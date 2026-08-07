@@ -4640,7 +4640,7 @@ fn native_thread_get_context_class_loader(
     if let Some(loader) = get_context_class_loader() {
         return Ok(Some(Value::Object(Some(loader))));
     }
-    let obj = crate::classloader::get_or_create_app_loader(ctx);
+    let obj = crate::classloader::get_or_create_app_loader(ctx)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -10196,7 +10196,7 @@ pub fn register_essential_natives_with_shims(
             let props = match crate::lang_system::system_props_singleton(ctx.vm_identity()) {
                 Some(cached) => cached,
                 None => {
-                    let p = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
+                    let p = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 16)?;
                     crate::properties_sidetable::mark_system_props(ctx, p);
                     crate::lang_system::set_system_props_singleton(ctx.vm_identity(), p)
                 }
@@ -11273,7 +11273,7 @@ pub fn register_essential_natives_with_shims(
             }
             buf
         }
-        fn write_bytes(ctx: &mut dyn NativeContext, args: &[Value], bytes: &[u8]) {
+        fn write_bytes(ctx: &mut dyn NativeContext, args: &[Value], bytes: &[u8]) -> Result<(), MethodCallFailed> {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return,
@@ -11285,7 +11285,8 @@ pub fn register_essential_natives_with_shims(
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, off + i, Value::Int(b as i8 as i32));
             }
-        }
+    Ok(())
+}
         registry.register(ba, "getBoolean", "([BI)Z", |ctx, args| {
             let b = read_bytes(ctx, args, 1);
             Ok(Some(Value::Int(if b[0] != 0 { 1 } else { 0 })))
@@ -11697,7 +11698,7 @@ pub fn register_essential_natives_with_shims(
                     Ok(Some(Value::Object(o))) => o,
                     _ => None,
                 };
-                let m = crate::lang_class::unnamed_module_for_loader(ctx, loader);
+                let m = crate::lang_class::unnamed_module_for_loader(ctx, loader)?;
                 return Ok(Some(Value::Object(Some(m))));
             }
 
@@ -11707,7 +11708,7 @@ pub fn register_essential_natives_with_shims(
                 return Ok(Some(Value::Object(Some(cached))));
             }
 
-            let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
             // GC-safety: `create_string` below allocates (String + char[]) and
             // can trigger a moving GC. `m_obj` lives only in this Rust local —
             // not a GC root — so without pinning it would be relocated/reclaimed
@@ -12728,7 +12729,7 @@ pub fn register_essential_natives_with_shims(
         "getProtectionDomain",
         "()Ljava/security/ProtectionDomain;",
         |ctx, args| {
-            let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4);
+            let pd = try_alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4)?;
             // Try to produce a real CodeSource with a URL pointing at the
             // classpath entry that holds this Class.
             let mut path_opt = if let Some(Value::Object(Some(mirror))) = args.first() {
@@ -12826,7 +12827,7 @@ pub fn register_essential_natives_with_shims(
                 // `authority` (slot 5) null so URL.toURI doesn't take its
                 // `isBuiltinStreamHandler(handler)` branch and NPE on the
                 // null `handler` slot.
-                let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+                let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
                 let path_str = ctx.create_string(&path);
                 let proto_str = ctx.create_string("file");
                 let host_str = ctx.create_string("");
@@ -12835,7 +12836,7 @@ pub fn register_essential_natives_with_shims(
                 ctx.set_field(url, 2, Value::Int(-1)); // port: -1 = unspecified
                 ctx.set_field(url, 3, Value::Object(Some(path_str))); // file
                 ctx.set_field(url, 6, Value::Object(Some(path_str))); // path
-                let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
+                let cs = try_alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2)?;
                 // BY NAME. These were raw slots 0 and 1; slot 0 is `location`
                 // on both layouts, but slot 1 is `signers` on a real
                 // `CodeSource` and only `certs` in the fabricated model — the
@@ -15830,7 +15831,7 @@ pub fn register_essential_natives_with_shims(
             use cratonvm_types::ArrayElementType;
             // AssertionStatusDirectives (package-private, java.lang):
             //   0:classes[] 1:classEnabled[] 2:packages[] 3:packageEnabled[] 4:deflt
-            let d = alloc_concurrent_synthetic(ctx, "java/lang/AssertionStatusDirectives", 5);
+            let d = try_alloc_concurrent_synthetic(ctx, "java/lang/AssertionStatusDirectives", 5)?;
             // Every `new_array` below can collect and relocate whatever was
             // allocated before it, so pin as we go and re-read through the
             // pins before the field writes.
@@ -16934,7 +16935,7 @@ pub fn register_essential_natives_with_shims(
         "getLogManager",
         "()Ljava/util/logging/LogManager;",
         |ctx, _args| {
-            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 2);
+            let mgr = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 2)?;
             Ok(Some(Value::Object(Some(mgr))))
         },
     );
@@ -16948,7 +16949,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
             let name_obj = ctx.create_string(&name);
             // Slot 0 is `Logger.config` on a real layout, not `name`. See the
             // slot table in `logmanager.rs`.
@@ -16970,7 +16971,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
             let name_obj = ctx.create_string(&name);
             // Slot 0 is `Logger.config` on a real layout, not `name`.
             ctx.set_field(
@@ -17254,7 +17255,7 @@ pub fn register_essential_natives_with_shims(
             let handlers = match jul_logger_handlers_get(ctx, logger) {
                 Some(list) => list,
                 None => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, logger, list);
                     list
@@ -19650,7 +19651,7 @@ pub fn register_essential_natives_with_shims(
     // hand-listing one zone at a time — see
     // `fixed-suite-bugs/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md`.
 
-    fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
+    fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> Result<cratonvm_types::Value, MethodCallFailed> {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
         // current recurring DST rule is known (`tz_dst_rule`), construct a
         // real `java.util.SimpleTimeZone` through its full constructor — its
@@ -19691,7 +19692,7 @@ pub fn register_essential_natives_with_shims(
                         &[Value::Int(start_year)],
                     );
                 }
-                return cratonvm_types::Value::Object(Some(obj));
+                return Ok(cratonvm_types::Value::Object(Some(obj)));
             }
         }
         // Prefer sun/util/calendar/ZoneInfo (concrete subclass of TimeZone).
@@ -19725,10 +19726,10 @@ pub fn register_essential_natives_with_shims(
         ctx.set_field_by_name(obj, "rawOffset", Value::Int(raw_offset_ms));
         ctx.set_field_by_name(obj, "rawOffsetDiff", Value::Int(0));
         ctx.set_field_by_name(obj, "dstSavings", Value::Int(0));
-        cratonvm_types::Value::Object(Some(obj))
+        Ok(cratonvm_types::Value::Object(Some(obj)))
     }
 
-    fn timezone_default_ref(ctx: &mut dyn NativeContext) -> cratonvm_types::Value {
+    fn timezone_default_ref(ctx: &mut dyn NativeContext) -> Result<cratonvm_types::Value, MethodCallFailed> {
         // Fallback id when `TimeZone.setDefault(...)` has never run this
         // process: honour the embedder's `user.timezone` system property
         // (set at VM init from `-Duser.timezone`/the environment) instead of
@@ -19742,16 +19743,16 @@ pub fn register_essential_natives_with_shims(
             if let Some(field_index) = ctx.static_field_index_by_name(class_id, "defaultTimeZone") {
                 let current = ctx.get_static_field(class_id, field_index);
                 if matches!(current, Value::Object(Some(_))) {
-                    return current;
+                    return Ok(current);
                 }
                 let fallback = alloc_synth_timezone(ctx, &fallback_id);
                 if matches!(fallback, Value::Object(Some(_))) {
-                    ctx.set_static_field(class_id, field_index, fallback);
+                    ctx.set_static_field(class_id, field_index, fallback?);
                 }
-                return fallback;
+                return Ok(fallback?);
             }
         }
-        alloc_synth_timezone(ctx, &fallback_id)
+        Ok(alloc_synth_timezone(ctx, &fallback_id)?)
     }
 
     /// Localized display name for a synthetic TimeZone, honouring its `ID` and
@@ -19765,7 +19766,7 @@ pub fn register_essential_natives_with_shims(
     /// the zone strings are not explicitly set and falls through to
     /// `getDisplayName`, so the fix must live here. `style` follows
     /// `TimeZone.SHORT` (0) / `TimeZone.LONG` (1).
-    fn tz_display_name(ctx: &mut dyn NativeContext, this: ObjectRef, long_style: bool) -> String {
+    fn tz_display_name(ctx: &mut dyn NativeContext, this: ObjectRef, long_style: bool) -> Result<String, MethodCallFailed> {
         let id = match ctx.get_field_by_name(this, "ID") {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
@@ -19792,7 +19793,7 @@ pub fn register_essential_natives_with_shims(
                 // used before (CratonVM models most zones by their standard
                 // offset, without per-zone CLDR display names).
                 if id.starts_with("GMT+") || id.starts_with("GMT-") {
-                    return id;
+                    return Ok(id);
                 }
                 return if long_style {
                     "Coordinated Universal Time".to_string()
@@ -19801,7 +19802,7 @@ pub fn register_essential_natives_with_shims(
                 };
             }
         }
-        .to_string()
+        Ok(.to_string())
     }
 
     registry.register(
@@ -19998,7 +19999,7 @@ pub fn register_essential_natives_with_shims(
     fn register_tzdb_offset_natives_for(
         registry: &mut NativeMethodRegistry,
         class_name: &'static str,
-    ) {
+    ) -> Result<(), MethodCallFailed> {
         registry.register(class_name, "getOffset", "(J)I", |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
@@ -20074,7 +20075,8 @@ pub fn register_essential_natives_with_shims(
             let raw = crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0);
             Ok(Some(Value::Int(raw.saturating_mul(1000))))
         });
-    }
+    Ok(())
+}
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
     register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
     // The abstract base too. Only the two concrete subclasses above carried the
@@ -20627,7 +20629,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
     // the fields here lets the real-JDK `withUpperCase()` bytecode run
     // to completion against a well-formed receiver.
     registry.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
         let empty = ctx.create_string("");
         ctx.set_field(obj, 0, Value::Object(Some(empty))); // delimiter
         let empty2 = ctx.create_string("");
@@ -20646,7 +20648,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         "ofDelimiter",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             let empty1 = ctx.create_string("");
             ctx.set_field(obj, 1, Value::Object(Some(empty1)));
@@ -20673,7 +20675,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
             ctx.set_field(obj, 0, ctx.get_field(this, 0));
             ctx.set_field(obj, 1, ctx.get_field(this, 1));
             ctx.set_field(obj, 2, ctx.get_field(this, 2));
@@ -20690,7 +20692,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
             ctx.set_field(obj, 0, ctx.get_field(this, 0));
             ctx.set_field(obj, 1, ctx.get_field(this, 1));
             ctx.set_field(obj, 2, ctx.get_field(this, 2));
@@ -20711,7 +20713,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
             ctx.set_field(obj, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, ctx.get_field(this, 1));
             ctx.set_field(obj, 2, ctx.get_field(this, 2));
@@ -20728,7 +20730,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
             ctx.set_field(obj, 0, ctx.get_field(this, 0));
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, ctx.get_field(this, 2));
@@ -20745,7 +20747,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 4)?;
             ctx.set_field(obj, 0, ctx.get_field(this, 0));
             ctx.set_field(obj, 1, ctx.get_field(this, 1));
             ctx.set_field(obj, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
@@ -21835,7 +21837,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // holder.threadStatus and calls VM.toThreadState(int).  We override
     // both to return RUNNABLE directly, avoiding the FieldHolder dependency.
     let thread_state_runnable = |ctx: &mut dyn NativeContext, _args: &[Value]| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2)?;
         let name = ctx.create_string("RUNNABLE");
         ctx.set_field(obj, 0, Value::Object(Some(name)));
         ctx.set_field(obj, 1, Value::Int(1));
@@ -22160,7 +22162,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
             let runnable = args.first().copied().unwrap_or(Value::Object(None));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name = ctx.create_string("virtual-thread");
             ctx.set_field(thr, 0, Value::Object(Some(name))); // name
             ctx.set_field(thr, 1, Value::Int(5)); // priority
@@ -22198,7 +22200,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
             let runnable = args.first().copied().unwrap_or(Value::Object(None));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name = ctx.create_string("virtual-builder-thread");
             ctx.set_field(thr, 0, Value::Object(Some(name)));
             ctx.set_field(thr, 1, Value::Int(5));
@@ -22215,7 +22217,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
             let runnable = args.first().copied().unwrap_or(Value::Object(None));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name = ctx.create_string("platform-builder-thread");
             ctx.set_field(thr, 0, Value::Object(Some(name)));
             ctx.set_field(thr, 1, Value::Int(5));
@@ -22261,7 +22263,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         // Instead, copy the intern data: field 0 (value array) + field 1 (hash).
         let val = ctx.get_field(str_obj, 0);
         ctx.set_field(_this, 0, val);
-        let hash = ctx.get_field(str_obj, 1);
+        let hash = ctx.get_field(str_obj, 1)?;
         ctx.set_field(_this, 1, hash);
         Ok(None)
     });
@@ -22287,7 +22289,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         let str_obj = ctx.create_string(&s);
         let val = ctx.get_field(str_obj, 0);
         ctx.set_field(_this, 0, val);
-        let hash = ctx.get_field(str_obj, 1);
+        let hash = ctx.get_field(str_obj, 1)?;
         ctx.set_field(_this, 1, hash);
         Ok(None)
     });
@@ -27159,7 +27161,7 @@ fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> 
     }
 }
 
-fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> cratonvm_types::ObjectRef {
+fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
         Err(_) => ctx.ensure_synthetic_class("java/util/UUID", 2),
@@ -27167,7 +27169,7 @@ fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> cratonvm_types
     let obj = ctx.alloc_object(class_id, 2);
     uuid_set_msb(ctx, obj, msb);
     uuid_set_lsb(ctx, obj, lsb);
-    obj
+    Ok(obj)
 }
 
 fn native_uuid_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -27209,7 +27211,7 @@ fn native_uuid_random(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     // Set variant to 2 (bits 62-63 of lsb)
     lsb = (lsb & !(3i64 << 62)) | (2i64 << 62);
     let uuid = alloc_uuid(ctx, msb, lsb);
-    Ok(Some(Value::Object(Some(uuid))))
+    Ok(Some(Value::Object(Some(uuid?))))
 }
 
 fn native_uuid_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -27230,7 +27232,7 @@ fn native_uuid_from_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let msb = u64::from_str_radix(&hex[0..16], 16).unwrap_or(0) as i64;
     let lsb = u64::from_str_radix(&hex[16..32], 16).unwrap_or(0) as i64;
     let uuid = alloc_uuid(ctx, msb, lsb);
-    Ok(Some(Value::Object(Some(uuid))))
+    Ok(Some(Value::Object(Some(uuid?))))
 }
 
 fn native_uuid_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -27295,7 +27297,7 @@ fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let msb = uuid_get_msb(ctx, this);
     let lsb = uuid_get_lsb(ctx, this);
     let hilo = msb ^ lsb;
-    let hash = ((hilo >> 32) ^ hilo) as i32;
+    let hash = (((hilo >> 32) ^ hilo) as i32);
     Ok(Some(Value::Int(hash)))
 }
 
@@ -29876,12 +29878,12 @@ const DUR_FIELD_SECONDS: usize = 0;
 const DUR_FIELD_NANOS: usize = 1;
 const DUR_NUM_FIELDS: usize = 2;
 
-fn alloc_local_date(ctx: &mut dyn NativeContext, year: i32, month: i32, day: i32) -> ObjectRef {
+fn alloc_local_date(ctx: &mut dyn NativeContext, year: i32, month: i32, day: i32) -> Result<ObjectRef, MethodCallFailed> {
     let obj = alloc_time_synthetic(ctx, "java/time/LocalDate", LD_NUM_FIELDS);
     ctx.set_field(obj, LD_FIELD_YEAR, Value::Int(year));
     ctx.set_field(obj, LD_FIELD_MONTH, Value::Int(month));
     ctx.set_field(obj, LD_FIELD_DAY, Value::Int(day));
-    obj
+    Ok(obj)
 }
 
 fn alloc_local_time(
@@ -29890,23 +29892,23 @@ fn alloc_local_time(
     minute: i32,
     second: i32,
     nano: i32,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let obj = alloc_time_synthetic(ctx, "java/time/LocalTime", LT_NUM_FIELDS);
     ctx.set_field(obj, LT_FIELD_HOUR, Value::Int(hour));
     ctx.set_field(obj, LT_FIELD_MINUTE, Value::Int(minute));
     ctx.set_field(obj, LT_FIELD_SECOND, Value::Int(second));
     ctx.set_field(obj, LT_FIELD_NANO, Value::Int(nano));
-    obj
+    Ok(obj)
 }
 
-fn alloc_instant(ctx: &mut dyn NativeContext, epoch_sec: i64, nano: i32) -> ObjectRef {
+fn alloc_instant(ctx: &mut dyn NativeContext, epoch_sec: i64, nano: i32) -> Result<ObjectRef, MethodCallFailed> {
     let obj = alloc_time_synthetic(ctx, "java/time/Instant", INST_NUM_FIELDS);
     ctx.set_field(obj, INST_FIELD_EPOCH_SEC, Value::Long(epoch_sec));
     ctx.set_field(obj, INST_FIELD_NANO, Value::Int(nano));
-    obj
+    Ok(obj)
 }
 
-fn alloc_duration(ctx: &mut dyn NativeContext, seconds: i64, nanos: i32) -> ObjectRef {
+fn alloc_duration(ctx: &mut dyn NativeContext, seconds: i64, nanos: i32) -> Result<ObjectRef, MethodCallFailed> {
     // Normalize: nanos must be in [0, 999_999_999]
     let total_nanos = seconds as i128 * 1_000_000_000 + nanos as i128;
     let norm_sec = (total_nanos.div_euclid(1_000_000_000)) as i64;
@@ -29914,7 +29916,7 @@ fn alloc_duration(ctx: &mut dyn NativeContext, seconds: i64, nanos: i32) -> Obje
     let obj = alloc_time_synthetic(ctx, "java/time/Duration", DUR_NUM_FIELDS);
     ctx.set_field(obj, DUR_FIELD_SECONDS, Value::Long(norm_sec));
     ctx.set_field(obj, DUR_FIELD_NANOS, Value::Int(norm_nanos));
-    obj
+    Ok(obj)
 }
 
 fn alloc_time_synthetic(ctx: &mut dyn NativeContext, class: &str, n: usize) -> ObjectRef {
@@ -30344,7 +30346,7 @@ pub(crate) fn build_real_layout_string_hashset(
     let n_next = ctx.resolve_field_index("java/util/HashMap$Node", "next");
     let s_map = ctx.resolve_field_index("java/util/HashSet", "map");
 
-    fn jdk_string_hash_from_obj(ctx: &mut dyn NativeContext, k: ObjectRef) -> i32 {
+    fn jdk_string_hash_from_obj(ctx: &mut dyn NativeContext, k: ObjectRef) -> Result<i32, MethodCallFailed> {
         // Use String.hashCode equivalent: per-char folded with 31, then JDK
         // HashMap.hash post-mix `h ^ (h >>> 16)`.
         let s = ctx.read_string(k).unwrap_or_default();
@@ -30352,7 +30354,7 @@ pub(crate) fn build_real_layout_string_hashset(
         for ch in s.chars() {
             h = h.wrapping_mul(31).wrapping_add(ch as i32);
         }
-        h ^ ((h as u32 >> 16) as i32)
+        Ok(h ^ ((h as u32 >> 16) as i32))
     }
 
     if let (
@@ -30406,7 +30408,7 @@ pub(crate) fn build_real_layout_string_hashset(
         ctx.set_field(map, f_entryset, Value::Object(None));
 
         for &k in keys {
-            let hash = jdk_string_hash_from_obj(ctx, k);
+            let hash = jdk_string_hash_from_obj(ctx, k)?;
             let idx = ((cap as u32 - 1) & hash as u32) as usize;
             let node = ctx.alloc_object(node_cid, node_n_fields);
             ctx.set_field(node, n_hash, Value::Int(hash));
@@ -30429,7 +30431,7 @@ pub(crate) fn build_real_layout_string_hashset(
 
     // Fallback: legacy synthetic-2-field (data_array, size) layout used by
     // older callers that don't go through the JDK spliterator/stream path.
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
     for (i, &k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Object(Some(k)));
@@ -30473,13 +30475,13 @@ pub(crate) fn build_real_layout_string_hashset(
 /// The object has a single instance field (slot 0 reserved for any future
 /// back-reference); native methods registered on `java/lang/System$1`
 /// read nothing from it.
-fn get_or_build_jla_shim(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn get_or_build_jla_shim(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Per-thread cache: because cratonvm's per-thread heap means a cached
     // ObjectRef from another thread could be stale, we allocate a fresh
     // `System$1` each call. The backing class is shared, so every
     // returned object routes to the same `JavaLangAccess.*` natives —
     // the object identity is irrelevant for these method calls.
-    alloc_concurrent_synthetic(ctx, "java/lang/System$1", 1)
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/lang/System$1", 1)?)
 }
 
 /// `jdk/internal/access/SharedSecrets.getJavaLangAccess()` shim.
@@ -30488,7 +30490,7 @@ fn native_shared_secrets_get_jla(
     _args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let shim = get_or_build_jla_shim(ctx);
-    Ok(Some(Value::Object(Some(shim))))
+    Ok(Some(Value::Object(Some(shim?))))
 }
 
 /// `jdk/internal/misc/SharedSecrets.getJavaLangAccess()` (legacy package).
@@ -30497,7 +30499,7 @@ fn native_shared_secrets_misc_get_jla(
     _args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
     let shim = get_or_build_jla_shim(ctx);
-    Ok(Some(Value::Object(Some(shim))))
+    Ok(Some(Value::Object(Some(shim?))))
 }
 
 /// `java/lang/System$1.currentCarrierThread()` — forwards to the VM's
@@ -30836,7 +30838,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljdk/internal/util/ClassFileDumper;",
         |ctx, args| {
-            let d = alloc_concurrent_synthetic(ctx, "jdk/internal/util/ClassFileDumper", 4);
+            let d = try_alloc_concurrent_synthetic(ctx, "jdk/internal/util/ClassFileDumper", 4)?;
             ctx.set_field(d, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(d, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(d, 2, Value::Int(0)); // disabled
@@ -30970,7 +30972,7 @@ fn cslm_subrange(
     };
 
     // Build a new map with the subrange
-    let result = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentSkipListMap", 3);
+    let result = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentSkipListMap", 3)?;
     let cap = size.max(4);
     let new_keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     let new_vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
@@ -31834,7 +31836,7 @@ fn b64_alloc_encoder(
     variant: i32,
     no_padding: bool,
 ) -> MethodCallResult {
-    let encoder = alloc_concurrent_synthetic(ctx, "java/util/Base64$Encoder", 4);
+    let encoder = try_alloc_concurrent_synthetic(ctx, "java/util/Base64$Encoder", 4)?;
     ctx.set_field(
         encoder,
         B64_ENCODER_FIELD_LINEMAX,
@@ -31854,7 +31856,7 @@ fn b64_alloc_encoder(
 }
 
 fn b64_alloc_decoder(ctx: &mut dyn NativeContext, variant: i32) -> MethodCallResult {
-    let decoder = alloc_concurrent_synthetic(ctx, "java/util/Base64$Decoder", 1);
+    let decoder = try_alloc_concurrent_synthetic(ctx, "java/util/Base64$Decoder", 1)?;
     ctx.set_field(decoder, B64_DECODER_FIELD_VARIANT, Value::Int(variant));
     Ok(Some(Value::Object(Some(decoder))))
 }
@@ -32229,7 +32231,7 @@ mod base64_tests {
 
 pub(crate) const CHARSET_FIELD_NAME: usize = 0;
 
-fn register_charset_natives(registry: &mut NativeMethodRegistry) {
+fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     // census-tag: Charset encode/decode (UTF-8 etc.) is spec-exact and matches
     // real JDK bytecode → Intrinsic.
     let __prev_cat = registry.current_category();
@@ -32355,7 +32357,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             ("UTF_16LE", "UTF-16LE"),
         ];
         for (field_name, charset_name) in charsets {
-            let obj = charset_alloc(ctx, charset_name);
+            let obj = charset_alloc(ctx, charset_name)?;
             ctx.set_static_field_by_name(
                 "java/nio/charset/StandardCharsets",
                 field_name,
@@ -32447,7 +32449,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             let cid = ctx.class_id_of_object(this);
             let cname = ctx.class_name_of_id(cid).unwrap_or_default();
             if cname != "java/nio/StringCharBuffer" {
-                return None;
+                return Ok(None);
             }
             let str_obj = match ctx.get_field_by_name(this, "str") {
                 Value::Object(Some(o)) => o,
@@ -32486,7 +32488,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             let (chars, _pos, _lim, off) = string_cb_state(ctx, this)?;
             let real = absolute_index + off;
             if real < 0 || real as usize >= chars.len() {
-                return None;
+                return Ok(None);
             }
             Some(Value::Int(chars[real as usize] as i32))
         }
@@ -32941,7 +32943,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 _ => {
                     // No receiver — still hand back a usable UTF-8 Charset
                     // rather than null so callers never NPE.
-                    let cs = charset_alloc(ctx, "UTF-8");
+                    let cs = charset_alloc(ctx, "UTF-8")?;
                     return Ok(Some(Value::Object(Some(cs))));
                 }
             };
@@ -32951,12 +32953,13 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(cs))));
             }
             // Field missing or null: synthesize UTF-8 and write it back.
-            let cs = charset_alloc(ctx, "UTF-8");
+            let cs = charset_alloc(ctx, "UTF-8")?;
             ctx.set_field_by_name(this, "charset", Value::Object(Some(cs)));
             Ok(Some(Value::Object(Some(cs))))
         },
     );
     registry.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
@@ -33128,8 +33131,8 @@ pub fn register_charset_natives_pub(registry: &mut NativeMethodRegistry) {
     register_netty_internal_tcnative_natives(registry);
 }
 
-fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-    let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 3);
+fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let charset = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 3)?;
     let charset_pin = ctx.pin_native_root(charset);
     let aliases = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
     let aliases_pin = ctx.pin_native_root(aliases);
@@ -33144,7 +33147,7 @@ fn charset_alloc(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     ctx.set_field_by_name(charset, "aliasSet", Value::Object(None));
     ctx.unpin_native_roots(aliases_pin);
     ctx.unpin_native_roots(charset_pin);
-    charset
+    Ok(charset)
 }
 
 fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33180,12 +33183,12 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     }
     let charset = charset_alloc(ctx, &normalized);
-    let handle = ctx.add_global_root(charset);
+    let handle = ctx.add_global_root(charset?);
     real_charset_cache()
         .lock()
         .unwrap()
         .insert(normalized, handle);
-    Ok(Some(Value::Object(Some(charset))))
+    Ok(Some(Value::Object(Some(charset?))))
 }
 
 /// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
@@ -33233,7 +33236,7 @@ fn throw_unsupported_charset_exception(
 
 fn native_charset_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let charset = charset_alloc(ctx, "UTF-8");
-    Ok(Some(Value::Object(Some(charset))))
+    Ok(Some(Value::Object(Some(charset?))))
 }
 
 /// `Charset.availableCharsets()` — return a real-JDK TreeMap populated
@@ -33276,10 +33279,10 @@ fn native_charset_available_charsets(
     let map_pin = ctx.pin_native_root(map);
     for name in charsets {
         let value = charset_alloc(ctx, name);
-        let value_pin = ctx.pin_native_root(value);
+        let value_pin = ctx.pin_native_root(value?);
         let key = ctx.create_string(name);
         let map = ctx.read_native_pin(map_pin, map);
-        let value = ctx.read_native_pin(value_pin, value);
+        let value = ctx.read_native_pin(value_pin, value?);
         cratonvm_native_collections::native_map_put_pub(
             ctx,
             &[
@@ -33372,22 +33375,22 @@ fn native_charset_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_std_charset_utf8(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-8")))))
+    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-8")?))))
 }
 fn native_std_charset_utf16(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16")))))
+    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16")?))))
 }
 fn native_std_charset_utf16be(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16BE")))))
+    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16BE")?))))
 }
 fn native_std_charset_utf16le(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16LE")))))
+    Ok(Some(Value::Object(Some(charset_alloc(ctx, "UTF-16LE")?))))
 }
 fn native_std_charset_ascii(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "US-ASCII")))))
+    Ok(Some(Value::Object(Some(charset_alloc(ctx, "US-ASCII")?))))
 }
 fn native_std_charset_latin1(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(charset_alloc(ctx, "ISO-8859-1")))))
+    Ok(Some(Value::Object(Some(charset_alloc(ctx, "ISO-8859-1")?))))
 }
 
 /// Normalize a charset name to its canonical form, or return empty if unsupported.
@@ -33686,7 +33689,7 @@ fn failed_executor_future(
 }
 
 fn native_new_single_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+    let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
     crate::phases_early::initialize_real_thread_pool_executor(
         ctx,
         exec,
@@ -33704,7 +33707,7 @@ fn native_new_fixed_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+    let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
     crate::phases_early::initialize_real_thread_pool_executor(
         ctx,
         exec,
@@ -33718,7 +33721,7 @@ fn native_new_fixed_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_new_cached_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+    let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
     let thread_factory = match args.first() {
         Some(Value::Object(Some(factory))) => Some(*factory),
         _ => None,
@@ -34307,7 +34310,7 @@ fn nf_apply_grouping(int_part: &str) -> String {
 }
 
 fn native_nf_get_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let nf = alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 4);
+    let nf = try_alloc_concurrent_synthetic(ctx, "java/text/DecimalFormat", 4)?;
     let pattern = ctx.create_string("#,##0.###");
     ctx.set_field(nf, NF_FIELD_PATTERN, Value::Object(Some(pattern)));
     nf_init_optional_fields(ctx, nf);
@@ -34708,7 +34711,7 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     let user_dir_str = ctx.create_string(&user_dir);
     #[cfg(windows)]
     {
-        let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/WinNTFileSystem", 4);
+        let fs_obj = try_alloc_concurrent_synthetic(ctx, "java/io/WinNTFileSystem", 4)?;
         ctx.set_field_by_name(
             fs_obj,
             "slash",
@@ -34721,7 +34724,7 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     }
     #[cfg(not(windows))]
     {
-        let fs_obj = alloc_concurrent_synthetic(ctx, "java/io/UnixFileSystem", 3);
+        let fs_obj = try_alloc_concurrent_synthetic(ctx, "java/io/UnixFileSystem", 3)?;
         ctx.set_field_by_name(
             fs_obj,
             "slash",
@@ -34734,9 +34737,9 @@ fn native_file_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(None)
 }
 
-fn alloc_heap_bytebuffer(ctx: &mut dyn NativeContext, capacity: usize) -> ObjectRef {
+fn alloc_heap_bytebuffer(ctx: &mut dyn NativeContext, capacity: usize) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, capacity);
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 5);
+    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 5)?;
     let cap = capacity as i32;
     ctx.set_field(buf, 0, Value::Object(Some(arr)));
     ctx.set_field(buf, 1, Value::Int(0));
@@ -34755,7 +34758,7 @@ fn alloc_heap_bytebuffer(ctx: &mut dyn NativeContext, capacity: usize) -> Object
     // Keep this last so synthetic indexed compatibility writes cannot clobber
     // the inherited real-JDK Buffer.address slot.
     ctx.set_field_by_name(buf, "address", Value::Long(16));
-    buf
+    Ok(buf)
 }
 
 fn native_heap_bytebuffer_allocate(
@@ -34794,12 +34797,12 @@ fn native_heap_bytebuffer_allocate(
     result
 }
 
-fn alloc_coding_error_action(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-    let action = alloc_concurrent_synthetic(ctx, "java/nio/charset/CodingErrorAction", 1);
+fn alloc_coding_error_action(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let action = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CodingErrorAction", 1)?;
     let name_obj = ctx.create_string(name);
     ctx.set_field_by_name(action, "name", Value::Object(Some(name_obj)));
     ctx.set_field(action, 0, Value::Object(Some(name_obj)));
-    action
+    Ok(action)
 }
 
 fn native_coding_error_action_clinit(
@@ -34811,7 +34814,7 @@ fn native_coding_error_action_clinit(
         ctx.set_static_field_by_name(
             "java/nio/charset/CodingErrorAction",
             name,
-            Value::Object(Some(action)),
+            Value::Object(Some(action?)),
         );
     }
     Ok(None)
@@ -34841,7 +34844,7 @@ fn native_level_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
         ("OFF", i32::MAX),
     ] {
         let level = alloc_level(ctx, name, value);
-        ctx.set_static_field_by_name("java/util/logging/Level", name, Value::Object(Some(level)));
+        ctx.set_static_field_by_name("java/util/logging/Level", name, Value::Object(Some(level?)));
     }
     Ok(None)
 }
@@ -34851,12 +34854,12 @@ const LOGGER_FIELD_LEVEL: usize = 1;
 const LEVEL_FIELD_NAME: usize = 0;
 const LEVEL_FIELD_VALUE: usize = 1;
 
-fn alloc_level(ctx: &mut dyn NativeContext, name: &str, value: i32) -> ObjectRef {
-    let lvl = alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2);
+fn alloc_level(ctx: &mut dyn NativeContext, name: &str, value: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let lvl = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2)?;
     let n = ctx.create_string(name);
     ctx.set_field(lvl, LEVEL_FIELD_NAME, Value::Object(Some(n)));
     ctx.set_field(lvl, LEVEL_FIELD_VALUE, Value::Int(value));
-    lvl
+    Ok(lvl)
 }
 
 fn native_level_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34876,23 +34879,23 @@ fn native_level_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 }
 
 fn native_logger_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+    let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
     ctx.set_field(
         logger,
         LOGGER_FIELD_NAME,
         args.first().copied().unwrap_or(Value::Object(None)),
     );
     let info = alloc_level(ctx, "INFO", 800);
-    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info)));
+    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info?)));
     Ok(Some(Value::Object(Some(logger))))
 }
 
 fn native_logger_get_global(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let name = ctx.create_string("global");
-    let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+    let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
     ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name)));
     let info = alloc_level(ctx, "INFO", 800);
-    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info)));
+    ctx.set_field(logger, LOGGER_FIELD_LEVEL, Value::Object(Some(info?)));
     Ok(Some(Value::Object(Some(logger))))
 }
 
@@ -34961,31 +34964,31 @@ fn native_logger_log_level(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_level_all(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "ALL", i32::MIN)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "ALL", i32::MIN)?))))
 }
 fn native_level_severe(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "SEVERE", 1000)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "SEVERE", 1000)?))))
 }
 fn native_level_warning(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "WARNING", 900)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "WARNING", 900)?))))
 }
 fn native_level_info(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "INFO", 800)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "INFO", 800)?))))
 }
 fn native_level_config(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "CONFIG", 700)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "CONFIG", 700)?))))
 }
 fn native_level_fine(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "FINE", 500)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "FINE", 500)?))))
 }
 fn native_level_finer(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "FINER", 400)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "FINER", 400)?))))
 }
 fn native_level_finest(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "FINEST", 300)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "FINEST", 300)?))))
 }
 fn native_level_off(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(alloc_level(ctx, "OFF", i32::MAX)))))
+    Ok(Some(Value::Object(Some(alloc_level(ctx, "OFF", i32::MAX)?))))
 }
 
 fn native_level_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35033,8 +35036,8 @@ fn register_locale_natives(_registry: &mut NativeMethodRegistry) {
 // String. All language/country/variant data lives in the `locale_data`
 // side table instead. See `locale_data()` for the full rationale.
 
-pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> ObjectRef {
-    locale_alloc_full(ctx, lang, "", country, "")
+pub(crate) fn locale_alloc(ctx: &mut dyn NativeContext, lang: &str, country: &str) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(locale_alloc_full(ctx, lang, "", country, "")?)
 }
 
 /// [`locale_alloc`] with the full subtag set, including the BCP-47 script.
@@ -35044,9 +35047,9 @@ pub(crate) fn locale_alloc_full(
     script: &str,
     country: &str,
     variant: &str,
-) -> ObjectRef {
-    let loc = alloc_concurrent_synthetic(ctx, "java/util/Locale", 3);
-    locale_populate_full(ctx, loc, lang, script, country, variant)
+) -> Result<ObjectRef, MethodCallFailed> {
+    let loc = try_alloc_concurrent_synthetic(ctx, "java/util/Locale", 3)?;
+    Ok(locale_populate_full(ctx, loc, lang, script, country, variant))
 }
 
 /// Record a synthetic Locale's `(language, country, variant)` in the side
@@ -35188,7 +35191,7 @@ fn native_locale_init2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_locale_get_default(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let loc = locale_alloc(ctx, "en", "US");
-    Ok(Some(Value::Object(Some(loc))))
+    Ok(Some(Value::Object(Some(loc?))))
 }
 
 fn native_locale_get_lang(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35273,16 +35276,16 @@ fn native_locale_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn native_locale_english(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "")))))
+    Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "")?))))
 }
 fn native_locale_us(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "US")))))
+    Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "US")?))))
 }
 fn native_locale_uk(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "GB")))))
+    Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "GB")?))))
 }
 fn native_locale_root(ctx: &mut dyn NativeContext, _: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(locale_alloc(ctx, "", "")))))
+    Ok(Some(Value::Object(Some(locale_alloc(ctx, "", "")?))))
 }
 
 fn native_locale_for_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35294,7 +35297,7 @@ fn native_locale_for_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let lang = parts.first().copied().unwrap_or("");
     let country = parts.get(1).copied().unwrap_or("");
     let loc = locale_alloc(ctx, lang, country);
-    Ok(Some(Value::Object(Some(loc))))
+    Ok(Some(Value::Object(Some(loc?))))
 }
 
 // ===========================================================================
@@ -35425,7 +35428,7 @@ fn native_md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // back to SHA-256 inside `compute_digest`, matching the JDK
         // behaviour of NoSuchAlgorithmException being surfaced lazily.
     }
-    let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 2);
+    let md = try_alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 2)?;
     // GC-safety: `md` is a bare Rust local held across two further
     // allocating calls (`create_string`, `new_array`) below. Either can
     // trigger a moving GC that relocates `md`; without re-reading through a
@@ -35544,7 +35547,7 @@ fn native_md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// `real_sha256` / `real_sha384` / `real_sha512`). The SHA-3 family is
 /// provided by the RustCrypto `sha3` crate so CratonVM does not have to
 /// re-implement the Keccak permutation.
-pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Vec<u8> {
+pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodCallFailed> {
     use sha3::Digest as _;
     // Strip both `-` and `/` so the truncated SHA-512 spellings
     // ("SHA-512/256", "SHA-512/224") normalise to "SHA512256" / "SHA512224"
@@ -35627,7 +35630,7 @@ const MD5_K: [u32; 64] = [
     0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
 ];
 
-pub(crate) fn real_md5(data: &[u8]) -> Vec<u8> {
+pub(crate) fn real_md5(data: &[u8]) -> Result<Vec<u8>, MethodCallFailed> {
     let mut h0: u32 = 0x67452301;
     let mut h1: u32 = 0xefcdab89;
     let mut h2: u32 = 0x98badcfe;
@@ -35686,7 +35689,7 @@ pub(crate) fn real_md5(data: &[u8]) -> Vec<u8> {
     result.extend_from_slice(&h1.to_le_bytes());
     result.extend_from_slice(&h2.to_le_bytes());
     result.extend_from_slice(&h3.to_le_bytes());
-    result
+    Ok(result)
 }
 
 // ===========================================================================
@@ -36268,7 +36271,7 @@ fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // un-reset -- same unread-pin anti-pattern fixed in
     // `populate_real_thread_holder` (GCBARRIER-CDLWAIT-FIX, 2026-07-17).
     let this_handle = ctx.pin_native_root(this);
-    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest?.len());
     let result_handle = ctx.pin_native_root(result);
     for (i, &b) in digest.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
@@ -36345,14 +36348,14 @@ fn native_md_digest_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // JDK writes the full digest (callers size `len` to the digest length); we
     // additionally clamp to both `len` and the array bounds to fail safe.
     let cap = ctx.array_length(buf);
-    let n = digest.len().min(len).min(cap.saturating_sub(offset));
+    let n = digest?.len().min(len).min(cap.saturating_sub(offset));
     for i in 0..n {
         ctx.set_array_element(buf, offset + i, Value::Int(digest[i] as i8 as i32));
     }
     // Reset the running state, matching `digest()`'s post-finalization reset.
     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
-    Ok(Some(Value::Int(digest.len() as i32)))
+    Ok(Some(Value::Int(digest?.len() as i32)))
 }
 
 fn native_md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -36542,24 +36545,24 @@ fn pack_lock_key(hash: u32, generation: u32) -> usize {
 ///      assigned identity — hash 0 means "identity not yet assigned" and
 ///      DISTINCT objects all bucket there, so we must NOT merge them);
 ///   3. otherwise a new object / genuine collision → fresh generation.
-fn gc_stable_lock_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
-    let hash = ctx.identity_hash_code(obj) as u32;
+fn gc_stable_lock_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<usize, MethodCallFailed> {
+    let hash = (ctx.identity_hash_code(obj) as u32);
     let ptr = obj.as_ptr() as usize;
     let mut reg = lock_key_registry().lock();
     let slots = reg.entry(hash).or_default();
     if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
-        return pack_lock_key(hash, slot.generation);
+        return Ok(pack_lock_key(hash, slot.generation));
     }
     if hash != 0 && slots.len() == 1 {
         slots[0].last_ptr = ptr;
-        return pack_lock_key(hash, slots[0].generation);
+        return Ok(pack_lock_key(hash, slots[0].generation));
     }
     let generation = slots.len() as u32;
     slots.push(LockKeyEntry {
         last_ptr: ptr,
         generation,
     });
-    pack_lock_key(hash, generation)
+    Ok(pack_lock_key(hash, generation))
 }
 
 fn mirror_stamped_state(ctx: &mut dyn NativeContext, obj: ObjectRef, addr: usize) {
@@ -37079,7 +37082,7 @@ fn register_enterprise_natives(registry: &mut NativeMethodRegistry) {
     // `native-io`'s ProcessBuilder.start, not a local stub. What stood here
     // was `native_pb_start`: it consulted the SecurityManager and then handed
     // back a dummy Process that had never spawned anything, on a ONE-slot
-    // `alloc_concurrent_synthetic(ctx, "java/lang/Process", 1)`. Registering
+    // `try_alloc_concurrent_synthetic(ctx, "java/lang/Process", 1)?`. Registering
     // the real one costs nothing and cannot lie.
     registry.register(
         pb,
@@ -37546,7 +37549,7 @@ fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
 }
 
 fn native_classloader_get_system(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/ClassLoader", 0);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/ClassLoader", 0)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -37809,7 +37812,7 @@ fn native_arraylist_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
 
-    let itr = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 5);
+    let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList$ListItr", 5)?;
     let (cursor_slot, last_ret_slot, expected_slot, parent_list_slot, child_list_slot) =
         native_arraylist_list_itr_slots(ctx);
     set_field_if_present(ctx, itr, parent_list_slot, Value::Object(Some(this)));
@@ -38145,11 +38148,11 @@ fn register_function_identity_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-fn synthetic_instant_alloc(ctx: &mut dyn NativeContext, epoch_sec: i64, nano: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/time/Instant", 2);
+fn synthetic_instant_alloc(ctx: &mut dyn NativeContext, epoch_sec: i64, nano: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Instant", 2)?;
     ctx.set_field(obj, 0, Value::Long(epoch_sec));
     ctx.set_field(obj, 1, Value::Int(nano));
-    obj
+    Ok(obj)
 }
 
 fn synthetic_instant_parts(ctx: &dyn NativeContext, obj: ObjectRef) -> (i64, i32) {
@@ -38178,7 +38181,7 @@ fn native_synthetic_instant_now(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let obj = synthetic_instant_alloc(ctx, now.as_secs() as i64, now.subsec_nanos() as i32);
+    let obj = synthetic_instant_alloc(ctx, now.as_secs() as i64, now.subsec_nanos() as i32)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38191,7 +38194,7 @@ fn native_synthetic_instant_of_epoch_second(
         Some(Value::Int(v)) => *v as i64,
         _ => 0,
     };
-    let obj = synthetic_instant_alloc(ctx, sec, 0);
+    let obj = synthetic_instant_alloc(ctx, sec, 0)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38210,7 +38213,7 @@ fn native_synthetic_instant_of_epoch_second_nano(
         _ => 0,
     };
     let (sec, nano) = synthetic_instant_norm(sec, adj);
-    let obj = synthetic_instant_alloc(ctx, sec, nano);
+    let obj = synthetic_instant_alloc(ctx, sec, nano)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38225,7 +38228,7 @@ fn native_synthetic_instant_of_epoch_milli(
     };
     let sec = millis.div_euclid(1000);
     let nano = (millis.rem_euclid(1000) * 1_000_000) as i32;
-    let obj = synthetic_instant_alloc(ctx, sec, nano);
+    let obj = synthetic_instant_alloc(ctx, sec, nano)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38267,7 +38270,7 @@ fn native_synthetic_instant_plus_seconds(
         _ => 0,
     };
     let (sec, nano) = synthetic_instant_parts(ctx, this);
-    let obj = synthetic_instant_alloc(ctx, sec.saturating_add(add), nano);
+    let obj = synthetic_instant_alloc(ctx, sec.saturating_add(add), nano)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38282,7 +38285,7 @@ fn native_synthetic_instant_minus_seconds(
         _ => 0,
     };
     let (sec, nano) = synthetic_instant_parts(ctx, this);
-    let obj = synthetic_instant_alloc(ctx, sec.saturating_sub(sub), nano);
+    let obj = synthetic_instant_alloc(ctx, sec.saturating_sub(sub), nano)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38298,7 +38301,7 @@ fn native_synthetic_instant_plus_millis(
     };
     let (sec, nano) = synthetic_instant_parts(ctx, this);
     let (sec, nano) = synthetic_instant_norm(sec, nano as i64 + add.saturating_mul(1_000_000));
-    let obj = synthetic_instant_alloc(ctx, sec, nano);
+    let obj = synthetic_instant_alloc(ctx, sec, nano)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38314,7 +38317,7 @@ fn native_synthetic_instant_plus_nanos(
     };
     let (sec, nano) = synthetic_instant_parts(ctx, this);
     let (sec, nano) = synthetic_instant_norm(sec, nano as i64 + add);
-    let obj = synthetic_instant_alloc(ctx, sec, nano);
+    let obj = synthetic_instant_alloc(ctx, sec, nano)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -38358,7 +38361,7 @@ fn native_synthetic_instant_is_after(
 /// default-feature build — which is what the blocking `cargo test --workspace`
 /// CI job runs, while every check in this module's own CI job passes
 /// `--features synthetic-jdk` and so never saw it.
-pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> Result<(i32, i32, i32), MethodCallFailed> {
     let z = epoch_day + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -38369,7 +38372,7 @@ pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as i32, d as i32)
+    Ok((y as i32, m as i32, d as i32))
 }
 
 /// `Instant.toString()` — ISO-8601, per `DateTimeFormatter.ISO_INSTANT`.
@@ -39819,7 +39822,7 @@ fn parse_param_class_names(descriptor: &str) -> Vec<String> {
 // CompletableFuture, Executors, Formatter
 // ===========================================================================
 
-fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
+fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     // --- AtomicBoolean (1-field synthetic: value=0 Int) ---
     register_atomic_boolean_natives(registry);
 
@@ -40058,7 +40061,8 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // lines later in the boot sequence, in every configuration; see the note
     // where it used to live in `phases_early.rs`.
 
-    // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases
+    // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases;
+    Ok(())
 }
 
 // ===========================================================================
@@ -40091,14 +40095,14 @@ const ASR_PAIR_CLASS: &str = "java/util/concurrent/atomic/AtomicStampedReference
 /// `(reference, stamp)`. Slot 0 = reference (Object), slot 1 = stamp (int),
 /// matching the JDK field order so real ASR bytecode reading `pair.reference`
 /// / `pair.stamp` stays consistent with the intrinsic.
-fn asr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, stamp: i32) -> ObjectRef {
+fn asr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, stamp: i32) -> Result<ObjectRef, MethodCallFailed> {
     // `alloc_concurrent_synthetic` resolves the real Pair class (2 fields) when
     // loadable and falls back to a 2-field synthetic class otherwise, so the
     // header's declared field count always matches the 2 slots we write.
-    let pair = alloc_concurrent_synthetic(ctx, ASR_PAIR_CLASS, 2);
+    let pair = try_alloc_concurrent_synthetic(ctx, ASR_PAIR_CLASS, 2)?;
     ctx.set_field(pair, 0, reference);
     ctx.set_field(pair, 1, Value::Int(stamp));
-    pair
+    Ok(pair)
 }
 
 /// Read `(reference, stamp)` out of the `pair` stored in `this.field(0)`.
@@ -40149,14 +40153,14 @@ const AMR_PAIR_CLASS: &str = "java/util/concurrent/atomic/AtomicMarkableReferenc
 /// stored as Int 0/1), matching the JDK field order so real AMR bytecode
 /// reading `pair.reference` / `pair.mark` stays consistent with the
 /// intrinsic.
-fn amr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, mark: bool) -> ObjectRef {
+fn amr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, mark: bool) -> Result<ObjectRef, MethodCallFailed> {
     // `alloc_concurrent_synthetic` resolves the real Pair class (2 fields) when
     // loadable and falls back to a 2-field synthetic class otherwise, so the
     // header's declared field count always matches the 2 slots we write.
-    let pair = alloc_concurrent_synthetic(ctx, AMR_PAIR_CLASS, 2);
+    let pair = try_alloc_concurrent_synthetic(ctx, AMR_PAIR_CLASS, 2)?;
     ctx.set_field(pair, 0, reference);
     ctx.set_field(pair, 1, Value::Int(if mark { 1 } else { 0 }));
-    pair
+    Ok(pair)
 }
 
 /// Read `(reference, mark)` out of the `pair` stored in `this.field(0)`.
@@ -40184,7 +40188,7 @@ fn native_amr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let r = args.get(1).copied().unwrap_or(Value::Object(None));
     let mark = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
     let pair = amr_alloc_pair(ctx, r, mark);
-    ctx.set_field(this, 0, Value::Object(Some(pair)));
+    ctx.set_field(this, 0, Value::Object(Some(pair?)));
     Ok(None)
 }
 
@@ -40230,7 +40234,7 @@ fn native_amr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // JDK `set` allocates a fresh Pair only when reference or mark differ; we
     // always install a fresh Pair (semantically identical, slightly simpler).
     let pair = amr_alloc_pair(ctx, r, mark);
-    ctx.set_field(this, 0, Value::Object(Some(pair)));
+    ctx.set_field(this, 0, Value::Object(Some(pair?)));
     Ok(None)
 }
 
@@ -40245,7 +40249,7 @@ fn native_amr_attempt_mark(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if values_ref_equal(current_ref, expected_ref) {
         // Swap in a new Pair carrying the (unchanged) reference + new mark.
         let pair = amr_alloc_pair(ctx, current_ref, new_mark);
-        ctx.set_field(this, 0, Value::Object(Some(pair)));
+        ctx.set_field(this, 0, Value::Object(Some(pair?)));
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
@@ -40267,7 +40271,7 @@ fn native_amr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         // JDK fast-path: when both are identical it skips the casPair entirely).
         if !values_ref_equal(current_ref, new_ref) || current_mark != new_mark {
             let pair = amr_alloc_pair(ctx, new_ref, new_mark);
-            ctx.set_field(this, 0, Value::Object(Some(pair)));
+            ctx.set_field(this, 0, Value::Object(Some(pair?)));
         }
         Ok(Some(Value::Int(1)))
     } else {
@@ -40641,7 +40645,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         let initializer = args.first().copied().unwrap_or(Value::Object(None));
         let integrator = args.get(1).copied().unwrap_or(Value::Object(None));
         let finisher = args.get(2).copied().unwrap_or(Value::Object(None));
-        let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+        let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
         ctx.set_field(g, 0, initializer);
         ctx.set_field(g, 1, integrator);
         ctx.set_field(g, 2, Value::Object(None));
@@ -40656,7 +40660,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         "(Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
             let integrator = args.first().copied().unwrap_or(Value::Object(None));
-            let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+            let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
             ctx.set_field(g, 0, Value::Object(None));
             ctx.set_field(g, 1, integrator);
             ctx.set_field(g, 2, Value::Object(None));
@@ -40705,7 +40709,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let initial = args.first().copied().unwrap_or(Value::Object(None));
             let folder = args.get(1).copied().unwrap_or(Value::Object(None));
-            let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+            let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
             ctx.set_field(g, 0, initial);
             ctx.set_field(g, 1, folder);
             ctx.set_field(g, 2, Value::Object(None));
@@ -40722,7 +40726,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let initial = args.first().copied().unwrap_or(Value::Object(None));
             let scanner = args.get(1).copied().unwrap_or(Value::Object(None));
-            let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+            let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
             ctx.set_field(g, 0, initial);
             ctx.set_field(g, 1, scanner);
             ctx.set_field(g, 2, Value::Object(None));
@@ -40741,7 +40745,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) => *n,
                 _ => 1,
             };
-            let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+            let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
             ctx.set_field(g, 0, Value::Int(window_size));
             ctx.set_field(g, 1, Value::Object(None));
             ctx.set_field(g, 2, Value::Object(None));
@@ -40760,7 +40764,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) => *n,
                 _ => 1,
             };
-            let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+            let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
             ctx.set_field(g, 0, Value::Int(window_size));
             ctx.set_field(g, 1, Value::Object(None));
             ctx.set_field(g, 2, Value::Object(None));
@@ -40776,7 +40780,7 @@ fn register_pd_stream_gatherers(r: &mut NativeMethodRegistry) {
         "(ILjava/util/function/Function;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
             let function = args.get(1).copied().unwrap_or(Value::Object(None));
-            let g = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5);
+            let g = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 5)?;
             ctx.set_field(g, 0, Value::Object(None));
             ctx.set_field(g, 1, function);
             ctx.set_field(g, 2, Value::Object(None));
@@ -40801,14 +40805,14 @@ fn pd_stream_gather(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let result = match kind {
         GATHERER_KIND_FOLD => pd_gather_fold(ctx, &elems, gatherer)?,
         GATHERER_KIND_SCAN => pd_gather_scan(ctx, &elems, gatherer)?,
-        GATHERER_KIND_WINDOW_FIXED => pd_gather_window_fixed(ctx, &elems, gatherer),
-        GATHERER_KIND_WINDOW_SLIDING => pd_gather_window_sliding(ctx, &elems, gatherer),
+        GATHERER_KIND_WINDOW_FIXED => pd_gather_window_fixed(ctx, &elems, gatherer)?,
+        GATHERER_KIND_WINDOW_SLIDING => pd_gather_window_sliding(ctx, &elems, gatherer)?,
         GATHERER_KIND_MAP_CONCURRENT => pd_gather_map(ctx, &elems, gatherer)?,
         _ => pd_gather_custom(ctx, &elems, gatherer)?,
     };
 
     let stream = p56_build_stream(ctx, result, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(stream))))
+    Ok(Some(Value::Object(Some(stream?))))
 }
 
 fn pd_gather_fold(
@@ -40869,7 +40873,7 @@ fn pd_gather_window_fixed(
     _ctx: &mut dyn NativeContext,
     elems: &[Value],
     gatherer: ObjectRef,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, MethodCallFailed> {
     let window_size = match _ctx.get_field(gatherer, 0) {
         Value::Int(n) => n.max(1) as usize,
         _ => 1,
@@ -40877,7 +40881,7 @@ fn pd_gather_window_fixed(
     // Each window becomes an ArrayList in the output stream
     let mut result = Vec::new();
     for chunk in elems.chunks(window_size) {
-        let al = alloc_concurrent_synthetic(_ctx, "java/util/ArrayList", 2);
+        let al = try_alloc_concurrent_synthetic(_ctx, "java/util/ArrayList", 2)?;
         let arr = _ctx.new_array(cratonvm_types::ArrayElementType::Reference, chunk.len());
         for (i, v) in chunk.iter().enumerate() {
             _ctx.set_array_element(arr, i, *v);
@@ -40886,14 +40890,14 @@ fn pd_gather_window_fixed(
         _ctx.set_field(al, 1, Value::Int(chunk.len() as i32));
         result.push(Value::Object(Some(al)));
     }
-    result
+    Ok(result)
 }
 
 fn pd_gather_window_sliding(
     _ctx: &mut dyn NativeContext,
     elems: &[Value],
     gatherer: ObjectRef,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, MethodCallFailed> {
     let window_size = match _ctx.get_field(gatherer, 0) {
         Value::Int(n) => n.max(1) as usize,
         _ => 1,
@@ -40902,7 +40906,7 @@ fn pd_gather_window_sliding(
     if elems.len() >= window_size {
         for start in 0..=(elems.len() - window_size) {
             let window = &elems[start..start + window_size];
-            let al = alloc_concurrent_synthetic(_ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(_ctx, "java/util/ArrayList", 2)?;
             let arr = _ctx.new_array(cratonvm_types::ArrayElementType::Reference, window.len());
             for (i, v) in window.iter().enumerate() {
                 _ctx.set_array_element(arr, i, *v);
@@ -40912,7 +40916,7 @@ fn pd_gather_window_sliding(
             result.push(Value::Object(Some(al)));
         }
     }
-    result
+    Ok(result)
 }
 
 fn pd_gather_map(
@@ -40954,7 +40958,7 @@ fn pd_gather_custom(
     };
 
     // Create a downstream collector: [0]=backing array, [1]=size
-    let downstream = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer$Downstream", 2);
+    let downstream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer$Downstream", 2)?;
     let downstream_arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
         elems.len() + 16,
@@ -41017,7 +41021,7 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljava/lang/ScopedValue;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue", 2)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -41082,7 +41086,7 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let scoped_val = args.first().copied().unwrap_or(Value::Object(None));
             let value = args.get(1).copied().unwrap_or(Value::Object(None));
-            let carrier = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 3);
+            let carrier = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 3)?;
             ctx.set_field(carrier, 0, scoped_val);
             ctx.set_field(carrier, 1, value);
             ctx.set_field(carrier, 2, Value::Object(None));
@@ -41100,7 +41104,7 @@ fn register_pd_scoped_values(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let scoped_val = args.get(1).copied().unwrap_or(Value::Object(None));
             let value = args.get(2).copied().unwrap_or(Value::Object(None));
-            let new_carrier = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 3);
+            let new_carrier = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 3)?;
             ctx.set_field(new_carrier, 0, scoped_val);
             ctx.set_field(new_carrier, 1, value);
             ctx.set_field(new_carrier, 2, Value::Object(Some(this)));
@@ -41199,14 +41203,15 @@ fn pd_collect_carrier_bindings(
 // -----------------------------------------------------------------------------
 
 /// Shared helper: initialize a StructuredTaskScope (or subclass) with subtask list.
-fn pd_init_scope(ctx: &mut dyn NativeContext, this: ObjectRef) {
-    let subtasks = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+fn pd_init_scope(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+    let subtasks = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
     ctx.set_field(subtasks, 0, Value::Object(Some(arr)));
     ctx.set_field(subtasks, 1, Value::Int(0));
     ctx.set_field(this, 0, Value::Object(Some(subtasks)));
     ctx.set_field(this, 1, Value::Int(0)); // OPEN
     ctx.set_field(this, 2, Value::Long(ctx.thread_id() as i64));
+    Ok(())
 }
 
 /// Shared helper: fork a callable synchronously into a scope's subtask list.
@@ -41216,7 +41221,7 @@ fn pd_fork_callable(
     callable: Value,
 ) -> MethodCallResult {
     let subtask =
-        alloc_concurrent_synthetic(ctx, "java/util/concurrent/StructuredTaskScope$Subtask", 5);
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/StructuredTaskScope$Subtask", 5)?;
     ctx.set_field(subtask, 0, callable);
     ctx.set_field(subtask, 3, Value::Int(0)); // UNAVAILABLE
 
@@ -41715,7 +41720,7 @@ mod liquibase_checksum_tests {
         } else {
             2
         };
-        let obj = ctx.alloc_object(class_id, fields);
+        let obj = ctx.alloc_object(class_id, fields)?;
         ctx.set_field(obj, 0, Value::Long(millis));
         if let Some(nanos) = nanos {
             ctx.set_field(obj, fields - 1, Value::Int(nanos));
@@ -41886,7 +41891,7 @@ mod t2_random_tests {
         // Random's synthetic layout: field 0 = seed (Long), field 1 =
         // haveNextGaussian (Int). Same layout as SecureRandom so the
         // shared `sr_next_seed` helper works on both.
-        let r = alloc_concurrent_synthetic(ctx, "java/util/Random", 2);
+        let r = try_alloc_concurrent_synthetic(ctx, "java/util/Random", 2)?;
         ctx.set_field(r, 0, Value::Long(0));
         ctx.set_field(r, 1, Value::Int(0));
         r

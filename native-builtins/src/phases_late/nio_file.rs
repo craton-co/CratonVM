@@ -89,7 +89,7 @@ pub fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
     }
 }
 
-pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
+pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let path = "java/nio/file/Path";
@@ -105,7 +105,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, this);
             let abs = p57_absolute_path_string(&p);
-            let result = p57_alloc_path(ctx, &abs);
+            let result = p57_alloc_path(ctx, &abs)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -114,7 +114,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let normalized = p57_normalize_path(&p);
-        let result = p57_alloc_path(ctx, &normalized);
+        let result = p57_alloc_path(ctx, &normalized)?;
         Ok(Some(Value::Object(Some(result))))
     });
 
@@ -179,7 +179,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .into());
         }
         let name = parts[idx as usize].as_str();
-        let result = p57_alloc_path(ctx, name);
+        let result = p57_alloc_path(ctx, name)?;
         Ok(Some(Value::Object(Some(result))))
     });
 
@@ -205,14 +205,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .into());
         }
         let sub: Vec<String> = parts[begin as usize..end as usize].to_vec();
-        let result = p57_alloc_path(ctx, &sub.join("/"));
+        let result = p57_alloc_path(ctx, &sub.join("/"))?;
         Ok(Some(Value::Object(Some(result))))
     });
 
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
@@ -247,7 +247,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         };
         let encoded = encode_file_uri_path(&abs);
         let uri_str = format!("file://{encoded}");
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
+        let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
         let raw = ctx.create_string(&uri_str);
         ctx.set_field(uri, 0, Value::Object(Some(raw)));
         let scheme = ctx.create_string("file");
@@ -286,10 +286,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, parts.len());
         for (i, part) in parts.iter().enumerate() {
-            let path_obj = p57_alloc_path(ctx, part);
+            let path_obj = p57_alloc_path(ctx, part)?;
             ctx.set_array_element(arr, i, Value::Object(Some(path_obj)));
         }
-        let itr = alloc_concurrent_synthetic(ctx, "Path$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "Path$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -338,7 +338,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     acc.truncate(acc.len() - 1);
                 }
             }
-            let result = p57_alloc_path(ctx, &acc);
+            let result = p57_alloc_path(ctx, &acc)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -363,8 +363,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // path loses the mounted archive identity, making Files.isDirectory
             // false and Files.list() empty despite a valid central directory.
             if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
-                let fs = p57_alloc_jar_filesystem(ctx, &jar);
-                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
+                let fs = p57_alloc_jar_filesystem(ctx, &jar)?;
+                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry))?;
                 ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
             }
@@ -474,7 +474,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if crate::nbflags().dbg_sbload {
                 eprintln!("[DBG_SBLOAD] Path.of(URI) -> {:?}", os_path);
             }
-            let result = p57_alloc_path(ctx, &os_path);
+            let result = p57_alloc_path(ctx, &os_path)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -498,11 +498,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 // .getScheme()` reports jrt/jar (javac inspects this).
                 let p = p57_read_path(ctx, this);
                 if let Some((jh, _)) = jrtfs_decode(&p) {
-                    let fs = p57_alloc_jrt_filesystem(ctx, &jh);
+                    let fs = p57_alloc_jrt_filesystem(ctx, &jh)?;
                     return Ok(Some(Value::Object(Some(fs))));
                 }
                 if let Some((jar, _)) = jarfs_decode(&p) {
-                    let fs = p57_alloc_default_filesystem(ctx);
+                    let fs = p57_alloc_default_filesystem(ctx)?;
                     let jp = ctx.create_string(&jar);
                     ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
                     return Ok(Some(Value::Object(Some(fs))));
@@ -511,7 +511,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // No owning FileSystem recorded: this is a default-filesystem
             // path, so return THE default-FS singleton (identity checks
             // against FileSystems.getDefault() must hold).
-            let fs = p57_default_filesystem_singleton(ctx);
+            let fs = p57_default_filesystem_singleton(ctx)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -527,7 +527,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let base = p57_read_path(ctx, this);
             let other = ctx.read_string(other_ref).unwrap_or_default();
             let resolved = p57_resolve_paths(&base, &other);
-            let result = p57_alloc_path(ctx, &resolved);
+            let result = p57_alloc_path(ctx, &resolved)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -543,7 +543,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let base = p57_read_path(ctx, this);
             let other_str = p57_read_path(ctx, other);
             let resolved = p57_resolve_paths(&base, &other_str);
-            let result = p57_alloc_path(ctx, &resolved);
+            let result = p57_alloc_path(ctx, &resolved)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -560,7 +560,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let other = ctx.read_string(other_ref).unwrap_or_default();
             let parent = p57_parent_of(&base);
             let resolved = p57_resolve_paths(&parent, &other);
-            let result = p57_alloc_path(ctx, &resolved);
+            let result = p57_alloc_path(ctx, &resolved)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -577,7 +577,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let other_str = p57_read_path(ctx, other);
             let parent = p57_parent_of(&base);
             let resolved = p57_resolve_paths(&parent, &other_str);
-            let result = p57_alloc_path(ctx, &resolved);
+            let result = p57_alloc_path(ctx, &resolved)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -606,7 +606,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // org.h2.tools does not exist" for every classpath jar.
             if let (Some((_, _, be)), Some((_, _, te))) = (vfs_decode(&base), vfs_decode(&target)) {
                 let rel = p57_relativize(&be, &te).unwrap_or(te);
-                let result = p57_alloc_path(ctx, &rel);
+                let result = p57_alloc_path(ctx, &rel)?;
                 // Tag the result with the source's owning virtual FS so its
                 // `toString()` renders with '/' (the zipfs/jrtfs separator), not
                 // the host '\' — javac keys its package map on
@@ -620,7 +620,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // off the shared root, not just a forward strip_prefix. Falls back to
             // `target` when the roots differ (can't be relativized).
             let relative = p57_relativize(&base, &target).unwrap_or_else(|| target.clone());
-            let result = p57_alloc_path(ctx, &relative);
+            let result = p57_alloc_path(ctx, &relative)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -633,7 +633,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if parent.is_empty() {
             Ok(Some(Value::Object(None)))
         } else {
-            let result = p57_alloc_path(ctx, &parent);
+            let result = p57_alloc_path(ctx, &parent)?;
             Ok(Some(Value::Object(Some(result))))
         }
     });
@@ -646,7 +646,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // is '/'-canonical, so the old `[2]==b'\\'` check never matched a drive).
         match p57_parse_root(&p).0 {
             Some(root) => {
-                let result = p57_alloc_path(ctx, &root);
+                let result = p57_alloc_path(ctx, &root)?;
                 Ok(Some(Value::Object(Some(result))))
             }
             None => Ok(Some(Value::Object(None))),
@@ -692,7 +692,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 });
             match name {
                 Some(n) => {
-                    let result = p57_alloc_path(ctx, &n);
+                    let result = p57_alloc_path(ctx, &n)?;
                     Ok(Some(Value::Object(Some(result))))
                 }
                 None => {
@@ -712,7 +712,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     if vfs_decode(&p_raw).is_some() {
                         return Ok(Some(Value::Object(None)));
                     }
-                    let result = p57_alloc_path(ctx, "");
+                    let result = p57_alloc_path(ctx, "")?;
                     Ok(Some(Value::Object(Some(result))))
                 }
             }
@@ -780,7 +780,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljava/nio/file/FileSystem;",
         |ctx, _args| {
-            let fs = p57_default_filesystem_singleton(ctx);
+            let fs = p57_default_filesystem_singleton(ctx)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -793,7 +793,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -806,7 +806,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -819,7 +819,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -935,7 +935,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 _ => "file",
             };
             let provider =
-                alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh provider (native stale-local family).
             let provider_pin = ctx.pin_native_root(provider);
@@ -1028,7 +1028,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_)))
                     || matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_))));
             if is_virtual {
-                let s = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0);
+                let s = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptySet", 0)?;
                 return Ok(Some(Value::Object(Some(s))));
             }
             let names: &[&str] = if cfg!(windows) {
@@ -1062,7 +1062,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
@@ -1114,7 +1114,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let root_path = match (jar_field, jrt_field) {
                 (Some(Value::Object(Some(s))), _) => {
                     let jar = ctx.read_string(s).unwrap_or_default();
-                    let rp = p57_alloc_path(ctx, &jarfs_encode(&jar, ""));
+                    let rp = p57_alloc_path(ctx, &jarfs_encode(&jar, ""))?;
                     if let Some((h, orig)) = this_pin {
                         let this = ctx.read_native_pin(h, orig);
                         ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
@@ -1125,7 +1125,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     // Runtime image: root is the synthetic `/` whose only child is
                     // `/modules` (javac walks `/modules/<module>/...`).
                     let jh = ctx.read_string(s).unwrap_or_default();
-                    let rp = p57_alloc_path(ctx, &jrtfs_encode(&jh, ""));
+                    let rp = p57_alloc_path(ctx, &jrtfs_encode(&jh, ""))?;
                     if let Some((h, orig)) = this_pin {
                         let this = ctx.read_native_pin(h, orig);
                         ctx.set_field(rp, P57_PATH_FS_FIELD, Value::Object(Some(this)));
@@ -1144,7 +1144,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 0, Value::Object(Some(root_path)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
@@ -1222,7 +1222,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = p57_alloc_jar_filesystem(ctx, &jar_path)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -1246,7 +1246,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // A jrt: URI mounts the runtime image (HIB-CV-27 in-process javac).
             if text.starts_with("jrt:") {
                 let jh = ctx.get_system_property("java.home").unwrap_or_default();
-                let fs = p57_alloc_jrt_filesystem(ctx, &jh);
+                let fs = p57_alloc_jrt_filesystem(ctx, &jh)?;
                 return Ok(Some(Value::Object(Some(fs))));
             }
             if let Some((jar, _entry)) = p57_jar_uri_to_entry_path(&text) {
@@ -1254,10 +1254,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 // exist yet. HotSpot's zipfs supports Map.of("create", "true");
                 // callers then populate it through Files.createDirectories/copy.
                 // CratonVM's jarfs writer below creates the archive lazily.
-                let fs = p57_alloc_jar_filesystem(ctx, &jar);
+                let fs = p57_alloc_jar_filesystem(ctx, &jar)?;
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            let fs = p57_alloc_default_filesystem(ctx);
+            let fs = p57_alloc_default_filesystem(ctx)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -1327,7 +1327,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the view alloc below — a moving young GC there would
             // relocate the Path (native stale-local family).
             let path_pin = ctx.pin_native_root(path_obj);
-            let view = alloc_concurrent_synthetic(ctx, vclass, 1);
+            let view = try_alloc_concurrent_synthetic(ctx, vclass, 1)?;
             let path_obj = ctx.read_native_pin(path_pin, path_obj);
             ctx.set_field(view, 0, Value::Object(Some(path_obj)));
             ctx.unpin_native_roots(path_pin);
@@ -1383,17 +1383,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Slot 5 (new) records the backing path so the DOS flag reads can
             // query the real file instead of answering a hardcoded `false`.
             let dos =
-                alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributes", 6);
+                try_alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributes", 6)?;
             // Pin across each allocation below — a moving young GC there would
             // relocate the fresh attributes (native stale-local family).
             let dos_pin = ctx.pin_native_root(dos);
-            let ct = filetime_alloc(ctx, creation);
+            let ct = filetime_alloc(ctx, creation)?;
             let dos_cur = ctx.read_native_pin(dos_pin, dos);
             ctx.set_field(dos_cur, 0, Value::Object(Some(ct)));
-            let at = filetime_alloc(ctx, access);
+            let at = filetime_alloc(ctx, access)?;
             let dos_cur = ctx.read_native_pin(dos_pin, dos);
             ctx.set_field(dos_cur, 1, Value::Object(Some(at)));
-            let mt = filetime_alloc(ctx, modified);
+            let mt = filetime_alloc(ctx, modified)?;
             let dos_cur = ctx.read_native_pin(dos_pin, dos);
             ctx.set_field(dos_cur, 2, Value::Object(Some(mt)));
             ctx.set_field(dos_cur, 3, Value::Int(i32::from(is_dir)));
@@ -1879,7 +1879,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             use cratonvm_types::ArrayElementType;
             let mk_provider = |ctx: &mut dyn NativeContext, scheme: &str| {
-                let p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
+                let p = try_alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1)?;
                 // Pin across the create_string below — a moving young GC there
                 // would relocate the fresh provider (native stale-local family).
                 let p_pin = ctx.pin_native_root(p);
@@ -1909,7 +1909,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, 2, Value::Object(Some(jrt_p)));
             // Real ArrayList field layout in real-JDK mode:
             //   [0]=AbstractList.modCount (int), [1]=elementData (Object[]), [2]=size (int).
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
@@ -1941,10 +1941,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             if scheme == "jrt" || uri_is_jrt {
                 let jh = ctx.get_system_property("java.home").unwrap_or_default();
-                let fs = p57_alloc_jrt_filesystem(ctx, &jh);
+                let fs = p57_alloc_jrt_filesystem(ctx, &jh)?;
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            let fs = p57_alloc_default_filesystem(ctx);
+            let fs = p57_alloc_default_filesystem(ctx)?;
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -1978,8 +1978,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // in spring-boot-test-support, which resolves `test.jks` etc. via
             // exactly this path.
             if let Some((jar, entry)) = p57_jar_uri_to_entry_path(&uri_text) {
-                let fs = p57_alloc_jar_filesystem(ctx, &jar);
-                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
+                let fs = p57_alloc_jar_filesystem(ctx, &jar)?;
+                let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry))?;
                 ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
             }
@@ -1992,7 +1992,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if let Some(decoded) = ctx.read_string(s) {
                     if !decoded.is_empty() {
                         let os_path = p57_to_os_path(&decoded);
-                        let result = p57_alloc_path(ctx, &os_path);
+                        let result = p57_alloc_path(ctx, &os_path)?;
                         return Ok(Some(Value::Object(Some(result))));
                     }
                 }
@@ -2009,7 +2009,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 },
             };
             let os_path = p57_to_os_path(&path_str);
-            let result = p57_alloc_path(ctx, &os_path);
+            let result = p57_alloc_path(ctx, &os_path)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -2185,7 +2185,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 3)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(list, 0, Value::Int(0));
             ctx.set_field(list, 1, Value::Object(Some(arr)));
@@ -2345,7 +2345,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Value::Object(Some(data)) = ctx.get_field_by_name(list, "elementData") {
             if index < ctx.array_length(data) {
                 if let Value::Object(Some(o)) = ctx.get_array_element(data, index) {
-                    return Some(o);
+                    return Ok(Some(o));
                 }
             }
         }
@@ -2366,7 +2366,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         delta: i32,
     ) -> Vec<PicocliStyledSectionData> {
         let Some(list) = list else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let count = picocli_list_size(ctx, list).min(100_000);
         let mut out = Vec::with_capacity(count);
@@ -2720,7 +2720,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> bool {
         let from_prefix = picocli_string_field(ctx, mapper, "fromPrefix");
         if !from_prefix.is_empty() && key.starts_with(&from_prefix) {
-            return keycloak_wildcard_value_valid(&key[from_prefix.len()..]);
+            return Ok(keycloak_wildcard_value_valid(&key[from_prefix.len()..]));
         }
 
         let to_prefix = picocli_string_field(ctx, mapper, "toPrefix");
@@ -2730,7 +2730,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             || !key.ends_with(&to_suffix)
             || key.len() < to_prefix.len().saturating_add(to_suffix.len())
         {
-            return false;
+            return Ok(false);
         }
         let end = key.len().saturating_sub(to_suffix.len());
         keycloak_wildcard_value_valid(&key[to_prefix.len()..end])
@@ -2822,8 +2822,8 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(list))))
     }
 
-    fn keycloak_optional_string(ctx: &mut dyn NativeContext, value: Option<String>) -> Value {
-        let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    fn keycloak_optional_string(ctx: &mut dyn NativeContext, value: Option<String>) -> Result<Value, MethodCallFailed> {
+        let optional = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh Optional (native stale-local family).
         let optional_pin = ctx.pin_native_root(optional);
@@ -2833,7 +2833,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let optional = ctx.read_native_pin(optional_pin, optional);
         ctx.set_field(optional, 0, optional_value);
         ctx.unpin_native_roots(optional_pin);
-        Value::Object(Some(optional))
+        Ok(Value::Object(Some(optional)))
     }
 
     fn keycloak_is_not_blank(value: &str) -> bool {
@@ -2855,7 +2855,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else {
             None
         };
-        Ok(Some(keycloak_optional_string(ctx, result)))
+        Ok(Some(keycloak_optional_string(ctx, result)?))
     }
 
     fn native_keycloak_property_mapper_get_enabled_when(
@@ -2864,7 +2864,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> MethodCallResult {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(keycloak_optional_string(ctx, None))),
+            _ => return Ok(Some(keycloak_optional_string(ctx, None)?)),
         };
         keycloak_prefixed_optional_field(ctx, this, "enabledWhen", "Available only when ")
     }
@@ -2875,7 +2875,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> MethodCallResult {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(keycloak_optional_string(ctx, None))),
+            _ => return Ok(Some(keycloak_optional_string(ctx, None)?)),
         };
         keycloak_prefixed_optional_field(ctx, this, "requiredWhen", "Required when ")
     }
@@ -2901,7 +2901,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     ) -> MethodCallResult {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(keycloak_optional_string(ctx, None))),
+            _ => return Ok(Some(keycloak_optional_string(ctx, None)?)),
         };
         let key = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -2925,7 +2925,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
         }
         .filter(|s| keycloak_wildcard_value_valid(s));
-        Ok(Some(keycloak_optional_string(ctx, candidate)))
+        Ok(Some(keycloak_optional_string(ctx, candidate)?))
     }
 
     r.register(
@@ -3198,7 +3198,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn keycloak_cli_args(ctx: &mut dyn NativeContext) -> Vec<String> {
         let raw = keycloak_cli_args_property(ctx);
         if raw.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut result = Vec::new();
         let mut escaped = false;
@@ -3426,7 +3426,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
     fn keycloak_cache_set_to_infinispan(ctx: &mut dyn NativeContext) -> bool {
         if keycloak_cli_value(ctx, "cache-remote-host").is_some() {
-            return false;
+            return Ok(false);
         }
         keycloak_cli_value(ctx, "cache")
             .map(|v| v.eq_ignore_ascii_case("ispn"))
@@ -3792,7 +3792,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let units: Vec<u16> = s.encode_utf16().collect();
         let mut freq = rustc_hash::FxHashMap::default();
         if units.len() < 2 {
-            return freq;
+            return Ok(freq);
         }
         for pair in units.windows(2) {
             *freq.entry((pair[0], pair[1])).or_insert(0) += 1;
@@ -4095,7 +4095,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if crate::nbflags().dbg_picocli_style {
                     eprintln!("[picocli-style] ensure_class_initialized failed");
                 }
-                return cratonvm_types::Value::Object(None);
+                return Ok(cratonvm_types::Value::Object(None));
             }
         };
         let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
@@ -4117,7 +4117,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
-                return v;
+                return Ok(v);
             }
         } else if dbg {
             eprintln!("[picocli-style] plain {} -> no static field", name);
@@ -4135,7 +4135,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
-                return v;
+                return Ok(v);
             }
         } else if dbg {
             eprintln!("[picocli-style] prefixed {} -> no static field", prefixed);
@@ -4151,7 +4151,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     matches!(v, cratonvm_types::Value::Object(None))
                 );
             }
-            return v;
+            return Ok(v);
         }
         if dbg {
             eprintln!("[picocli-style] reset static field not found, returning null");
@@ -4214,16 +4214,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else if let Some(rest) = input.strip_prefix('-') {
             ("-", rest)
         } else {
-            return input.to_string();
+            return Ok(input.to_string());
         };
         let Some(colon) = rest.find(':') else {
-            return input.to_string();
+            return Ok(input.to_string());
         };
         if !rest[..colon]
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         {
-            return input.to_string();
+            return Ok(input.to_string());
         }
         let after_colon = &rest[colon + 1..];
         let (replacement_sign, value) = if let Some(value) = after_colon.strip_prefix('+') {
@@ -4231,10 +4231,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         } else if let Some(value) = after_colon.strip_prefix('-') {
             ('+', value)
         } else {
-            return input.to_string();
+            return Ok(input.to_string());
         };
         if !picocli_regex_word_hyphen(value) {
-            return input.to_string();
+            return Ok(input.to_string());
         }
         if synopsis {
             format!("{}{}:(+|-){}", prefix, &rest[..colon], value)
@@ -4244,7 +4244,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     }
 
     fn picocli_new_regex_transformer(ctx: &mut dyn NativeContext) -> MethodCallResult {
-        let obj = alloc_concurrent_synthetic(ctx, "picocli/CommandLine$RegexTransformer", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "picocli/CommandLine$RegexTransformer", 2)?;
         // Pin across the emptyMap invoke below — a moving young GC there would
         // relocate the fresh transformer (native stale-local family).
         let obj_pin = ctx.pin_native_root(obj);
@@ -4502,7 +4502,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let entries = vfs_or_host_list(&p);
             let mut vals = Vec::with_capacity(entries.len());
             for e in &entries {
-                let ep = p57_alloc_path(ctx, e);
+                let ep = p57_alloc_path(ctx, e)?;
                 vals.push(Value::Object(Some(ep)));
             }
             cratonvm_native_collections::make_stream_from_elements(ctx, &vals)
@@ -4520,7 +4520,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         vfs_or_host_walk(&p, 0, max_depth, follow_links, &mut paths);
         let mut vals = Vec::with_capacity(paths.len());
         for e in &paths {
-            let ep = p57_alloc_path(ctx, e);
+            let ep = p57_alloc_path(ctx, e)?;
             vals.push(Value::Object(Some(ep)));
         }
         cratonvm_native_collections::make_stream_from_elements(ctx, &vals)
@@ -4589,7 +4589,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let mut vals = Vec::with_capacity(paths.len());
             for e in &paths {
-                let ep = p57_alloc_path(ctx, e);
+                let ep = p57_alloc_path(ctx, e)?;
                 let ep_pin = ctx.pin_native_root(ep);
                 let opts = match nofollow_pin {
                     Some((pin, orig)) => Value::Object(Some(ctx.read_native_pin(pin, orig))),
@@ -4688,7 +4688,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     fn read_all_lines_impl(
         ctx: &mut dyn NativeContext,
         args: &[Value],
-    ) -> cratonvm_types::error::MethodCallResult {
+    ) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
         match p57_read_to_string(&p) {
@@ -4705,7 +4705,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     .resolve_field_index("java/util/ArrayList", "size")
                     .unwrap_or(1);
                 let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
                 // Pin across the array/string allocs below — a moving young GC
                 // there would relocate the fresh list/array (native
                 // stale-local family).
@@ -4762,7 +4762,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         let arr = ctx.read_native_pin(arr_pin, arr);
                         ctx.set_array_element(arr, i, Value::Object(Some(s)));
                     }
-                    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                     let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_field(stream, 0, Value::Object(Some(arr)));
                     ctx.unpin_native_roots(arr_pin);
@@ -4791,7 +4791,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             &path_str,
             posix_mode_from_file_attributes(ctx, args.get(2)).or(Some(0o600)),
         );
-        let result = p57_alloc_path(ctx, &path_str);
+        let result = p57_alloc_path(ctx, &path_str)?;
         Ok(Some(Value::Object(Some(result))))
     });
 
@@ -4820,7 +4820,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 &path_str,
                 posix_mode_from_file_attributes(ctx, args.get(1)).or(Some(0o700)),
             );
-            let result = p57_alloc_path(ctx, &path_str);
+            let result = p57_alloc_path(ctx, &path_str)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -5046,11 +5046,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(p57_access_denied(ctx, &p))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let exc = alloc_concurrent_synthetic(
+                    let exc = try_alloc_concurrent_synthetic(
                         ctx,
                         "java/nio/file/FileAlreadyExistsException",
                         4,
-                    );
+                    )?;
                     // Pin across the create_string below — a moving young GC
                     // there would relocate the fresh exception (native
                     // stale-local family).
@@ -5092,11 +5092,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(p57_access_denied(ctx, &p))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let exc = alloc_concurrent_synthetic(
+                    let exc = try_alloc_concurrent_synthetic(
                         ctx,
                         "java/nio/file/FileAlreadyExistsException",
                         4,
-                    );
+                    )?;
                     // Pin across the create_string below — a moving young GC
                     // there would relocate the fresh exception (native
                     // stale-local family).
@@ -5199,11 +5199,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if let Some(read) = vfs_read(&p) {
                 return match read {
                     Ok(data) => {
-                        let channel = alloc_concurrent_synthetic(
+                        let channel = try_alloc_concurrent_synthetic(
                             ctx,
                             "java/nio/channels/SeekableByteChannel",
                             3,
-                        );
+                        )?;
                         // Pin across the array alloc below — a moving young GC
                         // there would relocate the fresh channel (native
                         // stale-local family).
@@ -5427,7 +5427,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // 2 fields: slot 0 = materialised Object[] of Paths, slot 1 = the
             // closed flag `close()` sets (see the `close`/`iterator`
             // registrations below).
-            let stream = alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 2);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryStream", 2)?;
             // Pin across the array/Path allocs below — a moving young GC there
             // would relocate the fresh stream/array (native stale-local family).
             let stream_pin = ctx.pin_native_root(stream);
@@ -5455,7 +5455,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let arr = ctx.new_array(ArrayElementType::Reference, entries.len());
             let arr_pin = ctx.pin_native_root(arr);
             for (i, entry) in entries.iter().enumerate() {
-                let ep = p57_alloc_path(ctx, entry);
+                let ep = p57_alloc_path(ctx, entry)?;
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.set_array_element(arr, i, Value::Object(Some(ep)));
             }
@@ -5530,7 +5530,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the allocation below — a moving young GC there would
             // relocate the listing array (native stale-local family).
             let arr_pin = ctx.pin_native_root(arr);
-            let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let spl = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_field(spl, 0, Value::Object(Some(arr)));
             ctx.set_field(spl, 1, Value::Int(0));
@@ -5746,7 +5746,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
 
             // Legacy synthetic fallback (only if the real FileChannelImpl
             // construction is unavailable — keeps prior behavior intact).
-            let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
+            let fc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1)?;
             ctx.set_field(fc, 0, Value::Int(fd_id as i32));
             Ok(Some(Value::Object(Some(fc))))
         },
@@ -6270,7 +6270,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // (`C:`), UNC (`\\`/`//`), or leading-separator path is already absolute
             // and returned unchanged; a relative path is anchored to the CWD.
             let abs = p57_absolute_path_string(&p);
-            let result = p57_alloc_path(ctx, &abs);
+            let result = p57_alloc_path(ctx, &abs)?;
             Ok(Some(Value::Object(Some(result))))
         },
     );
@@ -6300,7 +6300,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if matches!(vfs_classify(&p), Some(JarFsKind::Absent) | None) {
                     return Err(p57_no_such_file(ctx, &p));
                 }
-                let result = p57_alloc_path(ctx, &p);
+                let result = p57_alloc_path(ctx, &p)?;
                 return Ok(Some(Value::Object(Some(result))));
             }
             match std::fs::canonicalize(&p) {
@@ -6313,7 +6313,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         .strip_prefix("//?/")
                         .map(|s| s.to_string())
                         .unwrap_or(real);
-                    let result = p57_alloc_path(ctx, &real);
+                    let result = p57_alloc_path(ctx, &real)?;
                     Ok(Some(Value::Object(Some(result))))
                 }
                 Err(_) => Err(p57_no_such_file(ctx, &p)),
@@ -6328,14 +6328,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
         let normalized = p57_normalize_path(&p);
-        let result = p57_alloc_path(ctx, &normalized);
+        let result = p57_alloc_path(ctx, &normalized)?;
         Ok(Some(Value::Object(Some(result))))
     });
 
     r.register(path, "toFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let file = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
+        let file = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
         // Pin across the create_string below — a moving young GC there would
         // relocate the fresh File (native stale-local family).
         let file_pin = ctx.pin_native_root(file);
@@ -6360,7 +6360,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             };
             let entry = entry.trim_start_matches('/');
             let uri_str = format!("jar:file:{jar_abs}!/{entry}");
-            let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+            let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 5)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh URI (native stale-local family).
             let uri_pin = ctx.pin_native_root(uri);
@@ -6376,7 +6376,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         if let Some((_jh, entry)) = jrtfs_decode(&p) {
             let entry = entry.trim_start_matches('/');
             let uri_str = format!("jrt:/{entry}");
-            let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+            let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 5)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh URI (native stale-local family).
             let uri_pin = ctx.pin_native_root(uri);
@@ -6416,7 +6416,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         };
         let encoded = encode_file_uri_path(slash_p);
         let uri_str = format!("file://{}", encoded);
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 5);
+        let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 5)?;
         // Pin across the create_strings below — a moving young GC there would
         // relocate the fresh URI (native stale-local family).
         let uri_pin = ctx.pin_native_root(uri);
@@ -6455,7 +6455,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .into());
         }
         let name = parts[idx as usize].as_str();
-        let result = p57_alloc_path(ctx, name);
+        let result = p57_alloc_path(ctx, name)?;
         Ok(Some(Value::Object(Some(result))))
     });
 
@@ -6519,11 +6519,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // would relocate the fresh array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
         for (i, part) in parts.iter().enumerate() {
-            let ep = p57_alloc_path(ctx, part);
+            let ep = p57_alloc_path(ctx, part)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(ep)));
         }
-        let iter = alloc_concurrent_synthetic(ctx, "java/util/Iterator", 2);
+        let iter = try_alloc_concurrent_synthetic(ctx, "java/util/Iterator", 2)?;
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_field(iter, 0, Value::Object(Some(arr)));
         ctx.set_field(iter, 1, Value::Int(0)); // cursor
@@ -6552,7 +6552,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .into());
         }
         let sub: Vec<String> = parts[begin as usize..end as usize].to_vec();
-        let result = p57_alloc_path(ctx, &sub.join("/"));
+        let result = p57_alloc_path(ctx, &sub.join("/"))?;
         Ok(Some(Value::Object(Some(result))))
     });
 
@@ -6603,7 +6603,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getPathMatcher",
         "(Ljava/lang/String;)Ljava/nio/file/PathMatcher;",
         |ctx, _args| {
-            let pm = alloc_concurrent_synthetic(ctx, "java/nio/file/PathMatcher", 0);
+            let pm = try_alloc_concurrent_synthetic(ctx, "java/nio/file/PathMatcher", 0)?;
             Ok(Some(Value::Object(Some(pm))))
         },
     );
@@ -7193,6 +7193,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
@@ -8067,13 +8068,13 @@ pub(crate) fn p57_alloc_path_checked(ctx: &mut dyn NativeContext, path: &str) ->
             .into()),
         };
     }
-    Ok(Some(Value::Object(Some(p57_alloc_path(ctx, path)))))
+    Ok(Some(Value::Object(Some(p57_alloc_path(ctx, path)?))))
 }
 
-pub(crate) fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
+pub(crate) fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> Result<ObjectRef, MethodCallFailed> {
     // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
     // null unless set by `FileSystem.getPath`).
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
     // Canonicalise separators to '/' internally so Path operations
     // (normalize/equals/resolve/hashCode) and the file-IO natives all see one
     // form. Windows accepts '\' as a separator and HotSpot's WindowsPath stores
@@ -8102,7 +8103,7 @@ pub(crate) fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectR
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 /// The `OpenOption`s the nio open paths act on, as scanned by
@@ -8272,7 +8273,7 @@ pub(crate) fn fsp_new_input_stream(
     if let Some(read) = vfs_read(&p) {
         return match read {
             Ok(data) => files_byte_array_input_stream(ctx, &data),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &p)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &p)?),
             Err(e) => Err(p57_io_error(&e)),
         };
     }
@@ -8296,8 +8297,8 @@ pub(crate) fn fsp_new_input_stream(
         }
         Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
             return Err(match e.kind() {
-                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
-                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p)?,
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p)?,
                 _ => p57_io_error(&e),
             })
         }
@@ -8309,7 +8310,7 @@ pub(crate) fn fsp_new_input_stream(
     // why native-io has `fis_backfill_constructor_fields` doing exactly this.
     // Miss `closeLock` and the JDK's `close()`, which opens with
     // `synchronized (closeLock)`, NPEs on every try-with-resources.
-    let stream = alloc_concurrent_synthetic(ctx, "java/io/FileInputStream", 4);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/FileInputStream", 4)?;
     // Pin across the allocations below — each can trigger a moving young GC
     // that relocates the fresh stream (native stale-local family).
     let stream_pin = ctx.pin_native_root(stream);
@@ -8342,7 +8343,7 @@ pub(crate) fn fsp_new_input_stream(
 /// A `ByteArrayInputStream` over `data` — the in-memory stream shape used for
 /// VFS (jar) entries, which have no file descriptor to stream from.
 fn files_byte_array_input_stream(ctx: &mut dyn NativeContext, data: &[u8]) -> MethodCallResult {
-    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
     // Pin across the array alloc below — a moving young GC there would
     // relocate the fresh stream (native stale-local family).
     let stream_pin = ctx.pin_native_root(stream);
@@ -8403,8 +8404,8 @@ pub(crate) fn fsp_new_output_stream(
             // a missing parent → `NoSuchFileException`. Both are `IOException`
             // subclasses so existing `catch (IOException)` callers are unaffected.
             return Err(match e.kind() {
-                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
-                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p)?,
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p)?,
                 _ => RuntimeError::IOException {
                     message: format!("newOutputStream({}): {}", p, e),
                 }
@@ -8416,11 +8417,11 @@ pub(crate) fn fsp_new_output_stream(
     // FileDescriptor — the existing FOS native overrides (write/flush/close,
     // registered in native-io::lib.rs) recover the fd via the same
     // `fd`/`handle` fields on the FileDescriptor object.
-    let fos = alloc_concurrent_synthetic(ctx, "java/io/FileOutputStream", 4);
+    let fos = try_alloc_concurrent_synthetic(ctx, "java/io/FileOutputStream", 4)?;
     // Pin across the FileDescriptor alloc below — a moving young GC there
     // would relocate the fresh stream (native stale-local family).
     let fos_pin = ctx.pin_native_root(fos);
-    let fd_obj = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 4);
+    let fd_obj = try_alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 4)?;
     let fos = ctx.read_native_pin(fos_pin, fos);
     ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
     ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
@@ -8543,8 +8544,8 @@ pub(crate) fn p57_files_write_bytes(
         }
         Err(cratonvm_native_api::fd_table::FdCapabilityError::Io(e)) => {
             return Err(match e.kind() {
-                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p),
-                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p),
+                std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, &p)?,
+                std::io::ErrorKind::NotFound => p57_no_such_file(ctx, &p)?,
                 _ => p57_io_error(&e),
             })
         }
@@ -8573,8 +8574,8 @@ pub(crate) fn p57_files_write_bytes(
 /// offending path); `FileSystemException.getMessage()` builds the human
 /// message from that field, so we deliberately leave `Throwable.detailMessage`
 /// null to avoid a doubled `<path>: <path>` message.
-pub(crate) fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
-    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NoSuchFileException", 4);
+pub(crate) fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/NoSuchFileException", 4)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh exception (native stale-local family).
     let exc_pin = ctx.pin_native_root(exc);
@@ -8583,7 +8584,7 @@ pub(crate) fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> Metho
     // FileSystemException stores the offending path in its `file` field.
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
-    MethodCallFailed::ExceptionThrown(exc)
+    Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
 /// Build a *typed* `java.nio.file.AccessDeniedException` for `path` (mirrors
@@ -8592,8 +8593,8 @@ pub(crate) fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> Metho
 /// matches `catch (AccessDeniedException)` / `FileSystemException` / `IOException`.
 /// Used when an OS open returns access-denied (e.g. opening a directory for
 /// output on Windows) so the thrown type matches HotSpot.
-pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
-    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/AccessDeniedException", 4);
+pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/AccessDeniedException", 4)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh exception (native stale-local family).
     let exc_pin = ctx.pin_native_root(exc);
@@ -8601,7 +8602,7 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Meth
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
-    MethodCallFailed::ExceptionThrown(exc)
+    Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
 /// Remove a single filesystem entry, choosing `remove_dir` vs `remove_file` the
@@ -8625,14 +8626,14 @@ pub(crate) fn p57_delete_path(path: &str) {
 /// [`p57_no_such_file`]). Thrown by `readSymbolicLink` when the path exists but
 /// is not a symbolic link — the JDK's contract, and what
 /// `Files.readSymbolicLink`'s callers catch.
-pub(crate) fn p57_not_link(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
-    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/NotLinkException", 4);
+pub(crate) fn p57_not_link(ctx: &mut dyn NativeContext, path: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/NotLinkException", 4)?;
     let exc_pin = ctx.pin_native_root(exc);
     let file_str = ctx.create_string(path);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
-    MethodCallFailed::ExceptionThrown(exc)
+    Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
 /// Build a *typed* `java.nio.file.FileSystemException` carrying the JDK's
@@ -8652,8 +8653,8 @@ pub(crate) fn p57_filesystem_exception(
     file: &str,
     other: Option<&str>,
     reason: &str,
-) -> MethodCallFailed {
-    let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystemException", 4);
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystemException", 4)?;
     let exc_pin = ctx.pin_native_root(exc);
     let file_str = ctx.create_string(file);
     let exc = ctx.read_native_pin(exc_pin, exc);
@@ -8667,7 +8668,7 @@ pub(crate) fn p57_filesystem_exception(
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "reason", Value::Object(Some(reason_str)));
     ctx.unpin_native_roots(exc_pin);
-    MethodCallFailed::ExceptionThrown(exc)
+    Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
 /// Windows error code for "a required privilege is not held by the client",
@@ -8686,7 +8687,7 @@ fn p57_link_io_error(
     e: &std::io::Error,
     link: &str,
     other: Option<&str>,
-) -> MethodCallFailed {
+) -> Result<MethodCallFailed, MethodCallFailed> {
     match e.kind() {
         std::io::ErrorKind::AlreadyExists => p57_file_already_exists(ctx, link),
         std::io::ErrorKind::NotFound => p57_no_such_file(ctx, link),
@@ -8721,7 +8722,7 @@ pub(crate) fn p57_create_symbolic_link(
     target: &str,
 ) -> Result<(), MethodCallFailed> {
     #[cfg(unix)]
-    let result = std::os::unix::fs::symlink(target, link);
+    let result = std::os::unix::fs::symlink(target, link)?;
     #[cfg(windows)]
     let result = {
         // Windows needs to know at creation time whether the link is a file or
@@ -8758,7 +8759,7 @@ pub(crate) fn p57_create_symbolic_link(
     };
     match result {
         Ok(()) => Ok(()),
-        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(target))),
+        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
     }
 }
 
@@ -8773,7 +8774,7 @@ pub(crate) fn p57_create_hard_link(
         // `hard_link` reports a missing SOURCE as NotFound too, but the JDK
         // names the link being created in either case, so the generic mapping
         // is right.
-        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(existing))),
+        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(existing))?),
     }
 }
 
@@ -8791,26 +8792,26 @@ pub(crate) fn p57_read_symbolic_link(
             jrt_image(&java_home).and_then(|image| jrt_package_link_target(&image, rest))
         }) {
             let p = p57_alloc_path(ctx, &jrtfs_encode(&java_home, &format!("/{target}")));
-            return Ok(Some(Value::Object(Some(p))));
+            return Ok(Some(Value::Object(Some(p?))));
         }
-        return Err(p57_no_such_file(ctx, path));
+        return Err(p57_no_such_file(ctx, path)?);
     }
     // Distinguish "missing" from "present but not a link" before reading, so
     // both map to the JDK's types (NoSuchFileException vs NotLinkException)
     // rather than to whatever errno `readlink` happens to produce for each.
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if !meta.file_type().is_symlink() => return Err(p57_not_link(ctx, path)),
+        Ok(meta) if !meta.file_type().is_symlink() => return Err(p57_not_link(ctx, path)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(p57_no_such_file(ctx, path))
+            return Err(p57_no_such_file(ctx, path)?)
         }
         _ => {}
     }
     match std::fs::read_link(path) {
         Ok(target) => {
             let target = target.to_string_lossy().into_owned();
-            Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &target)))))
+            Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &target)?))))
         }
-        Err(e) => Err(p57_link_io_error(ctx, &e, path, None)),
+        Err(e) => Err(p57_link_io_error(ctx, &e, path, None)?),
     }
 }
 
@@ -10196,12 +10197,12 @@ pub(crate) fn p57_parent_of(path: &str) -> String {
 
 /// Allocate a synthetic default FileSystem object.
 /// FileSystem = 1-field synthetic (field 0 = separator String).
-pub(crate) fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub(crate) fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Field 0 = separator; field 1 (P57_FS_JAR_FIELD) = mounted-JAR path (or
     // null); field 2 (P57_FS_JRT_FIELD) = mounted runtime-image java.home (or
     // null). The jrt field exists on every FS object so the jrt-aware
     // FileSystem.getPath/getRootDirectories natives can read it unconditionally.
-    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3);
+    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh FileSystem (native stale-local family).
     let fs_pin = ctx.pin_native_root(fs);
@@ -10210,13 +10211,13 @@ pub(crate) fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> Objec
     let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, 0, Value::Object(Some(s)));
     ctx.unpin_native_roots(fs_pin);
-    fs
+    Ok(fs)
 }
 
-pub(crate) fn p57_alloc_jar_filesystem(ctx: &mut dyn NativeContext, jar_path: &str) -> ObjectRef {
-    let fs = p57_alloc_default_filesystem(ctx);
+pub(crate) fn p57_alloc_jar_filesystem(ctx: &mut dyn NativeContext, jar_path: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let fs = p57_alloc_default_filesystem(ctx)?;
     if jar_path.is_empty() {
-        return fs;
+        return Ok(fs);
     }
     // Pin across the create_string below: a moving young GC there would
     // relocate the fresh FileSystem before we store the mounted jar path.
@@ -10225,14 +10226,14 @@ pub(crate) fn p57_alloc_jar_filesystem(ctx: &mut dyn NativeContext, jar_path: &s
     let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
     ctx.unpin_native_roots(fs_pin);
-    fs
+    Ok(fs)
 }
 
 /// Allocate a synthetic runtime-image (`jrt:`) FileSystem rooted at `java_home`.
 /// `getPath`/`readAttributes`/`newDirectoryStream` route through the jrt helpers
 /// when they see the P57_FS_JRT_FIELD / a `JRTFS`-encoded path.
-pub(crate) fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> ObjectRef {
-    let fs = alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3);
+pub(crate) fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let fs = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystem", 3)?;
     // Pin across the create_strings below — a moving young GC there would
     // relocate the fresh FileSystem (native stale-local family).
     let fs_pin = ctx.pin_native_root(fs);
@@ -10243,7 +10244,7 @@ pub(crate) fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &
     let fs = ctx.read_native_pin(fs_pin, fs);
     ctx.set_field(fs, P57_FS_JRT_FIELD, Value::Object(Some(jh)));
     ctx.unpin_native_roots(fs_pin);
-    fs
+    Ok(fs)
 }
 
 // ---------------------------------------------------------------------------
@@ -10554,8 +10555,8 @@ pub(crate) fn attribute_view_short_name(class_name: &str) -> Option<&'static str
 /// the store's `name()` — the drive root on Windows (`C:\`), or `/` on
 /// Unix — since real JDK FileStore names are the mount point, not the
 /// queried path itself.
-pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
-    let store = alloc_concurrent_synthetic(ctx, "java/nio/file/FileStore", 1);
+pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let store = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileStore", 1)?;
     let name = if cfg!(windows) {
         std::path::Path::new(path)
             .components()
@@ -10572,7 +10573,7 @@ pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> O
     let store = ctx.read_native_pin(store_pin, store);
     ctx.set_field(store, 0, Value::Object(Some(s)));
     ctx.unpin_native_roots(store_pin);
-    store
+    Ok(store)
 }
 
 /// The per-VM default-FileSystem SINGLETON. Identity matters: callers
@@ -10586,7 +10587,7 @@ pub(crate) fn p57_alloc_file_store(ctx: &mut dyn NativeContext, path: &str) -> O
 /// collections), and the holder's real `<clinit>` never runs because
 /// `FileSystems.getDefault()` is intercepted. Falls back to a fresh
 /// allocation only if the holder class is unavailable.
-pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     const HOLDER: &str = "java/nio/file/FileSystems$DefaultFileSystemHolder";
     // `class_id_by_name` is lookup-only and nothing else loads the private
     // holder class (its bytecode `<clinit>` never runs because getDefault is
@@ -10600,13 +10601,13 @@ pub(crate) fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> O
     });
     if let Some((cid, idx)) = slot {
         if let Value::Object(Some(fs)) = ctx.get_static_field(cid, idx) {
-            return fs;
+            return Ok(fs);
         }
-        let fs = p57_alloc_default_filesystem(ctx);
+        let fs = p57_alloc_default_filesystem(ctx)?;
         ctx.set_static_field(cid, idx, Value::Object(Some(fs)));
-        return fs;
+        return Ok(fs);
     }
-    p57_alloc_default_filesystem(ctx)
+    Ok(p57_alloc_default_filesystem(ctx)?)
 }
 
 pub(crate) fn p57_alloc_enum(
@@ -10615,7 +10616,7 @@ pub(crate) fn p57_alloc_enum(
     name: &str,
     ordinal: i32,
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, class, 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, class, 2)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh enum (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
@@ -10647,7 +10648,7 @@ pub(crate) fn raf_fd_object(ctx: &dyn NativeContext, this: ObjectRef) -> Option<
 /// `FileDescriptor` itself (so the JDK `getFD()` bytecode returns a non-null
 /// FD), allocating a fresh `FileDescriptor` when the JDK ctor did not run.
 /// On the synthetic 2-slot layout we keep the legacy slot-0 placement.
-pub(crate) fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) {
+pub(crate) fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) -> Result<(), MethodCallFailed> {
     // Real-JDK path: there's an `fd` Object field — make sure it points at a
     // live `FileDescriptor` and write the id there.
     let cid = ctx.class_id_of_object(this);
@@ -10666,7 +10667,7 @@ pub(crate) fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) 
                 // Pin across the alloc below — a moving young GC there would
                 // relocate `this` (native stale-local family).
                 let this_pin = ctx.pin_native_root(this);
-                let new_fd = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1);
+                let new_fd = try_alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1)?;
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field_by_name(this, "fd", Value::Object(Some(new_fd)));
                 ctx.unpin_native_roots(this_pin);
@@ -10678,6 +10679,7 @@ pub(crate) fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) 
         return;
     }
     ctx.set_field(this, 0, Value::Int(fd as i32));
+    Ok(())
 }
 
 /// Recover the open RAF fd id. Tries the real-JDK `fd.fd`/`fd.handle` pair
@@ -11384,7 +11386,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         // also remain non-null on return — `Ok(Some(Value::Object(Some(fd))))`
         // — or `file.getFD().sync()` NPEs at the next bytecode step.
         let fd_id = ctx.get_field(this, 0);
-        let fd = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1);
+        let fd = try_alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1)?;
         ctx.set_field(fd, 0, fd_id);
         // Mirror the id into the named real-JDK slots when present so that
         // `FileDescriptor.valid()` / `.sync()` see a non-(-1) value.
@@ -11411,7 +11413,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         "()Ljava/nio/channels/FileChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
+            let fc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1)?;
             ctx.set_field(fc, 0, ctx.get_field(this, 0));
             Ok(Some(Value::Object(Some(fc))))
         },
@@ -12115,7 +12117,7 @@ pub(crate) fn win_case_correct(full: &str) -> String {
 /// fallback returned a raw absolute path with `..` segments intact, so a
 /// containment check (`child.startsWith(parentDir)`) — as Felix's
 /// `getDataFile` does — would spuriously fail.
-pub(crate) fn file_canonicalize_path(path: &str) -> String {
+pub(crate) fn file_canonicalize_path(path: &str) -> Result<String, MethodCallFailed> {
     // JDK-faithful canonicalization cache. The real `WinNTFileSystem.canonicalize`
     // fronts a 30s `ExpiringCache` for exactly this reason: Tomcat (and most apps)
     // re-resolve the same docBase/appBase/work/temp paths on every start, and each
@@ -12133,10 +12135,10 @@ pub(crate) fn file_canonicalize_path(path: &str) -> String {
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some((canon, at)) = cache.lock().unwrap().get(path) {
         if at.elapsed() < TTL {
-            return canon.clone();
+            return Ok(canon.clone());
         }
     }
-    let result = file_canonicalize_path_uncached(path);
+    let result = file_canonicalize_path_uncached(path)?;
     {
         let mut c = cache.lock().unwrap();
         // Bound memory: a long-running app may canonicalize many distinct paths.
@@ -12145,7 +12147,7 @@ pub(crate) fn file_canonicalize_path(path: &str) -> String {
         }
         c.insert(path.to_string(), (result.clone(), Instant::now()));
     }
-    result
+    Ok(result)
 }
 
 /// Resolve symlinks in the longest existing ancestor of `path` (via repeated
@@ -12199,7 +12201,7 @@ pub(crate) fn resolve_existing_ancestor_then_literal_tail(path: &str) -> Option<
     Some("/".to_string())
 }
 
-pub(crate) fn file_canonicalize_path_uncached(path: &str) -> String {
+pub(crate) fn file_canonicalize_path_uncached(path: &str) -> Result<String, MethodCallFailed> {
     #[cfg(windows)]
     {
         // DEFAULT on Windows: canonicalize the path as a STRING via `GetFullPathNameW`,
@@ -12221,10 +12223,10 @@ pub(crate) fn file_canonicalize_path_uncached(path: &str) -> String {
         // resolving, file-opening behavior if an app genuinely needs realpath semantics.
         if crate::nbflags().canon_openfile {
             if let Ok(c) = std::fs::canonicalize(path) {
-                return strip_unc(&c.to_string_lossy());
+                return Ok(strip_unc(&c.to_string_lossy()));
             }
         } else if let Some(full) = win_get_full_path_name(path) {
-            return strip_unc(&win_case_correct(&full));
+            return Ok(strip_unc(&win_case_correct(&full)));
         }
         // GetFullPathNameW failed (empty input / API error) — fall through to the
         // pure-Rust lexical normalization below.
@@ -12234,7 +12236,7 @@ pub(crate) fn file_canonicalize_path_uncached(path: &str) -> String {
         // Non-Windows has no cpcrypt-style filter hazard, so keep the symlink-resolving
         // filesystem call for existing paths.
         if let Ok(c) = std::fs::canonicalize(path) {
-            return strip_unc(&c.to_string_lossy());
+            return Ok(strip_unc(&c.to_string_lossy()));
         }
         // `path` (or its final component(s)) doesn't exist yet — e.g. a file about
         // to be created by `WebResourceRoot.write()`/`DirResourceSet.write()`.
@@ -12252,7 +12254,7 @@ pub(crate) fn file_canonicalize_path_uncached(path: &str) -> String {
         // resolves symlinks in the longest EXISTING ancestor and appends the
         // nonexistent tail literally (`realpath -m` semantics) — do the same here.
         if let Some(resolved) = resolve_existing_ancestor_then_literal_tail(path) {
-            return strip_unc(&resolved);
+            return Ok(strip_unc(&resolved));
         }
     }
     // Lexical fallback: normalize the path as a string without touching the filesystem.
@@ -12288,7 +12290,7 @@ pub(crate) fn file_canonicalize_path_uncached(path: &str) -> String {
     for comp in out {
         result.push(comp.as_os_str());
     }
-    strip_unc(&result.to_string_lossy())
+    Ok(strip_unc(&result.to_string_lossy()))
 }
 
 /// Query real OS disk-space stats for the volume containing `path`, matching
@@ -12593,8 +12595,8 @@ fn win_file_identity(path: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// Allocate a new File synthetic with the given path.
-pub(crate) fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
+pub(crate) fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/io/File", 1)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh File (native stale-local family).
     let obj_pin = ctx.pin_native_root(obj);
@@ -12602,10 +12604,10 @@ pub(crate) fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
-pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
+pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let file = "java/io/File";
@@ -13230,7 +13232,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 // would relocate the fresh array (native stale-local family).
                 let arr_pin = ctx.pin_native_root(arr);
                 for (i, p) in paths.iter().enumerate() {
-                    let f = file_alloc(ctx, p);
+                    let f = file_alloc(ctx, p)?;
                     let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, Value::Object(Some(f)));
                 }
@@ -13264,7 +13266,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             let mut first_pin = filter_pin.map(|(h, _)| h);
             let mut accepted: Vec<(usize, ObjectRef)> = Vec::new();
             for entry_path in &entries {
-                let file_obj = file_alloc(ctx, entry_path);
+                let file_obj = file_alloc(ctx, entry_path)?;
                 let file_pin = ctx.pin_native_root(file_obj);
                 if first_pin.is_none() {
                     first_pin = Some(file_pin);
@@ -13346,7 +13348,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                     _ => true,
                 };
                 if accept {
-                    let f_obj = file_alloc(ctx, full);
+                    let f_obj = file_alloc(ctx, full)?;
                     accepted.push((ctx.pin_native_root(f_obj), f_obj));
                 }
             }
@@ -13559,7 +13561,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let full = format!("file:{encoded}");
         // Allocate a real URI and populate named + positional fields so both
         // `URI` natives and any real-JDK bytecode see consistent state.
-        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
+        let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
         // Pin across the parse/store helpers below (they create strings) — a
         // moving young GC there would relocate the fresh URI (native
         // stale-local family).
@@ -13599,7 +13601,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // relocate the fresh array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
         for (i, r) in roots.iter().enumerate() {
-            let f = file_alloc(ctx, r);
+            let f = file_alloc(ctx, r)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(f)));
         }
@@ -13690,6 +13692,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(sep)))
     });
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -14010,7 +14013,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(byte_arr, i, Value::Int(buf[i] as i8 as i32));
                 }
                 let byte_arr_pin = ctx.pin_native_root(byte_arr);
-                let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+                let bb = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3)?;
                 let byte_arr = ctx.read_native_pin(byte_arr_pin, byte_arr);
                 ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
                 ctx.set_field(bb, 1, Value::Int(0));
@@ -14083,7 +14086,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
                 // Allocate a bounded ByteBuffer and call src.read(ByteBuffer)
                 let byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, chunk);
                 let byte_arr_pin = ctx.pin_native_root(byte_arr);
-                let bb = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3);
+                let bb = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 3)?;
                 let bb_pin = ctx.pin_native_root(bb);
                 let byte_arr = ctx.read_native_pin(byte_arr_pin, byte_arr);
                 ctx.set_field(bb, 0, Value::Object(Some(byte_arr)));
@@ -14215,7 +14218,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
 // FileTime = 1-field (millis=0 Long)
 // =============================================================================
 
-pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // FileTreeWalker hands `Files.find` the concrete platform attributes
@@ -14345,7 +14348,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = filetime_alloc(ctx, millis);
+            let obj = filetime_alloc(ctx, millis)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -14445,11 +14448,12 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            let ft = filetime_alloc(ctx, millis);
+            let ft = filetime_alloc(ctx, millis)?;
             Ok(Some(Value::Object(Some(ft))))
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Allocate a `java.nio.file.attribute.FileTime` carrying `millis`.
@@ -14462,8 +14466,8 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
 /// slot 0 of a real FileTime is a *reference* field, so a `Long` written there
 /// is coerced to null — the overlay-on-real-class bug that made `toMillis()`
 /// return 0 instead of the file's mtime.
-pub(crate) fn filetime_alloc(ctx: &mut dyn NativeContext, millis: i64) -> ObjectRef {
-    let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
+pub(crate) fn filetime_alloc(ctx: &mut dyn NativeContext, millis: i64) -> Result<ObjectRef, MethodCallFailed> {
+    let ft = try_alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1)?;
     ctx.set_field_by_name(ft, "value", Value::Long(millis));
     // Set the real `unit` field to TimeUnit.MILLISECONDS. The raw-alloc path
     // skips FileTime's constructor, so `unit` and the cached `instant` are both
@@ -14486,7 +14490,7 @@ pub(crate) fn filetime_alloc(ctx: &mut dyn NativeContext, millis: i64) -> Object
     if !matches!(ctx.get_field_by_name(ft, "value"), Value::Long(_)) {
         ctx.set_field(ft, 0, Value::Long(millis));
     }
-    ft
+    Ok(ft)
 }
 
 /// Read the millis from a FileTime built by [`filetime_alloc`]: prefer the
@@ -14602,7 +14606,7 @@ pub(crate) fn set_file_attribute_times_windows(
 /// actually implement that interface. The native bridge stores its canonical
 /// values in named platform fields and force-dispatches the interface methods;
 /// it never relies on the implementation's bytecode layout.
-pub(crate) fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub(crate) fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let class_name = if cfg!(windows) {
         "sun/nio/fs/WindowsFileAttributes"
     } else {
@@ -14611,12 +14615,12 @@ pub(crate) fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> Object
     if let Ok(class_id) = ctx.ensure_class_initialized(class_name) {
         let fields = ctx.class_num_total_fields(class_id);
         if ctx.class_name_of_id(class_id).as_deref() == Some(class_name) && fields > 0 {
-            return ctx.alloc_object(class_id, fields);
+            return Ok(ctx.alloc_object(class_id, fields));
         }
     }
     // Only reached by a synthetic-JDK configuration, where the interface is
     // modelled as a concrete helper with a five-field layout.
-    alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5)
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5)?)
 }
 
 pub(crate) fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
@@ -14650,7 +14654,7 @@ pub(crate) fn basic_file_attributes_is_synthetic(
 }
 
 /// Slot layout of the synthetic `BasicFileAttributes` stub (5 slots — keep in
-/// sync with the `alloc_concurrent_synthetic(..., 5)` call in
+/// sync with the `try_alloc_concurrent_synthetic(..., 5)?` call in
 /// `basic_file_attributes_alloc`). The mode word uses the Unix `st_mode`
 /// encoding (type bits | permission bits) on every host so the shared
 /// predicates can decode it uniformly.
@@ -15062,15 +15066,15 @@ fn alloc_windows_user_principal(
     sid_text: &str,
     sid_type: i32,
 ) -> cratonvm_types::ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/nio/fs/WindowsUserPrincipals$User", 3);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/nio/fs/WindowsUserPrincipals$User", 3)?;
     // GC-SAFETY: `create_string` allocates, so pin the carrier and re-read it
     // through the pin after each allocation before writing into it.
     let pin = ctx.pin_native_root(obj);
     let sid_str = ctx.create_string(sid_text);
-    let obj = ctx.read_native_pin(pin, obj);
+    let obj = ctx.read_native_pin(pin, obj)?;
     ctx.set_field_by_name(obj, "sidString", Value::Object(Some(sid_str)));
     let account_str = ctx.create_string(account);
-    let obj = ctx.read_native_pin(pin, obj);
+    let obj = ctx.read_native_pin(pin, obj)?;
     ctx.set_field_by_name(obj, "accountName", Value::Object(Some(account_str)));
     ctx.set_field_by_name(obj, "sidType", Value::Int(sid_type));
     ctx.unpin_native_roots(pin);
@@ -15271,7 +15275,7 @@ pub(crate) fn p59_files_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         return match bytes {
             Ok(b) => Ok(Some(Value::Long(b.len() as i64))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(p57_no_such_file(ctx, &path_str))
+                Err(p57_no_such_file(ctx, &path_str)?)
             }
             Err(e) => Err(p57_io_error(&e)),
         };
@@ -15279,7 +15283,7 @@ pub(crate) fn p59_files_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
     match std::fs::metadata(&path_str) {
         Ok(meta) => Ok(Some(Value::Long(meta.len() as i64))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &path_str)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(p57_no_such_file(ctx, &path_str)?),
         Err(e) => Err(p57_io_error(&e)),
     }
 }
@@ -15566,7 +15570,7 @@ pub(crate) fn read_named_attributes(
     let path = p57_read_path(ctx, path_obj);
     let facts = match stat_facts(&path, nofollow) {
         Ok(f) => f,
-        Err(_) => return Err(p57_no_such_file(ctx, &path)),
+        Err(_) => return Err(p57_no_such_file(ctx, &path)?),
     };
 
     let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[]) {
@@ -15603,10 +15607,10 @@ pub(crate) fn read_named_attributes(
         let key = ctx.create_string(name);
         let key_pin = ctx.pin_native_root(key);
         let value: Value = match name {
-            "lastModifiedTime" => Value::Object(Some(filetime_alloc(ctx, facts.modified_millis))),
-            "lastAccessTime" => Value::Object(Some(filetime_alloc(ctx, facts.access_millis))),
-            "creationTime" => Value::Object(Some(filetime_alloc(ctx, facts.creation_millis))),
-            "ctime" => Value::Object(Some(filetime_alloc(ctx, facts.ctime_millis))),
+            "lastModifiedTime" => Value::Object(Some(filetime_alloc(ctx, facts.modified_millis)?)),
+            "lastAccessTime" => Value::Object(Some(filetime_alloc(ctx, facts.access_millis)?)),
+            "creationTime" => Value::Object(Some(filetime_alloc(ctx, facts.creation_millis)?)),
+            "ctime" => Value::Object(Some(filetime_alloc(ctx, facts.ctime_millis)?)),
             "size" => box_long(ctx, facts.size),
             "isRegularFile" => box_boolean(ctx, facts.is_regular),
             "isDirectory" => box_boolean(ctx, facts.is_dir),
@@ -15795,8 +15799,8 @@ pub(crate) fn p59_files_read_attributes(
                 .into());
             }
         };
-        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
-        return Ok(Some(Value::Object(Some(bfa))));
+        basic_file_attributes_store(ctx, bfa?, is_dir != 0, size, 0, 0, 0, 0);
+        return Ok(Some(Value::Object(Some(bfa?))));
     }
 
     // jrt-FS (runtime image) path — attributes come from the jimage, not the
@@ -15813,8 +15817,8 @@ pub(crate) fn p59_files_read_attributes(
                 .into());
             }
         };
-        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
-        return Ok(Some(Value::Object(Some(bfa))));
+        basic_file_attributes_store(ctx, bfa?, is_dir != 0, size, 0, 0, 0, 0);
+        return Ok(Some(Value::Object(Some(bfa?))));
     }
 
     // NOFOLLOW_LINKS. `java.nio.file.LinkOption` is a single-constant enum, so
@@ -15853,7 +15857,7 @@ pub(crate) fn p59_files_read_attributes(
             let perm_bits = 0i32;
             basic_file_attributes_store(
                 ctx,
-                bfa,
+                bfa?,
                 meta.is_dir(),
                 meta.len() as i64,
                 creation_millis,
@@ -15866,31 +15870,31 @@ pub(crate) fn p59_files_read_attributes(
             // following read resolves the target (and the real JDK likewise
             // reports `isSymbolicLink() == false` there).
             if meta.file_type().is_symlink() {
-                if basic_file_attributes_is_synthetic(ctx, bfa) {
+                if basic_file_attributes_is_synthetic(ctx, bfa?) {
                     // Synthetic stub has no named fields — patch the slot.
-                    let cur = basic_file_attributes_syn_mode(ctx, bfa);
+                    let cur = basic_file_attributes_syn_mode(ctx, bfa?);
                     ctx.set_field(
-                        bfa,
+                        bfa?,
                         BFA_SYN_SLOT_MODE,
                         Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
                     );
-                } else if basic_file_attributes_is_windows(ctx, bfa) {
-                    let cur = match ctx.get_field_by_name(bfa, "fileAttrs") {
+                } else if basic_file_attributes_is_windows(ctx, bfa?) {
+                    let cur = match ctx.get_field_by_name(bfa?, "fileAttrs") {
                         Value::Int(v) => v,
                         _ => 0,
                     };
                     ctx.set_field_by_name(
-                        bfa,
+                        bfa?,
                         "fileAttrs",
                         Value::Int(cur | WIN_ATTR_REPARSE_POINT),
                     );
                 } else {
-                    let cur = match ctx.get_field_by_name(bfa, "st_mode") {
+                    let cur = match ctx.get_field_by_name(bfa?, "st_mode") {
                         Value::Int(v) => v,
                         _ => 0,
                     };
                     ctx.set_field_by_name(
-                        bfa,
+                        bfa?,
                         "st_mode",
                         Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
                     );
@@ -15907,15 +15911,15 @@ pub(crate) fn p59_files_read_attributes(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                ctx.set_field_by_name(bfa, "st_uid", Value::Int(meta.uid() as i32));
-                ctx.set_field_by_name(bfa, "st_gid", Value::Int(meta.gid() as i32));
+                ctx.set_field_by_name(bfa?, "st_uid", Value::Int(meta.uid() as i32));
+                ctx.set_field_by_name(bfa?, "st_gid", Value::Int(meta.gid() as i32));
                 // `st_dev`/`st_ino` ARE the file's identity — both our
                 // `fileKey()` native and the real JDK's own
                 // `UnixFileAttributes.fileKey()` build a key out of them.
                 // Never populated before, which is why `fileKey()` had nothing
                 // to report and returned null for every file.
-                ctx.set_field_by_name(bfa, "st_dev", Value::Long(meta.dev() as i64));
-                ctx.set_field_by_name(bfa, "st_ino", Value::Long(meta.ino() as i64));
+                ctx.set_field_by_name(bfa?, "st_dev", Value::Long(meta.dev() as i64));
+                ctx.set_field_by_name(bfa?, "st_ino", Value::Long(meta.ino() as i64));
             }
             // Windows equivalent of the `st_dev`/`st_ino` identity above: the
             // `(volume serial, file index)` triple `WindowsFileAttributes`
@@ -15946,12 +15950,12 @@ pub(crate) fn p59_files_read_attributes(
         // and translates it to `FileNotFoundException`
         // (ResourceTests#resourceCreateRelativeUnknown).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(p57_no_such_file(ctx, &path_str));
+            return Err(p57_no_such_file(ctx, &path_str)?);
         }
         Err(e) => return Err(p57_io_error(&e)),
     }
 
-    Ok(Some(Value::Object(Some(bfa))))
+    Ok(Some(Value::Object(Some(bfa?))))
 }
 
 // =============================================================================
@@ -16143,7 +16147,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let addrs = ctx.get_field(this, 2);
             // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            let enum_obj = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2)?;
             match addrs {
                 Value::Object(Some(a)) => {
                     ctx.set_field(enum_obj, 0, Value::Object(Some(a)));
@@ -16383,11 +16387,11 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
 
 /// Build the list of NetworkInterface synthetic objects for this host.
 /// Returns loopback + primary interface (resolved via hostname DNS).
-pub(crate) fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
+pub(crate) fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Result<Vec<ObjectRef>, MethodCallFailed> {
     let mut result = Vec::new();
 
     // 1. Loopback interface
-    let lo = alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5);
+    let lo = try_alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5)?;
     let lo_name = ctx.create_string("lo");
     let lo_display = ctx.create_string("Loopback Interface");
     ctx.set_field(lo, 0, Value::Object(Some(lo_name)));
@@ -16400,7 +16404,7 @@ pub(crate) fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<O
     // `NetworkInterface.getInetAddresses()` then calls `.getHostName()` on.
     let lo_addr = crate::net_phase_e::alloc_inet_address_external(ctx, "localhost", "127.0.0.1");
     let lo_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-    ctx.set_array_element(lo_addrs, 0, Value::Object(Some(lo_addr)));
+    ctx.set_array_element(lo_addrs, 0, Value::Object(Some(lo_addr?)));
     ctx.set_field(lo, 2, Value::Object(Some(lo_addrs)));
     ctx.set_field(lo, 3, Value::Int(1)); // index
     ctx.set_field(lo, 4, Value::Int(0b111)); // up + loopback + multicast
@@ -16414,21 +16418,21 @@ pub(crate) fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<O
     let primary_ip = crate::resolve_primary_ipv4(&hostname);
 
     if primary_ip != "127.0.0.1" {
-        let eth = alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5);
+        let eth = try_alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5)?;
         let eth_name = ctx.create_string("eth0");
         let eth_display = ctx.create_string("Primary Network Interface");
         ctx.set_field(eth, 0, Value::Object(Some(eth_name)));
         ctx.set_field(eth, 1, Value::Object(Some(eth_display)));
         let eth_addr = crate::net_phase_e::alloc_inet_address_external(ctx, &hostname, &primary_ip);
         let eth_addrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
-        ctx.set_array_element(eth_addrs, 0, Value::Object(Some(eth_addr)));
+        ctx.set_array_element(eth_addrs, 0, Value::Object(Some(eth_addr?)));
         ctx.set_field(eth, 2, Value::Object(Some(eth_addrs)));
         ctx.set_field(eth, 3, Value::Int(2)); // index
         ctx.set_field(eth, 4, Value::Int(0b101)); // up + multicast (not loopback)
         result.push(eth);
     }
 
-    result
+    Ok(result)
 }
 
 // =============================================================================
@@ -16626,7 +16630,7 @@ pub(crate) fn p98_walk_file_tree(
         p98_visit_single_file(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks)
     };
     ctx.unpin_native_roots(visitor_pin.0);
-    result?;
+    result;
     Ok(Some(path_val))
 }
 
@@ -16657,7 +16661,7 @@ fn p98_visit_single_file(
         "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         path_now,
-        Value::Object(Some(fa)),
+        Value::Object(Some(fa?)),
     )?;
     Ok(())
 }
@@ -16687,7 +16691,7 @@ pub(crate) fn p98_invoke_file_visitor(
     second_arg: Value,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let args = [Value::Object(Some(path_obj)), second_arg];
-    let result = ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args);
+    let result = ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args)?;
     let value = match result {
         Ok(value) => value,
         Err(err) if p98_is_missing_visitor_method(&err, method_name, erased_descriptor) => {
@@ -16726,10 +16730,10 @@ pub(crate) fn p98_alloc_basic_file_attributes(
     ctx: &mut dyn NativeContext,
     is_dir: bool,
     size: i64,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let attrs = basic_file_attributes_alloc(ctx);
-    basic_file_attributes_store(ctx, attrs, is_dir, size, 0, 0, 0, 0);
-    attrs
+    basic_file_attributes_store(ctx, attrs?, is_dir, size, 0, 0, 0, 0);
+    Ok(attrs?)
 }
 
 /// Fast-path the only callback implemented by javac's archive indexer.
@@ -16800,7 +16804,7 @@ pub(crate) fn p98_index_javac_archive_packages(
             root_path_pin
         } else {
             let encoded = jarfs_encode(&jar, &entry);
-            let path = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let path = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
             let path_pin = p98_pin(ctx, path);
             let path_string = ctx.create_string(&encoded);
             let path_now = p98_read_pin(ctx, path_pin);
@@ -16881,7 +16885,7 @@ pub(crate) fn p98_walk_dir(
         "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
         dir_path_now,
-        Value::Object(Some(attrs)),
+        Value::Object(Some(attrs?)),
     )?;
     if let Some(r) = pre {
         let ord = ctx.get_field(r, 1).as_int().unwrap_or(0);
@@ -16903,7 +16907,7 @@ pub(crate) fn p98_walk_dir(
             for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
                 let es = jarfs_encode(&jar, &child);
                 if is_dir {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
                     let epo_pin = p98_pin(ctx, epo);
                     let s = ctx.create_string(&es);
                     let epo_now = p98_read_pin(ctx, epo_pin);
@@ -16920,7 +16924,7 @@ pub(crate) fn p98_walk_dir(
                         return Ok(false);
                     }
                 } else if !skip_file_callbacks {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
                     let epo_pin = p98_pin(ctx, epo);
                     let s = ctx.create_string(&es);
                     let epo_now = p98_read_pin(ctx, epo_pin);
@@ -16939,7 +16943,7 @@ pub(crate) fn p98_walk_dir(
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     epo_now,
-                    Value::Object(Some(fa)),
+                    Value::Object(Some(fa?)),
                 )?;
                     if let Some(r) = vr {
                         if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
@@ -16953,7 +16957,7 @@ pub(crate) fn p98_walk_dir(
             for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
                 let es = jrtfs_encode(&java_home, &child);
                 if is_dir {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
                     let epo_pin = p98_pin(ctx, epo);
                     let s = ctx.create_string(&es);
                     let epo_now = p98_read_pin(ctx, epo_pin);
@@ -16970,7 +16974,7 @@ pub(crate) fn p98_walk_dir(
                         return Ok(false);
                     }
                 } else if !skip_file_callbacks {
-                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo = try_alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2)?;
                     let epo_pin = p98_pin(ctx, epo);
                     let s = ctx.create_string(&es);
                     let epo_now = p98_read_pin(ctx, epo_pin);
@@ -16989,7 +16993,7 @@ pub(crate) fn p98_walk_dir(
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     epo_now,
-                    Value::Object(Some(fa)),
+                    Value::Object(Some(fa?)),
                 )?;
                     if let Some(r) = vr {
                         if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
@@ -17020,7 +17024,7 @@ pub(crate) fn p98_walk_dir(
                 // `relativize`/`getNameCount` against it all disagreed.
                 if is_dir {
                     let epo = p57_alloc_path(ctx, &es);
-                    let epo_pin = p98_pin(ctx, epo);
+                    let epo_pin = p98_pin(ctx, epo?);
                     if !p98_walk_dir(
                         ctx,
                         &es,
@@ -17034,7 +17038,7 @@ pub(crate) fn p98_walk_dir(
                     }
                 } else if !skip_file_callbacks {
                     let epo = p57_alloc_path(ctx, &es);
-                    let epo_pin = p98_pin(ctx, epo);
+                    let epo_pin = p98_pin(ctx, epo?);
                     let fa = p98_alloc_basic_file_attributes(
                         ctx,
                         false,
@@ -17052,7 +17056,7 @@ pub(crate) fn p98_walk_dir(
                     "(Ljava/nio/file/Path;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
                     epo_now,
-                    Value::Object(Some(fa)),
+                    Value::Object(Some(fa?)),
                 )?;
                     if let Some(r) = vr {
                         if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
@@ -17352,7 +17356,7 @@ pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodReg
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // FileTime — millis stored in the real `long value` field (by name) so
@@ -17367,7 +17371,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = filetime_alloc(ctx, millis);
+            let obj = filetime_alloc(ctx, millis)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -17391,7 +17395,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 }
                 _ => val,
             };
-            let obj = filetime_alloc(ctx, millis);
+            let obj = filetime_alloc(ctx, millis)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -17417,7 +17421,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 }
                 _ => 0,
             };
-            let obj = filetime_alloc(ctx, millis);
+            let obj = filetime_alloc(ctx, millis)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -17739,7 +17743,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             // Pin across the alloc/create_string below — a moving young GC
             // there would relocate them (native stale-local family).
             let set_pin = ctx.pin_native_root(set);
-            let fa = alloc_concurrent_synthetic(ctx, FILE_ATTRIBUTE_CLASS, 2);
+            let fa = try_alloc_concurrent_synthetic(ctx, FILE_ATTRIBUTE_CLASS, 2)?;
             let fa_pin = ctx.pin_native_root(fa);
             let name = ctx.create_string("posix:permissions");
             let fa = ctx.read_native_pin(fa_pin, fa);
@@ -17770,13 +17774,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     );
     register_posix_file_permission_stub_clinit(r);
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 // =============================================================================
 // Files stream/IO bridge
 // =============================================================================
 
-pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let f = "java/nio/file/Files";
@@ -18109,10 +18114,10 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             let link_pin = ctx.pin_native_root(link_obj);
             let link = p57_read_path(ctx, link_obj);
             let existing = p57_read_path(ctx, existing);
-            let result = p57_create_hard_link(ctx, &link, &existing);
+            let result = p57_create_hard_link(ctx, &link, &existing)?;
             let link_obj = ctx.read_native_pin(link_pin, link_obj);
             ctx.unpin_native_roots(link_pin);
-            result?;
+            result;
             Ok(Some(Value::Object(Some(link_obj))))
         },
     );
@@ -18124,10 +18129,10 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             let link_pin = ctx.pin_native_root(link_obj);
             let link = p57_read_path(ctx, link_obj);
             let target = p57_read_path(ctx, target);
-            let result = p57_create_symbolic_link(ctx, &link, &target);
+            let result = p57_create_symbolic_link(ctx, &link, &target)?;
             let link_obj = ctx.read_native_pin(link_pin, link_obj);
             ctx.unpin_native_roots(link_pin);
-            result?;
+            result;
             Ok(Some(Value::Object(Some(link_obj))))
         });
     r.register(
@@ -18141,4 +18146,5 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }

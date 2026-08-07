@@ -37,7 +37,8 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 /// StackWalker field layout we use across this module (mirrors the real
 /// JDK private fields the `<init>(EnumSet, int, ExtendedOption, Scope, Continuation)`
@@ -67,8 +68,8 @@ fn alloc_walker(
     options: Value,
     estimate_depth: i32,
     retain_class_ref: bool,
-) -> ObjectRef {
-    let walker = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let walker = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", STACK_WALKER_FIELD_COUNT)?;
     // Real-JDK field declaration order is:
     //   continuation, contScope, options, extendedOption, estimateDepth, retainClassRef
     // Our synthetic-mode hard-coded indices (FIELD_OPTIONS=0,
@@ -103,7 +104,7 @@ fn alloc_walker(
         retain_idx,
         Value::Int(if retain_class_ref { 1 } else { 0 }),
     );
-    walker
+    Ok(walker)
 }
 
 /// `StackWalker.getInstance()` — no options; an empty set is stored.
@@ -118,15 +119,15 @@ pub(crate) fn native_get_instance_default(
     // so allocating it as synthetic leaves Set methods broken under real-JDK
     // dispatch.
     let options = build_options_set(ctx, &[]);
-    let walker = alloc_walker(ctx, Value::Object(Some(options)), 1, false);
+    let walker = alloc_walker(ctx, Value::Object(Some(options?)), 1, false)?;
     Ok(Some(Value::Object(Some(walker))))
 }
 
 /// Helper: allocate a real `java.util.HashSet` and add each provided option
 /// reference to it. Used by every `getInstance(...)` variant so the stored
 /// option set is queryable via standard `Set.contains` without NPE.
-fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0);
+fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 0)?;
     let _ = ctx.invoke(
         "java/util/HashSet",
         "<init>",
@@ -141,7 +142,7 @@ fn build_options_set(ctx: &mut dyn NativeContext, opts: &[ObjectRef]) -> ObjectR
             &[Value::Object(Some(set)), Value::Object(Some(*opt))],
         );
     }
-    set
+    Ok(set)
 }
 
 /// `StackWalker.getInstance(StackWalker$Option)` — build a one-option walker.
@@ -164,7 +165,7 @@ pub(crate) fn native_get_instance_one_option(
         }
     };
     let options = build_options_set(ctx, &[option]);
-    let walker = alloc_walker(ctx, Value::Object(Some(options)), 1, true);
+    let walker = alloc_walker(ctx, Value::Object(Some(options?)), 1, true)?;
     Ok(Some(Value::Object(Some(walker))))
 }
 
@@ -195,7 +196,7 @@ pub(crate) fn native_get_instance_set_depth(
         }
         .into());
     }
-    let walker = alloc_walker(ctx, option_set_arg, estimate_depth, true);
+    let walker = alloc_walker(ctx, option_set_arg, estimate_depth, true)?;
     Ok(Some(Value::Object(Some(walker))))
 }
 
@@ -297,7 +298,7 @@ fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
         "SHOW_HIDDEN_FRAMES",
         "SHOW_REFLECT_FRAMES",
     ] {
-        let option = alloc_concurrent_synthetic(ctx, class_name, 0);
+        let option = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
         ctx.set_static_field_by_name(class_name, name, Value::Object(Some(option)));
         values.push(option);
     }
@@ -314,7 +315,7 @@ fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 /// Install every StackWalker boot-path native this module owns.
-pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
+pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
@@ -356,7 +357,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let walker = alloc_walker(ctx, option_set_arg, 1, true);
+            let walker = alloc_walker(ctx, option_set_arg, 1, true)?;
             Ok(Some(Value::Object(Some(walker))))
         },
     );
@@ -403,6 +404,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
         NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
+    Ok(())
 }
 
 /// `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` —
@@ -570,7 +572,7 @@ mod tests {
     #[test]
     fn get_instance_set_depth_rejects_nonpositive() {
         let mut ctx = MockNativeContext::new();
-        let set = alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1);
+        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1)?;
         let bad_args = [Value::Object(Some(set)), Value::Int(0)];
         let err = native_get_instance_set_depth(&mut ctx, &bad_args).unwrap_err();
         let s = format!("{:?}", err);
@@ -606,7 +608,7 @@ mod tests {
     #[test]
     fn get_instance_set_depth_sets_fields_correctly() {
         let mut ctx = MockNativeContext::new();
-        let set = alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1);
+        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1)?;
         let args = [Value::Object(Some(set)), Value::Int(16)];
         let result = native_get_instance_set_depth(&mut ctx, &args)
             .unwrap()
@@ -696,7 +698,7 @@ mod tests {
     #[test]
     fn get_instance_one_option_sets_retain_flag() {
         let mut ctx = MockNativeContext::new();
-        let option = alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1);
+        let option = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1)?;
         let args = [Value::Object(Some(option))];
         let result = native_get_instance_one_option(&mut ctx, &args)
             .unwrap()

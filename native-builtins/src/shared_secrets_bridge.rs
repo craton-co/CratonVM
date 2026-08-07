@@ -51,7 +51,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 /// WP1.4 — Re-export of the canonical concrete-class mapping.
 /// Mirrors `vm/src/runtime/shared_secrets.rs::SharedSecretsInterface`
@@ -490,7 +490,7 @@ fn jla_get_enum_constants_shared(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn jla_define_unnamed_module(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Mirror `Class.getModule()` shape: 2-field synthetic Module, field 0 =
     // name (None = unnamed).
-    let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+    let m_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", 2)?;
     ctx.set_field(m_obj, 0, Value::Object(None));
     Ok(Some(Value::Object(Some(m_obj))))
 }
@@ -2008,7 +2008,7 @@ fn jnio_page_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRe
 /// spec-compatible: the legacy interface only documents the value
 /// shape, not strict per-call accuracy of the counters.
 fn jnio_get_direct_buffer_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let pool = alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4);
+    let pool = try_alloc_concurrent_synthetic(ctx, "jdk/internal/misc/VM$BufferPool", 4)?;
     Ok(Some(Value::Object(Some(pool))))
 }
 

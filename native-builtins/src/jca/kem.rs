@@ -77,7 +77,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 // Algorithm indices (KEM-local; not shared with key_factory's table).
 const KEM_MLKEM_512: i32 = 0;
@@ -260,7 +260,7 @@ fn kem_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Pin the SPI across the mirror allocation (which may GC).
     let spi_pin = ctx.pin_native_root(spi);
     let base = synthetic_base_offset(ctx, KEM_CLASS);
-    let obj = alloc_concurrent_synthetic(ctx, KEM_CLASS, base + KEM_PRIVATE_SLOTS);
+    let obj = try_alloc_concurrent_synthetic(ctx, KEM_CLASS, base + KEM_PRIVATE_SLOTS)?;
     let spi = ctx.read_native_pin(spi_pin, spi);
     ctx.set_field(obj, base + KEM_OFF_ALGO, Value::Int(idx));
     ctx.set_field(obj, base + KEM_OFF_SPI, Value::Object(Some(spi)));
@@ -310,7 +310,7 @@ fn drive_new_consumer(
     // Pin the returned SPI across the mirror allocation.
     let pin = ctx.pin_native_root(consumer_spi);
     let base = synthetic_base_offset(ctx, mirror_class);
-    let mirror = alloc_concurrent_synthetic(ctx, mirror_class, base + SPI_PRIVATE_SLOTS);
+    let mirror = try_alloc_concurrent_synthetic(ctx, mirror_class, base + SPI_PRIVATE_SLOTS)?;
     let consumer_spi = ctx.read_native_pin(pin, consumer_spi);
     ctx.set_field(
         mirror,

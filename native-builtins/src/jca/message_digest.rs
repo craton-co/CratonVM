@@ -39,7 +39,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, compute_digest, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, compute_digest, obj_arg};
 
 // C14 fix: the previous implementation keyed the side-table on `ObjectRef`,
 // whose `Hash` impl derives from the raw pointer (`self.ptr.as_ptr() as usize`,
@@ -167,7 +167,7 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             &format!("{algo_raw} MessageDigest not available"),
         ));
     }
-    let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 4);
+    let md = try_alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 4)?;
     let algo_str = ctx.create_string(&algo_raw);
     // Real JDK has `algorithm:String` as a declared instance field; resolve
     // it by name so the slot index matches the actual class layout (the
@@ -409,10 +409,10 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // JDK contract (MessageDigestSpi.engineDigest(byte[],int,int)): the caller's
     // window must be able to hold the whole digest, else DigestException.
     let buf_len = ctx.array_length(buf);
-    if len < hash.len() {
+    if len < hash?.len() {
         return Err(throw_digest_exception(ctx, "partial digests not returned"));
     }
-    if buf_len.saturating_sub(offset) < hash.len() {
+    if buf_len.saturating_sub(offset) < hash?.len() {
         return Err(throw_digest_exception(
             ctx,
             "insufficient space in the output buffer to store the digest",
@@ -423,7 +423,7 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     // Reset accumulator after digest() per JDK contract (see md_digest).
     write_accumulator(ctx, this, &[]);
-    Ok(Some(Value::Int(hash.len() as i32)))
+    Ok(Some(Value::Int(hash?.len() as i32)))
 }
 
 /// Construct & throw a real `java.security.DigestException` (a
@@ -474,7 +474,7 @@ fn md_get_digest_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// the layout-aware path from `provider_chain::make_provider` (set fields
 /// by name so the real-JDK class layout is honoured).
 fn md_get_provider(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 8);
+    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
     let name = ctx.create_string("SUN");
     let info = ctx.create_string("SUN security provider (cratonvm)");
     let ver_str = ctx.create_string("25");
@@ -602,7 +602,7 @@ fn md_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let algo = read_algo(ctx, this);
     let acc = read_accumulator(ctx, this);
-    let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 4);
+    let md = try_alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 4)?;
     let algo_str = ctx.create_string(&algo);
     ctx.set_field_by_name(md, "algorithm", Value::Object(Some(algo_str)));
     ctx.set_field(md, FIELD_ALGO, Value::Object(Some(algo_str)));

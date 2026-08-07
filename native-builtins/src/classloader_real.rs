@@ -15,7 +15,8 @@ use std::sync::Mutex;
 use cratonvm_native_api::registry::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Normalise a raw URL/path string to a filesystem path the classpath
 /// loader can resolve.
@@ -126,7 +127,7 @@ static PLATFORM_CL: Mutex<Option<ObjectRef>> = Mutex::new(None);
 /// blocked the cglib probe (a `ClassLoader` subclass calling
 /// `defineClass`). Build the same non-null `defaultDomain` shape here
 /// so the real JDK `defineClass` bytecode path runs cleanly.
-fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
+fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
     // GC-safety: every `alloc_concurrent_synthetic`/`new_object`/`invoke` call
     // below can trigger a moving GC; `this` (and, briefly, `cs`) are each
     // reused repeatedly across multiple such hazards, unpinned otherwise.
@@ -136,12 +137,12 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     let this_pin = ctx.pin_native_root(this);
     // defaultDomain → ProtectionDomain(CodeSource(null URL, null certs),
     // null perms, this loader, null principals). Build CodeSource first.
-    let cs = alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2);
+    let cs = try_alloc_concurrent_synthetic(ctx, "java/security/CodeSource", 2)?;
     let cs_pin = ctx.pin_native_root(cs);
     ctx.set_field_by_name(cs, "location", Value::Object(None));
     ctx.set_field_by_name(cs, "certs", Value::Object(None));
 
-    let pd = alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4);
+    let pd = try_alloc_concurrent_synthetic(ctx, "java/security/ProtectionDomain", 4)?;
     let cs = ctx.read_native_pin(cs_pin, cs);
     ctx.unpin_native_roots(cs_pin);
     let this = ctx.read_native_pin(this_pin, this);
@@ -155,28 +156,28 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     // `classes` — ArrayList the JDK uses to pin loaded classes. JDK code
     // (`addClass`) does `synchronized (classes) { classes.add(c); }`; a
     // null here would NPE on monitorenter.
-    let classes = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 4);
+    let classes = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 4)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "classes", Value::Object(Some(classes)));
 
     // `packages` — ConcurrentHashMap; `ClassLoader.packages()` does
     // `getfield packages → values()` and would NPE on null.
-    let packages = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let packages = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages)));
 
     // `package2certs` — ConcurrentHashMap consulted by `checkCerts`.
-    let pkg2certs = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let pkg2certs = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "package2certs", Value::Object(Some(pkg2certs)));
 
     // `parallelLockMap` — used by `getClassLoadingLock`.
-    let lock_map = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+    let lock_map = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "parallelLockMap", Value::Object(Some(lock_map)));
 
     // `assertionLock` — `setDefaultAssertionStatus` synchronizes on it.
-    let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let lock = try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 0)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "assertionLock", Value::Object(Some(lock)));
 
@@ -218,6 +219,7 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
         }
     }
     ctx.unpin_native_roots(this_pin);
+    Ok(())
 }
 
 /// Populate the `URLClassLoader`-specific instance fields that the real
@@ -389,7 +391,7 @@ pub(crate) fn init_urlclassloader_constructor_with_default_parent(
 /// These override the complex real-JDK constructors with minimal versions
 /// that just store the parent reference, and provide getParent() that reads
 /// it back.
-pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
+pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cl = "java/lang/ClassLoader";
@@ -535,7 +537,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(o)) => *o,
                 _ => None,
             };
-            let m = crate::lang_class::unnamed_module_for_loader(ctx, this);
+            let m = crate::lang_class::unnamed_module_for_loader(ctx, this)?;
             Ok(Some(Value::Object(Some(m))))
         },
     );
@@ -864,6 +866,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// `ClassLoader.loadClass(String)` for real-JDK mode.
@@ -881,7 +884,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
 fn cl_real_load_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> cratonvm_types::error::MethodCallResult {
+) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -906,7 +909,7 @@ fn cl_real_load_class(
             &name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     // Calling it virtually is safe because a real override is present; base
@@ -914,7 +917,7 @@ fn cl_real_load_class(
     if let Some(result) =
         crate::classloader::invoke_single_load_class_override(ctx, this, class_name_obj)
     {
-        return result;
+        return Ok(result);
     }
 
     // Honor a `loadClass(String,boolean)` override (override-first loaders).
@@ -930,7 +933,7 @@ fn cl_real_load_class(
         );
     }
 
-    cl_real_load_class_base(ctx, this, class_name_obj)
+    Ok(cl_real_load_class_base(ctx, this, class_name_obj)?)
 }
 
 /// Outcome of [`load_class_visible_to`].
@@ -1033,7 +1036,7 @@ fn load_class_visible_to(
 pub(crate) fn no_class_def_found_error(
     ctx: &mut dyn NativeContext,
     missing_internal: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let dotted = missing_internal.replace('/', ".");
     let cnfe_msg = ctx.create_string(&dotted);
     let cause = match ctx.new_object_initialized(
@@ -1055,7 +1058,7 @@ pub(crate) fn no_class_def_found_error(
         );
         ctx.unpin_native_roots(cause_pin);
         if let Ok(Some(Value::Object(Some(exc)))) = result {
-            return exc;
+            return Ok(exc);
         }
     }
     // Fallback (constructor dispatch unavailable for some reason): reuse the
@@ -1107,12 +1110,12 @@ fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     class_name_obj: ObjectRef,
-) -> cratonvm_types::error::MethodCallResult {
+) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let name_pin = ctx.pin_native_root(class_name_obj);
-    let result = cl_real_load_class_base_rooted(ctx, this, this_pin, class_name_obj, name_pin);
+    let result = cl_real_load_class_base_rooted(ctx, this, this_pin, class_name_obj, name_pin)?;
     ctx.unpin_native_roots(this_pin);
-    result
+    Ok(result)
 }
 
 fn cl_real_load_class_base_rooted(
@@ -1121,7 +1124,7 @@ fn cl_real_load_class_base_rooted(
     this_pin: usize,
     class_name_obj: ObjectRef,
     name_pin: usize,
-) -> cratonvm_types::error::MethodCallResult {
+) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
     let __obsreg_dbg =
@@ -1159,7 +1162,7 @@ fn cl_real_load_class_base_rooted(
             &class_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
 
@@ -1191,7 +1194,7 @@ fn cl_real_load_class_base_rooted(
             &class_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
 
@@ -1288,7 +1291,7 @@ fn cl_real_load_class_base_rooted(
         && !bootstrap_appended
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-            return result;
+            return Ok(result);
         }
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
@@ -1297,7 +1300,7 @@ fn cl_real_load_class_base_rooted(
             &class_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
 
@@ -1399,7 +1402,7 @@ fn cl_real_load_class_base_rooted(
             ClassLookup::DependencyMissing(missing) => {
                 let exc = no_class_def_found_error(ctx, &missing);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                    exc,
+                    exc?,
                 ));
             }
             ClassLookup::NotFound => {}
@@ -1416,7 +1419,7 @@ fn cl_real_load_class_base_rooted(
     // not always expose their inherited URLClassLoader identity here.
     if !bootstrap_appended {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-            return result;
+            return Ok(result);
         }
     }
 
@@ -1450,7 +1453,7 @@ fn cl_real_load_class_base_rooted(
             _ if defer_to_find_class
                 && crate::classloader::find_class_is_urlclassloader_native(ctx, this) =>
             {
-                return result;
+                return Ok(result);
             }
             // In the deferred case, findClass missing/throwing falls through to
             // the global store as the last resort. Otherwise propagate.
@@ -1468,7 +1471,7 @@ fn cl_real_load_class_base_rooted(
             ClassLookup::DependencyMissing(missing) => {
                 let exc = no_class_def_found_error(ctx, &missing);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                    exc,
+                    exc?,
                 ));
             }
             ClassLookup::NotFound => {}
@@ -1483,7 +1486,7 @@ fn cl_real_load_class_base_rooted(
         &class_name,
     );
     Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-        exc,
+        exc?,
     ))
 }
 
@@ -1492,7 +1495,7 @@ fn cl_real_load_class_base_rooted(
 pub(crate) fn cl_real_load_class_base_from_args(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> cratonvm_types::error::MethodCallResult {
+) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -1501,7 +1504,7 @@ pub(crate) fn cl_real_load_class_base_from_args(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    cl_real_load_class_base(ctx, this, name_obj)
+    Ok(cl_real_load_class_base(ctx, this, name_obj)?)
 }
 
 /// Real-JDK-mode `URLClassLoader.findClass(String)`.
@@ -1578,7 +1581,7 @@ pub fn ucl_real_find_class(
             &class_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     let internal = class_name.replace('.', "/");
@@ -1596,7 +1599,7 @@ pub fn ucl_real_find_class(
             &class_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
@@ -1612,7 +1615,7 @@ pub fn ucl_real_find_class(
             &class_name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     if let Ok(Some(mirror)) = ctx.load_class(&internal) {
@@ -1625,14 +1628,14 @@ pub fn ucl_real_find_class(
         &class_name,
     );
     Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-        exc,
+        exc?,
     ))
 }
 
 /// Get or create the system (app) class loader singleton.
 pub fn get_or_create_system_cl(
     ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     // IDENTITY-UNIFIED with the loader object `Class.getClassLoader()`
     // returns (classloader.rs::get_or_create_app_loader). These used to be
     // two distinct singletons — a plain "java/lang/ClassLoader" here vs the
@@ -1648,17 +1651,17 @@ pub fn get_or_create_system_cl(
     // remapped, which is safe solely because it is never read back; the
     // canonical GC-tracked copy lives in classloader.rs's app-loader store.)
     let obj = crate::classloader::get_or_create_app_loader(ctx);
-    *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
-    Some(obj)
+    *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj?);
+    Ok(Some(obj?))
 }
 
 /// Get or create the platform class loader singleton.
 fn get_or_create_platform_cl(
     ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     // Identity-unified with classloader.rs::get_or_create_platform_loader —
     // same rationale as `get_or_create_system_cl` above.
     let obj = crate::classloader::get_or_create_platform_loader(ctx);
-    *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
-    Some(obj)
+    *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj?);
+    Ok(Some(obj?))
 }

@@ -2344,10 +2344,10 @@ fn build_string_collection(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     items: Vec<String>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let coll = match ctx.new_object(class_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return crate::alloc_concurrent_synthetic(ctx, class_name, 2),
+        _ => return crate::try_alloc_concurrent_synthetic(ctx, class_name, 2),
     };
     let pin = ctx.pin_native_root(coll);
     let _ = ctx.invoke(class_name, "<init>", "()V", &[Value::Object(Some(coll))]);
@@ -2363,13 +2363,13 @@ fn build_string_collection(
     }
     let coll = ctx.read_native_pin(pin, coll);
     ctx.unpin_native_roots(pin);
-    coll
+    Ok(coll)
 }
 
 /// Build a real `HashSet<String>` populated with the side-table keys for the
 /// given Properties object.  Returns an empty HashSet if the object isn't
 /// tracked.
-fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> ObjectRef {
+fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let keys: Vec<String> = ordered_snapshot_kv(ctx, this)
         .into_iter()
         .map(|(k, _v)| k)
@@ -2384,7 +2384,7 @@ fn build_key_set(ctx: &mut dyn NativeContext, this: &mut ObjectRef) -> ObjectRef
     // the entire process (a MUCH more common class) is completely
     // unaffected. `LinkedHashSet extends HashSet`, so `instanceof HashSet`
     // and the `Set` contract are unchanged for callers.
-    build_string_collection(ctx, "java/util/LinkedHashSet", keys)
+    Ok(build_string_collection(ctx, "java/util/LinkedHashSet", keys)?)
 }
 
 /// Side table linking a `Properties.keySet()` snapshot `Set` (by identity
@@ -2574,7 +2574,7 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// `vec`.
 fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
     let empty = |ctx: &mut dyn NativeContext| {
-        crate::alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
+        crate::try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?
     };
     let vec = match ctx.new_object("java/util/Vector") {
         Ok(Some(Value::Object(Some(o)))) => o,
@@ -2675,7 +2675,7 @@ fn native_properties_string_property_names(
     // Same `LinkedHashSet` this returned before (see `build_key_set` for why
     // that class and not `HashSet`).
     let set = build_string_collection(ctx, "java/util/LinkedHashSet", names);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(set?))))
 }
 
 /// Native `Properties.keySet()Ljava/util/Set;` — returns a synthetic
@@ -2692,7 +2692,7 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     };
     let mut this = this;
     let mut set = build_key_set(ctx, &mut this);
-    let set_pin = ctx.pin_native_root(set);
+    let set_pin = ctx.pin_native_root(set?);
     // Add keys for CHM-exclusive (non-String-valued) entries so the key view
     // matches the real map; `stringPropertyNames()` deliberately does NOT do
     // this (it is specified to return only String-keyed/String-valued names).
@@ -2713,27 +2713,27 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             let fresh_pin = ctx.pin_native_root(fresh);
             let fresh = ctx.read_native_pin(fresh_pin, fresh);
             let value = Value::Object(Some(fresh));
-            set = ctx.read_native_pin(set_pin, set);
-            let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[value]);
+            set = ctx.read_native_pin(set_pin, set?);
+            let _ = ctx.invoke_virtual(set?, "add", "(Ljava/lang/Object;)Z", &[value]);
             ctx.unpin_native_roots(fresh_pin);
             continue;
         } else {
             let _ = key_obj;
             Value::Object(Some(ctx.read_native_pin(*key_pin, *key_fallback)))
         };
-        set = ctx.read_native_pin(set_pin, set);
-        let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[key_value]);
+        set = ctx.read_native_pin(set_pin, set?);
+        let _ = ctx.invoke_virtual(set?, "add", "(Ljava/lang/Object;)Z", &[key_value]);
     }
     for (pin, _fallback) in extra_key_pins {
         ctx.unpin_native_roots(pin);
     }
-    set = ctx.read_native_pin(set_pin, set);
+    set = ctx.read_native_pin(set_pin, set?);
     // Tag the snapshot so `LinkedHashSet.retainAll`/`remove` can propagate
     // mutations back to `this` (the source `Properties`) — see
     // `tag_properties_keyset_source`'s doc comment.
-    tag_properties_keyset_source(ctx, set, this);
+    tag_properties_keyset_source(ctx, set?, this);
     ctx.unpin_native_roots(set_pin);
-    Ok(Some(Value::Object(Some(set))))
+    Ok(Some(Value::Object(Some(set?))))
 }
 
 /// Native `Properties.values()Ljava/util/Collection;` — returns a **live**
@@ -2760,7 +2760,7 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = crate::try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(0));

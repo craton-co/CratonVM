@@ -209,7 +209,7 @@ fn get_or_create_default(ctx: &mut dyn NativeContext) -> MethodCallResult {
         format!("{lang}-{country}")
     };
 
-    let locale_obj = crate::alloc_concurrent_synthetic(ctx, "java/util/Locale", 32);
+    let locale_obj = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Locale", 32)?;
 
     synthetic_locale_data()
         .lock()
@@ -1353,7 +1353,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                  using the Rust subtag split (extensions will be dropped)"
             );
             let (lang, script, country, variant) = split_language_tag(&tag);
-            let loc = crate::locale_alloc_full(ctx, &lang, &script, &country, &variant);
+            let loc = crate::locale_alloc_full(ctx, &lang, &script, &country, &variant)?;
             Ok(Some(Value::Object(Some(loc))))
         },
     );

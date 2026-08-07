@@ -80,11 +80,12 @@
 //!   Both are JDK-standard read-only fields; reading either cannot
 //!   trigger arbitrary-code-execution.
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::cell::RefCell;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Internal name of `java.lang.Object`.
 const OBJECT_INTERNAL: &str = "java/lang/Object";
@@ -330,8 +331,8 @@ fn is_object_inherited_method(ctx: &dyn NativeContext, method_obj: ObjectRef) ->
 fn alloc_array_list_from(
     ctx: &mut dyn NativeContext,
     elements: &[(usize, ObjectRef)],
-) -> ObjectRef {
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     // Pin across the backing-array allocation below — a moving young GC
     // there would relocate the fresh list (native stale-local family).
     let list_pin = ctx.pin_native_root(list);
@@ -357,7 +358,7 @@ fn alloc_array_list_from(
         ctx.set_field(list, 1, Value::Int(elements.len() as i32));
     }
     ctx.unpin_native_roots(list_pin);
-    list
+    Ok(list)
 }
 
 // ---------------------------------------------------------------------------
@@ -404,14 +405,14 @@ fn native_introspector_get_methods(
         Some(s) => s,
         None => {
             // Empty list — caller's iterator path won't crash.
-            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])))));
+            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])?))));
         }
     };
     let class_name_internal = class_name_dot.replace('.', "/");
     let cid = match ctx.class_id_by_name(&class_name_internal) {
         Some(c) => c,
         None => {
-            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])))));
+            return Ok(Some(Value::Object(Some(alloc_array_list_from(ctx, &[])?))));
         }
     };
 
@@ -481,8 +482,8 @@ fn native_introspector_get_methods(
                 &method_meta.descriptor,
                 method_meta.access_flags,
             );
-            let method_mirror_pin = ctx.pin_native_root(method_mirror);
-            method_mirrors.push((method_mirror_pin, method_mirror));
+            let method_mirror_pin = ctx.pin_native_root(method_mirror?);
+            method_mirrors.push((method_mirror_pin, method_mirror?));
         }
 
         // Enqueue superclass + superinterfaces.
@@ -497,7 +498,7 @@ fn native_introspector_get_methods(
     Ok(Some(Value::Object(Some(alloc_array_list_from(
         ctx,
         &method_mirrors,
-    )))))
+    )?))))
 }
 
 /// Allocate a `java.lang.reflect.Method` mirror with the JDK-25 field
@@ -509,7 +510,7 @@ pub(crate) fn build_method_mirror(
     name: &str,
     descriptor: &str,
     modifiers: u16,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // SPB.11: Delegate to the canonical `create_method_object` so that the
     // CratonVM extra metadata slots (raw descriptor, parameter count,
     // accessible flag) are populated. Without those, `Method.invoke`
@@ -527,7 +528,7 @@ pub(crate) fn build_method_mirror(
             declaring_class_id,
             exceptions: Vec::new(),
         };
-        return crate::lang_class::create_method_object(ctx, &meta);
+        return Ok(crate::lang_class::create_method_object(ctx, &meta));
     }
     // Fallback when we can't resolve the declaring class id — fill in only
     // the JDK-named fields we can. Method.invoke will still error, but the
@@ -539,7 +540,7 @@ pub(crate) fn build_method_mirror(
     // GC during any of them would relocate the objects and leave the raw
     // `ObjectRef`s stale (native stale-local family).
     let declaring_pin = ctx.pin_native_root(declaring_class_mirror);
-    let method_obj = alloc_concurrent_synthetic(ctx, "java/lang/reflect/Method", 12);
+    let method_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/Method", 12)?;
     let method_obj_pin = ctx.pin_native_root(method_obj);
     let declaring_class_mirror = ctx.read_native_pin(declaring_pin, declaring_class_mirror);
     ctx.set_field_by_name(
@@ -569,7 +570,7 @@ pub(crate) fn build_method_mirror(
     // allocating call, so the returned ref is current. Callers that hold it
     // across their own allocating calls pin it themselves.
     ctx.unpin_native_roots(declaring_pin);
-    method_obj
+    Ok(method_obj)
 }
 
 /// Minimal JVM method-descriptor parser. Returns `(parameter_descs,
@@ -761,7 +762,7 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // calls below — a moving young GC there would relocate them (native
     // stale-local family).
     let method_pin = ctx.pin_native_root(method_obj);
-    let cvt = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/ConvertingMethod", 4);
+    let cvt = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/ConvertingMethod", 4)?;
     let cvt_pin = ctx.pin_native_root(cvt);
     // Field 0: method
     let method_obj = ctx.read_native_pin(method_pin, method_obj);
@@ -771,12 +772,12 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // to operation dispatch signatures, which are keyed from paramMappings.
     let ret_mapping = alloc_identity_mapping(ctx);
     let cvt = ctx.read_native_pin(cvt_pin, cvt);
-    ctx.set_field(cvt, 1, Value::Object(Some(ret_mapping)));
+    ctx.set_field(cvt, 1, Value::Object(Some(ret_mapping?)));
     // Field 2: paramMappings.
     let method_obj = ctx.read_native_pin(method_pin, method_obj);
     let param_mappings = converting_method_param_mappings(ctx, method_obj);
     let cvt = ctx.read_native_pin(cvt_pin, cvt);
-    ctx.set_field(cvt, 2, Value::Object(Some(param_mappings)));
+    ctx.set_field(cvt, 2, Value::Object(Some(param_mappings?)));
     // Field 3: paramConversionIsIdentity = true
     ctx.set_field(cvt, 3, Value::Int(1));
     ctx.unpin_native_roots(method_pin);
@@ -786,7 +787,7 @@ fn native_converting_method_from(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn converting_method_param_mappings(
     ctx: &mut dyn NativeContext,
     method_obj: ObjectRef,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the class-load and the reflective invokes below — a moving
     // young GC there would relocate `method_obj` (native stale-local family);
     // in particular the first invoke can move it before the fallback invoke
@@ -810,7 +811,7 @@ fn converting_method_param_mappings(
         }
     };
     let Some(mut param_types_arr) = arr else {
-        return ctx.new_ref_array(mapping_class_id, 0);
+        return Ok(ctx.new_ref_array(mapping_class_id, 0));
     };
 
     let param_types_pin = ctx.pin_native_root(param_types_arr);
@@ -826,7 +827,7 @@ fn converting_method_param_mappings(
             _ => {
                 let mapping = alloc_identity_mapping(ctx);
                 out = ctx.read_native_pin(out_pin, out);
-                ctx.set_array_element(out, i, Value::Object(Some(mapping)));
+                ctx.set_array_element(out, i, Value::Object(Some(mapping?)));
                 continue;
             }
         };
@@ -835,16 +836,16 @@ fn converting_method_param_mappings(
         if preserve_original_open_class {
             param_types_arr = ctx.read_native_pin(param_types_pin, param_types_arr);
             if let Value::Object(Some(open_class)) = ctx.get_array_element(param_types_arr, i) {
-                ctx.set_field(mapping, 2, Value::Object(Some(open_class)));
+                ctx.set_field(mapping?, 2, Value::Object(Some(open_class)));
             }
         }
         out = ctx.read_native_pin(out_pin, out);
-        ctx.set_array_element(out, i, Value::Object(Some(mapping)));
+        ctx.set_array_element(out, i, Value::Object(Some(mapping?)));
     }
 
     out = ctx.read_native_pin(out_pin, out);
     ctx.unpin_native_roots(method_pin);
-    out
+    Ok(out)
 }
 
 fn invoke_reflect_type_array(
@@ -859,7 +860,7 @@ fn invoke_reflect_type_array(
     }
 }
 
-fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRef) -> ObjectRef {
+fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let pin = ctx.pin_native_root(type_obj);
     let type_obj = ctx.read_native_pin(pin, type_obj);
     let mapping = match native_mapping_for_type(
@@ -871,10 +872,10 @@ fn alloc_mapping_for_type_object(ctx: &mut dyn NativeContext, type_obj: ObjectRe
         ],
     ) {
         Ok(Some(Value::Object(Some(mapping)))) => mapping,
-        _ => alloc_identity_mapping(ctx),
+        _ => alloc_identity_mapping(ctx)?,
     };
     ctx.unpin_native_roots(pin);
-    mapping
+    Ok(mapping)
 }
 
 fn primitive_or_primitive_array_class_mirror(ctx: &dyn NativeContext, type_obj: ObjectRef) -> bool {
@@ -905,18 +906,18 @@ fn primitive_or_primitive_array_name(name: &str) -> bool {
 /// the heap tidy; consumers compare by reference rarely (they read
 /// `getOpenType()` mostly), so referential identity is preserved
 /// across calls within the same thread.
-fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Field 0: javaType (Type) — null is acceptable.
     // Field 1: openType (OpenType) — SimpleType.STRING singleton.
     // Field 2: openClass (Class<?>) — String.class mirror.
-    let m = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3);
+    let m = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh mapping (native stale-local family).
     let m_pin = ctx.pin_native_root(m);
     ctx.set_field(m, 0, Value::Object(None));
     let st = alloc_simple_type_string(ctx);
     let m = ctx.read_native_pin(m_pin, m);
-    ctx.set_field(m, 1, Value::Object(Some(st)));
+    ctx.set_field(m, 1, Value::Object(Some(st?)));
     let string_cid = ctx
         .ensure_class_initialized("java/lang/String")
         .unwrap_or(cratonvm_types::ClassId::new(0));
@@ -924,7 +925,7 @@ fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
     let m = ctx.read_native_pin(m_pin, m);
     ctx.set_field(m, 2, Value::Object(Some(string_mirror)));
     ctx.unpin_native_roots(m_pin);
-    m
+    Ok(m)
 }
 
 /// Allocate a synthetic `SimpleType<String>` instance. JDK 25's
@@ -934,7 +935,7 @@ fn alloc_identity_mapping(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// allocate an equivalent instance whose `getClassName()` /
 /// `getTypeName()` / `getDescription()` / `isArray()` reads return
 /// JDK-equivalent values.
-fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Try to fetch the static SimpleType.STRING first — it's by far
     // the cleanest path because `MXBeanIntrospector.canUseOpenInfo`
     // does a `==` comparison against the singleton, which only works
@@ -942,14 +943,14 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Ok(cid) = ctx.ensure_class_initialized("javax/management/openmbean/SimpleType") {
         if let Some(idx) = ctx.static_field_index_by_name(cid, "STRING") {
             if let Value::Object(Some(s)) = ctx.get_static_field(cid, idx) {
-                return s;
+                return Ok(s);
             }
         }
     }
     // Fall back to a synthetic instance with the right field values.
     // Pin each fresh object across the subsequent `create_string` calls — a
     // moving young GC there would relocate them (native stale-local family).
-    let st = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/SimpleType", 5);
+    let st = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/SimpleType", 5)?;
     let st_pin = ctx.pin_native_root(st);
     let class_name = ctx.create_string("java.lang.String");
     let class_name_pin = ctx.pin_native_root(class_name);
@@ -964,7 +965,7 @@ fn alloc_simple_type_string(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field_by_name(st, "description", Value::Object(Some(description)));
     ctx.set_field_by_name(st, "isArray", Value::Int(0));
     ctx.unpin_native_roots(st_pin);
-    st
+    Ok(st)
 }
 
 /// Native override for
@@ -1011,7 +1012,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // args[2] = the factory (recursive parameter)
     let type_obj = match args.get(1) {
         Some(Value::Object(Some(t))) => *t,
-        _ => return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)?)))),
     };
 
     // T19.M1 — extract a normalized type-name representation we can
@@ -1032,7 +1033,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         });
         if recursion_depth >= MAX_MAPPING_DEPTH {
             // Cycle — abort recursion with identity mapping.
-            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)))));
+            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)?))));
         }
     }
 
@@ -1041,7 +1042,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // with names we know will trigger recursion.
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
-            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)))));
+            return Ok(Some(Value::Object(Some(alloc_identity_mapping(ctx)?))));
         }
     }
 
@@ -1061,7 +1062,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
                     stack.remove(last_idx);
                 }
             });
-            return Ok(Some(Value::Object(Some(mapping))));
+            return Ok(Some(Value::Object(Some(mapping?))));
         }
     }
 
@@ -1091,7 +1092,7 @@ fn native_mapping_for_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // the underlying JDK Java implementation — would require mutual
     // recursion through the interpreter, which the registry doesn't
     // expose.
-    Ok(Some(Value::Object(Some(mapping))))
+    Ok(Some(Value::Object(Some(mapping?))))
 }
 
 /// T19.M1 — Resolve the canonical type name for a `Type` mirror.
@@ -1139,10 +1140,10 @@ fn resolve_type_name(ctx: &dyn NativeContext, type_obj: ObjectRef) -> Option<Str
 ///   here — `OpenConverter` only reads `openType` for cache hits).
 /// - `openClass` = `CompositeData.class` (the standard open class for
 ///   composite mappings).
-fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> ObjectRef {
+fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> Result<ObjectRef, MethodCallFailed> {
     // CompositeMapping fields match MXBeanMapping (identity layout) +
     // a CompositeType in the openType slot.
-    let m = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3);
+    let m = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MXBeanMapping", 3)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh mapping (native stale-local family).
     let m_pin = ctx.pin_native_root(m);
@@ -1151,7 +1152,7 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
     // Field 1: openType (OpenType) — synthetic CompositeType.
     let composite_type = alloc_composite_type(ctx, schema);
     let m = ctx.read_native_pin(m_pin, m);
-    ctx.set_field(m, 1, Value::Object(Some(composite_type)));
+    ctx.set_field(m, 1, Value::Object(Some(composite_type?)));
     // Field 2: openClass (Class<?>) — CompositeData.class mirror, fall
     // back to String.class if the class isn't loadable.
     let open_class_mirror =
@@ -1165,7 +1166,7 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
     let m = ctx.read_native_pin(m_pin, m);
     ctx.set_field(m, 2, Value::Object(Some(open_class_mirror)));
     ctx.unpin_native_roots(m_pin);
-    m
+    Ok(m)
 }
 
 /// T19.M1 — Allocate a synthetic `CompositeType` with the schema's
@@ -1179,8 +1180,8 @@ fn alloc_composite_mapping(ctx: &mut dyn NativeContext, schema: &CompositeSchema
 /// The synthetic CompositeType passes structural identity checks done
 /// by `OpenConverter.cacheIfRecursive` and avoids re-entering the
 /// recursive type analysis.
-fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> ObjectRef {
-    let ct = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeType", 8);
+fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -> Result<ObjectRef, MethodCallFailed> {
+    let ct = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeType", 8)?;
     // Pin each fresh object across the subsequent allocating calls
     // (`create_string` / `ensure_class_initialized` / `new_ref_array`) — a
     // moving young GC there would relocate them (native stale-local family).
@@ -1224,7 +1225,7 @@ fn alloc_composite_type(ctx: &mut dyn NativeContext, schema: &CompositeSchema) -
     let item_names_arr = ctx.read_native_pin(item_names_pin, item_names_arr);
     ctx.set_field_by_name(ct, "itemNames", Value::Object(Some(item_names_arr)));
     ctx.unpin_native_roots(ct_pin);
-    ct
+    Ok(ct)
 }
 
 /// Helper trait extension for reading a String field at a known slot.
@@ -1404,16 +1405,16 @@ pub(crate) fn build_composite_data(
     ctx: &mut dyn NativeContext,
     composite_type: Option<ObjectRef>,
     items: &[(String, Value)],
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref held across the allocating calls below — a moving young
     // GC there would relocate them (native stale-local family). The map is
     // built FIRST so `build_string_keyed_map` can pin the item refs before
     // any allocation invalidates them.
     let composite_type_pin = composite_type.map(|o| ctx.pin_native_root(o));
     let map = build_string_keyed_map(ctx, items);
-    let map_pin = ctx.pin_native_root(map);
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4);
-    let map = ctx.read_native_pin(map_pin, map);
+    let map_pin = ctx.pin_native_root(map?);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4)?;
+    let map = ctx.read_native_pin(map_pin, map?);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let composite_type = match (composite_type_pin, composite_type) {
         (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),
@@ -1424,13 +1425,13 @@ pub(crate) fn build_composite_data(
         Some(h) => ctx.unpin_native_roots(h),
         None => ctx.unpin_native_roots(map_pin),
     }
-    obj
+    Ok(obj)
 }
 
 /// Build a `java.util.HashMap` populated with the given String→Value pairs.
 /// Falls back to a synthetic 2-slot map (data array + size) when
 /// `HashMap.put` cannot be invoked (unit-test mock).
-fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]) -> ObjectRef {
+fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref-valued item BEFORE the first allocation below — the
     // per-item `create_string`/`put` calls allocate, and a moving young GC
     // there would relocate the not-yet-stored values (native stale-local
@@ -1480,12 +1481,12 @@ fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]
                 Some(&first) => ctx.unpin_native_roots(first),
                 None => ctx.unpin_native_roots(map_pin),
             }
-            return map;
+            return Ok(map);
         }
     }
     // Fallback: synthetic parallel-array map (keys[], vals[]) the natives
     // below understand directly.
-    let synth = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let synth = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     // Pin the fresh objects across the sibling allocations (native
     // stale-local family).
     let synth_pin = ctx.pin_native_root(synth);
@@ -1511,7 +1512,7 @@ fn build_string_keyed_map(ctx: &mut dyn NativeContext, items: &[(String, Value)]
         Some(&first) => ctx.unpin_native_roots(first),
         None => ctx.unpin_native_roots(synth_pin),
     }
-    synth
+    Ok(synth)
 }
 
 /// Read a value out of a carrier's backing map by key. Handles both the
@@ -1556,7 +1557,7 @@ fn carrier_get(ctx: &mut dyn NativeContext, carrier: ObjectRef, key: &str) -> Va
     Value::Object(None)
 }
 
-fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
+fn register_open_data_carriers(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let cds = "javax/management/openmbean/CompositeDataSupport";
 
     // CompositeData.get(String) -> Object.
@@ -1674,7 +1675,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(m)) => m,
                 _ => {
                     // Lazily create a backing HashMap on first put.
-                    let m = build_string_keyed_map(ctx, &[]);
+                    let m = build_string_keyed_map(ctx, &[])?;
                     let this = ctx.read_native_pin(this_pin, this);
                     ctx.set_field_by_name(this, CONTENTS_FIELD, Value::Object(Some(m)));
                     m
@@ -1734,6 +1735,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(empty as i32)))
     });
+    Ok(())
 }
 
 /// Build a `TabularDataSupport`-shaped carrier with the given tabular type
@@ -1741,15 +1743,15 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
 pub(crate) fn build_tabular_data(
     ctx: &mut dyn NativeContext,
     tabular_type: Option<ObjectRef>,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Pin every ref held across the allocating calls below — a moving young
     // GC there would relocate them (native stale-local family). The map is
     // built first so only the carrier needs a pin across it.
     let tabular_type_pin = tabular_type.map(|o| ctx.pin_native_root(o));
     let map = build_string_keyed_map(ctx, &[]);
-    let map_pin = ctx.pin_native_root(map);
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4);
-    let map = ctx.read_native_pin(map_pin, map);
+    let map_pin = ctx.pin_native_root(map?);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4)?;
+    let map = ctx.read_native_pin(map_pin, map?);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let tabular_type = match (tabular_type_pin, tabular_type) {
         (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),
@@ -1760,7 +1762,7 @@ pub(crate) fn build_tabular_data(
         Some(h) => ctx.unpin_native_roots(h),
         None => ctx.unpin_native_roots(map_pin),
     }
-    obj
+    Ok(obj)
 }
 
 /// T19.M1 — Native override for
@@ -1775,7 +1777,7 @@ fn native_open_converter_to_converter(
 ) -> MethodCallResult {
     let type_obj = match args.first() {
         Some(Value::Object(Some(t))) => *t,
-        _ => return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?)))),
     };
     let normalized = resolve_type_name(ctx, type_obj);
 
@@ -1783,13 +1785,13 @@ fn native_open_converter_to_converter(
     if let Some(name) = &normalized {
         let depth = VISITED_TYPES.with(|v| v.borrow().iter().filter(|t| t == &name).count());
         if depth >= MAX_MAPPING_DEPTH {
-            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))));
+            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?))));
         }
     }
 
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
-            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))));
+            return Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?))));
         }
     }
 
@@ -1798,11 +1800,11 @@ fn native_open_converter_to_converter(
             return Ok(Some(Value::Object(Some(alloc_open_converter(
                 ctx,
                 Some(schema),
-            )))));
+            )?))));
         }
     }
 
-    Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)))))
+    Ok(Some(Value::Object(Some(alloc_open_converter(ctx, None)?))))
 }
 
 /// T19.M1 — Allocate an `OpenConverter` instance with either a
@@ -1811,8 +1813,8 @@ fn native_open_converter_to_converter(
 fn alloc_open_converter(
     ctx: &mut dyn NativeContext,
     schema: Option<&CompositeSchema>,
-) -> ObjectRef {
-    let oc = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/OpenConverter", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let oc = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/OpenConverter", 4)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh converter (native stale-local family).
     let oc_pin = ctx.pin_native_root(oc);
@@ -1824,7 +1826,7 @@ fn alloc_open_converter(
         None => alloc_simple_type_string(ctx),
     };
     let oc = ctx.read_native_pin(oc_pin, oc);
-    ctx.set_field(oc, 1, Value::Object(Some(open_type)));
+    ctx.set_field(oc, 1, Value::Object(Some(open_type?)));
     // Field 2: openClass (Class<?>).
     let open_class_internal = if schema.is_some() {
         "javax/management/openmbean/CompositeData"
@@ -1841,7 +1843,7 @@ fn alloc_open_converter(
     // bidirectional conversion paths (we don't translate values).
     ctx.set_field(oc, 3, Value::Int(1));
     ctx.unpin_native_roots(oc_pin);
-    oc
+    Ok(oc)
 }
 
 /// T19.M1 — Native override for
@@ -1854,7 +1856,7 @@ fn native_mapped_mxbean_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx, None,
-            )))))
+            )?))))
         }
     };
     let normalized = resolve_type_name(ctx, type_obj);
@@ -1864,33 +1866,33 @@ fn native_mapped_mxbean_type(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         if depth >= MAX_MAPPING_DEPTH {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx, None,
-            )))));
+            )?))));
         }
     }
     if let Some(name) = &normalized {
         if PROBLEMATIC_TYPE_NAMES.contains(&name.as_str()) {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx, None,
-            )))));
+            )?))));
         }
         if let Some(schema) = composite_schema_for(name) {
             return Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
                 ctx,
                 Some(schema),
-            )))));
+            )?))));
         }
     }
     Ok(Some(Value::Object(Some(alloc_mapped_mxbean_type(
         ctx, None,
-    )))))
+    )?))))
 }
 
 /// T19.M1 — Allocate a `MappedMXBeanType` instance.
 fn alloc_mapped_mxbean_type(
     ctx: &mut dyn NativeContext,
     schema: Option<&CompositeSchema>,
-) -> ObjectRef {
-    let mt = alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MappedMXBeanType", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let mt = try_alloc_concurrent_synthetic(ctx, "com/sun/jmx/mbeanserver/MappedMXBeanType", 4)?;
     // Pin across the sibling allocations below — a moving young GC there
     // would relocate the fresh instance (native stale-local family).
     let mt_pin = ctx.pin_native_root(mt);
@@ -1899,7 +1901,7 @@ fn alloc_mapped_mxbean_type(
         None => alloc_simple_type_string(ctx),
     };
     let mt = ctx.read_native_pin(mt_pin, mt);
-    ctx.set_field(mt, 0, Value::Object(Some(open_type)));
+    ctx.set_field(mt, 0, Value::Object(Some(open_type?)));
     // Field 1: typeName.
     let type_name_str = match schema {
         Some(s) => ctx.create_string(s.type_name),
@@ -1912,7 +1914,7 @@ fn alloc_mapped_mxbean_type(
     // Field 3: arrayMapping flag — 0 (we don't model arrays here).
     ctx.set_field(mt, 3, Value::Int(0));
     ctx.unpin_native_roots(mt_pin);
-    mt
+    Ok(mt)
 }
 
 // ---------------------------------------------------------------------------
@@ -2087,7 +2089,7 @@ mod tests {
     #[test]
     fn test_alloc_identity_mapping_returns_non_null() {
         let mut ctx = mock_ctx();
-        let m = alloc_identity_mapping(&mut ctx);
+        let m = alloc_identity_mapping(&mut ctx)?;
         // Should be a real ObjectRef.
         let _ = m;
     }
@@ -2111,7 +2113,7 @@ mod tests {
         // fallback mirror instead.
         let mut ctx = mock_ctx();
         for desc in ["L", "L;", "Lfoo", "Ljava/lang/String", "[", "[L"] {
-            let m = type_descriptor_to_class_mirror(&mut ctx, desc);
+            let m = type_descriptor_to_class_mirror(&mut ctx, desc)?;
             assert!(
                 !m.as_ptr().is_null(),
                 "malformed descriptor {:?} produced a null mirror",
@@ -2125,7 +2127,7 @@ mod tests {
         // A well-formed object descriptor must still be accepted without
         // panicking after the bounds hardening.
         let mut ctx = mock_ctx();
-        let m = type_descriptor_to_class_mirror(&mut ctx, "Ljava/lang/Object;");
+        let m = type_descriptor_to_class_mirror(&mut ctx, "Ljava/lang/Object;")?;
         assert!(!m.as_ptr().is_null());
     }
 
@@ -2283,7 +2285,7 @@ mod tests {
 
         // Allocate a synthetic Class mirror that resolves to that
         // name via slot 1 (matches Class.name layout).
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2317,7 +2319,7 @@ mod tests {
             stack.push("java.lang.String".to_string());
         });
 
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("java.lang.String");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2342,7 +2344,7 @@ mod tests {
         reset_visited();
         let mut ctx = mock_ctx();
 
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("com.acme.SomeBean");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2364,7 +2366,7 @@ mod tests {
     fn t19_m1_problematic_type_short_circuits_without_push() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("java.lang.Class");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2386,7 +2388,7 @@ mod tests {
     fn t19_m1_composite_type_short_circuits_without_recursion() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2411,7 +2413,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let schema =
             composite_schema_for("java.lang.management.MemoryUsage").expect("schema present");
-        let m = alloc_composite_mapping(&mut ctx, schema);
+        let m = alloc_composite_mapping(&mut ctx, schema)?;
         // Verify the openType slot is populated.
         match ctx.get_field(m, 1) {
             Value::Object(Some(_)) => {}
@@ -2551,7 +2553,7 @@ mod tests {
     #[test]
     fn t19_m1_resolve_type_name_via_class_mirror_slot1() {
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
@@ -2564,7 +2566,7 @@ mod tests {
     #[test]
     fn t19_m1_resolve_type_name_normalizes_slashes_to_dots() {
         let mut ctx = mock_ctx();
-        let class_mirror = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4);
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
         let name_str = ctx.create_string("java/lang/management/MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
@@ -2642,7 +2644,7 @@ mod tests {
         // the synthetic map directly and verify slot layout.
         let mut ctx = mock_ctx();
         // Allocate a synthetic map exactly as the fallback does.
-        let synth = alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3);
+        let synth = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3)?;
         let keys = ctx.new_ref_array(ClassId::new(0), 1);
         let vals = ctx.new_ref_array(ClassId::new(0), 1);
         let k = ctx.create_string("used");

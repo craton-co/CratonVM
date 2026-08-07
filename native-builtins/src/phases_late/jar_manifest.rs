@@ -81,7 +81,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                     let csize = rec.csize;
                     let method = rec.method;
                     let crc = rec.crc;
-                    let ze = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+                    let ze = try_alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4)?;
                     // Pin across the create_string below — a moving young GC
                     // there would relocate the fresh entry (native stale-local
                     // family).
@@ -173,7 +173,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 None => return Ok(Some(Value::Object(None))),
             };
             // ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
-            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let bais = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
             // Pin across the array alloc below — a moving young GC there would
             // relocate the fresh stream (native stale-local family).
             let bais_pin = ctx.pin_native_root(bais);
@@ -536,8 +536,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // (Mockito's inline-mock-maker bootstrap JAR, JaCoCo, etc.). Detect the
     // real layout by field count and use the by-name accessors there.
     let je = "java/util/jar/JarEntry";
-    fn je_is_real_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
-        ctx.object_num_fields(this) > 5
+    fn je_is_real_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<bool, MethodCallFailed> {
+        Ok(ctx.object_num_fields(this) > 5)
     }
     r.register(je, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -659,9 +659,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         // real <init>s (which allocate and can GC-move objects), so pin `this`
         // and the attributes across the construction and re-read before storing.
         let this_pin = ctx.pin_native_root(this);
-        let attrs = p59_manifest_new_attributes(ctx);
+        let attrs = p59_manifest_new_attributes(ctx)?;
         let attrs_pin = ctx.pin_native_root(attrs);
-        let entries = p59_manifest_new_entries_map(ctx);
+        let entries = p59_manifest_new_entries_map(ctx)?;
         let this = ctx.read_native_pin(this_pin, this);
         let attrs = ctx.read_native_pin(attrs_pin, attrs);
         ctx.set_field(this, 0, Value::Object(Some(attrs)));
@@ -732,7 +732,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "MANIFEST_VERSION",
         "Ljava/util/jar/Attributes$Name;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Name (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -748,7 +748,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "MAIN_CLASS",
         "Ljava/util/jar/Attributes$Name;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh Name (native stale-local family).
             let obj_pin = ctx.pin_native_root(obj);
@@ -799,11 +799,11 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             let file = obj_arg(args, 0)?;
             let path = file_read_path(ctx, file);
             if std::path::Path::new(&path).is_dir() {
-                let archive = alloc_concurrent_synthetic(
+                let archive = try_alloc_concurrent_synthetic(
                     ctx,
                     "org/springframework/boot/loader/launch/ExplodedArchive",
                     3,
-                );
+                )?;
                 ctx.set_field(archive, 0, Value::Object(Some(file)));
                 let root_uri_path = ctx.create_string(&path.replace('\\', "/"));
                 ctx.set_field(archive, 1, Value::Object(Some(root_uri_path)));
@@ -827,13 +827,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             let path = ctx
                 .find_class_source_path("org/springframework/boot/loader/launch/Launcher")
                 .unwrap_or_default();
-            let file = file_alloc(ctx, &path);
+            let file = file_alloc(ctx, &path)?;
             if std::path::Path::new(&path).is_dir() {
-                let archive = alloc_concurrent_synthetic(
+                let archive = try_alloc_concurrent_synthetic(
                     ctx,
                     "org/springframework/boot/loader/launch/ExplodedArchive",
                     3,
-                );
+                )?;
                 ctx.set_field(archive, 0, Value::Object(Some(file)));
                 let root_uri_path = ctx.create_string(&path.replace('\\', "/"));
                 ctx.set_field(archive, 1, Value::Object(Some(root_uri_path)));
@@ -913,11 +913,11 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             // Pin across the archive alloc below — a moving young GC there
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
-            let archive = alloc_concurrent_synthetic(
+            let archive = try_alloc_concurrent_synthetic(
                 ctx,
                 "org/springframework/boot/loader/archive/JarFileArchive",
                 4,
-            );
+            )?;
             let this = ctx.read_native_pin(this_pin, this);
             // Write back into the launcher's `archive` field so bytecode
             // that does GETFIELD archive still gets a non-null value.
@@ -952,11 +952,11 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 // Pin across the archive alloc below — a moving young GC there
                 // would relocate `this` (native stale-local family).
                 let this_pin = ctx.pin_native_root(this);
-                let archive = alloc_concurrent_synthetic(
+                let archive = try_alloc_concurrent_synthetic(
                     ctx,
                     "org/springframework/boot/loader/archive/JarFileArchive",
                     4,
-                );
+                )?;
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field_by_name(this, "archive", Value::Object(Some(archive)));
                 ctx.unpin_native_roots(this_pin);
@@ -1837,9 +1837,9 @@ pub(crate) fn jar_entry_bytes_cached(
 /// synthetic `java/util/jar/JarEntry` ObjectRefs. Returns an empty Vec on
 /// any I/O / zip-parse error so callers see an empty Stream rather than
 /// an exception path.
-pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value> {
+pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Result<Vec<Value>, MethodCallFailed> {
     if path.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let contents = match jar_contents_cached(path) {
         Some(c) => c,
@@ -1866,7 +1866,7 @@ pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -
             rec.comment.clone(),
             rec.times,
         );
-        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
+        let je = try_alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5)?;
         let je_pin = ctx.pin_native_root(je);
         let comment_s = comment.map(|comment| ctx.create_string(&comment));
         let comment_pin = comment_s.map(|comment| ctx.pin_native_root(comment));
@@ -1905,7 +1905,7 @@ pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -
             *v = Value::Object(Some(ctx.read_native_pin(*h, *o)));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Resolve a JarFile lookup using the same multi-release entry selection as the
@@ -1942,7 +1942,7 @@ fn p59_jar_lookup_versioned_entry(
     let physical_name = physical_name.as_deref().unwrap_or(entry_name);
     let entry = p59_jar_lookup_entry(ctx, path, physical_name);
     let Value::Object(Some(physical_entry)) = entry else {
-        return Ok(Some(entry));
+        return Ok(Some(entry?));
     };
     if physical_name == entry_name {
         return Ok(Some(Value::Object(Some(physical_entry))));
@@ -2018,9 +2018,9 @@ pub(crate) fn p59_jar_lookup_entry(
     ctx: &mut dyn NativeContext,
     path: &str,
     entry_name: &str,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     if path.is_empty() || entry_name.is_empty() {
-        return Value::Object(None);
+        return Ok(Value::Object(None));
     }
     let contents = match jar_contents_cached(path) {
         Some(c) => c,
@@ -2038,7 +2038,7 @@ pub(crate) fn p59_jar_lookup_entry(
         ),
         None => return Value::Object(None),
     };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
+    let je = try_alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5)?;
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh entry (native stale-local family).
     let je_pin = ctx.pin_native_root(je);
@@ -2069,7 +2069,7 @@ pub(crate) fn p59_jar_lookup_entry(
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
     ctx.set_field_by_name(je, "comment", Value::Object(comment_s));
     p59_set_jar_entry_times(ctx, je, times);
-    Value::Object(Some(je))
+    Ok(Value::Object(Some(je)))
 }
 
 pub(crate) fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2083,14 +2083,14 @@ pub(crate) fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
         eprintln!(
             "[DBG_SBLOAD] JarFile.stream() path={:?} entries={}",
             path,
-            elems.len()
+            elems?.len()
         );
     }
     Ok(Some(Value::Object(Some(p56_build_stream(
         ctx,
-        elems,
+        elems?,
         "java/util/stream/Stream",
-    )))))
+    )?))))
 }
 
 /// `BOOT-INF/classes/` plus `BOOT-INF/lib/*.jar` as `jar:nested:...` [`Value`]s
@@ -2098,7 +2098,7 @@ pub(crate) fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
 pub(crate) fn p59_fat_jar_boot_inf_nested_url_values(
     ctx: &mut dyn NativeContext,
     jar_path: &str,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, MethodCallFailed> {
     let mut urls: Vec<Value> = Vec::new();
     // Pin each fresh URL across the subsequent per-entry allocs — a moving
     // young GC there would relocate the earlier URLs (native stale-local
@@ -2108,8 +2108,8 @@ pub(crate) fn p59_fat_jar_boot_inf_nested_url_values(
     let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
     let classes_url_str = format!("jar:nested:/{jar_uri_path}/!BOOT-INF/classes/!/");
     let classes_url = p59_alloc_url(ctx, &classes_url_str);
-    pins.push(ctx.pin_native_root(classes_url));
-    urls.push(Value::Object(Some(classes_url)));
+    pins.push(ctx.pin_native_root(classes_url?));
+    urls.push(Value::Object(Some(classes_url?)));
     if !jar_path.is_empty() {
         if let Ok(file) = std::fs::File::open(jar_path) {
             if let Ok(mut archive) = zip::ZipArchive::new(file) {
@@ -2119,8 +2119,8 @@ pub(crate) fn p59_fat_jar_boot_inf_nested_url_values(
                         if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
                             let url_str = format!("jar:nested:/{jar_uri_path}/!{name}!/");
                             let url = p59_alloc_url(ctx, &url_str);
-                            pins.push(ctx.pin_native_root(url));
-                            urls.push(Value::Object(Some(url)));
+                            pins.push(ctx.pin_native_root(url?));
+                            urls.push(Value::Object(Some(url?)));
                         }
                     }
                 }
@@ -2133,7 +2133,7 @@ pub(crate) fn p59_fat_jar_boot_inf_nested_url_values(
             *v = Value::Object(Some(ctx.read_native_pin(*h, *o)));
         }
     }
-    urls
+    Ok(urls)
 }
 
 /// Spring Boot 3 launcher: read the JarFileArchive's `jarFile` field, walk
@@ -2184,11 +2184,11 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
             continue;
         };
         let jar_entry_pin = ctx.pin_native_root(jar_entry);
-        let archive_entry = alloc_concurrent_synthetic(
+        let archive_entry = try_alloc_concurrent_synthetic(
             ctx,
             "org/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry",
             1,
-        );
+        )?;
         let archive_entry_pin = ctx.pin_native_root(archive_entry);
         let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
         let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
@@ -2231,7 +2231,7 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
                     // `jar:file:` spelling for nested JAR/ZIP entries.
                     let url_text = format!("jar:nested:/{jar_uri_path}/!{name}!/");
                     let url = p59_alloc_url(ctx, &url_text);
-                    urls.push((url, ctx.pin_native_root(url)));
+                    urls.push((url?, ctx.pin_native_root(url?)));
                 }
             }
         }
@@ -2324,13 +2324,13 @@ pub(crate) fn p59_spring_boot_exploded_archive_get_class_path_urls(
         if is_directory {
             entry_name.push('/');
         }
-        let file = file_alloc(ctx, &path.to_string_lossy());
+        let file = file_alloc(ctx, &path.to_string_lossy())?;
         let file_pin = ctx.pin_native_root(file);
-        let archive_entry = alloc_concurrent_synthetic(
+        let archive_entry = try_alloc_concurrent_synthetic(
             ctx,
             "org/springframework/boot/loader/launch/ExplodedArchive$FileArchiveEntry",
             2,
-        );
+        )?;
         let archive_entry_pin = ctx.pin_native_root(archive_entry);
         let name = ctx.create_string(&entry_name);
         let file = ctx.read_native_pin(file_pin, file);
@@ -2415,7 +2415,7 @@ pub(crate) fn p59_spring_boot_exploded_archive_get_class_path_urls(
     // so it stays correct regardless of the active field layout.
     let list = match ctx.new_object_initialized("java/util/ArrayList", "()V", &[])? {
         Some(Value::Object(Some(obj))) => obj,
-        _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+        _ => try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?,
     };
     let list_pin = ctx.pin_native_root(list);
     for (url, pin) in urls.iter().zip(&url_pins) {
@@ -2609,7 +2609,7 @@ pub(crate) fn sb2_launcher_get_main_class(
 pub(crate) fn sb2_launcher_build_archive_list(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, MethodCallFailed> {
     let mut archives: Vec<Value> = Vec::new();
     let jar_path = match sb2_launcher_jar_path(ctx, this) {
         Some(p) => p,
@@ -2628,9 +2628,9 @@ pub(crate) fn sb2_launcher_build_archive_list(
     // before returning.
     let mut pins: Vec<usize> = Vec::new();
     let classes_url = p59_alloc_url(ctx, &classes_url_str);
-    let classes_url_pin = ctx.pin_native_root(classes_url);
-    let classes_archive = alloc_concurrent_synthetic(ctx, archive_class, 3);
-    let classes_url = ctx.read_native_pin(classes_url_pin, classes_url);
+    let classes_url_pin = ctx.pin_native_root(classes_url?);
+    let classes_archive = try_alloc_concurrent_synthetic(ctx, archive_class, 3)?;
+    let classes_url = ctx.read_native_pin(classes_url_pin, classes_url?);
     // SB2 JarFileArchive layout: 0=jarFile, 1=url, 2=tempUnpackDirectory
     ctx.set_field(classes_archive, 1, Value::Object(Some(classes_url)));
     pins.push(ctx.pin_native_root(classes_archive));
@@ -2644,9 +2644,9 @@ pub(crate) fn sb2_launcher_build_archive_list(
                     if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
                         let url_str = format!("jar:file:/{jar_uri_path}!/{name}!/");
                         let url = p59_alloc_url(ctx, &url_str);
-                        let url_pin = ctx.pin_native_root(url);
-                        let nested = alloc_concurrent_synthetic(ctx, archive_class, 3);
-                        let url = ctx.read_native_pin(url_pin, url);
+                        let url_pin = ctx.pin_native_root(url?);
+                        let nested = try_alloc_concurrent_synthetic(ctx, archive_class, 3)?;
+                        let url = ctx.read_native_pin(url_pin, url?);
                         ctx.set_field(nested, 1, Value::Object(Some(url)));
                         pins.push(ctx.pin_native_root(nested));
                         archives.push(Value::Object(Some(nested)));
@@ -2667,7 +2667,7 @@ pub(crate) fn sb2_launcher_build_archive_list(
             archives.len()
         );
     }
-    archives
+    Ok(archives)
 }
 
 /// `getClassPathArchives()` — SB2 v1 returns List<Archive>.
@@ -2680,16 +2680,16 @@ pub(crate) fn sb2_launcher_get_class_path_archives_list(
     // Pin the archives across the list/array allocs below — a moving young GC
     // there would relocate them (native stale-local family).
     let pins = pin_object_values(ctx, &archives);
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let list_pin = ctx.pin_native_root(list);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives?.len());
     let list = ctx.read_native_pin(list_pin, list);
     for (i, (v, p)) in archives.iter().zip(&pins).enumerate() {
         let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
     ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(archives.len() as i32));
+    ctx.set_field(list, 1, Value::Int(archives?.len() as i32));
     let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     ctx.unpin_native_roots(first_pin.unwrap_or(list_pin));
     Ok(Some(Value::Object(Some(list))))
@@ -2720,7 +2720,7 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
     // Pin the archives across the array/iterator allocs below — a moving
     // young GC there would relocate them (native stale-local family).
     let pins = pin_object_values(ctx, &archives);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives?.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, (v, p)) in archives.iter().zip(&pins).enumerate() {
         let v = read_pinned_object_value(ctx, *p, *v);
@@ -2733,7 +2733,7 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
     if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries",
-            archives.len()
+            archives?.len()
         );
     }
     Ok(Some(Value::Object(Some(itr))))
@@ -2758,8 +2758,8 @@ pub(crate) fn sb2_launcher_create_class_loader_bypass_archive_walk(
                          // there would relocate them (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
     let archives = sb2_launcher_build_archive_list(ctx, this);
-    let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives.len());
-    let mut url_pins: Vec<usize> = Vec::with_capacity(archives.len());
+    let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives?.len());
+    let mut url_pins: Vec<usize> = Vec::with_capacity(archives?.len());
     for arch_val in archives {
         let Value::Object(Some(arch_obj)) = arch_val else {
             continue;
@@ -2787,8 +2787,8 @@ pub(crate) fn sb2_launcher_create_class_loader_bypass_archive_walk(
 /// Allocate a 13-field synthetic URL with `protocol`, `host`, `port`, `file`,
 /// `path`, and `full` populated so URL.toString / URL.toURI / URL.getPath
 /// all return the right thing for downstream classpath consumers.
-pub(crate) fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRef {
-    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
+pub(crate) fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
     let proto = if let Some(idx) = full.find(':') {
         &full[..idx]
     } else {
@@ -2823,7 +2823,7 @@ pub(crate) fn p59_alloc_url(ctx: &mut dyn NativeContext, full: &str) -> ObjectRe
     ctx.set_field(url, 5, Value::Object(Some(full_s))); // authority/full
     ctx.set_field(url, 6, Value::Object(Some(file_s))); // path
     ctx.unpin_native_roots(url_pin);
-    url
+    Ok(url)
 }
 
 pub(crate) fn p59_jar_file_entries(
@@ -2844,7 +2844,7 @@ pub(crate) fn p59_jar_file_entries(
     // young GC there would relocate them (native stale-local family).
     let pins = pin_object_values(ctx, &elems);
     let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems?.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
         let v = read_pinned_object_value(ctx, *p, *v);
@@ -2918,7 +2918,7 @@ pub(crate) fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = ctx.read_native_pin(this_pin, this);
     let manifest = match manifest_pin {
         Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
-        None => manifest,
+        None => manifest?,
     };
     ctx.set_field(this, 1, manifest);
     ctx.set_field_by_name(this, "manRef", manifest_ref);
@@ -2978,7 +2978,7 @@ pub(crate) fn p59_jar_file_init_file(
     let this = ctx.read_native_pin(this_pin, this);
     let manifest = match manifest_pin {
         Some((pin, fallback)) => Value::Object(Some(ctx.read_native_pin(pin, fallback))),
-        None => manifest,
+        None => manifest?,
     };
     ctx.set_field(this, 1, manifest);
     ctx.set_field_by_name(this, "manRef", manifest_ref);
@@ -3005,7 +3005,7 @@ pub(crate) fn p59_jar_file_manifest(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let path = p59_jar_file_path(ctx, this);
-    Ok(Some(p98_read_jar_manifest(ctx, &path)))
+    Ok(Some(p98_read_jar_manifest(ctx, &path)?))
 }
 
 /// Read MANIFEST.MF from a JAR file and create a Manifest synthetic object.
@@ -3022,24 +3022,24 @@ pub(crate) fn p59_jar_file_manifest(
 /// cost again on every construction. Route through the same lazily-cached
 /// `jar_entry_bytes_cached` the `getInputStream` native uses so only the
 /// FIRST touch of a given (path, mtime) pays for the archive open.
-pub(crate) fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
-    p98_read_jar_manifest_impl(ctx, path, true)
+pub(crate) fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Result<Value, MethodCallFailed> {
+    Ok(p98_read_jar_manifest_impl(ctx, path, true)?)
 }
 
 /// Constructor variant of [`p98_read_jar_manifest`]. The main attributes are
 /// sufficient during JarFile construction; signed entry sections are expanded
 /// only when a caller asks for the full manifest.
-pub(crate) fn p98_read_jar_manifest_main(ctx: &mut dyn NativeContext, path: &str) -> Value {
-    p98_read_jar_manifest_impl(ctx, path, false)
+pub(crate) fn p98_read_jar_manifest_main(ctx: &mut dyn NativeContext, path: &str) -> Result<Value, MethodCallFailed> {
+    Ok(p98_read_jar_manifest_impl(ctx, path, false)?)
 }
 
 fn p98_read_jar_manifest_impl(
     ctx: &mut dyn NativeContext,
     path: &str,
     include_entries: bool,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     if path.is_empty() {
-        return Value::Object(None);
+        return Ok(Value::Object(None));
     }
     let manifest_bytes = match jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF") {
         Some(b) => (*b).clone(),
@@ -3080,14 +3080,14 @@ fn p98_read_jar_manifest_impl(
             Value::Object(Some(a)) => a,
             _ => {
                 ctx.unpin_native_roots(man_pin);
-                return Value::Object(None);
+                return Ok(Value::Object(None));
             }
         },
     };
     let attrs_pin = ctx.pin_native_root(attrs);
     if p59_attrs_populate_real(ctx, attrs_pin, attrs, &parsed.main).is_err() {
         ctx.unpin_native_roots(man_pin);
-        return Value::Object(None);
+        return Ok(Value::Object(None));
     }
     let manifest = ctx.read_native_pin(man_pin, manifest);
     let entries_map = match ctx.get_field(manifest, 1) {
@@ -3096,7 +3096,7 @@ fn p98_read_jar_manifest_impl(
             Value::Object(Some(entries)) => entries,
             _ => {
                 ctx.unpin_native_roots(man_pin);
-                return Value::Object(None);
+                return Ok(Value::Object(None));
             }
         },
     };
@@ -3104,15 +3104,15 @@ fn p98_read_jar_manifest_impl(
         let entries_pin = ctx.pin_native_root(entries_map);
         for (name, pairs) in &parsed.entries {
             let entry_attrs = p59_manifest_new_attributes(ctx);
-            let entry_pin = ctx.pin_native_root(entry_attrs);
-            if p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs).is_err() {
+            let entry_pin = ctx.pin_native_root(entry_attrs?);
+            if p59_attrs_populate_real(ctx, entry_pin, entry_attrs?, pairs).is_err() {
                 ctx.unpin_native_roots(man_pin);
-                return Value::Object(None);
+                return Ok(Value::Object(None));
             }
             let name = ctx.create_string(name);
             let name_pin = ctx.pin_native_root(name);
             let entries_map = ctx.read_native_pin(entries_pin, entries_map);
-            let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+            let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs?);
             let name = ctx.read_native_pin(name_pin, name);
             if ctx
                 .invoke(
@@ -3128,13 +3128,13 @@ fn p98_read_jar_manifest_impl(
                 .is_err()
             {
                 ctx.unpin_native_roots(man_pin);
-                return Value::Object(None);
+                return Ok(Value::Object(None));
             }
         }
     }
     let manifest = ctx.read_native_pin(man_pin, manifest);
     ctx.unpin_native_roots(man_pin);
-    Value::Object(Some(manifest))
+    Ok(Value::Object(Some(manifest)))
 }
 
 // =============================================================================
@@ -3147,7 +3147,7 @@ fn p98_read_jar_manifest_impl(
 
 /// Allocate a fresh synthetic `java.util.jar.Attributes` with an empty
 /// buckets array (alternating key/value Strings; fixed cap=64 for simplicity).
-pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // Build a REAL java.util.jar.Attributes: its single `map` field is a real
     // LinkedHashMap, so every access path — Map.put/entrySet (real bytecode),
     // getValue/putValue/size (also real bytecode now) and Manifest.write's
@@ -3160,11 +3160,11 @@ pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> Object
     if let Ok(Some(Value::Object(Some(o)))) =
         ctx.new_object_initialized("java/util/jar/Attributes", "()V", &[])
     {
-        return o;
+        return Ok(o);
     }
     // Fallback: a bare allocation (map left at its default) is still better
     // than the broken synthetic layout.
-    alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 1)
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 1)?)
 }
 
 /// Allocate a fresh HashMap-shaped synthetic for per-entry Attributes
@@ -3173,7 +3173,7 @@ pub(crate) fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> Object
 /// of the codebase already mixes the real HashMap-node layout with this
 /// pair-list one, and `getEntries()` callers only walk the entries via
 /// their own iteration so the layout choice is local).
-pub(crate) fn p59_manifest_new_entries_map(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub(crate) fn p59_manifest_new_entries_map(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     // A REAL LinkedHashMap (name -> Attributes), for the same reason as
     // p59_manifest_new_attributes: the synthetic 3-slot layout did not match
     // java.util.HashMap's real field layout, so real Map ops (put/get/entrySet,
@@ -3182,9 +3182,9 @@ pub(crate) fn p59_manifest_new_entries_map(ctx: &mut dyn NativeContext) -> Objec
     if let Ok(Some(Value::Object(Some(o)))) =
         ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])
     {
-        return o;
+        return Ok(o);
     }
-    alloc_concurrent_synthetic(ctx, "java/util/HashMap", 1)
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 1)?)
 }
 
 /// Read all bytes from an InputStream. For a synthetic ByteArrayInputStream
@@ -3564,10 +3564,10 @@ pub(crate) fn p59_manifest_init_copy(
             ctx.unpin_native_roots(source_pin);
             match copied {
                 Some(Value::Object(Some(attrs))) => attrs,
-                _ => p59_manifest_new_attributes(ctx),
+                _ => p59_manifest_new_attributes(ctx)?,
             }
         }
-        None => p59_manifest_new_attributes(ctx),
+        None => p59_manifest_new_attributes(ctx)?,
     };
     let attrs_pin = ctx.pin_native_root(attrs);
     let entries = match source.and_then(|src| source_field(ctx, src, "entries", 1)) {
@@ -3582,10 +3582,10 @@ pub(crate) fn p59_manifest_init_copy(
             ctx.unpin_native_roots(source_pin);
             match copied {
                 Some(Value::Object(Some(entries))) => entries,
-                _ => p59_manifest_new_entries_map(ctx),
+                _ => p59_manifest_new_entries_map(ctx)?,
             }
         }
-        None => p59_manifest_new_entries_map(ctx),
+        None => p59_manifest_new_entries_map(ctx)?,
     };
     let entries_pin = ctx.pin_native_root(entries);
 
@@ -3636,20 +3636,20 @@ pub(crate) fn p59_manifest_init_from_input_stream_at(
 
         // Main attributes: a real Attributes populated through real putValue.
         let main_attrs = p59_manifest_new_attributes(ctx);
-        let main_pin = ctx.pin_native_root(main_attrs);
-        p59_attrs_populate_real(ctx, main_pin, main_attrs, &parsed.main)?;
+        let main_pin = ctx.pin_native_root(main_attrs?);
+        p59_attrs_populate_real(ctx, main_pin, main_attrs?, &parsed.main)?;
 
         // Per-entry sections: name -> Attributes in a real LinkedHashMap.
         let entries_map = p59_manifest_new_entries_map(ctx);
-        let entries_pin = ctx.pin_native_root(entries_map);
+        let entries_pin = ctx.pin_native_root(entries_map?);
         for (name, pairs) in &parsed.entries {
             let entry_attrs = p59_manifest_new_attributes(ctx);
-            let entry_pin = ctx.pin_native_root(entry_attrs);
-            p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs)?;
+            let entry_pin = ctx.pin_native_root(entry_attrs?);
+            p59_attrs_populate_real(ctx, entry_pin, entry_attrs?, pairs)?;
             let ns = ctx.create_string(name);
             let ns_pin = ctx.pin_native_root(ns);
-            let entries_map = ctx.read_native_pin(entries_pin, entries_map);
-            let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+            let entries_map = ctx.read_native_pin(entries_pin, entries_map?);
+            let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs?);
             let ns = ctx.read_native_pin(ns_pin, ns);
             ctx.invoke(
                 "java/util/LinkedHashMap",
@@ -3665,8 +3665,8 @@ pub(crate) fn p59_manifest_init_from_input_stream_at(
 
         // Install on the Manifest, re-reading every ref after the allocations.
         let this = ctx.read_native_pin(this_pin, this);
-        let main_attrs = ctx.read_native_pin(main_pin, main_attrs);
-        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+        let main_attrs = ctx.read_native_pin(main_pin, main_attrs?);
+        let entries_map = ctx.read_native_pin(entries_pin, entries_map?);
         ctx.set_field(this, 0, Value::Object(Some(main_attrs)));
         ctx.set_field(this, 1, Value::Object(Some(entries_map)));
         ctx.set_field_by_name(this, "attr", Value::Object(Some(main_attrs)));
@@ -4005,7 +4005,7 @@ pub(crate) mod t10_manifest_input_stream_tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         let jar_path = tmp_dir.join("t10.jar");
         {
-            let file = std::fs::File::create(&jar_path).expect("create jar");
+            let file = std::fs::File::create(&jar_path).expect("create jar")?;
             let mut zw = zip::ZipWriter::new(file);
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);

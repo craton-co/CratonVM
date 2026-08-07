@@ -15,7 +15,7 @@ use crate::lang_class::{
     create_constructor_object, create_method_object, read_constructor_descriptor,
 };
 use crate::lang_invoke::alloc_method_handle;
-use crate::{alloc_concurrent_synthetic, native_noop, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop, obj_arg};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
@@ -1090,7 +1090,7 @@ fn read_field_value(ctx: &mut dyn NativeContext, addr: usize, type_code: char) -
 
 /// Allocate a stub ObjectStreamClass with default values.
 fn alloc_stream_class_stub(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
-    let desc = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 6);
+    let desc = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 6)?;
     let name = ctx.create_string(class_name);
     ctx.set_field(desc, 0, Value::Object(Some(name)));
     ctx.set_field(desc, 1, Value::Long(compute_default_svuid(class_name)));
@@ -2122,7 +2122,7 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         "putFields",
         "()Ljava/io/ObjectOutputStream$PutField;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectOutputStream$PutField", 2)?;
             ctx.set_field(obj, 0, Value::Int(0)); // field count
             ctx.set_field(obj, 1, Value::Int(0)); // written flag
             Ok(Some(Value::Object(Some(obj))))
@@ -2329,7 +2329,7 @@ fn ois_read_object(ctx: &mut dyn NativeContext, addr: usize) -> Value {
             .max(serialized_count);
         ctx.alloc_object(class_id, class_field_count)
     } else {
-        alloc_concurrent_synthetic(ctx, &desc.class_name, serialized_count)
+        try_alloc_concurrent_synthetic(ctx, &desc.class_name, serialized_count)?
     };
 
     // Cross-call GC-safety fix (2026-07-07, same shape + pattern as
@@ -2739,7 +2739,7 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
             }
             TC_OBJECT => {
                 skip_class_desc(addr);
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/Object", 2);
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 2)?;
                 Value::Object(Some(obj))
             }
             _ => Value::Object(None),
@@ -2853,7 +2853,7 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         "readFields",
         "()Ljava/io/ObjectInputStream$GetField;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputStream$GetField", 2)?;
             ctx.set_field(obj, 0, Value::Int(0));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -3258,7 +3258,7 @@ fn build_object_stream_field(
     field_name: &str,
     field_descriptor: &str,
 ) -> ObjectRef {
-    let osf = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamField", 4);
+    let osf = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamField", 4)?;
     let name = ctx.create_string(field_name);
     ctx.set_field(osf, 0, Value::Object(Some(name)));
     let tc: char = match field_descriptor.chars().next() {
@@ -3316,7 +3316,7 @@ fn build_object_stream_class(
     // mode `alloc_concurrent_synthetic` bumps this to the real-JDK
     // field count if larger, so named-field writes below still hit the
     // right slots either way.
-    let desc = alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 8);
+    let desc = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectStreamClass", 8)?;
 
     // ----- Legacy indexed-slot population (preserved for back-compat) -----
     let name_obj = ctx.create_string(&class_name);
@@ -3539,7 +3539,7 @@ fn native_sun_reflection_factory_get(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/reflect/ReflectionFactory", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/reflect/ReflectionFactory", 1)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -3547,7 +3547,7 @@ fn native_jdk_reflection_factory_get(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, "jdk/internal/reflect/ReflectionFactory", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "jdk/internal/reflect/ReflectionFactory", 1)?;
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -3726,16 +3726,16 @@ fn install_serialization_constructor_accessor(
     let target_mirror_pin = ctx.pin_native_root(target_mirror);
 
     let target =
-        alloc_concurrent_synthetic(ctx, "java/lang/invoke/DirectMethodHandle$Constructor", 1);
+        try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/DirectMethodHandle$Constructor", 1)?;
     let target_pin = ctx.pin_native_root(target);
     let target_mirror = ctx.read_native_pin(target_mirror_pin, target_mirror);
     ctx.set_field_by_name(target, "instanceClass", Value::Object(Some(target_mirror)));
 
-    let accessor = alloc_concurrent_synthetic(
+    let accessor = try_alloc_concurrent_synthetic(
         ctx,
         "jdk/internal/reflect/DirectConstructorHandleAccessor",
         1,
-    );
+    )?;
     let target = ctx.read_native_pin(target_pin, target);
     let ctor_obj = ctx.read_native_pin(base_pin, ctor_obj);
     ctx.set_field_by_name(accessor, "target", Value::Object(Some(target)));
@@ -4554,7 +4554,7 @@ fn osc_class_name(ctx: &dyn NativeContext, desc: ObjectRef) -> Option<String> {
 }
 
 fn alloc_filter(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
-    let filter = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter", 4);
+    let filter = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter", 4)?;
     ctx.set_field(filter, 0, Value::Int(status));
     ctx.set_field(filter, 1, Value::Int(256));
     ctx.set_field(filter, 2, Value::Int(10000));
@@ -4576,7 +4576,7 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
                 Value::Int(s) => s,
                 _ => 0,
             };
-            let status_obj = alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1);
+            let status_obj = try_alloc_concurrent_synthetic(ctx, "java/io/ObjectInputFilter$Status", 1)?;
             ctx.set_field(status_obj, 0, Value::Int(status));
             Ok(Some(Value::Object(Some(status_obj))))
         },

@@ -7,7 +7,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 use cratonvm_native_api::ffi::{
     self, LAYOUT_ADDRESS, LAYOUT_BOOLEAN, LAYOUT_BYTE, LAYOUT_CHAR, LAYOUT_DOUBLE, LAYOUT_FLOAT,
@@ -295,20 +295,20 @@ pub(crate) fn register_pe_panama(registry: &mut NativeMethodRegistry) {
 const PE_VALUE_LAYOUT_NAME_SLOT: usize = 2;
 const PE_P67_LAYOUT_NAME_SLOT: usize = 3;
 
-fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-    let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout", 3);
+fn pe_make_layout(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/ValueLayout", 3)?;
     ctx.set_field(layout, 0, Value::Int(kind));
     ctx.set_field(layout, 1, Value::Int(ffi::layout_byte_size(kind) as i32));
     ctx.set_field(layout, PE_VALUE_LAYOUT_NAME_SLOT, Value::Object(None));
-    layout
+    Ok(layout)
 }
 
-fn pe_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+fn pe_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
     let pinned = match value {
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     let value = match pinned {
         Some((pin, obj)) => {
             let obj = ctx.read_native_pin(pin, obj);
@@ -318,7 +318,7 @@ fn pe_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
         None => Value::Object(None),
     };
     ctx.set_field(opt, 0, value);
-    opt
+    Ok(opt)
 }
 
 fn pe_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
@@ -343,7 +343,7 @@ fn pe_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
 fn pe_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = pe_layout_name_value(ctx, this);
-    Ok(Some(Value::Object(Some(pe_optional(ctx, name)))))
+    Ok(Some(Value::Object(Some(pe_optional(ctx, name)?))))
 }
 
 fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -364,7 +364,7 @@ fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => None,
     };
 
-    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
+    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
     let this = ctx.read_native_pin(this_pin, this);
     for i in 0..field_count {
         let value = ctx.get_field(this, i);
@@ -383,7 +383,7 @@ fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(cloned))))
 }
 
-fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
+fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let vl = "java/lang/foreign/ValueLayout";
 
     // Static factory fields — return pre-built layout objects
@@ -486,6 +486,7 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
         pe_layout_with_name,
     );
+    Ok(())
 }
 
 // --- Arena: lifecycle-scoped memory management ---
@@ -495,7 +496,7 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
     let arena = "java/lang/foreign/Arena";
 
     r.register(arena, "global", "()Ljava/lang/foreign/Arena;", |ctx, _| {
-        let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
+        let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
         let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(ffi::ARENA_GLOBAL));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
@@ -504,7 +505,7 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(a))))
     });
     r.register(arena, "ofAuto", "()Ljava/lang/foreign/Arena;", |ctx, _| {
-        let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
+        let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
         let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(ffi::ARENA_AUTO));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
@@ -517,7 +518,7 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         "ofConfined",
         "()Ljava/lang/foreign/Arena;",
         |ctx, _| {
-            let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
+            let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
             let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
             ctx.set_field(a, 0, Value::Int(ffi::ARENA_CONFINED));
             ctx.set_field(a, 1, Value::Object(Some(ids)));
@@ -532,7 +533,7 @@ pub(crate) fn register_pe_arena(r: &mut NativeMethodRegistry) {
         "ofShared",
         "()Ljava/lang/foreign/Arena;",
         |ctx, _| {
-            let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
+            let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
             let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
             ctx.set_field(a, 0, Value::Int(ffi::ARENA_SHARED));
             ctx.set_field(a, 1, Value::Object(Some(ids)));
@@ -645,7 +646,7 @@ fn pe_arena_allocate_impl(
     }
 
     // Create MemorySegment: [0]=ptr, [1]=size, [2]=arena, [3]=ro, [4]=alive, [5]=offset
-    let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
     ctx.set_field(seg, 0, Value::Long(ptr as i64));
     ctx.set_field(seg, 1, Value::Long(size));
     ctx.set_field(seg, 2, Value::Object(Some(arena_obj)));
@@ -888,7 +889,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 _ => ctx.get_field(this, 3),
             };
 
-            let slice = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+            let slice = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
             ctx.set_field(slice, 0, Value::Long(slice_ptr));
             ctx.set_field(slice, 1, Value::Long(new_size));
             ctx.set_field(slice, 2, Value::Object(None));
@@ -931,7 +932,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
             ctx.set_field(seg, 0, Value::Long(addr));
             ctx.set_field(seg, 1, Value::Long(0)); // unknown size
             ctx.set_field(seg, 2, Value::Object(None)); // no arena
@@ -1020,7 +1021,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         }
                     }
                 }
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None)); // auto-managed
@@ -1062,7 +1063,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         }
                     }
                 }
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -1111,7 +1112,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         *dest = value;
                     }
                 }
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -1151,7 +1152,7 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
                         }
                     }
                 }
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(byte_size));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -1843,7 +1844,7 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
             require_native_access(ctx, "libraryLookup")?;
             let lib_index = ctx.load_native_library(&path)?;
 
-            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
+            let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2)?;
             ctx.set_field(lookup, 0, Value::Long(lib_index));
             let name_str = ctx.create_string(&path);
             ctx.set_field(lookup, 1, Value::Object(Some(name_str)));
@@ -1862,7 +1863,7 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
             // `libraryLookup` minus the `--enable-native-access` requirement,
             // which the JDK does not impose on `loaderLookup`.
             crate::security_manager::check_host_native_access_or_throw(ctx, "symbolLookup")?;
-            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
+            let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2)?;
             ctx.set_field(lookup, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(lookup))))
         },
@@ -1893,7 +1894,7 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
             match ctx.find_native_symbol(lib_index, &sym_name) {
                 Some(addr) => {
                     // Wrap address in MemorySegment and Optional.of()
-                    let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                     ctx.set_field(seg, 0, Value::Long(addr as i64));
                     ctx.set_field(seg, 1, Value::Long(0)); // function pointer — no byte size
                     ctx.set_field(seg, 2, Value::Object(None));
@@ -1901,13 +1902,13 @@ pub(crate) fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
                     ctx.set_field(seg, 4, Value::Int(1)); // alive
                     ctx.set_field(seg, 5, Value::Long(0));
                     // Return as Optional.of(segment)
-                    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+                    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
                     ctx.set_field(opt, 0, Value::Object(Some(seg)));
                     Ok(Some(Value::Object(Some(opt))))
                 }
                 None => {
                     // Return Optional.empty()
-                    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+                    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
                     ctx.set_field(opt, 0, Value::Object(None));
                     Ok(Some(Value::Object(Some(opt))))
                 }
@@ -2049,7 +2050,7 @@ pub(crate) fn register_pe_linker_options(r: &mut NativeMethodRegistry) {
         "(Z)Ljava/lang/foreign/Linker$Option;",
         |ctx, args| {
             let enabled = args.first().and_then(|v| v.as_int()).unwrap_or(0) != 0;
-            let opt = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker$Option", 2);
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker$Option", 2)?;
             ctx.set_field(opt, 0, Value::Int(1)); // kind = critical
             ctx.set_field(opt, 1, Value::Long(enabled as i64));
             Ok(Some(Value::Object(Some(opt))))
@@ -2079,7 +2080,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         "nativeLinker",
         "()Ljava/lang/foreign/Linker;",
         |ctx, _| {
-            let l = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 1);
+            let l = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 1)?;
             Ok(Some(Value::Object(Some(l))))
         },
     );
@@ -2097,7 +2098,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         let descriptor = obj_arg(args, 2)?;
         let fn_addr = crate::panama_libffi::segment_address(ctx, addr_seg);
 
-        let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
+        let handle = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
         ctx.set_field(handle, 0, Value::Long(fn_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -2146,7 +2147,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let handle = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
+            let handle = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
             ctx.set_field(handle, 0, Value::Long(fn_addr));
             ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
             ctx.set_field(handle, 2, Value::Long(variadic_fixed));
@@ -2163,7 +2164,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/foreign/Linker$Option;",
         |ctx, args| {
             let n = args.first().and_then(|v| v.as_int()).unwrap_or(0);
-            let opt = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker$Option", 2);
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker$Option", 2)?;
             ctx.set_field(opt, 0, Value::Int(0)); // kind = firstVariadicArg
             ctx.set_field(opt, 1, Value::Long(n as i64)); // payload
             Ok(Some(Value::Object(Some(opt))))
@@ -2572,7 +2573,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                     Value::Long(address) => address,
                     _ => 0,
                 };
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(address));
                 ctx.set_field(seg, 1, Value::Long(0));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -2601,7 +2602,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
                 unsafe {
                     std::ptr::copy_nonoverlapping(ret_slot.as_ptr(), ptr, total);
                 }
-                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
                 ctx.set_field(seg, 0, Value::Long(ptr as i64));
                 ctx.set_field(seg, 1, Value::Long(total as i64));
                 ctx.set_field(seg, 2, Value::Object(None));
@@ -2629,7 +2630,7 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
     r.register(fd, "of", "(Ljava/lang/foreign/ValueLayout;[Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/FunctionDescriptor;", |ctx, args| {
         let ret_layout = args.first().copied().unwrap_or(Value::Object(None));
         let params = args.get(1).copied().unwrap_or(Value::Object(None));
-        let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(desc, 0, ret_layout);
         ctx.set_field(desc, 1, params);
         Ok(Some(Value::Object(Some(desc))))
@@ -2638,7 +2639,7 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
     r.register(fd, "of", "(Ljava/lang/foreign/MemoryLayout;[Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;", |ctx, args| {
         let ret_layout = args.first().copied().unwrap_or(Value::Object(None));
         let params = args.get(1).copied().unwrap_or(Value::Object(None));
-        let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+        let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(desc, 0, ret_layout);
         ctx.set_field(desc, 1, params);
         Ok(Some(Value::Object(Some(desc))))
@@ -2651,7 +2652,7 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/FunctionDescriptor;",
         |ctx, args| {
             let params = args.first().copied().unwrap_or(Value::Object(None));
-            let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(desc, 0, Value::Object(None)); // void return
             ctx.set_field(desc, 1, params);
             Ok(Some(Value::Object(Some(desc))))
@@ -2664,7 +2665,7 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/FunctionDescriptor;",
         |ctx, args| {
             let params = args.first().copied().unwrap_or(Value::Object(None));
-            let desc = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(desc, 0, Value::Object(None));
             ctx.set_field(desc, 1, params);
             Ok(Some(Value::Object(Some(desc))))
@@ -2675,7 +2676,7 @@ fn register_pe_function_descriptor(r: &mut NativeMethodRegistry) {
     r.register(fd, "returnLayout", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let rl = ctx.get_field(this, 0);
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         ctx.set_field(opt, 0, rl);
         Ok(Some(Value::Object(Some(opt))))
     });
@@ -3292,7 +3293,7 @@ fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     // Wrap the trampoline address in a MemorySegment so Java can pass
     // it to other downcalls expecting a `MemorySegment` function ptr.
-    let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+    let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
     ctx.set_field(seg, 0, Value::Long(code_ptr as i64));
     ctx.set_field(seg, 1, Value::Long(0));
     ctx.set_field(seg, 2, Value::Object(None));
@@ -3409,7 +3410,7 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
             };
-            let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6);
+            let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
             ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
             ctx.set_field(layout, 1, Value::Long(bytes));
             ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
@@ -3425,7 +3426,7 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
             };
-            let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6);
+            let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
             ctx.set_field(layout, 0, Value::Int(LAYOUT_PADDING));
             ctx.set_field(layout, 1, Value::Long(bytes));
             ctx.set_field(layout, 5, Value::Long(1)); // alignment=1
@@ -3434,7 +3435,7 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
     );
 
     // Common methods on all layouts
-    fn layout_members_as_list(ctx: &mut dyn NativeContext, members_arr: ObjectRef) -> ObjectRef {
+    fn layout_members_as_list(ctx: &mut dyn NativeContext, members_arr: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
         let len = ctx.array_length(members_arr);
         let arr_pin = ctx.pin_native_root(members_arr);
         let data_slot = ctx
@@ -3444,12 +3445,12 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
             .resolve_field_index("java/util/ArrayList", "size")
             .unwrap_or(1);
         let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
         let members_arr = ctx.read_native_pin(arr_pin, members_arr);
         ctx.set_field(list, data_slot, Value::Object(Some(members_arr)));
         ctx.set_field(list, size_slot, Value::Int(len as i32));
         ctx.unpin_native_roots(arr_pin);
-        list
+        Ok(list)
     }
 
     let sl = "java/lang/foreign/StructLayout";
@@ -3586,7 +3587,7 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
             let elem =
-                alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout$PathElement", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout$PathElement", 2)?;
             ctx.set_field(elem, 0, name); // field name
             ctx.set_field(elem, 1, Value::Int(0)); // kind=group
             Ok(Some(Value::Object(Some(elem))))
@@ -3598,7 +3599,7 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemoryLayout$PathElement;",
         |ctx, _| {
             let elem =
-                alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout$PathElement", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout$PathElement", 2)?;
             ctx.set_field(elem, 0, Value::Object(None));
             ctx.set_field(elem, 1, Value::Int(1)); // kind=sequence
             Ok(Some(Value::Object(Some(elem))))
@@ -3707,7 +3708,7 @@ fn pe_memory_layout_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if !(1..=8).contains(&width) {
         width = 1;
     }
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3);
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3)?;
     ctx.set_field(vh, 0, Value::Int(1)); // little-endian marker for memory-segment varhandles
     ctx.set_field(vh, 1, Value::Int(width as i32));
     ctx.set_field(vh, 2, Value::Int(3)); // VH_KIND_MEMORY_SEGMENT
@@ -3762,7 +3763,7 @@ fn pe_struct_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Pad total size to alignment
     let total_size = ffi::align_up(offset, max_align);
 
-    let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 6);
+    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 6)?;
     ctx.set_field(layout, 0, Value::Int(LAYOUT_STRUCT));
     ctx.set_field(layout, 1, Value::Long(total_size as i64));
     ctx.set_field(layout, 2, Value::Object(Some(members_arr)));
@@ -3812,7 +3813,7 @@ fn pe_union_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
     }
 
-    let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6);
+    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
     ctx.set_field(layout, 0, Value::Int(LAYOUT_UNION));
     ctx.set_field(layout, 1, Value::Long(max_size as i64));
     ctx.set_field(layout, 2, Value::Object(Some(members_arr)));
@@ -3852,7 +3853,7 @@ fn pe_sequence_layout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         (s, a)
     };
 
-    let layout = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6);
+    let layout = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemoryLayout", 6)?;
     ctx.set_field(layout, 0, Value::Int(LAYOUT_SEQUENCE));
     ctx.set_field(layout, 1, Value::Long((count * elem_size) as i64));
     ctx.set_field(layout, 2, Value::Object(Some(element))); // element layout
@@ -4043,7 +4044,7 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
                 _ => ctx.get_field(this, 3),
             };
 
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
             ctx.set_field(seg, 0, Value::Long(ptr));
             ctx.set_field(seg, 1, Value::Long(new_size));
             ctx.set_field(seg, 2, Value::Object(None));
@@ -4502,12 +4503,12 @@ mod tests {
     // Phase 85.1: Arena Lifecycle Tests
     // ===================================================================
 
-    use crate::alloc_concurrent_synthetic;
+    use crate::try_alloc_concurrent_synthetic;
     use crate::test_utils::mock_ctx;
 
     /// Helper: create an arena object of the given kind using the actual registration logic.
     fn make_arena(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-        let a = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4);
+        let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
         let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(kind));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
@@ -4666,7 +4667,7 @@ mod tests {
         let layout_int = make_layout(&mut ctx, LAYOUT_INT);
 
         // Create a segment with null pointer
-        let seg = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6);
+        let seg = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6)?;
         ctx.set_field(seg, 0, Value::Long(0)); // null ptr
         ctx.set_field(seg, 1, Value::Long(100));
         ctx.set_field(seg, 5, Value::Long(0));
@@ -4869,7 +4870,7 @@ mod tests {
         pe_segment_set_impl(&mut ctx, seg, layout_int, 16, Value::Int(0xCAFE)).unwrap();
 
         // Create a slice starting at offset 16, size 32
-        let slice = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6);
+        let slice = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6)?;
         let base_ptr = match ctx.get_field(seg, 0) {
             Value::Long(n) => n,
             _ => 0,
@@ -4915,7 +4916,7 @@ mod tests {
 
         // Reinterpret with new size 128
         let reinterpreted =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6)?;
         ctx.set_field(reinterpreted, 0, Value::Long(orig_ptr));
         ctx.set_field(reinterpreted, 1, Value::Long(128));
         ctx.set_field(reinterpreted, 2, ctx.get_field(seg, 2));
@@ -4969,12 +4970,12 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
         // Build DowncallHandle
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2)?;
         ctx.set_field(handle, 0, Value::Long(strlen_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
@@ -5014,11 +5015,11 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2)?;
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
@@ -5064,12 +5065,12 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
         // Build a DowncallHandle with 4 fields (the new cache layout).
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4)?;
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -5132,7 +5133,7 @@ mod tests {
         // Simpler smoke test: if we don't actually call, field 3 stays 0.
         // Only the invoke path populates the cache slot.
         let mut ctx = mock_ctx();
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4)?;
         ctx.set_field(handle, 3, Value::Long(0));
         match ctx.get_field(handle, 3) {
             Value::Long(0) => {}
@@ -5232,11 +5233,11 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(None)); // void
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2)?;
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
@@ -5264,7 +5265,7 @@ mod tests {
         let mut ctx = mock_ctx();
 
         // Create a "MethodHandle" target object
-        let target = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2);
+        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)?;
 
         let entry = ffi::UpcallEntry {
             target,
@@ -5300,7 +5301,7 @@ mod tests {
             let mut ctx = mock_ctx();
 
             // Create target, descriptor
-            let target = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2);
+            let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)?;
 
             let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
             let param_layout = make_layout(&mut ctx, LAYOUT_INT);
@@ -5308,11 +5309,11 @@ mod tests {
             ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
             let descriptor =
-                alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
             ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
             ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-            let linker = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1);
+            let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1)?;
             let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
             // Register upcall handle
@@ -5352,7 +5353,7 @@ mod tests {
 
             // Create an UpcallStub handle object for pe_upcall_invoke
             // (uses the VM upcall slot 0, not the trampoline address)
-            let stub = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2);
+            let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2)?;
             ctx.set_field(stub, 0, Value::Long(0)); // slot 0 in the VM's upcall table
 
             // Create args array
@@ -5374,7 +5375,7 @@ mod tests {
         // Invoking an upcall with an invalid slot should return an error
         let mut ctx = mock_ctx();
 
-        let stub = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2);
+        let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2)?;
         ctx.set_field(stub, 0, Value::Long(999)); // non-existent slot
 
         let result = pe_upcall_invoke(&mut ctx, &[Value::Object(Some(stub))]);
@@ -5430,11 +5431,11 @@ mod tests {
             ctx.set_array_element(params_arr, i, Value::Object(Some(p)));
         }
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3)?;
         ctx.set_field(handle, 0, Value::Long(fn_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -5478,11 +5479,11 @@ mod tests {
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_flt)));
 
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3)?;
         ctx.set_field(handle, 0, Value::Long(fn_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -5548,11 +5549,11 @@ mod tests {
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_var)));
 
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3);
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3)?;
         ctx.set_field(handle, 0, Value::Long(snprintf_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         // First 3 args fixed; everything from index 3 is variadic.
@@ -5599,12 +5600,12 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p2)));
         let descriptor =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let target = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2);
-        let linker = alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1);
+        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)?;
+        let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1)?;
         let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
         // Pre-arm the mock NativeContext to return Int(123) from invoke_virtual.
@@ -5769,7 +5770,7 @@ mod tests {
     /// in-bounds accesses are sound while out-of-bounds accesses are caught by
     /// the bounds checks before any dereference.
     fn make_segment(ctx: &mut dyn NativeContext, ptr: i64, size: i64, base_off: i64) -> ObjectRef {
-        let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+        let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
         ctx.set_field(seg, 0, Value::Long(ptr));
         ctx.set_field(seg, 1, Value::Long(size));
         ctx.set_field(seg, 2, Value::Object(None));

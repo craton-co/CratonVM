@@ -11,7 +11,7 @@ use cratonvm_types::{ObjectRef, Value};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 // The live-thread helpers live in `crate::phases_late::management` rather than
 // here: this module is gated on the `management` feature, that one is
 // not, and both register the same `ThreadMXBean` triples. One copy is what
@@ -733,7 +733,7 @@ fn object_name_set_text(ctx: &mut dyn NativeContext, obj: ObjectRef, text: Strin
 }
 
 fn object_name_new(ctx: &mut dyn NativeContext, text: String) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/ObjectName", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/ObjectName", 1)?;
     object_name_set_text(ctx, obj, text);
     obj
 }
@@ -1905,7 +1905,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "(Z)Ljava/lang/management/MemoryUsage;",
         |ctx, args| {
             let is_heap = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
             if is_heap {
                 let used = ctx.heap_allocated_bytes() as i64;
                 let committed = used.max(64 * 1024 * 1024);
@@ -2069,7 +2069,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             for (i, b) in beans.iter().enumerate() {
                 ctx.set_array_element(backing, i, Value::Object(Some(*b)));
             }
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             ctx.set_field_by_name(list, "elementData", Value::Object(Some(backing)));
             ctx.set_field_by_name(list, "size", Value::Int(beans.len() as i32));
             Ok(Some(Value::Object(Some(list))))
@@ -2659,7 +2659,7 @@ fn long_arg(args: &[Value], idx: usize) -> i64 {
 /// .getMemoryUsage0` already surfaces — so every `MemoryPoolImpl` usage query
 /// answers with the spec-defined sentinel rather than a fabricated number.
 fn undefined_memory_usage(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+    let mu = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
     ctx.set_field(mu, 0, Value::Long(-1));
     ctx.set_field(mu, 1, Value::Long(-1));
     ctx.set_field(mu, 2, Value::Long(-1));
@@ -2878,7 +2878,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
                 // Fall back to a freshly allocated synthetic enum object —
                 // the probe only stringifies via toString(), which on
                 // enums reads the `name` field at slot 0.
-                let e = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryType", 2);
+                let e = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryType", 2)?;
                 let label = ctx.create_string(field);
                 ctx.set_field_by_name(e, "name", Value::Object(Some(label)));
                 Ok(Some(Value::Object(Some(e))))
@@ -2967,7 +2967,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
 /// (longs) / null (refs) which matches a "no-threshold" pool — fine for
 /// JConsole-style enumeration.
 pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: bool) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryPoolImpl", 12);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/MemoryPoolImpl", 12)?;
     let n = ctx.create_string(name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
     ctx.set_field_by_name(obj, "isHeap", Value::Int(if is_heap { 1 } else { 0 }));
@@ -2982,7 +2982,7 @@ pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: 
 /// passes the `instanceof` filter in
 /// `ManagementFactoryHelper.getGarbageCollectorMXBeans`).
 pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4)?;
     let n = ctx.create_string(name);
     init_memory_manager_fields(ctx, obj, Value::Object(Some(n)));
     obj
@@ -3143,7 +3143,7 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
         "getDiagnosticOptions",
         "()Ljava/util/List;",
         |ctx, _args| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let backing = ctx.new_ref_array(ClassId::new(0), 0);
             ctx.set_field(list, 0, Value::Object(Some(backing))); // elementData
             ctx.set_field(list, 1, Value::Int(0)); // size
@@ -3437,7 +3437,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
 
     // KAFKA-MBEAN: do NOT register a native for
     // `ManagementFactory.getPlatformMBeanServer()`. The previous synthetic
-    // here allocated `alloc_concurrent_synthetic("javax/management/MBeanServer", 2)`,
+    // here allocated `try_alloc_concurrent_synthetic("javax/management/MBeanServer", 2)?`,
     // whose Class metadata is the *interface* `javax/management/MBeanServer`.
     // Any subsequent `invokeinterface MBeanServer.registerMBean(...)`
     // (e.g. Kafka's `kafka.utils.CoreUtils$.registerMBean` at
@@ -3676,7 +3676,7 @@ fn register_platform_managed_object_names(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10)?;
     init_runtime_mxbean_fields(ctx, obj);
     obj
 }
@@ -3705,7 +3705,7 @@ fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, 7, Value::Long(vm_start_epoch_ms() as i64));
     ctx.set_field(obj, 8, Value::Long(uptime_ms() as i64));
     // field 9 = inputArguments (empty ArrayList)
-    let args_list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let args_list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let empty_arr = ctx.new_ref_array(ClassId::new(0), 0);
     ctx.set_field(args_list, 0, Value::Object(Some(empty_arr)));
     ctx.set_field(args_list, 1, Value::Int(0));
@@ -3874,7 +3874,7 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_logging_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)
+    try_alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)?
 }
 
 /// The live `java.util.logging.LogManager` singleton.
@@ -4102,7 +4102,7 @@ fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: Objec
     ) {
         let lock = match ctx.new_object("java/lang/Object") {
             Ok(Some(Value::Object(Some(lock)))) => lock,
-            _ => alloc_concurrent_synthetic(ctx, "java/lang/Object", 0),
+            _ => try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 0)?,
         };
         let current = ctx.read_native_pin(pin, emitter);
         ctx.set_field_by_name(current, "listenerLock", Value::Object(Some(lock)));
@@ -4117,7 +4117,7 @@ fn init_notification_emitter_support(ctx: &mut dyn NativeContext, emitter: Objec
             Ok(Some(Value::Object(Some(list)))) => list,
             // Synthetic-mode fallback. The real initialized ArrayList above
             // is required for real-JDK mode and covered by the probe.
-            _ => alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2),
+            _ => try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?,
         };
         let current = ctx.read_native_pin(pin, emitter);
         ctx.set_field_by_name(current, "listenerList", Value::Object(Some(list)));
@@ -4133,7 +4133,7 @@ fn alloc_memory_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     // interface makes `instanceof NotificationEmitter` false and hides
     // MemoryImpl's inherited listener implementation. The concrete class's
     // registered `getMemoryUsage0` bridge still supplies live heap values.
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/MemoryImpl", 1)?;
     let obj = init_notification_emitter_support(ctx, obj);
     // Slot 0 = heapUsed, the same snapshot the `MemoryMXBean` *interface*
     // `<init>` native writes to ITS slot 0 (see `register_memory_mxbean`).
@@ -4165,7 +4165,7 @@ fn alloc_memory_usage(
     committed: i64,
     max: i64,
 ) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
     ctx.set_field(obj, 0, Value::Long(init));
     ctx.set_field(obj, 1, Value::Long(used));
     ctx.set_field(obj, 2, Value::Long(committed));
@@ -4414,7 +4414,7 @@ fn alloc_basic_thread_info(
     let locked_synchronizers = ctx.new_ref_array(lock_info_cid, 0);
     let synchronizers_pin = ctx.pin_native_root(locked_synchronizers);
 
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18)?;
 
     let thread_name = ctx.read_native_pin(name_pin, thread_name);
     let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
@@ -4460,7 +4460,7 @@ fn alloc_named_thread_info(ctx: &mut dyn NativeContext, thread_id: i64, name: &s
     let locked_synchronizers = ctx.new_ref_array(lock_info_cid, 0);
     let synchronizers_pin = ctx.pin_native_root(locked_synchronizers);
 
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18)?;
 
     let thread_name = ctx.read_native_pin(name_pin, thread_name);
     let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
@@ -4499,7 +4499,7 @@ fn alloc_jmx_lock_info(
         .replace('/', ".");
     let class_name = ctx.create_string(&class_name);
     let class_pin = ctx.pin_native_root(class_name);
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/LockInfo", 2);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/LockInfo", 2)?;
     let class_name = ctx.read_native_pin(class_pin, class_name);
     ctx.set_field_by_name(info, "className", Value::Object(Some(class_name)));
     ctx.set_field_by_name(
@@ -4567,7 +4567,7 @@ fn alloc_jmx_monitor_info(
     let class_name = ctx.create_string(&class_name);
     let class_pin = ctx.pin_native_root(class_name);
     let frame_pin = locked_frame.map(|f| (ctx.pin_native_root(f), f));
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/MonitorInfo", 4);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MonitorInfo", 4)?;
     let info_pin = ctx.pin_native_root(info);
     let class_name = ctx.read_native_pin(class_pin, class_name);
     let info = ctx.read_native_pin(info_pin, info);
@@ -4672,7 +4672,7 @@ fn alloc_snapshot_thread_info(
         ctx.set_array_element(arr, i, Value::Object(Some(info)));
     }
 
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadInfo", 18)?;
     let info_pin = ctx.pin_native_root(info);
     let thread_name = ctx.read_native_pin(name_pin, thread_name);
     let stack_trace = ctx.read_native_pin(stack_pin, stack_trace);
@@ -4896,7 +4896,7 @@ fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<Str
 }
 
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6)?;
     init_thread_mxbean_fields(ctx, obj);
     obj
 }
@@ -5319,7 +5319,7 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
 const CLM_VERBOSE: usize = 3;
 
 fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 4)?;
     init_class_loading_mxbean_fields(ctx, obj);
     obj
 }
@@ -5396,7 +5396,7 @@ fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 5);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 5)?;
     init_os_mxbean_fields(ctx, obj);
     obj
 }
@@ -5472,7 +5472,7 @@ fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3)?;
     init_compilation_mxbean_fields(ctx, obj);
     obj
 }
@@ -5574,7 +5574,7 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
 // live `ForkJoinScheduler` counters through `NativeContext::vt_scheduler_stats`;
 // see the note on their registrations below.
 fn alloc_virtual_thread_scheduler_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1)?;
     ctx.set_field(obj, 0, Value::Int(ctx.available_processor_count()));
     obj
 }
@@ -5640,7 +5640,7 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4)?;
     init_gc_mxbean_fields(ctx, obj);
     obj
 }
@@ -5768,7 +5768,7 @@ fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// Allocate an in-process MBeanServer whose default domain follows the
 /// `MBeanServerFactory` overload that created it.
 fn alloc_mbean_server_with_domain(ctx: &mut dyn NativeContext, domain: Option<&str>) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", MBS_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", MBS_NUM_FIELDS)?;
     let domain = ctx.create_string(domain.unwrap_or("DefaultDomain"));
     ctx.set_field(obj, MBS_DOMAIN, Value::Object(Some(domain)));
     ctx.set_field(obj, MBS_COUNT, Value::Int(0));
@@ -5969,7 +5969,7 @@ fn jmx_attribute_not_found(ctx: &mut dyn NativeContext, attr: &str) -> MethodCal
 /// `iterator()` read its (empty) backing map, so callers see an empty set
 /// regardless of contents (the TC0622 defect).
 fn build_synthetic_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
     let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
     for (i, e) in elems.iter().enumerate() {
         ctx.set_array_element(backing, i, Value::Object(Some(*e)));
@@ -6018,7 +6018,7 @@ fn build_object_instance(
     name: Option<ObjectRef>,
     bean: Option<ObjectRef>,
 ) -> ObjectRef {
-    let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
+    let oi = try_alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2)?;
     ctx.set_field_by_name(oi, "name", Value::Object(name));
     let cls_name = bean
         .map(|b| {
@@ -7208,7 +7208,7 @@ mod jmx_tests {
         // Name object: a mock String holding the canonical-name text.
         let name = ctx.create_string("com.acme:type=Widget");
         // Bean object: any allocated object.
-        let bean = alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2);
+        let bean = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2)?;
 
         // Not registered yet.
         assert!(mbs_find(&ctx, server, "com.acme:type=Widget").is_none());

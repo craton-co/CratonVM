@@ -22,7 +22,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, normalize_charset_name, CHARSET_FIELD_NAME};
+use crate::{try_alloc_concurrent_synthetic, normalize_charset_name, CHARSET_FIELD_NAME};
 
 /// Layout constants for the synthetic ByteBuffer / CharBuffer.  Keep in
 /// sync with `native-io/src/lib.rs::BB_FIELD_*` — the two modules both
@@ -154,7 +154,7 @@ fn write_char_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, chars: 
 
 /// Allocate a fresh ByteBuffer (synthetic 5-field layout) wrapping a
 /// newly-allocated byte[] containing `bytes`.
-pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
+pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
     let cap = bytes.len();
     // Allocate the CONCRETE `HeapByteBuffer`, not the abstract `ByteBuffer`:
     // the abstract base leaves `isDirect()`/`isReadOnly()`/`base()` unbound
@@ -162,7 +162,7 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
     // consumers that call them — e.g. `sun.security.util.PBEUtil.encodePassword`
     // reads `isReadOnly()` on the `CharsetEncoder.encode(...)` result. The
     // named-field writes below match HeapByteBuffer's real layout.
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", BUF_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", BUF_NUM_FIELDS)?;
     let arr = ctx.new_array(ArrayElementType::Byte, cap);
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
@@ -199,7 +199,7 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
     // LAST, by name, so the indexed BUF_FIELD_* writes above (which can alias the
     // real `address` slot) can't clobber it.
     ctx.set_field_by_name(obj, "address", Value::Long(16));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a fresh CharBuffer containing `chars`.
@@ -215,10 +215,10 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
 /// fallback slots so any caller assuming the synthetic 5-field overlay
 /// (e.g. older `register_p62_char_buffer` natives compiled only in
 /// synthetic mode) continues to see consistent state.
-pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> ObjectRef {
+pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> Result<ObjectRef, MethodCallFailed> {
     let cap = chars.len();
     // Concrete `HeapCharBuffer` (not abstract `CharBuffer`) — see alloc_byte_buffer.
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", BUF_NUM_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", BUF_NUM_FIELDS)?;
     let arr = ctx.new_array(ArrayElementType::Char, cap);
     for (i, &c) in chars.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(c as i32));
@@ -244,14 +244,14 @@ pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> O
     // would make multi-byte views little-endian. Harmless for byte get/array
     // but kept correct for `asCharBuffer`/`getInt` consumers.
     ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a CoderResult with the given tag.
-fn alloc_coder_result(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
-    let cr = alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1);
+fn alloc_coder_result(ctx: &mut dyn NativeContext, tag: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let cr = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CoderResult", 1)?;
     ctx.set_field(cr, 0, Value::Int(tag));
-    cr
+    Ok(cr)
 }
 
 /// Read the `(array, pos, limit)` triple from a Buffer-shaped object.
@@ -701,7 +701,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             return Ok(Some(Value::Object(Some(alloc_coder_result(
                 ctx,
                 CR_UNDERFLOW,
-            )))))
+            )?))))
         }
     };
     let (bsink, boff, bpos, blim) = match byte_sink(ctx, bb) {
@@ -710,14 +710,14 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             return Ok(Some(Value::Object(Some(alloc_coder_result(
                 ctx,
                 CR_OVERFLOW,
-            )))))
+            )?))))
         }
     };
 
     let name = enc_name(ctx, this);
     if chars.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
-        return Ok(Some(Value::Object(Some(r))));
+        return Ok(Some(Value::Object(Some(r?))));
     }
 
     let avail = (blim - bpos).max(0) as usize;
@@ -745,7 +745,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             set_pos(ctx, bb, bpos + written as i32);
             set_pos(ctx, cb, cpos + chars.len() as i32);
             let r = alloc_coder_result(ctx, CR_UNDERFLOW);
-            return Ok(Some(Value::Object(Some(r))));
+            return Ok(Some(Value::Object(Some(r?))));
         }
     }
 
@@ -758,7 +758,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // anything (matches real JDK's `UnicodeEncoder.encodeLoop`).
     if bom_pending && avail < bom_bytes.len() {
         let r = alloc_coder_result(ctx, CR_OVERFLOW);
-        return Ok(Some(Value::Object(Some(r))));
+        return Ok(Some(Value::Object(Some(r?))));
     }
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(bom_bytes);
@@ -856,7 +856,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // unconsumed), exactly matching the real encoder's CoderResult contract.
     set_pos(ctx, cb, cpos + i as i32);
     let r = alloc_coder_result(ctx, tag);
-    Ok(Some(Value::Object(Some(r))))
+    Ok(Some(Value::Object(Some(r?))))
 }
 
 /// `CharsetDecoder.decode(ByteBuffer, CharBuffer, boolean end_of_input)
@@ -876,7 +876,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             return Ok(Some(Value::Object(Some(alloc_coder_result(
                 ctx,
                 CR_UNDERFLOW,
-            )))))
+            )?))))
         }
     };
     let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
@@ -885,7 +885,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             return Ok(Some(Value::Object(Some(alloc_coder_result(
                 ctx,
                 CR_OVERFLOW,
-            )))))
+            )?))))
         }
     };
 
@@ -893,7 +893,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let bytes = read_byte_array(ctx, barr, (boff + bpos) as usize, (blim - bpos).max(0) as usize);
     if bytes.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
-        return Ok(Some(Value::Object(Some(r))));
+        return Ok(Some(Value::Object(Some(r?))));
     }
 
     // UTF-8 is decoded through a JDK-faithful streaming state machine so the
@@ -917,7 +917,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             engine::Utf8DecodeStatus::Malformed => CR_MALFORMED,
         };
         let r = alloc_coder_result(ctx, tag);
-        return Ok(Some(Value::Object(Some(r))));
+        return Ok(Some(Value::Object(Some(r?))));
     }
 
     // `input_len` = how many input bytes the `decoded` units represent
@@ -946,7 +946,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 Err(_) => {
                     set_pos(ctx, bb, bpos + e.offset as i32);
                     let r = alloc_coder_result(ctx, CR_MALFORMED);
-                    return Ok(Some(Value::Object(Some(r))));
+                    return Ok(Some(Value::Object(Some(r?))));
                 }
             }
         }
@@ -954,7 +954,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Err(e) => {
             set_pos(ctx, bb, bpos + e.offset as i32);
             let r = alloc_coder_result(ctx, CR_MALFORMED);
-            return Ok(Some(Value::Object(Some(r))));
+            return Ok(Some(Value::Object(Some(r?))));
         }
     };
 
@@ -969,11 +969,11 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let consumed = proportional_input_consumed_bytes(&bytes[..input_len], &decoded, to_write);
         set_pos(ctx, bb, bpos + consumed as i32);
         let r = alloc_coder_result(ctx, CR_OVERFLOW);
-        Ok(Some(Value::Object(Some(r))))
+        Ok(Some(Value::Object(Some(r?))))
     } else {
         set_pos(ctx, bb, bpos + input_len as i32);
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
-        Ok(Some(Value::Object(Some(r))))
+        Ok(Some(Value::Object(Some(r?))))
     }
 }
 
@@ -993,35 +993,35 @@ fn native_charset_encode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = arg_obj(args, 0)?;
     let s = match args.get(1) {
         Some(Value::Object(Some(s))) => *s,
-        _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[])?)))),
     };
     let chars = read_string_utf16(ctx, s);
     let bytes = encode_with_charset(ctx, this, &chars);
-    Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)))))
+    Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)?))))
 }
 
 fn native_charset_encode_charbuf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
     let cb = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
-        _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[])?)))),
     };
     let (chars, _cpos, clim) = match char_window(ctx, cb) {
         Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
+        None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[])?)))),
     };
     let bytes = encode_with_charset(ctx, this, &chars);
     // Advance the input position — matches HotSpot's contract that
     // Charset.encode(CharBuffer) consumes the buffer.
     set_pos(ctx, cb, clim);
-    Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)))))
+    Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)?))))
 }
 
 fn native_charset_decode_bytebuf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
     let bb = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
-        _ => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[]))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[])?)))),
     };
     // Round 58 — tolerate real-JDK ByteBuffer layouts. Our synthetic
     // ByteBuffer uses (array=0, pos=1, limit=2, cap=3, mark=4) but real-JDK
@@ -1060,7 +1060,7 @@ fn native_charset_decode_bytebuf(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
     let chars = decode_with_charset(ctx, this, &bytes);
-    Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &chars)))))
+    Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &chars)?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1419,11 +1419,11 @@ fn native_charset_encode_charbuf_via_encoder(
     let this = arg_obj(args, 0)?;
     let cb = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
-        _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[])?)))),
     };
     let (chars, _cpos, clim) = match char_window(ctx, cb) {
         Some(s) => s,
-        None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
+        None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[])?)))),
     };
     let name = enc_name(ctx, this);
     let malformed = coding_action(ctx, this, "malformedInputAction");
@@ -1432,7 +1432,7 @@ fn native_charset_encode_charbuf_via_encoder(
         Ok(bytes) => {
             // CharsetEncoder.encode(CharBuffer) consumes the input buffer.
             set_pos(ctx, cb, clim);
-            Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)))))
+            Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &bytes)?))))
         }
         Err((cls, len)) => Err(throw_coding_exception(ctx, cls, len)),
     }
@@ -1452,13 +1452,13 @@ fn native_charset_decode_bytebuf_via_decoder(
     let this = arg_obj(args, 0)?;
     let bb = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
-        _ => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[]))))),
+        _ => return Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &[])?)))),
     };
     let bytes = read_and_consume_bytebuffer(ctx, bb);
     let name = enc_name(ctx, this);
     let malformed = coding_action(ctx, this, "malformedInputAction");
     match decode_honoring_action(&name, &bytes, malformed) {
-        Ok(units) => Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &units))))),
+        Ok(units) => Ok(Some(Value::Object(Some(alloc_char_buffer(ctx, &units)?)))),
         Err((cls, len)) => Err(throw_coding_exception(ctx, cls, len)),
     }
 }
@@ -1471,7 +1471,7 @@ mod tests {
     use crate::test_utils::mock_ctx;
 
     fn make_charset(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-        let cs = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+        let cs = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
         let n = ctx.create_string(name);
         ctx.set_field(cs, CHARSET_FIELD_NAME, Value::Object(Some(n)));
         cs
@@ -1610,7 +1610,7 @@ mod tests {
     /// Build a synthetic `CharsetEncoder` whose charset (slot 0) is `name`.
     fn make_encoder(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         let cs = make_charset(ctx, name);
-        let enc = alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3);
+        let enc = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3)?;
         ctx.set_field(enc, 0, Value::Object(Some(cs)));
         enc
     }

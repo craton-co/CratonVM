@@ -30,7 +30,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 // cceres5 (WildFly metrics `getResourceDescription` stale-ResourceBundle,
 // live-captured 2026-07-22 via CRATONVM_DBG_STALE_RECV): every helper below
@@ -406,15 +407,15 @@ fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
 /// non-null. For user `.properties` resources on the classpath we
 /// populate from the file. For known JDK locale-data base names we
 /// pre-populate English/US defaults. Unknown names get an empty bundle.
-fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
+fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     // cceres5: pin the bundle + backing map across every allocation below
     // (map init, root-locale alloc, per-property string allocations, the
     // populate tables) and return the pin-refreshed address — the raw `obj`
     // return was one producer of the stale-ResourceBundle family (see
     // rb_get_bundle).
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2)?;
     let obj_pin = ctx.pin_native_root(obj);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let obj_now = ctx.read_native_pin(obj_pin, obj);
@@ -441,11 +442,11 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
     let root_locale = crate::locale_alloc(ctx, "", "");
     let obj_now = ctx.read_native_pin(obj_pin, obj);
     if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
-        ctx.set_field(obj_now, loc_idx, Value::Object(Some(root_locale)));
+        ctx.set_field(obj_now, loc_idx, Value::Object(Some(root_locale?)));
     } else {
         // Synthetic-JDK mode (class not loaded with real layout): slot 1 is
         // the conventional `locale` placement used by the synthetic layout.
-        ctx.set_field(obj_now, 1, Value::Object(Some(root_locale)));
+        ctx.set_field(obj_now, 1, Value::Object(Some(root_locale?)));
     }
 
     // Record the base name so `getBaseBundleName()` has something true to
@@ -519,7 +520,7 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
 
     let obj_now = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
-    obj_now
+    Ok(obj_now)
 }
 
 /// Decode `java.util.Properties` escapes in a key or value: `\uXXXX`,
@@ -1052,9 +1053,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // and `locale_alloc` — and the PRE-MOVE `obj` was then returned to Java.
     // Pin all three; read through the pins at every later use.
     let loader_pin = loader.map(|l| ctx.pin_native_root(l));
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2)?;
     let obj_pin = ctx.pin_native_root(obj);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let obj_now = ctx.read_native_pin(obj_pin, obj);
@@ -1120,9 +1121,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let locale = crate::locale_alloc(ctx, &m_lang, &m_country);
         let obj_now = ctx.read_native_pin(obj_pin, obj);
         if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
-            ctx.set_field(obj_now, loc_idx, Value::Object(Some(locale)));
+            ctx.set_field(obj_now, loc_idx, Value::Object(Some(locale?)));
         } else {
-            ctx.set_field(obj_now, 1, Value::Object(Some(locale)));
+            ctx.set_field(obj_now, 1, Value::Object(Some(locale?)));
         }
         let first_pin = loader_pin.unwrap_or(obj_pin);
         ctx.unpin_native_roots(first_pin);
@@ -1148,10 +1149,10 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if is_jdk_internal_bundle(&bundle_name) {
         ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
         let obj = build_bundle(ctx, &bundle_name);
-        return Ok(Some(Value::Object(Some(obj))));
+        return Ok(Some(Value::Object(Some(obj?))));
     }
     ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
-    let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
     let msg = ctx.create_string(&format!(
         "Can't find bundle for base name {bundle_name}, locale {lang}"
     ));
@@ -1340,7 +1341,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // Key absent: throw MissingResourceException — ResourceBundle.getObject's
             // contract, and jakarta.el.ResourceBundleELResolver.getValue catches it
             // to produce the "???key???" sentinel.
-            let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()
@@ -1381,7 +1382,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 &[Value::Object(Some(parent)), Value::Object(Some(key))],
             );
         }
-        let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+        let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
         let msg = ctx.create_string(&format!(
             "Can't find resource for key {}",
             key_str.unwrap_or_default()
@@ -1419,7 +1420,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 );
             }
             let key_str = ctx.read_string(key);
-            let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()
@@ -1645,7 +1646,7 @@ fn en_calendar_field_names(field: i32, style: i32) -> Option<Vec<(&'static str, 
     }
 }
 
-pub fn register(registry: &mut NativeMethodRegistry) {
+pub fn register(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let rb = "java/util/ResourceBundle";
@@ -2409,6 +2410,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     );
 
     registry.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,

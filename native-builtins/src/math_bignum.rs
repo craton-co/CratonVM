@@ -73,8 +73,8 @@ pub(crate) fn bi_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
     }
 }
 
-pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
+pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2)?;
     // GC-SAFETY (use-after-move — mirrors the `bi_alloc_int` fix): `obj` is
     // freshly allocated and not yet reachable from any Java root. The
     // `new_array` / `create_string` allocations below can trigger a minor GC
@@ -158,8 +158,8 @@ pub(crate) fn bi_read_int(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bi
 /// `O(words)`, writing `signum` + big-endian `mag:[I` directly with NO decimal
 /// conversion (unlike `bi_alloc`, which goes through `decimal_to_mag_words`).
 /// Fast write boundary for the limb rewrite.
-pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigInt) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
+pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigInt) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2)?;
     // GC-SAFETY (bc math-ec use-after-move, 2026-06-05): `obj` is freshly
     // allocated and NOT yet reachable from any Java root. The `new_array` /
     // `create_string` allocations below can trigger a minor GC that relocates
@@ -1300,7 +1300,7 @@ pub(crate) fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMeth
     registry.set_category(__prev_cat);
 }
 
-pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     // census-tag: BigInteger spec-exact arithmetic/factories → Intrinsic.
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -1790,6 +1790,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     registry.set_category(__prev_cat);
+    Ok(())
 }
 
 fn native_bi_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1870,7 +1871,7 @@ fn native_bi_value_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // constant cache is an optional optimization (the spec allows fresh
     // instances), and value-equality is what all JDK bytecode relies on.
     let result = bi_alloc_int(ctx, &bigint_from_i64(v));
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1889,7 +1890,7 @@ fn native_bi_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let a = bi_read_int(ctx, this);
     let b = bi_read_int(ctx, other);
     let result = bi_alloc_int(ctx, &a.add(&b));
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1905,7 +1906,7 @@ fn native_bi_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let a = bi_read_int(ctx, this);
     let b = bi_read_int(ctx, other);
     let result = bi_alloc_int(ctx, &a.sub(&b));
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1923,7 +1924,7 @@ fn native_bi_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let a = bi_read_int(ctx, this);
     let b = bi_read_int(ctx, other);
     let result = bi_alloc_int(ctx, &a.mul(&b));
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_divide(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1944,7 +1945,7 @@ fn native_bi_divide(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         .into());
     }
     let result = bi_alloc(ctx, &bi_div_str(&a, &b));
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_mod(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1959,7 +1960,7 @@ fn native_bi_mod(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let a = bi_read(ctx, this);
     let b = bi_read(ctx, other);
     let result = bi_alloc(ctx, &bi_mod_str(&a, &b));
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1970,7 +1971,7 @@ fn native_bi_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Word-based limb path — sign flip only, no decimal round-trip.
     let a = bi_read_int(ctx, this);
     let result = bi_alloc_int(ctx, &a.neg_value());
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1985,7 +1986,7 @@ fn native_bi_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         a
     };
     let result = bi_alloc(ctx, &abs);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bi_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2292,7 +2293,7 @@ fn native_bi_pow(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
     }
     let obj = bi_alloc_int(ctx, &result);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_bi_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2382,8 +2383,8 @@ fn bd_unscaled_and_precision(value: &str, scale: i32) -> (String, i32) {
     (unscaled, precision)
 }
 
-fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
+fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3)?;
     // GC-SAFETY (use-after-move — see `bi_alloc`/`bi_alloc_int`): pin `obj`
     // across the `bi_alloc` / `create_string` allocations below, which can
     // trigger a minor GC that relocates the not-yet-rooted `obj`. Each branch
@@ -2405,7 +2406,7 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
             // intVal BigInteger.
             let bi = bi_alloc(ctx, &unscaled_str);
             let obj = ctx.read_native_pin(h, obj);
-            ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            ctx.set_field(obj, iv_i, Value::Object(Some(bi?)));
             ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
             ctx.set_field(obj, sc_i, Value::Int(scale));
             ctx.set_field(obj, pr_i, Value::Int(precision));
@@ -2435,10 +2436,10 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     }
     let obj = ctx.read_native_pin(h, obj);
     ctx.unpin_native_roots(h);
-    obj
+    Ok(obj)
 }
 
-pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     // census-tag: BigDecimal spec-exact arithmetic/factories → Intrinsic.
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -2547,6 +2548,7 @@ pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(bd_alloc(ctx, "10", 0)))))
     });
     registry.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Read a `BigDecimal`'s `(unscaled-digits, scale)` in real-JDK layout, or
@@ -2679,7 +2681,7 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Populate an existing `BigDecimal` instance from a decimal string + scale.
 /// Picks the layout (real-JDK intVal/scale/precision/intCompact vs. legacy
 /// synthetic value/scale/precision) automatically.
-fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) {
+fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) -> Result<(), MethodCallFailed> {
     // GC-SAFETY (use-after-move — see `bi_alloc`): pin `this` across the
     // `bi_alloc` / `create_string` allocations, which can trigger a minor GC
     // that relocates it. Re-read the forwarded ref before the `set_field`s so we
@@ -2695,7 +2697,7 @@ fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scal
             int_compact
         };
         let this = ctx.read_native_pin(h, this);
-        ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(this, iv_i, Value::Object(Some(bi?)));
         ctx.set_field(this, ic_i, Value::Long(ic));
         ctx.set_field(this, sc_i, Value::Int(scale));
         ctx.set_field(this, pr_i, Value::Int(precision));
@@ -2707,6 +2709,7 @@ fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scal
         ctx.set_field(this, BD_FIELD_PRECISION, Value::Int(precision));
     }
     ctx.unpin_native_roots(h);
+    Ok(())
 }
 
 /// Populate an existing real-layout `BigDecimal` from an exact
@@ -2720,7 +2723,7 @@ fn bd_write_into_bigint(
     unscaled: &crate::bigint::BigInt,
     scale: i32,
     precision: i32,
-) {
+) -> Result<(), MethodCallFailed> {
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         let le = unscaled.mag_le();
         let compact: Option<i64> = if le.len() <= 2 {
@@ -2750,7 +2753,7 @@ fn bd_write_into_bigint(
         let h = ctx.pin_native_root(this);
         let bi = bi_alloc_int(ctx, unscaled);
         let this = ctx.read_native_pin(h, this);
-        ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(this, iv_i, Value::Object(Some(bi?)));
         ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
         ctx.set_field(this, sc_i, Value::Int(scale));
         ctx.set_field(this, pr_i, Value::Int(precision));
@@ -2759,6 +2762,7 @@ fn bd_write_into_bigint(
     }
     let value = apply_scale(&unscaled.to_decimal(), scale);
     bd_write_into(ctx, this, &value, scale);
+    Ok(())
 }
 
 fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2802,7 +2806,7 @@ fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let zero = bi_alloc_int(ctx, &BigInt::zero());
         let this = ctx.read_native_pin(h, this);
         if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
-            ctx.set_field(this, iv_i, Value::Object(Some(zero)));
+            ctx.set_field(this, iv_i, Value::Object(Some(zero?)));
             ctx.set_field(this, ic_i, Value::Long(0));
             ctx.set_field(this, sc_i, Value::Int(0));
             ctx.set_field(this, pr_i, Value::Int(1));
@@ -2919,7 +2923,7 @@ fn native_bd_value_of_long(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 0,
     };
     let result = bd_alloc(ctx, &v.to_string(), 0);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2930,7 +2934,7 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let s = format!("{}", d);
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
     let result = bd_alloc(ctx, &s, scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {
@@ -2971,7 +2975,7 @@ fn bd_alloc_bigint(
     ctx: &mut dyn NativeContext,
     unscaled: &crate::bigint::BigInt,
     scale: i32,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         // Compact iff |unscaled| <= i64::MAX (Long.MIN_VALUE is the INFLATED
         // sentinel, so exactly -2^63 must stay inflated, matching the JDK's
@@ -2992,29 +2996,29 @@ fn bd_alloc_bigint(
         } else {
             None
         };
-        let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3)?;
         if let Some(ic) = compact {
             ctx.set_field(obj, iv_i, Value::Object(None));
             ctx.set_field(obj, ic_i, Value::Long(ic));
             ctx.set_field(obj, sc_i, Value::Int(scale));
             ctx.set_field(obj, pr_i, Value::Int(0));
-            return obj;
+            return Ok(obj);
         }
         // Inflated: allocate the backing BigInteger. Pin `obj` across that
         // allocation (GC-SAFETY — see `bd_alloc`).
         let h = ctx.pin_native_root(obj);
         let bi = bi_alloc_int(ctx, unscaled);
         let obj = ctx.read_native_pin(h, obj);
-        ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(obj, iv_i, Value::Object(Some(bi?)));
         ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
         ctx.set_field(obj, sc_i, Value::Int(scale));
         ctx.set_field(obj, pr_i, Value::Int(0));
         ctx.unpin_native_roots(h);
-        return obj;
+        return Ok(obj);
     }
     // Synthetic-stub layout: fall back to the decimal-string path.
     let value = apply_scale(&unscaled.to_decimal(), scale);
-    bd_alloc(ctx, &value, scale)
+    Ok(bd_alloc(ctx, &value, scale)?)
 }
 
 fn native_bd_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3032,7 +3036,7 @@ fn native_bd_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let s = sa.max(sb);
     let sum = bigint_mul_pow10(&ua, s - sa).add(&bigint_mul_pow10(&ub, s - sb));
     let result = bd_alloc_bigint(ctx, &sum, s);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3050,7 +3054,7 @@ fn native_bd_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let s = sa.max(sb);
     let diff = bigint_mul_pow10(&ua, s - sa).sub(&bigint_mul_pow10(&ub, s - sb));
     let result = bd_alloc_bigint(ctx, &diff, s);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3068,7 +3072,7 @@ fn native_bd_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let s = sa + sb;
     let prod = ua.mul(&ub);
     let result = bd_alloc_bigint(ctx, &prod, s);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_divide(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3091,7 +3095,7 @@ fn native_bd_divide(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let s = format!("{}", a / b);
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
     let result = bd_alloc(ctx, &s, scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_divide_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3117,7 +3121,7 @@ fn native_bd_divide_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
     let s = format!("{:.prec$}", a / b, prec = new_scale as usize);
     let result = bd_alloc(ctx, &s, new_scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3234,7 +3238,7 @@ fn native_bd_to_big_integer(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let t = bd_truncated_bigint(ctx, this);
     let obj = bi_alloc_int(ctx, &t);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn native_bd_double_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3312,7 +3316,7 @@ fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         format!("-{}", dec)
     };
     let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&neg), scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3324,7 +3328,7 @@ fn native_bd_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let dec = u.to_decimal();
     let abs = dec.strip_prefix('-').unwrap_or(&dec).to_string();
     let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&abs), scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_signum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3418,7 +3422,7 @@ fn bd_set_scale_impl(
     if new_scale >= scale {
         let padded = bigint_mul_pow10(&unscaled, new_scale - scale);
         let result = bd_alloc_bigint(ctx, &padded, new_scale);
-        return Ok(Some(Value::Object(Some(result))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
     let drop = (scale - new_scale) as usize;
     let mut divisor_dec = String::with_capacity(drop + 1);
@@ -3444,7 +3448,7 @@ fn bd_set_scale_impl(
         quotient
     };
     let result = bd_alloc_bigint(ctx, &rounded, new_scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_set_scale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -3492,7 +3496,7 @@ fn native_bd_strip_zeros(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .map(|p| (stripped.len() - p - 1) as i32)
         .unwrap_or(0);
     let result = bd_alloc(ctx, &stripped, scale);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn native_bd_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

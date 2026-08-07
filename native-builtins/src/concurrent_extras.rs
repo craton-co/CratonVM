@@ -48,7 +48,7 @@ use parking_lot::{Condvar, Mutex};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{error::MethodCallResult, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // Part 1: Real work-stealing ForkJoin pool

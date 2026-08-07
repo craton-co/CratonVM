@@ -383,9 +383,9 @@ fn impl_jars_load_class_inner(
     defining_loader: Option<cratonvm_types::ObjectRef>,
     internal_name: &str,
     visited: &mut std::collections::HashSet<String>,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     if !visited.insert(internal_name.to_owned()) {
-        return None;
+        return Ok(None);
     }
     let dotted = internal_name.replace('/', ".");
     let class_file = format!("{internal_name}.class");
@@ -406,9 +406,9 @@ fn impl_jars_load_class_inner(
             // GC-safety: `create_string` below can trigger a moving GC;
             // `app_loader` (the shared application-classloader singleton) is
             // reused as an `invoke` argument afterward, unpinned otherwise.
-            let app_loader_pin = ctx.pin_native_root(app_loader);
+            let app_loader_pin = ctx.pin_native_root(app_loader?);
             let module_name_obj = ctx.create_string(&module_name);
-            let app_loader = ctx.read_native_pin(app_loader_pin, app_loader);
+            let app_loader = ctx.read_native_pin(app_loader_pin, app_loader?);
             ctx.unpin_native_roots(app_loader_pin);
             if let Ok(Some(Value::Object(Some(loader)))) = ctx.invoke(
                 "org/elasticsearch/core/internal/provider/EmbeddedImplClassLoader",
@@ -423,7 +423,7 @@ fn impl_jars_load_class_inner(
                     "(Ljava/lang/String;)Ljava/lang/Class;",
                     &[Value::Object(Some(name_obj))],
                 ) {
-                    return Some(mirror);
+                    return Ok(Some(mirror));
                 }
             }
         }
@@ -474,12 +474,12 @@ fn impl_jars_load_class_inner(
                     if let Some(loader) = defining_loader {
                         crate::classloader::register_defining_loader(ctx.vm_identity(), cid.as_u32(), loader);
                     }
-                    return Some(ctx.get_class_mirror(cid));
+                    return Ok(Some(ctx.get_class_mirror(cid)));
                 }
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// If the ServiceLoader carries a non-builtin ClassLoader, return it so the
@@ -3030,7 +3030,7 @@ fn drain_real_spliterator(
         );
     }
     let spl_pin = ctx.pin_native_root(spliterator);
-    let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
+    let collector = crate::try_alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2)?;
     let col_pin = ctx.pin_native_root(collector);
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     let initial_pin = ctx.pin_native_root(initial);

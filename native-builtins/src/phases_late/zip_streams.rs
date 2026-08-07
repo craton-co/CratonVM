@@ -340,7 +340,7 @@ pub(crate) fn drain_input_stream_per_byte(
     ctx.unpin_native_roots(is_pin);
 }
 
-pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // GZIPInputStream / GZIPOutputStream.
@@ -514,7 +514,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             // the one that is actually read. A 2-field entry left
             // `getCompressedSize()`/`getCrc()` reading past the object, and
             // `getSize()` returning an `Int` from a `()J` accessor.
-            let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+            let ze = try_alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4)?;
             let name_val = read_pinned_object_value(ctx, name_pin, name_val);
             let this = ctx.read_native_pin(this_pin, this);
             if let Some((h, _)) = name_pin {
@@ -684,7 +684,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..]));
         }
         if let Some(Value::Object(Some(src))) = args.get(1) {
             // Validate signed off/len against the array length BEFORE casting to
@@ -725,7 +725,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..]));
         }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         if let Some(state) = zo_real_fast_state(ctx, this) {
@@ -736,7 +736,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "write", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..]));
         }
         if let Some(Value::Object(Some(src))) = args.get(1) {
             let len = ctx.array_length(*src);
@@ -755,7 +755,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "closeEntry", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[]));
         }
         zo_finalize_current_entry(ctx, this);
         Ok(None)
@@ -763,7 +763,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "finish", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[]));
         }
         // Finalize any open entry
         zo_finalize_current_entry(ctx, this);
@@ -774,7 +774,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(zo, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]));
         }
         zo_finalize_current_entry(ctx, this);
         zo_write_zip(ctx, this)?;
@@ -930,6 +930,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     r.register(dos, "flush", "()V", dos_flush);
     r.register(dos, "close", "()V", dos_close);
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Register the bulk stream-transfer helper used by Spring's `StreamUtils`.
@@ -3014,7 +3015,7 @@ pub(crate) fn p58_gzip_out_close(ctx: &mut dyn NativeContext, args: &[Value]) ->
 // java.util.zip.ZipEntry = 4-field (name=0, size=1 Long, compressedSize=2 Long, crc=3 Long)
 // =============================================================================
 
-pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ze = "java/util/zip/ZipEntry";
@@ -3065,6 +3066,7 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 // =============================================================================
@@ -3852,8 +3854,8 @@ fn zip_entry_alloc(
     size: i64,
     csize: i64,
     crc: i64,
-) -> ObjectRef {
-    let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let ze = try_alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4)?;
     // Pin across `create_string` — a moving young GC there would relocate the
     // fresh entry (native stale-local family).
     let ze_pin = ctx.pin_native_root(ze);
@@ -3864,10 +3866,10 @@ fn zip_entry_alloc(
     ctx.set_field(ze, 2, Value::Long(csize));
     ctx.set_field(ze, 3, Value::Long(crc));
     ctx.unpin_native_roots(ze_pin);
-    ze
+    Ok(ze)
 }
 
-pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Adler32 = 1-field (sum=0 Long)
@@ -4012,7 +4014,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         // young GC there would relocate the array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
         for (i, (n, size, csize, crc)) in metas.iter().enumerate() {
-            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc);
+            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(ze)));
         }
@@ -4192,4 +4194,5 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.set_category(__prev_cat);
+    Ok(())
 }

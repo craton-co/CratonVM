@@ -8,7 +8,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::intern_arc;
 use cratonvm_types::Value;
 
-use crate::{alloc_concurrent_synthetic, compile_java_regex, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, compile_java_regex, native_noop_with_this, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Thread-local scratch buffers for per-element char[] reads.
@@ -6054,7 +6054,7 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // (A concurrent fix independently found this same root cause -- e.g. it
     // also breaks `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`
     // -- via a 1-field allocation; reconciled to the 2-field layout here.)
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2)?;
     // Must be a primitive `int[]`, not a reference array: this stream's
     // consumers (`IntStream.forEach`/`toArray`/etc.) read field 0 as an
     // int-element array. A `new_ref_array` allocation stored `Value::Int`s
