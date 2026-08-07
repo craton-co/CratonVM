@@ -829,7 +829,7 @@ fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 #[allow(dead_code)]
-fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<()> {
+fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Result<Option<()>, MethodCallFailed> {
     let data_class =
         "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache$Data";
 
@@ -883,22 +883,34 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
     // call below allocates and can trigger a collection that relocates the
     // PREVIOUSLY produced locals (all read again by the Data-record
     // construction/fallback further down); pin each right after it's bound.
-    let mappings = mk_hashmap(ctx)?;
+    let Some(mappings) = mk_hashmap(ctx) else {
+        return Ok(None);
+    };
     let mappings_pin = ctx.pin_native_root(mappings);
-    let reverse_mappings = mk_hashmap(ctx)?;
+    let Some(reverse_mappings) = mk_hashmap(ctx) else {
+        return Ok(None);
+    };
     let reverse_mappings_pin = ctx.pin_native_root(reverse_mappings);
-    let descendants = mk_hashset(ctx)?;
+    let Some(descendants) = mk_hashset(ctx) else {
+        return Ok(None);
+    };
     let descendants_pin = ctx.pin_native_root(descendants);
-    let sys_env_copy = mk_hashmap(ctx)?;
+    let Some(sys_env_copy) = mk_hashmap(ctx) else {
+        return Ok(None);
+    };
     let sys_env_copy_pin = ctx.pin_native_root(sys_env_copy);
 
     // Empty ConfigurationPropertyName[] — class must be loadable.
-    let cpn_cid = ctx.class_id_by_name(SICP_NAME)?;
+    let Some(cpn_cid) = ctx.class_id_by_name(SICP_NAME) else {
+        return Ok(None);
+    };
     let cpn_arr = ctx.new_ref_array(cpn_cid, 0);
     let cpn_arr_pin = ctx.pin_native_root(cpn_arr);
 
     // Empty String[]
-    let str_cid = ctx.class_id_by_name("java/lang/String")?;
+    let Some(str_cid) = ctx.class_id_by_name("java/lang/String") else {
+        return Ok(None);
+    };
     let str_arr = ctx.new_ref_array(str_cid, 0);
     let str_arr_pin = ctx.pin_native_root(str_arr);
 
@@ -940,6 +952,7 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
         ctx.unpin_native_roots(obj_pin);
         Some(obj)
     })()
+    .map(Ok)
     .unwrap_or_else(|| {
         let obj = crate::try_alloc_concurrent_synthetic(ctx, data_class, 8)?;
         let mappings = ctx.read_native_pin(mappings_pin, mappings);
@@ -968,13 +981,13 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
             Value::Object(Some(sys_env_copy)),
         );
         ctx.set_field_by_name(obj, "lastUpdated", Value::Object(Some(str_arr)));
-        obj
-    });
+        Ok(obj)
+    })?;
 
     let cache = ctx.read_native_pin(cache_pin, cache);
     ctx.unpin_native_roots(cache_pin);
     ctx.set_field_by_name(cache, "data", Value::Object(Some(data_obj)));
-    Some(())
+    Ok(Some(()))
 }
 
 #[allow(dead_code)]

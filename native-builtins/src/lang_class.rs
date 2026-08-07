@@ -12687,7 +12687,7 @@ fn create_annotation_proxy_with_type(
             value_container_class_id,
             value_container_loader,
             ann_class_id_opt,
-        );
+        )?;
         if crate::nbflags().iae_trace2 {
             let desc = match &java_val {
                 Value::Object(Some(o)) => {
@@ -12789,8 +12789,8 @@ fn create_annotation_proxy_with_type(
 pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
-) -> Value {
-    annotation_element_to_java_typed(ctx, val, None, None, None, None)
+) -> Result<Value, MethodCallFailed> {
+    Ok(annotation_element_to_java_typed(ctx, val, None, None, None, None)?)
 }
 
 /// Preserve the declared array shape when the class-file annotation reader
@@ -12867,10 +12867,10 @@ pub(crate) fn annotation_element_to_java_typed(
     container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
     annotation_class_id: Option<ClassId>,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     use cratonvm_native_api::AnnotationElementValue;
     let container_loader_pin =
-        container_loader.map(|loader| ctx.pin_native_root(loader));
+        container_loader.map(|loader| ctx.pin_native_root(loader))?;
     let result = (|| match val {
         AnnotationElementValue::Int(v) => {
             // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
@@ -13443,7 +13443,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     container_class_id,
                     loader_cur,
                     annotation_class_id,
-                );
+                )?;
                 arr = ctx.read_native_pin(arr_pin, arr);
                 let value_pin = match v {
                     Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
@@ -13490,7 +13490,7 @@ pub(crate) fn annotation_element_to_java_typed(
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
     }
-    result
+    Ok(result)
 }
 
 /// Build an Annotation[] array from annotation data.

@@ -801,7 +801,7 @@ pub(crate) fn native_method_get_default_value(
         Some(class_id),
         container_loader,
         Some(class_id),
-    )))
+    )?))
 }
 
 // ---------------------------------------------------------------------------

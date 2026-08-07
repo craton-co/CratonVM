@@ -2118,7 +2118,8 @@ fn huc_verify_hostname(
         ctx,
         "javax/net/ssl/SSLSession",
         crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
-    )?;
+    )
+    .map_err(|_| "--jdk-only refused javax/net/ssl/SSLSession".to_string())?;
     let session_pin = ctx.pin_native_root(session0);
 
     let proto_s = ctx.read_native_pin(proto_pin, proto_s0);

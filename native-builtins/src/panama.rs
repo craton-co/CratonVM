@@ -2258,7 +2258,7 @@ pub(crate) fn pe_downcall_type(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }
 
     let method_type =
-        crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor).ok_or_else(
+        crate::lang_invoke::build_method_type_from_descriptor(ctx, &method_descriptor)?.ok_or_else(
             || -> MethodCallFailed {
                 RuntimeError::IllegalStateException {
                     message: format!(

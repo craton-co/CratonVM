@@ -2926,8 +2926,8 @@ pub(crate) fn try_build_real_certificate_factory(
     let Some(provider) = find_service_provider("CertificateFactory", &algo) else {
         return Ok(None);
     };
-    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo)? {
-        Ok(Some(Value::Object(Some(o)))) => o,
+    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo) {
+        Some(Ok(Some(Value::Object(Some(o))))) => o,
         _ => return Ok(None),
     };
     let pin = ctx.pin_native_root(impl_ref);
