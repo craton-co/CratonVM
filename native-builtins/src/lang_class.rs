@@ -2786,6 +2786,32 @@ pub(crate) fn native_class_is_instance(
     };
     let target_class_id = ctx.class_id_of_object(target);
 
+    // PERF (webapp-deploy annotation scan): answer the ordinary "the object's
+    // class IS, or extends/implements, this mirror's class" shape from class
+    // ids alone, before anything below materialises a class NAME.
+    //
+    // Every `class_name_of_id` / `mirror_class_name` call takes the class-
+    // manager read lock and clones the name into a fresh `String`, and the
+    // AnnotationProxy and `Proxy$Instance` probes below each do one on EVERY
+    // call just to compare against a fixed literal. Tomcat's BCEL scanner
+    // reaches this through `ConstantPool.getConstant(int, Class)`, which runs
+    // `castTo.isAssignableFrom(...)` + `castTo.cast(...)` once per constant-
+    // pool access of every class in every scanned jar: a `--stack-sample-ms`
+    // profile of `TestHostConfigAutomaticDeploymentCopyXML` put 55% of all
+    // interpreted time in that one method.
+    //
+    // This is the FIRST TWO DISJUNCTS OF THIS FUNCTION'S OWN TAIL, evaluated
+    // earlier. Every branch between here and there returns `1` or falls
+    // through -- none returns `0` -- so hoisting a `true` cannot change an
+    // answer. Arrays are excluded: `class_id_of_object` reports an array's
+    // COMPONENT class id, so the id comparison is not meaningful for them and
+    // they keep taking the descriptor-based path above and the tail below.
+    if !target_is_array
+        && (target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id))
+    {
+        return Ok(Some(Value::Int(1)));
+    }
+
     // Annotation proxy special case: our `create_annotation_proxy` allocates
     // objects of class `java/lang/annotation/AnnotationProxy`, not of the
     // actual annotation interface. JDK reflection and Spring's
@@ -3151,6 +3177,29 @@ pub(crate) fn native_class_is_assignable_from(
         // вЂ” it throws `IllegalArgumentException` from
         // `assignableCheckFailed` when this returns false, masking the
         // underlying type-system gap.
+        // PERF (webapp-deploy annotation scan): same hoist as
+        // `native_class_is_instance` above, and the same reason -- the two
+        // `mirror_class_name` calls immediately below each take the class-
+        // manager read lock and clone the name into a fresh `String`, on a path
+        // Tomcat's BCEL scanner walks once per constant-pool access
+        // (`ConstantPool.getConstant(int, Class)` -> `castTo.isAssignableFrom`).
+        //
+        // These are the first two disjuncts of this function's own tail. Every
+        // branch between here and there returns `1` or falls through, and the
+        // two `mirror_class_id` `None` arms cannot be reached once BOTH ids
+        // have resolved -- so hoisting a `true` cannot change an answer.
+        // Skipped when the ObservationRegistry trace is armed, so that
+        // diagnostic still sees every call.
+        if !crate::vmflags().loader.dbg_obsreg {
+            if let (Some(this_cid), Some(other_cid)) =
+                (mirror_class_id(ctx, this), mirror_class_id(ctx, other))
+            {
+                if this_cid == other_cid || ctx.is_subclass(other_cid, this_cid) {
+                    return Ok(Some(Value::Int(1)));
+                }
+            }
+        }
+
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
         if crate::vmflags().loader.dbg_obsreg

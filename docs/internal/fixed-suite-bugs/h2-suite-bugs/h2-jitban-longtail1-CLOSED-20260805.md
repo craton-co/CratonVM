@@ -143,8 +143,10 @@ at `nioMemLZF:`. It cleared `memFS:`, `memLZF:`, `nioMemFS:`, `nioMemLZF:1:`,
 **That is not reproducible on `dev` as of 2026-08-05**, for a reason unrelated to
 anything here: the class now dies in ~1 second on the *first*, plain-disk
 filesystem with `IOException: pread0/pwrite0: bad addr/len/pos`, identically on
-`dev` and on this branch, where the 2026-08-02 binary did not. Filed as
-`docs/known-issues/h2/bug-h2-testfilesystem-pread0-bad-addr-len-pos-20260805.md`.
+`dev` and on this branch, where the 2026-08-02 binary did not. Filed as the
+`bug-h2-testfilesystem-pread0-bad-addr-len-pos` write-up, which closed
+2026-08-07 as not reproducible — including at this very commit, so what that
+2026-08-05 arm measured is not settled.
 So `TestFileSystem` cannot presently serve as this page's acceptance test; the
 `DbbElemProbe` / `LzfProbe` / `DirectReclaimProbe` numbers above and the
 per-class table earlier are what the verdict rests on.
@@ -227,8 +229,10 @@ reached before, and it is not about the JIT ban or about `nioMemLZF:`. It does
 NOT reproduce in isolation — `probes/WeakGcProbe.java` collects a plain object,
 a direct buffer and a `MappedByteBuffer` on the first `System.gc()`, and
 `apps/h2database-suite-runner/probes/NioMappedProbe.java` drives H2's own
-`unMap()` path clean on both this build and an unmodified `dev` one. Tracked in
-`docs/known-issues/h2/bug-h2-niomapped-unmap-gc-timeout.md`.
+`unMap()` path clean on both this build and an unmodified `dev` one. Tracked in the `bug-h2-niomapped-unmap-gc-timeout` write-up, which closed
+2026-08-07: the retention was the conservative JIT root scan marking the whole
+native stack on the residue of a compiled frame that had already returned, and
+it reproduces in 12 seconds, not 784.
 
 ## Reproducing
 
