@@ -961,3 +961,85 @@ pwsh apps/tomcat-suite-runner/run-one.ps1 -Vm craton -Exe <cratonvm.exe> -Class 
 the `examples` redeploy under the ~1 s the `list` assertion needs and the
 `bug57700` deploy under the client's 30 s read timeout. Both test methods then
 pass without touching the test.
+
+---
+
+## Handoff 2026-08-07 — the `TestHostConfigAutomaticDeployment*` family is this doc's, and here is its profile
+
+Arrived here from
+`fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`,
+which proposed that a persistent moving-young → non-moving GC fallback was
+making that family HANG. It is not: GC-side work on those classes measures
+**0.4 %** of the run (101 minor collections, 0 major, 1.41 s of card refinement
+in a 352 s run), and forcing `CRATONVM_NO_MOVING_YOUNG=1` changes nothing. The
+family does not hang either — all ten classes PASS. What is left is this doc's
+subject, so the measurements move here.
+
+**Scale, standalone, HotSpot control run back to back on the same host**
+(`dev` `e9c05391a`; box quiet at load ~15 for the last row):
+
+| Class | CratonVM | HotSpot | ratio |
+|---|---|---|---|
+| `…DeploymentModification` | 448 s | 21 s | 21× |
+| `…DeploymentUpdateWarOffline` | 246 s | 13 s | 19× |
+| `…DeploymentDeleteC` | 215 s | 13 s | 17× |
+| `…DeploymentCopyXML` | 126 s | 10 s | 12× |
+| `…DeploymentDeleteA` | 77 s | 7 s | 10× |
+| `catalina.nonblocking.TestNonBlockingAPI` | 485 s | 55 s | 9× |
+| `…DeploymentAddition` (quiet box) | 352 s | 11 s | **32×** |
+
+**Time-weighted interpreted profile** (`--stack-sample-ms 50` over `CopyXML`,
+1516 samples ≈ 76 s of a 79 s run — essentially every sample has an interpreted
+frame on top):
+
+```
+ 55.21%  org/apache/tomcat/util/bcel/classfile/ConstantPool.getConstant
+ 12.47%  java/io/BufferedInputStream.fill
+  5.74%  java/io/BufferedInputStream.read
+  2.97%  org/apache/catalina/startup/ContextConfig.processAnnotationsJar
+  2.64%  org/apache/tomcat/util/bcel/classfile/ConstantPool.<init>
+  1.65%  org/apache/catalina/startup/ContextConfig.processResourceJARs
+  1.52%  org/apache/catalina/startup/ContextConfig.processAnnotationsFile
+  1.19%  org/apache/tomcat/util/bcel/classfile/JavaClass.<init>
+  0.86%  java/io/BufferedInputStream.getBufIfOpen
+```
+
+The `BufferedInputStream` bodies this doc's 2026-08-06 update named are still
+there but no longer dominant (≈ 19.5 % combined, down from 78.3 %). The new top
+line is BCEL's own constant-pool reader.
+
+**Native-invocation census** (`--dump-native-registry`, same class, 122 s):
+**48.2 M native invocations**, and the shape is the class-file reader:
+
+```
+12 645 096  java/io/DataInputStream.readByte()B
+ 6 935 427  java/util/Objects.requireNonNull(Object,String)
+ 6 934 818  java/io/DataInputStream.readUTF()
+ 6 523 648  java/io/DataInputStream.skipBytes(int)
+ 4 802 416  java/io/DataInputStream.readUnsignedShort()
+ 1 771 570  java/lang/Class.isAssignableFrom(Class)
+ 1 771 319  java/lang/Class.cast(Object)
+ 1 490 869  java/io/DataInputStream.readInt()
+   746 864  java/util/jar/JarEntry.getName()
+```
+
+That is ≈ 2.5 µs of wall per native invocation if the run were nothing else,
+which it is not — but it does say where to look next: **the per-invocation cost
+of a registered native, and the `DataInputStream` family's 32 M round trips**,
+not the JIT-admission levers this doc has already exhausted.
+
+### One lever measured and rejected as a fix
+
+`ConstantPool.getConstant(int, Class)` runs `castTo.isAssignableFrom(…)` and
+`castTo.cast(…)` once per constant-pool access — the 1.77 M pairs above. Both
+natives materialised class **names** before deciding (two `mirror_class_name` /
+`class_name_of_id` calls each, every one taking the class-manager read lock and
+cloning a `String`). Both now answer the "same class, or a subclass" shape from
+class ids alone. Measured, 2 M iterations, A-B-B-A:
+`isAssignableFrom` 793 → 565 ms (1.40×), `isInstance` 899 → 615 ms (1.46×);
+HotSpot is 9 ms and 7 ms.
+
+**It does not move this workload**: 1.77 M × 114 ns ≈ 0.2 s of 122 s, and
+`CopyXML` measures the same before and after (A-B-B-A: 116 / 111 / 116 / 122 s).
+Recorded so the next reader does not re-derive it — the reflective type checks
+are 1.5 % of the native traffic here, and the `DataInputStream` family is 66 %.
