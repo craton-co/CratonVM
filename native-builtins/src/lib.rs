@@ -33326,7 +33326,7 @@ fn native_charset_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     }
 
     let this_pin = ctx.pin_native_root(this);
-    let set = build_real_layout_string_hashset(ctx, &[]);
+    let set = build_real_layout_string_hashset(ctx, &[])?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, "aliasSet", Value::Object(Some(set)));
     ctx.set_field(this, 2, Value::Object(Some(set)));

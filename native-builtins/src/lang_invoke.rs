@@ -734,7 +734,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             }
         }
         out.push(')');
-        let ret = simple_name(ctx, rtype);
+        let ret = simple_name(ctx, rtype)?;
         let s = if !ptypes_ok || ret == "?" {
             // A field could not be read — do not invent a signature.
             ctx.create_string(&format!("MethodType({param_count} params)"))

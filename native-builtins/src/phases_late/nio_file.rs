@@ -1048,7 +1048,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
             // (already established for exactly this class of bug — see its
             // doc comment) instead.
             let keys: Vec<ObjectRef> = names.iter().map(|s| ctx.create_string(s)).collect();
-            let s = crate::build_real_layout_string_hashset(ctx, &keys);
+            let s = crate::build_real_layout_string_hashset(ctx, &keys)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -6693,7 +6693,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 // Normalize even for non-existent paths: make absolute and
                 // collapse `.`/`..` so containment checks behave like the
                 // real JDK. Strips the `\\?\` extended-length prefix too.
-                let canonical = file_canonicalize_path(&p);
+                let canonical = file_canonicalize_path(&p)?;
                 let s = ctx.create_string(&canonical);
                 Ok(Some(Value::Object(Some(s))))
             },
@@ -12923,7 +12923,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let path = file_read_path(ctx, this);
-            let canonical = file_canonicalize_path(&path);
+            let canonical = file_canonicalize_path(&path)?;
             let s = ctx.create_string(&canonical);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -12931,7 +12931,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
     r.register(file, "getCanonicalFile", "()Ljava/io/File;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        let canonical = file_canonicalize_path(&path);
+        let canonical = file_canonicalize_path(&path)?;
         Ok(Some(Value::Object(Some(file_alloc(ctx, &canonical)?))))
     });
     r.register(file, "isAbsolute", "()Z", |ctx, args| {

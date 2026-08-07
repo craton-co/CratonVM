@@ -3467,7 +3467,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
             }
             "toString" => {
-                let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler);
+                let s = crate::lang_class::ctx_annotation_proxy_to_string(ctx, handler)?;
                 let result = ctx.create_string(&s);
                 return Ok(Some(Value::Object(Some(result))));
             }

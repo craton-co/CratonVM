@@ -2676,20 +2676,20 @@ pub(crate) fn sb2_launcher_get_class_path_archives_list(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let archives = sb2_launcher_build_archive_list(ctx, this);
+    let archives = sb2_launcher_build_archive_list(ctx, this)?;
     // Pin the archives across the list/array allocs below — a moving young GC
     // there would relocate them (native stale-local family).
     let pins = pin_object_values(ctx, &archives);
     let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let list_pin = ctx.pin_native_root(list);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives?.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
     let list = ctx.read_native_pin(list_pin, list);
     for (i, (v, p)) in archives.iter().zip(&pins).enumerate() {
         let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
     ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(archives?.len() as i32));
+    ctx.set_field(list, 1, Value::Int(archives.len() as i32));
     let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     ctx.unpin_native_roots(first_pin.unwrap_or(list_pin));
     Ok(Some(Value::Object(Some(list))))
@@ -2705,7 +2705,7 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let archives = sb2_launcher_build_archive_list(ctx, this);
+    let archives = sb2_launcher_build_archive_list(ctx, this)?;
     // Wrap the archive array in `java/util/Enumeration$Impl` — a synthetic
     // class with `hasNext`/`next` natives already registered by
     // `register_enumeration_impl_natives` (layout: field 0 = elements
@@ -2720,7 +2720,7 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
     // Pin the archives across the array/iterator allocs below — a moving
     // young GC there would relocate them (native stale-local family).
     let pins = pin_object_values(ctx, &archives);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives?.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, archives.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, (v, p)) in archives.iter().zip(&pins).enumerate() {
         let v = read_pinned_object_value(ctx, *p, *v);
@@ -2733,7 +2733,7 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
     if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries",
-            archives?.len()
+            archives.len()
         );
     }
     Ok(Some(Value::Object(Some(itr))))
@@ -2835,7 +2835,7 @@ pub(crate) fn p59_jar_file_entries(
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let elems = p59_jar_collect_entries(ctx, &path);
+    let elems = p59_jar_collect_entries(ctx, &path)?;
     // Pack into the concrete synthetic `Enumeration$Impl` (array=0,
     // cursor=1). Allocating the bare `java/util/Enumeration` interface
     // produced an object with no instantiable concrete class — it degraded
@@ -2844,7 +2844,7 @@ pub(crate) fn p59_jar_file_entries(
     // young GC there would relocate them (native stale-local family).
     let pins = pin_object_values(ctx, &elems);
     let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems?.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elems.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, (v, p)) in elems.iter().zip(&pins).enumerate() {
         let v = read_pinned_object_value(ctx, *p, *v);

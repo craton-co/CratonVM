@@ -6090,16 +6090,16 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
     // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
     // with NO GC-blocking-region bracket — same missing-bracket bug as
     // ReentrantReadWriteLock's rw_write_lock (see that registration's
     // comment for the full rationale and how this was diagnosed).
     ctx.begin_blocking_region();
-    let stamp = crate::stamped_lock::stamped_write_lock(addr?);
+    let stamp = crate::stamped_lock::stamped_write_lock(addr);
     ctx.end_blocking_region();
-    mirror_stamped_state(ctx, obj, addr?);
+    mirror_stamped_state(ctx, obj, addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
         eprintln!("[SL-DBG] writeLock addr={addr:#x} stamp={stamp}");
     }
@@ -6436,9 +6436,9 @@ fn native_stamped_try_convert_to_optimistic(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let converted = crate::stamped_lock::stamped_try_convert_to_optimistic(addr?, stamp);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let converted = crate::stamped_lock::stamped_try_convert_to_optimistic(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
         eprintln!("[SL-DBG] tryConvertToOptimisticRead addr={addr:#x} stamp={stamp} -> {converted}");
     }

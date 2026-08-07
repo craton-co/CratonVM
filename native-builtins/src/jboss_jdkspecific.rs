@@ -775,7 +775,7 @@ pub(crate) fn native_module_get_packages(
         }
     };
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let set = build_package_set(ctx, &refs);
+    let set = build_package_set(ctx, &refs)?;
     Ok(Some(Value::Object(Some(set))))
 }
 

@@ -964,7 +964,7 @@ fn native_dcm_get_cache_names(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // this method with no null guard.
     let names = global_manager().cache_names();
     let key_objs: Vec<ObjectRef> = names.iter().map(|n| ctx.create_string(n)).collect();
-    let set = crate::build_real_layout_string_hashset(ctx, &key_objs);
+    let set = crate::build_real_layout_string_hashset(ctx, &key_objs)?;
     Ok(Some(Value::Object(Some(set))))
 }
 

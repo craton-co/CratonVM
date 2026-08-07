@@ -701,7 +701,7 @@ pub(crate) fn native_class_get_enclosing_method_public(
     let methods = ctx.declared_methods(enc_class_id);
     for meta in &methods {
         if &*meta.name == method_name && &*meta.descriptor == method_desc {
-            let m = create_method_object(ctx, meta);
+            let m = create_method_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(m))));
         }
     }
@@ -743,7 +743,7 @@ pub(crate) fn native_class_get_enclosing_constructor_public(
     let methods = ctx.declared_methods(enc_class_id);
     for meta in &methods {
         if &*meta.name == "<init>" && &*meta.descriptor == method_desc {
-            let c = create_constructor_object(ctx, meta);
+            let c = create_constructor_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(c))));
         }
     }

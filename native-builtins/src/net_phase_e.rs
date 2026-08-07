@@ -2804,15 +2804,15 @@ fn uri_host_is_valid(host: &str) -> bool {
 }
 
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
-fn uri_resolve_ref(base: &str, reference: &str) -> String {
+fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFailed> {
     if reference.is_empty() {
-        return base.to_string();
+        return Ok(base.to_string());
     }
     let (r_scheme, r_auth, r_path, r_query, r_frag) = uri_split(reference);
     // Reference has a scheme → it is absolute, return as-is (normalized).
     if r_scheme.is_some() {
-        let path = uri_remove_dot_segments(&r_path);
-        return uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag);
+        let path = uri_remove_dot_segments(&r_path)?;
+        return Ok(uri_recompose(&r_scheme, &r_auth, &path, &r_query, &r_frag));
     }
     let (b_scheme, b_auth, b_path, b_query, _b_frag) = uri_split(base);
     let (t_auth, t_path, t_query);
@@ -2834,7 +2834,7 @@ fn uri_resolve_ref(base: &str, reference: &str) -> String {
         }
         t_query = r_query;
     }
-    uri_recompose(&b_scheme, &t_auth, &t_path, &t_query, &r_frag)
+    Ok(uri_recompose(&b_scheme, &t_auth, &t_path, &t_query, &r_frag))
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.
@@ -3465,11 +3465,11 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
         if opaque || path.is_empty() {
             return Ok(Some(Value::Object(Some(this))));
         }
-        let mut norm = uri_remove_dot_segments(&path);
+        let mut norm = uri_remove_dot_segments(&path)?;
         // For a relative path whose first segment ends up containing a ':',
         // prefix "./" so it cannot be re-parsed as a scheme (JDK does the same).
-        if scheme.is_none() && authority.is_none() && !norm?.starts_with('/') {
-            if norm?
+        if scheme.is_none() && authority.is_none() && !norm.starts_with('/') {
+            if norm
                 .split('/')
                 .next()
                 .map(|s| s.contains(':'))
@@ -3502,7 +3502,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
                 Some(Value::Object(Some(o))) => uri_raw_string(ctx, *o),
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let resolved = uri_resolve_ref(&base, &reference);
+            let resolved = uri_resolve_ref(&base, &reference)?;
             Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
         },
     );
@@ -3520,7 +3520,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
-            let resolved = uri_resolve_ref(&base, &reference);
+            let resolved = uri_resolve_ref(&base, &reference)?;
             Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
         },
     );
@@ -3551,16 +3551,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
             {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let b_norm = uri_remove_dot_segments(&b_path);
+            let b_norm = uri_remove_dot_segments(&b_path)?;
             let t_norm = uri_remove_dot_segments(&t_path);
             if !t_norm?.starts_with(&b_norm) {
                 return Ok(Some(Value::Object(Some(other))));
             }
-            let rel = &t_norm[b_norm?.len()..];
+            let rel = &t_norm[b_norm.len()..];
             if rel.is_empty() {
                 return Ok(Some(Value::Object(Some(make_uri(ctx, "")?))));
             }
-            if !b_norm?.ends_with('/') && !rel.starts_with('/') {
+            if !b_norm.ends_with('/') && !rel.starts_with('/') {
                 return Ok(Some(Value::Object(Some(other))));
             }
             let rel = rel.strip_prefix('/').unwrap_or(rel);

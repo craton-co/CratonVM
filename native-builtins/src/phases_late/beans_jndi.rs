@@ -2372,8 +2372,8 @@ pub(crate) fn introspector_get_bean_info(
                 let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
                 let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
                 let mm = ctx.read_native_pin(mm_pin, mm?);
-                let idx = prop_idx(&mut props, &prop_name);
-                let p = &mut props[idx]?;
+                let idx = prop_idx(&mut props, &prop_name)?;
+                let p = &mut props[idx];
                 if is_is {
                     // A boolean isXxx() always wins and locks out plain getters.
                     p.read_method = Some((mm_pin, mm));
@@ -2405,7 +2405,7 @@ pub(crate) fn introspector_get_bean_info(
                         method.access_flags,
                     );
                     let mm_pin = ctx.pin_native_root(mm?);
-                    let idx = prop_idx(&mut props, &prop_name);
+                    let idx = prop_idx(&mut props, &prop_name)?;
                     if props[idx].indexed_read.is_none() {
                         props[idx].indexed_read = Some((mm_pin, mm?));
                     }
@@ -2451,7 +2451,7 @@ pub(crate) fn introspector_get_bean_info(
                     let param_mirror_pin = ctx.pin_native_root(param_mirror);
                     let param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
                     let mm = ctx.read_native_pin(mm_pin, mm?);
-                    let idx = prop_idx(&mut props, &prop_name);
+                    let idx = prop_idx(&mut props, &prop_name)?;
                     props[idx].write_methods.push((
                         (mm_pin, mm),
                         param_desc,
@@ -2471,7 +2471,7 @@ pub(crate) fn introspector_get_bean_info(
                         method.access_flags,
                     );
                     let mm_pin = ctx.pin_native_root(mm?);
-                    let idx = prop_idx(&mut props, &prop_name);
+                    let idx = prop_idx(&mut props, &prop_name)?;
                     props[idx]
                         .indexed_write_candidates
                         .push(((mm_pin, mm?), params[1].clone()));

@@ -346,7 +346,7 @@ fn md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
     let algo = read_algo(ctx, this);
     let data = read_accumulator(ctx, this);
-    let hash = compute_digest(&algo, &data);
+    let hash = compute_digest(&algo, &data)?;
     // Reset accumulator after digest() per JDK contract.  Re-seed with an
     // empty entry so subsequent update→digest round-trips on the same
     // instance still satisfy the presence check above.

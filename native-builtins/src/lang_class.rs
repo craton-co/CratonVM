@@ -9092,7 +9092,7 @@ pub(crate) fn native_class_get_declared_method(
             if decl == class_id {
                 if let Some(meta) = methods.get(idx as usize) {
                     if meta.name == target_name {
-                        let method_obj = create_method_object(ctx, meta);
+                        let method_obj = create_method_object(ctx, meta)?;
                         return Ok(Some(Value::Object(Some(method_obj))));
                     }
                 }
@@ -9167,7 +9167,7 @@ pub(crate) fn native_class_get_declared_method(
                 meta_idx as u32,
             );
         }
-        let method_obj = create_method_object(ctx, meta);
+        let method_obj = create_method_object(ctx, meta)?;
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -10232,7 +10232,7 @@ pub(crate) fn native_class_get_declared_constructor(
             }
         }
 
-        let ctor_obj = create_constructor_object(ctx, meta);
+        let ctor_obj = create_constructor_object(ctx, meta)?;
         return Ok(Some(Value::Object(Some(ctor_obj))));
     }
 
@@ -10497,7 +10497,7 @@ pub(crate) fn native_class_get_fields(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    let arr = collect_public_fields(ctx, class_id);
+    let arr = collect_public_fields(ctx, class_id)?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -10636,7 +10636,7 @@ pub(crate) fn native_class_get_methods(
                 return Ok(Some(Value::Object(Some(arr))));
             }
         };
-        let arr = collect_public_methods(ctx, class_id);
+        let arr = collect_public_methods(ctx, class_id)?;
         Ok(Some(Value::Object(Some(arr))))
     })();
     GET_METHODS_DEPTH.with(|d| d.set(prev_depth));
@@ -10731,7 +10731,7 @@ pub(crate) fn native_class_get_method(
                     && meta.name != "<clinit>"
                     && (meta.access_flags & 0x0001) != 0
                 {
-                    let method_obj = create_method_object(ctx, meta);
+                    let method_obj = create_method_object(ctx, meta)?;
                     return Ok(Some(Value::Object(Some(method_obj))));
                 }
             }
@@ -10805,7 +10805,7 @@ pub(crate) fn native_class_get_method(
                     meta_idx as u32,
                 );
             }
-            let method_obj = create_method_object(ctx, meta);
+            let method_obj = create_method_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(method_obj))));
         }
         // Depth-first class lookup precedes interfaces: for a package-private
@@ -10936,7 +10936,7 @@ pub(crate) fn native_class_get_constructor(
             continue;
         }
 
-        let ctor_obj = create_constructor_object(ctx, meta);
+        let ctor_obj = create_constructor_object(ctx, meta)?;
         return Ok(Some(Value::Object(Some(ctor_obj))));
     }
 
@@ -11817,7 +11817,7 @@ fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> Result<
         Value::Object(None) | Value::Uninitialized => Ok(0),
         Value::Object(Some(obj)) => {
             if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-                return Ok(ctx_annotation_array_hash(ctx, obj));
+                return Ok(ctx_annotation_array_hash(ctx, obj)?);
             }
             let cname = ctx_class_name_of(ctx, obj);
             if ctx_wrapper_class_to_primitive(&cname).is_some() {
@@ -11842,15 +11842,15 @@ fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> Result<
     }
 }
 
-fn ctx_annotation_array_hash(ctx: &mut dyn NativeContext, arr: ObjectRef) -> i32 {
+fn ctx_annotation_array_hash(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Result<i32, MethodCallFailed> {
     let n = ctx.array_length(arr);
     let mut h: i32 = 1;
     for i in 0..n {
         let elem = ctx.get_array_element(arr, i);
-        let elem_hash = ctx_annotation_value_hash(ctx, elem);
+        let elem_hash = ctx_annotation_value_hash(ctx, elem)?;
         h = h.wrapping_mul(31).wrapping_add(elem_hash);
     }
-    h
+    Ok(h)
 }
 
 fn ctx_annotation_member_hash(ctx: &mut dyn NativeContext, name: &str, val: Value) -> i32 {
@@ -11895,7 +11895,7 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
                 for i in 0..nx {
                     let av = ctx.get_array_element(x, i);
                     let bv = ctx.get_array_element(y, i);
-                    if !ctx_annotation_values_equal(ctx, av, bv) {
+                    if !ctx_annotation_values_equal(ctx, av, bv)? {
                         return Ok(false);
                     }
                 }
@@ -11990,7 +11990,7 @@ pub(crate) fn ctx_annotation_proxy_equals(
             Some((_, v)) => *v,
             None => return Ok(false),
         };
-        if !ctx_annotation_values_equal(ctx, *av, bv) {
+        if !ctx_annotation_values_equal(ctx, *av, bv)? {
             return Ok(false);
         }
     }
