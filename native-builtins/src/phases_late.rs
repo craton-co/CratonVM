@@ -1246,25 +1246,21 @@ const PB_FIELD_COMMAND: usize = 0;
 const PB_FIELD_DIRECTORY: usize = 1;
 const PB_FIELD_ENVIRONMENT: usize = 2;
 
-/// Leading slots reserved for `java.lang.Process`'s own six instance fields
-/// (`outputWriter`, `outputCharset`, `inputReader`, `inputCharset`,
-/// `errorReader`, `errorCharset`). Real `java.lang.Process` bytecode — the
-/// final concrete `inputReader()`/`errorReader()`/`outputWriter()` — resolves
-/// those to absolute slots 0..=5 on whatever receiver it is handed, so a
-/// synthetic Process that puts its own state there makes that bytecode read
-/// an int fd as a `BufferedReader`. Must stay identical to `native-io`'s
-/// `process::JAVA_PROCESS_FIELD_COUNT`: `native-io`'s `legacy_captured_stream`
-/// reads THIS layout's stdout/stderr string slots through its own
-/// `PROC_FIELD_STDIN_FD`/`PROC_FIELD_STDOUT_FD` constants, an alias that only
-/// holds while both layouts start at the same offset.
-const JAVA_PROCESS_FIELD_COUNT: usize = 6;
-
-const PROC_FIELD_EXIT: usize = JAVA_PROCESS_FIELD_COUNT;
-const PROC_FIELD_STDOUT: usize = JAVA_PROCESS_FIELD_COUNT + 1;
-const PROC_FIELD_STDERR: usize = JAVA_PROCESS_FIELD_COUNT + 2;
-const PROC_FIELD_PID: usize = JAVA_PROCESS_FIELD_COUNT + 3;
-/// Total slots on this (legacy) synthetic Process.
-const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 4;
+// The legacy synthetic Process layout -- JAVA_PROCESS_FIELD_COUNT and the four
+// PROC_FIELD_* slots after it -- lived here, together with the
+// `ProcessBuilder.start` that produced it and the sixteen Process natives that
+// read it. All of it is gone; `native-io::process` owns the Process surface and
+// this file registers ITS `native_process_builder_start`.
+//
+// The layout was allocated with
+// `alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT)`,
+// which in real-JDK mode yields the REAL six-field `java.lang.Process`: the
+// four extra slots did not exist, so every write to them was dropped and every
+// read of them returned nothing. The same shape on the `Runtime.exec` route is
+// what emptied Tomcat's CGI response body -- see
+// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
+// It was unreachable here only because `register_io_natives` registers over
+// these triples later, which is a property of boot ordering, not of this code.
 
 /// Walk a `java.util.Map`'s entries via its own `entrySet()`/`iterator()`/
 /// `Map.Entry` protocol (virtual dispatch on the receiver's real class, not a
@@ -1403,223 +1399,27 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, PB_FIELD_DIRECTORY)))
     });
 
-    // ProcessBuilder.start() — real process execution via std::process::Command
+    // ProcessBuilder.start() -- `native-io`'s implementation, registered here
+    // rather than reimplemented.
     //
-    // `SyntheticStub`, stated, for the same reason as the `native-io` copy that
-    // supersedes this one: `start()` is ordinary bytecode on the image, so §1.4
-    // gives the real method precedence and a shadow of it is not a bridge.
-    // Stating it here matters even though this registration loses the slot —
-    // strict mode drops registrations as they are made, so if only the winner
-    // were restated this one would simply inherit the slot and keep fabricating.
-    r.register(pb, "start", "()Ljava/lang/Process;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // FIX (finding 5): this was an UNCONDITIONAL stderr print on every
-        // ProcessBuilder.start() — noisy in production. Gate it behind the
-        // standard CRATONVM_DBG_PB debug flag.
-        if crate::vmflags().io.dbg_pb {
-            eprintln!("[PB-START-ENTRY] this={:?}", this);
-        }
-
-        // --- Extract command strings from the `command` field ---
-        // Three cases are possible:
-        //
-        //  (1) Our `<init>([Ljava/lang/String;)V` shim ran — slot 0 holds
-        //      the raw String[] verbatim. Detect via `heap_kind_of ==
-        //      Array`.
-        //
-        //  (2) The real-JDK `<init>([Ljava/lang/String;)V` bytecode ran
-        //      (e.g. because the receiver class disagreed with our
-        //      registration, or our shim wasn't installed yet) — slot 0
-        //      holds an ArrayList. The ArrayList's `elementData` field
-        //      is the backing Object[]; its `size` field is the live
-        //      element count. Read both by NAME, not by slot index, so
-        //      we don't pick up AbstractList.modCount (slot 0) by
-        //      accident — that was the immediate trigger of
-        //      `[ARRAY-LEN-GUARD] non-array object class=java/util/
-        //      ArrayList` from `org/aesh/terminal/utils/InfoCmp.
-        //      getInfoCmp` (wildfly-39 / keycloak-16 jboss-cli-client.jar).
-        //
-        //  (3) `command(List)` was called and the List is some other
-        //      `Collection` (e.g. unmodifiable). Best-effort: walk it as
-        //      an ArrayList via the named fields; if `elementData` /
-        //      `size` aren't present (synthetic ArrayList) fall back to
-        //      slot-1-as-size.
-        // Prefer real-JDK `command` field (slot 0 may have been
-        // descriptor-coerced if the field is declared with a primitive
-        // type ancestor) — match the read path with the write path.
-        let cmd_val = match ctx.get_field_by_name(this, "command") {
-            Value::Object(Some(o)) => Value::Object(Some(o)),
-            _ => ctx.get_field(this, PB_FIELD_COMMAND),
-        };
-        let mut cmd_strings: Vec<String> = Vec::new();
-
-        if let Value::Object(Some(cmd_obj)) = cmd_val {
-            use cratonvm_types::ObjectKind;
-            if ctx.heap_kind_of(cmd_obj) == ObjectKind::Array {
-                // Case (1): raw String[] — iterate elements.
-                let len = ctx.array_length(cmd_obj);
-                for i in 0..len {
-                    if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, i) {
-                        cmd_strings.push(ctx.read_string(s).unwrap_or_default());
-                    }
-                }
-            } else {
-                // Case (2) / (3): treat as List. Prefer real-JDK named
-                // fields; fall back to slot indices for the synthetic
-                // ArrayList layout (data_array=0, size=1).
-                let size_by_name = match ctx.get_field_by_name(cmd_obj, "size") {
-                    Value::Int(v) => Some(v),
-                    _ => None,
-                };
-                let data_by_name = match ctx.get_field_by_name(cmd_obj, "elementData") {
-                    Value::Object(Some(a)) => Some(a),
-                    _ => None,
-                };
-                let (size, data_arr) = match (size_by_name, data_by_name) {
-                    (Some(sz), Some(arr)) => (sz, Some(arr)),
-                    _ => {
-                        // Synthetic ArrayList fallback (data=slot0, size=slot1).
-                        let sz = ctx.get_field(cmd_obj, 1).as_int().unwrap_or(0);
-                        let arr = match ctx.get_field(cmd_obj, 0) {
-                            Value::Object(Some(a)) => Some(a),
-                            _ => None,
-                        };
-                        (sz, arr)
-                    }
-                };
-                if let Some(data) = data_arr {
-                    // Diag: classify `data` before reading it as an array.
-                    use cratonvm_types::ObjectKind;
-                    if ctx.heap_kind_of(data) != ObjectKind::Array {
-                        let cid = ctx.class_id_of_object(data);
-                        let cname = ctx.class_name_of_id(cid).unwrap_or_else(|| "<?>".into());
-                        let cmd_cid = ctx.class_id_of_object(cmd_obj);
-                        let cmd_cname = ctx.class_name_of_id(cmd_cid).unwrap_or_else(|| "<?>".into());
-                        // Gated behind the same debug flag (finding 5): keep the
-                        // diagnostic available but off by default in production.
-                        if crate::vmflags().io.dbg_pb {
-                            eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
-                        }
-                        // Skip the array_length call to avoid noisy guard print.
-                    } else {
-                        let len = ctx.array_length(data);
-                        let n = (size as usize).min(len);
-                        for i in 0..n {
-                            if let Value::Object(Some(s)) = ctx.get_array_element(data, i) {
-                                cmd_strings.push(ctx.read_string(s).unwrap_or_default());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if cmd_strings.is_empty() {
-            return Err(RuntimeError::IllegalStateException {
-                message: "ProcessBuilder: no command specified".to_string(),
-            }.into());
-        }
-
-        // SECURITY: gate the spawn on SecurityManager.checkExec(command[0]).
-        // Must happen BEFORE std::process::Command is touched so a denial
-        // surfaces as a SecurityException with no fork/exec syscall issued.
-        // See `lang_system::check_exec_or_throw` for the contract.
-        crate::lang_system::check_exec_or_throw(ctx, &cmd_strings[0])?;
-
-        // --- Extract optional working directory from File field ---
-        let work_dir: Option<String> = match ctx.get_field(this, PB_FIELD_DIRECTORY) {
-            Value::Object(Some(file_obj)) => {
-                // File is 1-field synthetic: field 0 = path string
-                match ctx.get_field(file_obj, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        // --- Build and spawn the process ---
-        let program = &cmd_strings[0];
-        let mut command = std::process::Command::new(program);
-        if cmd_strings.len() > 1 {
-            command.args(&cmd_strings[1..]);
-        }
-        if let Some(ref dir) = work_dir {
-            command.current_dir(dir);
-        }
-
-        // --- Apply environment overrides from the `environment()` map, if any ---
-        // BUG FIX (2026-07-10): this native previously never consulted
-        // `PB_FIELD_ENVIRONMENT` at all, so any `ProcessBuilder.environment()`
-        // mutation the Java caller made (`.clear()`, `.put(...)`, `.putAll(...)`,
-        // `.remove(...)`) was silently discarded — the spawned child always got
-        // `std::process::Command`'s bare default (full inheritance from THIS
-        // process), regardless of what the Java code asked for. Real JDK
-        // semantics: if `environment()` was never called, the child inherits
-        // the parent's environment unmodified (matches `Command`'s own
-        // default, so leave it alone in that case); if it WAS called, the
-        // child's environment is EXACTLY the live map's current contents at
-        // `start()` time (`env_clear()` then repopulate). `PB_FIELD_ENVIRONMENT`
-        // is only ever populated by the `environment()` registration below,
-        // which now returns a genuinely-working, pre-populated-from-this-
-        // process's-real-environment HashMap (see that registration's own
-        // fix note) — so a caller that reads, mutates, and never fully
-        // replaces the map still ends up with a sensible "inherit + edits"
-        // result, matching real `ProcessBuilder` behavior.
-        if let Value::Object(Some(env_map)) = ctx.get_field(this, PB_FIELD_ENVIRONMENT) {
-            let pairs = collect_map_entries_as_strings(ctx, env_map);
-            command.env_clear();
-            for (k, v) in pairs {
-                command.env(k, v);
-            }
-        }
-
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-
-        // Use spawn() (not the output() convenience wrapper) so the real OS
-        // pid of the launched child is available via Child::id() — output()
-        // only returns an Output{status, stdout, stderr}, with no pid, which
-        // is why pid()/toHandle() used to fall back to the VM's OWN pid.
-        match command.spawn() {
-            Ok(child) => {
-                let child_pid = child.id();
-                match child.wait_with_output() {
-                    Ok(output) => {
-                        let process =
-                            alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT);
-                        // Pin across the create_strings below — a moving young GC there
-                        // would relocate the fresh Process (native stale-local family).
-                        let process_pin = ctx.pin_native_root(process);
-                        let exit_code = output.status.code().unwrap_or(-1);
-                        ctx.set_field(process, PROC_FIELD_EXIT, Value::Int(exit_code));
-                        ctx.set_field(process, PROC_FIELD_PID, Value::Long(child_pid as i64));
-                        let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
-                        let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
-                        let stdout_ref = ctx.create_string(&stdout_str);
-                        let stdout_pin = ctx.pin_native_root(stdout_ref);
-                        let stderr_ref = ctx.create_string(&stderr_str);
-                        let process = ctx.read_native_pin(process_pin, process);
-                        let stdout_ref = ctx.read_native_pin(stdout_pin, stdout_ref);
-                        ctx.set_field(process, PROC_FIELD_STDOUT, Value::Object(Some(stdout_ref)));
-                        ctx.set_field(process, PROC_FIELD_STDERR, Value::Object(Some(stderr_ref)));
-                        ctx.unpin_native_roots(process_pin);
-                        Ok(Some(Value::Object(Some(process))))
-                    }
-                    Err(e) => {
-                        Err(RuntimeError::IllegalStateException {
-                            message: format!("ProcessBuilder.start() failed: {e}"),
-                        }.into())
-                    }
-                }
-            }
-            Err(e) => {
-                Err(RuntimeError::IllegalStateException {
-                    message: format!("ProcessBuilder.start() failed: {e}"),
-                }.into())
-            }
-        }
-    });
+    // This site used to carry its own ~200-line copy: it read the same command
+    // / directory / environment fields, ran `Command::spawn()` +
+    // `wait_with_output()`, and returned a Process holding the child's entire
+    // stdout and stderr as two Java Strings. `native-io`'s version is a strict
+    // superset -- it also honours `redirectInput/Output/Error` and
+    // `redirectErrorStream`, reads a `List` through the List API when it is not
+    // ArrayList-shaped, and hands back live pipes instead of a corpse -- and it
+    // is what actually ran in every build, since `register_io_natives` runs
+    // after this registrar and `register()` is last-registration-wins.
+    //
+    // Registering the same function pointer makes this a genuine belt to that
+    // braces: whichever registration wins, the behaviour is identical.
+    r.register(
+        pb,
+        "start",
+        "()Ljava/lang/Process;",
+        cratonvm_native_io::process::native_process_builder_start,
+    );
 
     r.register(
         pb,
@@ -1702,7 +1502,16 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         map = ctx.read_native_pin(map_pin, map);
         ctx.unpin_native_roots(map_pin);
         let this = ctx.read_native_pin(this_pin, this);
+        // Write BOTH spellings, like the `command` registrations above.
+        // `start()` looks this map up by the NAME `environment`; the indexed
+        // write reached it only because a real JDK 25
+        // `java.lang.ProcessBuilder` happens to declare `command`,
+        // `directory`, `environment` in that order, so slot 2 IS the named
+        // field. That coincidence is the whole reason
+        // `pb.environment().put(...)` took effect at all, and it is not a
+        // contract.
         ctx.set_field(this, PB_FIELD_ENVIRONMENT, Value::Object(Some(map)));
+        ctx.set_field_by_name(this, "environment", Value::Object(Some(map)));
         ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(map))))
     });
@@ -1762,259 +1571,20 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // --- Process ---
-    r.register(proc, "waitFor", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
-    });
-
-    r.register(proc, "exitValue", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
-    });
-
-    // WAVE-4: `isAlive()`/`destroy()`/`waitFor(long, TimeUnit)` used to be
-    // registered here as the constants `false` / no-op / `true`, justified by
-    // the `Child::wait_with_output()` pre-reap in the `start()` above.
+    // The `java/lang/Process` and `cratonvm/synthetic/Process` natives lived
+    // here: waitFor, exitValue, destroyForcibly, pid, toHandle,
+    // getInputStream, getErrorStream and getOutputStream, on both class names.
     //
-    // They are DELETED rather than reimplemented, because the honest version
-    // already exists and already wins: `native-io/src/process.rs`
-    // (`register_process_natives`) keeps the live `std::process::Child` in a
-    // handle side-table and answers all three against it
-    // (`try_exit_handle` / `destroy_handle` / a real polled timeout), and it
-    // registers them for BOTH `java/lang/Process` and
-    // `cratonvm/synthetic/Process` — plus its own `ProcessBuilder.start`, so
-    // no un-handled "pre-reaped" Process object is ever produced any more.
-    // `register_io_natives` runs AFTER `register_essential_natives_with_shims`
-    // in both `vm_init.rs` arms (real-JDK and synthetic), and `register()` is
-    // last-registration-wins, so the constants here could never be reached;
-    // keeping them only preserved a fallback that lies.
-
-    r.register(
-        proc,
-        "destroyForcibly",
-        "()Ljava/lang/Process;",
-        |_ctx, args| Ok(Some(args[0])),
-    );
-
-    r.register(proc, "pid", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PROC_FIELD_PID)))
-    });
-
-    // Process.toHandle() (JDK 9+) — build a ProcessHandle from the real
-    // child pid captured at spawn time (see PROC_FIELD_PID above).
-    r.register(
-        proc,
-        "toHandle",
-        "()Ljava/lang/ProcessHandle;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let pid = ctx.get_field(this, PROC_FIELD_PID);
-            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
-            ctx.set_field(handle, 0, pid);
-            Ok(Some(Value::Object(Some(handle))))
-        },
-    );
-
-    // Process.getInputStream() — returns ByteArrayInputStream wrapping stdout bytes
-    r.register(
-        proc,
-        "getInputStream",
-        "()Ljava/io/InputStream;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            // Field 1 = stdout string ref
-            let stdout_bytes = match ctx.get_field(this, PROC_FIELD_STDOUT) {
-                Value::Object(Some(s)) => {
-                    let text = ctx.read_string(s).unwrap_or_default();
-                    text.into_bytes()
-                }
-                _ => Vec::new(),
-            };
-            // Create ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
-            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-            // Pin across the array alloc below — a moving young GC there would
-            // relocate the fresh stream (native stale-local family).
-            let bais_pin = ctx.pin_native_root(bais);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stdout_bytes.len());
-            let bais = ctx.read_native_pin(bais_pin, bais);
-            ctx.unpin_native_roots(bais_pin);
-            for (i, &b) in stdout_bytes.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
-            ctx.set_field(bais, 0, Value::Object(Some(arr))); // buf
-            ctx.set_field(bais, 1, Value::Int(0)); // pos
-            ctx.set_field(bais, 2, Value::Int(0)); // mark
-            ctx.set_field(bais, 3, Value::Int(stdout_bytes.len() as i32)); // count
-            Ok(Some(Value::Object(Some(bais))))
-        },
-    );
-
-    // Process.getErrorStream() — returns ByteArrayInputStream wrapping stderr bytes
-    r.register(
-        proc,
-        "getErrorStream",
-        "()Ljava/io/InputStream;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let stderr_bytes = match ctx.get_field(this, PROC_FIELD_STDERR) {
-                Value::Object(Some(s)) => {
-                    let text = ctx.read_string(s).unwrap_or_default();
-                    text.into_bytes()
-                }
-                _ => Vec::new(),
-            };
-            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-            // Pin across the array alloc below — a moving young GC there would
-            // relocate the fresh stream (native stale-local family).
-            let bais_pin = ctx.pin_native_root(bais);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stderr_bytes.len());
-            let bais = ctx.read_native_pin(bais_pin, bais);
-            ctx.unpin_native_roots(bais_pin);
-            for (i, &b) in stderr_bytes.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
-            ctx.set_field(bais, 0, Value::Object(Some(arr))); // buf
-            ctx.set_field(bais, 1, Value::Int(0)); // pos
-            ctx.set_field(bais, 2, Value::Int(0)); // mark
-            ctx.set_field(bais, 3, Value::Int(stderr_bytes.len() as i32)); // count
-            Ok(Some(Value::Object(Some(bais))))
-        },
-    );
-
-    // Process.getOutputStream() — returns a no-op OutputStream (process already finished)
-    r.register(
-        proc,
-        "getOutputStream",
-        "()Ljava/io/OutputStream;",
-        |ctx, _args| {
-            let os = alloc_concurrent_synthetic(ctx, "java/io/OutputStream", 0);
-            Ok(Some(Value::Object(Some(os))))
-        },
-    );
-
-    // Process.waitFor(long, TimeUnit) — see the WAVE-4 note above: the real
-    // polled implementation lives in `native-io::process` and supersedes this
-    // registration in every build, so the constant `true` was removed.
-
-    // `alloc_concurrent_synthetic(ctx, "java/lang/Process", ...)` can yield a
-    // VM synthetic wrapper whose runtime class is reported as
-    // `cratonvm/synthetic/Process`. Virtual dispatch then probes the native
-    // registry with that receiver class, not `java/lang/Process`, so mirror the
-    // Process surface needed by WildFly's launcher checks.
-    let synthetic_proc = "cratonvm/synthetic/Process";
-    // `SyntheticStub`, stated for the whole block below. This class is minted
-    // by the VM and appears on no image, so §1.5's "what an `ACC_NATIVE` method
-    // binds to" cannot describe these registrations — there is no image method
-    // to bind to. `--jdk-only` must not reach a fabricated class (§5), and the
-    // `Bridge` tag these used to carry was precisely what kept them reachable
-    // there. `native-io::process` supersedes most of them and is restated the
-    // same way.
-    let __synthetic_proc_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    r.register(synthetic_proc, "waitFor", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
-    });
-    r.register(synthetic_proc, "exitValue", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
-    });
-    // `isAlive`/`destroy` were mirrored here too; removed for the same reason
-    // as the `java/lang/Process` copies above — `native-io::process` registers
-    // real ones on this exact class name (`SYNTHETIC_PROCESS_CLASS`) later.
-    r.register(
-        synthetic_proc,
-        "destroyForcibly",
-        "()Ljava/lang/Process;",
-        |_ctx, args| Ok(Some(args[0])),
-    );
-    r.register(synthetic_proc, "pid", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PROC_FIELD_PID)))
-    });
-
-    // Process.toHandle() (JDK 9+) — was entirely unregistered on this
-    // synthetic receiver class, causing NoSuchMethodError on any
-    // CratonVM-backed Process (fixed-suite-bugs/wildfly/wildfly-process-tohandle-missing-FIXED.md).
-    r.register(
-        synthetic_proc,
-        "toHandle",
-        "()Ljava/lang/ProcessHandle;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let pid = ctx.get_field(this, PROC_FIELD_PID);
-            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
-            ctx.set_field(handle, 0, pid);
-            Ok(Some(Value::Object(Some(handle))))
-        },
-    );
-    // `waitFor(long, TimeUnit)` likewise removed — see the WAVE-4 note above.
-    r.register(
-        synthetic_proc,
-        "getInputStream",
-        "()Ljava/io/InputStream;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let stdout_bytes = match ctx.get_field(this, PROC_FIELD_STDOUT) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().into_bytes(),
-                _ => Vec::new(),
-            };
-            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-            // Pin across the array alloc below — a moving young GC there would
-            // relocate the fresh stream (native stale-local family).
-            let bais_pin = ctx.pin_native_root(bais);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stdout_bytes.len());
-            let bais = ctx.read_native_pin(bais_pin, bais);
-            ctx.unpin_native_roots(bais_pin);
-            for (i, &b) in stdout_bytes.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
-            ctx.set_field(bais, 0, Value::Object(Some(arr)));
-            ctx.set_field(bais, 1, Value::Int(0));
-            ctx.set_field(bais, 2, Value::Int(0));
-            ctx.set_field(bais, 3, Value::Int(stdout_bytes.len() as i32));
-            Ok(Some(Value::Object(Some(bais))))
-        },
-    );
-    r.register(
-        synthetic_proc,
-        "getErrorStream",
-        "()Ljava/io/InputStream;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let stderr_bytes = match ctx.get_field(this, PROC_FIELD_STDERR) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default().into_bytes(),
-                _ => Vec::new(),
-            };
-            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-            // Pin across the array alloc below — a moving young GC there would
-            // relocate the fresh stream (native stale-local family).
-            let bais_pin = ctx.pin_native_root(bais);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, stderr_bytes.len());
-            let bais = ctx.read_native_pin(bais_pin, bais);
-            ctx.unpin_native_roots(bais_pin);
-            for (i, &b) in stderr_bytes.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
-            ctx.set_field(bais, 0, Value::Object(Some(arr)));
-            ctx.set_field(bais, 1, Value::Int(0));
-            ctx.set_field(bais, 2, Value::Int(0));
-            ctx.set_field(bais, 3, Value::Int(stderr_bytes.len() as i32));
-            Ok(Some(Value::Object(Some(bais))))
-        },
-    );
-    r.register(
-        synthetic_proc,
-        "getOutputStream",
-        "()Ljava/io/OutputStream;",
-        |ctx, _args| {
-            let os = alloc_concurrent_synthetic(ctx, "java/io/OutputStream", 0);
-            Ok(Some(Value::Object(Some(os))))
-        },
-    );
-    r.set_category(__synthetic_proc_cat);
+    // Every one of those sixteen triples is registered by
+    // `native-io::process::register_process_natives` on the SAME two class
+    // names, answered from the live `std::process::Child` in its handle table,
+    // and `register_io_natives` runs later in both boot arms -- so none of
+    // these ever answered a call. What they WOULD have answered if the ordering
+    // moved was worse than nothing: they read the legacy four-slot layout
+    // (exit at 6, stdout String at 7, stderr String at 8, pid at 9), and in the
+    // surviving layout slot 9 is the stderr file descriptor, so `pid()` would
+    // have returned an fd. Removed rather than re-pointed at the new slots: a
+    // second reader of a layout with one writer is how the two drift apart.
 
     // ProcessHandle stub
     r.register(

@@ -520,12 +520,16 @@ pub(super) fn publish_entry_metadata(
                 }
                 let body_home = local_assignments.get(i).copied().flatten();
                 let seeded = osr_local_assignments.get(i).copied().flatten();
-                if body_home.is_some() && seeded.is_none() {
-                    stripped_live += 1;
-                    eprintln!(
-                        "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{} in the body but the trampoline seeds no register for it",
-                        body_home.unwrap()
-                    );
+                // `if let` rather than `is_some()` + `.unwrap()`: this file
+                // carries `deny(clippy::unwrap_used)` for production code, and
+                // a diagnostic is the last place worth a panic site.
+                if let Some(home) = body_home {
+                    if seeded.is_none() {
+                        stripped_live += 1;
+                        eprintln!(
+                            "[osr-seed-stripped] {method_label} entry_pc={pc} LIVE local {i}                          reads r{home} in the body but the trampoline seeds no register for it"
+                        );
+                    }
                 }
             }
         }

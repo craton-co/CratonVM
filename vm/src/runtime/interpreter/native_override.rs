@@ -6704,6 +6704,42 @@ mod threadpool_receiver_shape_tests {
              the same native and aborts the process rather than throwing."
         );
     }
+
+    /// The scan corpus above is non-empty and every path in it is real.
+    ///
+    /// `every_threadpool_receiver_shape_site_is_gone` is a loop over
+    /// `FORMER_SITE_FILES` asserting an absence. **A loop over nothing asserts
+    /// nothing** — rename or move one of those four files and the gate keeps
+    /// passing while scanning three, or zero, and the regression it exists to
+    /// catch walks straight through the file it stopped reading.
+    ///
+    /// That is the same failure as the count this module's predecessor froze at
+    /// eight silently becoming zero, which is why the count gate was replaced
+    /// rather than emptied. An absence-gate needs its corpus pinned for exactly
+    /// the reason a presence-gate needs its number pinned.
+    ///
+    /// `vm_src` already panics on an unreadable path, so this adds the two
+    /// things it cannot check: that the list is not empty, and that a path
+    /// resolving to something implausibly small (a stub left behind by a move)
+    /// is not silently accepted as "no matches found".
+    #[test]
+    fn the_receiver_shape_scan_set_is_real() {
+        assert!(
+            !FORMER_SITE_FILES.is_empty(),
+            "FORMER_SITE_FILES is empty, so `every_threadpool_receiver_shape_site_is_gone` \
+             scans nothing and cannot fail"
+        );
+        for file in FORMER_SITE_FILES {
+            let src = vm_src(file);
+            assert!(
+                src.len() > 10_000,
+                "{file} is {} bytes — far smaller than any of the four dispatch files that \
+                 carried the receiver-shape probes. The scan is reading the wrong path, and \
+                 the gate above is passing vacuously over it.",
+                src.len()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

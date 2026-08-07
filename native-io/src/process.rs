@@ -74,6 +74,41 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
+// Java-visible spawn policy gate
+// ---------------------------------------------------------------------------
+
+/// A pre-spawn policy check, called with `command[0]` before any fork/exec.
+///
+/// Returning `Err` cancels the spawn and propagates the error verbatim to the
+/// Java caller, so a `SecurityException` stays a `SecurityException`.
+pub type SpawnPolicyHook = fn(&mut dyn NativeContext, &str) -> Result<(), MethodCallFailed>;
+
+/// Installed once at native-registration time by `native-builtins`, which owns
+/// `SecurityManager` and therefore cannot be called from here directly (it
+/// depends on this crate, not the reverse).
+///
+/// A `fn` pointer, not per-VM state: the hook is the same code in every VM in
+/// the process, and it resolves the *calling* VM's SecurityManager through the
+/// `NativeContext` it is handed. Nothing about a particular VM is latched.
+static SPAWN_POLICY_HOOK: OnceLock<SpawnPolicyHook> = OnceLock::new();
+
+/// Install the pre-spawn policy gate. Idempotent: the first hook wins, so
+/// calling this from more than one registration path is safe.
+pub fn set_spawn_policy_hook(hook: SpawnPolicyHook) {
+    let _ = SPAWN_POLICY_HOOK.set(hook);
+}
+
+/// Run the installed policy gate, if any. With no hook installed (a
+/// native-io-only build, or a unit test) this is a no-op, which matches the
+/// JDK: spawning is unrestricted until a SecurityManager is installed.
+fn run_spawn_policy(ctx: &mut dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+    match SPAWN_POLICY_HOOK.get() {
+        Some(hook) => hook(ctx, program),
+        None => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process-table (holds live std::process::Child handles)
 // ---------------------------------------------------------------------------
 
@@ -136,67 +171,6 @@ fn pipe_cache() -> &'static Mutex<HashMap<i64, PipeFds>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Reverse index: child **pid** -> `process_table` handle.
-///
-/// The handle is a monotonic counter minted at spawn (`NEXT_HANDLE`); it is not
-/// the pid, and nothing about the two is interchangeable. That stays invisible
-/// while the only callers are the VM's own `Process` natives, which carry the
-/// handle in `PROC_FIELD_HANDLE` — but the real JDK's `ProcessImpl` never sees
-/// a handle. It keeps the **pid** `forkAndExec` returned and calls
-/// `ProcessHandleImpl.{waitForProcessExit0, isAlive0, destroy0, parent0}` with
-/// it, so without this index every one of those looks up a handle that was
-/// never minted, misses the table, and answers "not mine".
-///
-/// Entries are deliberately NOT removed when the child exits, matching
-/// `exit_cache`: the JDK's reaper thread asks about a pid precisely because it
-/// expects the exit status to still be answerable afterwards. The OS may
-/// recycle a pid later, so a query for a pid this VM spawned once, that now
-/// belongs to an unrelated process, is answered about the old one; a re-spawn
-/// drawing the same pid overwrites the entry. That window is strictly narrower
-/// than not indexing at all, which reads every pid as if it were a handle.
-fn pid_index() -> &'static Mutex<HashMap<i64, i64>> {
-    static T: OnceLock<Mutex<HashMap<i64, i64>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Resolve the `long` a `ProcessHandleImpl` native was handed to a
-/// `process_table` handle.
-///
-/// Both conventions genuinely arrive here. By the JDK's contract the argument
-/// is a **pid** — that is what `ProcessImpl` stores and what
-/// `ProcessHandle.of(pid)` carries. By the VM's older convention it is a
-/// **handle**, because `native_process_impl_create` hands its table handle back
-/// as the process id on the Windows spawn path.
-///
-/// The pid reading is tried first because it is the one the contract specifies.
-/// The two can only be confused when a pid is no larger than the number of
-/// children this VM has spawned, and in that tie the contract wins.
-fn table_handle_for(id: i64) -> Option<i64> {
-    if let Some(handle) = pid_index().lock().get(&id).copied() {
-        return Some(handle);
-    }
-    if exit_cache().lock().contains_key(&id) {
-        return Some(id);
-    }
-    None
-}
-
-/// Is `pid` a live process this VM did not spawn?
-///
-/// Only meaningful for `isAlive0`, which the JDK also calls for handles
-/// obtained through `ProcessHandle.of(pid)` — an arbitrary process, not a
-/// child. Without this the answer for every such pid was an unconditional
-/// "alive", which is indistinguishable from a real answer and made the reaper's
-/// `NOT_A_CHILD` fallback loop (`while (startTime >= 0)`) spin forever.
-#[cfg(target_os = "linux")]
-fn foreign_pid_is_live(pid: i64) -> bool {
-    pid > 0 && std::path::Path::new(&format!("/proc/{pid}")).exists()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn foreign_pid_is_live(_pid: i64) -> bool {
-    false
-}
 
 #[derive(Clone, Copy, Debug)]
 struct ExitCache {
@@ -256,12 +230,6 @@ const PROC_FIELD_HANDLE: usize = JAVA_PROCESS_FIELD_COUNT + 5;
 
 /// Sentinel "not yet exited" value stored in the exit-code field.
 const EXIT_NOT_YET: i32 = i32::MIN;
-
-/// `ProcessHandleImpl.NOT_A_CHILD` — the value `waitForProcessExit0` returns
-/// for a pid that is not a child of this process. `@Native`-annotated on the
-/// JDK side, i.e. part of the native contract rather than an implementation
-/// detail.
-const PROCESS_NOT_A_CHILD: i32 = -2;
 
 /// Total number of fields on the synthetic Process.
 const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 6;
@@ -698,6 +666,25 @@ fn spawn_child(
         .into());
     }
 
+    // SECURITY: the Java-visible spawn gate (`SecurityManager.checkExec`),
+    // ahead of everything else so a denial cannot be observed as an
+    // `IOException` and so no fork/exec syscall is issued.
+    //
+    // It lives HERE, in the one function every spawn route funnels through
+    // (`ProcessBuilder.start`, `Runtime.exec`, `ProcessImpl.create`,
+    // `forkAndExec`), because it previously lived in only some of them:
+    // `native-builtins` gated `Runtime.exec` and its own now-shadowed
+    // `ProcessBuilder.start`, while THIS crate's `ProcessBuilder.start` -- the
+    // registration that actually wins at runtime -- had no gate at all. A
+    // deny-all `checkExec` policy therefore refused `Runtime.exec` and let
+    // `new ProcessBuilder(...).start()` fork the same child unchallenged
+    // (probes/ExecPolicyProbe.java, PB_CHILD_RAN=true).
+    //
+    // Called with `program` verbatim, before the Windows quote-strip below, so
+    // the SecurityManager sees exactly the `command[0]` the caller wrote --
+    // which is what HotSpot's `ProcessBuilder.start` passes to `checkExec`.
+    run_spawn_policy(ctx, program)?;
+
     // Windows launchers wrap a space-containing program path in double quotes
     // (e.g. WildFly's `StandaloneCommandBuilder` →
     // `"C:\Program Files\…\bin\java"`). The OS `CreateProcess` takes the program
@@ -875,8 +862,6 @@ fn spawn_child(
             stderr_fd,
         },
     );
-    pid_index().lock().insert(pid, handle);
-
     Ok(SpawnedChild {
         handle,
         pid,
@@ -1201,13 +1186,28 @@ fn read_process_redirects(ctx: &mut dyn NativeContext, builder: ObjectRef) -> Pr
     redirects
 }
 
+/// Slot the synthetic `ProcessBuilder` layout keeps its environment map in
+/// (`phases_late`'s `PB_FIELD_ENVIRONMENT`), consulted only when the receiver
+/// has no field NAMED `environment`.
+///
+/// On a real JDK 25 `java.lang.ProcessBuilder` the two coincide -- `command`,
+/// `directory`, `environment` are declared in that order -- which is the only
+/// reason the by-name read alone ever worked for a `ProcessBuilder` whose
+/// `environment()` native writes the indexed slot. That is a coincidence, not
+/// a contract, and it does not hold for a fabricated ProcessBuilder with no
+/// named fields at all.
+const PB_FIELD_ENVIRONMENT: usize = 2;
+
 fn read_process_environment(
     ctx: &mut dyn NativeContext,
     builder: ObjectRef,
 ) -> Option<Vec<(String, String)>> {
     let env_obj = match ctx.get_field_by_name(builder, "environment") {
         Value::Object(Some(o)) => o,
-        _ => return None,
+        _ => match ctx.get_field(builder, PB_FIELD_ENVIRONMENT) {
+            Value::Object(Some(o)) => o,
+            _ => return None,
+        },
     };
     let entry_set = match ctx.invoke_virtual(env_obj, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
@@ -1435,7 +1435,7 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// * the returned **pid** becomes `ProcessImpl.pid`, and
 ///   `ProcessHandleImpl.completion(pid, true)` — started by the constructor
 ///   immediately after — blocks the reaper thread in `waitForProcessExit0` with
-///   it. That is the whole reason [`pid_index`] exists.
+///   it. That is the whole reason [`handle_for_pid`] exists.
 /// * the **`int[] fds`** is the only channel by which the child's pipes reach
 ///   `initStreams`.
 /// * a thrown `IOException` is how an unspawnable command is reported;
@@ -1668,6 +1668,50 @@ fn int_arg(args: &[Value], index: usize) -> i32 {
     }
 }
 
+/// Resolve a JDK-visible **pid** to our internal process-table **handle**.
+///
+/// The four `ProcessHandleImpl` natives are handed a pid by the JDK's own
+/// bytecode -- `isAlive0(pid)`, `waitForProcessExit0(pid, ..)`,
+/// `destroyProcess0(pid, ..)`, `destroy0(pid, startTime, ..)` -- while
+/// `try_exit_handle` / `wait_for_handle` / `destroy_handle` are keyed by
+/// `NEXT_HANDLE`, a counter that starts at 1. All four used to pass the pid
+/// straight through as if it were a handle. Those are two unrelated number
+/// spaces, so every one of them addressed a child that did not exist (or, for
+/// a pid that happened to be a small integer, the WRONG child): `isAlive0`
+/// answered "still running" for every pid forever, `waitForProcessExit0`
+/// returned -1 without waiting, and `destroyProcess0` killed nothing and said
+/// so.
+///
+/// The entry survives the child's death -- `wait_for_handle` records the exit
+/// code in `exit_cache` rather than removing the row -- so a reaped child
+/// still resolves, which is exactly the case `isAlive0` has to get right.
+fn handle_for_pid(pid: i64) -> Option<i64> {
+    exit_cache()
+        .lock()
+        .iter()
+        .find(|(_, cache)| cache.pid == pid)
+        .map(|(handle, _)| *handle)
+}
+
+/// Is a pid we did not spawn still alive?
+///
+/// `/proc/<pid>` is present for a zombie too, which is the answer we want: a
+/// process that has exited but not been reaped is still a process. Only
+/// meaningful on Linux; elsewhere there is no portable probe, and answering a
+/// confident `false` would make `ProcessHandle.of(pid).isAlive()` claim a
+/// running process had exited, so the optimistic answer stands.
+fn foreign_pid_is_alive(pid: i64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// `java.lang.ProcessHandleImpl.getCurrentPid0() -> long`
 fn native_proc_handle_current_pid0(
     _ctx: &mut dyn NativeContext,
@@ -1690,25 +1734,44 @@ fn native_proc_handle_current_pid0(
 /// `NOT_A_CHILD` fallback loop spins `while (startTime >= 0)` and would never
 /// leave it.
 fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let id = match args.first() {
-        Some(Value::Long(h)) => *h,
-        _ => return Ok(Some(Value::Long(0))),
+    let pid = match args.first() {
+        Some(Value::Long(p)) => *p,
+        _ => return Ok(Some(Value::Long(-1))),
     };
-    // 0 = current JVM process by the VM's own convention, and the real pid is
-    // the same question — `ProcessHandleImpl.<clinit>` seeds `current` with
-    // `isAlive0(getCurrentPid0())`, so answering -1 there would make the VM
-    // report its own process as nonexistent.
-    if id == 0 || id == std::process::id() as i64 {
-        return Ok(Some(Value::Long(1)));
+    // The return value is NOT a boolean. `ProcessHandleImpl.isAlive()` reads it
+    // as the process's START TIME and decides liveness from the sign:
+    //
+    //     long startTime = isAlive0(pid);
+    //     return startTime >= 0
+    //         && (startTime == this.startTime || startTime == 0
+    //             || this.startTime == 0);
+    //
+    // so ANY value >= 0 means alive, and -1 is the only way to say "not
+    // alive". This native used to return 1 for running and **0 for exited**,
+    // and 0 is `>= 0` -- with `this.startTime == 0` on every handle
+    // `build_process_handle` makes, the third disjunct then made
+    // `ProcessHandle.isAlive()` answer `true` for a child that had already
+    // been waited for, while `Process.isAlive()` on the same child correctly
+    // answered `false` (probes/ProcHandleProbe.java, CHILD_ALIVE_AFTER_WAIT).
+    //
+    // 0 is the JDK's own "alive, start time unknown" value, which is honest:
+    // we do not track a start time, and every comparison against it is
+    // short-circuited by the `startTime == 0` disjunct anyway.
+    if pid == std::process::id() as i64 {
+        return Ok(Some(Value::Long(0)));
     }
-    match table_handle_for(id) {
+    match handle_for_pid(pid) {
+        // One of our own children: the process table knows for certain.
         Some(handle) => match try_exit_handle(handle) {
-            Some(_) => Ok(Some(Value::Long(0))), // exited
-            None => Ok(Some(Value::Long(1))),    // still running
+            Some(_) => Ok(Some(Value::Long(-1))), // exited
+            None => Ok(Some(Value::Long(0))),     // still running
         },
-        // Not a child of ours: `ProcessHandle.of(pid)` for an arbitrary
-        // process. Ask the OS rather than guessing.
-        None => Ok(Some(Value::Long(if foreign_pid_is_live(id) { 1 } else { -1 }))),
+        // Someone else's process: ask the OS.
+        None => Ok(Some(Value::Long(if foreign_pid_is_alive(pid) {
+            0
+        } else {
+            -1
+        }))),
     }
 }
 
@@ -1722,16 +1785,15 @@ fn native_proc_handle_wait_for_process_exit0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let id = match args.first() {
-        Some(Value::Long(h)) => *h,
+    // Keyed by pid, like the rest of this bridge -- see `handle_for_pid`.
+    let pid = match args.first() {
+        Some(Value::Long(p)) => *p,
         _ => return Ok(Some(Value::Int(-1))),
     };
-    let Some(handle) = table_handle_for(id) else {
-        // `NOT_A_CHILD`. Not an error code: the JDK reads -2 specifically and
-        // falls back to polling `isAlive0`, which is the correct handling for a
-        // pid this VM did not spawn. Returning -1 instead would be reported to
-        // the caller as a real exit status of -1.
-        return Ok(Some(Value::Int(PROCESS_NOT_A_CHILD)));
+    // A pid we did not spawn cannot be waited for: `wait(2)` only works on
+    // one's own children. -1 is what the JDK's own native reports there.
+    let Some(handle) = handle_for_pid(pid) else {
+        return Ok(Some(Value::Int(-1)));
     };
     ctx.begin_blocking_region();
     let code = wait_for_handle(handle);
@@ -1744,15 +1806,19 @@ fn native_proc_handle_destroy_process0(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let id = match args.first() {
-        Some(Value::Long(h)) => *h,
+    // Keyed by pid, like the rest of this bridge -- see `handle_for_pid`.
+    let pid = match args.first() {
+        Some(Value::Long(p)) => *p,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let Some(handle) = table_handle_for(id) else {
-        return Ok(Some(Value::Int(0)));
-    };
     let force = matches!(args.get(1), Some(Value::Int(1)));
-    let ok = destroy_handle(handle, force);
+    // Refusing to signal a process we did not spawn is deliberate: this bridge
+    // has no ownership check of its own, and `false` is a legal answer
+    // ("could not be destroyed"), unlike killing the wrong pid.
+    let ok = match handle_for_pid(pid) {
+        Some(handle) => destroy_handle(handle, force),
+        None => false,
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -2233,12 +2299,11 @@ fn native_process_destroy_forcibly(
 ///
 /// Known gap (not fixed here): `isAlive()`/`destroy()`/`waitFor()` on the
 /// returned handle route through `ProcessHandleImpl`'s already-registered
-/// natives (`isAlive0`/`destroy0`/`waitForProcessExit0`), which key off the
-/// VM's *internal* subprocess-table handle, not the real OS pid we store
-/// here — so they'll take the same "not found in table" fallback path
-/// `ProcessHandle.current()` already exercises, rather than accurately
-/// tracking this specific child. Fixing that needs the table to also be
-/// queryable by real pid, which is out of scope for the missing-native fix.
+/// natives (`isAlive0`/`destroy0`/`waitForProcessExit0`). Those used to key
+/// off the VM's *internal* subprocess-table handle rather than the real OS pid
+/// stored here, so they tracked no child at all; they now resolve the pid
+/// through `handle_for_pid`, which is the "queryable by real pid" the previous
+/// note deferred.
 fn native_process_to_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2746,43 +2811,18 @@ fn process_stream(
     Ok(Some(alloc_pipe_stream(ctx, stream_class, fd_id)))
 }
 
-fn captured_string_stream(ctx: &mut dyn NativeContext, text: &str) -> Value {
-    let cid = match ctx.ensure_class_initialized("java/io/ByteArrayInputStream") {
-        Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class("java/io/ByteArrayInputStream", 4),
-    };
-    let stream = ctx.alloc_object(cid, 4usize.max(ctx.class_num_total_fields(cid)));
-    let pin = ctx.pin_native_root(stream);
-    let bytes = text.as_bytes();
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-    let stream = ctx.read_native_pin(pin, stream);
-    ctx.unpin_native_roots(pin);
-    for (i, &byte) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(byte as i8 as i32));
-    }
-    ctx.set_field(stream, 0, Value::Object(Some(arr)));
-    ctx.set_field(stream, 1, Value::Int(0));
-    ctx.set_field(stream, 2, Value::Int(0));
-    ctx.set_field(stream, 3, Value::Int(bytes.len() as i32));
-    Value::Object(Some(stream))
-}
-
-fn legacy_captured_stream(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-    field: usize,
-) -> Option<Value> {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return None,
-    };
-    match ctx.get_field(this, field) {
-        Value::Object(Some(s)) => ctx
-            .read_string(s)
-            .map(|text| captured_string_stream(ctx, &text)),
-        _ => None,
-    }
-}
+// `captured_string_stream` / `legacy_captured_stream` lived here.
+//
+// They served ONE producer: a `ProcessBuilder.start` in `native-builtins` that
+// ran the child to completion and stored its whole stdout and stderr as two
+// Java Strings on the Process, which `getInputStream`/`getErrorStream` then
+// re-wrapped in a `ByteArrayInputStream`. That producer is gone -- every spawn
+// route now returns a Process carrying live pipe fds -- and the probe was left
+// reading slot 7 of every Process it was handed, hoping to find a String. In
+// the surviving layout that slot is `PROC_FIELD_STDIN_FD`, an `Int`, so it
+// could only ever fire on a foreign receiver that happened to hold a String
+// there. Deleted rather than kept as a fallback: there is nothing left for it
+// to fall back to.
 
 /// `java.lang.Process.getInputStream()Ljava/io/InputStream;` — the child's
 /// stdout pipe.
@@ -2790,9 +2830,6 @@ fn native_process_get_input_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(stream) = legacy_captured_stream(ctx, args, PROC_FIELD_STDIN_FD) {
-        return Ok(Some(stream));
-    }
     process_stream(
         ctx,
         args,
@@ -2807,9 +2844,6 @@ fn native_process_get_error_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(stream) = legacy_captured_stream(ctx, args, PROC_FIELD_STDOUT_FD) {
-        return Ok(Some(stream));
-    }
     process_stream(
         ctx,
         args,
@@ -3143,15 +3177,20 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "destroy0",
         "(JJZ)Z",
         |_ctx, args| {
-            let id = match args.first() {
-                Some(Value::Long(h)) => *h,
+            // args = (pid, startTime, force). Keyed by pid -- see
+            // `handle_for_pid`; `startTime` is the JDK's staleness check
+            // against a recycled pid, which we cannot answer (we record no
+            // start time) and do not need to: the process table maps a pid to
+            // OUR child, and a recycled pid is not in it.
+            let pid = match args.first() {
+                Some(Value::Long(p)) => *p,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let Some(handle) = table_handle_for(id) else {
-                return Ok(Some(Value::Int(0)));
-            };
             let force = matches!(args.get(2), Some(Value::Int(1)));
-            let ok = destroy_handle(handle, force);
+            let ok = match handle_for_pid(pid) {
+                Some(handle) => destroy_handle(handle, force),
+                None => false,
+            };
             Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         },
         NativeKind::Bridge,
@@ -3416,10 +3455,21 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 
 /// `java.lang.ProcessBuilder.start()Ljava/lang/Process;`
 ///
-/// Reads the command + directory + env map fields that the
-/// ProcessBuilder synthetic lays out in phases_late, then spawns the
-/// child via `spawn_and_wrap`.
-fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Reads the command + directory + env map fields that the ProcessBuilder
+/// synthetic lays out in phases_late, then spawns the child via
+/// `spawn_and_wrap`.
+///
+/// `pub` because it is THE implementation: `native-builtins` registers this
+/// same function pointer from its own two `ProcessBuilder.start` sites rather
+/// than keeping reimplementations behind it. Both of those allocated the
+/// returned Process under the name `java/lang/Process`, which in real-JDK mode
+/// is a real six-field class -- so the extra slots they asked for did not
+/// exist and every write to them was silently dropped. They were dead (this
+/// registration runs later and wins), but "dead" was the only thing keeping
+/// them harmless, and a registration-order change would have reintroduced the
+/// empty-CGI-body bug the same shape caused on the `Runtime.exec` route. See
+/// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
+pub fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if pb_debug_enabled() {
         eprintln!("[PB-START-IO] ProcessBuilder.start via native-io");
     }
@@ -3576,6 +3626,15 @@ mod tests {
     use super::*;
     use crate::test_support::MockNativeContext;
 
+    /// Serializes the tests that call `spawn_and_wrap`.
+    ///
+    /// `set_spawn_policy_hook` installs a PROCESS-GLOBAL hook, and
+    /// `spawn_policy_hook_is_consulted_and_can_refuse_the_fork` spends part of
+    /// its run with that hook set to refuse everything. Any other test
+    /// spawning through `spawn_and_wrap` at that moment is refused too, which
+    /// showed up as a flaky `SecurityException` from an unrelated test.
+    static SPAWN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn install_child_for_test(child: Child) -> (i64, i64) {
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         let pid = child.id() as i64;
@@ -3589,12 +3648,11 @@ mod tests {
                 exit_code: None,
             },
         );
-        pid_index().lock().insert(pid, handle);
         (handle, pid)
     }
 
-    /// The whole point of `pid_index`: the two ids are different numbers, and a
-    /// `ProcessHandleImpl` native handed the pid must still find the child.
+    /// The two ids are different numbers, and a `ProcessHandleImpl` native
+    /// handed the pid must still find the child.
     #[test]
     #[cfg(unix)]
     fn a_real_pid_resolves_to_its_table_handle() {
@@ -3612,31 +3670,24 @@ mod tests {
              coincide would pass for the wrong reason"
         );
 
-        assert_eq!(table_handle_for(pid), Some(handle), "by pid");
-        assert_eq!(
-            table_handle_for(handle),
-            Some(handle),
-            "by handle — the VM's own callers still resolve"
-        );
+        assert_eq!(handle_for_pid(pid), Some(handle), "by pid");
 
-        // Alive by pid, and the JDK reads a positive answer as a start time.
-        let alive = native_proc_handle_is_alive0(
-            &mut MockNativeContext::new(),
-            &[Value::Long(pid)],
-        )
-        .unwrap();
-        assert_eq!(alive, Some(Value::Long(1)));
+        // `isAlive0` answers a START TIME, not a boolean: >= 0 is alive and -1
+        // is the only way to say otherwise. 0 is the JDK's "alive, start time
+        // unknown".
+        let alive =
+            native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
+                .unwrap();
+        assert_eq!(alive, Some(Value::Long(0)), "alive, start time unknown");
 
         destroy_handle(handle, true);
         let code = wait_for_handle(handle);
         assert!(code != 0, "killed child should not report success: {code}");
 
-        let dead = native_proc_handle_is_alive0(
-            &mut MockNativeContext::new(),
-            &[Value::Long(pid)],
-        )
-        .unwrap();
-        assert_eq!(dead, Some(Value::Long(0)), "exited, by pid");
+        let dead =
+            native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
+                .unwrap();
+        assert_eq!(dead, Some(Value::Long(-1)), "exited, by pid");
     }
 
     /// `argc`/`envc` are passed for a reason: an empty argument is an
@@ -3733,35 +3784,35 @@ mod tests {
         assert_eq!(code, 128 + 9, "SIGKILL is reported as 128+signum");
     }
 
-    /// A pid we never spawned is `NOT_A_CHILD`, not an exit status.
-    ///
-    /// -1 would be handed to the caller as the child's real exit value; -2 is
-    /// the documented signal that makes `ProcessHandleImpl` fall back to
-    /// polling. The pid used here is this VM's own, which is guaranteed to
-    /// exist and guaranteed not to be in our table.
+    /// A pid we never spawned resolves to nothing, and the bridge says so
+    /// rather than reaching into the table with it.
     #[test]
-    fn an_unspawned_pid_is_not_a_child_rather_than_exit_minus_one() {
-        let foreign = 0x7fff_0000i64; // far above any handle this test mints
-        assert_eq!(table_handle_for(foreign), None);
+    fn an_unspawned_pid_resolves_to_no_handle() {
+        let foreign = 0x7fff_0000i64; // far above any pid this host will mint
+        assert_eq!(handle_for_pid(foreign), None);
         let mut ctx = MockNativeContext::new();
         let rc =
             native_proc_handle_wait_for_process_exit0(&mut ctx, &[Value::Long(foreign)]).unwrap();
-        assert_eq!(rc, Some(Value::Int(-2)), "NOT_A_CHILD");
+        assert_eq!(rc, Some(Value::Int(-1)), "cannot wait on a non-child");
+        assert_eq!(
+            native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(foreign), Value::Int(1)])
+                .unwrap(),
+            Some(Value::Int(0)),
+            "and must not signal it"
+        );
     }
 
     /// The VM's own pid must read as alive: `ProcessHandleImpl.<clinit>` seeds
-    /// `current` from it, and -1 there means "this process does not exist".
+    /// `current` with `isAlive0(getCurrentPid0())`, and -1 there would make the
+    /// VM report its own process as nonexistent.
     #[test]
     fn the_current_process_is_alive_by_its_real_pid() {
         let mut ctx = MockNativeContext::new();
         let self_pid = std::process::id() as i64;
         assert_eq!(
             native_proc_handle_is_alive0(&mut ctx, &[Value::Long(self_pid)]).unwrap(),
-            Some(Value::Long(1))
-        );
-        assert_eq!(
-            native_proc_handle_is_alive0(&mut ctx, &[Value::Long(0)]).unwrap(),
-            Some(Value::Long(1))
+            Some(Value::Long(0)),
+            "alive, start time unknown"
         );
     }
 
@@ -3777,6 +3828,260 @@ mod tests {
         ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(pid));
         ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(handle));
         proc_ref
+    }
+
+    /// A spawn must hand back a LIVE, READABLE stdout pipe.
+    ///
+    /// This is the property `Runtime.exec` did not have: it ran the child to
+    /// completion with `Command::output()` and stored the bytes as a Java
+    /// String on an object nothing downstream could read, so
+    /// `Process.getInputStream()` fell through to fd -1 and every read
+    /// returned EOF. Tomcat's `CGIServlet` copies exactly that stream into
+    /// the HTTP response, which is why `TestSecurity2019.testCVE_2019_0232`
+    /// saw `200 OK` with an empty body.
+    ///
+    /// Asserted through the `FdTable`, the same route the pipe-stream natives
+    /// take, rather than through the Java stream objects: the point is that
+    /// the fd recorded on the Process is the child's real stdout.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_and_wrap_exposes_a_live_stdout_pipe() {
+        let _guard = SPAWN_TEST_LOCK.lock();
+        let mut ctx = MockNativeContext::new();
+        let result = spawn_and_wrap(
+            &mut ctx,
+            "/bin/echo",
+            &["hello-from-the-child".to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("spawn /bin/echo")
+        .expect("spawn returns a Process");
+        let proc_ref = match result {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected a Process object, got {other:?}"),
+        };
+
+        let handle = match ctx.get_field(proc_ref, PROC_FIELD_HANDLE) {
+            Value::Long(h) => h,
+            other => panic!("PROC_FIELD_HANDLE must be a Long, got {other:?}"),
+        };
+        assert_ne!(handle, 0, "a spawned Process must carry a live handle");
+
+        let stdout_fd = match ctx.get_field(proc_ref, PROC_FIELD_STDOUT_FD) {
+            Value::Int(fd) => fd,
+            other => panic!("PROC_FIELD_STDOUT_FD must be an Int, got {other:?}"),
+        };
+        assert!(
+            stdout_fd >= 0,
+            "a piped stdout must have a real fd-table id, got {stdout_fd}"
+        );
+
+        let mut buf = [0u8; 64];
+        let n = ctx
+            .fd_table()
+            .read_bytes(stdout_fd as FdId, &mut buf)
+            .expect("read the child's stdout");
+        let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+        assert!(
+            text.contains("hello-from-the-child"),
+            "the child's stdout must be readable through the recorded fd, got {text:?}"
+        );
+
+        assert_eq!(wait_for_handle(handle), 0);
+    }
+
+    /// The spawn policy gate runs BEFORE the fork, on every spawn route.
+    ///
+    /// `SecurityManager.checkExec` used to be applied by `Runtime.exec` and by
+    /// `native-builtins`' own (shadowed) `ProcessBuilder.start`, but NOT by the
+    /// `ProcessBuilder.start` that actually wins at runtime, so a deny-all
+    /// policy refused one entry point and let the other fork the same child.
+    /// The gate now lives in `spawn_and_wrap`, which all of them funnel
+    /// through.
+    ///
+    /// Both arms are in one test on purpose: the hook is a process-global
+    /// `OnceLock`, so a second test installing a different one would silently
+    /// keep the first.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_policy_hook_is_consulted_and_can_refuse_the_fork() {
+        let _guard = SPAWN_TEST_LOCK.lock();
+        use std::sync::atomic::AtomicBool;
+
+        static DENY: AtomicBool = AtomicBool::new(true);
+        static SAW: Mutex<Option<String>> = Mutex::new(None);
+
+        fn hook(_ctx: &mut dyn NativeContext, program: &str) -> Result<(), MethodCallFailed> {
+            *SAW.lock() = Some(program.to_string());
+            if DENY.load(Ordering::Relaxed) {
+                Err(RuntimeError::SecurityException {
+                    message: format!("test policy denies {program}"),
+                }
+                .into())
+            } else {
+                Ok(())
+            }
+        }
+        set_spawn_policy_hook(hook);
+
+        // --- deny arm: the error propagates verbatim and nothing is spawned.
+        let mut ctx = MockNativeContext::new();
+        let marker = std::env::temp_dir().join(format!(
+            "cratonvm-spawn-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let denied = spawn_and_wrap(
+            &mut ctx,
+            "/usr/bin/touch",
+            &[marker.to_string_lossy().into_owned()],
+            None,
+            None,
+            false,
+            false,
+        );
+        match denied {
+            Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::SecurityException { .. },
+            ))) => {}
+            other => panic!("a refused spawn must surface the SecurityException, got {other:?}"),
+        }
+        assert_eq!(
+            SAW.lock().as_deref(),
+            Some("/usr/bin/touch"),
+            "the gate must see command[0]"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "a refused spawn must not fork: {} exists",
+            marker.display()
+        );
+
+        // --- allow arm: the same call goes through once the gate says yes.
+        DENY.store(false, Ordering::Relaxed);
+        let allowed = spawn_and_wrap(
+            &mut ctx,
+            "/bin/echo",
+            &["ok".to_string()],
+            None,
+            None,
+            false,
+            false,
+        )
+        .expect("an allowed spawn must proceed")
+        .expect("spawn returns a Process");
+        if let Value::Object(Some(proc_ref)) = allowed {
+            if let Value::Long(handle) = ctx.get_field(proc_ref, PROC_FIELD_HANDLE) {
+                assert_eq!(wait_for_handle(handle), 0);
+            }
+        }
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// `isAlive0` is keyed by PID and answers with a START TIME.
+    ///
+    /// Both halves were wrong at once. It took `args[0]` -- the JDK's pid --
+    /// and looked it up as a `NEXT_HANDLE` id, two unrelated number spaces, so
+    /// it found nothing and reported "still running" for every pid forever.
+    /// And it returned 1/0 as though `ProcessHandleImpl.isAlive()` read a
+    /// boolean; that method reads the value as a start time and treats ANY
+    /// value >= 0 as alive, so the 0 it returned for an exited process meant
+    /// alive as well. The two errors could not cancel out: the answer was
+    /// "alive" either way.
+    ///
+    /// -1 is the only encoding of "not alive"; 0 is "alive, start time
+    /// unknown".
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn is_alive0_is_keyed_by_pid_and_reports_a_start_time() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let (handle, pid) = install_child_for_test(child);
+        assert_ne!(handle, pid, "the test is meaningless if the two coincide");
+        let mut ctx = MockNativeContext::new();
+
+        let alive = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(pid)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            alive,
+            Value::Long(0),
+            "a running child must report a start time >= 0"
+        );
+
+        // A pid that is neither ours nor anyone's must be -1. (Deliberately
+        // NOT asserted for the internal handle id: on Linux a small integer is
+        // a perfectly plausible live pid -- `/proc/1` is init -- so that
+        // assertion would be testing the host, not this code.)
+        let nobody = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(pid + 4_000_000)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(nobody, Value::Long(-1), "an unused pid is not alive");
+
+        assert!(destroy_handle(handle, true));
+        let _ = wait_for_handle(handle);
+
+        let dead = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(pid)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dead,
+            Value::Long(-1),
+            "a reaped child must report -1, the only value ProcessHandleImpl \
+             .isAlive() reads as not-alive"
+        );
+    }
+
+    /// `destroyProcess0` and `waitForProcessExit0` are keyed by pid too.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn destroy_and_wait_natives_resolve_the_pid_not_the_handle() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let (handle, pid) = install_child_for_test(child);
+        let mut ctx = MockNativeContext::new();
+
+        // A pid we never spawned cannot be waited for.
+        let unknown = native_proc_handle_wait_for_process_exit0(
+            &mut ctx,
+            &[Value::Long(pid + 4_000_000), Value::Int(0)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(unknown, Value::Int(-1));
+
+        let killed =
+            native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(pid), Value::Int(1)])
+                .unwrap()
+                .unwrap();
+        assert_eq!(killed, Value::Int(1), "destroyProcess0 must find the child by pid");
+
+        let code = native_proc_handle_wait_for_process_exit0(
+            &mut ctx,
+            &[Value::Long(pid), Value::Int(0)],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(code, Value::Int(c) if c != -1),
+            "waitForProcessExit0 must find the child by pid, got {code:?}"
+        );
+
+        let _ = wait_for_handle(handle);
     }
 
     /// End-to-end spawn + waitFor round-trip — no NativeContext needed.
@@ -3916,11 +4221,15 @@ mod tests {
             .spawn()
             .expect("spawn");
 
-        let (handle, _pid) = install_child_for_test(child);
+        // The JDK's `ProcessHandleImpl.waitForProcessExit0` is handed a PID.
+        // This test used to pass the internal handle, which is what the native
+        // used to (wrongly) expect -- so it asserted the bug rather than the
+        // contract. See `handle_for_pid`.
+        let (_handle, pid) = install_child_for_test(child);
         let mut ctx = MockNativeContext::new();
         let result = native_proc_handle_wait_for_process_exit0(
             &mut ctx,
-            &[Value::Long(handle), Value::Int(0)],
+            &[Value::Long(pid), Value::Int(0)],
         )
         .unwrap()
         .unwrap();

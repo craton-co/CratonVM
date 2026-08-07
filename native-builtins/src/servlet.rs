@@ -4509,7 +4509,17 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     let bb = "java/nio/ByteBuffer";
 
     r.register(bb, "allocate", "(I)Ljava/nio/ByteBuffer;", |ctx, args| {
-        let cap = args.first().and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+        let requested = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+        // `ByteBuffer.allocate` opens with
+        // `if (capacity < 0) throw createCapacityException(capacity)`.
+        // Clamping to 0 handed back an empty buffer and reported success.
+        if requested < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("capacity < 0: ({requested} < 0)"),
+            }
+            .into());
+        }
+        let cap = requested as usize;
         match s2_bb_alloc(ctx, cap) {
             Some(buf) => Ok(Some(Value::Object(Some(buf)))),
             None => Err(RuntimeError::OutOfMemoryError {
@@ -4569,14 +4579,25 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let arr = obj_arg(args, 0)?;
         let off = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let len = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-        let cap = ctx.array_length(arr) as i32;
+        let cap = i32::try_from(ctx.array_length(arr)).unwrap_or(i32::MAX);
+        // `ByteBuffer.wrap(array, offset, length)` is
+        // `try { new HeapByteBuffer(array, offset, length, null) }
+        //  catch (IllegalArgumentException x) { throw new IndexOutOfBoundsException(); }`
+        // — the range check is the constructor's, and it raises
+        // `IndexOutOfBoundsException` with no detail message. Clamping the
+        // limit with `.min(cap)` instead silently produced a SHORTER buffer
+        // than asked for: `wrap(new byte[4], 0, 9)` returned a 4-byte window
+        // and reported success.
+        if off < 0 || len < 0 || i64::from(off) + i64::from(len) > i64::from(cap) {
+            return Err(RuntimeError::ioobe_no_message().into());
+        }
         let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
         bb_write_hb(ctx, buf, arr, cap);
         // Override position/limit set by bb_write_hb.
         ctx.set_field_by_name(buf, "position", Value::Int(off));
-        ctx.set_field_by_name(buf, "limit", Value::Int((off + len).min(cap)));
+        ctx.set_field_by_name(buf, "limit", Value::Int(off + len));
         ctx.set_field(buf, BB_POS, Value::Int(off));
-        ctx.set_field(buf, BB_LIMIT, Value::Int((off + len).min(cap)));
+        ctx.set_field(buf, BB_LIMIT, Value::Int(off + len));
         Ok(Some(Value::Object(Some(buf))))
     });
 
