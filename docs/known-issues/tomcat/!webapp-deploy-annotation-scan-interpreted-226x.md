@@ -3,10 +3,87 @@
 | | |
 |---|---|
 | **Status** | OPEN |
-| **Severity** | high — blocks `TestManagerWebapp.testDeploy` + `.testBug57700`; makes every deploy-heavy Tomcat class 15–65x slower |
+| **Severity** | medium (was high) — as of 2026-08-06 it no longer blocks `TestManagerWebapp.testDeploy` or `.testBug57700`, both of which PASS; it still makes deploy-heavy Tomcat classes several times slower than HotSpot |
 | **HotSpot** | PASS |
-| **CratonVM** | FAIL (timing only — no wrong results, no crash) |
+| **CratonVM** | PASS since 2026-08-06 on the two classes this doc named; still slow (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
+
+> **Update 2026-08-06 — 4.04x, and § What this is NOT — measured was wrong
+> about the mechanism. Both named test methods now PASS.**
+>
+> This doc's conclusion — "it is not a gate at all, it is interpreter
+> throughput", "the `perf` profile is correspondingly flat … no hotspot to
+> remove", "not reachable by tiering work … a genuine interpreter rewrite" —
+> was **premature**. Profiling the **real webapp deploy** (rather than
+> `AnnotationScanCostProbe`) found three removable costs worth 4.04x on this
+> doc's own metric and 4.56x on the deploy the metric stands in for. Full
+> write-up, evidence and commits:
+> `../../internal/fixed-suite-bugs/tomcat/testmanagerwebapp-post-seek0fix-read-timeout-FIXED.md`.
+>
+> * **`jmx_locked_monitors` leaked, and the leak was quadratic — 14.9% of the
+>   run.** Two of the four `complete_jmx_monitor_enter` publishers never
+>   retracted, so the per-thread owned-monitor set grew without bound and the
+>   linear dedupe scan every `monitorenter` runs grew with it. `perf annotate`
+>   put 96% of that 14.9% inside the scan loop. Commit `62d28988e`.
+>   **This doc dismissed exactly this symbol**, on the strength of the probe's
+>   profile: "the only monitor symbol that appears at all is
+>   `complete_jmx_monitor_enter`, at 1.47%". On the real deploy it is 14.87%.
+> * **`Multi-Release` was re-parsed once per jar ENTRY — 8.3%.** A whole-manifest
+>   `from_utf8_lossy` per lookup, memoized per (jar, mtime). Commit `3517a77fe`.
+>   Invisible to the probe, which opens one jar where the deploy opens hundreds.
+> * **Typed `DataInputStream` reads re-entered the interpreter per two bytes —
+>   the actual mechanism of this doc's headline number.** `dis_read_exact`
+>   allocated a Java `byte[2]` and ran the interpreted
+>   `BufferedInputStream.read(byte[],int,int)` chain for every
+>   `readUnsignedShort`. Now it copies from the stream's own buffer in Rust.
+>   Commit `e899910c2`.
+>
+> **The third one supersedes this doc's root-cause section outright**, and it
+> also explains the tier-up mystery this doc kept circling. `--stack-sample-ms`
+> over the real deploy puts **78.3% of all interpreted time** in five
+> `BufferedInputStream` bodies — `read` 30.6, `read1` 23.0, `getBufIfOpen` 12.9,
+> `ensureOpen` 6.2, `fill` 5.6 — and **none of them can compile**: `read` and
+> `read(byte[],int,int)` are `ACC_SYNCHRONIZED`, and the other four are private
+> and reached **only from a native re-entry**, so they have no inline-cache site
+> and the tiering manager never counts them at all. `jit-method-stats` sees
+> 129 k counted invocations against `invokestats`' 22.4 M cache hits.
+>
+> That is why every tier-up lever this doc tried moved nothing: the code that
+> mattered was never on a counted path. `CRATONVM_JIT=special-tierup` — the
+> "invokespecial stops feeding the tiered manager once cached" lever recorded
+> under § Untaken levers — was built and measured for this update: counted
+> invocations 129 391 → 129 455, compiled census 672 → 674, no
+> `BufferedInputStream` body compiled, and *worse* wall-clock combined with
+> `sync-methods`. It was reverted; do not rebuild it on that rationale.
+>
+> **New numbers**, Azure host, arms interleaved ABBA, pristine arm = `origin/dev`
+> `c3919f7d3` built from a detached worktree:
+>
+> | measurement | before | after | HotSpot |
+> |---|---|---|---|
+> | `AnnotationScanCostProbe` (`taglibs-standard-impl`) | **3284.5** µs/class | **813.5** µs/class | ~5–19 (≈2 ms total; noise at this scale) |
+> | `testBug57700` deploy of `/bug57700` | **74 323** ms, 4/4 FAIL | **16 311** ms, 4/4 PASS | 956 ms |
+> | `TestManagerWebapp` whole class | 84 s, `Failures: 1` | 50–58 s, **`OK (3 tests)`** | 8.9 s |
+>
+> Probe readings, no overlap in either order: before 3191.0–3482.9, after
+> 726.2–879.5.
+>
+> **Both test methods in this doc's § Symptom now pass**, so this doc's
+> remaining scope is throughput, not a failing test. The exit criterion (~5x of
+> HotSpot) is still not met and the doc stays OPEN — but the standing advice
+> above ("either attack interpreter dispatch cost broadly, or re-scope the exit
+> criteria") should be read with the caveat that it was written from a
+> profile of the wrong workload. After these three fixes the deploy's hottest
+> Rust symbol is `is_object_address` at **6.0%**, and the profile below it is
+> genuinely flat, so *that* claim now rests on a measurement of the real thing.
+>
+> **Methodological finding, and the reason this took four sessions:**
+> `AnnotationScanCostProbe` is **not representative of the deploy it stands in
+> for**. It under-reported the monitor cost 10x and could not see the jar
+> manifest cost at all. It remains a good A/B lever — it is stable and it moves
+> with the real thing — but it must not be used as the *profile* of record. Take
+> that from `perf record` on the actual failing test method, run alone on a
+> quiet host.
 
 > **Update 2026-08-03 — two corrections, neither of which closes this doc.**
 >
