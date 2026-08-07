@@ -234,16 +234,27 @@ and printing `DONE failed=1`. That is HotSpot's behaviour too (`Files.deleteIfEx
 on a non-empty directory is `DirectoryNotEmptyException` there); it only looks
 new because the delete used to lie.
 
-Rust gates re-run at the merged tip against pristine `dev` `cf4274fda`: 31
-failing test names on each arm, ratchet counts identical to the digit (1202
-shadowed registrations, 52 kind disagreements, 436 raw lock constructions, 323
-test-only public API). Four names differ between the arms in each direction and
-all four are known flakes — two wall-clock budgets
-(`t1_gc_pause_budget_100k_objects_under_200ms`,
-`re5_http_request_timeout_bounds_delayed_response_headers`), one port-binding
-test (`t4_8_1_jdwp_listening_transport`), and one
-(`compact_header::tests::forwarding_ptr_inline_boundary`) that passes in
-isolation on **both** arms and only fails under the suite's own parallelism.
+Rust gates re-run at the merged tip against pristine `dev` at the same commit:
+
+* vs `cf4274fda`: 31 failing test names on each arm, ratchet counts identical to
+  the digit. Four names differ in each direction and all four are known flakes —
+  two wall-clock budgets (`t1_gc_pause_budget_100k_objects_under_200ms`,
+  `re5_http_request_timeout_bounds_delayed_response_headers`), one port-binding
+  test (`t4_8_1_jdwp_listening_transport`), and
+  `compact_header::tests::forwarding_ptr_inline_boundary`, which passes in
+  isolation on **both** arms and only fails under the suite's own parallelism.
+* vs `13d2e01b3` (the final merge base): 26 failing names on this branch, 27 on
+  pristine — **the same set, plus one on pristine only**
+  (`xnio_worker::tests::t19_7_b_java_mirror_round_trip_through_registry`).
+  Ratchets identical: 436 raw lock constructions, 323 test-only public API.
+
+Pristine `dev` at `13d2e01b3` does not compile at all — `remap_datagram_sockets`
+declared `&std::collections::HashMap<usize, usize>` where `root_source!` wants
+`&cratonvm_types::PointerMap` (`rustc_hash::FxHashMap`), so `cargo build -p
+cratonvm-vm` fails with `E0308: expected fn pointer, found fn item`. Repaired on
+this branch (signature only, both ends) because it blocks building it, and the
+pristine arm above is `13d2e01b3` **plus that one repair** so the two arms are
+comparable at all.
 
 Rust gates at `e3456d0e5` against its own pristine base: failing-target sets
 **identical** (12 targets, red on dev) and ratchet counts identical to the digit
