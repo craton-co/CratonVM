@@ -14,56 +14,48 @@ carry it, and a thread-scaling question this host cannot answer. It is
 deliberately **not** filed as "a bug" — the previous framing ("≈100x. That is
 the bug.") pointed three sessions at a problem no single fix could match.
 
-## BLOCKED as of 2026-08-07: no file-backed H2 database opens on dev tip
+## UNBLOCKED 2026-08-07 (was: no file-backed H2 database opened on dev tip)
 
-`FileChannel.tryLock()` returns a corrupt `fileLockTable` cell under the compact
-reference-field layout that arrived with `HEADER_SIZE 24 -> 16`, so
-`H2UpdateScaleProbe` — and every other persistent H2 shape — dies on its first
-`getConnection`. Bisected, deterministic, `--nojit`-independent, and written up
-with a twelve-line reproducer in
-`docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md`.
+Two defects from the `HEADER_SIZE 24 -> 16` landing blocked this page for most
+of a day. Both are fixed on dev and **re-verified here on the merged tree**
+(`cc86228dd`), so the measurements below can be re-taken in the default
+configuration:
 
-**Every measurement dated 2026-08-07 on this page was taken with
-`CRATONVM_COMPACT_REF_FIELDS=0`**, which is a complete workaround for that bug
-but is *not* the default configuration — it turns off the field packing the
-header change exists for. Treat those numbers as valid for questions about
-dispatch, GC roots and class resolution (none of which the packing changes) and
-**re-take them once the layout defect is fixed** before comparing against
-anything measured with packing on.
+| defect | fix | witness, re-run on the merged tree |
+| --- | --- | --- |
+| `FileChannel.tryLock()` read a corrupt `fileLockTable` cell, so no file-backed database opened | `monitorexit` erased the object header quartet, converting a compact object to "legacy" on the first `synchronized` exit — one line in `vm/src/threading/monitor.rs` | `probes/CompactLayoutFileLockProbe.java` -> `PROBE-OK`; `MergeLockBudgetProbe verify 50` on a real H2 file DB -> `PROBE-OK` |
+| a `WeakReference` whose referent died was cleared but never enqueued, so nothing came out of a `ReferenceQueue` | "young and unmapped" is not a death certificate: after a NON-MOVING sweep nothing moves, so the map is empty and every live young `Reference`/`ReferenceQueue` was condemned — `pre_gc_addr_did_not_survive` now asks `is_live_young_survivor` | `probes/EnqProbe.java` -> `gc enqueued it = true`, 3 of 3 and with `--nojit` |
 
-## Re-measured 2026-08-07 — and the shape changed under it
+The second one matters directly to this page: **the non-moving sweep is the only
+young-collection path these workloads take** (`reason=unregistered-jit-frame-on-
+stack`, `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-
+callee` — the same fallback §"Where the CPU goes" already names as a scaling
+target), so GC-driven enqueue never happened at all in any H2 measurement taken
+before this fix.
 
-Two of this page's load-bearing claims are no longer true on the current tip,
-and one of them stops the page's own Reproducing block from running at all.
+**The 2026-08-07 profile below still carries its `CRATONVM_COMPACT_REF_FIELDS=0`
+caveat** — it was taken while the first defect was open, so it is valid for the
+dispatch / GC-root / class-resolution questions it is used for and must be
+re-taken with packing on before being compared against anything measured with
+packing on.
 
-**The UPDATE workload now exhausts the heap, and the JIT is the switch.** Same
-binary, same `--Xmx 1g`, same 4-thread x 2500-update shape:
+### The five-class gap is not closed by either fix
 
-| arm | result | minor GCs | young decisions |
-|---|---|---|---|
-| `--nojit` | completes | 7 | **moving=7, non_moving=0** |
-| JIT on (default) | **Out of memory** | 238 | moving=2, **non_moving=236** |
+The enqueue fix was recorded as the sibling defect that would recover the five
+H2 classes the quartet fix left short of the pre-landing baseline. Measured on
+the merged tree, `--Xmx 1g`, it does not:
 
-At 60 000 updates and `--Xmx 4g` the same flag still decides it (`--nojit`
-completes in 572 CPU-s with 7 moving collections; the JIT arm exhausts the heap
-after 1 321 non-moving ones). A live JIT frame blocks the moving young
-collector (`reason=innermost-rbp-belongs-to-unguarded-callee`), the young
-generation is swept in place rather than copied, and the old generation
-degenerates into a free list — 21 410 741 blocks coalesced in one run. Filed as
-[`bug-h2-update-path-oom-nonmoving-sweep-20260807.md`](bug-h2-update-path-oom-nonmoving-sweep-20260807.md).
+| class | before the enqueue fix | merged tree |
+| --- | --- | --- |
+| `TestLob` | FAIL, `OutOfMemoryError: Java heap space` | **HANG** at the 400 s cap |
+| `TestMemoryUsage` | PASS | PASS |
+| `TestLIRSMemoryConsumption` | PASS | PASS |
 
-So **two bullets under "What is ruled out" are withdrawn**: "not heap pressure"
-(1g and 2g now fail outright) and "not the JIT-root path (`--nojit` scales
-identically)" (`--nojit` is the difference between a result and no result).
-Both were true when measured; neither survived the object-header landing. Re-run
-a ruled-out list against the tip before inheriting it.
+`TestLob` moved from OOM to timeout — consistent with the enqueue fix relieving
+real memory pressure — but it still does not pass, and the other two were
+already green. Whatever the remaining five are, they are not this.
 
-**A consequence for every number below.** They were taken with the JIT on, which
-on this tip means they were taken from a VM in GC collapse — collecting ~90x
-more often than it should and reclaiming almost nothing. They are not
-measurements of the interpreter-vs-JIT tradeoff this page is about. Until the
-OOM is fixed, take UPDATE-path measurements with `--nojit`, where the moving
-collector actually runs, and say so.
+### A caution for anyone A/B-ing this suite
 
 **What did NOT change: the constant factor.** ABBA-interleaved, `--Xmx 4g`, on a
 quiet host (load 6.7-8.8), work term for 10 000 updates after subtracting an
@@ -90,6 +82,17 @@ is runnable; see the scaling section below.
 names no path, and `apps/` is gitignored, so it was invisible from the obvious
 place. It now lives at **`probes/H2UpdateScaleProbe.java`**, out of a directory
 slated for deletion. Its third argument is `objectCount`, not the lock timeout.
+
+A 40-class A/B of the enqueue fix, run 4-way parallel at a 180 s cap, showed
+30 PASS on both arms and three apparent changes: `TestAnalyzeTableTx`
+PASS->FAIL, `TestBigResult` HANG->PASS, `TestLargeBlob` HANG->FAIL. Re-run **in
+isolation**, ABBA-interleaved, 6 runs per arm, every one of the three is flaky on
+*both* arms with overlapping distributions (PASS/FAIL/HANG: 4/2/0 vs 4/1/1,
+3/0/3 vs 4/0/2, 0/5/1 vs 0/4/2). None is a regression and none is a recovery.
+Read on its own, the parallel run would have reported one regression and one fix,
+and it is neither — which is the standing rule in
+[`h2database-suite-runner`](../../../apps/h2database-suite-runner/run-h2-suite.md)
+and is worth restating because it cost a full re-run to establish.
 
 ## Severity
 **MEDIUM.** No incorrect behaviour, but not benign either. The class takes
