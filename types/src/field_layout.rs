@@ -190,6 +190,48 @@ pub fn set_compact_ref_fields_enabled(enabled: bool) {
     let _ = COMPACT_ENABLED.set(enabled);
 }
 
+static PACK_BY_WIDTH: OnceLock<bool> = OnceLock::new();
+
+/// Whether the compact layout builder assigns field offsets in
+/// **width-descending** order rather than declaration order.
+///
+/// Declaration order is the order the JVMS *lists* a class's fields in; it is
+/// not the order they have to be *stored* in, and storing them that way spends
+/// real bytes on alignment gaps. `java.lang.String` is the canonical case:
+/// `byte[] value` (8), `byte coder` (1), `int hash` (4), `boolean hashIsZero`
+/// (1) is 14 bytes of data, but laid out in declaration order the `int` has to
+/// skip to offset 12 and the body rounds to **24**. Assigning the same fields
+/// widest-first packs them into 14, which rounds to **16** — 8 bytes back on
+/// every `String` in the heap, with no change to what is stored or how it is
+/// read, since every accessor goes through `CompactLayout::field_offset`.
+///
+/// Read once and cached for the process lifetime, for the same reason
+/// [`compact_ref_fields_enabled`] is: the layout must be fixed, or an object is
+/// read back under a different layout than it was written. On by default; set
+/// `CRATONVM_PACK_FIELDS_BY_WIDTH=0` (or `false`/`off`/`no`) to lay fields out
+/// in declaration order for A/B runs.
+#[inline]
+pub fn pack_fields_by_width_enabled() -> bool {
+    *PACK_BY_WIDTH.get_or_init(
+        || match crate::flags::runtime_var("CRATONVM_PACK_FIELDS_BY_WIDTH") {
+            Ok(value) => {
+                let value = value.trim();
+                !matches!(
+                    value,
+                    "0" | "false" | "False" | "FALSE" | "off" | "Off" | "OFF" | "no" | "No" | "NO"
+                )
+            }
+            Err(_) => true,
+        },
+    )
+}
+
+/// Force the width-packing flag (test-only / explicit VM config). Idempotent —
+/// only the first set (whether via this fn or the env probe) wins.
+pub fn set_pack_fields_by_width_enabled(enabled: bool) {
+    let _ = PACK_BY_WIDTH.set(enabled);
+}
+
 // --- Per-class layout registry ------------------------------------------------
 
 /// Dense `class_id -> layout` registry. `class_id`s are assigned densely from 0,

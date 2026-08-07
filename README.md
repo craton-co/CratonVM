@@ -135,20 +135,24 @@ tier cannot is enumerated rather than discovered one regression at a time
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
-bit-identical to HotSpot):
+bit-identical to HotSpot; measured 2026-08-02):
 
-| Kernel                                   | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
-|------------------------------------------|------------|---------------|--------------|------------|--------------|
-| Integer div-chain (48 divs/elem)         | 1,910 ms   | 28 ms         | **9 ms**     | **212x**   | **3.1x**     |
-| Double div-chain (64 divs/elem)          | 1,508 ms   | 129 ms        | **91 ms**    | **16.6x**  | **1.4x**     |
-| 96 multiply-adds/elem (AVX2 on CPU)      | 8 ms       | 17 ms         | 11 ms        | 0.7x       | 1.5x         |
-| Dot-product reduction (int·int → long)   | 7 ms       | unimplemented | 18 ms        | 0.4x       | n/a          |
+| Kernel                                                | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
+|---------------------------------------------------------|------------|---------------|--------------|------------|--------------|
+| Integer div-chain (48 divs/elem)                         | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
+| Double div-chain (64 divs/elem)                          | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)       | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
+| Dot-product reduction (int·int → long, x300/elem)        | 1,172 ms   | unimplemented | **12 ms**    | **98x**    | n/a          |
 
 Unlike TornadoVM, the supported automatic path needs no `@Parallel`
 annotations or TaskGraph API. This applies only to the eligibility subset in
 the GPU reference; it is not a general promise that arbitrary Java runs on the
-GPU. Full results, extra sizes, and counter-cases: [BENCHMARK.md](BENCHMARK.md) and
-[docs/gpu/README.md](docs/gpu/README.md).
+GPU. The multiply-add and dot-product rows used to be documented as "honest
+counter-cases" where CPU AVX2/a cheap reduction beat the GPU — that framing
+no longer holds (a HotSpot constant-folding artifact and a since-widened
+kernel changed both rows to GPU wins); see BENCHMARK.md's GPU notes for the
+full explanation. Full results, extra sizes, and methodology notes:
+[BENCHMARK.md](BENCHMARK.md) and [docs/gpu/README.md](docs/gpu/README.md).
 
 ## What Runs Today
 

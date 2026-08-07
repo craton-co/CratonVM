@@ -2703,84 +2703,14 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(ctx.get_field(this, 0)))
 }
 
-pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // SECURITY: this is the "simplified" ProcessBuilder.start stub that
-    // never actually spawns вЂ” it returns a dummy Process with exit_code=0.
-    // The real spawning path is `phases_late::register_phase57_process`,
-    // which last-write-wins overrides this registration. Even so we
-    // funnel through check_exec_or_throw as defense-in-depth: if a future
-    // refactor ever wires this stub up to std::process::Command, the
-    // SecurityManager gate stays in place.
-    //
-    // Best-effort extraction of command[0] from the ProcessBuilder's
-    // command field (slot 0). If we can't recover a program string we
-    // still consult the SM with an empty argument so a deny-all policy
-    // surfaces a SecurityException вЂ” matching the "empty argv is
-    // suspicious" stance taken in `check_exec_or_throw`.
-    let program: String = match args.first() {
-        Some(Value::Object(Some(this))) => {
-            let cmd_val = ctx.get_field(*this, 0);
-            match cmd_val {
-                Value::Object(Some(cmd_obj)) => {
-                    // `ProcessBuilder.command` is a `List<String>` (typically an
-                    // ArrayList), but `Runtime.exec`/legacy paths may hand us a
-                    // raw `String[]`. Decide which by the object's RUNTIME CLASS,
-                    // then read it layout-independently:
-                    //   * List: read `size` / `elementData` BY FIELD NAME (the
-                    //     real-JDK ArrayList carries `AbstractList.modCount` ahead
-                    //     of `elementData`/`size`, so the old hard-coded
-                    //     `size = field1` assumption failed and fell through to
-                    //     `array_length(list)` вЂ” illegal on a non-array, which
-                    //     tripped the array-length guard during picocli's
-                    //     `getTerminalWidth()` ProcessBuilder probe).
-                    //   * Array: only THEN is `array_length` legal.
-                    let cname = ctx
-                        .class_name_of_id(ctx.class_id_of_object(cmd_obj))
-                        .unwrap_or_default();
-                    let read_elem0 = |ctx: &mut dyn NativeContext, arr: ObjectRef| -> String {
-                        match ctx.get_array_element(arr, 0) {
-                            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                            _ => String::new(),
-                        }
-                    };
-                    if cname.starts_with('[') {
-                        // Genuine array (e.g. String[]): array_length is legal.
-                        if ctx.array_length(cmd_obj) > 0 {
-                            read_elem0(ctx, cmd_obj)
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        // A List: read `size` + `elementData` by name.
-                        let size = match ctx.get_field_by_name(cmd_obj, "size") {
-                            Value::Int(n) => n,
-                            _ => 0,
-                        };
-                        if size > 0 {
-                            if let Value::Object(Some(data_arr)) =
-                                ctx.get_field_by_name(cmd_obj, "elementData")
-                            {
-                                read_elem0(ctx, data_arr)
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        }
-                    }
-                }
-                _ => String::new(),
-            }
-        }
-        _ => String::new(),
-    };
-    check_exec_or_throw(ctx, &program)?;
-
-    // Return a dummy Process object (simplified вЂ” no actual process execution)
-    let proc = alloc_concurrent_synthetic(ctx, "java/lang/Process", 1);
-    ctx.set_field(proc, 0, Value::Int(0)); // exit code
-    Ok(Some(Value::Object(Some(proc))))
-}
+// `native_pb_start` lived here: a `ProcessBuilder.start` that ran
+// `check_exec_or_throw` and then handed back a one-slot dummy Process which had
+// spawned nothing. Its own comment called it "the simplified
+// ProcessBuilder.start stub that never actually spawns", kept as
+// defense-in-depth for the SecurityManager gate. That gate now lives in
+// `native-io`'s `spawn_and_wrap`, where every spawn route meets it, so the stub
+// had nothing left to defend -- and its dummy Process was the same
+// allocate-under-a-real-JDK-class-name truncation as the rest of this cluster.
 
 /// Materialize a `java/lang/StackTraceElement[]` from a captured frame trace
 /// (innermost frame first, as `getStackTrace()` expects index 0 = current
@@ -4775,8 +4705,11 @@ mod t15_tests {
 //      allowed paths reach the spawn syscall.
 //
 // We exercise the integration through `native_runtime_exec_string` and
-// `native_pb_start` so any future refactor that bypasses
-// `check_exec_or_throw` regresses these tests.
+// `native-io`'s `native_process_builder_start` -- the two Java-visible spawn
+// entry points -- so any future refactor that bypasses `check_exec_or_throw`
+// regresses these tests. `ProcessBuilder.start` reaches the gate only through
+// the hook `install_spawn_policy_hook` installs, which is why that test calls
+// it explicitly.
 //
 // MockNativeContext.invoke_virtual returns whatever's pre-armed in
 // `invoke_virtual_result` (taken once), defaulting to `Ok(None)` вЂ”
@@ -4874,6 +4807,10 @@ mod exec_cmdarray_tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn runtime_exec_returns_while_the_child_is_still_running() {
+        // Serialize against the checkexec tests: the spawn policy hook is
+        // process-global once installed, so a deny-all SecurityManager
+        // installed by one of those tests would refuse this spawn.
+        let _guard = crate::security_manager::security_state_test_lock();
         let mut ctx = mock_ctx();
         let arr = string_array(&mut ctx, &[Some("/bin/sleep"), Some("5")]);
         let started = std::time::Instant::now();
@@ -5014,12 +4951,18 @@ mod checkexec_security_tests {
     }
 
     #[test]
-    fn denying_sm_blocks_processbuilder_start_stub() {
+    fn denying_sm_blocks_processbuilder_start() {
         let _guard = security_state_test_lock();
-        // Same coverage for the simplified `native_pb_start` stub. Even
-        // though this stub doesn't actually spawn, the SM gate runs first
-        // so a future refactor that wires it to std::process::Command can
-        // not silently bypass policy.
+        // Drives the REAL `ProcessBuilder.start` -- `native-io`'s, the one this
+        // crate now registers. It used to drive `native_pb_start`, a stub that
+        // never spawned, so what it proved was that a stub asked permission
+        // before doing nothing.
+        //
+        // `install_spawn_policy_hook()` is the point: the gate reaches
+        // `native-io` only through that hook, and nothing else in a unit-test
+        // binary installs it. If the wiring regresses, the spawn goes through
+        // and this test fails.
+        install_spawn_policy_hook();
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let prev = set_security_manager_for_test(&ctx, Some(sm));
@@ -5032,15 +4975,20 @@ mod checkexec_security_tests {
         }
 
         // Build a ProcessBuilder synthetic with a 4-slot layout and a
-        // command list. The native_pb_start stub reads slot 0; we plant a
-        // String[] there with command[0] = "/bin/anything".
+        // command list. `start` reads slot 0; we plant a String[] there with
+        // command[0] = "/bin/anything", a path that does not exist -- so if the
+        // gate ever fails to refuse, the spawn fails with an IOException rather
+        // than running something, and the assertion below still catches it.
         let pb = alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4);
         let cmd_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         let prog = ctx.create_string("/bin/anything");
         ctx.set_array_element(cmd_arr, 0, Value::Object(Some(prog)));
         ctx.set_field(pb, 0, Value::Object(Some(cmd_arr)));
 
-        let result = native_pb_start(&mut ctx, &[Value::Object(Some(pb))]);
+        let result = cratonvm_native_io::process::native_process_builder_start(
+            &mut ctx,
+            &[Value::Object(Some(pb))],
+        );
         let err = result.expect_err("deny-all SM must block ProcessBuilder.start");
         assert_security_exception(&err);
 

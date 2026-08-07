@@ -5773,6 +5773,13 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(elem))
     });
     let anon_enm = "cratonvm/synthetic/AnonymousObject$2";
+    // `SyntheticStub`, stated for this block. The receiver is the VM's
+    // anonymous-object fallback class — minted here, on no image — so §1.5's
+    // "what an `ACC_NATIVE` method binds to" has nothing to point at, and the
+    // `Bridge` tag was only ever keeping a fabricated class reachable under
+    // `--jdk-only`, which §5 forbids outright.
+    let __anon_enm_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(anon_enm, "hasMoreElements", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
@@ -5828,6 +5835,7 @@ pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int((idx + 1) as i32));
         Ok(Some(elem))
     });
+    r.set_category(__anon_enm_cat);
 }
 
 /// `ClassLoader.getSystemResources(String)` — static. Delegates to the

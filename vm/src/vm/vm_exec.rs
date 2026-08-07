@@ -11522,6 +11522,22 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             .threads
             .monitors
             .exit(obj, self.thread.thread_id);
+        // `monitor_enter_gc_safe` publishes JMX ownership (it goes through
+        // `monitor_enter_blocking`), so this is its retract. Plain
+        // `monitor_enter` above never publishes, which makes the retract a
+        // harmless no-op there rather than a wrong removal - the list is
+        // address-keyed and `remove` on an absent address does nothing.
+        if !self
+            .shared
+            .threads
+            .monitors
+            .holds(obj, self.thread.thread_id)
+        {
+            self.shared
+                .threads
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+        }
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -20079,15 +20095,6 @@ fn invoke_on_class_shared_inner(
                                 | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
                                 | ("java/lang/reflect/Method", "getReturnType", "()Ljava/lang/Class;")
                         )
-                        // Legacy Mockito selector override (off by default —
-                        // see `flags::mockito_legacy_selectors`): forced the
-                        // reflection fallback instead of letting the real
-                        // `delegate()` pick `InstrumentationMemberAccessor`.
-                        // Must stay in sync with the interpreter's gate.
-                        || (cratonvm_types::flags::mockito_legacy_selectors()
-                            && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
-                            && method_name == "delegate"
-                            && descriptor == "()Lorg/mockito/plugins/MemberAccessor;")
                         || ((class_name == "javax/net/ssl/SSLSocketFactory"
                                 || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
                             && method_name == "createSocket"
@@ -20350,18 +20357,6 @@ fn invoke_on_class_shared_inner(
                                     | ("getFormatter", "()Ljava/util/logging/Formatter;")
                                     | ("setFormatter", "(Ljava/util/logging/Formatter;)V")
                             ))
-                        || (class_name == "org/jboss/threads/JBossThread"
-                            && method_name == "run"
-                            && descriptor == "()V")
-                        || (class_name == "org/jboss/threads/JBossThread"
-                            && method_name == "onExit"
-                            && descriptor == "(Ljava/lang/Runnable;)Z")
-                        || (class_name == "org/jboss/threads/JBossThreadFactory"
-                            && ((method_name == "newThread"
-                                && descriptor == "(Ljava/lang/Runnable;)Ljava/lang/Thread;")
-                                || (method_name == "access$100"
-                                    && descriptor
-                                        == "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;")))
                         || (class_name == "java/io/InputStreamReader"
                             && method_name == "close"
                             && descriptor == "()V")
@@ -20378,24 +20373,6 @@ fn invoke_on_class_shared_inner(
                             && (method_name == "getEnumConstants"
                                 || method_name == "getEnumConstantsShared")
                             && descriptor == "()[Ljava/lang/Object;")
-                        // SPB.11: Our synthetic MethodDescriptor stores the
-                        // wrapped Method at slot 0 (real-JDK MD has a private
-                        // `method` field at a different layout). Force the
-                        // native so getMethod returns our overlay value.
-                        || (class_name == "java/beans/MethodDescriptor"
-                            && method_name == "getMethod")
-                        // SPB.11: Spring's ExtendedBeanInfoFactory wraps our
-                        // delegate BeanInfo into `new ExtendedBeanInfo(...)`,
-                        // which re-creates each PropertyDescriptor as a
-                        // SimplePropertyDescriptor and loses readMethod/
-                        // writeMethod/propertyType (subclass fields never
-                        // populated; downstream Spring NPEs comparing). Our
-                        // native bypasses the wrapping and returns the
-                        // delegate directly.
-                        || (class_name == "org/springframework/beans/ExtendedBeanInfoFactory"
-                            && method_name == "getBeanInfo")
-                        || (class_name == "org/springframework/beans/SimpleBeanInfoFactory"
-                            && method_name == "getBeanInfo")
                         // SPB.11: Spring's GenericTypeAwarePropertyDescriptor
                         // (built by CachedIntrospectionResults) stores
                         // readMethod/writeMethod/propertyType in its own
@@ -20437,19 +20414,6 @@ fn invoke_on_class_shared_inner(
                                 || method_name == "getSystemResource"
                                 || method_name == "getResourceAsStream"
                                 || method_name == "getSystemResourceAsStream"))
-                        // WildFly process-controller bootstrap: real
-                        // ServerSocket.getLocalSocketAddress() is Java bytecode
-                        // that builds from ServerSocket's internal impl fields.
-                        // CratonVM binds the listener through native side tables,
-                        // so force the registered accessors to report the actual
-                        // resolved bound address instead of constructing an
-                        // InetSocketAddress with a null InetAddress.
-                        || (class_name == "java/net/ServerSocket"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("getInetAddress", "()Ljava/net/InetAddress;")
-                                    | ("getLocalSocketAddress", "()Ljava/net/SocketAddress;")
-                            ))
                         // URLClassLoader.findResource / findResources +
                         // URLClassPath.addURL: the real bytecode routes through
                         // `jdk.internal.loader.URLClassPath`, whose CratonVM shim
@@ -20528,25 +20492,6 @@ fn invoke_on_class_shared_inner(
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
                         ) && method_name == "addURL"
                             && descriptor == "(Ljava/net/URL;)V")
-                        // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
-                        // of `Log4jLoggerFactory.getContext` calls
-                        // `LogManager.getFactory().isClassLoaderDependent()`
-                        // without a null-check. We patched `getFactory()`
-                        // to return a synthetic Log4jContextFactory and
-                        // registered `isClassLoaderDependent()` natives on
-                        // every concrete factory class (and the interface
-                        // itself). Those methods have default-method
-                        // bytecode in the real jars; pin our natives ahead
-                        // so the synthetic receiver doesn't walk the
-                        // un-initialised `selector` / `shutdownCallbackRegistry`
-                        // fields the real impl reads. Same rationale for
-                        // `hasContext` which the default `shutdown`
-                        // dispatches to.
-                        || ((class_name == "org/apache/logging/log4j/core/impl/Log4jContextFactory"
-                                || class_name == "org/apache/logging/log4j/simple/SimpleLoggerContextFactory"
-                                || class_name == "org/apache/logging/log4j/spi/LoggerContextFactory")
-                            && (method_name == "isClassLoaderDependent"
-                                || method_name == "hasContext"))
                         // Insurance / Spring Boot 3: real-JDK `URL.getHost` resolves
                         // the host through `InetAddress.getByName` /
                         // `getHostName`, which re-enters `Class.initClassName` in a
@@ -20701,49 +20646,6 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        || (matches!(
-                                class_name,
-                                "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock"
-                                | "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock"
-                            )
-                            && matches!(
-                                method_name,
-                                "lock" | "unlock" | "tryLock"
-                                | "lockInterruptibly"
-                                | "isHeldByCurrentThread"
-                            ))
-                        // EUREKA-LOGBACK-CLEANUP: LoggerContext.<init> is registered
-                        // as a no-op native, leaving the inherited `objectMap`/
-                        // `propertyMap`/`sm` fields null. Spring Boot's
-                        // `LogbackLoggingSystem.cleanUp` calls
-                        // `loggerContext.removeObject(...)`,
-                        // `loggerContext.getStatusManager().clear()`, and
-                        // `loggerContext.getTurboFilterList().remove(...)` —
-                        // every one of which the real-JDK bytecode services
-                        // by dereferencing a null field, producing the fatal
-                        // `NullPointerException: Cannot invoke remove on null`
-                        // during `prepareEnvironment` on every Spring Boot app
-                        // (eureka-server is the canonical reproducer). Force
-                        // our native stubs (registered in `native-builtins`
-                        // alongside the existing `LoggerContext.<init>` no-op)
-                        // to win so the null fields are never touched.
-                        || (class_name == "ch/qos/logback/classic/LoggerContext"
-                            && matches!(
-                                method_name,
-                                "removeObject" | "putObject" | "getObject"
-                                | "putProperty" | "getProperty"
-                                | "getStatusManager" | "getTurboFilterList"
-                            ))
-                        || (class_name == "ch/qos/logback/core/ContextBase"
-                            && matches!(
-                                method_name,
-                                "removeObject" | "putObject" | "getObject"
-                                | "putProperty" | "getProperty"
-                            ))
-                        || (class_name == "ch/qos/logback/core/BasicStatusManager"
-                            && method_name == "clear")
-                        || (class_name == "ch/qos/logback/classic/spi/TurboFilterList"
-                            && method_name == "remove")
                         // EUREKA-RB-CANDIDATE: ResourceBundle$Control.getCandidateLocales
                         // — the real-JDK bytecode passes `locale.getBaseLocale()`
                         // as a key into `ReferencedKeyMap.computeIfAbsent`. Our
@@ -21066,19 +20968,6 @@ fn invoke_on_class_shared_inner(
                         // partial-bootstrap states and NPE on connect().
                         || (class_name == "org/apache/maven/surefire/booter/ForkedBooter"
                             && matches!(method_name, "lookupDecoderFactory" | "acknowledgedExit"))
-                        // WP6.1: Provider.getEngineName(String) вЂ” the
-                        // real JDK bytecode reads `knownEngines` (a
-                        // static HashMap) which `Provider.<clinit>` would
-                        // populate. We no-op that clinit (see
-                        // `jca/cipher.rs::register_cipher_clinit_shim`),
-                        // so `knownEngines` stays null and the bytecode
-                        // NPEs at `knownEngines.get(name)` when
-                        // BouncyCastleProvider walks ~500 algorithm
-                        // mappings. The native override returns the input
-                        // name unchanged (matching the OpenJDK fallback
-                        // path when the engine lookup fails).
-                        || (class_name == "java/security/Provider"
-                            && method_name == "getEngineName")
                         // kafka-0617 #4: our synthetic `java.security.MessageDigest`
                         // (built by `native_md_get_instance` without a real SPI)
                         // carries the running digest state in MD_FIELD_ALGO/DATA.
@@ -21435,15 +21324,6 @@ fn invoke_on_class_shared_inner(
                                 | "getLocalAddress"
                                 | "socket"
                             ))
-                        // SocketAdaptor address accessors need the same channel
-                        // shims: the real JDK bytecode returns the unresolved
-                        // InetSocketAddress we synthesize for accepted peers,
-                        // so Socket.getInetAddress() becomes null and Tomcat's
-                        // request remoteAddr/remoteHost population fails.
-                        || (class_name == "sun/nio/ch/SocketAdaptor"
-                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
-                        || (class_name == "java/net/Socket"
-                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
                         // Jasper's embedded ECJ can surface a CratonVM-only
                         // false-positive "must implement
                         // ServletConfig.getInitParameterNames()" problem for
@@ -21656,147 +21536,6 @@ fn invoke_on_class_shared_inner(
                                 | "checkAccess"
                                 | "checkSecurityAccess"
                             ))
-                        // SPARK-LOG4J2: Spark `Logging.initializeLogging`
-                        // calls `core.LoggerContext.reconfigure()` on the
-                        // synthetic LoggerContext returned by our
-                        // `LogManager.getContext` shim. The real bytecode
-                        // derefs `this.configuration` at pc=11 and NPEs
-                        // because the synthetic was allocated via
-                        // `alloc_concurrent_synthetic` and never ran the
-                        // real ctor that would populate that field.
-                        //
-                        //   [WF-NPE-STK 4] org/apache/logging/log4j/core/LoggerContext
-                        //                  .reconfigure pc=11
-                        //   [WF-NPE-STK 3] org/apache/spark/internal/Logging
-                        //                  .initializeLogging pc=100
-                        //
-                        // Force the no-op natives registered in
-                        // `native-builtins/src/log4j_extras.rs` (via
-                        // `register_log4j_stubs`) to win for every
-                        // Configuration-touching surface on
-                        // `org/apache/logging/log4j/core/LoggerContext` so
-                        // the null `configuration` field is never
-                        // dereferenced. Same shape as the existing
-                        // `core.Logger.getAppenders` and
-                        // `DefaultLogbackConfiguration.apply` overrides.
-                        || (class_name == "org/apache/logging/log4j/core/LoggerContext"
-                            && matches!(
-                                method_name,
-                                "reconfigure"
-                                | "getConfiguration"
-                                | "setConfiguration"
-                                | "start"
-                                | "stop"
-                                | "terminate"
-                                | "close"
-                                | "isStarted"
-                                | "isStopped"
-                                | "setConfigLocation"
-                                | "getConfigLocation"
-                                | "updateLoggers"
-                                | "hasLogger"
-                                | "getLoggers"
-                                | "getName"
-                                | "getExternalContext"
-                                | "getLogger"
-                                | "getContext"
-                                // The ctor/clinit overrides are also
-                                // registered as no-ops in log4j_extras —
-                                // allowlist them so the native wins if
-                                // the synthetic-alloc path falls through
-                                // to <clinit> for the concrete class.
-                                | "<init>"
-                                | "<clinit>"
-                            ))
-                        // Same family of overrides on `core.Logger` (the
-                        // concrete log4j-core Logger class our `getLogger`
-                        // shim hands back). These are registered in
-                        // log4j_extras; allowlist so the natives win over
-                        // bytecode for the accessor surface that callers
-                        // touch immediately after `getLogger`.
-                        || (class_name == "org/apache/logging/log4j/core/Logger"
-                            && matches!(
-                                method_name,
-                                "getAppenders"
-                                | "getContext"
-                                | "getParent"
-                                | "getName"
-                                | "getLevel"
-                                | "getMessageFactory"
-                                // EJBCA / log4j-1.2-api bridge —
-                                // `org.apache.log4j.LogManager.<clinit>`
-                                // → `new Hierarchy(new RootLogger(DEBUG))`
-                                // → `RootLogger.setLevel(DEBUG)` → eventually
-                                // `core.Logger.setLevel(level)` on our
-                                // synthetic Logger. The real bytecode
-                                // builds a new `Logger$PrivateConfig` from
-                                // `this.privateConfig.config` and NPEs
-                                // because the synthetic was allocated
-                                // without a privateConfig. Force the no-op
-                                // native (registered in log4j_extras) to
-                                // win for the level/appender mutators that
-                                // touch privateConfig. See the existing
-                                // `getAppenders` rationale above.
-                                | "setLevel"
-                                | "addAppender"
-                                | "removeAppender"
-                                | "setAdditive"
-                            ))
-                        // log4j 2.x LogManager surface: getContext /
-                        // getLogger / getFormatterLogger / getRootLogger /
-                        // getFactory / shutdown overloads. The `<clinit>`
-                        // shim (elsewhere) leaves the static `factory`
-                        // field null, so the real bytecode for these
-                        // statics NPEs on `factory.getContext(...)`.
-                        // Allowlist them so
-                        // `log4j_extras::register_log4j_stubs` wins
-                        // dispatch and returns synthetic LoggerContext /
-                        // Logger instances instead.
-                        || (class_name == "org/apache/logging/log4j/LogManager"
-                            && matches!(method_name,
-                                "getContext"
-                                | "getLogger"
-                                | "getFormatterLogger"
-                                | "getRootLogger"
-                                | "getFactory"
-                                | "exists"
-                                | "shutdown"))
-                        // SimpleLoggerContext / SimpleLogger / core.Logger:
-                        // synthetic pipeline objects handed out by the
-                        // LogManager shims above. The receiver's real
-                        // bytecode (when it loads) would otherwise win
-                        // over our natives on getLogger / isXxxEnabled /
-                        // info / warn / etc.
-                        || (class_name
-                                == "org/apache/logging/log4j/simple/SimpleLoggerContext"
-                            && matches!(method_name,
-                                "getLogger" | "getContext" | "<init>" | "<clinit>"))
-                        || (matches!(class_name,
-                                "org/apache/logging/log4j/simple/SimpleLogger"
-                                | "org/apache/logging/log4j/spi/AbstractLogger")
-                            && matches!(method_name,
-                                "trace" | "debug" | "info" | "warn" | "error" | "fatal"
-                                | "isTraceEnabled" | "isDebugEnabled" | "isInfoEnabled"
-                                | "isWarnEnabled" | "isErrorEnabled" | "isFatalEnabled"
-                                | "isEnabled" | "logIfEnabled" | "logMessage"
-                                | "getName" | "getLevel" | "getMessageFactory"
-                                | "<init>"))
-                        // SB3-LOGBACK: STALE, no native override registered
-                        // here anymore (removed 2026-07-24 — see
-                        // `register_spring_boot_logback_apply` in
-                        // `native-builtins/src/lib.rs`; the premise, a
-                        // synthetic-allocated `LoggerContext` NPEing on
-                        // `monitorenter`, no longer holds — `LoggerContext`
-                        // construction is real bytecode). This allow-list
-                        // entry is now inert (no registration exists for this
-                        // triple, so dispatch falls through to real bytecode
-                        // either way) — left as a harmless historical marker
-                        // rather than risk touching unrelated dispatch logic.
-                        || (class_name
-                            == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
-                            && method_name == "apply"
-                            && descriptor
-                                == "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V")
                         // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()`
                         // (Charset.java:610) enumerates `CharsetProvider` SPI and calls
                         // `Charset.put` which dereferences a null name, NPEing during
@@ -21812,9 +21551,6 @@ fn invoke_on_class_shared_inner(
                         // SLF4J replay: force `LinkedBlockingQueue.clear` native over JDK
                         // bytecode so the synthetic field slots used by `drainTo` stay consistent.
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
-                            && method_name == "clear"
-                            && descriptor == "()V")
-                        || (class_name == "java/util/concurrent/LinkedBlockingDeque"
                             && method_name == "clear"
                             && descriptor == "()V")
                         || (class_name == "java/io/FilterInputStream"
@@ -21875,19 +21611,6 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // Logback / Spring: `new SimpleDateFormat(pattern)` on real-JDK
-                        // `java.text` classes can hit NSME during early bootstrap.
-                        || (class_name == "java/text/SimpleDateFormat"
-                            && method_name == "<init>"
-                            && descriptor == "(Ljava/lang/String;)V")
-                        // Tomcat `SessionIdGeneratorBase.<clinit>` calls
-                        // `Security.getAlgorithms("SecureRandom")`. Real-JDK
-                        // `Security` bytecode walks an incomplete provider graph
-                        // in cratonvm; force the native registered in
-                        // `register_essential_natives` (`native_security_get_algorithms`).
-                        || (class_name == "java/security/Security"
-                            && method_name == "getAlgorithms"
-                            && descriptor == "(Ljava/lang/String;)Ljava/util/Set;")
                         // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
                         // "No readable meta.properties files found." because
                         // our HashMap layout makes the populated logDirProps
@@ -21906,15 +21629,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/TimeUnit"
                             && method_name == "toMillis"
                             && descriptor == "(J)J")
-                        // Spring Boot 2.7 `SpringApplicationShutdownHook` static `Log logger`
-                        // calls `LogFactory.getLog(Class)`. Real commons-logging bytecode can
-                        // NPE during provider discovery; essentials registers a safe native.
-                        || (class_name == "org/apache/commons/logging/LogFactory"
-                            && method_name == "getLog"
-                            && (descriptor
-                                == "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;"
-                                || descriptor
-                                    == "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;"))
                         // Round 63: org.jboss.staxmapper.IntVersion.toString()
                         // — the real-JDK bytecode uses
                         //   IntStream.of(segments).limit(n).mapToObj(Integer::toString)
@@ -21944,11 +21658,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "javax/crypto/Cipher"
                             && matches!(method_name,
                                 "init" | "update" | "doFinal" | "getInstance"))
-                        // bc_probe / EJBCA: SecretKey accessors on synthetics.
-                        || (class_name == "javax/crypto/SecretKey"
-                            && matches!(method_name, "getEncoded" | "getAlgorithm" | "getFormat"))
-                        || (class_name == "java/security/Key"
-                            && matches!(method_name, "getEncoded" | "getAlgorithm" | "getFormat"))
                         // sportme: SimpleInstantiationStrategy.instantiate — Spring's
                         // bytecode NPEs on null bean classes. Our shim returns null
                         // gracefully so Spring's higher-level catch handles it.
@@ -21987,10 +21696,6 @@ fn invoke_on_class_shared_inner(
                         // roots directly.
                         || (class_name == "org/jboss/modules/ModuleClassLoader"
                             && matches!(method_name, "findClass" | "getResources" | "findResources" | "getResource" | "findResource"))
-                        || (class_name == "org/jboss/modules/PathFilter"
-                            && method_name == "accept")
-                        || (class_name == "org/jboss/modules/Resource"
-                            && method_name == "openStream")
                         // cglib_probe: defensive Unsafe.defineClass shim (null bytecode → null).
                         || (matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
                             && method_name == "defineClass")
@@ -22011,29 +21716,6 @@ fn invoke_on_class_shared_inner(
                             && matches!(method_name, "getURLs" | "closeLoaders" | "findResource"))
                         || (class_name == "sun/misc/URLClassPath"
                             && matches!(method_name, "getURLs" | "closeLoaders" | "findResource"))
-                        // demo (Spring Boot 4): PropertyBatchUpdateException constructor —
-                        // our PBE diagnostic intercept (`phases_late.rs::register_pbe_diagnostic`)
-                        // is registered for the <init>(PropertyAccessException[])V signature.
-                        // Allow it to override the JDK constructor bytecode so the
-                        // inner-exception dump runs before the throw is processed.
-                        //
-                        // NOTE: <init> override has a constructor-skip guard at
-                        // `vm_exec.rs:3983` (`if method_name != "<init>"` inside
-                        // `invoke_or_native`'s hierarchy-walk path) — that guard
-                        // only suppresses *superclass* native lookup for constructors,
-                        // NOT the direct `native_methods.find(class_name, ...)` at
-                        // the top of `invoke_or_native`. So allowlisting <init>
-                        // here is sufficient when the native is registered directly
-                        // on `PropertyBatchUpdateException` (which it is, in
-                        // `register_pbe_diagnostic`). If the PBE intercept still
-                        // doesn't fire after this allowlist entry, the deeper
-                        // bypass is in the bytecode-vs-native priority logic
-                        // around `has_own_bytecode` (line ~3985), not here.
-                        // The PBE constructor's bytecode just stores the array in
-                        // `propertyAccessExceptions` and calls super; our intercept
-                        // does the same plus prints diagnostics.
-                        || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
-                            && method_name == "<init>")
                         // NOTE: the Jetty 11 launcher force-override entries
                         // (`org/eclipse/jetty/start/Main.processCommandLine`
                         // and the `StartArgs` predicate/getter list) were
@@ -22412,15 +22094,6 @@ fn invoke_on_class_shared_inner(
                         // GenericPrincipal.writeReplace → SerializablePrincipal record).
                         || (class_name == "java/io/ObjectStreamClass$RecordSupport"
                             && method_name == "deserializationCtr")
-                        // WF-XNIO: `OptionMap$Builder.addAll(OptionMap)` is
-                        // concrete bytecode, but it iterates over a native-backed
-                        // `OptionMap` and can resolve the synthetic iterator as
-                        // `java/lang/Object.next()`. Force the native copy path;
-                        // companion entry in interpreter.rs.
-                        || (class_name == "org/xnio/OptionMap$Builder"
-                            && method_name == "addAll"
-                            && descriptor
-                                == "(Lorg/xnio/OptionMap;)Lorg/xnio/OptionMap$Builder;")
                         // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull):
                         // force our natives that parse RuntimeVisibleTypeAnnotations,
                         // since the real JDK path can't decode our null
@@ -23957,6 +23630,7 @@ fn invoke_on_class_shared_inner(
         thread.native_pin_roots.push(obj);
         Some(SynchronizedMethodGuard {
             monitor_pool: &shared.threads.monitors,
+            thread_registry: &shared.threads.thread_registry,
             obj,
             monitor_pin,
             thread: thread as *mut JvmThread,
@@ -24492,6 +24166,16 @@ fn invoke_on_class_shared_inner(
 /// the call leaked the monitor entirely because the line never executed).
 struct SynchronizedMethodGuard<'a> {
     monitor_pool: &'a crate::threading::monitor::MonitorTable,
+    /// Registry the matching `complete_jmx_monitor_enter` published this
+    /// monitor to. `Drop` MUST retract it. `jmx_locked_monitors` dedupes by
+    /// address and is only ever appended to here, so a publish with no
+    /// matching retract leaves the object in the thread's owned set for the
+    /// life of the thread: `getLockedMonitors()` then reports a monitor the
+    /// thread does not hold, the object is pinned as a GC root, and the
+    /// membership scan every `monitorenter` runs grows to O(distinct objects
+    /// ever locked through this path). On a Tomcat webapp deploy that scan was
+    /// 14.9% of the whole run.
+    thread_registry: &'a crate::threading::thread_registry::ThreadRegistry,
     /// Address of the monitor object AT ENTRY. Only the fallback when the
     /// pin below is unreadable — a moving GC during the method body makes
     /// this stale, which is exactly why `Drop` reads the pin instead.
@@ -24530,6 +24214,16 @@ impl Drop for SynchronizedMethodGuard<'_> {
                 error = ?e,
                 "implicit monitorexit on synchronized-method exit failed"
             );
+        }
+        // Retract the ownership publish `monitor_enter_synchronized_method`
+        // made, but only on the OUTERMOST exit: `holds` is still true while a
+        // recursive acquisition remains, and retracting there would
+        // under-report a monitor the thread really does hold. Same shape as
+        // `JitSynchronizedMonitorGuard::drop` and the interpreter's
+        // `monitor_on_exit` frame-pop path, both of which already do this.
+        if !self.monitor_pool.holds(obj, self.thread_id) {
+            self.thread_registry
+                .remove_jmx_locked_monitor(self.thread_id, obj);
         }
     }
 }

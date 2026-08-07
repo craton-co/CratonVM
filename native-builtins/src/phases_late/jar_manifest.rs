@@ -1565,6 +1565,15 @@ pub(crate) struct JarEntryTimes {
 pub(crate) struct JarContents {
     pub(crate) by_name: std::collections::HashMap<String, JarEntryRec>,
     pub(crate) order: Vec<String>,
+    /// Memoized `Multi-Release: true` answer (JEP 238) for this jar.
+    ///
+    /// `p59_jar_lookup_versioned_entry` asks once per ENTRY lookup, and
+    /// answering costs a whole-manifest `from_utf8_lossy` plus a line-by-line
+    /// parse. On a Tomcat webapp deploy - hundreds of jars, thousands of entry
+    /// lookups - that re-parse was 8.3% of the entire run. Living on
+    /// `JarContents` keys it on the same (path, mtime) pair as the rest of the
+    /// jar cache, so it invalidates exactly when the jar does.
+    pub(crate) multi_release: std::sync::OnceLock<bool>,
 }
 
 /// The three `ZipEntry` time attributes for Spring Boot's cached `JarEntryRec`.
@@ -1741,7 +1750,11 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
             },
         );
     }
-    let contents = Arc::new(JarContents { by_name, order });
+    let contents = Arc::new(JarContents {
+        by_name,
+        order,
+        multi_release: std::sync::OnceLock::new(),
+    });
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1964,6 +1977,17 @@ fn p59_jar_lookup_versioned_entry(
 }
 
 fn p59_jar_is_multi_release(path: &str) -> bool {
+    let Some(contents) = jar_contents_cached(path) else {
+        return false;
+    };
+    *contents
+        .multi_release
+        .get_or_init(|| p59_jar_manifest_declares_multi_release(path))
+}
+
+/// The actual manifest read behind `p59_jar_is_multi_release`. Runs at most
+/// once per (jar, mtime) - see `JarContents::multi_release`.
+fn p59_jar_manifest_declares_multi_release(path: &str) -> bool {
     let Some(bytes) = jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF") else {
         return false;
     };
