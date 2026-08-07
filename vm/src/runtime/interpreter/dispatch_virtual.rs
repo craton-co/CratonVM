@@ -157,6 +157,19 @@ pub(super) fn execute_invokevirtual_vtable_fast(
         return Ok(CachedCallResult::CacheMiss);
     }
 
+    // An array-typed call site resolves to `java.lang.Object`'s method table
+    // statically (JVMS §4.4.1 — an array class declares no methods), so there
+    // is nothing for a receiver-class vtable to answer. The array-kind guard
+    // further down only covers a receiver whose header still SAYS array; a
+    // reclaimed-and-re-served block does not, and this path would then resolve
+    // the site against the occupant's vtable — the `"[J".clone()` ->
+    // `java.lang.Thread.clone` route of
+    // `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame`.
+    // Cede to the slow dispatcher, which decides from the call site.
+    if method_class_name.starts_with('[') {
+        return Ok(CachedCallResult::CacheMiss);
+    }
+
     // Step 3 — peek the receiver. The receiver sits `num_params_slots`
     // down the operand stack from the top.
     // `cp_index` alone is not a call-site identity. Do not install a
