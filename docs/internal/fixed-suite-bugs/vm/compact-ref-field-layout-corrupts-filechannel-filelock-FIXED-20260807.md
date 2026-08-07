@@ -77,6 +77,51 @@ from the same header change. That one is in the JIT's inline allocator; this one
 reproduces with **`--nojit`**, byte-identically, and is still present on the tip
 that contains it.
 
+## The second victim, found independently from the other end
+
+While re-running the two 2026-08 full-suite G1 comparisons, the same defect
+turned up as **every Spring Boot test class (1975) failing at JUnit
+discovery** on dev tip — under the default collector, JIT or not:
+
+```
+Exception in thread "main" org.junit.platform.commons.JUnitException:
+  TestEngine with ID 'junit-jupiter' failed to discover tests
+Caused by: java.lang.NullPointerException: Cannot invoke
+  "java.util.Iterator.hasNext()" because "<local5>" is null
+    at ...EngineDiscoveryResultValidator.getCyclicGraphInfo
+```
+
+`AbstractTestDescriptor.children` is a `Collections.synchronizedSet`, and
+`getCyclicGraphInfo` walks `descriptor.getChildren().iterator()`. The first
+`synchronized` inside that wrapper de-compacted it, so the native reading its
+backing collection out of field 0 got the corrupt-cell guard and returned null.
+
+Reduced to eight lines with no JUnit, no H2 and no JIT — this is
+`probes/MonitorQuartetProbe.java`:
+
+```java
+Set<String> s = Collections.synchronizedSet(new LinkedHashSet<>());
+s.iterator();          // java.util.HashMap$KeyItr
+synchronized (s) { }   // quartet wiped here
+s.iterator();          // null, on a broken build
+```
+
+The `CRATONVM_DBG=cellcorrupt` witness for it names the two packed references
+being read as one 16-byte cell — `raw0` the backing `LinkedHashSet`, `raw1` the
+object itself, which is `SynchronizedCollection`'s `mutex = this`:
+
+```
+[CELLCORRUPT] holder=0x200c2c45078 class_id=450
+  class=java/util/Collections$SynchronizedSet num_slots=2 gc_flags=0x0 index=0
+  raw0=0x00000200c2c069a8 raw1=0x00000200c2c45078
+[CELLCORRUPT]   target-header: class=java/util/LinkedHashSet
+```
+
+Same `gc_flags=0x0`-on-a-compact-body signature as the `FileChannelImpl` case
+above, from a completely different workload — which is what makes the
+monitor-release diagnosis, rather than anything about the layout, the one that
+explains both.
+
 ## Severity
 **HIGH.** `FileChannel.tryLock()` / `lock()` is how every file-backed database
 opens. On dev tip no persistent H2 database opens at all — the whole
