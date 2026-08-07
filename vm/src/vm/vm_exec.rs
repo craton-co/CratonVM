@@ -11522,6 +11522,22 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             .threads
             .monitors
             .exit(obj, self.thread.thread_id);
+        // `monitor_enter_gc_safe` publishes JMX ownership (it goes through
+        // `monitor_enter_blocking`), so this is its retract. Plain
+        // `monitor_enter` above never publishes, which makes the retract a
+        // harmless no-op there rather than a wrong removal - the list is
+        // address-keyed and `remove` on an absent address does nothing.
+        if !self
+            .shared
+            .threads
+            .monitors
+            .holds(obj, self.thread.thread_id)
+        {
+            self.shared
+                .threads
+                .thread_registry
+                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
+        }
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -23796,6 +23812,7 @@ fn invoke_on_class_shared_inner(
         thread.native_pin_roots.push(obj);
         Some(SynchronizedMethodGuard {
             monitor_pool: &shared.threads.monitors,
+            thread_registry: &shared.threads.thread_registry,
             obj,
             monitor_pin,
             thread: thread as *mut JvmThread,
@@ -24331,6 +24348,16 @@ fn invoke_on_class_shared_inner(
 /// the call leaked the monitor entirely because the line never executed).
 struct SynchronizedMethodGuard<'a> {
     monitor_pool: &'a crate::threading::monitor::MonitorTable,
+    /// Registry the matching `complete_jmx_monitor_enter` published this
+    /// monitor to. `Drop` MUST retract it. `jmx_locked_monitors` dedupes by
+    /// address and is only ever appended to here, so a publish with no
+    /// matching retract leaves the object in the thread's owned set for the
+    /// life of the thread: `getLockedMonitors()` then reports a monitor the
+    /// thread does not hold, the object is pinned as a GC root, and the
+    /// membership scan every `monitorenter` runs grows to O(distinct objects
+    /// ever locked through this path). On a Tomcat webapp deploy that scan was
+    /// 14.9% of the whole run.
+    thread_registry: &'a crate::threading::thread_registry::ThreadRegistry,
     /// Address of the monitor object AT ENTRY. Only the fallback when the
     /// pin below is unreadable — a moving GC during the method body makes
     /// this stale, which is exactly why `Drop` reads the pin instead.
@@ -24369,6 +24396,16 @@ impl Drop for SynchronizedMethodGuard<'_> {
                 error = ?e,
                 "implicit monitorexit on synchronized-method exit failed"
             );
+        }
+        // Retract the ownership publish `monitor_enter_synchronized_method`
+        // made, but only on the OUTERMOST exit: `holds` is still true while a
+        // recursive acquisition remains, and retracting there would
+        // under-report a monitor the thread really does hold. Same shape as
+        // `JitSynchronizedMonitorGuard::drop` and the interpreter's
+        // `monitor_on_exit` frame-pop path, both of which already do this.
+        if !self.monitor_pool.holds(obj, self.thread_id) {
+            self.thread_registry
+                .remove_jmx_locked_monitor(self.thread_id, obj);
         }
     }
 }
