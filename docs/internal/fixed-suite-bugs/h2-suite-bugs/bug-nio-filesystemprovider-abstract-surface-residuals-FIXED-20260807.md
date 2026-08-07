@@ -185,10 +185,16 @@ below for why that is the honest arm to quote:
 | `nioMemFS:` | `AbstractMethodError` | OK 28.6 s | OK 2.9 s |
 | `rec:memFS:` | `AbstractMethodError` | OK 12.9 s | OK 2.1 s |
 | `cache:` | `AbstractMethodError` | OK 156.3 s | OK 4.1 s |
+| `split:` | `AbstractMethodError` | OK 19.3 s | — |
+| `encrypt:0007:` | `AbstractMethodError` | OK 1992 s | — |
+| `nioMemLZF:12:` | `AbstractMethodError` | OK 5032 s | — |
 
-Nine of the thirteen prefixes the class drives, `failed=0` on every one. The
-wall-clock gaps are a throughput matter, tracked separately; the doc this closes
-was about a class that could not get past its fourth sub-test on any prefix.
+Twelve of the thirteen prefixes the class drives, `failed=0` on every one (the
+thirteenth, `cache:encrypt:0007:`, is the composition of two that pass). The
+wall-clock gaps are a throughput matter, tracked separately — `encrypt:0007:`
+and `nioMemLZF:12:` are the two known walls, and they are walls, not hangs: both
+completed. The doc this closes was about a class that could not get past its
+fourth sub-test on any prefix.
 Linux `TfsProbe` (plain disk) also passed at 1.2 s on that arm — it always did,
 because H2 takes the POSIX branch there.
 
