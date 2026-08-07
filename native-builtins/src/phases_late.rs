@@ -1318,6 +1318,29 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     let pb = "java/lang/ProcessBuilder";
     let proc = "java/lang/Process";
 
+    // `SyntheticStub`, stated for the whole `java.lang.ProcessBuilder` block
+    // that follows — constructors, accessors, `redirectErrorStream`,
+    // `inheritIO`, `environment` and `start`.
+    //
+    // Every one of them shadows ordinary bytecode: the image adjudication reads
+    // `acc_native: false, has_code: true` for all eleven, so §1.4 gives the real
+    // method precedence and none of them is a bridge by §1.5's definition. They
+    // are here because synthetic-JDK mode fabricates `ProcessBuilder` outright
+    // and needs a body for each.
+    //
+    // The tag is what makes `--jdk-only` coherent, and the cluster has to move
+    // together. Restating `start()` alone leaves `<init>([Ljava/lang/String;)V`
+    // in place, which writes the raw `String[]` into the `command` field; the
+    // JDK's own `start()` then reaches `command.toArray(...)` on an array and
+    // dies with `AbstractMethodError: java/util/List.toArray has no Code
+    // attribute`. Measured, not predicted — that is precisely what the first
+    // build with only `start` restated did.
+    //
+    // Compatible mode is unchanged: these registrations survive there and the
+    // VM keeps answering ProcessBuilder itself.
+    let __pb_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+
     // --- ProcessBuilder constructors ---
     // Write to BOTH the indexed slot (synthetic-mode `PB_FIELD_COMMAND`)
     // and the real-JDK `command` field by name, so any JDK bytecode that
@@ -1492,6 +1515,8 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         ctx.unpin_native_roots(this_pin);
         Ok(Some(Value::Object(Some(map))))
     });
+
+    r.set_category(__pb_cat);
 
     // redirectInput/Output/Error(File) are DELIBERATELY NOT REGISTERED.
     //

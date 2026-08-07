@@ -9891,6 +9891,13 @@ fn dis_read_one(
     // BlockDataInputStream, and javac's class-file readers also mix consumers.
     // Read exactly the one byte requested by this helper so all consumers
     // observe the same stream position.
+    // Same buffered-window shortcut the typed reads take (`dis_fast_pull`):
+    // one byte that is already in the wrapped stream's buffer needs neither a
+    // scratch array nor an interpreted `read(byte[],int,int)`.
+    let mut one: Vec<u8> = Vec::with_capacity(1);
+    if dis_fast_pull(ctx, inner, 1, &mut one) == 1 {
+        return Ok(one[0] as i32);
+    }
     let read_size = 1;
     let tmp = ctx.new_array(ArrayElementType::Byte, read_size);
     let this_pin = ctx.pin_native_root(this);
@@ -9951,6 +9958,133 @@ fn dis_read_one(
     Ok(bytes[0] as i32)
 }
 
+/// Copy up to `want` bytes straight out of the wrapped stream's OWN buffer,
+/// in Rust, and advance its `pos`. Returns how many bytes were appended to
+/// `out` (0 means "not applicable, use the generic path").
+///
+/// # Why this exists
+///
+/// `dis_read_exact` is the shared helper behind `readByte`, `readShort`,
+/// `readUnsignedShort`, `readChar`, `readInt`, `readLong`, `readFloat`,
+/// `readDouble`, `readBoolean` and `readUTF`. Its generic path, for a **two
+/// byte** `readUnsignedShort`, allocates a Java `byte[2]` on the heap and then
+/// re-enters the VM through `invoke_virtual` to run the whole interpreted
+/// `BufferedInputStream.read(byte[],int,int)` chain (`read` -> `read1` ->
+/// `getBufIfOpen` x2 -> `ensureOpen` -> `System.arraycopy`), then copies the
+/// bytes back out. That is ~6 interpreted invocations plus an allocation per
+/// two bytes of class file.
+///
+/// Tomcat's webapp deploy is exactly that shape: `ContextConfig`'s annotation
+/// scan runs BCEL's `ClassParser` over every `.class` in every jar on the
+/// container classpath, and `ClassParser` reads the whole file through
+/// `DataInputStream.readUnsignedShort`/`readInt`. Measured on
+/// `TestManagerWebapp.testBug57700` with `--stack-sample-ms`, those five
+/// `BufferedInputStream` bodies were **78% of all interpreted time in the
+/// run**, and none of them can compile: `read` and `read(byte[],int,int)` are
+/// `ACC_SYNCHRONIZED`, and `read1`/`getBufIfOpen`/`ensureOpen`/`fill` are
+/// private, so the tiering manager never sees any of them.
+///
+/// With the buffer already filled the bytes are simply sitting in `buf` at
+/// `pos`, so the whole round trip is avoidable. The generic path still runs
+/// whenever the buffer is exhausted — that is what refills it — so the cost
+/// becomes one re-entry per 8 KiB rather than one per two bytes.
+///
+/// # Why it is faithful
+///
+/// * **Exact class only.** A subclass may override `read(byte[],int,int)`, and
+///   only the generic `invoke_virtual` path honours an override. Anything that
+///   is not exactly `java/io/BufferedInputStream` or
+///   `java/io/ByteArrayInputStream` returns 0 here.
+/// * **Same state transition.** Serving from the buffer is what
+///   `BufferedInputStream.read1` and `ByteArrayInputStream.read` do: copy out
+///   of `buf` starting at `pos`, then `pos += n`. Neither touches `markpos` on
+///   that path, so `mark`/`reset` keep working.
+/// * **Short reads are allowed.** `read(byte[],int,int)` may legally return
+///   fewer bytes than asked; the caller already loops, so returning only what
+///   the buffer holds needs no special handling.
+/// * **Field reads are by NAME**, so a layout this VM does not model answers
+///   `Int(0)` rather than a wrong slot — `count <= pos` then fails the guard
+///   and the generic path runs.
+/// * **No allocation**, therefore no GC, therefore no `ObjectRef` can go stale
+///   inside this function.
+///
+/// Not synchronized, unlike the bytecode it replaces. `dis_read_exact`'s
+/// existing loop already issues several `read` calls without holding anything
+/// across them, so a `DataInputStream` shared between threads was never atomic
+/// here; this does not add a race class.
+fn dis_fast_window(ctx: &mut dyn NativeContext, inner: ObjectRef) -> Option<(ObjectRef, usize, usize)> {
+    let class_id = ctx.class_id_of_object(inner);
+    let class_name = ctx.class_name_of_id(class_id)?;
+    if class_name != "java/io/BufferedInputStream" && class_name != "java/io/ByteArrayInputStream"
+    {
+        return None;
+    }
+    let pos = ctx.get_field_by_name(inner, "pos").as_int().unwrap_or(-1);
+    let count = ctx.get_field_by_name(inner, "count").as_int().unwrap_or(-1);
+    if pos < 0 || count <= pos {
+        return None;
+    }
+    let Value::Object(Some(buf)) = ctx.get_field_by_name(inner, "buf") else {
+        return None;
+    };
+    // Clamp to the array too: `count` is the VM's view of a field, the array
+    // length is ground truth, and reading past it would be out of bounds.
+    let count = (count as usize).min(ctx.array_length(buf));
+    let pos = pos as usize;
+    if pos >= count {
+        return None;
+    }
+    Some((buf, pos, count))
+}
+
+/// Discard-only sibling of [`dis_fast_pull`], for `skipBytes`.
+///
+/// `Utility.skipFully` is how BCEL steps over every class-file attribute it
+/// does not care about - which is most of them, `Code` included - so this runs
+/// once per skipped attribute. The generic path below allocates an 8 KiB Java
+/// scratch array and re-enters the VM to read-and-discard into it; when the
+/// bytes are already buffered, advancing `pos` is the entire operation.
+/// `BufferedInputStream.skip` does exactly that on its buffered path
+/// (`long avail = count - pos; ... pos += n`), and like `read1` it leaves
+/// `markpos` alone.
+fn dis_fast_skip(ctx: &mut dyn NativeContext, inner: ObjectRef, want: usize) -> usize {
+    if want == 0 {
+        return 0;
+    }
+    let Some((_buf, pos, count)) = dis_fast_window(ctx, inner) else {
+        return 0;
+    };
+    let n = want.min(count - pos);
+    ctx.set_field_by_name(inner, "pos", Value::Int((pos + n) as i32));
+    n
+}
+
+fn dis_fast_pull(
+    ctx: &mut dyn NativeContext,
+    inner: ObjectRef,
+    want: usize,
+    out: &mut Vec<u8>,
+) -> usize {
+    if want == 0 {
+        return 0;
+    }
+    let Some((buf, pos, count)) = dis_fast_window(ctx, inner) else {
+        return 0;
+    };
+    let n = want.min(count - pos);
+    let base = out.len();
+    out.resize(base + n, 0);
+    let copied = ctx.read_byte_array_into(buf, pos, &mut out[base..]);
+    if copied != n {
+        // Defensive: the array read declined. Leave `pos` untouched so the
+        // generic path re-reads these bytes rather than losing them.
+        out.truncate(base);
+        return 0;
+    }
+    ctx.set_field_by_name(inner, "pos", Value::Int((pos + n) as i32));
+    n
+}
+
 fn dis_read_exact(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -9979,11 +10113,22 @@ fn dis_read_exact(
         Value::Object(Some(s)) => s,
         _ => return Err(eof_exception()),
     };
+    // Take whatever the wrapped stream already holds in its own buffer without
+    // allocating or re-entering the VM - see `dis_fast_pull`. On the common
+    // case (a filled `BufferedInputStream`, which is how every class-file
+    // parser drives this) that satisfies the whole request and the generic
+    // path below never runs.
+    let mut fast: Vec<u8> = Vec::with_capacity(len);
+    dis_fast_pull(ctx, inner, len, &mut fast);
+    if fast.len() == len {
+        return Ok(fast);
+    }
+    let want = len - fast.len();
     // Family-1 fix (cce0079): `inner` is dispatched repeatedly below — each
     // `read` can trigger a moving GC, so refresh it per iteration like `buf`.
     let inner_pin = ctx.pin_native_root(inner);
     let mut inner = inner;
-    let buf = ctx.new_array(ArrayElementType::Byte, len);
+    let buf = ctx.new_array(ArrayElementType::Byte, want);
     let buf_pin = ctx.pin_native_root(buf);
     let mut buf = buf;
     // `new_array` can collect and relocate the wrapped stream. The pin keeps
@@ -9992,8 +10137,8 @@ fn dis_read_exact(
     // every subsequent GC-capable call.
     inner = ctx.read_native_pin(inner_pin, inner);
     let mut total = 0usize;
-    while total < len {
-        let remaining = (len - total) as i32;
+    while total < want {
+        let remaining = (want - total) as i32;
         let n = match ctx.invoke_virtual(
             inner,
             "read",
@@ -10042,8 +10187,10 @@ fn dis_read_exact(
         }
         total += n as usize;
     }
-    let mut out = vec![0u8; len];
-    ctx.read_byte_array_into(buf, 0, &mut out);
+    let base = fast.len();
+    let mut out = fast;
+    out.resize(len, 0);
+    ctx.read_byte_array_into(buf, 0, &mut out[base..]);
     ctx.unpin_native_roots(inner_pin);
     Ok(out)
 }
@@ -10552,14 +10699,24 @@ fn native_dis_skip_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             return Ok(Some(Value::Int(0)));
         }
     };
+    // Consume the wrapped stream's already-buffered bytes in Rust first - see
+    // `dis_fast_skip`. An attribute smaller than what the buffer holds (the
+    // common case) is skipped entirely here, with no scratch allocation and no
+    // VM re-entry. `skipBytes` is allowed to return short, so if the buffer
+    // runs out mid-skip the loop below finishes the job.
+    let fast_skipped = dis_fast_skip(ctx, inner, n as usize) as i64;
+    if fast_skipped >= n {
+        ctx.unpin_native_roots(this_pin);
+        return Ok(Some(Value::Int(fast_skipped as i32)));
+    }
     // `inner` gets its own pin handle (distinct from `this_pin`) — `pin_native_root`
     // pins one object per call; `unpin_native_roots(this_pin)` below releases
     // both, since pins are released from a handle onward.
     let inner_pin = ctx.pin_native_root(inner);
-    let scratch = ctx.new_array(ArrayElementType::Byte, SKIP_CHUNK.min(n) as usize);
+    let scratch = ctx.new_array(ArrayElementType::Byte, SKIP_CHUNK.min(n - fast_skipped) as usize);
     let scratch_pin = ctx.pin_native_root(scratch);
     let mut scratch = scratch;
-    let mut total_skipped = 0i64;
+    let mut total_skipped = fast_skipped;
     while total_skipped < n {
         let inner_cur = ctx.read_native_pin(inner_pin, inner);
         let want = (n - total_skipped).min(SKIP_CHUNK) as i32;
@@ -13292,13 +13449,48 @@ fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     let _bis_dropped_overrides = "java/io/BufferedInputStream";
 
     // BufferedOutputStream
+    //
+    // The two constructors are `SyntheticStub`, stated; the read/write/flush
+    // natives below stay on the ambient category. The note above about BIS
+    // ends "if a future regression appears for those streams we should drop
+    // them too rather than adding more layout-coupled hacks" — this is that
+    // regression, and this is that drop, scoped to the constructors.
+    //
+    // `java.lang.ProcessImpl` builds the child's stdin as
+    // `new ProcessPipeOutputStream(fd)` -> `super(new FileOutputStream(...))`
+    // -> `BufferedOutputStream(OutputStream)`. These shims set `out` and stop;
+    // the real constructor also runs `super(out)`, and `FilterOutputStream`'s
+    // constructor is where `private final Object closeLock = new Object()`
+    // lives. Skipping it leaves `closeLock` null, and `FilterOutputStream
+    // .close()` opens with `synchronized (closeLock)` — so the FIRST
+    // `Process.destroy()` in `--jdk-only` died with
+    //
+    //   NullPointerException: Cannot enter synchronized block because
+    //                         "this.closeLock" is null
+    //
+    // out of `ProcessImpl.destroy`, whose own `try { stdin.close(); } catch
+    // (IOException ignored)` cannot catch an NPE. Measured on the first build
+    // that let the real `ProcessImpl` run.
+    //
+    // Restated, strict mode drops both and the real constructor chain runs:
+    // `out`, `buf`, `maxBufSize`, `closed` and `closeLock` all get their real
+    // values, and the surviving write/flush natives resolve `out`/`buf`/`count`
+    // by NAME (see `bos_slots`), so they read the real layout unchanged.
+    // Compatible mode keeps the shims and is untouched.
     let bos = "java/io/BufferedOutputStream";
-    registry.register(bos, "<init>", "(Ljava/io/OutputStream;)V", native_bos_init);
-    registry.register(
+    registry.register_with_kind(
+        bos,
+        "<init>",
+        "(Ljava/io/OutputStream;)V",
+        native_bos_init,
+        cratonvm_native_api::NativeKind::SyntheticStub,
+    );
+    registry.register_with_kind(
         bos,
         "<init>",
         "(Ljava/io/OutputStream;I)V",
         native_bos_init_size,
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     registry.register(bos, "write", "(I)V", native_bos_write);
     registry.register(bos, "write", "([BII)V", native_bos_write_bulk);
