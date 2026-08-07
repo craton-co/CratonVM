@@ -1594,6 +1594,64 @@ pub struct GenerationalHeap {
 unsafe impl Send for GenerationalHeap {}
 unsafe impl Sync for GenerationalHeap {}
 
+
+// ---------------------------------------------------------------------------
+// Per-cycle copy tally.
+//
+// Phase H used to derive `bytes_promoted` / `objects_promoted` /
+// `bytes_copied_young` / `objects_copied_young` by walking every
+// `pointer_map` entry after the copy phase and dereferencing each destination
+// header to recompute its size. On a workload with ~756 000 survivors per
+// collection that walk is ~756 000 random header reads, and it measured
+// 29 ms of a 424 ms median stop-the-world pause — to recompute a size
+// `forward_object_impl` already had in hand.
+//
+// A thread-local is sound here and not merely convenient: `forward_object_impl`
+// takes `&mut Arena` for both destinations, so the copy phase is
+// single-threaded by construction and the borrow checker enforces it. (The
+// PARALLEL part of a young cycle is the mark closure, which is read-only and
+// never forwards.)
+//
+// Layout: [bytes_promoted, objects_promoted, bytes_copied_young,
+// objects_copied_young].
+// ---------------------------------------------------------------------------
+thread_local! {
+    static COPY_TALLY: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+
+/// Record one copied object, classified by the arena it actually landed in
+/// (promotion can fall back to to-space when old gen is full, so the
+/// destination is the truth, not `should_promote`).
+#[inline]
+fn copy_tally_add(promoted: bool, bytes: u64) {
+    COPY_TALLY.with(|t| {
+        let mut a = t.get();
+        let i = if promoted { 0 } else { 2 };
+        a[i] += bytes;
+        a[i + 1] += 1;
+        t.set(a);
+    });
+}
+
+/// Read and clear the tally for this cycle.
+fn copy_tally_take() -> [u64; 4] {
+    COPY_TALLY.with(|t| {
+        let a = t.get();
+        t.set([0; 4]);
+        a
+    })
+}
+
+/// `CRATONVM_DBG_FWDWALK=1` — re-enable the post-copy `pointer_map` walk that
+/// used to produce the counters above. It is now only a BUG-Z diagnostic
+/// (every forward must land inside young to-space or old gen), so it is off by
+/// default rather than paid for on every collection.
+fn fwd_walk_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var("CRATONVM_DBG_FWDWALK").is_ok_and(|v| v != "0"))
+}
+
 impl GenerationalHeap {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -5161,6 +5219,18 @@ impl GenerationalHeap {
             let on = *G.get_or_init(|| gc_flags().dbg_gcpause);
             PauseTimer(on.then(std::time::Instant::now))
         };
+        let mv_phase_on = gc_flags().dbg_gcpause;
+        #[allow(unused_assignments, unused_variables)]
+        let mut mv_last = std::time::Instant::now();
+        macro_rules! mv_phase {
+            ($name:expr) => {
+                if mv_phase_on {
+                    let now = std::time::Instant::now();
+                    moving_phase_marks_push($name, now.duration_since(mv_last).as_millis());
+                    mv_last = now;
+                }
+            };
+        }
         // Fresh cycle: no old-gen reclamation has happened yet. Phase 5 below
         // sets this when the mark-compact major GC runs, and
         // `run_non_moving_young_cycle` does the same for the in-place old
@@ -6019,18 +6089,8 @@ impl GenerationalHeap {
         // Marks go to a thread-local that `collect_garbage_inner`'s existing
         // pause timer drains on drop, so the breakdown survives every exit path
         // this function has rather than only the one that falls through.
-        let mv_phase_on = gc_flags().dbg_gcpause;
-        let mut mv_last = std::time::Instant::now();
-        macro_rules! mv_phase {
-            ($name:expr) => {
-                if mv_phase_on {
-                    let now = std::time::Instant::now();
-                    moving_phase_marks_push($name, now.duration_since(mv_last).as_millis());
-                    mv_last = now;
-                }
-            };
-        }
 
+        mv_phase!("pre_evacuate");
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
@@ -6630,19 +6690,28 @@ impl GenerationalHeap {
             (0, 0)
         };
 
+        mv_phase!("finalizer_resurrect");
         // Phase H (RH.1): compute promotion / young-copy stats from the
         // pointer_map BEFORE major_gc appends its own entries below.
         // Every entry at this point is a minor-GC forward: new_addr is
         // either in old_gen (promoted) or in young_to-space (copied).
         // Walking the map once avoids an expensive counter plumbed
         // through `forward_object`'s 12 call sites.
-        let mut bytes_promoted_cycle: u64 = 0;
-        let mut objects_promoted_cycle: u64 = 0;
-        let mut bytes_copied_young_cycle: u64 = 0;
-        let mut objects_copied_young_cycle: u64 = 0;
+        let [
+            bytes_promoted_cycle,
+            objects_promoted_cycle,
+            bytes_copied_young_cycle,
+            objects_copied_young_cycle,
+        ] = copy_tally_take();
+        // The walk below no longer produces those counters — `copy_tally_add`
+        // does, at the copy site. What is left of it is the BUG-Z forward
+        // validation, which is a diagnostic and does not need to run on every
+        // collection: it cost 29 ms of a 424 ms median pause, ~756 000 random
+        // destination-header dereferences deep inside stop-the-world.
         let mut bad_forward_count: u64 = 0;
         let mut bad_forward_sample: (usize, usize) = (0, 0);
-        for (&old_addr, &new_addr) in pointer_map.iter() {
+        let fwd_walk = if fwd_walk_enabled() { usize::MAX } else { 0 };
+        for (&old_addr, &new_addr) in pointer_map.iter().take(fwd_walk) {
             let new_ptr = new_addr as *const u8;
             let in_old = old_gen.contains(new_ptr);
             let in_young = young_to.contains(new_ptr);
@@ -6664,20 +6733,6 @@ impl GenerationalHeap {
                 }
                 continue;
             }
-            // SAFETY: `new_addr` is confirmed inside young_to or old_gen; both
-            // allocations begin with a valid ObjectHeader.
-            let header = unsafe { &*(new_addr as *const ObjectHeader) };
-            // `gen_object_total_size` is the sum of HEADER_SIZE and the
-            // variable-length object body, computed from the header
-            // exactly as the copy path does.
-            let sz = gen_object_total_size(header) as u64;
-            if in_old {
-                bytes_promoted_cycle += sz;
-                objects_promoted_cycle += 1;
-            } else {
-                bytes_copied_young_cycle += sz;
-                objects_copied_young_cycle += 1;
-            }
         }
         if bad_forward_count > 0 {
             // BUG-Z: surface the corruption once per cycle (not per entry).
@@ -6688,6 +6743,7 @@ impl GenerationalHeap {
             );
         }
 
+        mv_phase!("promotion_stats");
         // Phase 3: Clear card table and reset young from-space
         card_table.clear_all();
         // Re-mark cards for promoted objects that still reference young gen.
@@ -6821,8 +6877,10 @@ impl GenerationalHeap {
         // `collector.rs`) and `GcResult.pointer_map` (the public-API field
         // in `gc.rs`). The conversion is a single O(N) walk — cheap
         // compared to N SipHash operations across the Cheney scan.
+        mv_phase!("cardclear+young_reset");
         let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
 
+        mv_phase!("pointer_map_rebuild");
         // Phase 4: Swap young spaces (monitor remap deferred until after a
         // possible major GC so we can pass the composed pointer_map).
         std::mem::swap(&mut *young_from, &mut *young_to);
@@ -6832,6 +6890,7 @@ impl GenerationalHeap {
         // reliable within the next non-moving epoch, where A2's desync occurs).
         crate::a2dbg::clear();
 
+        mv_phase!("young_swap");
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact).
         //
         // `take_major_gc_request` is ALWAYS evaluated (not short-circuited by
@@ -6983,12 +7042,14 @@ impl GenerationalHeap {
             }
         }
 
+        mv_phase!("major_check");
         // Phase 4b (moved): remap monitors with the FINAL composed pointer_map.
         // Doing this after a possible major GC ensures monitor keys for
         // promoted-then-compacted objects are remapped to their final
         // post-compaction addresses, not the intermediate post-promotion ones.
         monitors.remap_after_gc(&pointer_map);
 
+        mv_phase!("monitor_remap");
         let bytes_freed = bytes_before.saturating_sub(bytes_copied);
 
         // Phase 6: Adaptive heap expansion.
@@ -7082,6 +7143,7 @@ impl GenerationalHeap {
         // `[base, end)` before any mutator resumes. Guards still held.
         self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
 
+        mv_phase!("heap_expand");
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC
         // statistics after the call returns.
@@ -12972,6 +13034,11 @@ impl GenerationalHeap {
                 );
             }
         }
+        // Phase H statistics, at the one place that already knows both the
+        // size and the destination arena. Classify by where the object
+        // ACTUALLY landed: the promotion branch falls back to to-space when
+        // old gen is full, so `should_promote` is not the answer.
+        copy_tally_add(old_gen.contains(new_ptr), total_size as u64);
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
