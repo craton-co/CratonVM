@@ -8570,7 +8570,6 @@ impl GenerationalHeap {
                     // SAFETY: reads the first header word at `src`, already validated in-bounds
                     // (`cursor < used`, from-space mapped, `>= HEADER_SIZE`) by the header deref above.
                     let word0 = unsafe { *(src as *const u64) };
-                    let mut anomaly = false;
                     if word0 == 0 {
                         let limit = free_iter
                             .peek()
@@ -8579,15 +8578,17 @@ impl GenerationalHeap {
                             .min(used);
                         let run_end = zero_run_end(from_base, cursor, limit);
                         if run_end - cursor >= HEADER_SIZE {
-                            anomaly = true;
+                            // A zero span is no longer evidence of an upstream mis-stride --
+                            // see the sweep walk's note: since `HEADER_SIZE` 24 -> 16 a
+                            // JIT-allocated `new Object()` has an all-zero header. Step over
+                            // the run one header at a time (never parsed, never freed) and keep
+                            // walking, rather than abandoning every stride to the next anchor.
+                            cursor += ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+                            continue;
                         }
                     }
-                    let total_size = if anomaly {
-                        0
-                    } else {
-                        gen_object_total_size(header)
-                    };
-                    if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                    let total_size = gen_object_total_size(header);
+                    if total_size < HEADER_SIZE || cursor + total_size > used {
                         unwind_evac(
                             &mut fwd_installs,
                             &mut evacuated,
@@ -8909,7 +8910,6 @@ impl GenerationalHeap {
                         // SAFETY: reads the first header word at `obj`, already validated in-bounds
                         // (`cursor < used`, from-space mapped, `>= HEADER_SIZE`) by the header deref above.
                         let word0 = unsafe { *(obj as *const u64) };
-                        let mut anomaly = false;
                         if word0 == 0 {
                             let limit = free_iter
                                 .peek()
@@ -8918,15 +8918,17 @@ impl GenerationalHeap {
                                 .min(used);
                             let run_end = zero_run_end(from_base, cursor, limit);
                             if run_end - cursor >= HEADER_SIZE {
-                                anomaly = true;
+                                // A zero span is no longer evidence of an upstream mis-stride --
+                                // see the sweep walk's note: since `HEADER_SIZE` 24 -> 16 a
+                                // JIT-allocated `new Object()` has an all-zero header. Step over
+                                // the run one header at a time (never parsed, never freed) and keep
+                                // walking, rather than abandoning every stride to the next anchor.
+                                cursor += ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+                                continue;
                             }
                         }
-                        let total_size = if anomaly {
-                            0
-                        } else {
-                            gen_object_total_size(header)
-                        };
-                        if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+                        let total_size = gen_object_total_size(header);
+                        if total_size < HEADER_SIZE || cursor + total_size > used {
                             let stretch_lo = cursor;
                             let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
                             let stretch_hi = if resynced { cursor } else { used };
@@ -9609,11 +9611,45 @@ impl GenerationalHeap {
                     // reclaim decisions collected since the anchor
                     // (over-retention is always safe), then re-anchor at the
                     // next free block, or stop if no anchor remains.
+                    // The stretch behind us is NOT suspect, and this is why
+                    // the unwind was right when it was written and is wrong now.
+                    //
+                    // `tlab.rs` still states the invariant it rested on: a live
+                    // `new Object()` was distinguishable from zeroed arena
+                    // because "identity_hash at offset 8" was its one non-zero
+                    // header word. The `HEADER_SIZE` 24 -> 16 shrink
+                    // (2026-08-06) made offset 8 the MARK WORD, and the JIT's
+                    // inline allocator deliberately leaves it zero -- lazy
+                    // identity-hash mint, `jit/src/x64/objects.rs`. A
+                    // JIT-allocated `new Object()` is therefore class_id 0,
+                    // shape 0, mark word 0: bit-identical to unallocated zeroed
+                    // arena. The interpreter still stamps a hash eagerly (H1),
+                    // which is exactly why `--nojit` never sees this.
+                    //
+                    // Punishing the stretch abandoned everything up to the next
+                    // free-block anchor -- 233 MB of a 256 MB young generation
+                    // from one 16-byte span -- and with an empty free list
+                    // there is no anchor at all, so the sweep freed NOTHING
+                    // (`young_free_list=0`, `freed == promoted` exactly).
+                    // Promotion became young's only exit and old gen bled out
+                    // into `OutOfMemoryError` at 68 MB live in a 1 GB heap. See
+                    // docs/known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md
+                    //
+                    // Conservative half KEPT: if this span ever WERE genuine
+                    // desync evidence, the reclaim decisions taken since the
+                    // last anchor were made on an unverified grid, and freeing
+                    // them is the UAF this hardening exists to stop. Drop them.
+                    // Only what happens NEXT changes -- the walk resumes
+                    // instead of abandoning the arena. The span sits at a low
+                    // offset in practice (measured: 3208), so the discarded
+                    // prefix is tiny and the recovered suffix is everything.
                     dead_regions.truncate(dead_watermark);
-                    if resync_to_next_free_block(&mut cursor, &mut free_iter) {
-                        continue;
-                    }
-                    break;
+                    // Step by WHOLE HEADERS, never to `run_end`: see the stride
+                    // note at the other zero-span sites. The span itself is
+                    // still never parsed and never freed, so nothing live can
+                    // be lost.
+                    cursor += ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+                    continue;
                 }
                 // Zero run shorter than a header: a real `ClassId(0)` ad-hoc
                 // container's header legitimately starts with zero words
@@ -12003,7 +12039,6 @@ impl GenerationalHeap {
             // SAFETY: reads the first header word at `obj_ptr` (`cursor < young_from.used()`),
             // already dereferenced in-bounds as a header above.
             let word0 = unsafe { *(obj_ptr as *const u64) };
-            let mut anomaly = false;
             if word0 == 0 {
                 let limit = free_iter
                     .peek()
@@ -12012,15 +12047,17 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
-                    anomaly = true;
+                    // A zero span is no longer evidence of an upstream mis-stride --
+                    // see the sweep walk's note: since `HEADER_SIZE` 24 -> 16 a
+                    // JIT-allocated `new Object()` has an all-zero header. Step over
+                    // the run one header at a time (never parsed, never freed) and keep
+                    // walking, rather than abandoning every stride to the next anchor.
+                    cursor += ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+                    continue;
                 }
             }
-            let total_size = if anomaly {
-                0
-            } else {
-                gen_object_total_size(header)
-            };
-            if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+            let total_size = gen_object_total_size(header);
+            if total_size < HEADER_SIZE || cursor + total_size > used {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
                 let stretch_hi = if resynced { cursor } else { used };
@@ -12288,7 +12325,6 @@ impl GenerationalHeap {
             // SAFETY: reads the first header word at `obj_ptr` (`cursor < young_from.used()`),
             // already dereferenced in-bounds as a header above.
             let word0 = unsafe { *(obj_ptr as *const u64) };
-            let mut anomaly = false;
             if word0 == 0 {
                 let limit = free_iter
                     .peek()
@@ -12297,15 +12333,17 @@ impl GenerationalHeap {
                     .min(used);
                 let run_end = zero_run_end(base, cursor, limit);
                 if run_end - cursor >= HEADER_SIZE {
-                    anomaly = true;
+                    // A zero span is no longer evidence of an upstream mis-stride --
+                    // see the sweep walk's note: since `HEADER_SIZE` 24 -> 16 a
+                    // JIT-allocated `new Object()` has an all-zero header. Step over
+                    // the run one header at a time (never parsed, never freed) and keep
+                    // walking, rather than abandoning every stride to the next anchor.
+                    cursor += ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+                    continue;
                 }
             }
-            let total_size = if anomaly {
-                0
-            } else {
-                gen_object_total_size(header)
-            };
-            if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+            let total_size = gen_object_total_size(header);
+            if total_size < HEADER_SIZE || cursor + total_size > used {
                 let stretch_lo = cursor;
                 let resynced = resync_to_next_free_block(&mut cursor, &mut free_iter);
                 let stretch_hi = if resynced { cursor } else { used };
@@ -13625,7 +13663,6 @@ impl GenerationalHeap {
                 // SAFETY: reads the first header word at `ptr` (`offset < used`),
                 // already dereferenced in-bounds as a header above.
                 let word0 = unsafe { *(ptr as *const u64) };
-                let mut anomaly = false;
                 if word0 == 0 {
                     let limit = free_iter
                         .peek()
@@ -13634,19 +13671,21 @@ impl GenerationalHeap {
                         .min(used);
                     let run_end = zero_run_end(base, offset, limit);
                     if run_end - offset >= HEADER_SIZE {
-                        anomaly = true;
+                        // A zero span is no longer evidence of an upstream mis-stride --
+                        // see the sweep walk's note: since `HEADER_SIZE` 24 -> 16 a
+                        // JIT-allocated `new Object()` has an all-zero header. Step over
+                        // the run one header at a time (never parsed, never freed) and keep
+                        // walking, rather than abandoning every stride to the next anchor.
+                        offset += ((run_end - offset) / HEADER_SIZE) * HEADER_SIZE;
+                        continue;
                     }
                 }
                 // `gen_object_total_size` returns 0 for an array with an
                 // implausible length or a kind=Object header with a non-zero
                 // array_length / oversized num_slots; the `< HEADER_SIZE` check
                 // below then re-anchors the walk (matching the sweep).
-                let total_size = if anomaly {
-                    0
-                } else {
-                    gen_object_total_size(header)
-                };
-                if anomaly || total_size < HEADER_SIZE || offset + total_size > used {
+                let total_size = gen_object_total_size(header);
+                if total_size < HEADER_SIZE || offset + total_size > used {
                     if resync_to_next_free_block(&mut offset, &mut free_iter) {
                         continue;
                     }
@@ -15927,7 +15966,6 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         // SAFETY: reads the first header word at `obj_ptr` (`cursor < used`),
         // already dereferenced in-bounds as a header above.
         let word0 = unsafe { *(obj_ptr as *const u64) };
-        let mut anomaly = false;
         if word0 == 0 {
             let limit = free_iter
                 .peek()
@@ -15936,15 +15974,17 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
                 .min(used);
             let run_end = zero_run_end(base, cursor, limit);
             if run_end - cursor >= HEADER_SIZE {
-                anomaly = true;
+                // A zero span is no longer evidence of an upstream mis-stride --
+                // see the sweep walk's note: since `HEADER_SIZE` 24 -> 16 a
+                // JIT-allocated `new Object()` has an all-zero header. Step over
+                // the run one header at a time (never parsed, never freed) and keep
+                // walking, rather than abandoning every stride to the next anchor.
+                cursor += ((run_end - cursor) / HEADER_SIZE) * HEADER_SIZE;
+                continue;
             }
         }
-        let total_size = if anomaly {
-            0
-        } else {
-            gen_object_total_size(header)
-        };
-        if anomaly || total_size < HEADER_SIZE || cursor + total_size > used {
+        let total_size = gen_object_total_size(header);
+        if total_size < HEADER_SIZE || cursor + total_size > used {
             // Corruption — same defence as the sweep loop: re-anchor at the
             // next free block rather than risk parsing arbitrary bytes as a
             // header (marks in the skipped stretch remain — retention only).

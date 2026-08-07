@@ -1483,6 +1483,17 @@ pub trait NativeClassAccess {
         false
     }
 
+    /// Every module name the VM's module registry knows, in no defined order.
+    ///
+    /// The registry is small by construction — `java.base` plus whatever
+    /// `--module-path` supplied — because only two sites populate it, so
+    /// callers may enumerate it eagerly. An empty vector means "this context
+    /// does not model modules", exactly as [`module_is_registered`] returning
+    /// `false` does, and must not be read as "no modules exist".
+    fn module_names(&self) -> Vec<String> {
+        vec![]
+    }
+
     /// `exports` directives declared by `module_name`, as
     /// `(package, targets)`. Package names are INTERNAL (slash) form; an empty
     /// `targets` is an unqualified export.
