@@ -446,7 +446,7 @@ constants, and the `<< 24` compact-flag shift became
 ### 6.3 What the shrink actually has to deal with
 
 1. **`HEADER_SIZE` shrinking 32 → 16 is value-safe for every disp8 site.** 16 still fits a
-   signed byte. Those 35 sites need no encoding change; they recompile correctly.
+   signed byte. Those 22 sites need no encoding change; they recompile correctly.
 2. **`ARRAY_LENGTH_OFFSET` / `NUM_SLOTS_OFFSET` is the harder surface.** It is `12` today
    and *will* move in a 16-byte header (`class_id`(4) + kind-word(4) + `shape`(4) = 12
    leaves only 4 bytes, so the mark word cannot fit at 16 unless `shape` moves). 28 sites

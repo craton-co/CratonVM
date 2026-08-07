@@ -3394,7 +3394,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     let Ok(data_size) = cratonvm_types::array_data_size(length as usize, elem_type) else {
         return jit_newarray_oom(vm, length as usize);
     };
-    let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    let total_size = cratonvm_types::ARRAY_DATA_OFFSET + data_size;
     // Fastest path: bump this thread's TLAB, taking no lock at all. Unlike the
     // `new` site there is no inline TLAB bump in codegen for arrays, so this
     // helper is not a slow path — it is the ONLY path a JIT-compiled
@@ -3741,7 +3741,7 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         None
     };
     let shape = if compact_body.is_some() {
-        *(raw_ptr.add(cratonvm_types::GC_FLAGS_OFFSET) as *mut u8) =
+        *(raw_ptr.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *mut u8) =
             cratonvm_types::GC_FLAG_COMPACT;
         num_fields as u32
     } else {
@@ -4603,7 +4603,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // slow path.
     let data_size =
         cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference).unwrap_or(0);
-    let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    let total_size = cratonvm_types::ARRAY_DATA_OFFSET + data_size;
     // Lock-free TLAB bump first — see the same arm in `jit_newarray` for why
     // this is the only path a JIT-compiled array allocation has, and what the
     // global `young_from` mutex below cost when it was the only option.
@@ -5112,7 +5112,7 @@ unsafe fn jit_compact_field_slot(
         return None;
     }
     // GC_FLAG_COMPACT is in the exported gc_flags byte.
-    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_OFFSET));
+    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_BYTE_OFFSET));
     if gc_flags & cratonvm_types::GC_FLAG_COMPACT == 0 {
         return None;
     }
@@ -7280,9 +7280,11 @@ pub unsafe extern "C" fn jit_throw_aioobe(
             let num_slots =
                 std::ptr::read_unaligned(base.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
             let gc_age =
-                std::ptr::read_unaligned(base.add(cratonvm_types::GC_AGE_OFFSET) as *const u8);
+                cratonvm_types::ObjectHeader::gc_age_of(std::ptr::read_unaligned(
+                    base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64,
+                ));
             let gc_flags =
-                std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_OFFSET) as *const u8);
+                std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) as *const u8);
             // Forwarding folded into the mark word (32 -> 24 shrink), so this
             // diagnostic reports the whole word: its 2-bit state distinguishes
             // NEUTRAL / THIN_LOCKED / INFLATED / FORWARDED, which is strictly

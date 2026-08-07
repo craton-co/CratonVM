@@ -10461,7 +10461,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
                         "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
-                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots(), h.kind as u8, index, value, culprit, rva,
+                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots(), cratonvm_types::ObjectHeader::kind_tag(h.mark_word.load(std::sync::atomic::Ordering::Relaxed)), index, value, culprit, rva,
                     );
                     eprintln!("[straystack-native] Java stack (top first):");
                     for f in self.thread.frames.iter().rev().take(28) {
