@@ -803,6 +803,53 @@ impl ObjectHeader {
         ((mark & FORWARDING_PTR_MASK) as usize) as *mut u8
     }
 
+    /// Read this object's identity hash out of the mark word, installing one
+    /// from `mint` if it has none yet.
+    ///
+    /// `Ok(hash)` — the hash lives (or now lives) in the mark word.
+    /// `Err(())` — the object is not `NEUTRAL`, so its hash cannot live here.
+    /// The caller must go to the displaced-hash table, and must **not** mint:
+    /// minting per call would hand out a different value every time.
+    ///
+    /// # Why the CAS retries instead of taking the loser's word for it
+    ///
+    /// The obvious shape is "CAS failed, so somebody else installed a hash;
+    /// return theirs". That is wrong here, because a CAS against a `NEUTRAL`
+    /// word can also lose to a *thin lock* — the same word, the same instant,
+    /// a completely different state. Re-reading is what distinguishes the two,
+    /// and it is what routes the lock case to `Err` rather than decoding an
+    /// owner id as a hash.
+    ///
+    /// The loop terminates: each iteration either returns, or observes a state
+    /// change, and the only transition back into un-hashed `NEUTRAL` is a thin
+    /// unlock, which cannot repeat without a matching lock.
+    #[inline]
+    pub fn mark_word_identity_hash(&self, mint: impl Fn() -> i32) -> Result<i32, ()> {
+        loop {
+            let mark = self.mark_word.load(std::sync::atomic::Ordering::Relaxed);
+            if Self::mark_state(mark) != MARK_NEUTRAL {
+                return Err(());
+            }
+            let existing = Self::neutral_hash(mark);
+            if existing != 0 {
+                return Ok(existing);
+            }
+            let candidate = Self::make_neutral_hashed(mint());
+            if self
+                .mark_word
+                .compare_exchange(
+                    mark,
+                    candidate,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Ok(Self::neutral_hash(candidate));
+            }
+        }
+    }
+
     /// Build a `MARK_NEUTRAL` word carrying `hash` as this object's identity
     /// hash.
     ///
@@ -1319,6 +1366,99 @@ mod tests {
         assert_eq!(ObjectHeader::neutral_hash(inflated), 0);
         let forwarded = ObjectHeader::make_forwarded(0x2_0000);
         assert_eq!(ObjectHeader::neutral_hash(forwarded), 0);
+    }
+
+    /// First call installs, every later call returns the same value, and the
+    /// mint closure is not consulted again.
+    #[test]
+    fn the_identity_hash_is_installed_once_and_then_stable() {
+        let header = make_header();
+        let mints = std::sync::atomic::AtomicUsize::new(0);
+        let mint = || {
+            mints.fetch_add(1, Ordering::Relaxed);
+            0x0BAD_F00Du32 as i32 & 0x7FFF_FFFF
+        };
+
+        let first = header.mark_word_identity_hash(&mint).unwrap();
+        assert_ne!(first, 0);
+        assert_eq!(mints.load(Ordering::Relaxed), 1);
+
+        for _ in 0..8 {
+            assert_eq!(header.mark_word_identity_hash(&mint).unwrap(), first);
+        }
+        assert_eq!(
+            mints.load(Ordering::Relaxed),
+            1,
+            "a second mint means a second identity for one object"
+        );
+    }
+
+    /// A locked or inflated object must route to the displaced table, not
+    /// decode an owner id or a `Monitor*` as a hash — and must not mint.
+    #[test]
+    fn a_non_neutral_object_refuses_rather_than_minting() {
+        let mint = || panic!("must not mint for a non-neutral object");
+
+        let header = make_header();
+        header
+            .mark_word
+            .store(ObjectHeader::make_thin_locked(77, 0), Ordering::Relaxed);
+        assert!(header.mark_word_identity_hash(mint).is_err());
+
+        let header = make_header();
+        header
+            .mark_word
+            .store(ObjectHeader::make_inflated(0x1_0000), Ordering::Relaxed);
+        assert!(header.mark_word_identity_hash(mint).is_err());
+
+        let header = make_header();
+        header
+            .mark_word
+            .store(ObjectHeader::make_forwarded(0x2_0000), Ordering::Relaxed);
+        assert!(header.mark_word_identity_hash(mint).is_err());
+    }
+
+    /// Concurrent first-hashers must converge on ONE value. This is the
+    /// property the CAS exists for, and a plain load/store would pass every
+    /// single-threaded test above while failing this.
+    #[test]
+    fn concurrent_hashers_converge_on_one_value() {
+        use std::sync::atomic::AtomicI32;
+        use std::sync::Arc;
+
+        for _round in 0..64 {
+            let header = Arc::new(make_header());
+            let next = Arc::new(AtomicI32::new(1));
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let seen: Vec<_> = (0..8)
+                .map(|_| {
+                    let header = Arc::clone(&header);
+                    let next = Arc::clone(&next);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        // Every thread proposes a DIFFERENT value, so a lost
+                        // update is visible rather than accidentally benign.
+                        header
+                            .mark_word_identity_hash(|| {
+                                next.fetch_add(1, Ordering::Relaxed)
+                            })
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect();
+
+            assert!(
+                seen.windows(2).all(|w| w[0] == w[1]),
+                "threads disagreed about one object's identity hash: {seen:?}"
+            );
+            assert_eq!(ObjectHeader::neutral_hash(
+                header.mark_word.load(Ordering::Relaxed)
+            ), seen[0]);
+        }
     }
 
     /// The hash field must not collide with the forwarding/monitor payload
