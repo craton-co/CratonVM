@@ -420,7 +420,7 @@ fn every_backend_door_goes_through_the_admission_gate() {
     // whichever one this configuration routes through — and
     // `DOOR_EAGER_FIRST_CALL` stays referenced, which is what keeps the
     // constant from rotting while that door is dormant.
-    let compiled_here: usize = [DOOR_METHOD_ENTRY, DOOR_EAGER_FIRST_CALL, DOOR_OSR]
+    let compiled_here: u64 = [DOOR_METHOD_ENTRY, DOOR_EAGER_FIRST_CALL, DOOR_OSR]
         .into_iter()
         .map(|door| nth(&fields, "admitted", door))
         .sum();
