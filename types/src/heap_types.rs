@@ -115,6 +115,50 @@ pub const INFLATED_PTR_MASK: u64 = !MARK_STATE_MASK;
 /// `mark & FORWARDING_PTR_MASK` for any address in the 64-bit space.
 pub const FORWARDING_PTR_MASK: u64 = !MARK_STATE_MASK;
 
+// --- Identity hash in the NEUTRAL mark word --------------------------------
+//
+// An object's identity hash is installed lazily, on first request, into the
+// upper bits of a `MARK_NEUTRAL` mark word -- HotSpot's design, and half of what
+// getting `HEADER_SIZE` to 16 needs (`identity_hash_code` is 4 of the 8 bytes
+// that have to go; see
+// `arch-2026-07-26/header-16-and-field-packing-20260806.md` section 2).
+//
+// # Why this needs no change to the locking fast path
+//
+// `try_thin_lock` (`vm/src/threading/monitor.rs`) CASes from the **literal**
+// `MARK_NEUTRAL` (`== 0`), not from `mark_state(cur) == MARK_NEUTRAL`. A word
+// carrying a hash is non-zero, so that CAS simply fails and the caller falls
+// through to `inflate_locked` -- which is exactly HotSpot's rule that a hashed
+// object cannot be thin-locked and must inflate instead. It is already
+// implemented, for free. `a_hashed_word_cannot_win_the_thin_lock_cas` below
+// pins it, so a future change from a literal compare to a state compare fails
+// here rather than silently destroying identity hashes under contention.
+//
+// # The one transition that destroys a hash
+//
+// Inflation. `publish_inflated` overwrites the whole word with
+// `INFLATED | monitor_ptr`, so it has to displace the hash into the
+// address-keyed `HashCodeTable` (`gc/src/compact_header.rs`, which already
+// carries the GC re-keying and dead-entry sweep that needs). Nothing else can:
+// THIN_LOCKED is unreachable for a hashed object per the above, and FORWARDED
+// is written to the *source* after the copy, so the destination carries the
+// intact word.
+//
+// Hashing an object that is already thin-locked therefore has to inflate it
+// too -- otherwise releasing the lock restores a bare `MARK_NEUTRAL` and the
+// next request mints a *second*, different hash for the same live object. This
+// VM never deflates a monitor (`grep deflat` in `monitor.rs` finds nothing), so
+// once displaced a hash never has to come back.
+
+/// Bit position of the identity hash within a `MARK_NEUTRAL` mark word; bits
+/// 0-1 are the state tag.
+pub const MARK_HASH_SHIFT: u32 = 2;
+
+/// Mask of the identity-hash field within a `MARK_NEUTRAL` mark word: 31 bits,
+/// matching the non-negative `int` range `Object.hashCode` is expected to
+/// produce (and HotSpot's own hash width).
+pub const MARK_HASH_MASK: u64 = 0x7FFF_FFFFu64 << MARK_HASH_SHIFT;
+
 /// Byte offset of `mark_word` within `ObjectHeader`. Documented for downstream
 /// agents (JIT lock fast-path) so they can emit direct atomic loads / CAS.
 ///
@@ -759,6 +803,37 @@ impl ObjectHeader {
         ((mark & FORWARDING_PTR_MASK) as usize) as *mut u8
     }
 
+    /// Build a `MARK_NEUTRAL` word carrying `hash` as this object's identity
+    /// hash.
+    ///
+    /// `hash` is truncated to the 31 bits [`MARK_HASH_MASK`] covers and forced
+    /// non-zero: zero is the "no hash installed yet" encoding, so a generator
+    /// that happened to produce 0 (or a multiple of 2^31) would install a hash
+    /// that reads back as absent and be re-minted on the next call — a
+    /// *different* identity hash for the same live object, which is the one
+    /// thing this must never do.
+    #[inline(always)]
+    pub fn make_neutral_hashed(hash: i32) -> u64 {
+        let bits = (hash as u32 as u64) & (MARK_HASH_MASK >> MARK_HASH_SHIFT);
+        let bits = if bits == 0 { 1 } else { bits };
+        MARK_NEUTRAL | (bits << MARK_HASH_SHIFT)
+    }
+
+    /// The identity hash carried by a mark word snapshot, or `0` for "none".
+    ///
+    /// `0` for every non-`NEUTRAL` state as well as for an un-hashed neutral
+    /// word: a `THIN_LOCKED` payload is an owner and recursion count and an
+    /// `INFLATED`/`FORWARDED` payload is a pointer, and handing any of those
+    /// back as a hash would be worse than useless. A caller that gets `0` from a
+    /// non-neutral word must consult the displaced-hash table, not mint one.
+    #[inline(always)]
+    pub fn neutral_hash(mark: u64) -> i32 {
+        if Self::mark_state(mark) != MARK_NEUTRAL {
+            return 0;
+        }
+        ((mark & MARK_HASH_MASK) >> MARK_HASH_SHIFT) as i32
+    }
+
     /// Whether a mark word snapshot encodes a GC forwarding pointer.
     ///
     /// Uses tag *equality*, not a bitwise test — `mark & MARK_FORWARDED != 0`
@@ -1181,6 +1256,78 @@ mod tests {
     // ---------------------------------------------------------------------
 
     use std::sync::atomic::Ordering;
+
+    // --- Identity hash in the NEUTRAL mark word ---------------------------
+
+    /// Every hash round-trips, and the word stays in `NEUTRAL` state so the
+    /// rest of the mark-word machinery keeps classifying it correctly.
+    #[test]
+    fn a_neutral_hash_round_trips_and_stays_neutral() {
+        for h in [1i32, 42, 0x7FFF_FFFE, i32::MAX] {
+            let mark = ObjectHeader::make_neutral_hashed(h);
+            assert_eq!(ObjectHeader::mark_state(mark), MARK_NEUTRAL, "hash {h}");
+            assert_eq!(ObjectHeader::neutral_hash(mark), h, "hash {h}");
+            assert!(!ObjectHeader::is_forwarded_mark(mark));
+        }
+    }
+
+    /// An installed hash must never read back as "no hash", or the next request
+    /// mints a second, different identity hash for the same live object.
+    /// Zero and 2^31 are the two generators that would do it.
+    #[test]
+    fn an_installed_hash_is_never_zero() {
+        for h in [0i32, 0x8000_0000u32 as i32, i32::MIN] {
+            let mark = ObjectHeader::make_neutral_hashed(h);
+            assert_ne!(
+                ObjectHeader::neutral_hash(mark),
+                0,
+                "make_neutral_hashed({h}) installed a hash that reads back absent"
+            );
+            assert_ne!(mark, MARK_NEUTRAL);
+        }
+    }
+
+    /// The free half of the design: `try_thin_lock` CASes from the *literal*
+    /// `MARK_NEUTRAL`, so a hashed word cannot win it and the caller inflates
+    /// instead — HotSpot's rule, already implemented.
+    ///
+    /// If someone ever "tidies" that CAS into a state comparison, thin-locking
+    /// a hashed object would start succeeding and would overwrite the hash.
+    /// This is where that fails.
+    #[test]
+    fn a_hashed_word_cannot_win_the_thin_lock_cas() {
+        let hashed = ObjectHeader::make_neutral_hashed(0x1234_5678);
+        assert_ne!(
+            hashed, MARK_NEUTRAL,
+            "a hashed word must differ from the literal the thin-lock CAS \
+             compares against, or locking would silently destroy the hash"
+        );
+        // ...while still being NEUTRAL by state, which is what makes the
+        // caller's fall-through land in the inflate path rather than an
+        // "unknown state" arm.
+        assert_eq!(ObjectHeader::mark_state(hashed), MARK_NEUTRAL);
+    }
+
+    /// A non-neutral payload is an owner id or a pointer. Reporting one as a
+    /// hash would be stable-looking garbage; `0` sends the caller to the
+    /// displaced-hash table, which is the only correct answer.
+    #[test]
+    fn no_non_neutral_state_reports_a_hash() {
+        let thin = ObjectHeader::make_thin_locked(0x1234_5678, 9);
+        assert_eq!(ObjectHeader::neutral_hash(thin), 0);
+        let inflated = ObjectHeader::make_inflated(0x1_0000);
+        assert_eq!(ObjectHeader::neutral_hash(inflated), 0);
+        let forwarded = ObjectHeader::make_forwarded(0x2_0000);
+        assert_eq!(ObjectHeader::neutral_hash(forwarded), 0);
+    }
+
+    /// The hash field must not collide with the forwarding/monitor payload
+    /// masks — the tag bits are the only overlap that is allowed.
+    #[test]
+    fn the_hash_field_does_not_overlap_the_state_tag() {
+        assert_eq!(MARK_HASH_MASK & MARK_STATE_MASK, 0);
+        assert_eq!(MARK_HASH_MASK >> MARK_HASH_SHIFT, 0x7FFF_FFFF);
+    }
 
     #[test]
     fn mark_state_constants_are_distinct_and_in_low_two_bits() {
