@@ -444,7 +444,7 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// and pays for it on the hottest path in strict mode. The identities are what
 /// the migration needs; the magnitude only has to be non-zero.
 ///
-/// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement moves every
+/// Zero when `CRATONVM_ENFORCE_NATIVE_SHADOW` is set: enforcement moves every
 /// one of these into [`jdk_only_native_shadow_attempts`] instead, so the two
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {
@@ -554,7 +554,7 @@ fn offer_native_shadow_observation(
 /// RAN" observation — §1.4's shadow, seen at the moment it actually dispatched.
 ///
 /// This is the census hole
-/// `docs/internal/jdk-only-step1-bytecode-available-*.md` was filed for:
+/// `jdk-only-step1-bytecode-available-*.md` was filed for:
 /// `resolve_step1_native` passed a hard-coded `bytecode_available: false`, so
 /// step 1 — which answers first for nearly every dispatch in the VM — recorded
 /// nothing at all, and the shadow lists could read as inert while the natives
@@ -1437,6 +1437,279 @@ pub fn unbox_poly_return(
         b'L' | b'[' => value,
         _ => value.map(|v| coerce_value_against_ret_char(v, ret, shared)),
     }
+}
+
+/// The eight classes a primitive boxes to, in the order
+/// [`primitive_wrapper_for_ret_char`] names them.
+///
+/// The membership test — "is the thing the handle produced a boxed primitive at
+/// all?" — is the whole safety margin of the strict check below, so it is a
+/// closed list rather than a `starts_with("java/lang/")` guess: a synthetic
+/// stand-in, an un-nameable fabricated class, a `MethodHandle` that failed to
+/// dispatch and a Groovy `Closure` all fall outside it and keep today's
+/// behaviour exactly.
+const PRIMITIVE_WRAPPER_CLASSES: [&str; 8] = [
+    "java/lang/Long",
+    "java/lang/Integer",
+    "java/lang/Byte",
+    "java/lang/Short",
+    "java/lang/Character",
+    "java/lang/Boolean",
+    "java/lang/Float",
+    "java/lang/Double",
+];
+
+/// The wrapper class `ret_char`'s primitive boxes to; `None` for `V`, for a
+/// reference/array return, and for any byte that is not a primitive field
+/// descriptor.
+///
+/// This is the same eight-way table [`coerce_value_against_ret_char`] applies
+/// inline. Named here so the strict `invokeExact` check and the coercion it
+/// guards cannot drift apart — they must agree on "which wrapper did the call
+/// site want", or the check would fire on a value the coercion would have
+/// unboxed correctly.
+fn primitive_wrapper_for_ret_char(ret_char: u8) -> Option<&'static str> {
+    Some(match ret_char {
+        b'J' => "java/lang/Long",
+        b'I' => "java/lang/Integer",
+        b'B' => "java/lang/Byte",
+        b'S' => "java/lang/Short",
+        b'C' => "java/lang/Character",
+        b'Z' => "java/lang/Boolean",
+        b'F' => "java/lang/Float",
+        b'D' => "java/lang/Double",
+        _ => return None,
+    })
+}
+
+/// `CRATONVM_MH_STRICT_INVOKEEXACT` — opt-in strict **return-type** check for
+/// `MethodHandle.invokeExact`. Declared as `CRATONVM_COMPAT=mh-strict-invokeexact`
+/// in `types/src/flag_groups.rs`.
+///
+/// **Default off.** Unset, every path below is byte-identical to what it was.
+///
+/// Read once through the declared-flag boundary
+/// (`cratonvm_types::flags::runtime_var_os`), which serves declared
+/// `CRATONVM_*` names from the one immutable `VmFlags` snapshot. So it
+/// **latches twice over** — once when the snapshot is built at VM start, and
+/// again in the `OnceLock` here. Exporting the variable before launching the
+/// process is the only way to set it; an in-process `set_var` after any flag
+/// has been read is invisible.
+#[inline]
+fn mh_strict_invokeexact() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        // DEFAULT FLIPPED 2026-08-07 (W5-4). Set the exact string `0` to
+        // restore the pre-W3-1 fabricated zero.
+        //
+        // The check's fire set is a strict SUBSET of the "fabricate a zero"
+        // set: the two wrapper tables are byte-identical, and the checked
+        // wrapper additionally declines an unresolvable class and a non-wrapper
+        // object, both of which the coercion still zeroes. So the only delta
+        // anywhere is: on a subset of today's fabricated zeros, an exception.
+        //
+        // One honest caveat, and it is why this needed an A/B rather than an
+        // argument: a fabricated zero is the CORRECT observable answer whenever
+        // the true answer is 0/false. "Nothing correct can become an exception"
+        // holds for the computation (that branch invents a value) but not for
+        // the outcome. The one mechanism where HotSpot would disagree is
+        // `asType`, which here is a passthrough leaving MH_DESC carrying the
+        // LEAF return type — already broken for every non-zero value, so this
+        // converts "silently wrong except at zero" into "loudly wrong always".
+        //
+        // Measured before flipping, interleaved, on the wave-4 binary:
+        //   Netty echo (`invokeExact(Thread)Z` — the one named risk that can
+        //     structurally reach the fire set): NETTY_OK in BOTH arms;
+        //   Groovy 4.0.21 (`IndyInterface`, which a strict check on this path
+        //     killed outright once before): identical PASS markers in both.
+        //   Groovy/Jackson/Spring/JRuby return REFERENCES, so they cannot reach
+        //     the fire set at any input.
+        //
+        // Permanent blind spot, recorded rather than papered over: Panama
+        // primitive downcalls can reach the fire set and have NO Java fixture
+        // in this tree — coverage is Rust-side only, and those calls do not
+        // route through `unbox_poly_return_checked`.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_MH_STRICT_INVOKEEXACT").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+/// [`unbox_poly_return`], plus the one JDK rule the coercion cannot express:
+/// **`invokeExact` does not convert.**
+///
+/// # The rule
+///
+/// JLS §15.12.3 / `java.lang.invoke.MethodHandle`: `invokeExact` requires the
+/// call site's symbolic descriptor to be *identical* to the handle's
+/// `type()` — no widening, no boxing, no `asType`. A mismatch is a
+/// `WrongMethodTypeException`. `invoke` is the opposite: it is specified to
+/// apply `asType` conversions, and `invokeBasic` / the `VarHandle` accessors
+/// are likewise permissive here. **Only `invokeExact` is gated below.** Making
+/// `invoke` strict is the mistake that would break Groovy's `IndyInterface`,
+/// whose call sites depend on the conversion.
+///
+/// # Why this is a *return-type-only* check, and why it is narrow
+///
+/// `register_t4_method_handle_invoke`'s `invokeExact` registration carries an
+/// in-tree warning that a strict **arity** check there once aborted the VM and
+/// killed every Groovy `IndyInterface` call site: CratonVM's `MH_KIND_*`
+/// adapters (insertArguments / asCollector / asSpreader / dropArguments /
+/// guardWithTest) keep their inner target's descriptor, so apparent arity
+/// routinely disagrees with the real call site. That objection does not
+/// transfer to the *return* type, which those adapters preserve.
+///
+/// This fires on one shape and one only: the native produced a **boxed
+/// primitive of a different wrapper class** than the call-site return char
+/// names. That is precisely the branch where
+/// [`coerce_value_against_ret_char`] gives up and fabricates a zero
+/// (`cls_name != expected_wrapper` → `Long(0)`/`Int(0)`/…), i.e. every value
+/// reaching it is *already* a silent wrong answer today. There is no case
+/// where this check replaces a correct result with an exception.
+///
+/// Deliberately NOT covered, each keeping today's behaviour:
+///
+/// * reference/array/void returns — [`unbox_poly_return`] returns those
+///   untouched, and a strict check there would need the handle's full
+///   `MethodType`, not a value shape;
+/// * a `null` result, or any non-wrapper object (a failed dispatch, a
+///   synthetic stand-in, an un-nameable fabricated class) — these are the
+///   modelling gaps a caller may be tolerating, and turning one into a throw
+///   is the broad gate this is written to avoid;
+/// * argument count and argument types.
+///
+/// So it is strictly less strict than HotSpot. That is intentional: the defect
+/// being fixed is the *silent wrong answer*, not full spec conformance.
+pub fn unbox_poly_return_checked(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    value: Option<Value>,
+    descriptor: &str,
+    method_name: &str,
+) -> Result<Option<Value>, MethodCallFailed> {
+    // W6-1 — VARHANDLE WRONG-TYPE ACCESS. The `VarHandle` accessors are
+    // registered with an erased `Object` return and BOX their primitive
+    // result, and `unbox_poly_return` passes `b'L' | b'['` through untouched.
+    // So `String s = (String) intVarHandle.get(h)` yields a live `Integer`
+    // typed as `String` — and javac emits NO `checkcast` for a
+    // signature-polymorphic call (the cast lives in the call site's own
+    // symbolic descriptor), so nothing downstream catches it. HotSpot raises
+    // WrongMethodTypeException from the access-mode type check. Fire set: a
+    // boxed primitive (the same closed eight-class table the invokeExact rule
+    // uses) reaching a NON-`Object` reference return — i.e. exactly the values
+    // that are already a silent wrong answer today.
+    if let Some(actual) = varhandle_reference_return_mismatch(shared, value, descriptor, method_name)
+    {
+        let message = format!(
+            "VarHandle access site {descriptor} requires a reference of its declared return \
+             type, but the access produced {}",
+            actual.replace('/', ".")
+        );
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/invoke/WrongMethodTypeException",
+            Some(&message),
+        ) {
+            return Err(MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
+    if method_name != "invokeExact" || !mh_strict_invokeexact() {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    }
+    let ret = crate::jit::return_type(descriptor);
+    let (Some(expected), Some(Value::Object(Some(obj)))) =
+        (primitive_wrapper_for_ret_char(ret), value)
+    else {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    };
+    // Scoped so the `class_manager` read guard is released before
+    // `create_exception_object` takes the write lock to load the throwable.
+    let actual = {
+        let cid = shared.mem.heap.class_id_of(obj);
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cid).map(|c| c.name.to_string())
+    };
+    let Some(actual) = actual else {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    };
+    if actual == expected || !PRIMITIVE_WRAPPER_CLASSES.contains(&actual.as_str()) {
+        return Ok(unbox_poly_return(shared, value, descriptor));
+    }
+    // Not HotSpot's wording (its message renders both `MethodType`s, which we
+    // do not have here — only the produced value's class). It names the two
+    // facts that identify the site.
+    let message = format!(
+        "invokeExact call site {descriptor} requires {}, but the handle produced {}",
+        expected.replace('/', "."),
+        actual.replace('/', ".")
+    );
+    match crate::runtime::exceptions::create_exception_object(
+        shared,
+        thread,
+        "java/lang/invoke/WrongMethodTypeException",
+        Some(&message),
+    ) {
+        Ok(exc) => Err(MethodCallFailed::ExceptionThrown(exc)),
+        // The throwable would not load — a `synthetic-jdk` build need not model
+        // it. Degrade to today's fabricated zero rather than replace a wrong
+        // answer with an uncatchable internal abort.
+        Err(_) => Ok(unbox_poly_return(shared, value, descriptor)),
+    }
+}
+
+/// The `VarHandle` access modes that RETURN the accessed variable, paired with
+/// a call site whose descriptor names a reference type that the produced box
+/// cannot be. `None` means "no complaint"; `Some(cls)` names what was produced.
+fn varhandle_reference_return_mismatch(
+    shared: &SharedVm,
+    value: Option<Value>,
+    descriptor: &str,
+    method_name: &str,
+) -> Option<String> {
+    if !matches!(
+        method_name,
+        "get"
+            | "getVolatile"
+            | "getOpaque"
+            | "getAcquire"
+            | "getPlain"
+            | "getAndSet"
+            | "getAndSetAcquire"
+            | "getAndSetRelease"
+            | "getAndAdd"
+            | "getAndAddAcquire"
+            | "getAndAddRelease"
+            | "compareAndExchange"
+            | "compareAndExchangeAcquire"
+            | "compareAndExchangeRelease"
+    ) {
+        return None;
+    }
+    if crate::jit::return_type(descriptor) != b'L' {
+        return None;
+    }
+    let want = descriptor.rsplit(')').next()?;
+    let want = want.strip_prefix('L')?.strip_suffix(';')?;
+    // An erased `Object` call site legitimately receives a box.
+    if want == "java/lang/Object" {
+        return None;
+    }
+    let Some(Value::Object(Some(obj))) = value else {
+        return None;
+    };
+    let actual = {
+        let cid = shared.mem.heap.class_id_of(obj);
+        let cm = shared.classes.class_manager.read();
+        cm.get_class(cid).map(|c| c.name.to_string())?
+    };
+    // Only a boxed primitive complains — a synthetic stand-in, an un-nameable
+    // fabricated class or a genuine reference value keeps today's behaviour.
+    if actual == want || !PRIMITIVE_WRAPPER_CLASSES.contains(&actual.as_str()) {
+        return None;
+    }
+    Some(actual)
 }
 
 fn is_method_handle_signature_polymorphic_receiver(class_name: &str) -> bool {
@@ -4448,7 +4721,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
+    /// See `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         crate::memory::reclaim_guard::audit_thread_frames(self.shared, self.thread, site);
     }
@@ -6694,6 +6967,21 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         }
     }
 
+    fn register_lambda_proxy_markers(&mut self, proxy_class_id: u32, marker_interfaces: &[String]) {
+        if proxy_class_id == 0 || marker_interfaces.is_empty() {
+            return;
+        }
+        let names: Vec<std::sync::Arc<str>> = marker_interfaces
+            .iter()
+            .map(|n| std::sync::Arc::from(n.as_str()))
+            .collect();
+        crate::runtime::invokedynamic::record_lambda_proxy_markers(
+            self.shared.vm_identity,
+            ClassId::new(proxy_class_id),
+            &names,
+        );
+    }
+
     fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
         self.shared
             .classes
@@ -7156,12 +7444,23 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         _ => None,
                     })
                     .unwrap_or_default();
+                // Same one pass, for the same reason: `create_method_object`
+                // used to re-find this method by name+descriptor to read it.
+                let signature: Option<String> = m.attributes.iter().find_map(|a| {
+                    match a.as_decoded() {
+                        Some(cratonvm_reader::attribute::Attribute::Signature(sig)) => {
+                            Some(sig.to_string())
+                        }
+                        _ => None,
+                    }
+                });
                 MethodMetadata {
                     name: m.name.to_string(),
                     descriptor: m.descriptor.to_string(),
                     access_flags: m.access_flags.bits(),
                     declaring_class_id: class_id,
                     exceptions,
+                    signature,
                 }
             })
             .collect()
@@ -7659,6 +7958,80 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .module_registry
             .get(module_name)
             .is_some_and(|d| d.is_open)
+    }
+
+    fn module_is_registered(&self, module_name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .is_some()
+    }
+
+    fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.exports
+                    .iter()
+                    .map(|e| (e.package_name.clone(), e.to_modules.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn module_opens(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.opens
+                    .iter()
+                    .map(|o| (o.package_name.clone(), o.to_modules.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn module_requires(&self, module_name: &str) -> Vec<(String, bool, bool)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.requires
+                    .iter()
+                    .map(|r| (r.module_name.clone(), r.is_transitive, r.is_static))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn module_provides(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| {
+                d.provides
+                    .iter()
+                    .map(|p| (p.service.clone(), p.with.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn all_module_names(&self) -> Vec<String> {
@@ -20095,26 +20468,6 @@ fn invoke_on_class_shared_inner(
                                 | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
                                 | ("java/lang/reflect/Method", "getReturnType", "()Ljava/lang/Class;")
                         )
-                        // Legacy Mockito selector override (off by default —
-                        // see `flags::mockito_legacy_selectors`): forced the
-                        // reflection fallback instead of letting the real
-                        // `delegate()` pick `InstrumentationMemberAccessor`.
-                        // Must stay in sync with the interpreter's gate.
-                        || (cratonvm_types::flags::mockito_legacy_selectors()
-                            && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
-                            && method_name == "delegate"
-                            && descriptor == "()Lorg/mockito/plugins/MemberAccessor;")
-                        || ((class_name == "javax/net/ssl/SSLSocketFactory"
-                                || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
-                            && method_name == "createSocket"
-                            && matches!(
-                                descriptor,
-                                "(Ljava/lang/String;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
-                            ))
                         || ((class_name == "javax/net/ssl/SSLSocket"
                                 || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
                             && matches!(
@@ -20366,18 +20719,6 @@ fn invoke_on_class_shared_inner(
                                     | ("getFormatter", "()Ljava/util/logging/Formatter;")
                                     | ("setFormatter", "(Ljava/util/logging/Formatter;)V")
                             ))
-                        || (class_name == "org/jboss/threads/JBossThread"
-                            && method_name == "run"
-                            && descriptor == "()V")
-                        || (class_name == "org/jboss/threads/JBossThread"
-                            && method_name == "onExit"
-                            && descriptor == "(Ljava/lang/Runnable;)Z")
-                        || (class_name == "org/jboss/threads/JBossThreadFactory"
-                            && ((method_name == "newThread"
-                                && descriptor == "(Ljava/lang/Runnable;)Ljava/lang/Thread;")
-                                || (method_name == "access$100"
-                                    && descriptor
-                                        == "(Lorg/jboss/threads/JBossThreadFactory;Ljava/lang/Runnable;)Ljava/lang/Thread;")))
                         || (class_name == "java/io/InputStreamReader"
                             && method_name == "close"
                             && descriptor == "()V")
@@ -20394,12 +20735,6 @@ fn invoke_on_class_shared_inner(
                             && (method_name == "getEnumConstants"
                                 || method_name == "getEnumConstantsShared")
                             && descriptor == "()[Ljava/lang/Object;")
-                        // SPB.11: Our synthetic MethodDescriptor stores the
-                        // wrapped Method at slot 0 (real-JDK MD has a private
-                        // `method` field at a different layout). Force the
-                        // native so getMethod returns our overlay value.
-                        || (class_name == "java/beans/MethodDescriptor"
-                            && method_name == "getMethod")
                         // SPB.11: Spring's GenericTypeAwarePropertyDescriptor
                         // (built by CachedIntrospectionResults) stores
                         // readMethod/writeMethod/propertyType in its own
@@ -20441,19 +20776,6 @@ fn invoke_on_class_shared_inner(
                                 || method_name == "getSystemResource"
                                 || method_name == "getResourceAsStream"
                                 || method_name == "getSystemResourceAsStream"))
-                        // WildFly process-controller bootstrap: real
-                        // ServerSocket.getLocalSocketAddress() is Java bytecode
-                        // that builds from ServerSocket's internal impl fields.
-                        // CratonVM binds the listener through native side tables,
-                        // so force the registered accessors to report the actual
-                        // resolved bound address instead of constructing an
-                        // InetSocketAddress with a null InetAddress.
-                        || (class_name == "java/net/ServerSocket"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("getInetAddress", "()Ljava/net/InetAddress;")
-                                    | ("getLocalSocketAddress", "()Ljava/net/SocketAddress;")
-                            ))
                         // URLClassLoader.findResource / findResources +
                         // URLClassPath.addURL: the real bytecode routes through
                         // `jdk.internal.loader.URLClassPath`, whose CratonVM shim
@@ -20686,45 +21008,6 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        || (matches!(
-                                class_name,
-                                "java/util/concurrent/locks/ReentrantReadWriteLock$ReadLock"
-                                | "java/util/concurrent/locks/ReentrantReadWriteLock$WriteLock"
-                            )
-                            && matches!(
-                                method_name,
-                                "lock" | "unlock" | "tryLock"
-                                | "lockInterruptibly"
-                                | "isHeldByCurrentThread"
-                            ))
-                        // EUREKA-LOGBACK-CLEANUP: LoggerContext.<init> is registered
-                        // as a no-op native, leaving the inherited `objectMap`/
-                        // `propertyMap`/`sm` fields null. Spring Boot's
-                        // `LogbackLoggingSystem.cleanUp` calls
-                        // `loggerContext.removeObject(...)`,
-                        // `loggerContext.getStatusManager().clear()`, and
-                        // `loggerContext.getTurboFilterList().remove(...)` —
-                        // every one of which the real-JDK bytecode services
-                        // by dereferencing a null field, producing the fatal
-                        // `NullPointerException: Cannot invoke remove on null`
-                        // during `prepareEnvironment` on every Spring Boot app
-                        // (eureka-server is the canonical reproducer). Force
-                        // our native stubs (registered in `native-builtins`
-                        // alongside the existing `LoggerContext.<init>` no-op)
-                        // to win so the null fields are never touched.
-                        || (class_name == "ch/qos/logback/classic/LoggerContext"
-                            && matches!(
-                                method_name,
-                                "removeObject" | "putObject" | "getObject"
-                                | "putProperty" | "getProperty"
-                                | "getStatusManager" | "getTurboFilterList"
-                            ))
-                        || (class_name == "ch/qos/logback/core/ContextBase"
-                            && matches!(
-                                method_name,
-                                "removeObject" | "putObject" | "getObject"
-                                | "putProperty" | "getProperty"
-                            ))
                         // EUREKA-RB-CANDIDATE: ResourceBundle$Control.getCandidateLocales
                         // — the real-JDK bytecode passes `locale.getBaseLocale()`
                         // as a key into `ReferencedKeyMap.computeIfAbsent`. Our
@@ -21047,19 +21330,6 @@ fn invoke_on_class_shared_inner(
                         // partial-bootstrap states and NPE on connect().
                         || (class_name == "org/apache/maven/surefire/booter/ForkedBooter"
                             && matches!(method_name, "lookupDecoderFactory" | "acknowledgedExit"))
-                        // WP6.1: Provider.getEngineName(String) вЂ” the
-                        // real JDK bytecode reads `knownEngines` (a
-                        // static HashMap) which `Provider.<clinit>` would
-                        // populate. We no-op that clinit (see
-                        // `jca/cipher.rs::register_cipher_clinit_shim`),
-                        // so `knownEngines` stays null and the bytecode
-                        // NPEs at `knownEngines.get(name)` when
-                        // BouncyCastleProvider walks ~500 algorithm
-                        // mappings. The native override returns the input
-                        // name unchanged (matching the OpenJDK fallback
-                        // path when the engine lookup fails).
-                        || (class_name == "java/security/Provider"
-                            && method_name == "getEngineName")
                         // kafka-0617 #4: our synthetic `java.security.MessageDigest`
                         // (built by `native_md_get_instance` without a real SPI)
                         // carries the running digest state in MD_FIELD_ALGO/DATA.
@@ -21416,15 +21686,6 @@ fn invoke_on_class_shared_inner(
                                 | "getLocalAddress"
                                 | "socket"
                             ))
-                        // SocketAdaptor address accessors need the same channel
-                        // shims: the real JDK bytecode returns the unresolved
-                        // InetSocketAddress we synthesize for accepted peers,
-                        // so Socket.getInetAddress() becomes null and Tomcat's
-                        // request remoteAddr/remoteHost population fails.
-                        || (class_name == "sun/nio/ch/SocketAdaptor"
-                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
-                        || (class_name == "java/net/Socket"
-                            && matches!(method_name, "getInetAddress" | "getLocalAddress"))
                         // Jasper's embedded ECJ can surface a CratonVM-only
                         // false-positive "must implement
                         // ServletConfig.getInitParameterNames()" problem for
@@ -21637,25 +21898,6 @@ fn invoke_on_class_shared_inner(
                                 | "checkAccess"
                                 | "checkSecurityAccess"
                             ))
-                        // log4j 2.x LogManager surface: getContext /
-                        // getLogger / getFormatterLogger / getRootLogger /
-                        // getFactory / shutdown overloads. The `<clinit>`
-                        // shim (elsewhere) leaves the static `factory`
-                        // field null, so the real bytecode for these
-                        // statics NPEs on `factory.getContext(...)`.
-                        // Allowlist them so
-                        // `log4j_extras::register_log4j_stubs` wins
-                        // dispatch and returns synthetic LoggerContext /
-                        // Logger instances instead.
-                        || (class_name == "org/apache/logging/log4j/LogManager"
-                            && matches!(method_name,
-                                "getContext"
-                                | "getLogger"
-                                | "getFormatterLogger"
-                                | "getRootLogger"
-                                | "getFactory"
-                                | "exists"
-                                | "shutdown"))
                         // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()`
                         // (Charset.java:610) enumerates `CharsetProvider` SPI and calls
                         // `Charset.put` which dereferences a null name, NPEing during
@@ -21673,17 +21915,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/util/concurrent/LinkedBlockingDeque"
-                            && method_name == "clear"
-                            && descriptor == "()V")
-                        || (class_name == "java/io/FilterInputStream"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
-                            ))
-                        || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
-                            && method_name == "iterator"
-                            && descriptor == "()Ljava/util/Iterator;")
                         || (class_name == "java/util/Iterator"
                             && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Reactor StepVerifier uses timed
@@ -21717,36 +21948,11 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // Spring CacheAdviceNamespaceTests: keep Spring XML
-                        // namespace validation active but force our
-                        // DefaultDocumentLoader factory bridge so it can attach
-                        // a shared Xerces grammar pool. Without this gate the
-                        // protected concrete Java method wins over the native
-                        // and every GenericXmlApplicationContext reparses the
-                        // same Spring XSDs from scratch.
-                        || (class_name
-                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
-                            && method_name == "createDocumentBuilderFactory"
-                            && descriptor
-                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,
                             descriptor,
                         )
-                        // Logback / Spring: `new SimpleDateFormat(pattern)` on real-JDK
-                        // `java.text` classes can hit NSME during early bootstrap.
-                        || (class_name == "java/text/SimpleDateFormat"
-                            && method_name == "<init>"
-                            && descriptor == "(Ljava/lang/String;)V")
-                        // Tomcat `SessionIdGeneratorBase.<clinit>` calls
-                        // `Security.getAlgorithms("SecureRandom")`. Real-JDK
-                        // `Security` bytecode walks an incomplete provider graph
-                        // in cratonvm; force the native registered in
-                        // `register_essential_natives` (`native_security_get_algorithms`).
-                        || (class_name == "java/security/Security"
-                            && method_name == "getAlgorithms"
-                            && descriptor == "(Ljava/lang/String;)Ljava/util/Set;")
                         // Kafka 4.2.0: MetaPropertiesEnsemble.verify throws
                         // "No readable meta.properties files found." because
                         // our HashMap layout makes the populated logDirProps
@@ -21765,15 +21971,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/TimeUnit"
                             && method_name == "toMillis"
                             && descriptor == "(J)J")
-                        // Spring Boot 2.7 `SpringApplicationShutdownHook` static `Log logger`
-                        // calls `LogFactory.getLog(Class)`. Real commons-logging bytecode can
-                        // NPE during provider discovery; essentials registers a safe native.
-                        || (class_name == "org/apache/commons/logging/LogFactory"
-                            && method_name == "getLog"
-                            && (descriptor
-                                == "(Ljava/lang/Class;)Lorg/apache/commons/logging/Log;"
-                                || descriptor
-                                    == "(Ljava/lang/String;)Lorg/apache/commons/logging/Log;"))
                         // Round 63: org.jboss.staxmapper.IntVersion.toString()
                         // — the real-JDK bytecode uses
                         //   IntStream.of(segments).limit(n).mapToObj(Integer::toString)
@@ -21803,11 +22000,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "javax/crypto/Cipher"
                             && matches!(method_name,
                                 "init" | "update" | "doFinal" | "getInstance"))
-                        // bc_probe / EJBCA: SecretKey accessors on synthetics.
-                        || (class_name == "javax/crypto/SecretKey"
-                            && matches!(method_name, "getEncoded" | "getAlgorithm" | "getFormat"))
-                        || (class_name == "java/security/Key"
-                            && matches!(method_name, "getEncoded" | "getAlgorithm" | "getFormat"))
                         // sportme: SimpleInstantiationStrategy.instantiate — Spring's
                         // bytecode NPEs on null bean classes. Our shim returns null
                         // gracefully so Spring's higher-level catch handles it.
@@ -21866,29 +22058,6 @@ fn invoke_on_class_shared_inner(
                             && matches!(method_name, "getURLs" | "closeLoaders" | "findResource"))
                         || (class_name == "sun/misc/URLClassPath"
                             && matches!(method_name, "getURLs" | "closeLoaders" | "findResource"))
-                        // demo (Spring Boot 4): PropertyBatchUpdateException constructor —
-                        // our PBE diagnostic intercept (`phases_late.rs::register_pbe_diagnostic`)
-                        // is registered for the <init>(PropertyAccessException[])V signature.
-                        // Allow it to override the JDK constructor bytecode so the
-                        // inner-exception dump runs before the throw is processed.
-                        //
-                        // NOTE: <init> override has a constructor-skip guard at
-                        // `vm_exec.rs:3983` (`if method_name != "<init>"` inside
-                        // `invoke_or_native`'s hierarchy-walk path) — that guard
-                        // only suppresses *superclass* native lookup for constructors,
-                        // NOT the direct `native_methods.find(class_name, ...)` at
-                        // the top of `invoke_or_native`. So allowlisting <init>
-                        // here is sufficient when the native is registered directly
-                        // on `PropertyBatchUpdateException` (which it is, in
-                        // `register_pbe_diagnostic`). If the PBE intercept still
-                        // doesn't fire after this allowlist entry, the deeper
-                        // bypass is in the bytecode-vs-native priority logic
-                        // around `has_own_bytecode` (line ~3985), not here.
-                        // The PBE constructor's bytecode just stores the array in
-                        // `propertyAccessExceptions` and calls super; our intercept
-                        // does the same plus prints diagnostics.
-                        || (class_name == "org/springframework/beans/PropertyBatchUpdateException"
-                            && method_name == "<init>")
                         // NOTE: the Jetty 11 launcher force-override entries
                         // (`org/eclipse/jetty/start/Main.processCommandLine`
                         // and the `StartArgs` predicate/getter list) were
@@ -21997,13 +22166,6 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "write" | "toByteArray" | "size" | "reset" | "toString"
                             ))
-                        // ES provider loading closes InputStreamReader wrappers
-                        // created by the lightweight resource-reader bridge. The
-                        // real close() body dereferences StreamDecoder state we do
-                        // not initialize; force the registered no-op native.
-                        || (class_name == "java/io/InputStreamReader"
-                            && method_name == "close"
-                            && descriptor == "()V")
                         || ((class_name == "java/lang/Runtime"
                             && method_name == "version"
                             && descriptor == "()Ljava/lang/Runtime$Version;")
@@ -22221,12 +22383,46 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
+                        // VARHANDLE.VARTYPE/COORDINATETYPES: both are concrete JDK
+                        // bytecode whose body reads `this.vform` and walks a
+                        // `VarForm`/`MethodType` chain CratonVM never builds — on a
+                        // CratonVM VarHandle slot 0 (`vform`) holds an `Int` ClassId,
+                        // so the real body cannot execute at all. The registered
+                        // natives (`register_p59_varhandle`) answer from the two
+                        // `Class` mirrors the factory stamped at slots 4/5, and
+                        // REFUSE with UnsupportedOperationException when a handle
+                        // carries none. regression-suite RJdkHandles:244-245.
+                        || (class_name == "java/lang/invoke/VarHandle"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("varType", "()Ljava/lang/Class;")
+                                    | ("coordinateTypes", "()Ljava/util/List;")
+                            ))
                         // METHODHANDLE.ASCOLLECTOR/ASSPREADER: unimplemented (real
                         // bytecode → species); Groovy's dispatch chains use
                         // `asCollector(Object[].class, n)` / `asSpreader(...)`. Pin
                         // `MH_KIND_COLLECT` / `MH_KIND_SPREAD`.
+                        // ASVARARGSCOLLECTOR/ASFIXEDARITY: the real bytecode wraps
+                        // the receiver in `MethodHandleImpl$AsVarargsCollector`, a
+                        // `DelegatingMethodHandle` whose ctor runs `makeReinvokerForm`
+                        // -> `mtype.form().cachedLambdaForm(LF_DELEGATE)` and then
+                        // needs a LambdaForm reinvoker to re-enter our synthetic
+                        // handle via `invokeBasic` (no body in the `MH_KIND_*` shim
+                        // model). regression-suite RJdkHandles died there with
+                        // `Cannot load from object array because "this.lambdaForms"
+                        // is null` in BOTH --real-jdk and --jdk-only. Pin the
+                        // identity shims registered in
+                        // `register_method_handle_combinator_extras_bridge`;
+                        // CratonVM applies collector semantics at dispatch
+                        // (`collect_trailing_varargs`).
                         || (class_name == "java/lang/invoke/MethodHandle"
-                            && matches!(method_name, "asCollector" | "asSpreader"))
+                            && matches!(
+                                method_name,
+                                "asCollector"
+                                    | "asSpreader"
+                                    | "asVarargsCollector"
+                                    | "asFixedArity"
+                            ))
                         // CALLSITE.DYNAMICINVOKER: `MutableCallSite`/
                         // `VolatileCallSite.dynamicInvoker()` — the real
                         // `makeDynamicInvoker` does `bindArgumentL` (BoundMethodHandle
@@ -22267,15 +22463,6 @@ fn invoke_on_class_shared_inner(
                         // GenericPrincipal.writeReplace → SerializablePrincipal record).
                         || (class_name == "java/io/ObjectStreamClass$RecordSupport"
                             && method_name == "deserializationCtr")
-                        // WF-XNIO: `OptionMap$Builder.addAll(OptionMap)` is
-                        // concrete bytecode, but it iterates over a native-backed
-                        // `OptionMap` and can resolve the synthetic iterator as
-                        // `java/lang/Object.next()`. Force the native copy path;
-                        // companion entry in interpreter.rs.
-                        || (class_name == "org/xnio/OptionMap$Builder"
-                            && method_name == "addAll"
-                            && descriptor
-                                == "(Lorg/xnio/OptionMap;)Lorg/xnio/OptionMap$Builder;")
                         // TYPE_USE annotation surface (JSpecify @Nullable/@NonNull):
                         // force our natives that parse RuntimeVisibleTypeAnnotations,
                         // since the real JDK path can't decode our null
@@ -22842,7 +23029,13 @@ fn invoke_on_class_shared_inner(
                                     poly_desc,
                                 ) {
                                     let r = safe_native_call(shared, thread, cb, args)?;
-                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                    return unbox_poly_return_checked(
+                                        shared,
+                                        thread,
+                                        r,
+                                        descriptor,
+                                        method_name,
+                                    );
                                 }
                             }
                         }
@@ -22854,7 +23047,13 @@ fn invoke_on_class_shared_inner(
                                     .find(base, method_name, poly_desc)
                             {
                                 let r = safe_native_call(shared, thread, cb, args)?;
-                                return Ok(unbox_poly_return(shared, r, descriptor));
+                                return unbox_poly_return_checked(
+                                    shared,
+                                    thread,
+                                    r,
+                                    descriptor,
+                                    method_name,
+                                );
                             }
                         }
                         if !prefer_exact {
@@ -22866,7 +23065,13 @@ fn invoke_on_class_shared_inner(
                                     poly_desc,
                                 ) {
                                     let r = safe_native_call(shared, thread, cb, args)?;
-                                    return Ok(unbox_poly_return(shared, r, descriptor));
+                                    return unbox_poly_return_checked(
+                                        shared,
+                                        thread,
+                                        r,
+                                        descriptor,
+                                        method_name,
+                                    );
                                 }
                             }
                         }
@@ -23454,8 +23659,8 @@ fn invoke_on_class_shared_inner(
                 // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
-                // docs/known-issues/h2/
-                // bug-h2-classid0-stale-address-family.md.
+                // fixed-suite-bugs/h2-suite-bugs/
+                // bug-h2-classid0-stale-address-family-FIXED.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     let addr = recv.as_ptr() as usize;
                     if crate::memory::reclaim_guard::report_reclaimed_receiver(
@@ -26045,6 +26250,61 @@ mod tests {
         let shared = test_shared();
         let r = unbox_poly_return(&shared, Some(Value::Object(None)), "()Ljava/lang/String;");
         assert_eq!(r, Some(Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------------
+    // W3-1 — the strict `invokeExact` return check's two lookup tables
+    //
+    // `unbox_poly_return_checked` fires only where
+    // `coerce_value_against_ret_char` would otherwise fabricate a zero. That
+    // equivalence holds only while the two functions agree on which wrapper
+    // each return char names — and `coerce_value_against_ret_char` spells its
+    // table inline. These tests are what keep the copy honest; a drift would
+    // make the check fire on a value the coercion unboxes correctly, which is
+    // the one way it could turn a right answer into an exception.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn primitive_wrapper_table_covers_exactly_the_eight_primitives() {
+        for ch in *b"JIBSCZFD" {
+            let wrapper =
+                primitive_wrapper_for_ret_char(ch).expect("every primitive ret char has a wrapper");
+            assert!(
+                PRIMITIVE_WRAPPER_CLASSES.contains(&wrapper),
+                "{wrapper} is named by ret char {} but is not in PRIMITIVE_WRAPPER_CLASSES",
+                ch as char
+            );
+        }
+        // Void, reference, array, and a non-descriptor byte must all decline —
+        // otherwise the check would reach shapes `unbox_poly_return` returns
+        // untouched.
+        for ch in *b"VL[Q\0" {
+            assert!(
+                primitive_wrapper_for_ret_char(ch).is_none(),
+                "ret char {:?} must not name a primitive wrapper",
+                ch as char
+            );
+        }
+        assert_eq!(PRIMITIVE_WRAPPER_CLASSES.len(), 8);
+    }
+
+    /// The mismatch predicate must be *symmetric with the fabrication branch*:
+    /// for each primitive return char, the wrapper it names is the only one of
+    /// the eight that `coerce_value_against_ret_char` would NOT zero out.
+    #[test]
+    fn each_ret_char_names_exactly_one_wrapper() {
+        for ch in *b"JIBSCZFD" {
+            let expected = primitive_wrapper_for_ret_char(ch).expect("primitive");
+            let matches = PRIMITIVE_WRAPPER_CLASSES
+                .iter()
+                .filter(|w| **w == expected)
+                .count();
+            assert_eq!(
+                matches, 1,
+                "ret char {} maps to {expected}, which appears {matches} times in the table",
+                ch as char
+            );
+        }
     }
 
     #[test]

@@ -505,13 +505,61 @@ impl ModuleRegistry {
     /// The unnamed module reads everything.  Every module reads `java.base`
     /// and itself.  If the graph has not been built yet this falls back to
     /// checking only direct `requires` edges.
+    ///
+    /// # The unnamed-module rule is DIRECTIONAL
+    ///
+    /// The classpath-compatibility escape hatch is the `reader ==
+    /// UNNAMED_MODULE` arm below, and only that arm. This function used to
+    /// carry a second, symmetric arm — `provider == UNNAMED_MODULE` — so a
+    /// NAMED module implicitly read the unnamed module too. JPMS says it does
+    /// not, and the JDK agrees; measured on HotSpot 25:
+    ///
+    /// ```text
+    ///   unnamed.canRead(java.logging)      = true
+    ///   java.logging.canRead(unnamed)      = false
+    ///   java.logging.canRead(java.base)    = true
+    ///   java.base.canRead(java.logging)    = false
+    ///   // and with --add-reads java.logging=ALL-UNNAMED:
+    ///   java.logging.canRead(unnamed)      = true
+    /// ```
+    ///
+    /// (`regression-suite/src/RJdkModule.java:114`,
+    /// `check(!svc.canRead(unnamed), "a named module must NOT implicitly read
+    /// the unnamed module")`, failed in BOTH `--real-jdk` and `--jdk-only` on
+    /// the symmetric rule.)
+    ///
+    /// Dropping the symmetry does not weaken the escape hatch, because no
+    /// access check ever reaches this arm:
+    ///
+    /// * [`Self::check_module_access`] returns `Ok(())` for `accessor_module ==
+    ///   UNNAMED_MODULE || target_module == UNNAMED_MODULE` *before* it calls
+    ///   `reads`.
+    /// * [`Self::check_deep_reflection_access`] returns `Ok(())` for
+    ///   `target_module == UNNAMED_MODULE` *before* it calls `reads`.
+    /// * A classpath jar carrying a `module-info.class` is registered
+    ///   `automatic`, and the automatic arm further down returns `true` for
+    ///   every provider including the unnamed one — so `org.jboss.logging` and
+    ///   friends are unaffected.
+    /// * A module with no registered descriptor still gets the open-world
+    ///   `true`.
+    /// * An explicit grant still works: `--add-reads m=ALL-UNNAMED` and the
+    ///   `Module.addReads0` VM-sync hook (Mockito's
+    ///   `InlineBytecodeGenerator.assureCanReadMockito` makes `java.base` read
+    ///   the unnamed module this way) both land in `extra_reads` keyed on the
+    ///   empty-string sentinel and are honoured on both the built-graph and the
+    ///   un-built-fallback paths below.
+    ///
+    /// What is left is the JPMS query surface — `NativeContext::reads_module`,
+    /// i.e. `java.lang.Module.canRead` — which is exactly where the directional
+    /// answer is the correct one.
     pub fn reads(&self, reader: &str, provider: &str) -> bool {
-        // Unnamed module reads all named modules (classpath compat).
+        // Unnamed module reads all named modules (classpath compat). This is
+        // the escape hatch, and it is one-way — see the doc comment.
         if reader == UNNAMED_MODULE {
             return true;
         }
         // Every module reads itself and java.base.
-        if reader == provider || provider == JAVA_BASE || provider == UNNAMED_MODULE {
+        if reader == provider || provider == JAVA_BASE {
             return true;
         }
 
@@ -939,11 +987,52 @@ impl ModuleRegistry {
     ///
     /// Returns `Ok(())` if access is allowed, `Err(reason)` otherwise.
     ///
-    /// # Unnamed-module compatibility
+    /// # The unnamed-accessor arm is a deliberate escape hatch, not an oversight
     ///
-    /// * The unnamed module can always access any package.
-    /// * The unnamed module is always readable by named modules in classpath
-    ///   mode (same JVM instance).
+    /// JPMS (JEP 261/403) says classpath code may reach a named module's
+    /// package only if that package is `exports`ed — unqualified, or qualified
+    /// to `ALL-UNNAMED`. The `accessor_module == UNNAMED_MODULE` arm below is
+    /// deliberately *more* permissive than that. Do not delete it on the
+    /// strength of the spec alone; audit the callers first. As of 2026-08-07
+    /// they are:
+    ///
+    /// | caller | live? | what tightening would refuse |
+    /// |---|---|---|
+    /// | `access_control::check_module_access(&Class, &Class, &ModuleRegistry)` | the only wrapper | — |
+    /// | ↳ `check_class_access_with_modules` | **no production call site** | — |
+    /// | ↳ `check_field_access_with_modules` | **no production call site** | — |
+    /// | ↳ `check_method_access_with_modules` | **no production call site** | — |
+    /// | ↳ `check_module_access_by_id` | **live** | see below |
+    /// | ↳↳ `runtime/resolve/mod.rs` (`AccessPolicy::ModuleOnly`, the one implementation behind BOTH field and method resolution) | **live** | every classpath `invoke*` / `getfield` / `putfield` naming a non-exported package |
+    /// | ↳↳ `vm/vm_init.rs` (5 sites) | self-test/probe only | — |
+    ///
+    /// The two live rows are bytecode resolution, and under `--real-jdk` the
+    /// registry carries java.base's REAL descriptor (parsed from the jimage's
+    /// `module-info.class`; `CRATONVM_BOOT_MODULE_REGISTRY`, default on), which
+    /// exports `java.lang`/`java.util`/… but NOT `jdk.internal.*` / `sun.nio.*`.
+    /// Tightening this arm therefore turns every classpath reference to
+    /// `jdk.internal.misc.Unsafe` & friends into an `IllegalAccessError` at
+    /// resolution time — a broad break, on the hot path, that no measured
+    /// vector asks for. The arm stays.
+    ///
+    /// # This function is NOT the reflection gate
+    ///
+    /// `RJdkModule.java:172` (a public no-arg constructor on a public class in
+    /// the one package the module neither exports nor opens must be refused
+    /// with `IllegalAccessException`) does **not** route through here.
+    /// `Constructor.newInstance` is served by
+    /// `native-builtins/src/lang_class.rs::native_constructor_new_instance`,
+    /// and the exports question it asks reaches this registry through
+    /// [`Self::is_package_exported_to`] (via
+    /// `NativeContext::reflective_export_to_accessor`), which has no
+    /// unnamed-*accessor* arm and already answers correctly. See
+    /// `docs/known-issues/jdk-only/W4-2-unnamed-accessor-bypasses-encapsulation.md`.
+    ///
+    /// So the asymmetry with [`Self::check_deep_reflection_access`] (which does
+    /// refuse an unnamed accessor) is not an inconsistency to resolve: the two
+    /// serve different subsystems. Deep reflection is caller-sensitive and
+    /// JEP-403-governed; this one is bytecode linkage, where the hatch is what
+    /// keeps mixed classpath/module-path applications running.
     pub fn check_module_access(
         &self,
         accessor_module: &str,
@@ -1207,6 +1296,322 @@ pub fn is_platform_module_name(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// `--module-path` / `--add-modules` resolution
+// ---------------------------------------------------------------------------
+//
+// Background — why this exists at all.
+//
+// `--module-path` and `--add-modules` were parsed by the launcher into
+// `VmConfig::module_path` / `VmConfig::add_modules` and then read by NOBODY:
+// `grep -rn '\.module_path\b|\.add_modules\b'` over the whole workspace found
+// exactly two hits, both *writes* in `vm-cli/src/main.rs`. Same disease as the
+// already-recorded `--add-opens was parsed then ignored`. The consequence is
+// that a launch of the shape
+//
+//     --module-path <dir> --add-modules <name> -cp <dir> Main
+//
+// resolved no module at all: the module's classes were not on any search path,
+// and `ModuleLayer.boot().findModule(<name>)` had no module to find. (It
+// answered `Optional.of(...)` regardless, because the synthetic
+// `ModuleLayer.findModule` native fabricates a Module for any syntactically
+// valid name — see `native-builtins/src/jboss_jdkspecific.rs`.)
+//
+// This module does the *resolution* half: turn the raw `--module-path` entries
+// into the set of named modules `--add-modules` actually selects, together with
+// the filesystem root each one lives at and the package set it declares. The
+// caller (`vm_init`) puts those roots on the application search path — the real
+// JDK also defines module-path classes to the application loader — and
+// registers the descriptors here with `automatic == false`, i.e. as EXPLICIT
+// modules whose `exports`/`opens` are enforced. That last part is the whole
+// point of a module path: a jar on the *class* path gets automatic-module
+// semantics (read/export/open everything, see `ModuleDescriptor::automatic`),
+// and a module resolved from a *module* path does not.
+
+/// One named module found on the `--module-path`.
+#[derive(Debug, Clone)]
+pub struct ModulePathModule {
+    /// Filesystem root to add to the class search path: an exploded module
+    /// directory, or a modular JAR.
+    pub root: String,
+    /// The parsed `module-info.class` descriptor. `automatic` is always
+    /// `false` — a module resolved from a real module path is explicit.
+    pub descriptor: ModuleDescriptor,
+    /// Packages the module contains, slash format (`"com/example/svc"`).
+    pub packages: Vec<String>,
+}
+
+/// `--add-modules ALL-MODULE-PATH` (JEP 261): resolve every observable module
+/// on the module path, whether or not anything requires it.
+pub const ALL_MODULE_PATH: &str = "ALL-MODULE-PATH";
+
+/// Parse `module-info.class` bytes into a descriptor plus whatever packages
+/// its `ModulePackages` attribute declares.
+///
+/// The package list is frequently EMPTY and that is not an error: `javac` does
+/// not emit `ModulePackages` for an exploded compilation. Verified with
+/// `javap -v regression-suite/build-modules/cratonvm.jdkonly.svc/module-info.class`
+/// — the attribute list is `SourceFile` + `Module`, nothing else. Only `jar` /
+/// `jlink` add it. Callers must fall back to scanning the tree
+/// ([`exploded_packages`] / the JAR entry list), exactly as the real JDK's
+/// `jdk.internal.module.ModulePath` does.
+pub fn parse_module_info(bytes: &[u8]) -> Option<(ModuleDescriptor, Vec<String>)> {
+    let mut class_file = cratonvm_reader::read_class(bytes).ok()?;
+    cratonvm_reader::attribute::force_decode_all(
+        &mut class_file.attributes,
+        &class_file.constant_pool,
+    )
+    .ok()?;
+    let desc = class_file.attributes.iter().find_map(|a| {
+        a.as_decoded()
+            .and_then(|d| descriptor_from_module_attribute(d, &class_file.constant_pool))
+    })?;
+    let packages = class_file
+        .attributes
+        .iter()
+        .find_map(|a| {
+            a.as_decoded()
+                .and_then(|d| packages_from_module_packages_attribute(d, &class_file.constant_pool))
+        })
+        .unwrap_or_default();
+    Some((desc, packages))
+}
+
+/// Is `segment` usable as one dot-separated component of a package name?
+///
+/// The real JDK drops directories that cannot be package components rather
+/// than inventing an illegal package name — this is what keeps `META-INF`
+/// (illegal: contains `-`) out of a module's package set.
+fn is_package_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c == '$' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+}
+
+/// Walk an exploded module directory and collect the packages it contains,
+/// in slash format.
+///
+/// Counts a directory as a package when it holds at least one regular file —
+/// not only `.class` files. That matches `ModulePath::explodedPackages`, and
+/// it matters here: a package that is opened purely to expose a resource still
+/// has to appear in `ModuleDescriptor.packages()`.
+///
+/// Symlinks are not followed (`file_type()` reports `is_symlink`, so they are
+/// neither descended into nor counted), which bounds the walk on a cyclic
+/// tree.
+fn exploded_packages(root: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, pkg)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut has_file = false;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !is_package_segment(&name) {
+                    continue;
+                }
+                let child = if pkg.is_empty() {
+                    name
+                } else {
+                    format!("{pkg}/{name}")
+                };
+                stack.push((entry.path(), child));
+            } else if file_type.is_file() {
+                has_file = true;
+            }
+        }
+        if has_file && !pkg.is_empty() && !out.contains(&pkg) {
+            out.push(pkg);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Read `module-info.class` out of a modular JAR, together with the package
+/// set derived from its entry names.
+fn modular_jar_module(path: &std::path::Path) -> Option<(ModuleDescriptor, Vec<String>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+
+    // Collect names first: `by_name` needs `&mut archive`, so the borrow of
+    // `file_names()` must be finished before the read below.
+    let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read as _;
+        let mut entry = archive.by_name("module-info.class").ok()?;
+        entry.read_to_end(&mut bytes).ok()?;
+    }
+    let (descriptor, declared) = parse_module_info(&bytes)?;
+
+    let packages = if declared.is_empty() {
+        let mut pkgs: Vec<String> = Vec::new();
+        for name in &names {
+            if name.ends_with('/') {
+                continue;
+            }
+            let Some(pos) = name.rfind('/') else {
+                continue;
+            };
+            let pkg = &name[..pos];
+            if pkg.split('/').all(is_package_segment) && !pkgs.iter().any(|p| p == pkg) {
+                pkgs.push(pkg.to_string());
+            }
+        }
+        pkgs.sort();
+        pkgs
+    } else {
+        declared
+    };
+    Some((descriptor, packages))
+}
+
+/// Try to read `path` as a single module root (exploded directory or modular
+/// JAR). Returns `None` when it carries no `module-info.class`.
+fn module_at(path: &std::path::Path) -> Option<ModulePathModule> {
+    let root = path.to_string_lossy().into_owned();
+    if path.is_dir() {
+        let info = path.join("module-info.class");
+        let bytes = std::fs::read(&info).ok()?;
+        let (mut descriptor, declared) = parse_module_info(&bytes)?;
+        descriptor.automatic = false;
+        let packages = if declared.is_empty() {
+            exploded_packages(path)
+        } else {
+            declared
+        };
+        return Some(ModulePathModule {
+            root,
+            descriptor,
+            packages,
+        });
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext.eq_ignore_ascii_case("jar") {
+        let (mut descriptor, packages) = modular_jar_module(path)?;
+        descriptor.automatic = false;
+        return Some(ModulePathModule {
+            root,
+            descriptor,
+            packages,
+        });
+    }
+    None
+}
+
+/// Every module *observable* on `entries` — i.e. present on the module path,
+/// whether or not `--add-modules` selects it.
+///
+/// A `--module-path` entry is either a module root itself (a directory holding
+/// `module-info.class`, or a modular JAR) or a directory *of* module roots;
+/// `java` accepts both spellings and so does this.
+pub fn scan_module_path(entries: &[String]) -> Vec<ModulePathModule> {
+    let mut found: Vec<ModulePathModule> = Vec::new();
+    for entry in entries {
+        let path = std::path::Path::new(entry);
+        if let Some(m) = module_at(path) {
+            found.push(m);
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(path) else {
+            continue;
+        };
+        let mut child_paths: Vec<std::path::PathBuf> =
+            children.flatten().map(|c| c.path()).collect();
+        // `read_dir` order is filesystem-dependent; sort so the resulting
+        // search-path order (and therefore split-package shadowing) is the
+        // same on every run and every OS.
+        child_paths.sort();
+        for child in child_paths {
+            if let Some(m) = module_at(&child) {
+                found.push(m);
+            }
+        }
+    }
+    found
+}
+
+/// Resolve the `--add-modules` root set against the modules observable on
+/// `--module-path`, returning the selected modules plus everything they
+/// (transitively) require that also lives on the module path.
+///
+/// Returns an empty vec when nothing is selected — which is the correct answer
+/// for a plain `-cp` launch, and the reason this is safe to call
+/// unconditionally at VM init.
+///
+/// `--add-modules` accepts a comma-separated list per occurrence, so tokens are
+/// split on `,` here as well as across occurrences. `ALL-MODULE-PATH` selects
+/// every observable module. `ALL-DEFAULT` / `ALL-SYSTEM` select system modules,
+/// none of which are on a module path, so they select nothing here.
+pub fn resolve_module_path(entries: &[String], add_modules: &[String]) -> Vec<ModulePathModule> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let observable = scan_module_path(entries);
+    if observable.is_empty() {
+        return Vec::new();
+    }
+
+    let mut roots: Vec<String> = Vec::new();
+    let mut all = false;
+    for spec in add_modules {
+        for token in spec.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if token == ALL_MODULE_PATH {
+                all = true;
+            } else {
+                roots.push(token.to_string());
+            }
+        }
+    }
+
+    if all {
+        return observable;
+    }
+
+    // Transitive closure of `requires`, restricted to what is observable.
+    // `requires static` is compile-time only and does NOT pull a module into
+    // the graph at run time, matching `build_readability_graph`'s seeding.
+    let mut selected: FxHashSet<String> = FxHashSet::default();
+    let mut work: Vec<String> = roots;
+    while let Some(name) = work.pop() {
+        if !selected.insert(name.clone()) {
+            continue;
+        }
+        if let Some(m) = observable.iter().find(|m| m.descriptor.name == name) {
+            for req in &m.descriptor.requires {
+                if !req.is_static && !selected.contains(&req.module_name) {
+                    work.push(req.module_name.clone());
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ModulePathModule> = observable
+        .into_iter()
+        .filter(|m| selected.contains(&m.descriptor.name))
+        .collect();
+    out.sort_by(|a, b| a.descriptor.name.cmp(&b.descriptor.name));
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1234,6 +1639,63 @@ mod tests {
         assert!(reg.reads(UNNAMED_MODULE, "java.base"));
         assert!(reg.reads(UNNAMED_MODULE, "java.logging"));
         assert!(reg.reads(UNNAMED_MODULE, "com.example.mymod"));
+    }
+
+    /// The other direction of `unnamed_reads_everything` — and the half that
+    /// was wrong. `reads` used to return `true` whenever `provider ==
+    /// UNNAMED_MODULE`, making the rule symmetric where JPMS makes it
+    /// directional. Measured on HotSpot 25: `unnamed.canRead(java.logging)` is
+    /// `true`, `java.logging.canRead(unnamed)` is `false`.
+    /// `regression-suite/src/RJdkModule.java:114` asserts exactly that and
+    /// failed in both `--real-jdk` and `--jdk-only`.
+    #[test]
+    fn named_module_does_not_implicitly_read_the_unnamed_module() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("com.example"), vec![]);
+        reg.build_readability_graph();
+
+        assert!(
+            reg.reads(UNNAMED_MODULE, "com.example"),
+            "the unnamed module reads every resolved module"
+        );
+        assert!(
+            !reg.reads("com.example", UNNAMED_MODULE),
+            "a named module must NOT implicitly read the unnamed module"
+        );
+        // ...but the explicit grant (`--add-reads m=ALL-UNNAMED`, or the
+        // `Module.addReads0` VM-sync hook) still works, on both the built-graph
+        // and un-built-fallback paths.
+        reg.add_reads("com.example", UNNAMED_MODULE);
+        assert!(reg.reads("com.example", UNNAMED_MODULE));
+        reg.register(sample_desc("mod.late"), vec![]); // invalidates the closure
+        assert!(reg.reads("com.example", UNNAMED_MODULE));
+    }
+
+    /// The classpath-compatibility escape hatch the symmetric rule was there
+    /// for. None of its users go through the deleted arm: an automatic module
+    /// reads everything by its own arm, an unregistered module gets the
+    /// open-world `true`, and both access checks short-circuit on an unnamed
+    /// participant before `reads` is ever consulted.
+    #[test]
+    fn classpath_escape_hatch_survives_the_directional_rule() {
+        let mut automatic = sample_desc("org.jboss.logging");
+        automatic.automatic = true;
+        let mut reg = ModuleRegistry::new();
+        reg.register(automatic, vec![]);
+        reg.register(sample_desc("com.example"), vec![]);
+        reg.build_readability_graph();
+
+        // Automatic (classpath jar carrying a module-info) reads everything.
+        assert!(reg.reads("org.jboss.logging", UNNAMED_MODULE));
+        // A module the registry never saw keeps the open-world answer.
+        assert!(reg.reads("mod.unregistered", UNNAMED_MODULE));
+        // Neither access check consults `reads` when either side is unnamed.
+        assert!(reg
+            .check_module_access("com.example", UNNAMED_MODULE, "com/whatever")
+            .is_ok());
+        assert!(reg
+            .check_deep_reflection_access("com.example", UNNAMED_MODULE, "com/whatever")
+            .is_ok());
     }
 
     #[test]
@@ -1946,5 +2408,30 @@ mod tests {
         assert!(reg
             .check_module_access("modA", "modB", "com/internal")
             .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // `--module-path` resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn package_segment_rejects_non_identifiers() {
+        // The filter that keeps `META-INF` (and `build-modules`-style names)
+        // out of a module's package set.
+        assert!(is_package_segment("svc"));
+        assert!(is_package_segment("_x"));
+        assert!(is_package_segment("$y"));
+        assert!(is_package_segment("a1"));
+        assert!(!is_package_segment("META-INF"));
+        assert!(!is_package_segment("1abc"));
+        assert!(!is_package_segment(""));
+    }
+
+    #[test]
+    fn empty_module_path_resolves_nothing() {
+        // The unconditional call at VM init must be a no-op for a plain
+        // `-cp` launch — no filesystem probing, no modules selected.
+        assert!(resolve_module_path(&[], &[]).is_empty());
+        assert!(resolve_module_path(&[], &["some.module".to_string()]).is_empty());
     }
 }

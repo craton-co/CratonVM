@@ -12,7 +12,7 @@ closed:
 
 One residual is **handed over, not closed**: a single `SIGSEGV` in those 330
 runs, with a different signature from this report's (see below). It is handed to
-`docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
 
 The `Chunk N not found` failures this report already attributed to upstream H2
 fault-injection flakiness are confirmed again: stock HotSpot JDK 25 hit them in

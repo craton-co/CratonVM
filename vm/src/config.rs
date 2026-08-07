@@ -1051,9 +1051,25 @@ impl VmConfig {
         if let Some((reader, targets)) = s.split_once('=') {
             for target in targets.split(',') {
                 let target = target.trim();
-                if !target.is_empty() {
-                    result.push((reader.trim().to_string(), target.to_string()));
+                if target.is_empty() {
+                    continue;
                 }
+                // `ALL-UNNAMED` is the JDK convention; store it as the empty
+                // string, our unnamed-module sentinel — the same translation
+                // `parse_add_exports` below already documents doing. Without
+                // it the flag records the literal "ALL-UNNAMED", which names
+                // no module and grants nothing. That was invisible while
+                // `ModuleRegistry::reads` returned `true` for every unnamed
+                // PROVIDER; now that the rule is directional (measured on
+                // HotSpot 25: `java.logging.canRead(unnamed)` is false bare
+                // and true under `--add-reads java.logging=ALL-UNNAMED`),
+                // this translation is what makes the flag work at all.
+                let target = if target == "ALL-UNNAMED" {
+                    String::new()
+                } else {
+                    target.to_string()
+                };
+                result.push((reader.trim().to_string(), target));
             }
         }
         result

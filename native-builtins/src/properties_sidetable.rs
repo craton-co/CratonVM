@@ -2648,7 +2648,7 @@ fn native_properties_string_property_names(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -2686,7 +2686,7 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -2805,7 +2805,7 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         };
     }
     let this_cur = ctx.read_native_pin(this_pin, this);
-    let list = cratonvm_native_collections::make_live_values_list(ctx, this_cur, &vals);
+    let list = cratonvm_native_collections::make_live_values_list(ctx, this_cur, &vals)?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
@@ -2830,7 +2830,7 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
@@ -2919,7 +2919,7 @@ fn native_properties_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // rather than the entries — as the write-through carrier also keeps a later
     // `new HashSet<>(props.entrySet())` copy correctly detached on `remove`.
     let this_cur = ctx.read_native_pin(this_pin, this);
-    let set = cratonvm_native_collections::make_static_entry_set(ctx, this_cur, &pairs);
+    let set = cratonvm_native_collections::make_static_entry_set(ctx, this_cur, &pairs)?;
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(set))))
 }

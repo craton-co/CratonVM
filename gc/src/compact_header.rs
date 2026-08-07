@@ -931,7 +931,9 @@ pub struct CompactAllocator {
     hash_table: HashCodeTable,
     /// Total number of objects allocated.
     object_count: std::sync::atomic::AtomicUsize,
-    /// Total bytes saved vs. legacy 32-byte headers.
+    /// Total bytes saved vs. legacy headers -- `LEGACY_MINUS_COMPACT_HEADER`
+    /// each. The legacy header was 32 bytes until the 2026-08-06 shrink and is
+    /// 24 now, so the figure is derived rather than written down here.
     bytes_saved: std::sync::atomic::AtomicUsize,
 }
 
@@ -1082,7 +1084,9 @@ impl CompactAllocator {
         self.object_count.load(Ordering::Relaxed)
     }
 
-    /// Total bytes saved vs. legacy 32-byte headers.
+    /// Total bytes saved vs. legacy headers -- `LEGACY_MINUS_COMPACT_HEADER`
+    /// each. The legacy header was 32 bytes until the 2026-08-06 shrink and is
+    /// 24 now, so the figure is derived rather than written down here.
     pub fn bytes_saved(&self) -> usize {
         self.bytes_saved.load(Ordering::Relaxed)
     }

@@ -230,15 +230,23 @@ snapshotted before that rung and the source carries the ordering requirement.
 * **`ProcessBuilder$Redirect.PIPE`/`INHERIT`** are registered as methods the
   image does not declare (`Redirect.PIPE` is a field). Dead registrations, not
   reached by anything; left for a dead-row sweep.
-* **`waitForProcessExit0` answers -1 for a pid it did not spawn, where HotSpot's
-  own native answers `NOT_A_CHILD` (-2) on `ECHILD`.** The difference is real:
-  -1 completes `ProcessHandle.of(pid).onExit()` immediately with a fabricated
-  exit status of -1, while -2 makes the JDK poll `isAlive0` until the process
-  actually ends and then complete with 0. It only differs for a handle to a
-  process this VM did not spawn, no probe covers that path, and the code is
-  `58f0ffb30`'s and freshly probe-verified — so it is recorded here rather than
-  changed unmeasured. Fixing it is a one-line change plus a probe rung that
-  holds a foreign pid.
+* ~~**`waitForProcessExit0` answers -1 for a pid it did not spawn, where
+  HotSpot's own native answers `NOT_A_CHILD` (-2) on `ECHILD`.**~~ **DONE
+  2026-08-07.** It was one line plus the probe this entry asked for, and the
+  probe confirmed the prediction before the change: bounding the wait at 400 ms
+  against a 30 s process, `--jdk-only` read `completed-while-alive` and HotSpot
+  read `still-waiting`. Now identical. `probes/ForeignHandleProbe.java`.
+
+  Writing that probe turned up two more things about foreign handles, both since
+  closed — see
+  [`foreign-processhandle-CLOSED-20260807.md`](foreign-processhandle-CLOSED-20260807.md).
+  `ProcessHandle.destroy()` on a foreign handle really was a no-op and is fixed:
+  `isAlive0` now reports a real start time from `/proc/<pid>/stat`, so `destroy0`
+  can run the JDK's staleness check instead of refusing outright. The other —
+  "compatible mode cannot construct a foreign `ProcessHandle`" — was **wrong and
+  is retracted**: the fault was in that probe's own launcher, which let the
+  subject inherit the shell's stdout pipe. Real HotSpot 25 shows the same race,
+  30001 ms against 2 ms on one binary with only the sleep duration changed.
 * **`native-builtins/src/lib.rs`'s synthetic-mode `ProcessBuilder` block** —
   `<init>` ×2, `command`, `start` — still carries the ambient `Bridge`. That
   registrar is not on the default boot path, so no gate here measures it and the

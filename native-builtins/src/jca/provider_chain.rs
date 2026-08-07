@@ -1154,6 +1154,79 @@ fn seed_direct_native_engine_services() {
         }
     }
     put_service("SunJSSE", "Signature", "MD5andSHA1withRSA", "sun.security.ssl.RSASignature");
+    seed_retired_getalgorithms_literals();
+}
+
+/// W4-3 — the engine services that were only ever asserted by the retired
+/// `Security.getAlgorithms` literal table in
+/// `phases_early::register_phase53_security`.
+///
+/// That table is now gone and `algorithms_for_service` answers from this
+/// registry instead. Every entry the table claimed must therefore exist here,
+/// or `--synthetic-jdk` would answer a SHORTER list than before — the same
+/// short-list defect one layer down. These are the entries that were claimed
+/// but not registered:
+///
+///   * `Mac` — the registry had NO `Mac` service at all, so the type would
+///     have gone 5 names -> 0.
+///   * `KeyGenerator` `AES`/`DESede` — only `HmacSHA256` existed, and only via
+///     `seed_sunjce_pbe_services`, which is gated on `ec_real`.
+///   * `KeyPairGenerator` `RSA`/`DSA` — only `EC` existed (`seed_sunec_services`).
+///
+/// Provider ownership and SPI class names are MEASURED, not guessed:
+/// enumerating `getServices()` per provider on jdk-25.0.3.9-hotspot. Every
+/// name below is one HotSpot really answers for that type.
+///
+/// Three things the retired table claimed that are deliberately NOT seeded,
+/// because the same measurement says HotSpot does not answer them:
+///   * `Cipher` `AES/CBC/PKCS5Padding`, `AES/CBC/NoPadding`,
+///     `AES/ECB/PKCS5Padding` — HotSpot's `Cipher` set has no `AES/CBC/*` or
+///     `AES/ECB/*` entry; those transformations are serviced by the generic
+///     `Cipher.AES` service, which is already registered.
+///   * `SecureRandom` `NativePRNGNonBlocking`/`NativePRNGBlocking` — SUN
+///     registers those only on unix-like images; the platform JDK answers
+///     `[DRBG, SHA1PRNG, WINDOWS-PRNG]`. `find_service_provider("SecureRandom",
+///     ..)` is what `securerandom.rs` uses to decide whether `getInstance`
+///     succeeds, so seeding a name we do not implement would fabricate a
+///     working PRNG. The set stays non-empty either way, which is all
+///     Tomcat's `SessionIdGeneratorBase.<clinit>` needs.
+///   * `MessageDigest` `SHAKE128-256`/`SHAKE256-512` — real on HotSpot, but
+///     `message_digest::algorithm_supported` does not implement them, and
+///     advertising a digest that `getInstance` then refuses is a worse lie
+///     than a 13-name list.
+fn seed_retired_getalgorithms_literals() {
+    const JCE: &str = "SunJCE";
+    for (algorithm, class_name) in [
+        ("HmacMD5", "com.sun.crypto.provider.HmacMD5"),
+        ("HmacSHA1", "com.sun.crypto.provider.HmacSHA1"),
+        ("HmacSHA256", "com.sun.crypto.provider.HmacCore$HmacSHA256"),
+        ("HmacSHA384", "com.sun.crypto.provider.HmacCore$HmacSHA384"),
+        ("HmacSHA512", "com.sun.crypto.provider.HmacCore$HmacSHA512"),
+    ] {
+        put_service(JCE, "Mac", algorithm, class_name);
+    }
+    for (algorithm, class_name) in [
+        ("AES", "com.sun.crypto.provider.AESKeyGenerator"),
+        ("DESede", "com.sun.crypto.provider.DESedeKeyGenerator"),
+        (
+            "HmacSHA256",
+            "com.sun.crypto.provider.KeyGeneratorCore$HmacKG$SHA256",
+        ),
+    ] {
+        put_service(JCE, "KeyGenerator", algorithm, class_name);
+    }
+    put_service(
+        "SunRsaSign",
+        "KeyPairGenerator",
+        "RSA",
+        "sun.security.rsa.RSAKeyPairGenerator$Legacy",
+    );
+    put_service(
+        "SUN",
+        "KeyPairGenerator",
+        "DSA",
+        "sun.security.provider.DSAKeyPairGenerator$Current",
+    );
 }
 
 /// Real-JCA bring-up: seed the `SunEC` provider's EC service entries into the
@@ -1427,7 +1500,46 @@ fn seed_sunjsse_services() {
         "Default",
         "sun.security.ssl.SSLContextImpl$DefaultSSLContext",
     );
+    // W3-7: the four entries above were the whole `SSLContext` table, so the
+    // chain claimed the platform could not service `TLSv1`, `TLSv1.1`,
+    // `SSLv3`, or any DTLS protocol — every one of which SunJSSE really does
+    // register on JDK 25. Verified by enumerating
+    // `Security.getProvider("SunJSSE").getServices()` on the platform JDK
+    // (jdk-25.0.3.9-hotspot): the nine primaries below plus the two
+    // `Alg.Alias.SSLContext` entries are exactly what it advertises.
+    put_service(
+        J,
+        "SSLContext",
+        "TLSv1",
+        "sun.security.ssl.SSLContextImpl$TLS10Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "TLSv1.1",
+        "sun.security.ssl.SSLContextImpl$TLS11Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "DTLS",
+        "sun.security.ssl.SSLContextImpl$DTLSContext",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "DTLSv1.0",
+        "sun.security.ssl.SSLContextImpl$DTLS10Context",
+    );
+    put_service(
+        J,
+        "SSLContext",
+        "DTLSv1.2",
+        "sun.security.ssl.SSLContextImpl$DTLS12Context",
+    );
     put_alias(J, "SSLContext", "SSL", "TLS");
+    // `Alg.Alias.SSLContext.SSLv3 -> TLSv1` on the platform JDK — NOT to TLS.
+    put_alias(J, "SSLContext", "SSLv3", "TLSv1");
     // KeyStore lives in the SUN provider (JKS/CaseExactJKS) and PKCS12 too.
     const S: &str = "SUN";
     put_service(
@@ -1958,7 +2070,7 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         .unwrap_or_default();
 
     let this_pin = ctx.pin_native_root(this);
-    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
     let set_pin = ctx.pin_native_root(set);
     for entry in entries {
         let prov = ctx.read_native_pin(this_pin, this);
@@ -2372,6 +2484,184 @@ pub(crate) fn find_service_provider(type_str: &str, algo: &str) -> Option<String
         .into_iter()
         .find(|(name, _, _)| get_service_entry(name, type_str, algo).is_some())
         .map(|(name, _, _)| name)
+}
+
+/// Every `SSLContext` protocol name SunJSSE registers on JDK 25, ASCII-
+/// uppercased.
+///
+/// Measured, not guessed: enumerating
+/// `Security.getProvider("SunJSSE").getServices()` on jdk-25.0.3.9-hotspot
+/// yields primaries {TLS, TLSv1, TLSv1.1, TLSv1.2, TLSv1.3, Default, DTLS,
+/// DTLSv1.0, DTLSv1.2} plus aliases {SSL -> TLS, SSLv3 -> TLSv1}. Anything
+/// outside that set raises `NoSuchAlgorithmException` on HotSpot — confirmed
+/// for `SSLv2`, `TLSv1.4` and `NO-SUCH-TLS`.
+const SSL_CONTEXT_PROTOCOLS: &[&str] = &[
+    "TLS", "TLSV1", "TLSV1.1", "TLSV1.2", "TLSV1.3", "SSL", "SSLV3", "DEFAULT", "DTLS", "DTLSV1.0",
+    "DTLSV1.2",
+];
+
+/// Can `SSLContext.getInstance(protocol)` be serviced?
+///
+/// W3-7 (`RJdkSecurity.tls`): the two real-JDK-mode `SSLContext.getInstance`
+/// registrations each carried their OWN hand-rolled protocol list, and both
+/// were narrower than the platform's — `net_phase_e::register_re6_ssl_context`
+/// accepted five names, `phases_late::ssl_security::register_p68_ssl` seven,
+/// and neither knew about DTLS. A too-narrow list is the dangerous direction
+/// here: it turns a valid `getInstance("TLSv1")` into a refusal and takes
+/// every HTTPS-using suite down with it. So this answers YES on two grounds
+/// and NO only when both fail:
+///
+///   1. the name is in the measured JDK-25 SunJSSE set above; or
+///   2. some provider in the live chain actually registered an `SSLContext`
+///      service under that name — a caller-installed provider (Conscrypt,
+///      BC-JSSE, Elytron) legitimately adds protocols we have never heard of,
+///      and refusing those would be the same defect one layer up.
+///
+/// It is NOT the place to decide whether a protocol is *safe*; `SSLv3` and
+/// `TLSv1` resolve here exactly as they do on HotSpot, and the enabled-
+/// protocol policy that actually keeps them off the wire lives in the
+/// connector (`new13_build_connector` pins a TLS 1.2 floor).
+pub(crate) fn ssl_context_protocol_supported(protocol: &str) -> bool {
+    // Do NOT copy `message_digest::algorithm_supported`'s alphanumeric-strip
+    // normalise here. Measured on jdk-25.0.3.9-hotspot: `TLSV1.2`, `tlsv1.3`,
+    // `SSLV3` and `dtls` all resolve, while `TLSv12`, `TLS `, ` TLS` and
+    // `T-L-S` all raise `NoSuchAlgorithmException`. JCA lookup is case-
+    // insensitive and nothing else. Digest names get the cruder normalise
+    // because the JDK's own tables carry `SHA256`/`SHA-256` aliases; the
+    // SSLContext table carries none, so stripping punctuation would fabricate
+    // `getInstance("TLSv12")` into a working context — the exact defect
+    // species this predicate exists to close.
+    if protocol != protocol.trim() {
+        return false;
+    }
+    let upper = protocol.to_ascii_uppercase();
+    if SSL_CONTEXT_PROTOCOLS.contains(&upper.as_str()) {
+        return true;
+    }
+    find_service_provider("SSLContext", protocol).is_some()
+}
+
+/// `Security.getAlgorithms(serviceName)` — the algorithm-name set for one
+/// engine type across EVERY provider in the live chain, answered from the
+/// same `services()` registry that backs `Provider.getService` /
+/// `Provider.getServices` / `find_service_provider`.
+///
+/// ## W4-3 — why this exists at all
+///
+/// In real-JDK mode there was no `Security.getAlgorithms` native, so the call
+/// ran real JDK 25 bytecode, which iterates `provider.keys()` over the
+/// `Provider` objects `Security.getProviders()` handed back. Those are the
+/// synthetics `make_provider` builds — their inherited `Hashtable` is empty by
+/// construction, and `make_provider`'s own doc comment already says so:
+/// "`keys()` returns an empty enumeration and `getAlgorithms` yields an empty
+/// set rather than throwing". Empty. For every engine type. That is
+/// `RJdkSecurity.providers` (:311) failing `MessageDigest algorithms must
+/// include SHA-256` in both `--real-jdk` and `--jdk-only`.
+///
+/// The only other implementation lived in
+/// `phases_early::register_phase53_security`, which is reached solely from
+/// `register_synthetic_overrides` — i.e. `--synthetic-jdk` builds. It carried a
+/// hand-maintained six-entry-per-type literal table. It now delegates here, so
+/// the two modes cannot disagree and the answer cannot drift from the registry
+/// that decides `getService`.
+///
+/// ## Semantics — measured on jdk-25.0.3.9-hotspot, not recalled
+///
+/// A probe enumerating `Security.getAlgorithms(t)` for 28 engine types
+/// established every rule below:
+///   * names come back ASCII-UPPERCASED (`SHA-256`, `HMACSHA256`,
+///     `AES/GCM/NOPADDING`) and `contains` is case-SENSITIVE:
+///     `contains("SHA-256")` is true, `contains("sha-256")` is false;
+///   * ALIASES ARE EXCLUDED. `MessageDigest` answers 15 names, exactly the 15
+///     primary `MessageDigest.*` services SUN registers — the `SHA256` alias
+///     of `SHA-256` is absent, because its property key is
+///     `Alg.Alias.MessageDigest.SHA256`, which does not start with
+///     `MESSAGEDIGEST`. So this walks `services()` and never `aliases()`;
+///   * attribute keys (`MessageDigest.SHA-256 ImplementedIn`) are skipped
+///     because they contain a space — kept here for faithfulness even though
+///     `put_service` never stores an attribute as its own entry;
+///   * the match is `startsWith` on the whole `TYPE.ALGORITHM` key and the cut
+///     is `serviceName.length() + 1` characters, NOT an exact type equality.
+///     That is a real JDK quirk (`getAlgorithms("Key")` yields `ACTORY.RSA`);
+///     reproduced rather than "fixed" so the two agree;
+///   * a null, empty, or `.`-terminated service name yields the EMPTY set.
+///
+/// Deliberate divergence, recorded: HotSpot wraps the result in
+/// `Collections.unmodifiableSet` (probe: `add` throws
+/// `UnsupportedOperationException`). The caller here gets a plain `HashSet`,
+/// matching what `provider_get_services_native` already returns, because the
+/// wrapper would add a Java round-trip through a synthetic view whose
+/// `contains` this lane could not measure. See the known-issues note.
+pub(crate) fn algorithms_for_service(service_name: &str) -> Vec<String> {
+    if service_name.is_empty() || service_name.ends_with('.') {
+        return Vec::new();
+    }
+    let prefix = service_name.to_ascii_uppercase();
+    let cut = service_name.len() + 1;
+    // Take the chain snapshot BEFORE locking `services()`: `snapshot()` locks
+    // `provider_chain()`, and no path in this module takes those two in the
+    // other order. Provider order is preserved so the result is deterministic.
+    let chain = snapshot();
+    let table = services().lock();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for (provider, _, _) in chain {
+        let Some(map) = table.get(&provider) else {
+            continue;
+        };
+        for entry in map.values() {
+            let key = format!("{}.{}", entry.type_str, entry.algorithm).to_ascii_uppercase();
+            if !key.starts_with(prefix.as_str()) || key.contains(' ') {
+                continue;
+            }
+            // Byte index: `cut` counts chars of the caller's service name.
+            // `str::get` returns `None` on a non-boundary index rather than
+            // panicking, so a multi-byte name degrades to "no match".
+            let Some(name) = key.get(cut..) else {
+                continue;
+            };
+            if !name.is_empty() && seen.insert(name.to_string()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `Security.getAlgorithms(null)` returns the EMPTY set on HotSpot (the
+    // real body's first branch), it does not NPE — measured.
+    let service_name = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let names = algorithms_for_service(&service_name);
+    // GC-safety: `ctx.create_string` allocates, so a `Vec<Value>` of
+    // already-created strings built in one pass would hold pre-move
+    // addresses. Same shape as `provider_get_services_native` above: build the
+    // set first, pin it, and add one pinned element at a time.
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
+    let set_pin = ctx.pin_native_root(set);
+    for name in names {
+        let s = ctx.create_string(&name);
+        let s_pin = ctx.pin_native_root(s);
+        let set = ctx.read_native_pin(set_pin, set);
+        let s = ctx.read_native_pin(s_pin, s);
+        let add_result = ctx.invoke(
+            "java/util/HashSet",
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(set)), Value::Object(Some(s))],
+        );
+        ctx.unpin_native_roots(s_pin);
+        if let Err(e) = add_result {
+            ctx.unpin_native_roots(set_pin);
+            return Err(e);
+        }
+    }
+    let set = ctx.read_native_pin(set_pin, set);
+    ctx.unpin_native_roots(set_pin);
+    Ok(Some(Value::Object(Some(set))))
 }
 
 /// Resolve `name` to the best available `Provider` object: the REAL
@@ -3148,6 +3438,16 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)V",
         security_set_property,
     );
+    // W4-3: without this, real-JDK mode ran the JDK's own `getAlgorithms`
+    // bytecode, which reads `provider.keys()` off the synthetic Providers
+    // `make_provider` hands out — an empty Hashtable, so EVERY engine type
+    // answered the empty set. See `algorithms_for_service`.
+    r.register(
+        sec,
+        "getAlgorithms",
+        "(Ljava/lang/String;)Ljava/util/Set;",
+        security_get_algorithms,
+    );
 }
 
 #[cfg(test)]
@@ -3566,6 +3866,94 @@ mod tests {
         assert!(get_service_entry("SunJCE", "Cipher", "AES").is_some());
         assert!(get_service_entry("SUN", "Cipher", "AES").is_none());
         assert!(get_service_entry("SunJCE", "Cipher", "AESWrap").is_some());
+    }
+
+    /// W3-7. Every name the platform JDK 25 SunJSSE provider registers must be
+    /// accepted, in the spellings a caller actually writes. `RJdkSecurity.tls`
+    /// only probes the negative half; the positive half is what breaks every
+    /// HTTPS suite if an accept list is drawn too narrow, so pin it here.
+    #[test]
+    fn ssl_context_protocol_supported_accepts_every_jdk25_name() {
+        for p in [
+            "TLS", "tls", "TLSv1", "TLSv1.1", "TLSv1.2", "tlsv1.2", "TLSV1.2", "TLSv1.3", "SSL",
+            "ssl", "SSLv3", "SSLV3", "Default", "default", "DEFAULT", "DTLS", "dtls", "DTLSv1.0",
+            "DTLSv1.2",
+        ] {
+            assert!(
+                ssl_context_protocol_supported(p),
+                "{p:?} is a real JDK 25 SSLContext protocol and must not be refused"
+            );
+        }
+    }
+
+    /// MUST RAISE. Every one of these was probed on jdk-25.0.3.9-hotspot and
+    /// answered `NoSuchAlgorithmException: <name> SSLContext not available`.
+    /// The last four pin the normalisation: JCA lookup folds case and NOTHING
+    /// else, so a punctuation-stripping or space-trimming accept would
+    /// fabricate a context HotSpot refuses.
+    #[test]
+    fn ssl_context_protocol_supported_rejects_names_hotspot_rejects() {
+        let _lock = reset_service_state_for_tests();
+        for p in [
+            "NO-SUCH-TLS",
+            "SSLv2",
+            "TLSv1.4",
+            "NoSuchThing",
+            "",
+            "TLSv12",
+            "T-L-S",
+            "TLS ",
+            " TLS",
+        ] {
+            assert!(
+                !ssl_context_protocol_supported(p),
+                "{p:?} is not a JDK SSLContext protocol and must be refused"
+            );
+        }
+    }
+
+    /// A protocol a caller's own provider registered must resolve even though
+    /// it is absent from the built-in list — the second accept ground.
+    #[test]
+    fn ssl_context_protocol_supported_honours_a_caller_registered_service() {
+        let _lock = reset_service_state_for_tests();
+        assert!(!ssl_context_protocol_supported("Conscrypt-TLS"));
+        apply_legacy_put(
+            "SUN",
+            "SSLContext.Conscrypt-TLS",
+            "org.conscrypt.OpenSSLContextImpl",
+        );
+        assert!(ssl_context_protocol_supported("Conscrypt-TLS"));
+    }
+
+    #[test]
+    fn sunjsse_seed_registers_the_full_jdk25_sslcontext_table() {
+        let _lock = reset_service_state_for_tests();
+        seed_sunjsse_services();
+        for algo in [
+            "TLS", "TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3", "Default", "DTLS", "DTLSv1.0",
+            "DTLSv1.2",
+        ] {
+            assert!(
+                get_service_entry("SunJSSE", "SSLContext", algo).is_some(),
+                "SunJSSE must service SSLContext.{algo}"
+            );
+        }
+        // Aliases, with the platform's own targets.
+        assert_eq!(
+            get_service_entry("SunJSSE", "SSLContext", "SSL")
+                .unwrap()
+                .algorithm,
+            "TLS"
+        );
+        assert_eq!(
+            get_service_entry("SunJSSE", "SSLContext", "SSLv3")
+                .unwrap()
+                .algorithm,
+            "TLSv1"
+        );
+        // And the negative half: no fabricated entry for a bogus name.
+        assert!(get_service_entry("SunJSSE", "SSLContext", "NO-SUCH-TLS").is_none());
     }
 
     #[test]

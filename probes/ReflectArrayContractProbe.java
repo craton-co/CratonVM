@@ -5,7 +5,7 @@ import java.lang.reflect.Array;
  * that is not about bounds.
  *
  * The bounds half was closed on 2026-08-06 (see
- * {@code docs/internal/array-index-out-of-bounds-has-no-detail-message-FIXED-20260806.md}).
+ * {@code array-index-out-of-bounds-has-no-detail-message-FIXED-20260806.md}).
  * What is left is conversion: {@code Array.getInt} on a {@code long[]} must
  * throw, {@code Array.getLong} on an {@code int[]} must succeed by widening,
  * and a primitive getter on a reference array has its own message again. Five

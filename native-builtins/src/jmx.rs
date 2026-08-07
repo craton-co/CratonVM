@@ -519,6 +519,11 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_virtual_thread_scheduler_mxbean(r);
     register_gc_mxbean(r);
     register_platform_logging_mxbean(r);
+    // `PlatformManagedObject.getObjectName()` for every bean the calls above
+    // stamp with an MXBean *interface*. Registered last so it cannot be
+    // shadowed by an earlier registration of the same triple; none of the
+    // functions above declare `getObjectName`, so nothing is overridden.
+    register_platform_managed_object_names(r);
     // NOTE: `register_mbean_server` is called above as a `SyntheticStub`
     // fallback for runs where `ManagementFactory.getPlatformMBeanServer()`
     // returns the synthetic interface object. The real-JDK hazard is the
@@ -3551,6 +3556,118 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(list))))
         },
     );
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// PlatformManagedObject.getObjectName() for the interface-stamped beans
+//
+// Every `alloc_*_mxbean` below hands back an object stamped with the MXBean
+// *interface* (`java/lang/management/RuntimeMXBean`, ...), so the only methods
+// that can run on it are the ones registered against that interface name.
+// `getObjectName()` is inherited from `java.lang.management.
+// PlatformManagedObject` and was never registered, so
+// `ManagementFactory.getRuntimeMXBean().getObjectName()` resolved the abstract
+// declaration and threw
+//
+//   AbstractMethodError: method java/lang/management/PlatformManagedObject
+//                        .getObjectName()Ljavax/management/ObjectName;
+//                        has no Code attribute
+//
+// — the same failure family this file already documents for
+// `RuntimeMXBean.getSystemProperties()`. `javac` emits the *qualifying* type in
+// the constant pool (verified: `invokeinterface java/lang/management/
+// RuntimeMXBean.getObjectName`), not the declaring interface, which is why
+// these registrations go on each concrete MXBean interface and deliberately
+// NOT on `PlatformManagedObject` itself: a native on the root interface would
+// outrank the exact-class registrations and intercept receivers stamped with
+// the concrete `sun.management.*Impl` classes, whose real bytecode already
+// answers this correctly.
+// ---------------------------------------------------------------------------
+
+/// The canonical platform `ObjectName` text for a bean, keyed by the class the
+/// receiver is stamped with.
+///
+/// `None` means "not one of the beans this file fabricates" — the callback
+/// then answers `null`, which is what `PlatformManagedObject` specifies for a
+/// bean that is not registered in the platform MBeanServer.
+fn platform_mxbean_object_name_text(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Option<String> {
+    let class_id = ctx.class_id_of_object(this);
+    let class_name = ctx.class_name_of_id(class_id)?;
+    let fixed = match class_name.as_str() {
+        "java/lang/management/RuntimeMXBean" => "java.lang:type=Runtime",
+        "java/lang/management/ThreadMXBean" => "java.lang:type=Threading",
+        "java/lang/management/ClassLoadingMXBean" => "java.lang:type=ClassLoading",
+        "java/lang/management/OperatingSystemMXBean" => "java.lang:type=OperatingSystem",
+        "java/lang/management/CompilationMXBean" => "java.lang:type=Compilation",
+        "java/lang/management/PlatformLoggingMXBean" => "java.util.logging:type=Logging",
+        "jdk/management/VirtualThreadSchedulerMXBean" => {
+            "jdk.management:type=VirtualThreadScheduler"
+        }
+        // The collector bean is a NAMED platform bean: its ObjectName carries
+        // the collector's own name, which `init_gc_mxbean_fields` puts in
+        // slot 0. `java.lang:type=GarbageCollector,name=<getName()>` is the
+        // key order the JDK builds and the order `getCanonicalName()` sorts
+        // to, so the text is already canonical.
+        "java/lang/management/GarbageCollectorMXBean" => {
+            let name = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            return Some(format!("java.lang:type=GarbageCollector,name={name}"));
+        }
+        _ => return None,
+    };
+    Some(fixed.to_string())
+}
+
+fn native_platform_managed_object_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match platform_mxbean_object_name_text(ctx, this) {
+        Some(text) => {
+            let name = object_name_new(ctx, text);
+            Ok(Some(Value::Object(Some(name))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Register `getObjectName()` on every MXBean interface this file stamps its
+/// fabricated beans with.
+///
+/// Exactly the eight interfaces an `alloc_*` helper above passes to
+/// `alloc_concurrent_synthetic`, and no more. `MemoryMXBean` is deliberately
+/// absent: `alloc_memory_mxbean` stamps the concrete `sun/management/MemoryImpl`
+/// instead, whose real bytecode answers `getObjectName()` on its own. Each row
+/// is `Bridge` and binds an abstract interface method, so each one adds to the
+/// `bridge.abstract_method` census bucket — the slack-free
+/// `bridge_without_acc_native` ratchet has to be re-frozen with this change.
+fn register_platform_managed_object_names(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    for cls in [
+        "java/lang/management/RuntimeMXBean",
+        "java/lang/management/ThreadMXBean",
+        "java/lang/management/ClassLoadingMXBean",
+        "java/lang/management/OperatingSystemMXBean",
+        "java/lang/management/CompilationMXBean",
+        "java/lang/management/PlatformLoggingMXBean",
+        "java/lang/management/GarbageCollectorMXBean",
+        "jdk/management/VirtualThreadSchedulerMXBean",
+    ] {
+        r.register(
+            cls,
+            "getObjectName",
+            "()Ljavax/management/ObjectName;",
+            native_platform_managed_object_name,
+        );
+    }
     r.set_category(__prev_cat);
 }
 

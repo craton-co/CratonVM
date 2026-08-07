@@ -2716,14 +2716,15 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     // back to 0 for a packet whose layout has no such slot (the other two
     // constructors have no offset argument, and 0 is their correct answer).
     //
-    // ESCALATED (wave 4) — the guard is load-bearing, and correcting wave 3's
-    // account of why: `java/net/DatagramPacket` has NO entry in
-    // `classloading/src/class_manager.rs::synthetic_stub_fields`, so it falls
-    // to that function's `_ => vec![]` arm and gets zero padded slots. It needs
-    // `"java/net/DatagramPacket" => instance_fields(5)` there — which is also
-    // what backs the existing 4-slot data/length/address/port layout this whole
-    // registrar already assumes. That is a cross-crate change; until it lands
-    // the write above is inert and this returns 0, exactly as before.
+    // CLOSED — the cross-crate change this paragraph asked for HAS landed:
+    // `classloading/src/class_manager.rs` now carries
+    // `"java/net/DatagramPacket" => instance_fields(5)`, and
+    // `t9c_synthetic_field_tables_cover_their_factories` asserts the 5. So the
+    // guard passes (5 > DP_OFFSET) and the slot-4 write is LIVE, not inert.
+    // The guard stays because this registrar is reachable only in a
+    // `--synthetic-jdk` build (`register_phase72_natives` is called from
+    // lib.rs's `#[cfg(feature = "synthetic-jdk")] register_synthetic_overrides`)
+    // and a shorter carrier would still silently drop the write.
     r.register(dp, "getOffset", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) > DP_OFFSET {

@@ -1,7 +1,20 @@
 # `TestTempTables` `CloneNotSupportedException` via a `java.lang.Thread.clone` frame — array receivers dispatched through their COMPONENT class
 
 ## Status
-**FIXED** (2026-07-31, branch `fix/h2-temptables-clone-frame-20260731`).
+**REOPENED (2026-08-07)** — recurred in single-threaded `TestTempTables`
+itself, the class this doc is named for. See "Reopened 2026-08-07" at the
+end for the new occurrence. The interpreter-cached-dispatch fix below
+(2026-07-31) is real and still correct as far as it goes — this doc's own
+"Possible residual observed 2026-07-31" section already flagged that the
+fix was not verified to be complete, only that the specific deterministic
+mechanism it targeted was closed. That residual has now recurred a second
+time, in a materially simpler (single-threaded, not 25-thread) case, which
+makes it a better regression vehicle than the one this doc's original fix
+shipped with.
+
+Original FIXED writeup (2026-07-31, branch
+`fix/h2-temptables-clone-frame-20260731`), preserved below for the root-cause
+analysis and the fix that IS real and IS still in the tree:
 
 The original report's central claim — that the two innermost frames "don't
 form a plausible real call chain" and are therefore evidence of a
@@ -269,3 +282,80 @@ re-run with stack printing did not reproduce). Worth a targeted rerun with
 Repro used:
 `docs/internal/repros/h2-insert-scale-20260731/H2InsertScaleProbe.java`, invoked
 as `H2InsertScaleProbe <abs-dir> 25 1000`.
+
+
+## Reopened 2026-08-07: recurred in single-threaded `TestTempTables`
+
+Full 218-class suite sweep on a clean host (`origin/dev` merge @
+`f9315411a`, load average ~14, i.e. not a contention artifact).
+`org.h2.test.db.TestTempTables` — the class this doc's title names — FAILs
+in 210.3s with:
+
+```
+Caused by: java/lang/CloneNotSupportedException
+	at org/h2/test/db/TestTempTables.main(TestTempTables.java:31)
+	at org/h2/test/TestBase.testFromMain(TestBase.java:479)
+	at org/h2/test/db/TestTempTables.test(TestTempTables.java:50)
+	at org/h2/test/db/TestTempTables.testLotsOfTables(TestTempTables.java:307)
+	at org/h2/jdbc/JdbcStatement.executeUpdate(JdbcStatement.java:147)
+	at org/h2/jdbc/JdbcStatement.executeUpdateInternal(JdbcStatement.java:196)
+	at org/h2/command/Command.executeUpdate(Command.java:251)
+	at org/h2/command/Command.executeUpdate(Command.java:299)
+	at org/h2/engine/SessionLocal.setSavepoint(SessionLocal.java:877)
+	at org/h2/engine/SessionLocal.getStatementSavepoint(SessionLocal.java:1647)
+	at org/h2/engine/SessionLocal.getTransaction(SessionLocal.java:1639)
+	at org/h2/mvstore/tx/TransactionStore.begin(TransactionStore.java:473)
+	at org/h2/mvstore/tx/TransactionStore.registerTransaction(TransactionStore.java:499)
+	at org/h2/mvstore/tx/VersionedBitSet.<init>(VersionedBitSet.java:25)
+	at org/h2/mvstore/tx/BitSetHelper.flip(BitSetHelper.java:34)
+	at java/util/Arrays.copyOf(Arrays.java:3617)
+	at java/lang/Thread.clone(Thread.java:1037)
+```
+
+This is **byte-for-byte the same call chain** this doc's "Fix" section
+already names as the residual-vulnerable path: `VersionedBitSet.<init>` →
+`BitSetHelper.flip` → `Arrays.copyOf` → an array receiver's `clone()`
+dispatching into `java.lang.Thread.clone()`. It is exactly the mechanism
+the 2026-07-31 fix targeted, on the exact same H2 code path
+(`TransactionStore.begin` → `registerTransaction`, i.e. every new
+transaction), and the fixed binary still has it.
+
+Unlike the doc's existing "possible residual" note (25 threads × 1000 rows,
+all 25 failing — a scale/concurrency-dependent occurrence never pinned
+down because no stack was captured), this one is:
+
+* **Single-threaded** — `testLotsOfTables` runs on one connection, no
+  concurrent access to race against. Whatever residual gap exists in the
+  2026-07-31 fix is not inherently a multi-thread-only problem.
+* **Deterministic enough to have shown up in a plain suite run** with no
+  special probe, at 210.3s into the test (i.e. after some number of prior
+  transactions on the same connection already succeeded — this is not a
+  first-transaction failure).
+
+This is the class named in the doc's own title reproducing the doc's own
+named exception via the doc's own named call chain, after the fix
+landed. Whatever the interpreter-cache fix closed, it was not everything —
+there is at least one more array-receiver (or otherwise component-class-id
+routed) dispatch site on this same `clone()` path that the three patched
+call sites (`execute_invokevirtual_cached`'s three arms,
+`invoke_or_native`'s NoSuchMethod rescue, `invoke_on_class_shared_inner`'s
+retarget) do not cover, or a fourth path into the same underlying
+component-class-id-in-header issue that has not been enumerated yet.
+
+## Next steps
+* Re-run `TestTempTables` standalone with the diagnostic from the original
+  fix's verification (armed to dump any bytecode `clone()` frame entered
+  with an array receiver, and any `java/lang/Thread.clone` frame at all) —
+  the original verification used exactly this diagnostic and got 7/7 clean
+  runs; it needs to be re-armed against the *current* binary, not
+  re-trusted from the 2026-07-31 result.
+* If the diagnostic fires, capture which of the four dispatch paths listed
+  in "Root cause" above (or a fifth, not yet found) let this one through —
+  the object being cloned is a `long[]` (`VersionedBitSet.bits`), same
+  shape as the original report, so start by checking whether `Arrays.copyOf`
+  on a `long[]` receiver can reach `clone()` through any call shape other
+  than a direct `invokevirtual` at the bytecode the fix patched (e.g. an
+  intrinsic/inlined fast path for `Object.clone()` on arrays that bypasses
+  `execute_invokevirtual_cached` entirely, or a JIT-compiled call site if
+  this recurs under JIT-on too — this occurrence was `--nojit`, matching
+  the original fix's own coverage, so JIT-vs-interpreter is not the gap).

@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service_loader::impl_jars_load_class;
+use crate::util_concurrent_ext::try_alloc_concurrent_synthetic;
 use crate::{alloc_concurrent_synthetic, obj_arg};
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
@@ -1518,8 +1520,22 @@ fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, LK_CLASS, LK_FIELD_COUNT);
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(None));
-    ctx.set_field(obj, LK_PREVIOUS_LOOKUP_CLASS, Value::Object(None));
-    ctx.set_field(obj, LK_LOOKUP_MODE, Value::Int(modes));
+    // W6-3: both index writes are the SYNTHETIC layout. On real JDK 25
+    // (`javap -p java.lang.invoke.MethodHandles$Lookup`) slot 2 is
+    // `allowedModes` (int) and slot 3 is `cachedProtectionDomain`, a
+    // `private volatile ProtectionDomain` REFERENCE. `lk_set_modes` below
+    // repairs slot 2 by name; slot 3 was never repaired, so `Int(modes)` sat
+    // in a reference slot the GC scans as an oop. Gate both on the synthetic
+    // layout — a real Lookup declares `prevLookupClass`, a fabricated stub
+    // names its fields `_f0..`. `cachedProtectionDomain` must stay null: it is
+    // a lazy cache `lookupClassProtectionDomain()` fills on first use.
+    let synthetic_layout = ctx
+        .resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "prevLookupClass")
+        .is_none();
+    if synthetic_layout {
+        ctx.set_field(obj, LK_PREVIOUS_LOOKUP_CLASS, Value::Object(None));
+        ctx.set_field(obj, LK_LOOKUP_MODE, Value::Int(modes));
+    }
     // Write `allowedModes` so it lands on the real JDK field (3-field layout
     // puts it at slot 2, not the synthetic slot 1 = prevLookupClass). See
     // `lk_modes_of` and `lang_invoke::lk_write_allowed_modes`.
@@ -2664,7 +2680,10 @@ fn resolve_global_if_visible(
             cratonvm_types::error::VmError::ClassFile(
                 cratonvm_types::error::ClassFileError::ClassNotFound { class_name },
             ),
-        )) if class_name != internal => {
+        )) if class_name != internal
+            && cratonvm_classloading::array_descriptor_element_class(internal)
+                != Some(class_name.as_str()) =>
+        {
             tracing::debug!(
                 requested = internal,
                 missing_dependency = %class_name,
@@ -4935,7 +4954,7 @@ fn deduplicate_rooted_urls(ctx: &mut dyn NativeContext, urls: &mut Vec<RootedUrl
     *urls = unique;
 }
 
-fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> ObjectRef {
+fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     // GC-safety: `build_synthetic_url` per iteration allocates (transitively
     // GC-triggering); `arr` is written into again via `set_array_element`
@@ -4947,19 +4966,17 @@ fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) ->
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
-    enm
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
+    Ok(enm)
 }
 
 /// Build a merged enumeration without converting its URLs through external
 /// forms.  Custom URLStreamHandler instances are object state, so rebuilding a
 /// URL from its String (as the flat-classpath path does) makes in-memory
 /// archives such as ShrinkWrap's `archive:` resources unreadable.
-fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl]) -> ObjectRef {
+fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, rooted) in urls.iter().copied().enumerate() {
@@ -4977,12 +4994,10 @@ fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl])
             let _ = ctx.remove_global_root(rooted.root);
         }
     }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
-    enm
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
+    Ok(enm)
 }
 
 /// `allow_delegate` = whether a non-builtin `ClassLoader` receiver may be
@@ -5091,7 +5106,7 @@ fn cl_get_resources_impl(
                 }
                 ctx.unpin_native_roots(p_this);
                 deduplicate_rooted_urls(ctx, &mut urls);
-                let enm = enumeration_from_rooted_urls(ctx, &urls);
+                let enm = enumeration_from_rooted_urls(ctx, &urls)?;
                 return Ok(Some(Value::Object(Some(enm))));
             }
         }
@@ -5215,7 +5230,7 @@ fn cl_get_resources_impl(
                         // this loader's local entries, so return the combined
                         // enumeration even when it is empty.
                         deduplicate_rooted_urls(ctx, &mut delegated_urls);
-                        let enm = enumeration_from_rooted_urls(ctx, &delegated_urls);
+                        let enm = enumeration_from_rooted_urls(ctx, &delegated_urls)?;
                         return Ok(Some(Value::Object(Some(enm))));
                     }
                 }
@@ -5306,7 +5321,7 @@ fn cl_get_resources_impl(
     // are registered unconditionally by `register_enumeration_impl_natives`
     // so this works in both synthetic-JDK and real-JDK modes without
     // relying on java.util.Vector's internal layout.
-    let enm = enumeration_from_url_strings(ctx, &urls);
+    let enm = enumeration_from_url_strings(ctx, &urls)?;
     Ok(Some(Value::Object(Some(enm))))
 }
 
@@ -5630,6 +5645,93 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
 /// function unconditionally, and we need the URLClassPath stubs installed
 /// in both real-JDK and synthetic-JDK modes. The two concerns are
 /// logically distinct but share a single wiring point.
+/// The class CratonVM fabricates for a snapshot `java.util.Enumeration`.
+///
+/// Not a real JDK name: `java.util.Enumeration` is an INTERFACE and has no
+/// `$Impl` nested class in any JDK. So under `--jdk-only` the fabrication is a
+/// §1.1 violation the policy refuses, which is why it needs the landing below.
+pub(crate) const ENUMERATION_IMPL_CLASS: &str = "java/util/Enumeration$Impl";
+
+/// A real `java.util.Enumeration` over `array`, or `None` when this image
+/// cannot build one.
+///
+/// Same rule as the snapshot-iterator and `System.Logger` landings, in its
+/// strongest form: prefer a real class the JDK BUILDS ITSELF over one whose
+/// fields we fill. The snapshot is already an `Object[]`,
+/// `java.util.Arrays$ArrayList` is the JDK's own fixed-size list over exactly
+/// that shape, and `Collections.enumeration(Collection)` turns one into a real
+/// `Enumeration` — real bytecode the whole way, so nothing here has to know
+/// what the resulting anonymous class is CALLED. That matters: it is
+/// `java.util.Collections$3` on JDK 25, and an anonymous class's number is
+/// precisely the kind of name that must not be written down.
+///
+/// `native-io`'s `zip_real_jar` already drives `Collections.enumeration` this
+/// way for `ZipFile.entries()`, so the invoke is known to reach real bytecode
+/// rather than a native of ours.
+fn real_snapshot_enumeration(
+    ctx: &mut dyn NativeContext,
+    array: ObjectRef,
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    let list = match ctx.new_object_initialized(
+        "java/util/Arrays$ArrayList",
+        "([Ljava/lang/Object;)V",
+        &[Value::Object(Some(array))],
+    )? {
+        Some(Value::Object(Some(list))) => list,
+        _ => return Ok(None),
+    };
+    match ctx.invoke(
+        "java/util/Collections",
+        "enumeration",
+        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
+        &[Value::Object(Some(list))],
+    )? {
+        Some(Value::Object(Some(enm))) => Ok(Some(enm)),
+        _ => Ok(None),
+    }
+}
+
+/// The snapshot enumeration over `array`: the fabricated
+/// [`ENUMERATION_IMPL_CLASS`] in `Compatible` mode, and a real
+/// `java.util.Enumeration` when `--jdk-only` refuses that fabrication.
+///
+/// This is the last of the shapes item 4 of
+/// `ensure-synthetic-class-cannot-enforce-only-record.md` listed as "refused
+/// with nowhere to land". `Compatible` mode is byte-for-byte what it was: the
+/// fallback is reached only from the refusal arm, which only strict mode takes.
+pub(crate) fn make_snapshot_enumeration(
+    ctx: &mut dyn NativeContext,
+    array: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // GC-SAFETY: both arms allocate — the fabricated shell, or a real
+    // `Arrays$ArrayList` plus whatever `Collections.enumeration` builds — and
+    // `array` is a bare Rust local the collector cannot see. Root it across
+    // both and read it back through the pin, the same contract
+    // `make_iterator_from_array` documents.
+    let pin = ctx.pin_native_root(array);
+    let out = match try_alloc_concurrent_synthetic(ctx, ENUMERATION_IMPL_CLASS, 2) {
+        Ok(enm) => {
+            let array = ctx.read_native_pin(pin, array);
+            ctx.set_field(enm, 0, Value::Object(Some(array)));
+            ctx.set_field(enm, 1, Value::Int(0));
+            Ok(enm)
+        }
+        Err(refusal) => {
+            let array = ctx.read_native_pin(pin, array);
+            match real_snapshot_enumeration(ctx, array) {
+                Ok(Some(enm)) => Ok(enm),
+                // Nothing real to stand in — an image with no
+                // `Arrays$ArrayList` — so the refusal stands rather than
+                // silently becoming a fabrication again.
+                Ok(None) => Err(refusal),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    ctx.unpin_native_roots(pin);
+    out
+}
+
 pub fn register_enumeration_impl_natives(r: &mut NativeMethodRegistry) {
     // Install the URLClassPath safe stubs alongside the enumeration helpers
     // so both real-JDK (`register_essential_natives`) and synthetic-JDK
@@ -6628,12 +6730,10 @@ fn record_url_on_path(ctx: &mut dyn NativeContext, ucp: ObjectRef, url: ObjectRe
     ctx.unpin_native_roots(p_ucp); // releases every pin taken here
 }
 
-fn empty_enumeration_impl(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn empty_enumeration_impl(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
-    enm
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
+    Ok(enm)
 }
 
 /// Cached `cratonvm_classloading::ClassPath::new(paths)` construction, keyed
@@ -7410,9 +7510,14 @@ fn merge_enum_with_list(
     ctx: &mut dyn NativeContext,
     std_enum: Option<ObjectRef>,
     custom_list: ObjectRef,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     if !is_array_list_object(ctx, custom_list) {
-        return std_enum.unwrap_or_else(|| empty_enumeration_impl(ctx));
+        return match std_enum {
+            Some(e) => Ok(e),
+            // `unwrap_or_else` cannot carry the refusal out of its closure,
+            // and building the empty enumeration is now fallible.
+            None => empty_enumeration_impl(ctx),
+        };
     }
     let p_custom = ctx.pin_native_root(custom_list);
     // Standard enumeration's backing URL[] (field 0 of `Enumeration$Impl`).
@@ -7454,12 +7559,10 @@ fn merge_enum_with_list(
         let arr = ctx.read_native_pin(p_arr, arr);
         ctx.set_array_element(arr, alen + i, e);
     }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(p_arr, arr);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
     ctx.unpin_native_roots(p_custom); // releases p_custom, p_std, p_arr
-    enm
+    Ok(enm)
 }
 
 pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7478,7 +7581,7 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // resources. Do this before the shared flat-classpath scan: consulting
     // that scan after close leaks resources from unrelated live loaders.
     if ucl_is_closed(ctx, this) {
-        return Ok(Some(Value::Object(Some(empty_enumeration_impl(ctx)))));
+        return Ok(Some(Value::Object(Some(empty_enumeration_impl(ctx)?))));
     }
     let name = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
@@ -7509,9 +7612,7 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
             let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, url);
             ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
         }
-        let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-        ctx.set_field(enm, 0, Value::Object(Some(arr)));
-        ctx.set_field(enm, 1, Value::Int(0));
+        let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
         Some(enm)
     };
     let p_local = local_enum.map(|e| ctx.pin_native_root(e));
@@ -7533,7 +7634,7 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ctx,
             local_ref.or(std_ref),
             custom,
-        )))),
+        )?))),
         None => match local_ref.or(std_ref) {
             Some(e) => Some(Value::Object(Some(e))),
             None => std_enum,
@@ -10052,6 +10153,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: bsh_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(&mut ctx, "bsh/classpath/DiscreteFilesClassLoader");
@@ -10085,6 +10187,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: filtered_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(
@@ -10118,6 +10221,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: modified_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(
@@ -11793,6 +11897,7 @@ mod classloader_tests {
                 access_flags: method_flags,
                 declaring_class_id: cls_id,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         ctx.set_declared_fields(
@@ -11972,6 +12077,7 @@ mod classloader_tests {
                 access_flags: ACC_PUBLIC,
                 declaring_class_id: parent,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let child = ctx.ensure_class_initialized("p/Child").unwrap();

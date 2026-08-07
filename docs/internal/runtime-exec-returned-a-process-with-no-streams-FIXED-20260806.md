@@ -172,9 +172,15 @@ which is what the timing test above covers.
 
 ## What to take away
 
-An `alloc_concurrent_synthetic(ctx, "<a real JDK class>", n)` is a silent
+**This paragraph's mechanism is WRONG — see the correction at the end of this
+file.** Nothing truncates; both allocators clamp the slot count UP. The real
+shape is two layouts on one class. Left in place, struck through rather than
+rewritten, because the wrong guess is instructive: it survived a fix, a
+follow-up and two rounds of review.
+
+~~An `alloc_concurrent_synthetic(ctx, "<a real JDK class>", n)` is a silent
 truncation whenever the real class has fewer than `n` fields, and in real-JDK
-mode `java/lang/Process` does. Every write past the real field count is
+mode `java/lang/Process` does.~~ Every write past the real field count is
 dropped, every read past it returns nothing, and the only trace is a `WARN`
 from the heap guard that reads like a speculative-probe false positive. Two
 more callers allocated a Process this way —
@@ -304,8 +310,104 @@ future test that spawns through `spawn_and_wrap` needs that lock.
 ### What is left
 
 Nothing allocates a Process under a real JDK class name any more, and there is
-exactly one Process layout with exactly one writer. The general landmine stands
-though, for other classes: `alloc_concurrent_synthetic(ctx, "<a real JDK class
-name>", n)` silently truncates whenever the real class has fewer than `n`
-fields, and reports it only as a `cratonvm::gc::guard` WARN whose own text
-blames a speculative collection probe.
+exactly one Process layout with exactly one writer.
+
+The general pattern stands for other classes, but NOT in the form this
+paragraph originally claimed ("silently truncates"). It does not truncate. See
+the correction below, which also carries the census: 49 classes, 75 call sites,
+zero live defects on the Tomcat corpus.
+
+## Correction 2026-08-07: it is not truncation, and here is the census
+
+Two sections above end by calling this "a silent truncation" —
+`alloc_concurrent_synthetic(ctx, "<a real JDK class name>", n)` said to drop
+every slot past the real field count. **That is wrong, and it is worth
+correcting rather than leaving, because it points the next reader at the wrong
+mechanism.**
+
+Nothing truncates. Both allocators clamp the slot count **up**:
+
+* `alloc_concurrent_synthetic` computes `let n = num_fields.max(real);`
+* `NativeContext::alloc_object` independently computes
+  `let slots = num_fields.max(real_fields);` — and `try_alloc_object_gc_safe`
+  has no override, it delegates straight to `alloc_object`.
+
+That clamp is deliberate and load-bearing: it is what keeps a real inherited
+`getfield` in bounds on an object a native allocated with a small hard-coded
+count (the comment there cites Kafka 3.7 booting on a `java/util/HashSet`
+allocated with 1 slot against a real layout of 3).
+
+### What actually went wrong
+
+**Two layouts on one class, and the clamp is what lets them coexist quietly.**
+
+`runtime_spawn_process` asked for `("java/lang/Process", 3)`. The real class has
+six fields, so `max(3, 6)` handed back a **six-slot object with the real
+`java.lang.Process` layout**. Two things follow, and neither is truncation:
+
+1. The caller's three writes at slots 0..2 landed on `java.lang.Process`'s own
+   first three fields — its `outputWriter` / `outputCharset` / `inputReader`
+   caches. Silent corruption of real state, in bounds the whole way.
+2. `native-io` reads a *different* synthetic layout for the same class name, one
+   offset past those six fields (`PROC_FIELD_STDOUT_FD` = slot 8,
+   `PROC_FIELD_HANDLE` = slot 11). Those reads ran off the end of a six-slot
+   object and the heap guard dropped them.
+
+Which is exactly what the WARN said, and now reads correctly:
+
+```text
+index=8  num_slots=6  class_name=java/lang/Process  real_field_count=Some(6)
+```
+
+`num_slots == real_field_count` is the fingerprint: the object has precisely the
+real class's layout, and the reader wanted a different one. The requested count
+never appears in the object at all.
+
+### The census: pervasive, and on this corpus harmless
+
+`CRATONVM_DBG_LAYOUT_ALIAS=1` (new, off by default) reports every
+`alloc_concurrent_synthetic` call whose requested field count is *smaller* than
+the resolved class's real one — i.e. every place a native imposes its own
+layout on a class that already has a bigger one. The test is
+self-discriminating: a class this call fabricated declares exactly the requested
+count, so it never reports itself.
+
+Over a 30-class random sample of the real Tomcat suite:
+
+| | |
+|---|---|
+| distinct JDK classes carrying a second layout | **49** |
+| distinct native call sites imposing one | **75** |
+| out-of-bounds field reads in the same runs | **0** |
+
+So the shape is everywhere — `java/util/Locale` (3 vs 32),
+`java/security/Provider` (8 vs 45), `java/util/Properties` (16 vs 32),
+`java/io/File` (1 vs 4), `jdk/internal/loader/ClassLoaders$AppClassLoader`
+(7 vs 21) — and on this corpus none of it is currently breaking anything. The
+clamp keeps every access in bounds, and no second native reads a wider layout
+for any of those 49 classes.
+
+That is a **risk register, not a bug list**, and it should not be treated as 49
+copies of this bug waiting to fire. Each entry needs its own question answered:
+does real JDK bytecode read the fields these writes are aliasing, and does any
+other native read a *different* layout for the same class? `java.lang.Process`
+was the one class in the workspace where the answer to the second question was
+yes, and that is why it — and only it — produced a `200 OK` with an empty body.
+
+### The discriminator, so the next one takes minutes
+
+A class has a **live** defect only if it appears in *both* lists:
+
+```bash
+CRATONVM_DBG_LAYOUT_ALIAS=1 <cratonvm> ... 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > run.log
+grep -o 'class="[^"]*"' run.log     | sed 's/class=//;s/"//g' | sort -u > layouts.txt
+grep -o 'class_name=[a-zA-Z0-9/$_]*' run.log | sed 's/class_name=//' | sort -u > oob.txt
+comm -12 layouts.txt oob.txt        # non-empty => a real defect, named
+```
+
+The `cratonvm::gc::guard` warning's own text used to assert the cause was
+"typically a speculative collection-layout probe dispatched on a non-matching
+receiver type". For this bug it was not, and that sentence is a large part of
+why the root cause sat unread in the log through the entire first
+investigation. It now describes both cases and names the field pattern that
+tells them apart, and points at `CRATONVM_DBG_LAYOUT_ALIAS`.

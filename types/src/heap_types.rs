@@ -598,6 +598,18 @@ pub struct ObjectHeader {
     ///
     /// State in the low 2 bits; see `MARK_NEUTRAL` / `MARK_THIN_LOCKED` /
     /// `MARK_INFLATED` / `MARK_FORWARDED`. Always at `MARK_WORD_OFFSET` (= 8).
+    ///
+    /// This word has absorbed the header three times. `forwarding_ptr` went
+    /// first (32 -> 24, 2026-08-06), then `identity_hash_code`, then the
+    /// `kind` / `element_type` / `gc_age` / `gc_flags` quartet into bits
+    /// 48..62 (24 -> 16, 2026-08-07).
+    ///
+    /// The note that used to sit here said folding `identity_hash_code` "buys
+    /// zero, because `AtomicU64` forces 8-byte alignment and the 4 bytes
+    /// reappear as padding". That was true and it was not a reason to stop:
+    /// the fold buys zero ALONE and is a prerequisite for the 8 that the
+    /// quartet's move then paid out. See
+    /// `arch-2026-07-26/header-16-and-field-packing-20260806.md` §4.
     pub mark_word: AtomicU64,
 }
 
@@ -731,7 +743,7 @@ impl ObjectHeader {
     /// This obligation did not exist while forwarding lived in its own field
     /// (the two words were distinct), and it is the reason the encoding was
     /// landed inert in 2026-07-26 rather than wired up opportunistically. See
-    /// `docs/internal/arch-2026-07-26/header-shrink.md` §4.3.
+    /// `arch-2026-07-26/header-shrink.md` §4.3.
     pub fn set_forwarding_address(&self, target: *mut u8) {
         let prev = self.mark_word.load(std::sync::atomic::Ordering::Relaxed);
         self.mark_word.store(

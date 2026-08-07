@@ -22,7 +22,7 @@ invisible to any test that only checks the method terminates.
 >   compiled counted loop. The predicate is `semantics` alone, and the refusal
 >   belongs at *admission*, not at exit.
 
-Answers the `osr-02` lane of `docs/known-issues/c2/deep-research-vm-c2.md`.
+Answers the `osr-02` lane of `docs/feature-designs/c2/deep-research-vm-c2.md`.
 Independent of the entry-metadata contract
 (`docs/feature-designs/jit-osr-entry-metadata.md`), which owns the publication
 site.

@@ -359,9 +359,48 @@ pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -
         .unwrap_or(true)
 }
 
+/// A `java.nio.ByteOrder` for `MemoryLayout.order()`.
+///
+/// W6-3 slot-index audit. JDK 25 `java.nio.ByteOrder` declares exactly ONE
+/// instance field — `private final java.lang.String name` (`javap -p`; the
+/// `BIG_ENDIAN`/`LITTLE_ENDIAN`/`NATIVE_ORDER` constants are all static). So on
+/// a real-JDK layout slot 0 is a String REFERENCE, and stamping the
+/// little-endian flag there put an `Int` in a reference slot: the GC would scan
+/// it as an oop, and real `ByteOrder.toString()` bytecode reads that same slot
+/// as the name.
+///
+/// The flag write stays — it is the synthetic-stub layout, and every existing
+/// reader (`p67_layout_is_little`, `reflect_invoke::vh_byte_order_is_little`)
+/// falls back to it. On top of it, when the CLASS actually declares `name` at a
+/// slot this object has, write a genuine String there. Three shapes, all
+/// covered: a fabricated stub names its fields `_f0..`, so `name` does not
+/// resolve and only the flag lands (byte-identical to before); a real
+/// `java.nio.ByteOrder` resolves `name` to slot 0 and gets the String;
+/// a shape where the resolved index is out of range is skipped rather than
+/// written out of bounds.
 pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
     ctx.set_field(obj, 0, Value::Int(if little_endian { 1 } else { 0 }));
+    let cid = ctx.class_id_of_object(obj);
+    // Bound before the `if let` so the immutable reborrow of `ctx` ends here
+    // rather than spanning the block that needs `&mut ctx`.
+    let name_slot = ctx.resolve_field_index_by_class_id(cid, "name");
+    if let Some(slot) = name_slot {
+        if slot < ctx.object_num_fields(obj) {
+            // `create_string` allocates and can move `obj` (native stale-local
+            // family) — pin it across the call.
+            let obj_pin = ctx.pin_native_root(obj);
+            let name = ctx.create_string(if little_endian {
+                "LITTLE_ENDIAN"
+            } else {
+                "BIG_ENDIAN"
+            });
+            let obj = ctx.read_native_pin(obj_pin, obj);
+            ctx.unpin_native_roots(obj_pin);
+            ctx.set_field(obj, slot, Value::Object(Some(name)));
+            return obj;
+        }
+    }
     obj
 }
 

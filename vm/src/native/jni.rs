@@ -9511,6 +9511,23 @@ mod tests {
     ///
     /// The failure was release-only and CI runs `cargo test -p cratonvm-vm
     /// --lib` in debug, which is why it never showed up there.
+    ///
+    /// # This test and the other two address-comparing ones are green under the
+    /// repo's release profile, and RED under `CARGO_PROFILE_RELEASE_LTO=thin`
+    ///
+    /// Measured 2026-08-06. `lto = "fat"` + `codegen-units = 1` (what
+    /// `[profile.release]` says, and what CI runs) passes. Overriding to
+    /// `LTO=thin` + `CODEGEN_UNITS=16` — the documented workaround when the fat
+    /// link is OOM-killed on a loaded build host — fails this,
+    /// `jni_nio_slots_not_stub` and `jni_function_table_matches_the_jni_h_layout`,
+    /// because thin LTO's function merging can leave one of two identical-bodied
+    /// `extern "C"` stubs as a THUNK: the address `build_function_table` stored
+    /// and the address `f as *const ()` yields here are then two different
+    /// entry points into the same code.
+    ///
+    /// That is a property of the override, not of the table. **Do not "fix" it
+    /// by weakening the assertion** — and do not read a red run under that
+    /// override as a defect on `dev`. Re-run with the real profile first.
     #[test]
     fn jni_function_table_extended_to_234() {
         let env = get_jni_env();

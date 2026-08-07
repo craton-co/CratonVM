@@ -889,7 +889,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                 // `concurrenthashmap-newkeyset-returns-a-plain-hashset`
                 // write-up.
                 if cname == "java/util/concurrent/ConcurrentHashMap" {
-                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m);
+                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m)?;
                     return Ok(Some(Value::Object(Some(view))));
                 }
             }
@@ -1238,21 +1238,24 @@ fn module_builder_alloc_with_named_fields(
     obj
 }
 
-fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Value {
-    Value::Object(Some(
-        cratonvm_native_collections::make_hashset_with_elements(ctx, &[]),
-    ))
+fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+    Ok(Value::Object(Some(
+        cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?,
+    )))
 }
 
-fn module_builder_set_or_empty(ctx: &mut dyn NativeContext, value: Value) -> Value {
+fn module_builder_set_or_empty(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<Value, MethodCallFailed> {
     match value {
-        Value::Object(Some(_)) => value,
+        Value::Object(Some(_)) => Ok(value),
         _ => module_builder_empty_set(ctx),
     }
 }
 
-pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> ObjectRef {
-    cratonvm_native_collections::make_hashset_with_elements(ctx, &[])
+pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?)
 }
 
 fn module_descriptor_set_field(
@@ -1262,13 +1265,13 @@ fn module_descriptor_set_field(
 ) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx))))),
+        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx)?)))),
     };
     if let Value::Object(Some(v)) = ctx.get_field_by_name(this, field) {
         return Ok(Some(Value::Object(Some(v))));
     }
     let this_pin = ctx.pin_native_root(this);
-    let empty = module_descriptor_empty_set(ctx);
+    let empty = module_descriptor_empty_set(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, field, Value::Object(Some(empty)));
     ctx.unpin_native_roots(this_pin);
@@ -1397,10 +1400,10 @@ fn native_module_builder_new_exports_qualified(
 ) -> MethodCallResult {
     // (Set<Modifier>, String source, Set<String> targets) -> Exports
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets =
-        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)))?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -1415,9 +1418,9 @@ fn native_module_builder_new_exports_unqualified(
 ) -> MethodCallResult {
     // (Set<Modifier>, String source) -> Exports
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_empty_set(ctx);
+    let targets = module_builder_empty_set(ctx)?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -1431,10 +1434,10 @@ fn native_module_builder_new_opens_qualified(
     args: &[Value],
 ) -> MethodCallResult {
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets =
-        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)))?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -1448,9 +1451,9 @@ fn native_module_builder_new_opens_unqualified(
     args: &[Value],
 ) -> MethodCallResult {
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_empty_set(ctx);
+    let targets = module_builder_empty_set(ctx)?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -1465,7 +1468,7 @@ fn native_module_builder_new_requires_versioned(
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn, String compiledVersion) -> Requires
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
@@ -1482,7 +1485,7 @@ fn native_module_builder_new_requires_short(
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn) -> Requires
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
@@ -1633,7 +1636,7 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             ctx.get_field_by_name(md_current, field),
             Value::Object(Some(_))
         ) {
-            let empty = module_builder_empty_set(ctx);
+            let empty = module_builder_empty_set(ctx)?;
             let md_current = ctx.read_native_pin(md_pin, md);
             ctx.set_field_by_name(md_current, field, empty);
         }
@@ -1645,6 +1648,112 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let md = ctx.read_native_pin(md_pin, md);
     ctx.unpin_native_roots(md_pin);
     Ok(Some(Value::Object(Some(md))))
+}
+
+/// The module names of a JDK 25 runtime image, as `java --list-modules`
+/// reports them.
+///
+/// Used only as the *lower bound* of [`is_system_module_name`] — a module the
+/// VM's own registry already knows about also counts, so this list going stale
+/// against a future image can only under-report, never invent.
+const JDK_SYSTEM_MODULE_NAMES: &[&str] = &[
+    "java.base",
+    "java.compiler",
+    "java.datatransfer",
+    "java.desktop",
+    "java.instrument",
+    "java.logging",
+    "java.management",
+    "java.management.rmi",
+    "java.naming",
+    "java.net.http",
+    "java.prefs",
+    "java.rmi",
+    "java.scripting",
+    "java.se",
+    "java.security.jgss",
+    "java.security.sasl",
+    "java.smartcardio",
+    "java.sql",
+    "java.sql.rowset",
+    "java.transaction.xa",
+    "java.xml",
+    "java.xml.crypto",
+    "jdk.accessibility",
+    "jdk.attach",
+    "jdk.charsets",
+    "jdk.compiler",
+    "jdk.crypto.cryptoki",
+    "jdk.crypto.ec",
+    "jdk.crypto.mscapi",
+    "jdk.dynalink",
+    "jdk.editpad",
+    "jdk.graal.compiler",
+    "jdk.graal.compiler.management",
+    "jdk.hotspot.agent",
+    "jdk.httpserver",
+    "jdk.incubator.vector",
+    "jdk.internal.ed",
+    "jdk.internal.jvmstat",
+    "jdk.internal.le",
+    "jdk.internal.md",
+    "jdk.internal.opt",
+    "jdk.internal.vm.ci",
+    "jdk.jartool",
+    "jdk.javadoc",
+    "jdk.jcmd",
+    "jdk.jconsole",
+    "jdk.jdeps",
+    "jdk.jdi",
+    "jdk.jdwp.agent",
+    "jdk.jfr",
+    "jdk.jlink",
+    "jdk.jpackage",
+    "jdk.jshell",
+    "jdk.jsobject",
+    "jdk.jstatd",
+    "jdk.localedata",
+    "jdk.management",
+    "jdk.management.agent",
+    "jdk.management.jfr",
+    "jdk.naming.dns",
+    "jdk.naming.rmi",
+    "jdk.net",
+    "jdk.nio.mapmode",
+    "jdk.sctp",
+    "jdk.security.auth",
+    "jdk.security.jgss",
+    "jdk.unsupported",
+    "jdk.unsupported.desktop",
+    "jdk.xml.dom",
+    "jdk.zipfs",
+];
+
+/// Does `name` name a module that the system image actually contains?
+///
+/// `ModuleFinder.ofSystem().find(name)` is a QUERY, and the JDK's answer for a
+/// name the image does not contain is `Optional.empty()`. The lazy finder
+/// registered below used to build a `ModuleReference` for whatever string it
+/// was handed, so `find("cratonvm.absent")` reported PRESENT — indistinguishable
+/// from a real hit for any caller that only checks `isPresent()`, and the error
+/// only surfaced (if ever) at the eventual `open()`/`read()`.
+///
+/// Two independent sources, unioned, so neither can shrink the answer:
+///   * the VM's own module registry (`module_packages`), which is authoritative
+///     for anything actually resolved in this VM, including non-JDK modules on
+///     the module path; and
+///   * [`JDK_SYSTEM_MODULE_NAMES`], for the JDK 25 image modules the registry
+///     has not lazily populated yet (`ofSystem().find("java.base")` must be
+///     present at any point in the VM's life, including before java.base's
+///     packages are enumerated).
+fn is_system_module_name(ctx: &dyn NativeContext, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if JDK_SYSTEM_MODULE_NAMES.contains(&name) {
+        return true;
+    }
+    !ctx.module_packages(name).is_empty()
 }
 
 pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
@@ -1813,6 +1922,8 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
     // ModuleFinder.ofSystem() — lazy system-module finder
     // -----------------------------------------------------------------
     //
+    // See `is_system_module_name` for why `find` is not a "yes to everything".
+    //
     // The genuine `jdk.internal.module.SystemModuleFinders.ofSystem()` cannot
     // run as-is in CratonVM:
     //   * The fast path (`SystemModulesMap.allSystemModules()`) returns null —
@@ -1875,7 +1986,7 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 .iter()
                 .map(|(pin, mref)| Value::Object(Some(ctx.read_native_pin(*pin, *mref))))
                 .collect();
-            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements);
+            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements)?;
             if let Some(pin) = first_pin {
                 ctx.unpin_native_roots(pin);
             }
@@ -1901,6 +2012,26 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                     );
                 }
             };
+            // A finder must answer for the modules it actually observes, and
+            // `Optional.empty()` for everything else. This used to mint a
+            // ModuleReference for ANY string, so
+            // `ModuleFinder.ofSystem().find("cratonvm.absent")` reported a
+            // module that does not exist — a fabricated success where the spec
+            // mandates an empty answer, and the failure surfaced later (as an
+            // `open()` on a reader for a module the image has no entries for)
+            // rather than here. Measured at
+            // `regression-suite/src/RJdkFailure.java:293` ("the system finder
+            // must not invent a module"), failing in `--real-jdk` and
+            // `--jdk-only` while HotSpot 25 passes.
+            let name_text = ctx.read_string(name).unwrap_or_default();
+            if !is_system_module_name(&*ctx, &name_text) {
+                return ctx.invoke(
+                    "java/util/Optional",
+                    "empty",
+                    "()Ljava/util/Optional;",
+                    &[],
+                );
+            }
             // A ModuleReferenceImpl whose `descriptor.name` carries the module
             // name and whose `readerSupplier` is left null — `open()` below
             // detects the null supplier and builds a SystemModuleReader.

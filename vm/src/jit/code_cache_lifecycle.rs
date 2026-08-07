@@ -6,7 +6,7 @@
 //! both auditable.
 //!
 //! This closes two adjacent items of the C2 review
-//! (`docs/known-issues/c2/deep-research-vm-c2.md`):
+//! (`docs/feature-designs/c2/deep-research-vm-c2.md`):
 //!
 //! * P1 *"Add code-cache lifecycle metrics and reclamation"* — acceptance:
 //!   installed/reclaimed bytes, fragmentation, sweeps, failed allocations,

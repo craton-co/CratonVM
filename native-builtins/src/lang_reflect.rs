@@ -1239,6 +1239,174 @@ pub(crate) fn native_constructor_get_name(
 }
 
 // ---------------------------------------------------------------------------
+// JLS §6.6.1 caller-sensitive access for reflective member use.
+// ---------------------------------------------------------------------------
+//
+// `Method.invoke` / `Field.get|set` / `Constructor.newInstance` do NOT require
+// `setAccessible(true)` merely because the member is non-public. The real JDK
+// routes each of them through `Reflection.verifyMemberAccess(caller,
+// declaringClass, obj, modifiers)` — the ordinary JLS §6.6.1 rules evaluated
+// against the *caller* class:
+//
+//   * `private`       → the declaring class itself, or a **nestmate**
+//                       (JEP 181, confirmed per JVMS §5.4.4).
+//   * package-private → a caller in the same runtime package (same package
+//                       name AND same defining loader).
+//   * `protected`     → same runtime package, or a subclass of the declaring
+//                       class (JLS §6.6.2).
+//
+// CratonVM's method path had no caller step at all: `lang_class::check_access`
+// answers "public, or `setAccessible(true)`, else deny". That rejects the very
+// common nestmate case — an enclosing class reflectively invoking a private
+// method of its own nested class — which HotSpot 25 accepts.
+// `regression-suite/src/RJdkReflect.java:160` is exactly that call, and it
+// failed identically in `--real-jdk` and `--jdk-only`.
+//
+// `lang_class::check_field_access` already grew the same-class half of this for
+// fields (HikariConfig's private-final `AtomicReference`); the helper below is
+// the complete, member-shaped twin. It is deliberately **pure widening**: it is
+// only ever consulted after the old rule has already said "not public and not
+// overridden", and every answer it gives is an `allow`. Nothing the old blanket
+// rule accepted is now rejected.
+
+/// Member access-flag bits (JVMS §4.6 `method_info.access_flags`). Named apart
+/// from the `ACC_SYNTHETIC` / `ACC_MANDATED` parameter-flag constants above so
+/// the two flag namespaces cannot be confused at a call site.
+const ACC_PUBLIC_MEMBER: i32 = 0x0001;
+const ACC_PRIVATE_MEMBER: i32 = 0x0002;
+const ACC_PROTECTED_MEMBER: i32 = 0x0004;
+
+/// Upper bound on the superclass walk in [`caller_is_subclass_of`]. A well
+/// formed hierarchy is far shallower; the bound exists so a corrupted or
+/// cyclic `superclass_of` chain degrades to "deny" instead of hanging the
+/// reflective call.
+const MAX_SUPERCLASS_WALK: usize = 128;
+
+/// The runtime package of `class_id`: `(package name, defining loader id)`.
+/// JLS §6.6.1 package access is *runtime* package access — two classes named
+/// `com.foo.Bar` defined by different loaders are NOT in the same package.
+fn runtime_package_of(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<(String, i32)> {
+    let name = ctx.class_name_of_id(class_id)?;
+    let pkg = match name.rfind('/') {
+        Some(i) => name[..i].to_string(),
+        // Default package (the regression-suite classes live here).
+        None => String::new(),
+    };
+    Some((pkg, ctx.loader_id_of_class(class_id)))
+}
+
+/// Resolve the *confirmed* nest host name of `class_id`, mirroring
+/// `classloading::access_control::confirmed_nest_host`.
+///
+/// A `NestHost` attribute is only a *claim*. JVMS §5.4.4 requires the claimed
+/// host to list the claimant back in its `NestMembers` before the claim grants
+/// anything — otherwise any class could name a victim as its host and read the
+/// victim's privates. When the claim cannot be confirmed the class is treated
+/// as its own nest host, so the spoof simply fails to match.
+///
+/// The host is resolved with `class_id_by_name_near(.., class_id)` rather than
+/// the ambient `class_id_by_name` so a duplicate binary name defined by another
+/// loader cannot be substituted for the real host.
+fn confirmed_nest_host_name(ctx: &mut dyn NativeContext, class_id: ClassId) -> Option<String> {
+    let own = ctx.class_name_of_id(class_id)?;
+    let claimed = match ctx.nest_host_name(class_id) {
+        // No `NestHost` attribute (or a self-referential one): the class is
+        // its own nest host. This is the case for the enclosing class of a
+        // nest, which carries `NestMembers` but no `NestHost`.
+        Some(h) if h != own => h,
+        _ => return Some(own),
+    };
+    let host_id = match ctx.class_id_by_name_near(&claimed, class_id) {
+        Some(id) => id,
+        // Host not loadable/loaded → claim unconfirmed → own host.
+        None => return Some(own),
+    };
+    if ctx.nest_member_names(host_id).iter().any(|m| *m == own) {
+        Some(claimed)
+    } else {
+        Some(own)
+    }
+}
+
+/// JEP 181 nestmate test: two classes are nestmates iff they resolve to the
+/// same *confirmed* nest host.
+fn classes_are_nestmates(ctx: &mut dyn NativeContext, a: ClassId, b: ClassId) -> bool {
+    if a == b {
+        return true;
+    }
+    match (
+        confirmed_nest_host_name(ctx, a),
+        confirmed_nest_host_name(ctx, b),
+    ) {
+        (Some(ha), Some(hb)) => ha == hb,
+        _ => false,
+    }
+}
+
+/// Is `caller` a subclass of `declaring` (JLS §6.6.2, the `protected` arm)?
+fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring: ClassId) -> bool {
+    let mut cursor = caller;
+    for _ in 0..MAX_SUPERCLASS_WALK {
+        if cursor == declaring {
+            return true;
+        }
+        cursor = match ctx.superclass_of(cursor) {
+            Some(s) => s,
+            None => return false,
+        };
+    }
+    false
+}
+
+/// Decide whether `caller` is entitled — by the ordinary JLS §6.6.1 rules, with
+/// no `setAccessible(true)` override — to reflectively use a member of
+/// `declaring` whose access flags are `modifiers`.
+///
+/// This is the caller-class question of the three that gate deep reflection.
+/// It does **not** answer the other two: the `setAccessible` override flag is
+/// checked before this is reached, and the JPMS `opens`/`exports` edge is
+/// checked after it by `lang_class::check_reflection_module_access`. Answering
+/// `true` here does not bypass the module check — see
+/// `docs/known-issues/jdk-only/L1-reflect-setaccessible-invoke.md`.
+pub(crate) fn caller_may_access_member(
+    ctx: &mut dyn NativeContext,
+    caller: ClassId,
+    declaring: ClassId,
+    modifiers: i32,
+) -> bool {
+    // A public member of an accessible class needs no caller analysis. (Call
+    // sites short-circuit this already; keep it so the helper is safe alone.)
+    if (modifiers & ACC_PUBLIC_MEMBER) != 0 {
+        return true;
+    }
+    // The declaring class may always reach its own members.
+    if caller == declaring {
+        return true;
+    }
+    if (modifiers & ACC_PRIVATE_MEMBER) != 0 {
+        // JEP 181: private is nest-scoped, nothing wider.
+        return classes_are_nestmates(ctx, caller, declaring);
+    }
+    // `protected` and package-private both admit a same-runtime-package caller.
+    let same_package = match (
+        runtime_package_of(ctx, caller),
+        runtime_package_of(ctx, declaring),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    };
+    if same_package {
+        return true;
+    }
+    if (modifiers & ACC_PROTECTED_MEMBER) != 0 {
+        // JLS §6.6.2: a subclass reaches inherited protected members.
+        return caller_is_subclass_of(ctx, caller, declaring);
+    }
+    // Package-private with a foreign package: denied.
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Method.invoke return-value boxing wrapper.
 // ---------------------------------------------------------------------------
 //

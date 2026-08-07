@@ -1962,7 +1962,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let comparator = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_max_by_collector(ctx, comparator);
+            let c = cratonvm_native_collections::make_max_by_collector(ctx, comparator)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -1974,7 +1974,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let comparator = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_min_by_collector(ctx, comparator);
+            let c = cratonvm_native_collections::make_min_by_collector(ctx, comparator)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -1987,7 +1987,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
             let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_mapping_collector(ctx, func, downstream);
+            let c = cratonvm_native_collections::make_mapping_collector(ctx, func, downstream)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2000,7 +2000,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let pred = args.first().copied().unwrap_or(Value::Object(None));
             let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_filtering_collector(ctx, pred, downstream);
+            let c = cratonvm_native_collections::make_filtering_collector(ctx, pred, downstream)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2012,7 +2012,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_summarizing_int_collector(ctx, func);
+            let c = cratonvm_native_collections::make_summarizing_int_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2024,7 +2024,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_summarizing_long_collector(ctx, func);
+            let c = cratonvm_native_collections::make_summarizing_long_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2036,7 +2036,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_summarizing_double_collector(ctx, func);
+            let c = cratonvm_native_collections::make_summarizing_double_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2047,7 +2047,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableList",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = cratonvm_native_collections::make_to_list_collector(ctx);
+            let c = cratonvm_native_collections::make_to_list_collector(ctx)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2058,7 +2058,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "toUnmodifiableSet",
         "()Ljava/util/stream/Collector;",
         |ctx, _args| {
-            let c = cratonvm_native_collections::make_to_set_collector(ctx);
+            let c = cratonvm_native_collections::make_to_set_collector(ctx)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2073,7 +2073,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
             let finisher = args.get(1).copied().unwrap_or(Value::Object(None));
             let c = cratonvm_native_collections::make_collecting_and_then_collector(
                 ctx, downstream, finisher,
-            );
+            )?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2085,7 +2085,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_averaging_int_collector(ctx, func);
+            let c = cratonvm_native_collections::make_averaging_int_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2095,7 +2095,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_averaging_long_collector(ctx, func);
+            let c = cratonvm_native_collections::make_averaging_long_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2105,7 +2105,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_averaging_double_collector(ctx, func);
+            let c = cratonvm_native_collections::make_averaging_double_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2117,7 +2117,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToIntFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_summing_int_collector(ctx, func);
+            let c = cratonvm_native_collections::make_summing_int_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2127,7 +2127,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToLongFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_summing_long_collector(ctx, func);
+            let c = cratonvm_native_collections::make_summing_long_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -2137,7 +2137,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/stream/Collector;",
         |ctx, args| {
             let func = args.first().copied().unwrap_or(Value::Object(None));
-            let c = cratonvm_native_collections::make_summing_double_collector(ctx, func);
+            let c = cratonvm_native_collections::make_summing_double_collector(ctx, func)?;
             Ok(Some(Value::Object(Some(c))))
         },
     );
@@ -3845,7 +3845,7 @@ pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
                 downstream1,
                 downstream2,
                 merger,
-            );
+            )?;
             Ok(Some(Value::Object(Some(c))))
         });
 

@@ -569,7 +569,32 @@ impl<'a> SharedEvac<'a> {
                 *bytes += obj_size;
                 Some((new_ptr, true))
             }
-            Err(winner) => Some((winner as *mut u8, false)),
+            // The loser must DECODE the winner's word. `compare_exchange`
+            // hands back the current *mark word*, and a forwarded mark word is
+            // `target | MARK_FORWARDED` (`make_forwarded`) — the tag lives in
+            // the low bits. This arm used to cast that word straight to a
+            // pointer, so the loser adopted an address three bytes past the
+            // real one and wrote it into the parent's reference slot and onto
+            // the gray queue. Symptom:
+            //
+            //     ObjectRef pointer not 8-byte aligned: 0x7299462265db
+            //
+            // (every reported address is an 8-aligned one +3). In a build
+            // without that debug assertion it is a corrupt reference stored
+            // into a live object.
+            //
+            // Only a two-worker race on the SAME object reaches this arm, which
+            // is why it needed a diamond — a shared child with two parents — to
+            // show up at all, and why the tree-shaped evacuation tests never
+            // saw it. Decoded exactly like the evacuation-failure loser twenty
+            // lines above, including its defensive check: a non-forwarded loser
+            // value means an unmodelled writer, and adopting its payload as an
+            // address is the INFLATED/FORWARDED aliasing this encoding was
+            // audited against.
+            Err(winner) if ObjectHeader::is_forwarded_mark(winner) => {
+                Some((ObjectHeader::forwarding_target(winner), false))
+            }
+            Err(_) => None,
         }
     }
 
@@ -806,6 +831,28 @@ impl<'a> SharedEvac<'a> {
             };
             match item {
                 Some(addr) => {
+                    // Retire this item's outstanding count on EVERY exit from
+                    // the block, including an unwind out of `process_object`.
+                    //
+                    // A bare `fetch_sub` at the end of the arm is skipped by a
+                    // panic, and the leak is unrecoverable: the count never
+                    // reaches 0, so every other worker spins in the `None` arm
+                    // below forever, the driver never returns from
+                    // `thread::scope`, and the panic that started it is never
+                    // propagated. A crash silently became an unkillable hang
+                    // that also hid its own cause — measured at 3h08m of CPU
+                    // for a suite that finishes in 2.5s. This is
+                    // defence-in-depth for the decode bug fixed in `evacuate`
+                    // above: with the guard, a future panic here FAILS the
+                    // collection loudly instead of wedging the process.
+                    struct RetireOnExit<'r>(&'r AtomicUsize);
+                    impl Drop for RetireOnExit<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::AcqRel);
+                        }
+                    }
+                    let _retire = RetireOnExit(self.outstanding);
+
                     children.clear();
                     self.process_object(
                         tlab,
@@ -820,12 +867,13 @@ impl<'a> SharedEvac<'a> {
                     if !children.is_empty() {
                         // Add children to the outstanding count BEFORE retiring
                         // the parent so the counter never transiently hits 0
-                        // while work remains.
+                        // while work remains. `_retire` drops at the end of this
+                        // block, i.e. after this add — the ordering the comment
+                        // asks for is preserved.
                         self.outstanding.fetch_add(children.len(), Ordering::AcqRel);
                         let mut q = self.queue.lock();
                         q.extend(children.iter().copied());
                     }
-                    self.outstanding.fetch_sub(1, Ordering::AcqRel);
                 }
                 None => {
                     // Queue momentarily empty but work still outstanding

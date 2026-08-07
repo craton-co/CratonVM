@@ -1375,16 +1375,389 @@ fn provider_construction_error(
     }
 }
 
+/// The service's binary name, for `ServiceConfigurationError` messages.
+///
+/// `serviceName` is a CratonVM-only field: `initialize_real_service_loader_fields`
+/// writes it, but a real JDK 25 `ServiceLoader` does not declare it, so the write
+/// is a no-op there and the read answers `Int(0)`. Fall back to the `service`
+/// mirror (named field, then the legacy slot 0 the synthetic layout uses) and ask
+/// it for its name, exactly as `discover_providers` does.
+fn sl_service_name(ctx: &mut dyn NativeContext, sl: cratonvm_types::ObjectRef) -> String {
+    if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(sl, "serviceName") {
+        let name = ctx.read_string(name_obj).unwrap_or_default();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    let service = match ctx.get_field_by_name(sl, "service") {
+        Value::Object(Some(c)) => c,
+        _ => match ctx.get_field(sl, 0) {
+            Value::Object(Some(c)) => c,
+            _ => return String::new(),
+        },
+    };
+    let service_pin = ctx.pin_native_root(service);
+    let service = ctx.read_native_pin(service_pin, service);
+    let name = match ctx.invoke(
+        "java/lang/Class",
+        "getName",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(service))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(service_pin);
+    name
+}
+
+/// The JDK's `fail(service, "Provider " + cn + " not found")`: a
+/// `ServiceConfigurationError` with a message and NO cause, which is what
+/// `LazyClassPathLookupIterator.nextProviderClass` raises when a descriptor
+/// names a class the loader cannot resolve.
+///
+/// `None` when the error object itself cannot be built — a `ServiceLoader`
+/// running on a class library that has no usable `ServiceConfigurationError`
+/// must keep this file's historical behaviour (an empty iterator) rather than
+/// gain a brand-new, uncatchable internal failure.
+fn provider_not_found_error(
+    ctx: &mut dyn NativeContext,
+    service_name: &str,
+    provider: &str,
+) -> Option<MethodCallFailed> {
+    service_configuration_error(ctx, &format!("{service_name}: Provider {provider} not found"))
+}
+
+/// `ServiceLoader.fail(service, msg)`: a cause-less `ServiceConfigurationError`.
+///
+/// `None` when the error object itself cannot be built — see
+/// `provider_not_found_error`, whose historic contract this preserves.
+fn service_configuration_error(
+    ctx: &mut dyn NativeContext,
+    text: &str,
+) -> Option<MethodCallFailed> {
+    let message = ctx.create_string(text);
+    let message_pin = ctx.pin_native_root(message);
+    let message = ctx.read_native_pin(message_pin, message);
+    let built = ctx.new_object_initialized(
+        "java/util/ServiceConfigurationError",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(message))],
+    );
+    ctx.unpin_native_roots(message_pin);
+    match built {
+        Ok(Some(Value::Object(Some(error)))) => Some(MethodCallFailed::ExceptionThrown(error)),
+        _ => None,
+    }
+}
+
+/// The `service` mirror of a `ServiceLoader`, named field first and the legacy
+/// synthetic slot 0 second — the same two-step `discover_providers` uses.
+fn sl_service_mirror(
+    ctx: &mut dyn NativeContext,
+    sl: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    match ctx.get_field_by_name(sl, "service") {
+        Value::Object(Some(c)) => Some(c),
+        _ => match ctx.get_field(sl, 0) {
+            Value::Object(Some(c)) => Some(c),
+            _ => None,
+        },
+    }
+}
+
+/// The provider FQNs a JPMS `module-info` `provides` clause declared for this
+/// service, in dot form — i.e. the subset of `discover_providers`' result that
+/// came from the module registry rather than a `META-INF/services` descriptor.
+///
+/// This is the `clazz.getModule().isNamed()` test of `ServiceLoader
+/// .loadProvider`, asked of the *descriptor* instead of the loaded class: a
+/// provider named by a module descriptor is by construction in a named module,
+/// and answering from the registry costs no Java dispatch on the hot classpath
+/// path (Spring/Tomcat boot walks hundreds of providers per run, none of which
+/// are module-declared).
+fn module_declared_providers(ctx: &mut dyn NativeContext, service_name: &str) -> Vec<String> {
+    if service_name.is_empty() {
+        return Vec::new();
+    }
+    ctx.service_providers_from_modules(&service_name.replace('.', "/"))
+        .into_iter()
+        .map(|s| s.replace('/', "."))
+        .collect()
+}
+
+/// Grant the `setAccessible(true)` override on a `Method`/`Constructor`
+/// WITHOUT calling `AccessibleObject.setAccessible`.
+///
+/// `setAccessible` is caller-sensitive, and this file is a Rust native that
+/// pushes no `java.util.ServiceLoader` frame: `resolve_caller_class_id`
+/// attributes the call to the *application* class that asked for the
+/// `ServiceLoader`, so the wave-4 JEP 403 gate correctly refuses to open a
+/// provider that lives in a package its module neither exports nor opens
+/// (`com.cratonvm.jdkonly.svc.internal` in `regression-suite/modules/`). The
+/// real JDK never meets that refusal because its `ServiceLoader` *is* java.base
+/// and takes the JDK-internal bypass. The `setAccessible` return value was
+/// being discarded here, so the refusal was invisible and the following
+/// `newInstance` / `Method.invoke` was refused in turn, leaving zero providers.
+///
+/// Writing the flag is what `getConstructor`'s `if (inExplicitModule(clazz))
+/// ctor.setAccessible(true)` and `findStaticProviderMethod`'s
+/// `m.setAccessible(true)` achieve in the JDK; only the caller identity differs.
+/// Both fields are written because a reflective object built with positional
+/// slots (synthetic-jdk layout) has no named `override` at all — the same
+/// belt-and-braces pair `lang_class::native_set_accessible` writes.
+fn grant_reflective_override(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) {
+    ctx.set_field_by_name(obj, "override", Value::Int(1));
+    let cid = ctx.class_id_of_object(obj);
+    let cname = ctx.class_name_of_id(cid);
+    match cname.as_deref() {
+        Some("java/lang/reflect/Constructor") => {
+            crate::lang_class::write_constructor_accessible(ctx, obj, true);
+        }
+        Some("java/lang/reflect/Method") => {
+            crate::lang_class::write_method_accessible(ctx, obj, true);
+        }
+        _ => {}
+    }
+}
+
+/// `ServiceLoader.findStaticProviderMethod` — the JPMS `provider()` static
+/// factory form.
+///
+/// A provider class in a NAMED module may expose `public static <S> provider()`
+/// INSTEAD of a public no-arg constructor, and then need not implement the
+/// service type at all. This file only ever did `getDeclaredConstructor()` +
+/// `newInstance`, so such a provider was at best skipped and at worst
+/// constructed through its private constructor and handed out as an instance
+/// that is not of the service type (`FactoryGreeter` in
+/// `regression-suite/modules/cratonvm.jdkonly.svc` is exactly that shape:
+/// private constructor, implements nothing, reachable only via `provider()`).
+///
+/// Returns the `Method` when the class declares the JDK's exact shape
+/// (declared, public, static, no-arg, named `provider`). The returned reference
+/// is UNPINNED — pin it before the next allocation, like `load_provider_class`.
+fn provider_factory_method(
+    ctx: &mut dyn NativeContext,
+    type_class: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    const ACC_PUBLIC: i32 = 0x0001;
+    const ACC_STATIC: i32 = 0x0008;
+    let type_pin = ctx.pin_native_root(type_class);
+    let name = ctx.create_string("provider");
+    let name_pin = ctx.pin_native_root(name);
+    let empty_types = ctx.new_ref_array(
+        ctx.class_id_by_name("java/lang/Class")
+            .unwrap_or(cratonvm_types::ClassId::new(0)),
+        0,
+    );
+    let empty_types_pin = ctx.pin_native_root(empty_types);
+    let type_now = ctx.read_native_pin(type_pin, type_class);
+    let name_now = ctx.read_native_pin(name_pin, name);
+    let empty_now = ctx.read_native_pin(empty_types_pin, empty_types);
+    // A `NoSuchMethodException` here is the ORDINARY constructor-form provider,
+    // not an error: the JDK's `getDeclaredPublicMethods(clazz, "provider")`
+    // simply answers an empty list and `findStaticProviderMethod` returns null.
+    let found = ctx.invoke(
+        "java/lang/Class",
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+        &[
+            Value::Object(Some(type_now)),
+            Value::Object(Some(name_now)),
+            Value::Object(Some(empty_now)),
+        ],
+    );
+    ctx.unpin_native_roots(type_pin);
+    let method = match found {
+        Ok(Some(Value::Object(Some(m)))) => m,
+        _ => return None,
+    };
+    let method_pin = ctx.pin_native_root(method);
+    let method_now = ctx.read_native_pin(method_pin, method);
+    let mods = match ctx.invoke(
+        "java/lang/reflect/Method",
+        "getModifiers",
+        "()I",
+        &[Value::Object(Some(method_now))],
+    ) {
+        Ok(Some(Value::Int(m))) => m,
+        _ => 0,
+    };
+    let method = ctx.read_native_pin(method_pin, method);
+    ctx.unpin_native_roots(method_pin);
+    // `getDeclaredPublicMethods` pre-filters on public; a non-public or
+    // non-static `provider()` is NOT the factory form and must fall through to
+    // the constructor path rather than be invoked.
+    if (mods & ACC_PUBLIC) == 0 || (mods & ACC_STATIC) == 0 {
+        return None;
+    }
+    Some(method)
+}
+
+/// `factoryMethod.getReturnType()` — the class `ServiceLoader$ProviderImpl`
+/// stores as `type`, i.e. what `Provider.type()` must answer for a factory
+/// provider (`Greeter`, not `FactoryGreeter`). Returned reference is unpinned.
+fn factory_return_type(
+    ctx: &mut dyn NativeContext,
+    method: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    let method_pin = ctx.pin_native_root(method);
+    let method_now = ctx.read_native_pin(method_pin, method);
+    let ret = ctx.invoke(
+        "java/lang/reflect/Method",
+        "getReturnType",
+        "()Ljava/lang/Class;",
+        &[Value::Object(Some(method_now))],
+    );
+    ctx.unpin_native_roots(method_pin);
+    match ret {
+        Ok(Some(Value::Object(Some(c)))) => Some(c),
+        _ => None,
+    }
+}
+
+/// `service.isAssignableFrom(candidate)`. An unreadable answer is reported as
+/// `true` so a mirror this VM cannot interrogate keeps the historic behaviour
+/// (accept the provider) instead of gaining a brand-new refusal.
+fn service_accepts_type(
+    ctx: &mut dyn NativeContext,
+    service: cratonvm_types::ObjectRef,
+    candidate: cratonvm_types::ObjectRef,
+) -> bool {
+    let service_pin = ctx.pin_native_root(service);
+    let candidate_pin = ctx.pin_native_root(candidate);
+    let service_now = ctx.read_native_pin(service_pin, service);
+    let candidate_now = ctx.read_native_pin(candidate_pin, candidate);
+    let answer = ctx.invoke(
+        "java/lang/Class",
+        "isAssignableFrom",
+        "(Ljava/lang/Class;)Z",
+        &[
+            Value::Object(Some(service_now)),
+            Value::Object(Some(candidate_now)),
+        ],
+    );
+    ctx.unpin_native_roots(service_pin);
+    match answer {
+        Ok(Some(Value::Int(v))) => v != 0,
+        _ => true,
+    }
+}
+
+/// The JDK's own per-loader instance cache: `ServiceLoader.instantiatedProviders`.
+///
+/// `initialize_real_service_loader_fields` allocates this list and
+/// `native_sl_reload` clears it, but until the caching arm of
+/// `native_sl_iterator` existed nothing ever read or wrote it — see that
+/// function's cache comment for what that cost.
+///
+/// Absent on a layout that does not declare the field (a fabricated
+/// synthetic-JDK `ServiceLoader`), where `get_field_by_name` answers
+/// `Int(0)` rather than an object; the caller then falls back to the
+/// re-discovering path this file has always taken.
+fn sl_instance_cache(
+    ctx: &mut dyn NativeContext,
+    sl: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    match ctx.get_field_by_name(sl, "instantiatedProviders") {
+        Value::Object(Some(list)) => Some(list),
+        _ => None,
+    }
+}
+
+/// `true` once a completed `iterator()` has published every provider into
+/// `instantiatedProviders`. Mirrors the real JDK field of the same name:
+/// `initialize_real_service_loader_fields` seeds it to 0 and
+/// `native_sl_reload` resets it to 0, so `reload()` still discards the cache.
+///
+/// A layout without the field answers `Int(0)` and therefore never reports a
+/// complete cache, which is what keeps this change inert wherever the named
+/// fields do not exist.
+fn sl_cache_is_complete(ctx: &mut dyn NativeContext, sl: cratonvm_types::ObjectRef) -> bool {
+    ctx.get_field_by_name(sl, "loadedAllProviders")
+        .as_int()
+        .unwrap_or(0)
+        != 0
+}
+
 fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sl = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `java.util.ServiceLoader` is specified to CACHE: "Instances are cached
+    // and instantiated lazily ... Iterating over a ServiceLoader a second time
+    // yields the same instances, in the same order" — only `reload()` discards
+    // them. This native re-discovered and re-instantiated every provider on
+    // every `iterator()` call, so `sl.iterator().next() != sl.iterator().next()`
+    // for the SAME loader (regression-suite `RJdkServices.java:121`,
+    // "a single ServiceLoader caches its instances" — the check that failed in
+    // `--real-jdk` while `--jdk-only`, which refuses this SyntheticStub and runs
+    // the real `ServiceLoader` bytecode, passed).
+    //
+    // The cache the JDK uses for exactly this is `instantiatedProviders`, and
+    // this file already allocated it (`initialize_real_service_loader_fields`)
+    // and already cleared it on `reload()` (`native_sl_reload`) — it just had
+    // no reader and no writer, so `reload()`'s clear was a no-op and the
+    // "reload discards the cache" check only passed because there was no cache
+    // to discard. The two arms below are that missing reader and writer.
+    //
+    // `sl` must be rooted for the whole body: the publish step at the bottom
+    // writes two of its fields after the instantiation loop's many collections.
+    let sl_pin = ctx.pin_native_root(sl);
+    if sl_cache_is_complete(ctx, sl) {
+        if let Some(cache) = sl_instance_cache(ctx, sl) {
+            let cache_pin = ctx.pin_native_root(cache);
+            let cache_now = ctx.read_native_pin(cache_pin, cache);
+            // A non-empty cache is required, not just the flag. In the real JDK
+            // `loadedAllProviders` guards `loadedProviders` (the `stream()`
+            // Provider-wrapper cache), NOT `instantiatedProviders`; the real
+            // iterator tracks its own position by index instead. Every
+            // `ServiceLoader` that reaches this native has the flag written by
+            // this file (0 at construction, 0 on `reload`, 1 only by the publish
+            // step below), but requiring providers to actually be there means a
+            // loader that somehow arrived with the JDK's meaning of the flag
+            // re-discovers rather than reporting itself empty. A service with
+            // genuinely zero providers just takes the discovery path every time,
+            // which is what this native has always done.
+            let cached_len = match ctx.invoke(
+                "java/util/ArrayList",
+                "size",
+                "()I",
+                &[Value::Object(Some(cache_now))],
+            ) {
+                Ok(Some(Value::Int(n))) => n,
+                _ => 0,
+            };
+            if cached_len > 0 {
+                let cache_now = ctx.read_native_pin(cache_pin, cache);
+                let it = ctx.invoke(
+                    "java/util/ArrayList",
+                    "iterator",
+                    "()Ljava/util/Iterator;",
+                    &[Value::Object(Some(cache_now))],
+                );
+                ctx.unpin_native_roots(sl_pin);
+                return it;
+            }
+            ctx.unpin_native_roots(cache_pin);
+        }
+    }
+    let sl = ctx.read_native_pin(sl_pin, sl);
     // Extract and pin the non-builtin loader BEFORE discover_providers (which
     // triggers GC via invoke). If the loader is not re-pinned it becomes stale.
     let loader_pin_opt: Option<(_, cratonvm_types::ObjectRef)> =
         sl_non_builtin_loader(ctx, sl).map(|r| (ctx.pin_native_root(r), r));
     let providers = discover_providers(ctx, sl)?;
+    // Which of these a JPMS `module-info` declared. The `provider()` static
+    // factory form and the `setAccessible` grant on a provider constructor are
+    // both module-path-only in the JDK (`ServiceLoader.loadProvider` looks for
+    // the factory on the `ModuleServicesLookupIterator` path only, and
+    // `getConstructor` calls `setAccessible` only `if (inExplicitModule)`), so
+    // classpath discovery keeps its existing behaviour byte for byte.
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let origin_service_name = sl_service_name(ctx, sl_now);
+    let module_declared = module_declared_providers(ctx, &origin_service_name);
 
     // Build an ArrayList and populate with load_provider_class(fqn).newInstance().
     let al_cls = "java/util/ArrayList";
@@ -1414,6 +1787,9 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             providers.len()
         );
     }
+    // Descriptor entries whose class could not be resolved at all. See the
+    // all-or-nothing `ServiceConfigurationError` decision after the loop.
+    let mut missing: Vec<String> = Vec::new();
     for fqn in providers {
         if diag {
             eprintln!("[SL-DBG]   instantiate provider={fqn}");
@@ -1423,17 +1799,132 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let loader_cur = loader_pin_opt
             .as_ref()
             .map(|(pin, orig)| ctx.read_native_pin(*pin, *orig));
-        let class = match load_provider_class(ctx, &fqn, loader_cur) {
+        // Bound outside the `match` so the shared borrow of `fqn` cannot outlive
+        // the call into the arms, where `fqn` is moved into `missing`.
+        let resolved = load_provider_class(ctx, &fqn, loader_cur);
+        let class = match resolved {
             Some(c) => c,
             None => {
                 if diag {
                     eprintln!("[SL-DBG]   skip (class not found for {fqn})");
                 }
+                missing.push(fqn);
                 continue;
             }
         };
         // newInstance via Class.getDeclaredConstructor() + Constructor.newInstance().
         let class_pin = ctx.pin_native_root(class);
+
+        // --- JPMS `provider()` static factory --------------------------------
+        // `ServiceLoader.loadProvider`: for a provider in a named module the
+        // static factory, when present, REPLACES the constructor entirely. The
+        // constructor path below would otherwise reach through `FactoryGreeter`'s
+        // PRIVATE constructor and hand out an object that is not a `Greeter`.
+        let mut built_via_factory = false;
+        if module_declared.iter().any(|m| m == &fqn) {
+            let class_now = ctx.read_native_pin(class_pin, class);
+            if let Some(factory) = provider_factory_method(ctx, class_now) {
+                let factory_pin = ctx.pin_native_root(factory);
+                // The JDK fails the load when the factory's return type is not a
+                // subtype of the service; a provider it may not legally hand out
+                // must not be quietly dropped instead.
+                //
+                // Order matters: `factory_return_type` allocates, so the service
+                // mirror is read AFTER it (via the non-allocating
+                // `sl_service_mirror`) rather than being held across that call.
+                let factory_now = ctx.read_native_pin(factory_pin, factory);
+                let subtype_ok = match factory_return_type(ctx, factory_now) {
+                    Some(ret) => {
+                        let ret_pin = ctx.pin_native_root(ret);
+                        let sl_now = ctx.read_native_pin(sl_pin, sl);
+                        let ret_now = ctx.read_native_pin(ret_pin, ret);
+                        let ok = match sl_service_mirror(ctx, sl_now) {
+                            Some(service) => service_accepts_type(ctx, service, ret_now),
+                            None => true,
+                        };
+                        ctx.unpin_native_roots(ret_pin);
+                        ok
+                    }
+                    None => true,
+                };
+                if !subtype_ok {
+                    ctx.unpin_native_roots(class_pin);
+                    let sl_now = ctx.read_native_pin(sl_pin, sl);
+                    let service_name = sl_service_name(ctx, sl_now);
+                    if let Some(error) = service_configuration_error(
+                        ctx,
+                        &format!(
+                            "{service_name}: provider() of {fqn} returns a type that is not a subtype"
+                        ),
+                    ) {
+                        ctx.unpin_native_roots(sl_pin);
+                        return Err(error);
+                    }
+                    continue;
+                }
+                // Caller-insensitive `setAccessible(true)` — see
+                // `grant_reflective_override`.
+                let factory_now = ctx.read_native_pin(factory_pin, factory);
+                grant_reflective_override(ctx, factory_now);
+                let empty_args = ctx.new_ref_array(
+                    ctx.class_id_by_name("java/lang/Object")
+                        .unwrap_or(cratonvm_types::ClassId::new(0)),
+                    0,
+                );
+                let empty_args_pin = ctx.pin_native_root(empty_args);
+                let factory_now = ctx.read_native_pin(factory_pin, factory);
+                let empty_args = ctx.read_native_pin(empty_args_pin, empty_args);
+                let invoked = ctx.invoke(
+                    "java/lang/reflect/Method",
+                    "invoke",
+                    "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[
+                        Value::Object(Some(factory_now)),
+                        Value::Object(None),
+                        Value::Object(Some(empty_args)),
+                    ],
+                );
+                ctx.unpin_native_roots(class_pin);
+                let inst = match invoked {
+                    Ok(Some(Value::Object(Some(o)))) => o,
+                    // `ProviderImpl.invokeFactoryMethod` fails the load on a null
+                    // return. Skipping the provider here would be a fabricated
+                    // success for a configuration the spec rejects.
+                    Ok(_) => {
+                        let sl_now = ctx.read_native_pin(sl_pin, sl);
+                        let service_name = sl_service_name(ctx, sl_now);
+                        if let Some(error) = service_configuration_error(
+                            ctx,
+                            &format!("{service_name}: provider() of {fqn} returned null"),
+                        ) {
+                            ctx.unpin_native_roots(sl_pin);
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                    Err(failure) => return Err(provider_construction_error(ctx, &fqn, failure)),
+                };
+                list = ctx.read_native_pin(list_pin, list);
+                let inst_pin = ctx.pin_native_root(inst);
+                let inst = ctx.read_native_pin(inst_pin, inst);
+                let add_result = ctx.invoke(
+                    al_cls,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[Value::Object(Some(list)), Value::Object(Some(inst))],
+                );
+                ctx.unpin_native_roots(inst_pin);
+                add_result?;
+                if diag {
+                    eprintln!("[SL-DBG]   built via provider() factory: {fqn}");
+                }
+                built_via_factory = true;
+            }
+        }
+        if built_via_factory {
+            continue;
+        }
+
         let empty_types = ctx.new_ref_array(
             ctx.class_id_by_name("java/lang/Class")
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
@@ -1480,13 +1971,24 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // itself was fixed — the Constructor object created there was fine;
         // it went stale HERE, one call site later).
         let ctor_pin = ctx.pin_native_root(ctor);
-        // setAccessible(true)
-        let _ = ctx.invoke(
-            "java/lang/reflect/AccessibleObject",
-            "setAccessible",
-            "(Z)V",
-            &[Value::Object(Some(ctor)), Value::Int(1)],
-        );
+        // setAccessible(true). For a module-declared provider the constructor
+        // lives in a package the module may neither export nor open, and the
+        // caller-sensitive `setAccessible` invoke is REFUSED here (its result was
+        // discarded, so the refusal was invisible and the `newInstance` below was
+        // refused in turn — zero providers, silently). Write the override
+        // directly instead; that is the JDK's `if (inExplicitModule(clazz))
+        // ctor.setAccessible(true)` minus the caller identity this native cannot
+        // supply. Classpath providers keep the historic invoke unchanged.
+        if module_declared.iter().any(|m| m == &fqn) {
+            grant_reflective_override(ctx, ctor);
+        } else {
+            let _ = ctx.invoke(
+                "java/lang/reflect/AccessibleObject",
+                "setAccessible",
+                "(Z)V",
+                &[Value::Object(Some(ctor)), Value::Int(1)],
+            );
+        }
         let empty_args = ctx.new_ref_array(
             ctx.class_id_by_name("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0)),
@@ -1561,18 +2063,159 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         eprintln!("[SL-DBG] iterator() final list size={:?}", size);
         list = ctx.read_native_pin(list_pin, list);
     }
+    // A descriptor entry naming a class that cannot be resolved is a
+    // `ServiceConfigurationError` in the JDK — `LazyClassPathLookupIterator.
+    // nextProviderClass` catches `ClassNotFoundException` and calls
+    // `fail(service, "Provider " + cn + " not found")`, message only, no cause.
+    // This native instead skipped the entry silently, so
+    // `ServiceLoader.load(Broken.class)` iterated empty and never threw
+    // (regression-suite `RJdkServices.java:196`, reachable in `--real-jdk` only
+    // once the caching defect at :121 stops aborting the class first; HotSpot
+    // and `--jdk-only` both print `badProviderCause=none`, i.e. an SCE whose
+    // `getCause()` is null — exactly this shape).
+    //
+    // NARROWED ON PURPOSE to "not one single provider could be built". Full JDK
+    // parity would raise on the FIRST unresolvable entry, and this VM reaches
+    // that arm routinely for reasons the JDK never would: the flat classpath
+    // scan unions the descriptors of every jar on the path, so an optional
+    // provider whose class this VM cannot yet load is common, and today every
+    // caller of such a service gets the working subset. Raising there would
+    // convert working partial discovery into a hard failure across the
+    // Spring/Tomcat/Elasticsearch/WildFly suites in one step, with no way to
+    // measure it from this lane. When nothing at all resolved, there is no
+    // subset to protect and the caller's alternative is an empty iterator that
+    // silently lies about the descriptor it just read.
+    if !missing.is_empty() {
+        let loaded = match ctx.invoke(al_cls, "size", "()I", &[Value::Object(Some(list))]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => 0,
+        };
+        list = ctx.read_native_pin(list_pin, list);
+        if loaded == 0 {
+            let sl_now = ctx.read_native_pin(sl_pin, sl);
+            let service_name = sl_service_name(ctx, sl_now);
+            if let Some(error) = provider_not_found_error(ctx, &service_name, &missing[0]) {
+                ctx.unpin_native_roots(sl_pin);
+                return Err(error);
+            }
+            list = ctx.read_native_pin(list_pin, list);
+        }
+    }
+    // Publish the freshly instantiated providers into `instantiatedProviders`
+    // and mark the cache complete, so the NEXT `iterator()` on this same
+    // ServiceLoader replays these very objects instead of building new ones.
+    // The iterator we hand back is the cache's own iterator on this path, which
+    // is what makes the first and second iterations agree by construction
+    // rather than by a copy that could drift.
+    //
+    // Every step degrades to today's behaviour rather than failing: no cache
+    // field (synthetic layout) or a copy step that does not resolve leaves
+    // `loadedAllProviders` at 0, so the next call simply re-discovers.
+    //
+    // The copy uses only calls this file already drives against these exact
+    // objects — `List.clear` (`native_sl_reload`), `List.get`
+    // (`discover_providers`' jarMetas walk), `ArrayList.size` (the diag branch
+    // above) and `ArrayList.add` (the instantiation loop above) — rather than
+    // `addAll`, which nothing here has ever exercised.
+    let mut iterate_over = list;
+    let mut published = false;
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    if let Some(cache) = sl_instance_cache(ctx, sl_now) {
+        let cache_pin = ctx.pin_native_root(cache);
+        let cache_now = ctx.read_native_pin(cache_pin, cache);
+        let mut copied = ctx
+            .invoke(
+                "java/util/List",
+                "clear",
+                "()V",
+                &[Value::Object(Some(cache_now))],
+            )
+            .is_ok();
+        list = ctx.read_native_pin(list_pin, list);
+        let count = match ctx.invoke(al_cls, "size", "()I", &[Value::Object(Some(list))]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => {
+                copied = false;
+                0
+            }
+        };
+        for i in 0..count {
+            list = ctx.read_native_pin(list_pin, list);
+            let element = match ctx.invoke(
+                "java/util/List",
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Object(Some(list)), Value::Int(i)],
+            ) {
+                Ok(Some(value @ Value::Object(Some(_)))) => value,
+                _ => {
+                    copied = false;
+                    break;
+                }
+            };
+            // The element is a native local across `add`'s own pre-dispatch
+            // resolve window, exactly like `inst` in the loop above.
+            let element_pin = match element {
+                Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                _ => None,
+            };
+            let element = match (element, element_pin) {
+                (Value::Object(Some(original)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, original)))
+                }
+                (value, _) => value,
+            };
+            let cache_now = ctx.read_native_pin(cache_pin, cache);
+            let added = ctx.invoke(
+                al_cls,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(cache_now)), element],
+            );
+            if let Some(pin) = element_pin {
+                ctx.unpin_native_roots(pin);
+            }
+            if added.is_err() {
+                copied = false;
+                break;
+            }
+        }
+        if copied {
+            let sl_now = ctx.read_native_pin(sl_pin, sl);
+            ctx.set_field_by_name(sl_now, "loadedAllProviders", Value::Int(1));
+            iterate_over = ctx.read_native_pin(cache_pin, cache);
+            published = true;
+        } else {
+            // Leave the flag at 0: a half-copied cache must never be replayed.
+            let cache_now = ctx.read_native_pin(cache_pin, cache);
+            let _ = ctx.invoke(
+                "java/util/List",
+                "clear",
+                "()V",
+                &[Value::Object(Some(cache_now))],
+            );
+            ctx.unpin_native_roots(cache_pin);
+            iterate_over = ctx.read_native_pin(list_pin, list);
+        }
+    }
+    if diag {
+        eprintln!("[SL-DBG] iterator() cache published={published}");
+    }
     let it = ctx.invoke(
         al_cls,
         "iterator",
         "()Ljava/util/Iterator;",
-        &[Value::Object(Some(list))],
+        &[Value::Object(Some(iterate_over))],
     )?;
-    // The returned iterator now keeps `list` reachable via the Java object
-    // graph, so the native pins can be released.
+    // The returned iterator now keeps its backing list reachable via the Java
+    // object graph, so the native pins can be released. `sl_pin` is the first
+    // pin owned by this scope, so truncating to it also releases the loader,
+    // list and cache pins taken after it.
     ctx.unpin_native_roots(list_pin);
     if let Some((pin, _)) = loader_pin_opt {
         ctx.unpin_native_roots(pin);
     }
+    ctx.unpin_native_roots(sl_pin);
     Ok(it)
 }
 
@@ -1627,6 +2270,11 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         ctx.unpin_native_roots(sl_pin);
         return alloc_synthetic_stream(ctx, &[]);
     }
+    // See `native_sl_iterator`: the `provider()` factory form is module-path
+    // only, and it changes what `Provider.type()` answers.
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    let origin_service_name = sl_service_name(ctx, sl_now);
+    let module_declared = module_declared_providers(ctx, &origin_service_name);
 
     // Resolve the JDK-internal wrapper class. If it is unavailable (e.g. a
     // stripped runtime), fall back to draining service instances so the
@@ -1680,51 +2328,112 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // before being stored into the wrapper.
         let type_pin = ctx.pin_native_root(type_class);
 
-        // type.getDeclaredConstructor() → the no-arg ctor used by get().
-        let empty_types = ctx.new_ref_array(
-            ctx.class_id_by_name("java/lang/Class")
-                .unwrap_or(cratonvm_types::ClassId::new(0)),
-            0,
-        );
-        let empty_types_pin = ctx.pin_native_root(empty_types);
-        let type_now = ctx.read_native_pin(type_pin, type_class);
-        let empty_types = ctx.read_native_pin(empty_types_pin, empty_types);
-        let ctor = match ctx.invoke(
-            "java/lang/Class",
-            "getDeclaredConstructor",
-            "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
-            &[
-                Value::Object(Some(type_now)),
-                Value::Object(Some(empty_types)),
-            ],
-        ) {
-            Ok(Some(Value::Object(Some(c)))) => c,
-            other => {
-                if diag {
-                    eprintln!("[SL-DBG]   stream skip (no no-arg ctor for {fqn} → {other:?})");
+        // --- JPMS `provider()` static factory --------------------------------
+        // `ProviderImpl` has a distinct `(Class, Class, Method)` constructor for
+        // this form, and it records `factoryMethod.getReturnType()` as `type` —
+        // which is exactly what `Provider.type()` answers. Building the
+        // constructor flavour here instead reports the FACTORY class
+        // (`FactoryGreeter`) where the JDK reports the service type (`Greeter`),
+        // and `get()` then reaches through a private constructor for an object
+        // that does not implement the service at all.
+        #[allow(clippy::type_complexity)]
+        let mut factory: Option<(
+            usize,
+            cratonvm_types::ObjectRef,
+            usize,
+            cratonvm_types::ObjectRef,
+        )> = None;
+        if module_declared.iter().any(|m| m == fqn) {
+            let type_now = ctx.read_native_pin(type_pin, type_class);
+            if let Some(method) = provider_factory_method(ctx, type_now) {
+                let method_pin = ctx.pin_native_root(method);
+                let method_now = ctx.read_native_pin(method_pin, method);
+                // Caller-insensitive `setAccessible(true)` so the real
+                // `ProviderImpl.invokeFactoryMethod` bytecode can call it —
+                // see `grant_reflective_override`.
+                grant_reflective_override(ctx, method_now);
+                let method_now = ctx.read_native_pin(method_pin, method);
+                match factory_return_type(ctx, method_now) {
+                    Some(ret) => {
+                        let ret_pin = ctx.pin_native_root(ret);
+                        factory = Some((method_pin, method, ret_pin, ret));
+                    }
+                    // Unreadable return type: fall back to the constructor
+                    // flavour rather than build a half-formed wrapper.
+                    None => ctx.unpin_native_roots(method_pin),
                 }
-                // Release this iteration's pins, keep sl + list.
+            }
+        }
+
+        // type.getDeclaredConstructor() → the no-arg ctor used by get().
+        // Skipped entirely for the factory form: `ServiceLoader.loadProvider`
+        // never looks at a constructor once `findStaticProviderMethod` answered.
+        let ctor_slot = if factory.is_some() {
+            None
+        } else {
+            let empty_types = ctx.new_ref_array(
+                ctx.class_id_by_name("java/lang/Class")
+                    .unwrap_or(cratonvm_types::ClassId::new(0)),
+                0,
+            );
+            let empty_types_pin = ctx.pin_native_root(empty_types);
+            let type_now = ctx.read_native_pin(type_pin, type_class);
+            let empty_types = ctx.read_native_pin(empty_types_pin, empty_types);
+            let ctor = match ctx.invoke(
+                "java/lang/Class",
+                "getDeclaredConstructor",
+                "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+                &[
+                    Value::Object(Some(type_now)),
+                    Value::Object(Some(empty_types)),
+                ],
+            ) {
+                Ok(Some(Value::Object(Some(c)))) => c,
+                other => {
+                    if diag {
+                        eprintln!("[SL-DBG]   stream skip (no no-arg ctor for {fqn} → {other:?})");
+                    }
+                    // Release this iteration's pins, keep sl + list.
+                    ctx.unpin_native_roots(type_pin);
+                    continue;
+                }
+            };
+            ctx.unpin_native_roots(empty_types_pin);
+            let ctor_pin = ctx.pin_native_root(ctor);
+            // setAccessible(true) so ProviderImpl.get()'s reflective newInstance
+            // succeeds for non-public providers. A module-declared provider's
+            // package may be neither exported nor opened, and the
+            // caller-sensitive invoke is refused there — write the override
+            // directly, as `native_sl_iterator` does.
+            if module_declared.iter().any(|m| m == fqn) {
+                let ctor_now = ctx.read_native_pin(ctor_pin, ctor);
+                grant_reflective_override(ctx, ctor_now);
+            } else {
+                let ctor_now = ctx.read_native_pin(ctor_pin, ctor);
+                let _ = ctx.invoke(
+                    "java/lang/reflect/AccessibleObject",
+                    "setAccessible",
+                    "(Z)V",
+                    &[Value::Object(Some(ctor_now)), Value::Int(1)],
+                );
+            }
+            Some((ctor_pin, ctor))
+        };
+
+        // The member ProviderImpl stores, and the `type` it reports: for the
+        // factory form those are the Method and its return type; otherwise the
+        // constructor and the provider class itself. Both are read back through
+        // their pins on every constructor attempt below rather than being held
+        // raw across provider allocation/retries.
+        let (member_pin, member_orig, type_read_pin, type_read_orig) = match (factory, ctor_slot) {
+            (Some((mp, m, rp, r)), _) => (mp, m, rp, r),
+            (None, Some((cp, c))) => (cp, c, type_pin, type_class),
+            // Unreachable: `ctor_slot` is Some whenever `factory` is None.
+            (None, None) => {
                 ctx.unpin_native_roots(type_pin);
                 continue;
             }
         };
-        ctx.unpin_native_roots(empty_types_pin);
-        let ctor_pin = ctx.pin_native_root(ctor);
-        // setAccessible(true) so ProviderImpl.get()'s reflective newInstance
-        // succeeds for non-public providers.
-        let ctor_now = ctx.read_native_pin(ctor_pin, ctor);
-        let _ = ctx.invoke(
-            "java/lang/reflect/AccessibleObject",
-            "setAccessible",
-            "(Z)V",
-            &[Value::Object(Some(ctor_now)), Value::Int(1)],
-        );
-
-        // Read the pinned constructor inputs back post-GC. The service Class is
-        // re-read from the pinned ServiceLoader for every constructor attempt
-        // below rather than being held raw across provider allocation/retries.
-        let type_final = ctx.read_native_pin(type_pin, type_class);
-        let ctor_final = ctx.read_native_pin(ctor_pin, ctor);
 
         // new ServiceLoader$ProviderImpl(service, type, ctor[, acc]) — the
         // classpath-flavour constructor (factoryMethod = null, acc = null).
@@ -1734,10 +2443,14 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // runs hit NoSuchMethodError on the 4-arg call, cascading into
         // "Log4j2 could not find a logging implementation"). Probe both and
         // remember which form this JDK has (0=unknown, 1=4-arg, 2=3-arg).
+        // Tag 3 is the `(Class, Class, Method)` factory form, which has no
+        // AccessControlContext variant and is never cached in `CTOR_FORM`.
         const CTOR_4ARG: &str =
             "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;Ljava/security/AccessControlContext;)V";
         const CTOR_3ARG: &str =
             "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;)V";
+        const FACTORY_3ARG: &str =
+            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Method;)V";
         static CTOR_FORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
         // Pick the ctor by *querying* which one ProviderImpl declares, rather
         // than invoke-and-catch. A failed invoke of the absent form emits a
@@ -1762,18 +2475,22 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         let mut ctor_err = None;
         // Forms to try: the queried one first; fall back to the other only if the
         // query was inconclusive (form==0) or the invoke unexpectedly fails.
-        let order: &[(u8, &str)] = match form {
-            2 => &[(2, CTOR_3ARG), (1, CTOR_4ARG)],
-            _ => &[(1, CTOR_4ARG), (2, CTOR_3ARG)],
+        let order: &[(u8, &str)] = if factory.is_some() {
+            &[(3, FACTORY_3ARG)]
+        } else {
+            match form {
+                2 => &[(2, CTOR_3ARG), (1, CTOR_4ARG)],
+                _ => &[(1, CTOR_4ARG), (2, CTOR_3ARG)],
+            }
         };
         for &(tag, desc) in order {
-            if form != 0 && tag != form {
+            if tag <= 2 && form != 0 && tag != form {
                 continue;
             }
             // Re-read pins: a failed prior attempt may have allocated (GC).
             let provider_now = ctx.read_native_pin(provider_pin, provider);
-            let type_now = ctx.read_native_pin(type_pin, type_final);
-            let ctor_now = ctx.read_native_pin(ctor_pin, ctor_final);
+            let type_now = ctx.read_native_pin(type_read_pin, type_read_orig);
+            let member_now = ctx.read_native_pin(member_pin, member_orig);
             let sl_now = ctx.read_native_pin(sl_pin, sl);
             let service = match ctx.get_field_by_name(sl_now, "service") {
                 v @ Value::Object(Some(_)) => v,
@@ -1783,14 +2500,16 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 Value::Object(Some(provider_now)),
                 service,
                 Value::Object(Some(type_now)),
-                Value::Object(Some(ctor_now)),
+                Value::Object(Some(member_now)),
             ];
             if tag == 1 {
                 args.push(Value::Object(None)); // acc = null
             }
             match ctx.invoke(PROVIDER_IMPL, "<init>", desc, &args) {
                 Ok(_) => {
-                    CTOR_FORM.store(tag, std::sync::atomic::Ordering::Relaxed);
+                    if tag <= 2 {
+                        CTOR_FORM.store(tag, std::sync::atomic::Ordering::Relaxed);
+                    }
                     ctor_ok = true;
                     break;
                 }

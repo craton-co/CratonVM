@@ -5,7 +5,7 @@
 > census the whole workspace against the declared inventory.
 >
 > The prompt for this lane carried a claim from
-> `docs/known-issues/c2/deep-research-vm-c2.md:19` — *"74 undeclared, including one
+> `docs/feature-designs/c2/deep-research-vm-c2.md:19` — *"74 undeclared, including one
 > that weakens a security control"*. That number is now **0 undeclared** under
 > the workspace guard, and the security-relevant one is named below.
 

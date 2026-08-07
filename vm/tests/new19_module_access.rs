@@ -320,9 +320,20 @@ fn new19_java_add_opens_grants_constructor_access() {
 
 #[ignore = "Class.getDeclaredMethods linkage gap in synthetic JDK (pre-existing)"]
 #[test]
-fn new19_java_allow_public_invoke_cross_module() {
+/// W6-8: this asserted `1` (allowed). That expectation is wrong against
+/// HotSpot 25. `setup_modules` re-homes `ModuleTarget` into `test.named`,
+/// declared with `exports: vec![]`, so package `cratonvm` is exported to
+/// nobody -- and `Reflection.verifyMemberAccess` runs `verifyModuleAccess`
+/// BEFORE its `Modifier.isPublic(modifiers)` shortcut, so a PUBLIC method of
+/// a public class in a non-exported package is still refused with
+/// `IllegalAccessException`. Measured on Temurin 25.0.3, identical shape:
+/// `Class.forName("jdk.internal.misc.VM").getMethod("isBooted").invoke(null)`
+/// -> IllegalAccessException "module java.base does not export
+/// jdk.internal.misc to unnamed module". `TckModule.allowPublicInvoke`
+/// returns 0 on any Throwable, so 0 IS the refusal.
+fn new19_java_public_invoke_cross_module_without_exports_is_refused() {
     require_classes!();
     let mut vm = test_vm();
     setup_modules(&mut vm, &[]);
-    assert_eq!(invoke_tck(&mut vm, "allowPublicInvoke"), 1);
+    assert_eq!(invoke_tck(&mut vm, "allowPublicInvoke"), 0);
 }
