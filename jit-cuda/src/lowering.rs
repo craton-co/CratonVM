@@ -1679,7 +1679,7 @@ mod tests {
         let m = lower_fixture_with_pool("EligibleLdcFloat", "fma", "([F[F)V");
         let text = m.render();
         assert!(text.contains(".visible .entry EligibleLdcFloat__fma_"));
-        let lit1 = format!("0f{:08X}", 3.14159265f32.to_bits());
+        let lit1 = format!("0f{:08X}", 3.141_592_7_f32.to_bits());
         let lit2 = format!("0f{:08X}", 1.5f32.to_bits());
         assert!(
             text.contains(&lit1),

@@ -3282,15 +3282,16 @@ pub mod vector_gate {
             // refuse — but a strict-alignment ISA would have to start at
             // `HEADER_SIZE % 16` bytes in. Pin the fact rather than the old
             // premise.
+            // ...and at HEADER_SIZE = 16 it contributes a multiple of 16
+            // again, so element ZERO is back to being 16-aligned on a base the
+            // caller can prove 16-aligned. The 24-byte header had broken that;
+            // this is the shrink handing it back, not a weakened assertion.
             assert_eq!(HEADER_SIZE % 8, 0);
+            assert_eq!(HEADER_SIZE % 16, 0);
             assert_eq!(
                 analyze_alignment(MemKind::Int, Some(0), 16, 16),
-                Alignment::Unknown,
-                "element zero cannot be 16-aligned while HEADER_SIZE % 16 != 0"
-            );
-            assert_eq!(
-                analyze_alignment(MemKind::Int, Some(0), PROVEN_OBJECT_ALIGNMENT, 16),
-                Alignment::Unknown
+                Alignment::Proven(16),
+                "element zero is 16-aligned again now that HEADER_SIZE % 16 == 0"
             );
             // ...and the first index that IS 16-aligned on a 16-aligned base
             // is `HEADER_SIZE % 16` bytes in, not index 0.

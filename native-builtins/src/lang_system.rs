@@ -1598,6 +1598,64 @@ pub(crate) fn is_vm_provided_jdk_library(name: &str) -> bool {
     EVERY_PLATFORM.contains(&name) || PLATFORM_ONLY.contains(&name)
 }
 
+/// Names HotSpot refuses NOT because the file is missing but because the BOOT
+/// loader already holds it (`UnsatisfiedLinkError: Native Library <path>
+/// already loaded in another classloader`). File presence cannot model that, so
+/// they are excluded from [`jdk_image_ships_library`] and keep throwing.
+///
+/// `zip` is the one the corpus pins: `RJdkJni.zipNatives()` runs immediately
+/// before `libraryLoading()`, so by the time the test asks, java.base has
+/// boot-loaded it and the HotSpot oracle prints `loadedLibrary=net`. Cold, with
+/// a directory classpath, `zip` LOADS on both platforms -- the exclusion is
+/// about the state that test creates, not about the image.
+const DYNAMIC_ALREADY_LOADED: &[&str] = &["zip"];
+
+/// Does the running JDK image ship `name` as a JNI library, in the directory
+/// the JDK loads its own from?
+///
+/// HotSpot decides this by FILE PRESENCE, not by an allowlist, so a hardcoded
+/// list can never keep up with it. MEASURED on the JDK 25.0.3 Linux x64 image,
+/// one cold `System.loadLibrary` per name from the app class loader:
+///
+///   LOADS : awt awt_xawt fontmanager javajpeg lcms jsound splashscreen
+///           freetype mlib_image jsig zip net nio management instrument
+///   THROWS: sunec, jvm, harfbuzz, and a made-up name -- none of which has a
+///           file (`libjvm.so` lives one level down in `lib/server`, which is
+///           on neither `java.library.path` nor `sun.boot.library.path`)
+///
+/// Every LOADS name has a `<java.home>/lib/lib<name>.so`; no THROWS name does.
+/// So the presence test reproduces the measured oracle exactly, and it covers
+/// the java.desktop libraries too, which [`is_vm_provided_jdk_library`] never
+/// listed.
+///
+/// `awt` is why this exists. Once `load_library_or_throw` began actually
+/// raising the `UnsatisfiedLinkError` it used to compute and drop,
+/// `java.awt.Toolkit.<clinit>` started dying on it -- and `Toolkit.<clinit>` is
+/// reached by merely CONSTRUCTING a `java.awt.event.ActionEvent`, on a VM that
+/// otherwise models AWT well enough to answer `HeadlessException` for
+/// `new java.awt.Button()` exactly as headless HotSpot does. H2
+/// `TestTools.testConsole` went from running for 8 minutes to dying in under a
+/// second on that one constructor.
+///
+/// Only a BARE name reaches here. `System.load("/abs/path/libfoo.so")` names a
+/// FILE, and a file that is not there is an error however it is spelled.
+fn jdk_image_ships_library(ctx: &dyn NativeContext, name: &str) -> bool {
+    if DYNAMIC_ALREADY_LOADED.contains(&name) {
+        return false;
+    }
+    let home = match ctx.get_system_property("java.home") {
+        Some(h) if !h.is_empty() => h,
+        _ => return false,
+    };
+    // The JDK image keeps its JNI libraries in `bin` on Windows and `lib`
+    // everywhere else; `platform_lib_name` supplies the decorated file name.
+    let dir = if cfg!(windows) { "bin" } else { "lib" };
+    std::path::Path::new(&home)
+        .join(dir)
+        .join(platform_lib_name(name))
+        .is_file()
+}
+
 /// Open a native library, or raise the `UnsatisfiedLinkError` the JDK
 /// specifies.
 ///
@@ -1635,6 +1693,14 @@ fn load_library_or_throw(
     // one; `System.load("/some/path/libzip.so")` names a FILE, and a file that
     // is not there is an error however it is spelled.
     if spelling == LibrarySpelling::BareName && is_vm_provided_jdk_library(requested) {
+        return Ok(None);
+    }
+    // Same reasoning, decided by measurement instead of by list: a library that
+    // SHIPS IN THE JDK IMAGE is one HotSpot loads, so refusing it here would be
+    // a divergence in the opposite direction from the one this function exists
+    // to fix. Restricted to the image directory on purpose -- a library the
+    // user put on `java.library.path` that we failed to open is a real failure.
+    if spelling == LibrarySpelling::BareName && jdk_image_ships_library(&*ctx, requested) {
         return Ok(None);
     }
     // NOT memoised as a failure: the JDK re-attempts the lookup on every call

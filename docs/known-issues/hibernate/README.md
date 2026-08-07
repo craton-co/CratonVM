@@ -252,6 +252,31 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 ## Open
 
+- **PostgreSQL SCRAM-SHA-256 auth fails** — `PBKDF2WithHmacSHA384
+  SecretKeyFactory not available` blocks any connection to a Postgres server
+  using its default `scram-sha-256` auth (worked around locally by
+  downgrading to `md5` auth so a real-Postgres suite run could proceed; the
+  underlying JCA gap is unfixed and would recur against any
+  scram-only-configured server). See
+  `postgres-scram-sha256-pbkdf2-hmacsha384-missing-20260807.md`.
+
+- **`-XX:+UseZGC` full-suite run (2026-08-06/07)** — `DefaultCatalogAndSchemaTest`
+  crashes via a **regression of the same-day JIT proxy-dispatch fix**: the
+  identical `AbstractMethodError` the fix targeted, but at a much higher
+  in-class rate (9/9 consecutive methods, not 3/132), cascading into a fatal
+  JUnit-internals exception that kills the process. Also a new
+  `ClassCastException: cratonvm.synthetic.AnonymousObject$3 cannot be cast to
+  [J` on `ZonedDateTimeTest` (5 failures across 4 methods). Zero HANGs,
+  otherwise clean (4445/4548). See `zgc-collector-fullsuite-crash-fails-20260806.md`.
+
+- **`-XX:+UseG1GC` full-suite run (2026-08-06)** — 3 native SIGSEGV crashes
+  sharing one faulting instruction address across independent process
+  launches (`OptimizerConcurrencyUnitTest`, `DefaultCatalogAndSchemaTest`,
+  `OffsetDateTimeTest`), 4 HANGs, 5 FAILs (most already-known default-collector
+  residuals recurring unchanged; one new, `JpaStreamTest`). None of these
+  reproduce under the default collector. See
+  `g1-collector-fullsuite-crashes-hangs-fails-20260806.md`.
+
 - ~~`SmokeTests#testQueryConcurrency` — 120 s JUnit timeout, "needs ~5.2x, gated
   on the tiered manager"~~ — **RETIRED 2026-08-05** to
   `../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.

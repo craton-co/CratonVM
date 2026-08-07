@@ -18,7 +18,8 @@ use std::sync::OnceLock;
 
 use crate::arena::Arena;
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    HEADER_SIZE, REF_ELEMENT_SIZE,
     SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
@@ -223,7 +224,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                  size {} (kind=0x{:02x}, num_slots={}, array_len={}); to_space.used()={}",
                 scan_cursor,
                 total_size,
-                header.kind as u8,
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                 header.num_slots(),
                 header.array_length(),
                 to_space.used(),
@@ -232,13 +233,13 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
         }
 
         // Scan all reference-containing slots
-        if header.kind == ObjectKind::Array {
+        if header.kind() == ObjectKind::Array {
             // Reference arrays use compact 8-byte pointer storage (REF_ELEMENT_SIZE).
-            if header.element_type == ArrayElementType::Reference {
+            if header.element_type() == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, so HEADER_SIZE + i * the reference
                     // element width is within the allocated object bounds.
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     // SAFETY: s_ptr points to a valid 8-byte reference slot in the array.
                     let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                     if raw != 0 {
@@ -432,8 +433,8 @@ fn try_forward_object(
     // the two single-byte tag reads at the fixed header offsets are
     // in-bounds; reading a raw `u8` has no validity requirement beyond
     // in-bounds-and-readable.
-    let kind_tag = unsafe { *old_ptr.add(cratonvm_types::OBJECT_KIND_OFFSET) };
-    let elem_tag = unsafe { *old_ptr.add(cratonvm_types::ARRAY_ELEMENT_TYPE_OFFSET) };
+    let kind_tag = unsafe { cratonvm_types::kind_tag_at(old_ptr) };
+    let elem_tag = unsafe { cratonvm_types::element_type_tag_at(old_ptr) };
     if cratonvm_types::object_kind_from_tag(kind_tag).is_none()
         || cratonvm_types::array_element_type_from_tag(elem_tag).is_none()
     {
@@ -461,15 +462,14 @@ fn try_forward_object(
         let h = old_header_ptr;
         let mut owned = ObjectHeader::new(
             std::ptr::addr_of!((*h).class_id).read(),
-            std::ptr::addr_of!((*h).kind).read(),
-            std::ptr::addr_of!((*h).element_type).read(),
-            std::ptr::addr_of!((*h).identity_hash_code).read(),
+            (*h).kind(),
+            (*h).element_type(),
             0,
             0,
         );
         owned.shape = std::ptr::addr_of!((*h).shape).read();
-        owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
-        owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
+        owned.set_gc_age((*h).gc_age());
+        owned.set_gc_flags((*h).gc_flags());
         // `mark_word` is an `AtomicU64`: read it through an atomic load.
         owned.mark_word.store(
             (*h).mark_word.load(std::sync::atomic::Ordering::Relaxed),
@@ -491,7 +491,7 @@ fn try_forward_object(
                  num_slots={}, array_len={}) — corrupt header, refusing to copy",
                 total_size,
                 old_ptr,
-                header_copy.kind,
+                header_copy.kind(),
                 header_copy.num_slots(),
                 header_copy.array_length(),
             ),
@@ -596,9 +596,9 @@ fn try_forward_object(
 /// This does not mask genuine bugs silently — the corruption is logged — but
 /// it converts a hard process abort into a recoverable / fail-safe path.
 pub fn object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+    if header.kind() == ObjectKind::Array {
+        match array_data_size(header.array_length() as usize, header.element_type()) {
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
                 // caller's `total_size < HEADER_SIZE` guard fires (matching the
@@ -607,7 +607,7 @@ pub fn object_total_size(header: &ObjectHeader) -> usize {
                     "gc: implausible array_length {} (element_type={:?}) in moving-collector \
                      object header — treating as corrupt; caller will skip/stop the walk",
                     header.array_length(),
-                    header.element_type,
+                    header.element_type(),
                 );
                 0
             }
@@ -696,7 +696,7 @@ pub fn collect_with_finalizers(
                  object size {} (kind=0x{:02x}, num_slots={}, array_len={}); to_space.used()={}",
                 scan_cursor,
                 total_size,
-                header.kind as u8,
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                 header.num_slots(),
                 header.array_length(),
                 to_space.used(),
@@ -704,10 +704,10 @@ pub fn collect_with_finalizers(
             break;
         }
 
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
@@ -865,7 +865,7 @@ pub fn collect_with_finalizers(
                      to_space.used()={}",
                     scan_cursor,
                     total_size,
-                    header.kind as u8,
+                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                     header.num_slots(),
                     header.array_length(),
                     to_space.used(),
@@ -874,10 +874,10 @@ pub fn collect_with_finalizers(
                 break;
             }
 
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
+            if header.kind() == ObjectKind::Array {
+                if header.element_type() == ArrayElementType::Reference {
                     for i in 0..header.array_length() as usize {
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                        let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                         let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
@@ -1192,7 +1192,7 @@ mod tests {
         // Check the array's first element points to the copied elem
         // Reference array elements are stored as compact 8-byte pointers (REF_ELEMENT_SIZE).
         let new_arr = roots[0];
-        let slot0_ptr = unsafe { new_arr.as_ptr().add(HEADER_SIZE) };
+        let slot0_ptr = unsafe { new_arr.as_ptr().add(ARRAY_DATA_OFFSET) };
         let raw: u64 = unsafe { std::ptr::read(slot0_ptr as *const u64) };
         assert_ne!(raw, 0, "Expected array[0] to be a non-null reference");
         let new_elem = unsafe { ObjectRef::from_raw(raw as usize as *mut u8) };

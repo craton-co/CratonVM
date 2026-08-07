@@ -5,7 +5,7 @@
 
 use cratonvm_types::{
     CompactValue, ObjectHeader, ObjectRef, RawSlot, Value, HEADER_SIZE,
-    IDENTITY_HASH_CODE_OFFSET, MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
+    MARK_WORD_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
 
 fn row(name: &str, value: usize) {
@@ -29,7 +29,6 @@ fn main() {
     row("SLOT_SIZE", SLOT_SIZE);
     row("REF_FIELD_SIZE", REF_FIELD_SIZE);
     row("REF_ELEMENT_SIZE", REF_ELEMENT_SIZE);
-    row("IDENTITY_HASH_CODE_OFFSET", IDENTITY_HASH_CODE_OFFSET);
     // `FORWARDING_PTR_OFFSET` was deleted with the `forwarding_ptr` field in
     // `3046fd490` — the mark word has encoded relocation itself since
     // 2026-07-26, so the header carried two mechanisms and one was dead

@@ -1,5 +1,10 @@
 # Header 24 → 16, and where the object bloat actually is
 
+> **LANDED 2026-08-07 — `HEADER_SIZE = 16`.** The header is `class_id`(0..4) +
+> `shape`(4..8) + `mark_word`(8..16). §2's arithmetic below is what ruled the
+> option space; the route actually taken is the one §2.1 did **not** pick, and
+> §2.3's cost estimate was wrong in an instructive way. Both corrected in §4.
+
 *Continues `header-shrink.md`, which planned and landed 32 → 24. That document's
 §3 ("Why 16 is blocked") and §5 ("Per-object savings") are both **superseded**
 here: §3 named the wrong blocker, and §5's arithmetic for compact bodies was
@@ -213,3 +218,58 @@ in release. HotSpot reaches 12 (8 mark + 4 compressed klass) because its object
 fields pack at 4-byte alignment and array data starts at 16. CratonVM's body is
 qword-indexed throughout, so 12 requires redoing the **body** model first, not
 the header.
+
+
+---
+
+## 4. What actually landed, and where §2 was wrong
+
+§2.1 proposed packing `shape` into 19 bits alongside the quartet at offset 4,
+pushing an array's length into a body prefix. That was rejected on execution:
+it leaves **arrays at 24 bytes** and buys the shrink only for non-arrays.
+
+The route taken inverts it. `shape` keeps its full 32 bits at offset 4, and the
+13-bit quartet moves into the **mark word** instead — bits 48..62, free in all
+four states because `plausible_heap_pointer` caps every pointer at `2^47 - 1`.
+So every heap object loses 8 bytes, arrays included.
+
+§2.3 counted ~860 `HEADER_SIZE` sites as "the dangerous number" and predicted
+the object-body-vs-array-data split would be the hard part. It was not. That
+split had already been made safe by `ARRAY_DATA_OFFSET` plus the perturbation
+control, and at `HEADER_SIZE = 16` with the length staying in the header,
+`ARRAY_DATA_OFFSET == HEADER_SIZE` again — the split cost nothing in the end.
+
+The real cost was the ~690 quartet field accesses, which §2.3 listed almost in
+passing. Those were converted by driving `rustc`'s own E0615 spans rather than
+by pattern: `.kind` matches a dozen unrelated types, and a textual sweep would
+have silently rewritten them. Two things that a sweep *did* get wrong, both
+caught by guards rather than by review:
+
+* `header.kind() as u8` is not the raw byte read it replaced. The typed
+  accessor coerces the one unmapped tag to `Object` — the exact coercion the
+  plausibility screens exist to prevent. They use `kind_tag` now.
+* the quartet-zeroing **dword** store in the inline TLAB emitter followed its
+  offset to byte 14, where it writes 14..18 — two bytes past the header, into
+  the object body.
+
+### 4.1 Two guards that had quietly become unable to fail
+
+Worth recording because neither was found by a failing assertion, but by asking
+what the assertion could still reject:
+
+* `gc_flags` packed to exactly its three defined bits leaves no *undefined* bit,
+  so `header_reserved_fields_plausible` — which rejects a header carrying one —
+  could never fail again. It is four bits wide; the spare one is the guard.
+* `try_thin_lock` CASed from the literal `MARK_NEUTRAL`. With the quartet in the
+  word, an unlocked `int[]` is not zero, so that CAS would have failed forever
+  and **every array lock would have inflated a monitor**. Masking the quartet
+  out restores the test and keeps what the literal was silently providing: a
+  hashed word still has non-zero bits outside the quartet, so a hashed object
+  still cannot thin-lock.
+
+### 4.2 One thing the shrink handed back
+
+At 16, `HEADER_SIZE % 16 == 0` again, so array element zero is 16-aligned on a
+16-aligned base. The 24-byte header had broken that, and
+`element_zero_alignment_is_not_provable_at_the_current_object_alignment` existed
+to pin the loss. It now pins the recovery.

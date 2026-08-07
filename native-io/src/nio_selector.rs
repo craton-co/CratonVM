@@ -447,6 +447,9 @@ impl SelectorState {
             // when empty.
             loop {
                 let n =
+                    // SAFETY: `rfd` is this selector's own non-blocking pipe read end,
+                    // live until `close_selector` takes it; `buf` is a stack array and the
+                    // length passed is its own. Draining stops on -1/EAGAIN.
                     unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
                 if n <= 0 {
                     break;
@@ -471,9 +474,13 @@ fn release_closed_selector_handles(st: &mut SelectorState) {
             unsafe { libc::close(efd) };
         }
         if let Some(rfd) = st.wakeup_pipe_read.take() {
+            // SAFETY: `rfd` was this selector's own pipe read end and has just
+            // been `take`n, so nothing else can close or observe it again.
             unsafe { libc::close(rfd) };
         }
         if let Some(wfd) = st.wakeup_pipe_write.take() {
+            // SAFETY: `wfd` was this selector's own pipe write end and has just
+            // been `take`n, so nothing else can close or observe it again.
             unsafe { libc::close(wfd) };
         }
     }
@@ -711,6 +718,9 @@ pub fn selector_register(
                 // dropped — fall back to ADD.
                 let rc = unsafe { libc::epoll_ctl(efd, op, os as libc::c_int, &mut ev) };
                 if rc < 0 && op == libc::EPOLL_CTL_MOD {
+                    // SAFETY: same three operands as the `epoll_ctl` above, which is why
+                    // this retry is reachable at all -- `efd` is the selector's epoll fd,
+                    // `os` the registered socket fd, and `ev` a live local.
                     let _ = unsafe {
                         libc::epoll_ctl(efd, libc::EPOLL_CTL_ADD, os as libc::c_int, &mut ev)
                     };
@@ -817,6 +827,9 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
         if st.in_flight_selects != 0 {
             if let Some(wfd) = st.wakeup_pipe_write {
                 let byte: u8 = b'I';
+                // SAFETY: `wfd` is this selector's own pipe write end, held live by
+                // `st`; the pointer is to a one-byte stack local and the length says
+                // one byte.
                 let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
             }
         }
@@ -1052,6 +1065,9 @@ fn kernel_select_linux(id: i32, timeout_ms: i32) -> Result<i32, MethodCallFailed
     }
 
     // Phase 2: epoll_wait without any selector lock held.
+    // SAFETY: `epoll_event` is a `#[repr(C)]` POD (a `u32` and a union of
+    // integers), so the all-zero bit pattern is a valid value for every
+    // element; the kernel overwrites the first `n` of them below.
     let mut events: [libc::epoll_event; 64] = unsafe { std::mem::zeroed() };
     // SAFETY: efd is valid; events buffer is sized correctly.
     let n = unsafe {
@@ -2224,10 +2240,15 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
                     events: linux_events_for(interest_ops, is_listener) as u32,
                     u64: new_fd as u64,
                 };
+                // SAFETY: `efd` is the selector's epoll fd, `os` the socket fd being
+                // re-registered under its new key, and `ev` a live local whose
+                // lifetime spans the call.
                 let rc = unsafe {
                     libc::epoll_ctl(efd, libc::EPOLL_CTL_ADD, os as libc::c_int, &mut ev)
                 };
                 if rc < 0 {
+                    // SAFETY: identical operands to the ADD above; only the opcode
+                    // differs, for the case where the fd was already registered.
                     let _ = unsafe {
                         libc::epoll_ctl(efd, libc::EPOLL_CTL_MOD, os as libc::c_int, &mut ev)
                     };
@@ -3203,6 +3224,9 @@ fn ioutil_fdval_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 fn eventfd0_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: `eventfd` takes an initial count and a flag word and
+        // touches no caller memory; a failure is reported as -1, checked
+        // immediately below.
         let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if fd < 0 {
             return Err(ioex(format!(
@@ -3226,6 +3250,10 @@ fn eventfd_set0_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             _ => return Ok(Some(Value::Int(-1))),
         };
         let value: u64 = 1;
+        // SAFETY: the pointer is to a `u64` stack local and the length is
+        // that type's own size, which is the write width an eventfd requires.
+        // `fd` comes from the caller; a bad one fails with -1 rather than
+        // touching memory.
         let rc = unsafe {
             libc::write(
                 fd,
@@ -3259,6 +3287,10 @@ fn ioutil_drain_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut drained = false;
         loop {
             let mut value: u64 = 0;
+            // SAFETY: the pointer is to a `u64` stack local and the length is
+            // that type's own size, which is the read width an eventfd requires.
+            // `fd` comes from the caller; a bad one fails with -1 rather than
+            // touching memory.
             let rc = unsafe {
                 libc::read(
                     fd,
@@ -3297,6 +3329,10 @@ fn fd_close_int_fd_native(_ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             _ => return Ok(None),
         };
         if fd >= 0 {
+            // SAFETY: `close` takes an integer fd and touches no caller memory.
+            // The fd comes from the caller, so this can close a descriptor the
+            // caller still holds -- that is the documented contract of
+            // `closeIntFD`, not a memory-safety property.
             let rc = unsafe { libc::close(fd) };
             if rc < 0 {
                 return Err(ioex(format!(
@@ -3336,6 +3372,10 @@ fn epoll_data_offset_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
     {
         let event = std::mem::MaybeUninit::<libc::epoll_event>::uninit();
         let base = event.as_ptr();
+        // SAFETY: `addr_of!` computes a field address without reading it, so
+        // the uninitialised backing store is never loaded; both addresses are
+        // derived from the same live `MaybeUninit`, which is what makes their
+        // difference the field's offset.
         let offset = unsafe {
             let data = std::ptr::addr_of!((*base).u64);
             data as usize - base as usize

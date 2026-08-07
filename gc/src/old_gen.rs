@@ -33,8 +33,9 @@ use std::collections::HashMap;
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_MARKED, HEADER_SIZE,
-    OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE,
+    ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, GC_FLAG_MARKED,
+    HEADER_SIZE,
+    REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::{ObjectRef, Value};
@@ -842,8 +843,8 @@ impl OldGen {
         // through a raw pointer has no validity requirement beyond
         // in-bounds-and-readable, so this cannot itself be the UB the rest of
         // this function exists to avoid.
-        let kind_tag = unsafe { *ptr.add(OBJECT_KIND_OFFSET) };
-        let elem_tag = unsafe { *ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        let kind_tag = unsafe { cratonvm_types::kind_tag_at(ptr) };
+        let elem_tag = unsafe { cratonvm_types::element_type_tag_at(ptr) };
         let kind = object_kind_from_tag(kind_tag);
         let element_type = array_element_type_from_tag(elem_tag);
         match (kind, element_type) {
@@ -918,8 +919,8 @@ impl OldGen {
                 break;
             }
             let raw_size = if kind == ObjectKind::Array {
-                HEADER_SIZE
-                    + array_data_size(header.array_length() as usize, header.element_type)
+                ARRAY_DATA_OFFSET
+                    + array_data_size(header.array_length() as usize, header.element_type())
                         .expect("array_data_size overflow in old_gen scan")
             } else {
                 // Compact reference-field layout: a promoted compact object's body
@@ -980,8 +981,8 @@ impl OldGen {
                 break;
             }
             let raw_size = if kind == ObjectKind::Array {
-                HEADER_SIZE
-                    + array_data_size(header.array_length() as usize, header.element_type)
+                ARRAY_DATA_OFFSET
+                    + array_data_size(header.array_length() as usize, header.element_type())
                         .expect("array_data_size overflow in old_gen scan")
             } else {
                 // Compact reference-field layout: honour the per-object
@@ -1010,8 +1011,8 @@ impl OldGen {
                         end_offset,
                         total_size,
                         raw_size,
-                        kind = header.kind as u8,
-                        element_type = header.element_type as u8,
+                        kind = ObjectHeader::kind_tag(header.mark_word.load(std::sync::atomic::Ordering::Relaxed)),
+                        element_type = header.element_type() as u8,
                         array_length = header.array_length(),
                         num_slots = header.num_slots(),
                         bytes = ?raw_bytes,
@@ -1122,7 +1123,7 @@ impl OldGen {
             for &(obj_ptr, _size) in &objects {
                 // SAFETY: `walk_objects` yielded this as a valid object start.
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
-                header.gc_flags &= !GC_FLAG_MARKED;
+                header.clear_gc_flags(GC_FLAG_MARKED);
             }
             return cratonvm_types::PointerMap::default();
         }
@@ -1174,7 +1175,7 @@ impl OldGen {
             for &(obj_ptr, _size) in &objects {
                 // SAFETY: `walk_objects` yielded this as a valid object start.
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
-                header.gc_flags &= !GC_FLAG_MARKED;
+                header.clear_gc_flags(GC_FLAG_MARKED);
             }
             return cratonvm_types::PointerMap::default();
         }
@@ -1200,7 +1201,7 @@ impl OldGen {
 
         for &(obj_ptr, total_size) in &objects {
             let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
-            if header.gc_flags & GC_FLAG_MARKED == 0 {
+            if header.gc_flags() & GC_FLAG_MARKED == 0 {
                 // H2-CID0 (2026-08-01): remember what this address held before
                 // compaction drops it. The storage either ends up under a slid
                 // survivor or inside the zeroed tail Phase 4 writes, and in the
@@ -1212,7 +1213,7 @@ impl OldGen {
                     obj_ptr as usize,
                     total_size,
                     header.class_id.as_u32(),
-                    header.kind as u8,
+                    ObjectHeader::kind_tag(header.mark_word.load(std::sync::atomic::Ordering::Relaxed)),
                     crate::gen_heap::OLD_FREED_SITE_COMPACT,
                     drop_flags.get(&(obj_ptr as usize)).copied().unwrap_or(0),
                 );
@@ -1276,7 +1277,7 @@ impl OldGen {
             final_header
                 .mark_word
                 .store(saved_mark, std::sync::atomic::Ordering::Relaxed);
-            final_header.gc_flags &= !GC_FLAG_MARKED;
+            final_header.clear_gc_flags(GC_FLAG_MARKED);
         }
 
         // Phase 4: Rebuild free list — one contiguous block at the end.
@@ -1358,8 +1359,8 @@ impl OldGen {
         let (kind, element_type, array_length, num_slots, is_compact, compact) = unsafe {
             let h = &*(obj_ptr as *const ObjectHeader);
             (
-                h.kind,
-                h.element_type,
+                h.kind(),
+                h.element_type(),
                 h.array_length(),
                 h.num_slots(),
                 crate::is_compact_object(h),
@@ -1374,7 +1375,7 @@ impl OldGen {
                 let max_elems = body_bytes / ref_element_size();
                 let elems = (array_length as usize).min(max_elems);
                 for i in 0..elems {
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let slot = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     let raw: u64 = unsafe { read_ref_slot(slot) };
                     if raw != 0 {
                         let ref_ptr = raw as usize;
@@ -1471,7 +1472,7 @@ impl OldGen {
     ///   region, dropping every object after it in that region.
     ///
     /// The pre-fix code responded to both by blindly `|=`-ing `GC_FLAG_MARKED`
-    /// into `ref_ptr + GC_FLAGS_OFFSET` — an unvalidated byte inside a free
+    /// into `ref_ptr + cratonvm_types::GC_FLAGS_BYTE_OFFSET` — an unvalidated byte inside a free
     /// block or another object's payload — and then Phase 1, which iterates
     /// only `objects`, gave that address no forwarding pointer. Phase 2 leaves
     /// the referrer's slot on the pre-compaction address, and Phase 3 slides a
@@ -1514,7 +1515,7 @@ impl OldGen {
                 // Snapshot the marked bit; don't hold a header borrow while the
                 // closure below may write the same header (self-loop case).
                 let is_marked =
-                    unsafe { (*(obj_ptr as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0 };
+                    unsafe { (*(obj_ptr as *const ObjectHeader)).gc_flags() & GC_FLAG_MARKED != 0 };
                 if !is_marked {
                     continue; // only trace *live* referrers
                 }
@@ -1537,8 +1538,8 @@ impl OldGen {
                     // were copied out before the walk), so the `&mut` does not
                     // alias.
                     let ref_header = unsafe { &mut *(ref_ptr as *mut ObjectHeader) };
-                    if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                        ref_header.gc_flags |= GC_FLAG_MARKED;
+                    if ref_header.gc_flags() & GC_FLAG_MARKED == 0 {
+                        ref_header.add_gc_flags(GC_FLAG_MARKED);
                         promoted_any = true;
                         promoted_total += 1;
                     }
@@ -1632,7 +1633,7 @@ impl OldGen {
                             header.class_id.as_u32(),
                             r,
                             ref_header.class_id.as_u32(),
-                            ref_header.gc_flags & GC_FLAG_MARKED != 0,
+                            ref_header.gc_flags() & GC_FLAG_MARKED != 0,
                             ref_header.forwarding_address() as usize,
                         );
                     }
@@ -1727,7 +1728,6 @@ mod tests {
                         cratonvm_types::ClassId::new(1),
                         ObjectKind::Object,
                         ArrayElementType::Reference,
-                        i as i32,
                         0,
                         slots,
                     ),
@@ -2112,11 +2112,11 @@ mod tests {
 
         // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
         // 2=HumongousFiller).
-        // SAFETY: `p2 + OBJECT_KIND_OFFSET` is the `kind` byte of a live
+        // SAFETY: `p2 + cratonvm_types::KIND_TAGS_BYTE_OFFSET` is the `kind` byte of a live
         // allocation from this OldGen; writing a raw `u8` there does not
         // require the resulting value to be a valid `ObjectKind`.
         unsafe {
-            std::ptr::write(p2.add(OBJECT_KIND_OFFSET), 0xFFu8);
+            std::ptr::write(p2.add(cratonvm_types::KIND_TAGS_BYTE_OFFSET), 0xFFu8);
         }
 
         let before = WALK_DESYNC_HITS.load(std::sync::atomic::Ordering::Relaxed);
@@ -2167,14 +2167,14 @@ mod tests {
             // A is live, references B in field 0.
             let a_hdr = &mut *(a as *mut ObjectHeader);
             a_hdr.set_num_slots(1);
-            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            a_hdr.add_gc_flags(GC_FLAG_MARKED);
             let a_field0 = a.add(HEADER_SIZE) as *mut Value;
             std::ptr::write(a_field0, Value::Object(Some(ObjectRef::from_raw(b))));
 
             // B is left UNMARKED (would be floating garbage without the guard).
             let b_hdr = &mut *(b as *mut ObjectHeader);
             b_hdr.set_num_slots(1);
-            b_hdr.identity_hash_code = B_TAG;
+            b_hdr.mark_word.store(ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, B_TAG), std::sync::atomic::Ordering::Relaxed);
         }
 
         let map = og.compact();
@@ -2202,12 +2202,12 @@ mod tests {
             // proving we did not leave the slot pointing at zeroed memory.
             let b_hdr = &*(b_new as *const ObjectHeader);
             assert_eq!(
-                b_hdr.identity_hash_code, B_TAG,
+                ObjectHeader::neutral_hash(b_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)), B_TAG,
                 "B data lost across compaction"
             );
             // GC metadata cleared on the survivor.
             assert!(!b_hdr.is_forwarded());
-            assert_eq!(b_hdr.gc_flags & GC_FLAG_MARKED, 0);
+            assert_eq!(b_hdr.gc_flags() & GC_FLAG_MARKED, 0);
         }
     }
 
@@ -2295,7 +2295,7 @@ mod tests {
 
             let a_hdr = &mut *(a as *mut ObjectHeader);
             a_hdr.set_num_slots(1);
-            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            a_hdr.add_gc_flags(GC_FLAG_MARKED);
             std::ptr::write(
                 a.add(HEADER_SIZE) as *mut Value,
                 Value::Object(Some(ObjectRef::from_raw(b))),
@@ -2305,8 +2305,8 @@ mod tests {
 
             let c_hdr = &mut *(c as *mut ObjectHeader);
             c_hdr.set_num_slots(1);
-            c_hdr.gc_flags |= GC_FLAG_MARKED;
-            c_hdr.identity_hash_code = C_TAG;
+            c_hdr.add_gc_flags(GC_FLAG_MARKED);
+            c_hdr.mark_word.store(ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, C_TAG), std::sync::atomic::Ordering::Relaxed);
         }
 
         // Return B's block to the free list WITHOUT zeroing it — the exact
@@ -2350,8 +2350,8 @@ mod tests {
             // C did not slide over the filler, and its mark bit was cleared so
             // the next cycle starts from a clean slate.
             let c_hdr = &*(c as *const ObjectHeader);
-            assert_eq!(c_hdr.identity_hash_code, C_TAG, "C must not have moved");
-            assert_eq!(c_hdr.gc_flags & GC_FLAG_MARKED, 0, "marks must be cleared");
+            assert_eq!(ObjectHeader::neutral_hash(c_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)), C_TAG, "C must not have moved");
+            assert_eq!(c_hdr.gc_flags() & GC_FLAG_MARKED, 0, "marks must be cleared");
             assert!(!c_hdr.is_forwarded());
         }
     }
@@ -2376,7 +2376,7 @@ mod tests {
         unsafe {
             let a_hdr = &mut *(a as *mut ObjectHeader);
             a_hdr.set_num_slots(1);
-            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            a_hdr.add_gc_flags(GC_FLAG_MARKED);
         }
 
         // Object B: also stays in place (contiguous with A, nothing to
@@ -2386,7 +2386,7 @@ mod tests {
         unsafe {
             let b_hdr = &mut *(b as *mut ObjectHeader);
             b_hdr.set_num_slots(1);
-            b_hdr.gc_flags |= GC_FLAG_MARKED;
+            b_hdr.add_gc_flags(GC_FLAG_MARKED);
         }
 
         crate::gc_quiescence::set_watched_referents(&[a as usize]);
@@ -2433,7 +2433,7 @@ mod tests {
         unsafe {
             let a_hdr = &mut *(a as *mut ObjectHeader);
             a_hdr.set_num_slots(1);
-            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            a_hdr.add_gc_flags(GC_FLAG_MARKED);
             std::ptr::write(
                 a.add(HEADER_SIZE) as *mut Value,
                 Value::Object(Some(ObjectRef::from_raw(b))),
@@ -2457,12 +2457,12 @@ mod tests {
         // SAFETY: nothing moved; both pointers still name their object.
         unsafe {
             assert_ne!(
-                (*(b as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED,
+                (*(b as *const ObjectHeader)).gc_flags() & GC_FLAG_MARKED,
                 0,
                 "an unmarked object a LIVE object references must be retained",
             );
             assert_eq!(
-                (*(c as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED,
+                (*(c as *const ObjectHeader)).gc_flags() & GC_FLAG_MARKED,
                 0,
                 "POSITIVE CONTROL: unreferenced garbage must stay dead, or the \
                  sweep this feeds would stop reclaiming anything at all",
@@ -2491,7 +2491,7 @@ mod tests {
         unsafe {
             let a_hdr = &mut *(a as *mut ObjectHeader);
             a_hdr.set_num_slots(1);
-            a_hdr.gc_flags |= GC_FLAG_MARKED;
+            a_hdr.add_gc_flags(GC_FLAG_MARKED);
             std::ptr::write(
                 a.add(HEADER_SIZE) as *mut Value,
                 Value::Object(Some(ObjectRef::from_raw(b))),
@@ -2512,7 +2512,7 @@ mod tests {
         // SAFETY: `b`'s block is unallocated but still mapped inside `og`.
         unsafe {
             assert_eq!(
-                (*(b as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED,
+                (*(b as *const ObjectHeader)).gc_flags() & GC_FLAG_MARKED,
                 0,
                 "the closure must NOT write a mark bit into a free block",
             );

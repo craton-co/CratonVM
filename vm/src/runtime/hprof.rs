@@ -375,9 +375,9 @@ impl<'a> HprofDumper<'a> {
             let obj = unsafe { ObjectRef::from_raw(*ptr) };
             let header = self.vm.mem.heap.get_header(obj);
 
-            match header.kind {
+            match header.kind() {
                 ObjectKind::Object => self.write_instance_dump_with_values(&mut seg, obj),
-                ObjectKind::Array => match header.element_type {
+                ObjectKind::Array => match header.element_type() {
                     ArrayElementType::Reference => self.write_obj_array_dump(&mut seg, obj),
                     _ => self.write_prim_array_dump(&mut seg, obj),
                 },
@@ -584,7 +584,7 @@ impl<'a> HprofDumper<'a> {
     fn write_prim_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
         let header = self.vm.mem.heap.get_header(obj);
         let length = header.array_length() as usize;
-        let elem_type = header.element_type;
+        let elem_type = header.element_type();
         let hprof_type = array_element_to_hprof(elem_type);
 
         seg.push_u8(GC_PRIM_ARRAY_DUMP);
@@ -796,10 +796,10 @@ fn count_instance_fields(class_id: ClassId, store: &cratonvm_classloading::Class
 ///      header, so MAT's "shallow size" column was already understated by a
 ///      header's worth for every object in the dump.
 ///   2. CratonVM does not use HotSpot's packed layout. Every object carries a
-///      32-byte header ([`cratonvm_types::HEADER_SIZE`]) and every instance
+///      16-byte header ([`cratonvm_types::HEADER_SIZE`]) and every instance
 ///      field — `boolean` included — occupies a 16-byte slot
 ///      ([`cratonvm_types::SLOT_SIZE`]). A class with eight `boolean` fields
-///      was reported as 8 bytes when it really occupies 160. An operator
+///      was reported as 8 bytes when it really occupies 144. An operator
 ///      chasing a leak sized the wrong objects by more than an order of
 ///      magnitude.
 ///
@@ -1057,11 +1057,14 @@ mod tests {
         // regardless of the fields' Java widths.
         let header = cratonvm_types::HEADER_SIZE;
         let slot = cratonvm_types::SLOT_SIZE;
-        // 32 until the 2026-08-06 shrink folded `forwarding_ptr` into the mark
-        // word. The tripwire did its job — it named the doc that had to move
-        // with it — so it keeps its literal rather than becoming self-proving.
+        // 32 -> 24 when `forwarding_ptr` folded into the mark word, 24 -> 16
+        // when the identity hash followed it and the kind/element_type/gc_age/
+        // gc_flags quartet joined them in the mark word's bits 48..62. The
+        // tripwire has now done its job twice — each time naming the dumper
+        // doc above that had to move with it — so it keeps its literal rather
+        // than becoming self-proving.
         assert_eq!(
-            header, 24,
+            header, 16,
             "object header size changed; update the dumper doc"
         );
         assert_eq!(slot, 16, "field slot size changed; update the dumper doc");

@@ -1214,7 +1214,7 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
             break;
         }
         let hdr = unsafe { &*(ptr as *const ObjectHeader) };
-        if hdr.kind != ObjectKind::Object {
+        if hdr.kind() != ObjectKind::Object {
             continue;
         }
         let cid = hdr.class_id;
@@ -1265,7 +1265,7 @@ pub fn verify_heap_object_fields(
 ) {
     use crate::types::Value;
     use cratonvm_types::{
-        ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+        ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE,
     };
 
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
@@ -1314,7 +1314,7 @@ pub fn verify_heap_object_fields(
         }
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
-            && h.identity_hash_code == 0
+            && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
             && h.num_slots() == 0
             && h.array_length() == 0
         {
@@ -1328,7 +1328,7 @@ pub fn verify_heap_object_fields(
         }
         let hdr = unsafe { &*(ptr as *const ObjectHeader) };
         let r_cid = hdr.class_id;
-        if hdr.kind == ObjectKind::Object {
+        if hdr.kind() == ObjectKind::Object {
             let referrer = unsafe { ObjectRef::from_raw(ptr) };
             let nf = heap.num_fields(referrer);
             for i in 0..nf {
@@ -1348,11 +1348,11 @@ pub fn verify_heap_object_fields(
                     }
                 }
             }
-        } else if hdr.kind == ObjectKind::Array && hdr.element_type == ArrayElementType::Reference {
+        } else if hdr.kind() == ObjectKind::Array && hdr.element_type() == ArrayElementType::Reference {
             // Reference array (Object[]): elements are 8-byte compact pointers.
             let len = hdr.array_length() as usize;
             for i in 0..len {
-                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * ref_element_size()) };
+                let s_ptr = unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                 let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
                     eprintln!(
@@ -1412,7 +1412,7 @@ pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
         // the header bytes are readable.
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
-            && h.identity_hash_code == 0
+            && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
             && h.num_slots() == 0
             && h.array_length() == 0
         {
@@ -1545,14 +1545,14 @@ fn verify_no_stale_refs(
                     // an opt-in debug path.
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
-                        && h.identity_hash_code == 0
+                        && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
                         && h.num_slots() == 0
                         && h.array_length() == 0
                     {
                         eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, li, frame.pc, addr, h.kind, h.gc_flags,
+                            fi, cname, mname, li, frame.pc, addr, h.kind(), h.gc_flags(),
                         );
                     }
                 }
@@ -1601,14 +1601,14 @@ fn verify_no_stale_refs(
                     // SAFETY: see locals comment above.
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
-                        && h.identity_hash_code == 0
+                        && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
                         && h.num_slots() == 0
                         && h.array_length() == 0
                     {
                         eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
-                            fi, cname, mname, si, frame.pc, addr, h.kind, h.gc_flags,
+                            fi, cname, mname, si, frame.pc, addr, h.kind(), h.gc_flags(),
                         );
                     }
                 }

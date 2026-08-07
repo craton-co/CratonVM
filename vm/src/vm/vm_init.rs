@@ -8571,8 +8571,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
                 HprofObjectInfo {
                     object_id: ptr as u64,
                     class_id: header.class_id.as_u32(),
-                    is_array: header.kind == ObjectKind::Array,
-                    element_type: header.element_type as u8,
+                    is_array: header.kind() == ObjectKind::Array,
+                    element_type: header.element_type() as u8,
                     array_length: header.array_length(),
                     total_size: size,
                     data_ptr: ptr as *const u8,
