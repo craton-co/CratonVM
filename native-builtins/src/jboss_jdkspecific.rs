@@ -327,7 +327,175 @@ fn build_boot_layer(
         memo.insert(vm, handle);
     }
     drop(memo);
+    populate_boot_layer_modules(ctx, layer)?;
     Ok(layer)
+}
+
+/// Insert every registered module into the boot layer's `nameToModule` map and
+/// `modules` set.
+///
+/// # Why this exists
+///
+/// The layer above is allocated with a freshly created, EMPTY `HashMap` and
+/// nothing ever added to it — `build_module` sets the module's `layer` but the
+/// back-edge was never written. That is invisible for most of `ModuleLayer`'s
+/// surface, because CratonVM answers `findModule`, `getDescriptor` and the rest
+/// from its own `ModuleRegistry` rather than from the map. It is NOT invisible
+/// to services.
+///
+/// Real `ModuleLayer.getServicesCatalog()` self-populates: when the field is
+/// null it calls `ServicesCatalog.create()` and loops `nameToModule.values()`
+/// calling `catalog.register(m)`, which reads `m.getDescriptor().provides()`.
+/// Over an empty map that produces an empty catalog, and `ServiceLoader` reads
+/// providers from the catalog ONLY — never from a descriptor directly. So
+/// `ServiceLoader.load(layer, Service.class)` found nothing:
+/// `regression-suite/src/RJdkModule.java` failed with
+/// `AssertionError: module service providers: []` under `--jdk-only`, where the
+/// real `java.util.ServiceLoader` bytecode runs because the ServiceLoader
+/// natives are `NativeKind::SyntheticStub` and strict mode refuses them at
+/// registration. Diagnosis: `docs/known-issues/jdk-only/W6-11-*`, §3.
+///
+/// This also un-breaks `native_module_layer_modules`, which already built a
+/// catalog by iterating `nameToModule.values()` and was a no-op for services in
+/// BOTH modes for the same reason.
+///
+/// # Why it runs after the layer is published
+///
+/// `build_module` runs Java (`build_module_descriptor` allocates and
+/// initialises), and that can re-enter `ModuleLayer.boot()`. Publishing the
+/// layer to the memo and the global root table FIRST means such a re-entry gets
+/// this same object — a partially populated map at worst — instead of recursing
+/// into a second `build_boot_layer`. Population is idempotent: `HashMap.put`
+/// re-keys by name and `build_module` returns the cached mirror for a
+/// registered name.
+///
+/// A failure to build any one module is not fatal to the layer: the module is
+/// skipped and the rest are inserted. A layer missing one module is strictly
+/// better than no layer at all, which is what propagating would produce.
+fn populate_boot_layer_modules(
+    ctx: &mut dyn NativeContext,
+    layer: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let names = ctx.module_names();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let layer_pin = ctx.pin_native_root(layer);
+    for name in names {
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        let Ok(module) = build_module(ctx, &name, layer) else {
+            continue;
+        };
+        let module_pin = ctx.pin_native_root(module);
+
+        // `nameToModule.put(name, module)` — the map real
+        // `getServicesCatalog()` iterates.
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        if let Value::Object(Some(map)) = ctx.get_field_by_name(layer, "nameToModule") {
+            let map_pin = ctx.pin_native_root(map);
+            let key = ctx.create_string(&name);
+            let map = ctx.read_native_pin(map_pin, map);
+            let module = ctx.read_native_pin(module_pin, module);
+            let _ = ctx.invoke_virtual(
+                map,
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key)), Value::Object(Some(module))],
+            );
+            ctx.unpin_native_roots(map_pin);
+        }
+
+        // `modules.add(module)` — kept in step so `ModuleLayer.modules()` and
+        // the map cannot disagree about the layer's contents.
+        let layer = ctx.read_native_pin(layer_pin, layer);
+        if let Value::Object(Some(set)) = ctx.get_field_by_name(layer, "modules") {
+            let set_pin = ctx.pin_native_root(set);
+            let set = ctx.read_native_pin(set_pin, set);
+            let module = ctx.read_native_pin(module_pin, module);
+            let _ = ctx.invoke_virtual(
+                set,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(module))],
+            );
+            ctx.unpin_native_roots(set_pin);
+        }
+        // `ServicesCatalog.getServicesCatalog(appLoader).register(module)` —
+        // the OTHER of the two routes `ServiceLoader` takes, and the one the
+        // no-arg `ServiceLoader.load(Service.class)` uses.
+        //
+        // `ModuleServicesLookupIterator.iteratorFor(loader)` asks
+        // `ServicesCatalog.getServicesCatalogOrNull(loader)` — a per-loader
+        // `ClassLoaderValue` — and NOT the layer. Populating `nameToModule`
+        // above fixes only `ServiceLoader.load(layer, Service.class)`; without
+        // this the plain overload still answers `[]`. Both are asserted, three
+        // lines apart, in `RJdkModule.moduleServices()` (`:223` is this route,
+        // `:242` the layer one), and fixing the layer alone moved the failure
+        // by zero lines.
+        //
+        // Registering against the SYSTEM loader is what the real
+        // `ModuleLayer.defineModules` does for boot-layer modules resolved from
+        // `--module-path`: they are defined to the application loader, and its
+        // catalog is what the lookup walks. `getServicesCatalog` creates the
+        // catalog if absent, and `register(Module)` reads
+        // `descriptor.provides()`, so a module that declares none is a no-op
+        // rather than a special case.
+        let module = ctx.read_native_pin(module_pin, module);
+        register_module_in_loader_catalog(ctx, module);
+
+        ctx.unpin_native_roots(module_pin);
+    }
+    ctx.unpin_native_roots(layer_pin);
+    Ok(())
+}
+
+/// Add `module` to the system class loader's `ServicesCatalog`.
+///
+/// Best-effort by design: every step is a real-JDK call that a synthetic-JDK
+/// build may not have, and a missing services catalog must not take the boot
+/// layer down with it. A caller that gets no catalog is exactly where it was
+/// before this existed.
+fn register_module_in_loader_catalog(ctx: &mut dyn NativeContext, module: ObjectRef) {
+    let module_pin = ctx.pin_native_root(module);
+    let loader = match ctx.invoke(
+        "java/lang/ClassLoader",
+        "getSystemClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => {
+            ctx.unpin_native_roots(module_pin);
+            return;
+        }
+    };
+    let loader_pin = ctx.pin_native_root(loader);
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    let catalog = match ctx.invoke(
+        "jdk/internal/module/ServicesCatalog",
+        "getServicesCatalog",
+        "(Ljava/lang/ClassLoader;)Ljdk/internal/module/ServicesCatalog;",
+        &[Value::Object(Some(loader))],
+    ) {
+        Ok(Some(Value::Object(Some(c)))) => c,
+        _ => {
+            ctx.unpin_native_roots(loader_pin);
+            ctx.unpin_native_roots(module_pin);
+            return;
+        }
+    };
+    let catalog_pin = ctx.pin_native_root(catalog);
+    let catalog = ctx.read_native_pin(catalog_pin, catalog);
+    let module = ctx.read_native_pin(module_pin, module);
+    let _ = ctx.invoke(
+        "jdk/internal/module/ServicesCatalog",
+        "register",
+        "(Ljava/lang/Module;)V",
+        &[Value::Object(Some(catalog)), Value::Object(Some(module))],
+    );
+    ctx.unpin_native_roots(catalog_pin);
+    ctx.unpin_native_roots(loader_pin);
+    ctx.unpin_native_roots(module_pin);
 }
 
 /// Build a `java.util.HashSet<String>` pre-populated with `packages`, backed

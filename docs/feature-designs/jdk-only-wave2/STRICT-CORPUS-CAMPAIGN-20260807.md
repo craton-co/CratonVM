@@ -1,6 +1,6 @@
 # The strict-corpus campaign — 14 failures, worked in parallel, 2026-08-06/07
 
-**Status: MEASURED 2026-08-07 — 51 passed, 3 failed** (three consecutive
+**Status: FIXED 2026-08-07 — 53 passed, 1 failed**, and the one that remains is dev's own. Was: **MEASURED — 51 passed, 3 failed** (three consecutive
 identical runs; see *MEASURED* below for the binary, the command and the
 remaining three). The campaign's 14 failures are down to 3, and only one of those
 is strict-only.
@@ -85,9 +85,44 @@ own narrower claims; this is a vector-level result, not a per-assertion audit.
 
 | vector | strict-only? | what it is |
 |---|---|---|
-| `RJdkModule` | **YES** | `AssertionError: module service providers: []` in `moduleServices()`. `rc=0` in Compatible with the identical command line. Owned by [`W6-11`](../../known-issues/jdk-only/W6-11-strict-mode-module-serviceloader.md). |
-| `RJdkFieldModule` | no | `Object.finalize through the caller's own class: expected OK but got IllegalAccessException`. Identical in both modes. Newly filed as [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](../../known-issues/jdk-only/method-invoke-refuses-the-jls-6-6-2-protected-receiver.md). |
+| `RJdkModule` | **YES** | `AssertionError: module service providers: []` in `moduleServices()`. `rc=0` in Compatible with the identical command line. Owned by [`W6-11`](../../internal/jdk-only-W6-11-module-serviceloader-FIXED-20260807.md). |
+| `RJdkFieldModule` | no | `Object.finalize through the caller's own class: expected OK but got IllegalAccessException`. Identical in both modes. Newly filed as [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](../../internal/method-invoke-jls-6-6-2-protected-receiver-FIXED-20260807.md). |
 | `RMapGcStress` | no | `rc=124`, the suite's 120 s timeout. Fails in every mode and in both the default and `--features synthetic-jdk` builds. Dev's own, unrelated to this campaign. |
+
+### 2026-08-07, later the same day: 53 passed / 1 failed
+
+Both remaining defects are fixed. The corpus is now **53 passed, 1 failed**,
+ABBA-interleaved (51/3 -> 53/1 -> 53/1 -> 51/3), and the one failure is
+`RMapGcStress`, which is dev's own.
+
+| was | now |
+|---|---|
+| `RJdkModule` (strict-only) | **PASS**, 44 checks, matching HotSpot. Three fixes: populate the boot layer's `nameToModule`; register modules in the system loader's `ServicesCatalog` (the plain `ServiceLoader.load(S)` route does not consult the layer); implement `JavaLangAccess.getDeclaredPublicMethods(Class,String,Class[])` as a filtered `List` so the `provider()` factory form is found. See [`W6-11`](../../internal/jdk-only-W6-11-module-serviceloader-FIXED-20260807.md). |
+| `RJdkFieldModule` (both modes) | **PASS**. `Method.invoke` was asking the `opens` question where the JDK asks `exports`. See [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](../../internal/method-invoke-jls-6-6-2-protected-receiver-FIXED-20260807.md). |
+
+**So there are now ZERO strict-only failures again** — the amendment above
+applied to a state that lasted one afternoon. Regression-checked: Compatible
+mode is unchanged at 30/1 across an ABBA, and the registration gates,
+`native-api` and `native-builtins` lib suites all pass.
+
+**One configuration is still worse, and it is not this campaign's.** A
+`--features synthetic-jdk` binary run `--jdk-only` measures 48 passed / 6 failed
+where the default build measures 53/1 — `RJdkHello`, `RJdkServices`, `RJdkNio`,
+`RJdkNet` and `RJdkJmx` fail only there. Both fixes above help that arm too
+(46/8 -> 48/6), but the other five are a feature-vs-default divergence under
+strict, a third configuration nobody had measured before today. It is the same
+shape as the (now closed)
+`synthetic-jdk-feature-binary-diverges-under-real-jdk` page and deserves its own
+record before anyone treats it as strict-mode work.
+
+**A trap this closure walked into, worth more than the fixes.** Lane W6-2 had
+already written a correct `provider()`-factory fix — in
+`native-builtins/src/service_loader.rs`, whose registrar is
+`NativeKind::SyntheticStub`. Strict mode refuses that kind at registration, by
+design, so the fix could never run in the mode it was written for. **A fix
+placed in a native that strict mode declines to register is invisible to strict
+mode.** Check the registrar's `NativeKind` before writing a strict-mode fix into
+it.
 
 ### The headline finding needs one amendment
 

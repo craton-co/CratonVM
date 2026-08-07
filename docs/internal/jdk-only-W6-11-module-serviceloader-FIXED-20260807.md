@@ -1,4 +1,54 @@
-# W6-11 — the boot layer's `nameToModule` is empty, so no `ServicesCatalog` can ever be built
+# FIXED — W6-11: the boot layer's `nameToModule` was empty, so no `ServicesCatalog` could ever be built
+
+**Status: FIXED 2026-08-07.** `RJdkModule` now passes `--jdk-only` with all 44
+checks, matching HotSpot 25 line for line
+(`CK RJdkModule services=[module-factory, module-hello] types=[EnGreeter, Greeter]`).
+The strict corpus went 51 passed / 3 failed to **53 passed / 1 failed**,
+ABBA-interleaved, and the one that remains (`RMapGcStress`) fails in every mode
+and both builds.
+
+This lane's diagnosis below was correct and complete; it took **three** fixes to
+discharge, because the vector asserts two independent `ServiceLoader` routes and
+then a third thing behind them:
+
+1. **`nameToModule` was never populated** (§3 below). `build_boot_layer`
+   allocated an empty `HashMap` and `build_module` never inserted the back-edge.
+   Real `ModuleLayer.getServicesCatalog()` self-populates by looping
+   `nameToModule.values()`, so it built an empty catalog. Fixed by
+   `populate_boot_layer_modules` in `jboss_jdkspecific.rs`, which runs AFTER the
+   layer is published to the memo so a re-entrant `ModuleLayer.boot()` cannot
+   recurse.
+2. **That fixed the wrong route first.** `:242` (`ServiceLoader.load(layer, S)`)
+   reads the layer's catalog; `:223` (the plain `ServiceLoader.load(S)`) reads a
+   PER-LOADER `ClassLoaderValue` via
+   `ServicesCatalog.getServicesCatalogOrNull(loader)` and never consults the
+   layer. Fixing the layer alone moved the failure by zero lines — same
+   assertion, same message. Fixed by also calling
+   `ServicesCatalog.getServicesCatalog(systemLoader).register(module)`, which is
+   what real `ModuleLayer.defineModules` does for boot-layer modules resolved
+   from `--module-path`.
+3. **Then the `provider()` factory form surfaced**, previously unreachable:
+   `ServiceConfigurationError: ... FactoryGreeter not a subtype`.
+   `ServiceLoader.findStaticProviderMethod` calls
+   `LANG_ACCESS.getDeclaredPublicMethods(clazz, "provider")`, and CratonVM had
+   registered the `(Class, String, Class[]) -> List` overload against the SAME
+   handler as the `(Class) -> Method[]` one — so it returned every declared
+   method as an array where a filtered `List` was declared, and the factory
+   could never be found. Fixed in `shared_secrets_bridge.rs` with a real
+   implementation that filters on public + name + exact parameter types.
+
+Lane W6-2 had already written a fix for the same `provider()` gap in
+`native-builtins/src/service_loader.rs`. That fix is not wrong, but it cannot
+help here: `register_service_loader_natives` is `NativeKind::SyntheticStub` and
+strict mode refuses it at registration, which is the whole point — under
+`--jdk-only` the REAL `java.util.ServiceLoader` bytecode runs, and it needs the
+`JavaLangAccess` hook to be correct instead. **A fix placed in a native that
+strict mode declines to register is invisible to strict mode.**
+
+---
+
+## Original diagnosis (2026-08-07, before the fix)
+
 
 **No code changed.** This lane was briefed to fix module `ServiceLoader` under
 `--jdk-only` at `regression-suite/src/RJdkModule.java:223/234/242`. The brief's
