@@ -164,7 +164,7 @@ disassembly of the real run, not the reproducer, is what found this.
 The original report noted that every occurrence was preceded by
 `cratonvm_gc::gc_quiescence [moving-young] fallback #N` warnings, and suspected
 a stale/aliased reference into ECJ's `OperandStack` array
-(see `known-issues/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression.md`).
+(see `gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`).
 
 That lead is **disproven as the cause**, though the correlation was genuine:
 both come from the same feature. The fallback reason on these runs is

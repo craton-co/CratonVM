@@ -263,7 +263,7 @@ Total class time is 177s (vs. HotSpot's low-teens-of-seconds for this class
 historically) — consistent with a slow deploy/scan cycle that occasionally
 exceeds the client's read timeout rather than a hard hang, similar in shape
 to the general deploy-throughput-wall family
-(see `../../known-issues/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression.md`),
+(see `gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`),
 though not yet confirmed to share that exact cause.
 
 ## Not yet done
