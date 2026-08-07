@@ -184,8 +184,21 @@ RJdkReflect RJdkHidden RJdkModule RJdkForkJoin RJdkNio RJdkNet RJdkProcess
 RJdkSecurity RJdkJmx RJdkJni RJdkFailure )
 ```
 
-Thirteen vectors for fourteen failures, because SC-3's one root cause accounts
-for both `RJdkHidden` and `RJdkStrict`. The 21 scheduled vectors are `run.sh:72`.
+**Fourteen vectors, fourteen failures, at most THIRTEEN distinct root causes.**
+Nothing is short: every class in that line is separately scheduled and fails
+once. What SC-3 collapses is two *vectors* onto one *cause* — `RJdkHidden` and
+`RJdkStrict` are different classes dying on the same null `Lookup.lookupClass()`
+from the same shadowed placeholder. Thirteen is an upper bound and may be lower:
+**no other pair has been checked for shared causation.** The 21 scheduled
+vectors are `run.sh:72`.
+
+> **A failure count is an upper bound on the defect count, never an estimate of
+> it.** SC-3 was recognised as one bug only because two lanes' traces were
+> compared, and nobody set out to look — it fell out of reading both records.
+> Twelve traces remain unpaired. Make it a standing check, because it costs
+> nothing: **before opening a lane, diff its trace against the already-filed
+> ones.** Two lanes working one cause is the expensive failure mode, and it is
+> invisible from the suite line.
 
 ### The two that were unidentified until 2026-08-07
 
@@ -209,16 +222,30 @@ for both `RJdkHidden` and `RJdkStrict`. The 21 scheduled vectors are `run.sh:72`
   feature — the class *is* correctly absent; we raise the wrong member of the
   pair.
 
-### One defect the strict corpus structurally cannot see
+### The gap in the instrument: this corpus runs one arm, and it is not the arm that survives
 
 Lane **SC-14**
 ([`../../known-issues/jdk-only/L14-serviceloader-instance-caching.md`](../../known-issues/jdk-only/L14-serviceloader-instance-caching.md))
 found `ServiceLoader`'s instance cache allocated, cleared on `reload()` and
-**never read** — and `RJdkServices` is *not* in the 14, because it fails in the
-**default `--real-jdk`** arm and passes under `--jdk-only`. That inversion is the
-headline finding's mirror image and sharpens it: the strict corpus is not merely
-free of strict-only failures, it is **blind to a Compatible-only one**. Run both
-arms, always; a green strict corpus is not a statement about `--real-jdk`.
+**never read**. `RJdkServices` is *not* among the 14 — it fails in the **default
+`--real-jdk`** arm and **passes** under `--jdk-only`.
+
+That is not a footnote about one class. `run.sh` schedules `JDKONLY_CLASSES`
+only when `CRATONVM_ARGS` names `--jdk-only` (`run.sh:83-86`), so these 21
+vectors have **never been run in Compatible mode**. The corpus is structurally
+incapable of seeing a Compatible-only regression in any of them:
+
+* **it answers "does strict break things?"** — and the answer is the headline
+  above, no;
+* **it cannot answer "does Compatible still work?"** — and SC-14 is the proof
+  that the question has a non-empty answer set, found by accident.
+
+The end state makes today's `--jdk-only` into `--real-jdk` and today's
+`--real-jdk` into `--synthetic-jdk`. **The arm this corpus cannot see is the one
+being deprecated *into*** — every Compatible-only defect it is blind to is a
+defect in the mode the whole codebase is heading for. A green strict corpus is
+not a statement about `--real-jdk`, and criterion 4 ("`Compatible` mode
+byte-for-byte unchanged") is not measured by it either.
 
 Lane **SC-15**
 ([`../../known-issues/jdk-only/L15-nestmate-access-field-and-constructor.md`](../../known-issues/jdk-only/L15-nestmate-access-field-and-constructor.md))
@@ -299,19 +326,33 @@ Nothing below has been done. In order:
    HotSpot 25 — with the module path passed the way `run.sh` passes it. A
    divergence present in both CratonVM arms is not a strict-mode defect, and a
    pass in one arm is not a pass in the other (SC-14).
-4. **Re-measure `RJdkProcess` from zero.** Every result before 2026-08-06 is
+4. **Run `JDKONLY_CLASSES` under `--real-jdk` and count the inversions.** These
+   21 vectors have never been run in Compatible mode (`run.sh:83-86` schedules
+   them only for `--jdk-only`), and the one time anyone looked, `RJdkServices`
+   fell out. **Record how many more `RJdkServices`-shaped inversions there are**
+   — vectors that pass strict and fail the default arm. That number is the size
+   of the instrument's blind spot, and it is currently unknown. Note the one
+   deliberate exception before reading the results: `RJdkStrict` is
+   mode-divergent **by design** and `run.sh` skips it in Compatible mode with a
+   printed reason (`regression-suite/jdk-only-coverage.txt`) — it is the only
+   vector of the 21 for which a Compatible-arm difference is expected.
+5. **Re-measure `RJdkProcess` from zero.** Every result before 2026-08-06 is
    void.
-5. **Expect `RJdkForkJoin` to still fail, and check *how*.** SC-12 removes the
+6. **Expect `RJdkForkJoin` to still fail, and check *how*.** SC-12 removes the
    hang; the class is then expected to fail fast on the `CountedCompleter`
    section. rc=124 → a fast, loud failure is the fix working, not a regression.
-6. **Re-freeze the baselines the lanes named.** They disagree about which move,
+7. **Diff the twelve unpaired traces against each other** before staffing
+   anything further — SC-3's two vectors were one bug, and no other pair has been
+   checked. Thirteen root causes is an upper bound.
+8. **Re-freeze the baselines the lanes named.** They disagree about which move,
    and each lane says why in its own *Baselines* section: SC-2
    (`bridge-ratchet`, +2), SC-3 (`kind-map` collapses a duplicate pair to one
    row; bridge counts fall by 1), SC-4 (`bridge_without_acc_native` 9528 →
    9536), SC-5/SC-7/SC-8 (none). Re-take the census on a JDK-bearing host; do
    not hand-edit.
-7. **File SC-16's record** at
+9. **File SC-16's record** at
    `docs/known-issues/jdk-only/L16-classnotfound-vs-noclassdeffound-shapes.md`,
    and add it to the reconciliation table above.
-8. **Only then** restate criterion 6 — with both numbers, the probe gate's and
-   the corpus's, side by side.
+10. **Only then** restate criterion 6 — with both numbers, the probe gate's and
+    the corpus's, side by side, and with the Compatible-arm count from step 4
+    beside them. Two of the three are currently unmeasured.

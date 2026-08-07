@@ -280,7 +280,7 @@ above looks paranoid.
    | instrument | what it measures | reading, 2026-08-07 |
    |---|---|---|
    | `scripts/jdk-only-strict-probes.sh` | five breadth probes, scored section-by-section against a HotSpot control | **2 baselined divergences** (`scripts/baselines/jdk-only-strict-corpus-25-linux.txt`, both `JdkOnlyPlatformProbe/*/vthreads` — one per arm, so neither is strict-only) |
-   | `regression-suite/run.sh` `JDKONLY_CLASSES` | 21 hostile vectors, asserting JDK contracts check by check | **14 failures** |
+   | `regression-suite/run.sh` `JDKONLY_CLASSES` | 21 hostile vectors, asserting JDK contracts check by check — **strict arm only**, never run in Compatible mode (`run.sh:83-86`) | **14 failures** |
 
    Both are honest; they ask different questions. Reading criterion 6 off the
    probe baseline **alone** badly overstates where the mode is — a green ratchet
@@ -608,8 +608,13 @@ and it reported 14 failures.** A separate pool, lanes `SC-1`…`SC-16`, took one
 lane per failure. On dev tip `84b85c624`: *37 passed, 14 failed — `RJdkStrict`
 `RJdkLambdas` `RJdkHandles` `RJdkReflect` `RJdkHidden` `RJdkModule`
 `RJdkForkJoin` `RJdkNio` `RJdkNet` `RJdkProcess` `RJdkSecurity` `RJdkJmx`
-`RJdkJni` `RJdkFailure`.* Thirteen vectors for fourteen failures, because
-`RJdkHidden` and `RJdkStrict` are one root cause. The campaign record, with the
+`RJdkJni` `RJdkFailure`.* **Fourteen vectors, fourteen failures, at most
+thirteen distinct root causes** — `RJdkHidden` and `RJdkStrict` are two
+separately scheduled vectors dying on one shadowed placeholder, and no other
+pair has been checked for shared causation. **A failure count is an upper bound
+on the defect count, never an estimate of it**; that collapse was noticed only
+because two lanes' traces got compared, so diff a new trace against the filed
+ones before staffing a lane. The campaign record, with the
 per-lane table, the `SC-<n>` reconciliation and what still has to be measured, is
 [`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md); the
 evidence is one file per lane in
@@ -622,7 +627,7 @@ thing to be missing from a merged tree. Read every "FIXED" in those records as
 *"fixed in source, unverified"* — most of them say so in their own headers. The
 one exception is SC-10, which changed a **Java vector** and measured it 26/26.
 
-Five things from it belong here rather than only in the campaign record:
+Six things from it belong here rather than only in the campaign record:
 
 * **The headline: of the 14 failures, 12 fail in `--real-jdk` too, and ZERO are
   strict-only.** `--jdk-only` is not rejecting legitimate things; it is
@@ -630,10 +635,21 @@ Five things from it belong here rather than only in the campaign record:
   the code underneath is wrong in both modes. The remaining work is ordinary
   subsystem bug-fixing that fixes BOTH modes, not `--jdk-only` contract work.
   This is L8's 2026-08-05 finding — "**Zero** were introduced by `--jdk-only`" —
-  at corpus scale. And it runs the other way too: SC-14 found `RJdkServices`
-  failing in the **default `--real-jdk`** arm while passing under `--jdk-only`,
-  so it is not in the 14 at all. The strict corpus is not merely free of
-  strict-only failures, it is **blind to a Compatible-only one**. Run both arms.
+  at corpus scale.
+* **…and the corpus that established it runs ONE arm, which is a gap in the
+  instrument, not a footnote.** `run.sh` schedules `JDKONLY_CLASSES` only when
+  `CRATONVM_ARGS` names `--jdk-only` (`run.sh:83-86`), so these 21 vectors have
+  **never been run in Compatible mode**. The corpus answers *"does strict break
+  things?"* and **cannot answer *"does Compatible still work?"*** — SC-14 is the
+  proof the second question has a non-empty answer set: `RJdkServices` fails in
+  the default `--real-jdk` arm, passes under `--jdk-only`, and therefore never
+  appears in the 14 at all. Since the end state renames today's `--jdk-only` to
+  `--real-jdk`, **the arm this corpus cannot see is the one being deprecated
+  *into***. Criterion 4 is not measured by it either. Run `JDKONLY_CLASSES`
+  under `--real-jdk` and record how many more `RJdkServices`-shaped inversions
+  fall out; that count is the blind spot's size and it is currently unknown.
+  (`RJdkStrict` is the one deliberate exception — mode-divergent by design, and
+  skipped in Compatible mode with a printed reason.)
 * **The disease shape has a name now, and four lanes found it independently: a
   synthetic stub or placeholder shadowing real JDK bytecode that already works.**
   Registration is last-write-wins on the triple, so a placeholder registered
