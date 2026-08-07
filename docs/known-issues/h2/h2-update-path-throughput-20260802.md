@@ -31,6 +31,65 @@ dispatch, GC roots and class resolution (none of which the packing changes) and
 **re-take them once the layout defect is fixed** before comparing against
 anything measured with packing on.
 
+## Re-measured 2026-08-07 — and the shape changed under it
+
+Two of this page's load-bearing claims are no longer true on the current tip,
+and one of them stops the page's own Reproducing block from running at all.
+
+**The UPDATE workload now exhausts the heap, and the JIT is the switch.** Same
+binary, same `--Xmx 1g`, same 4-thread x 2500-update shape:
+
+| arm | result | minor GCs | young decisions |
+|---|---|---|---|
+| `--nojit` | completes | 7 | **moving=7, non_moving=0** |
+| JIT on (default) | **Out of memory** | 238 | moving=2, **non_moving=236** |
+
+At 60 000 updates and `--Xmx 4g` the same flag still decides it (`--nojit`
+completes in 572 CPU-s with 7 moving collections; the JIT arm exhausts the heap
+after 1 321 non-moving ones). A live JIT frame blocks the moving young
+collector (`reason=innermost-rbp-belongs-to-unguarded-callee`), the young
+generation is swept in place rather than copied, and the old generation
+degenerates into a free list — 21 410 741 blocks coalesced in one run. Filed as
+[`bug-h2-update-path-oom-nonmoving-sweep-20260807.md`](bug-h2-update-path-oom-nonmoving-sweep-20260807.md).
+
+So **two bullets under "What is ruled out" are withdrawn**: "not heap pressure"
+(1g and 2g now fail outright) and "not the JIT-root path (`--nojit` scales
+identically)" (`--nojit` is the difference between a result and no result).
+Both were true when measured; neither survived the object-header landing. Re-run
+a ruled-out list against the tip before inheriting it.
+
+**A consequence for every number below.** They were taken with the JIT on, which
+on this tip means they were taken from a VM in GC collapse — collecting ~90x
+more often than it should and reclaiming almost nothing. They are not
+measurements of the interpreter-vs-JIT tradeoff this page is about. Until the
+OOM is fixed, take UPDATE-path measurements with `--nojit`, where the moving
+collector actually runs, and say so.
+
+**What did NOT change: the constant factor.** ABBA-interleaved, `--Xmx 4g`, on a
+quiet host (load 6.7-8.8), work term for 10 000 updates after subtracting an
+interleaved 0-update baseline of the same shape:
+
+| build | baseline | with updates | work term |
+|---|---|---|---|
+| pre-landing `1082eb446` | 15.44 | 37.41 | **21.97 CPU-s** |
+| current dev | 16.19 | 38.64 | **22.45 CPU-s** |
+
++2%, inside noise. Against HotSpot's ~1.13 CPU-s on the same shape that is
+**~20x at 4 threads**, where the table below says ~31x — the difference is the
+host, not the VM: this page's setup figure of 36-54 CPU-s is 15-16 CPU-s on a
+quiet one. Quote the ratio, never the absolute, and record `uptime`.
+
+**The thread-scaling experiment still cannot be run**, and now for a concrete
+reason rather than a resolution one: the arm size this page specifies
+(~100 000 updates) exhausts the heap before it finishes. It is blocked on the
+OOM, not on host load.
+
+**The probe is not missing, and it has moved.** `H2UpdateScaleProbe.java` was in
+`docs/internal/repros/h2-insert-scale-20260731/` — the Reproducing block below
+names no path, and `apps/` is gitignored, so it was invisible from the obvious
+place. It now lives at **`probes/H2UpdateScaleProbe.java`**, out of a directory
+slated for deletion. Its third argument is `objectCount`, not the lock timeout.
+
 ## Severity
 **MEDIUM.** No incorrect behaviour, but not benign either. The class takes
 20-45 minutes of CPU where HotSpot takes 17 seconds, and H2's internal
@@ -176,6 +235,10 @@ and so are the next targets:
   falls back to the non-moving sweep — `reason=unregistered-jit-frame-on-stack`,
   `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-callee`
   — which is its own question and has its own pages.
+  **ESCALATED 2026-08-07: this is no longer a throughput tax, it is the OOM.**
+  The fallback rate against this exact workload went from 3 to 361, and with it
+  the run stopped finishing. It is now the top item on this page, not a
+  footnote to it — see the re-measurement above.
 
 ## The same profile at 1 thread, on 2026-08-07 code
 
@@ -277,10 +340,12 @@ back 29 / 36 / 43 / 50 CPU-s. A flat tax on every H2 run, and the reason a
   no-op for this workload, so the retired insert page's "lifting the ban made it
   ~9 % worse" was a **null A/B** — two identical configurations — and is
   withdrawn.
-* **Not heap pressure** (`--Xmx` 1g/2g/4g/8g: no trend), **not the young-GC
-  livelock**, **not the STW cross-thread takeover**
-  (`CRATONVM_XT_PEER_DEADLINE_MS` 1/20/200: no effect), **not the JIT-root path**
-  (`--nojit` scales identically).
+* ~~**Not heap pressure** (`--Xmx` 1g/2g/4g/8g: no trend)~~ and ~~**not the
+  JIT-root path** (`--nojit` scales identically)~~ — **BOTH WITHDRAWN
+  2026-08-07**, see the re-measurement at the top of this page. 1g and 2g now
+  OOM, and `--nojit` is the difference between completing and exhausting the
+  heap. Still ruled out: **not the young-GC livelock**, **not the STW
+  cross-thread takeover** (`CRATONVM_XT_PEER_DEADLINE_MS` 1/20/200: no effect).
 * **`jit_activation`'s global `Mutex` is gone** (per-thread tables since
   2026-07-31).
 * **`Math.random()` is not a contention point** — a thread-local `Cell` seed
@@ -321,7 +386,7 @@ to add after the old page's 4-thread arm turned out to be unresolvable.
 ## Reproducing
 
 ```bash
-javac -cp <h2>/target/classes -d probe H2UpdateScaleProbe.java
+javac -cp <h2>/target/classes -d probe probes/H2UpdateScaleProbe.java
 <cratonvm> --java-home <jdk25> --Xmx 1g -c "<h2>/target/classes:probe" \
   -Dprobe.dir=./h2updb H2UpdateScaleProbe <threads> <updates> 10000
 ```
