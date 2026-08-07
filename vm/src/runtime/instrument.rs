@@ -1266,7 +1266,12 @@ pub fn run_load_time_transform_chain(
         ClassLoaderId::UserDefined(_) => {
             Some(cratonvm_native_builtins::classloader::get_or_create_app_loader(ctx))
         }
-    };
+    }
+    // This transformer entry point returns the bytes and has no error channel
+    // to carry a refusal. If `--jdk-only` refuses the app loader, fall back to
+    // the bootstrap loader (`None`) — the same answer this already gave for a
+    // bootstrap class — and let the recorded violation stand.
+    .and_then(|loader| loader.ok());
     run_chain_over_bytes(
         ctx,
         class_name,

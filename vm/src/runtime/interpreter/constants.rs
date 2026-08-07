@@ -1300,13 +1300,16 @@ pub(crate) fn drive_defining_loader_load(
         // namespace and defining-loader association.
         match result {
             Ok(Some(Value::Object(Some(_)))) => result,
-            _ => cratonvm_native_builtins::service_loader::impl_jars_load_class(
+            _ => match cratonvm_native_builtins::service_loader::impl_jars_load_class(
                 &mut ctx,
                 Some(loader_obj),
                 name,
-            )
-            .map(|mirror| Ok(Some(Value::Object(Some(mirror)))))
-            .unwrap_or(result),
+            ) {
+                Ok(Some(mirror)) => Ok(Some(Value::Object(Some(mirror)))),
+                // A refusal here leaves the original resolution result standing,
+                // exactly as "archive had no such class" already did.
+                _ => result,
+            },
         }
     };
     // Defensive: a re-entrant call that unwound abnormally must not leave stray
