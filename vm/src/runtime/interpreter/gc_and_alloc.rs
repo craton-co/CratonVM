@@ -2998,7 +2998,7 @@ pub(super) fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm)
 /// identical for both shapes, so arrays reuse this function rather than
 /// carrying a second, less-hardened copy of that machinery.
 #[derive(Clone, Copy)]
-enum TlabShape {
+pub(super) enum TlabShape {
     /// `num_fields` object slots.
     Object { num_fields: usize },
     /// `length` elements of `element_type`.

@@ -914,7 +914,7 @@ pub(crate) fn load_pkcs12_ex(
             p12::SafeBagKind::Pkcs8ShroudedKeyBag(epk) => {
                 let legacy = epk.decrypt(&password_bmp);
                 let pbes2 = if legacy.is_none() {
-                    decrypt_secret_pbes2(epk, password.as_ref())
+                    decrypt_secret_pbes2(epk, password)
                         .or_else(|| decrypt_secret_pbes2(epk, &password_bmp))
                 } else {
                     None
@@ -988,7 +988,7 @@ pub(crate) fn load_pkcs12_ex(
                             yasna::parse_ber(epki_der, p12::EncryptedPrivateKeyInfo::parse).ok()?;
                         let legacy = encrypted.decrypt(&password_bmp);
                         let pbes2 = if legacy.is_none() {
-                            decrypt_secret_pbes2(&encrypted, password.as_ref())
+                            decrypt_secret_pbes2(&encrypted, password)
                         } else {
                             None
                         };

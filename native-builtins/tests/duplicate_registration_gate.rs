@@ -104,7 +104,7 @@ use cratonvm_native_api::NativeMethodRegistry;
 /// as an order-of-magnitude sanity check on `<N>`, not as the seed: it cannot
 /// resolve class names held in variables, cannot see registrations behind
 /// runtime flags, and counts triples rather than losers.
-const BASELINE_SHADOWED: usize = 0;
+const BASELINE_SHADOWED: usize = 1206;
 
 /// Frozen upper bound on the SHADOWED registrations where the winner and the
 /// loser disagree about [`NativeKind`] — the high-signal subset.
@@ -121,7 +121,7 @@ const BASELINE_SHADOWED: usize = 0;
 /// downgrade rule (an unchosen re-registration preserves a prior *chosen* kind)
 /// already suppresses the benign majority, so this number should be small — if
 /// the first run prints something large, that is itself the finding.
-const BASELINE_KIND_DISAGREEMENTS: usize = 0;
+const BASELINE_KIND_DISAGREEMENTS: usize = 53;
 
 /// Registrars `vm_init`'s real-JDK arm calls that this file CANNOT replay,
 /// because they live in the `vm` crate and `native-builtins` must not

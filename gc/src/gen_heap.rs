@@ -10475,8 +10475,8 @@ impl GenerationalHeap {
         // millions of entries even though nearly all of them are adjacent.
         // Keep `dead_regions` intact for the per-object diagnostics below, but
         // zero and publish only maximal contiguous spans.
-        let mut reclaimed_regions: Vec<(usize, usize)> = Vec::new();
-        reclaimed_regions.reserve(dead_regions.len().min(1024));
+        let mut reclaimed_regions: Vec<(usize, usize)> =
+            Vec::with_capacity(dead_regions.len().min(1024));
         for &(off, sz, _, _, _) in &dead_regions {
             if let Some(last) = reclaimed_regions.last_mut() {
                 let last_end = last.0 + last.1;
