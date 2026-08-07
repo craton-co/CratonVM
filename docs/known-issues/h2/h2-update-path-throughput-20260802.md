@@ -79,10 +79,11 @@ interleaved 0-update baseline of the same shape:
 host, not the VM: this page's setup figure of 36-54 CPU-s is 15-16 CPU-s on a
 quiet one. Quote the ratio, never the absolute, and record `uptime`.
 
-**The thread-scaling experiment still cannot be run**, and now for a concrete
-reason rather than a resolution one: the arm size this page specifies
-(~100 000 updates) exhausts the heap before it finishes. It is blocked on the
-OOM, not on host load.
+**The thread-scaling experiment was blocked on the OOM, and is not any more.**
+When this was written the arm size this page specifies (~100 000 updates)
+exhausted the heap before finishing. Fixed 2026-08-07 in `0ea21c07a` -- 4
+threads x 60 000 updates at `--Xmx 4g` now completes in 163 s. The experiment
+is runnable; see the scaling section below.
 
 **The probe is not missing, and it has moved.** `H2UpdateScaleProbe.java` was in
 `docs/internal/repros/h2-insert-scale-20260731/` — the Reproducing block below
@@ -292,7 +293,15 @@ and so are the next targets:
   falls back to the non-moving sweep — `reason=unregistered-jit-frame-on-stack`,
   `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-callee`
   — which is its own question and has its own pages.
-  **ESCALATED 2026-08-07: this is no longer a throughput tax, it is the OOM.**
+  **RESOLVED 2026-08-07 (`0ea21c07a`).** The escalation below was right that
+  this had stopped being a throughput tax, and wrong about which half was at
+  fault: the fallback FRACTION barely moved (75% -> 99.4%), the collection
+  COUNT exploded. The fallback is still pre-existing and still open; what was
+  new is that the non-moving sweep abandoned the arena on an all-zero span,
+  because a JIT-allocated `new Object()` now has an all-zero header. Fixed;
+  `H2UpdateScaleProbe` 4t x 60000 at `--Xmx 4g` goes from OOM to PASS in 163 s
+  and 5038 minor GCs to 11. The thread-scaling arm below is UNBLOCKED.
+  **Superseded 2026-08-07: this is no longer a throughput tax, it is the OOM.**
   The fallback rate against this exact workload went from 3 to 361, and with it
   the run stopped finishing. It is now the top item on this page, not a
   footnote to it — see the re-measurement above.
