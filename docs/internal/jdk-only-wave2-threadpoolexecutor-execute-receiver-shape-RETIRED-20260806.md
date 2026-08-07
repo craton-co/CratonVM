@@ -186,6 +186,78 @@ Everything the record's *How to verify a fix* section asked for.
   counted where they belonged, at the moment they stopped being reachable on a
   real-JDK image.
 
+### Addendum, same day — the two contract-§5 items, and one flake
+
+Added by a second session that reached the same design independently and landed
+after this one. Its duplicate implementation was discarded; these are the checks
+this record did not already carry.
+
+**Why they are separate from everything above:** every measurement in this
+section so far is against *HotSpot* or against a census. Contract §5 asks a
+different question — is `Compatible` mode unchanged against the **pre-fix
+binary** — and the lane doc flags it precisely because *"most of the dangerous
+mistakes catalogued in this feature were `Compatible` changes made while
+intending to fix strict mode"*. Ask "which arm is the A?"; if the answer is
+HotSpot, that question has not been asked.
+
+**`test_classes` under `Compatible`**, three binaries (pre-L11 / retag-only /
+final), transcripts normalised by EMITTER only — the `[cratonvm]` banner,
+`tracing` records, worktree paths, hex addresses; never by content:
+
+* exit statuses **identical** across all three, including the pre-existing
+  `ToolProviderProbe exit=1`;
+* **10 of 11 normalised transcripts byte-identical**;
+* the 11th, `LicmHoistBench`, differs only in `best_ns` — and differs between
+  *every* pair, including the two whose only delta is a `NativeKind` tag.
+  Same-binary control: **776M / 931M / 1098M / 1540M ns** over four runs. A
+  wall-clock field; `sink`, the computed value, is identical everywhere.
+
+**Full suite** (`regression-suite/run.sh`):
+
+| Arm | pre-fix | after |
+|---|---|---|
+| `Compatible` | 27 passed, 1 failed | **28 passed, 0 failed** |
+| `--jdk-only` | 32 passed, 17 failed | 31 passed, 18 failed |
+
+The strict failure sets are **identical except `RMapGcStress`** — the other 17
+(`RSerial` and the `RJdk*` corpus) fail on both binaries and are the not-green
+strict corpus this wave already has open records against. `RExecutorShutdown`,
+the suite's own executor test, passes in every arm on both binaries.
+
+**`RMapGcStress` is a load flake, and it read as a result in both directions.**
+It failed on the **pre-fix** binary in `Compatible` (making the change look like
+a fix) and on the **fixed** binary in strict (making it look like a regression)
+— both `rc=124`, the 180-second timeout, both while a fat-LTO build saturated
+the host. Interleaved A/B/B/A/A/B/B/A on a quiet host: **8 runs, 8 passes, both
+binaries.** Neither reading was banked. *A suite result taken while the machine
+is building is not a suite result.*
+
+**One measurement worth keeping, because it is the empirical case for §3's
+allow-list entry.** `ThreadPoolExecutor.execute` native invocations on one
+`L10ThreadPoolInitProbe` run, as the change was built up:
+
+| | invocations |
+|---|---:|
+| pre-L11 | 2 |
+| retag only | 2 |
+| **nine sites deleted, no allow-list entry** | **31** |
+| final (+ allow-list entry) | **0** |
+
+Without the entry the deletion still produced the right answer — by reaching the
+native, checking the receiver there, and re-dispatching to real bytecode. Right
+answer, longer route, on a method as hot as a thread pool is busy, and
+**invisible to every probe** because the output was byte-identical throughout.
+The allow-list entry is what makes it free rather than merely correct. It also
+beats the pre-L11 baseline of 2: those two came from `resolve_step1_native`,
+which dispatches on the triple before any of the eight sites ran — the same
+"the lists were never the gate" finding item 3 made from the other direction.
+
+**Gate added:** `the_receiver_shape_scan_set_is_real`, beside the two above.
+`every_threadpool_receiver_shape_site_is_gone` is a loop over
+`FORMER_SITE_FILES` asserting an absence, and a loop over nothing asserts
+nothing — rename one of those four files and it passes while scanning three.
+Shown to fail both ways: an empty list, and a path that no longer resolves.
+
 ## What was deliberately NOT done
 
 `native-builtins`' own `executor_has_real_workers` (~8 call sites there, plus

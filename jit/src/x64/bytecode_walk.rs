@@ -6343,6 +6343,11 @@ impl Compiler {
                                 arg_slots.push(self.pop_stack());
                             }
                             arg_slots.reverse();
+                            // Spill cursor as the bytecode's operand stack sees it
+                            // now that this invoke's arguments are popped. The
+                            // return value belongs HERE, not wherever the
+                            // service-argument reservation below leaves the cursor.
+                            let post_pop_spill = self.next_spill_offset;
 
                             // T5.2.16 — Sibling tail-call optimization.
                             //
@@ -6496,6 +6501,35 @@ impl Compiler {
                             // the stashed exception through the exception
                             // table instead.
                             self.emit_post_invoke_exception_check(ret_type);
+
+                            // Reclaim the spill cursor to the popped-args depth
+                            // before the result is pushed, exactly as the
+                            // dispatch-helper arm below does with its own
+                            // `post_pop_spill`.
+                            //
+                            // `reserve_direct_call_service_slots` parks the cold
+                            // deopt-service copy of the arguments ABOVE the argument
+                            // slots (it has to: the slots `pop_stack` handed back are
+                            // still live sources for `emit_stack_arg_setup`), which
+                            // leaves `next_spill_offset` n slots past the pre-pop top.
+                            // Pushing the return value from there parks it above its
+                            // semantic operand-stack depth, and every later push in
+                            // this basic block inherits the shift. The linear walk
+                            // stays self-consistent, so nothing looks wrong -- until
+                            // the first branch target after the call, whose depth is
+                            // re-established from the bytecode. Writer and reader then
+                            // address different slots and the method computes with a
+                            // stale one. Measured on ECJ's
+                            // `OperandStack.pop(OperandCategory)`, whose `if_icmpeq`
+                            // (a tableswitch merge point) compared `TypeBinding.id`
+                            // against the expected category instead of
+                            // `TypeIds.getCategory(id)`: every JSP compiled after that
+                            // method tiered up threw `AssertionError: Unexpected
+                            // operand at stack top` (tomcat/ecj-operandstack-*.md).
+                            //
+                            // Safe to hand the reserved range back: its only consumer
+                            // is `emit_inline_callee_deopt_check`, emitted just above.
+                            self.next_spill_offset = post_pop_spill;
 
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {
@@ -8434,6 +8468,11 @@ impl Compiler {
                                 arg_slots.push(self.pop_stack());
                             }
                             arg_slots.reverse();
+                            // Spill cursor as the bytecode's operand stack sees it
+                            // now that this invoke's arguments are popped. The
+                            // return value belongs HERE, not wherever the
+                            // service-argument reservation below leaves the cursor.
+                            let post_pop_spill = self.next_spill_offset;
 
                             // Preserve Java arguments for the cold direct-callee
                             // exception-table service before call marshalling.
@@ -8483,6 +8522,35 @@ impl Compiler {
                             // deopts) returns the `i64::MIN` sentinel. Propagate
                             // the deopt instead of running on with a bogus value.
                             self.emit_post_invoke_exception_check(ret_type);
+
+                            // Reclaim the spill cursor to the popped-args depth
+                            // before the result is pushed, exactly as the
+                            // dispatch-helper arm below does with its own
+                            // `post_pop_spill`.
+                            //
+                            // `reserve_direct_call_service_slots` parks the cold
+                            // deopt-service copy of the arguments ABOVE the argument
+                            // slots (it has to: the slots `pop_stack` handed back are
+                            // still live sources for `emit_stack_arg_setup`), which
+                            // leaves `next_spill_offset` n slots past the pre-pop top.
+                            // Pushing the return value from there parks it above its
+                            // semantic operand-stack depth, and every later push in
+                            // this basic block inherits the shift. The linear walk
+                            // stays self-consistent, so nothing looks wrong -- until
+                            // the first branch target after the call, whose depth is
+                            // re-established from the bytecode. Writer and reader then
+                            // address different slots and the method computes with a
+                            // stale one. Measured on ECJ's
+                            // `OperandStack.pop(OperandCategory)`, whose `if_icmpeq`
+                            // (a tableswitch merge point) compared `TypeBinding.id`
+                            // against the expected category instead of
+                            // `TypeIds.getCategory(id)`: every JSP compiled after that
+                            // method tiered up threw `AssertionError: Unexpected
+                            // operand at stack top` (tomcat/ecj-operandstack-*.md).
+                            //
+                            // Safe to hand the reserved range back: its only consumer
+                            // is `emit_inline_callee_deopt_check`, emitted just above.
+                            self.next_spill_offset = post_pop_spill;
 
                             if ret_type != b'V' {
                                 if matches!(ret_type, b'D' | b'F') {

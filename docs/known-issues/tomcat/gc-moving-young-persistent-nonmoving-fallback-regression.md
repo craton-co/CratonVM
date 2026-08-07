@@ -52,9 +52,25 @@ belongs to an unguarded callee"* / *"compiled-frame-oop-not-published"*
 conditions are hit routinely for this workload's JIT'd frames, not rarely.
 
 This same fallback spam was also observed leading into every occurrence of
-the ECJ `OperandStack` corruption documented in
-[ecj-operandstack-corruption-jsp-compilation-500s.md](ecj-operandstack-corruption-jsp-compilation-500s.md)
-— a plausible (not proven) shared root cause across both symptoms.
+the ECJ `OperandStack` corruption, and a shared root cause was proposed there.
+**That half is now settled and it is NOT a shared root cause** — see
+[ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md](../../internal/fixed-suite-bugs/tomcat/ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md).
+The ECJ symptom was a codegen slot-accounting defect: the x64 single-pass
+backend pushed a raw JIT-to-JIT call's return value from a spill cursor the
+service-argument reservation had already moved, so the result landed `n`
+operand-stack slots too deep and every branch target after the call read a
+different slot than the call wrote.
+
+The correlation was real, but the direction is the other way round: both come
+from the same feature. `innermost-rbp-belongs-to-unguarded-callee` is the GC
+*declining* to trust a precise root map when the innermost frame was entered by
+a raw JIT-to-JIT call it cannot decode — the fail-closed safety net working —
+and that same raw-call feature is what carried the codegen defect. The fixed
+binary still emits moving-young fallbacks on the ECJ classes and returns `OK`,
+so the fallback does not corrupt anything by itself. What that leaves for THIS
+doc is unchanged: the fallbacks are a throughput problem, and the open question
+is still whether the two named conditions are a regression in the frame-safety
+proofs or new categories introduced by the recent JIT/interpreter work.
 
 ## Not yet established
 
