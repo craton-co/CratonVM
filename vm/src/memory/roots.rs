@@ -926,6 +926,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     InetAddressRandomBinaryDocValuesRangeQueryTests CONTAINS-query false
     //     negative). Remap companion in `gc.rs` (`gc_update_inet_addr_refs`).
 
+    //     Process-global DatagramSocket side tables (`net_phase_e.rs`):
+    //     `ds_side_table` (fd / closed / timeout / connected / broadcast /
+    //     reuse) and `ds_peer_table` (the connected peer) are both keyed by the
+    //     socket mirror. A relocated mirror makes `ds_get` miss and answer the
+    //     all-defaults `ds_default()` — fd = -1 on a live, connected socket, so
+    //     send() fails as "DatagramSocket: closed" — and a dead mirror's entry
+    //     survives for the allocator to collide with, handing a fresh object a
+    //     dead socket's descriptor. Remap companion in `gc.rs`
+    //     (`gc_update_ds_refs`).
+
     //     NIO SelectionKey table: channel/selector/attachment/key_obj ObjectRefs
     //     live only in `sk_table`; remap was already wired (gc.rs
     //     `sk_table_update_after_gc`) but the root SCAN was missing, so a key
