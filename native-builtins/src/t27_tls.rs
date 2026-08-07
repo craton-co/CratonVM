@@ -435,6 +435,7 @@ pub(crate) fn attach_trust_managers_to_ctx(
         table.insert(key, list);
         ctx_accepted_issuers_table().lock().insert(key, issuers);
     }
+    Ok(())
 }
 
 /// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
@@ -601,6 +602,7 @@ pub(crate) fn attach_key_managers_to_ctx(
     } else {
         table.insert(key, list);
     }
+    Ok(())
 }
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
@@ -660,6 +662,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
             key
         );
     }
+    Ok(())
 }
 
 /// Look up the identity previously associated with an `SSLContext` object.
@@ -969,6 +972,7 @@ fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: Obje
         .map(|managers| !managers.is_empty())
         .unwrap_or(false);
     *huc_default_tm_ctx_key_slot().lock() = has_managers.then_some(key);
+    Ok(())
 }
 
 pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
@@ -992,6 +996,7 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
         );
     }
     set_huc_default_key_managers_ctx_key(if has_kms { Some(key) } else { None });
+    Ok(())
 }
 
 /// Capture all TLS state for the Java SSLContext supplying HttpsURLConnection.
@@ -1016,6 +1021,7 @@ pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: Obje
         trust_managers_ctx_key,
     );
     *huc_default_client_config_slot().lock() = config.ok();
+    Ok(())
 }
 
 /// Capture an instance factory without changing the process-default TLS
@@ -10819,6 +10825,7 @@ pub(crate) fn set_engine_trust_ctx_key(
     with_engine(id, |s| {
         s.trust_managers_ctx_key = Some(key);
     });
+    Ok(())
 }
 
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why

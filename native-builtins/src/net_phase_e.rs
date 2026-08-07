@@ -3552,8 +3552,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
                 return Ok(Some(Value::Object(Some(other))));
             }
             let b_norm = uri_remove_dot_segments(&b_path)?;
-            let t_norm = uri_remove_dot_segments(&t_path);
-            if !t_norm?.starts_with(&b_norm) {
+            let t_norm = uri_remove_dot_segments(&t_path)?;
+            if !t_norm.starts_with(&b_norm) {
                 return Ok(Some(Value::Object(Some(other))));
             }
             let rel = &t_norm[b_norm.len()..];
@@ -7651,9 +7651,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
             // (os error 123) that would otherwise mask the real not-found error
             // from the canonical `C:/...` path.
             let mut first_err: Option<std::io::Error> = None;
-            let Some(result) = None else {
-                return Ok(None);
-            };
+            let mut result: Option<Vec<u8>> = None;
             for p in &try_paths {
                 match std::fs::read(p) {
                     Ok(b) => {
@@ -15954,7 +15952,7 @@ fn re10_alloc_server(
             let ip_str = ip.to_string();
             Some(alloc_inet_socket_address_resolved(
                 ctx, &ip_str, &ip_str, port,
-            ))
+            )?)
         }
         None => None,
     };

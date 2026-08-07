@@ -384,6 +384,7 @@ pub(crate) fn init_urlclassloader_constructor_with_default_parent(
     let this = ctx.read_native_pin(this_pin, this);
     init_urlclassloader_constructor_with_parent(ctx, this, urls, Value::Object(parent));
     ctx.unpin_native_roots(this_pin);
+    Ok(())
 }
 
 /// Register ClassLoader natives needed in real-JDK mode.

@@ -2179,7 +2179,7 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
     let include_filter_pin = ctx.pin_native_root(include_filter);
     let mut urls: Vec<(ObjectRef, usize)> = Vec::new();
     let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
-    for jar_entry in p59_jar_collect_entries(ctx, &jar_path) {
+    for jar_entry in p59_jar_collect_entries(ctx, &jar_path)? {
         let Value::Object(Some(jar_entry)) = jar_entry else {
             continue;
         };
@@ -2230,8 +2230,8 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
                     // the former `jar:nested:` form; preserve the ordinary
                     // `jar:file:` spelling for nested JAR/ZIP entries.
                     let url_text = format!("jar:nested:/{jar_uri_path}/!{name}!/");
-                    let url = p59_alloc_url(ctx, &url_text);
-                    urls.push((url?, ctx.pin_native_root(url?)));
+                    let url = p59_alloc_url(ctx, &url_text)?;
+                    urls.push((url, ctx.pin_native_root(url)));
                 }
             }
         }
