@@ -174,6 +174,7 @@ pub const INVENTORY: &[E] = &[
     // latched `VmFlags` snapshot -- `CRATONVM_DBG=token` could not reach them
     // and `flags::with_thread_overrides` could not arrange one in a test.
     E { group: Group::DBG, token: "callee-deopt", on_key: Some("CRATONVM_DBG_CALLEE_DEOPT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "layout-alias", on_key: Some("CRATONVM_DBG_LAYOUT_ALIAS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "check-override", on_key: Some("CRATONVM_DBG_CHECK_OVERRIDE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },

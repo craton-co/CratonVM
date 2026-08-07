@@ -54,7 +54,7 @@ conditions are hit routinely for this workload's JIT'd frames, not rarely.
 This same fallback spam was also observed leading into every occurrence of
 the ECJ `OperandStack` corruption, and a shared root cause was proposed there.
 **That half is now settled and it is NOT a shared root cause** — see
-[ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md](../../internal/fixed-suite-bugs/tomcat/ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md).
+`fixed-suite-bugs/tomcat/ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md`.
 The ECJ symptom was a codegen slot-accounting defect: the x64 single-pass
 backend pushed a raw JIT-to-JIT call's return value from a spill cursor the
 service-argument reservation had already moved, so the result landed `n`

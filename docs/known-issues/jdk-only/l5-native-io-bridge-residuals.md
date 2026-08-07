@@ -46,7 +46,7 @@ method, so `--jdk-only` admits it on a claim nobody has checked.
 >   `scripts/jdk-only-adjudicate.py` prints the split.
 >
 > **Item 1 is CLOSED 2026-08-06** —
-> [`synthetic-process-cluster-RETIRED-20260806.md`](../../internal/synthetic-process-cluster-RETIRED-20260806.md).
+> `synthetic-process-cluster-RETIRED-20260806.md`.
 > The cluster was **37 rows and not 25** (the count below omits
 > `cratonvm/synthetic/AnonymousObject$2`, 4 rows, and miscounts the pipe
 > streams), and the `Bridge` tag was wrong by §1.5's own definition since no

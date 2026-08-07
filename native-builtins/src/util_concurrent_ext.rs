@@ -808,7 +808,7 @@ fn native_lock_support_get_blocker(
 ///
 /// That is two layouts on one class, and it is how Tomcat's CGI response body
 /// came back empty (see
-/// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
+/// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
 ///
 /// `num_fields < real` is a self-discriminating test for it: a class this call
 /// FABRICATED would declare exactly `num_fields` fields, so `real == num_fields`
