@@ -82,6 +82,27 @@ fn int_arg(args: &[Value], idx: usize) -> i32 {
     }
 }
 
+/// Render the raw argument list for a refusal message.
+///
+/// `long_arg`/`int_arg` answer 0 for an argument that is absent or of the wrong
+/// `Value` shape, so a refused `(addr, len, pos)` triple of zeroes is ambiguous:
+/// the JDK may genuinely have passed a zero, or the dispatch may have handed us
+/// a shape these accessors do not read. Printing the arguments as received
+/// separates the two without a rebuild.
+fn args_debug(args: &[Value]) -> String {
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|v| match v {
+            Value::Int(x) => format!("I:{x}"),
+            Value::Long(x) => format!("J:{x}"),
+            Value::Object(Some(_)) => "L:obj".to_string(),
+            Value::Object(None) => "L:null".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
 // ---------------------------------------------------------------------------
 // sun/nio/ch/FileDispatcherImpl natives
 // ---------------------------------------------------------------------------
@@ -102,7 +123,10 @@ fn native_fd_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let addr = long_arg(args, 1);
     let len = int_arg(args, 2);
     if addr == 0 || len < 0 {
-        return Err(io_error("read0: bad addr/len"));
+        return Err(io_error(format!(
+            "read0: bad addr/len (addr={addr:#x}, len={len}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("read0: FileDescriptor has no open handle"));
@@ -139,7 +163,10 @@ fn native_fd_pread0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let len = int_arg(args, 2);
     let pos = long_arg(args, 3);
     if addr == 0 || len < 0 || pos < 0 {
-        return Err(io_error("pread0: bad addr/len/pos"));
+        return Err(io_error(format!(
+            "pread0: bad addr/len/pos (addr={addr:#x}, len={len}, pos={pos}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("pread0: FileDescriptor has no open handle"));
@@ -169,7 +196,10 @@ fn native_fd_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let addr = long_arg(args, 1);
     let len = int_arg(args, 2);
     if addr == 0 || len < 0 {
-        return Err(io_error("write0: bad addr/len"));
+        return Err(io_error(format!(
+            "write0: bad addr/len (addr={addr:#x}, len={len}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("write0: FileDescriptor has no open handle"));
@@ -200,7 +230,10 @@ fn native_fd_pwrite0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let len = int_arg(args, 2);
     let pos = long_arg(args, 3);
     if addr == 0 || len < 0 || pos < 0 {
-        return Err(io_error("pwrite0: bad addr/len/pos"));
+        return Err(io_error(format!(
+            "pwrite0: bad addr/len/pos (addr={addr:#x}, len={len}, pos={pos}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("pwrite0: FileDescriptor has no open handle"));
