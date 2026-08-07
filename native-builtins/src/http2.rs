@@ -1014,7 +1014,7 @@ fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRe
 fn http2_send_async(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
             let req = match args.get(1) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
@@ -1022,7 +1022,7 @@ fn http2_send_async(
                     let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Ok(Some(Value::Object(Some(cf)))));
+                    return Ok(Some(Value::Object(Some(cf))));
                 }
             };
             let method_idx = match ctx.get_field(req, REQ_METHOD) {
@@ -1037,7 +1037,7 @@ fn http2_send_async(
                     let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Ok(Some(Value::Object(Some(cf)))));
+                    return Ok(Some(Value::Object(Some(cf))));
                 }
             };
             let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
@@ -1047,7 +1047,7 @@ fn http2_send_async(
                     let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Ok(Some(Value::Object(Some(cf)))));
+                    return Ok(Some(Value::Object(Some(cf))));
                 }
             };
             let use_tls = match ctx.get_field(uri_obj, URI_SCHEME) {
@@ -1077,7 +1077,7 @@ fn http2_send_async(
             let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
             ctx.set_field(cf, 0, Value::Object(Some(resp)));
             ctx.set_field(cf, 1, Value::Int(1)); // completed
-            Ok(Ok(Some(Value::Object(Some(cf)))))
+            Ok(Some(Value::Object(Some(cf))))
 }
 
 /// `HttpClient.Version` for an ordinal, as a real enum object.

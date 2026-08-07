@@ -884,14 +884,14 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
 fn cl_real_load_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Ok(Some(Value::Object(None)))),
+        _ => return Ok(Some(Value::Object(None))),
     };
     let class_name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Ok(Some(Value::Object(None)))),
+        _ => return Ok(Some(Value::Object(None))),
     };
 
     // `ClassLoader.loadClass(String)` is virtual too. Honor an override of
@@ -925,12 +925,12 @@ fn cl_real_load_class(
     // `loadClass(String,boolean)` native (→ `cl_real_load_class_base`), so there
     // is no recursion back here.
     if crate::classloader::receiver_overrides_load_class_resolve(ctx, this) {
-        return Ok(Ok(ctx.invoke_virtual(
+        return Ok(ctx.invoke_virtual(
             this,
             "loadClass",
             "(Ljava/lang/String;Z)Ljava/lang/Class;",
             &[Value::Object(Some(class_name_obj)), Value::Int(0)],
-        )?));
+        )?);
     }
 
     Ok(cl_real_load_class_base(ctx, this, class_name_obj)?)
@@ -1110,7 +1110,7 @@ fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     class_name_obj: ObjectRef,
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this_pin = ctx.pin_native_root(this);
     let name_pin = ctx.pin_native_root(class_name_obj);
     let result = cl_real_load_class_base_rooted(ctx, this, this_pin, class_name_obj, name_pin)?;
@@ -1124,7 +1124,7 @@ fn cl_real_load_class_base_rooted(
     this_pin: usize,
     class_name_obj: ObjectRef,
     name_pin: usize,
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
     let __obsreg_dbg =
@@ -1185,7 +1185,7 @@ fn cl_real_load_class_base_rooted(
     if crate::classloader::is_generated_proxy_name(&internal) {
         if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
         {
-            return Ok(Ok(Some(Value::Object(Some(mirror)))));
+            return Ok(Some(Value::Object(Some(mirror))));
         }
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
@@ -1222,7 +1222,7 @@ fn cl_real_load_class_base_rooted(
     if crate::classloader::is_user_defined_loader(ctx, this) {
         if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
         {
-            return Ok(Ok(Some(Value::Object(Some(mirror)))));
+            return Ok(Some(Value::Object(Some(mirror))));
         }
     }
 
@@ -1355,7 +1355,7 @@ fn cl_real_load_class_base_rooted(
             let _ = (this, class_name_obj);
             match delegated {
                 Ok(Some(Value::Object(Some(mirror)))) => {
-                    return Ok(Ok(Some(Value::Object(Some(mirror)))));
+                    return Ok(Some(Value::Object(Some(mirror))));
                 }
                 _ => {
                     parent_user_defined_authoritative_miss = true;
@@ -1398,7 +1398,7 @@ fn cl_real_load_class_base_rooted(
         && !stub_would_answer_delegation
     {
         match load_class_visible_to(ctx, this, &internal) {
-            ClassLookup::Found(mirror) => return Ok(Ok(Some(mirror))),
+            ClassLookup::Found(mirror) => return Ok(Some(mirror)),
             ClassLookup::DependencyMissing(missing) => {
                 let exc = no_class_def_found_error(ctx, &missing);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
@@ -1410,7 +1410,7 @@ fn cl_real_load_class_base_rooted(
         if let Some(mirror) =
             crate::jboss_module_loader::load_property_bridge_class(ctx, &class_name)
         {
-            return Ok(Ok(Some(mirror)));
+            return Ok(Some(mirror));
         }
     }
 
@@ -1433,7 +1433,7 @@ fn cl_real_load_class_base_rooted(
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(class_name_obj))],
-        );
+        )?;
         // The override is the loader's own Java (Hibernate's
         // AggregatedClassLoader iterates its scoped child loaders here);
         // refresh before the fall-through arms reuse either local.
@@ -1442,7 +1442,7 @@ fn cl_real_load_class_base_rooted(
         let _ = class_name_obj;
         match result {
             // findClass produced the class — that is the answer.
-            Ok(Some(Value::Object(Some(_)))) => return result,
+            Some(Value::Object(Some(_))) => return Ok(result),
             // A miss from URLClassLoader's own native URL/HTTP search is
             // authoritative -- propagate it (e.g. ClassNotFoundException)
             // rather than falling through to step 2b's global-store
@@ -1457,7 +1457,7 @@ fn cl_real_load_class_base_rooted(
             }
             // In the deferred case, findClass missing/throwing falls through to
             // the global store as the last resort. Otherwise propagate.
-            _ if !defer_to_find_class => return result,
+            _ if !defer_to_find_class => return Ok(result),
             _ => {}
         }
     }
@@ -1467,7 +1467,7 @@ fn cl_real_load_class_base_rooted(
     //     whose override legitimately misses still resolves here.
     if defer_to_find_class && !scoped_user_chain {
         match load_class_visible_to(ctx, this, &internal) {
-            ClassLookup::Found(mirror) => return Ok(Ok(Some(mirror))),
+            ClassLookup::Found(mirror) => return Ok(Some(mirror)),
             ClassLookup::DependencyMissing(missing) => {
                 let exc = no_class_def_found_error(ctx, &missing);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
@@ -1495,14 +1495,14 @@ fn cl_real_load_class_base_rooted(
 pub(crate) fn cl_real_load_class_base_from_args(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Ok(Some(Value::Object(None)))),
+        _ => return Ok(Some(Value::Object(None))),
     };
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Ok(Some(Value::Object(None)))),
+        _ => return Ok(Some(Value::Object(None))),
     };
     Ok(cl_real_load_class_base(ctx, this, name_obj)?)
 }

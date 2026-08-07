@@ -1732,7 +1732,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
             if let Some(real) =
                 p67_session_delegate(ctx, args, "addCloseAction", "(Ljava/lang/Runnable;)V")
             {
-                return Ok(real);
+                return real;
             }
             p67_session_add_action_synthetic(ctx, args)
         },
@@ -1748,7 +1748,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
                 "addOrCleanupIfFail",
                 "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
             ) {
-                return Ok(real);
+                return real;
             }
             p67_session_add_action_synthetic(ctx, args)
         },
@@ -1764,14 +1764,14 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
                 "addInternal",
                 "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
             ) {
-                return Ok(real);
+                return real;
             }
             p67_session_add_action_synthetic(ctx, args)
         },
     );
     r.register(session, "release0", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "release0", "()V") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         p67_session_release(ctx, this);
@@ -1779,7 +1779,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     });
     r.register(session, "acquire0", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "acquire0", "()V") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         p67_session_acquire(ctx, this)?;
@@ -1793,7 +1793,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
             if let Some(real) =
                 p67_session_delegate(ctx, args, "whileAlive", "(Ljava/lang/Runnable;)V")
             {
-                return Ok(real);
+                return real;
             }
             let this = obj_arg(args, 0)?;
             let action = obj_arg(args, 1)?;
@@ -1819,7 +1819,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
             if let Some(real) =
                 p67_session_delegate(ctx, args, "ownerThread", "()Ljava/lang/Thread;")
             {
-                return Ok(real);
+                return real;
             }
             let this = obj_arg(args, 0)?;
             if p67_session_modelled(ctx, this) {
@@ -1840,7 +1840,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
             if let Some(real) =
                 p67_session_delegate(ctx, args, "isAccessibleBy", "(Ljava/lang/Thread;)Z")
             {
-                return Ok(real);
+                return real;
             }
             let this = obj_arg(args, 0)?;
             if p67_session_modelled(ctx, this) {
@@ -1855,7 +1855,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     );
     r.register(session, "isAlive", "()Z", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "isAlive", "()Z") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         let alive = !p67_session_modelled(ctx, this) || p67_session_state(ctx, this) == 1;
@@ -1863,7 +1863,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     });
     r.register(session, "checkValidStateRaw", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "checkValidStateRaw", "()V") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         p67_session_check_valid(ctx, this)?;
@@ -1871,7 +1871,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     });
     r.register(session, "checkValidState", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "checkValidState", "()V") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         p67_session_check_valid(ctx, this)?;
@@ -1891,13 +1891,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     );
     r.register(session, "isCloseable", "()Z", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "isCloseable", "()Z") {
-            return Ok(real);
+            return real;
         }
         Ok(Some(Value::Int(1)))
     });
     r.register(session, "close", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "close", "()V") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         p67_session_just_close(ctx, this)?;
@@ -1906,7 +1906,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     });
     r.register(session, "justClose", "()V", |ctx, args| {
         if let Some(real) = p67_session_delegate(ctx, args, "justClose", "()V") {
-            return Ok(real);
+            return real;
         }
         let this = obj_arg(args, 0)?;
         p67_session_just_close(ctx, this)?;

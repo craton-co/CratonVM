@@ -4688,7 +4688,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
     fn read_all_lines_impl(
         ctx: &mut dyn NativeContext,
         args: &[Value],
-    ) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+    ) -> cratonvm_types::error::MethodCallResult {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
         match p57_read_to_string(&p) {
@@ -4723,7 +4723,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 ctx.set_field(list, data_slot, Value::Object(Some(arr)));
                 ctx.set_field(list, size_slot, Value::Int(lines.len() as i32));
                 ctx.unpin_native_roots(list_pin);
-                Ok(Ok(Some(Value::Object(Some(list)))))
+                Ok(Some(Value::Object(Some(list))))
             }
             Err(e) => Err(p57_io_error(&e)),
         }

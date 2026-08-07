@@ -9714,7 +9714,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) -> Result<(), Meth
 fn wrap_single(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => Some(*b),
@@ -9723,13 +9723,13 @@ fn wrap_single(
     let dst = match args.get(2) {
         Some(Value::Object(Some(b))) => *b,
         _ => {
-            return Ok(Ok(Some(Value::Object(Some(alloc_engine_result(
+            return Ok(Some(Value::Object(Some(alloc_engine_result(
                 ctx,
                 SR_BUFFER_OVERFLOW,
                 HS_NEED_WRAP_R,
                 0,
                 0,
-            )?)))))
+            )?))))
         }
     };
     Ok(do_wrap(ctx, this, src.into_iter().collect(), dst)?)
@@ -9738,7 +9738,7 @@ fn wrap_single(
 fn wrap_array(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let srcs_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => Some(*a),
@@ -9747,13 +9747,13 @@ fn wrap_array(
     let dst = match args.get(2) {
         Some(Value::Object(Some(b))) => *b,
         _ => {
-            return Ok(Ok(Some(Value::Object(Some(alloc_engine_result(
+            return Ok(Some(Value::Object(Some(alloc_engine_result(
                 ctx,
                 SR_BUFFER_OVERFLOW,
                 HS_NEED_WRAP_R,
                 0,
                 0,
-            )?)))))
+            )?))))
         }
     };
     let mut srcs: Vec<ObjectRef> = Vec::new();
@@ -9771,7 +9771,7 @@ fn wrap_array(
 fn wrap_array_offset(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let srcs_arr = match args.get(1) {
         Some(Value::Object(Some(a))) => Some(*a),
@@ -9782,13 +9782,13 @@ fn wrap_array_offset(
     let dst = match args.get(4) {
         Some(Value::Object(Some(b))) => *b,
         _ => {
-            return Ok(Ok(Some(Value::Object(Some(alloc_engine_result(
+            return Ok(Some(Value::Object(Some(alloc_engine_result(
                 ctx,
                 SR_BUFFER_OVERFLOW,
                 HS_NEED_WRAP_R,
                 0,
                 0,
-            )?)))))
+            )?))))
         }
     };
     let mut srcs: Vec<ObjectRef> = Vec::new();
@@ -9809,7 +9809,7 @@ fn do_wrap(
     this: ObjectRef,
     srcs: Vec<ObjectRef>,
     dst: ObjectRef,
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(ctx, this);
     let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
@@ -9831,7 +9831,7 @@ fn do_wrap(
             );
         }
         let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Ok(Some(Value::Object(Some(result?)))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     // Lazily realize rustls connection.
@@ -9966,24 +9966,24 @@ fn do_wrap(
         );
     }
     let result = alloc_engine_result(ctx, status, hs, total_consumed, produced as i32);
-    Ok(Ok(Some(Value::Object(Some(result?)))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn unwrap_single(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
         _ => {
-            return Ok(Ok(Some(Value::Object(Some(alloc_engine_result(
+            return Ok(Some(Value::Object(Some(alloc_engine_result(
                 ctx,
                 SR_BUFFER_UNDERFLOW,
                 HS_NEED_UNWRAP_R,
                 0,
                 0,
-            )?)))))
+            )?))))
         }
     };
     let dst = match args.get(2) {
@@ -9996,18 +9996,18 @@ fn unwrap_single(
 fn unwrap_array(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
         _ => {
-            return Ok(Ok(Some(Value::Object(Some(alloc_engine_result(
+            return Ok(Some(Value::Object(Some(alloc_engine_result(
                 ctx,
                 SR_BUFFER_UNDERFLOW,
                 HS_NEED_UNWRAP_R,
                 0,
                 0,
-            )?)))))
+            )?))))
         }
     };
     let mut dsts: Vec<ObjectRef> = Vec::new();
@@ -10025,18 +10025,18 @@ fn unwrap_array(
 fn unwrap_array_offset(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     args: &[Value],
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let this = obj_arg(args, 0)?;
     let src = match args.get(1) {
         Some(Value::Object(Some(b))) => *b,
         _ => {
-            return Ok(Ok(Some(Value::Object(Some(alloc_engine_result(
+            return Ok(Some(Value::Object(Some(alloc_engine_result(
                 ctx,
                 SR_BUFFER_UNDERFLOW,
                 HS_NEED_UNWRAP_R,
                 0,
                 0,
-            )?)))))
+            )?))))
         }
     };
     let off = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
@@ -10059,7 +10059,7 @@ fn do_unwrap(
     this: ObjectRef,
     src: ObjectRef,
     dsts: Vec<ObjectRef>,
-) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
+) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(ctx, this);
     let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
@@ -10080,7 +10080,7 @@ fn do_unwrap(
             );
         }
         let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Ok(Some(Value::Object(Some(result?)))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     {
@@ -10157,7 +10157,7 @@ fn do_unwrap(
             );
         }
         let result = alloc_engine_result(ctx, status, hs, 0, idx as i32);
-        return Ok(Ok(Some(Value::Object(Some(result?)))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     // If the caller's dst has no room for APPLICATION data, do NOT
@@ -10180,7 +10180,7 @@ fn do_unwrap(
             );
         }
         let result = alloc_engine_result(ctx, SR_BUFFER_OVERFLOW, hs, 0, 0);
-        return Ok(Ok(Some(Value::Object(Some(result?)))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     let src_view = bb_view(ctx, src);
@@ -10440,7 +10440,7 @@ fn do_unwrap(
         consumed as i32,
         produced_total as i32,
     );
-    Ok(Ok(Some(Value::Object(Some(result?)))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // -----------------------------------------------------------------------------

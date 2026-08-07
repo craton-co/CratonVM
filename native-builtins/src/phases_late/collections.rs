@@ -1908,7 +1908,7 @@ pub(crate) fn native_p64_lhm_seq_entry_set(
     let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, entries.len());
     for (i, e) in entries.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Object(Some(*e?)));
+        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
     }
     ctx.set_field(al, 0, Value::Object(Some(arr)));
     ctx.set_field(al, 1, Value::Int(entries.len() as i32));
