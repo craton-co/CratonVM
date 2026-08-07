@@ -68,7 +68,40 @@ use crate::flags::{FlagSource, MapSource};
 #[allow(non_camel_case_types)]
 pub enum Group {
     /// `CRATONVM_DBG` — tracing, dumps, extra verification. Class (a) in the
-    /// census: no token here can change a program's result.
+    /// census: no token here can change a program's result — **except for the
+    /// three named below**, which can.
+    ///
+    /// The unqualified rule was already false before it was ever written down,
+    /// so stating it plainly is worth more than an invariant nobody can rely
+    /// on. The exceptions, all verified against their read sites:
+    ///
+    /// * `force-moving` (`CRATONVM_DBG_FORCE_MOVING`) — forces the moving
+    ///   (Cheney) young collection even when quiescence says JIT frames are
+    ///   live. `gc_quiescence.rs` records that it is the *only* thing that can
+    ///   carry a cycle past `divert_non_moving`, and `gen_heap.rs` calls it
+    ///   UNSAFE when a JIT frame genuinely is live, because it relocates
+    ///   JIT-held raw pointers.
+    /// * `sweep-zero` (`CRATONVM_DBG_SWEEP_ZERO`) — sets `retain_dead_objects`
+    ///   in the young sweep, so the sweep stops collapsing adjacent dead
+    ///   objects and keeps one record each. It changes what the collector
+    ///   reclaims, not merely what it prints.
+    /// * `nativelibraries-load-ok` (`CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK`) —
+    ///   restores an unconditional `System.loadLibrary` success, which flips
+    ///   callers like Netty's `NativeLibraryLoader` out of their pure-Java
+    ///   fallback.
+    ///
+    /// These are deliberately NOT renamed out of `DBG`. Moving them would leave
+    /// the invariant just as broken with one fewer visible counterexample,
+    /// which is the state that let the rule read as true for so long.
+    ///
+    /// Consequence for the generated docs: `render-inventory.py` derives the
+    /// `Class` column from the group alone, so all three are labelled `diag`
+    /// there. That is a known generator limitation with three instances, not a
+    /// claim about any one of them.
+    ///
+    /// A *new* behaviour-changing knob should still go in the group that
+    /// matches what it does — `COMPAT`, `GC`, `SECURITY` — rather than
+    /// lengthening this list.
     DBG,
     /// `CRATONVM_JIT` — compiler passes, tiering, deopt, precise maps, shadow stack.
     JIT,
@@ -161,6 +194,38 @@ pub struct E {
 /// Generated from the census scan; `types/tests/flag_surface.rs` asserts it
 /// stays complete and `tools/flag-census/check-surface.sh` asserts the code and
 /// the reference docs agree with it.
+///
+/// # Adding a `CRATONVM_*` flag: the four files, all of them
+///
+/// The enforcing tests are `cargo test` assertions, not compile errors, so
+/// `cargo build --all-targets` is green while any of these is missing. Editing
+/// two of the four and stopping is how this has gone red before.
+///
+/// 1. `types/src/flag_groups.rs` — an [`E`] row here (or a [`SCALARS`] entry).
+///    This is the only file that makes a name *declared*.
+/// 2. `types/tests/flag-surface.txt` — the name, in sort order. Compared
+///    byte-for-byte, so match the file's existing line endings.
+/// 3. `docs/flag-tokens.md` — a `` | `token` | `KEY` | `` row in the group's
+///    section, and that section's "N tokens." count.
+/// 4. `docs/config/flag-inventory.md` — a Full-inventory row, the
+///    "N rows: D declared, A allowlisted." header, and the **declared** count
+///    in "Where the surface stands".
+///
+/// Enforced by `types/tests/flag_declaration_guard.rs` (a literal with no
+/// declaration), `flag_surface.rs` (1 vs 2, both directions) and
+/// `flag_docs_generated.rs` (1 vs 3 and 4, both directions). Files 3 and 4 are
+/// generated — `tools/flag-census/render-tokens.sh` and `render-inventory.py`
+/// write them from this table, and running them beats hand-editing.
+///
+/// A `CRATONVM_*` name is not free-standing in either direction: a literal with
+/// no row fails the guard, and a row with no read site fails check 5 of
+/// `check-surface.sh`. Land the declaration and its consumer together.
+///
+/// Declaring a name is also what routes it through the latched snapshot, so the
+/// read site must use `flags::runtime_var[_os]` — a raw `std::env::var` on a
+/// declared name additionally trips check 4 of `check-surface.sh`. No
+/// `flags.rs` field is needed: `VmFlags::legacy_var_os` serves every declared
+/// name from one map.
 ///
 /// One row per line, deliberately. rustfmt would break each entry across five
 /// lines, turning a 541-line table that `grep` can answer questions about into
@@ -421,6 +486,19 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "moving-young-verify", on_key: Some("CRATONVM_MOVING_YOUNG_VERIFY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "msc", on_key: Some("CRATONVM_DBG_MSC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mtroots", on_key: Some("CRATONVM_DBG_MTROOTS"), off_key: None, off_word: None },
+    // A REVERT knob, not a trace: it restores the pre-2026-08 unconditional
+    // `System.loadLibrary`/`NativeLibraries.load` success for a library this VM
+    // does not implement, which flips callers like Netty's
+    // `NativeLibraryLoader` out of their pure-Java fallback. Filed under DBG
+    // because the key is spelled `DBG_` and every `CRATONVM_DBG_*` key in this
+    // table is in `Group::DBG`.
+    //
+    // It is one of three DBG tokens that can change a program's result, NOT the
+    // only one — `force-moving` is the prior art and the more dangerous case
+    // (it relocates JIT-held raw pointers). All three are named in the
+    // `Group::DBG` doc; `render-inventory.py` labels the whole group `diag`,
+    // which is a generator limitation recorded there rather than a wart here.
+    E { group: Group::DBG, token: "nativelibraries-load-ok", on_key: Some("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ncdfe", on_key: Some("CRATONVM_DBG_NCDFE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "needs-exact-trace", on_key: Some("CRATONVM_NEEDS_EXACT_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "net", on_key: Some("CRATONVM_DBG_NET"), off_key: None, off_word: None },
@@ -1095,6 +1173,17 @@ pub const INVENTORY: &[E] = &[
     // Opt back in to the pre-hardening no-op `SSLEngine`. Stated positively
     // because the legacy name already spells the permissive direction.
     E { group: Group::SECURITY, token: "noncrypto-sslengine", on_key: Some("CRATONVM_ALLOW_NONCRYPTO_SSLENGINE"), off_key: None, off_word: None },
+    // The JPMS `exports` gate on reflective access, covering all three arms at
+    // once (`Field.get`/`set`, `Method.invoke`, `Constructor.newInstance`) —
+    // `lang_class::check_reflection_export_access_with_target_id` is the single
+    // helper all three ask. The token is stated positively and the ONLY spelling
+    // is the opt-out, so the gate is enforced by default and setting the key at
+    // all (any value — the consumer tests `.is_ok()`, not the value) disables
+    // it. SECURITY rather than DBG: this is access-control policy, the same
+    // class as `noncrypto-sslengine` and `untrusted-code` above, and filing it
+    // here is what makes `render-inventory.py` label it `behaviour` instead of
+    // `diag`.
+    E { group: Group::SECURITY, token: "reflect-export-gate", on_key: None, off_key: Some("CRATONVM_REFLECT_NO_EXPORT_GATE"), off_word: None },
     E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
     E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
@@ -1112,6 +1201,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
+    // Default-ON, off for the exact untrimmed string `0` only — the
+    // `!matches!(…, Ok("0"))` at `vm_exec::vh_strict_reference_return`. Same
+    // shape as `mh-strict-invokeexact` above and deliberately a SEPARATE knob:
+    // the two rules fire on disjoint method names and share only their funnel,
+    // so one going wrong in the field must not force the other off.
+    E { group: Group::COMPAT, token: "vh-strict-reference-return", on_key: Some("CRATONVM_VH_STRICT_REFERENCE_RETURN"), off_key: None, off_word: Some("0") },
     E { group: Group::TEST, token: "force-win-build", on_key: Some("CRATONVM_FORCE_WIN_BUILD"), off_key: None, off_word: None },
     E { group: Group::TEST, token: "jdk", on_key: Some("CRATONVM_TEST_JDK"), off_key: None, off_word: None },
     E { group: Group::TEST, token: "segv", on_key: Some("CRATONVM_TEST_SEGV"), off_key: None, off_word: None },

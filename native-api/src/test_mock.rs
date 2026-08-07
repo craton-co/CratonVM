@@ -30,7 +30,21 @@
 //!  * `alloc_object` / `new_array` stubs returning fresh, 8-byte-aligned
 //!    `ObjectRef` pointers, and
 //!  * a programmable `invoke_virtual` that returns a caller-configured
-//!    [`MethodCallResult`] (defaults to `Ok(None)` — Java `void`).
+//!    [`MethodCallResult`] (defaults to `Ok(None)` — Java `void`), and
+//!  * an opt-in class model ([`MockNativeContext::declare_class`]) so
+//!    `resolve_field_index` / `resolve_field_index_by_class_id` can answer
+//!    something other than a constant `None`. Nothing is declared by default,
+//!    so an untouched mock behaves exactly as it always has.
+//!
+//! ## Fidelity note
+//!
+//! `get_field_by_name` here answers `Value::Object(None)` for a name it cannot
+//! resolve, which is what the production `NativeContextImpl` does
+//! (`vm/src/vm/vm_exec.rs:10613-10623`) and what the trait promises
+//! (`registry.rs`: "Returns `Value::Object(None)` if the field is not found").
+//! `native-builtins/src/test_utils.rs`'s much larger `MockNativeContext`
+//! answers `Value::Int(0)` instead — see the DIVERGENCE note on its
+//! `get_field_by_name`. Do not carry a conclusion from that mock to this one.
 //!
 //! Tests that need real heap layout, real class loading, or real threading
 //! should keep using `native-builtins`'s `MockNativeContext` instead.
@@ -122,6 +136,20 @@ pub struct MockNativeContext {
     handle_slots: UnsafeCell<Vec<Option<ObjectRef>>>,
     /// Nested scope bases, matching the production `JvmThread` layout.
     handle_scope_bases: UnsafeCell<Vec<usize>>,
+    /// Optional class model: the instance fields a test says `ClassId` (as
+    /// `u32`) declares. Empty by default, so `resolve_field_index*` and
+    /// `declared_fields` answer exactly as they did before this existed.
+    /// Populated via [`MockNativeContext::declare_class`].
+    declared_fields: UnsafeCell<HashMap<u32, Vec<FieldMetadata>>>,
+    /// `class_name -> ClassId` for the classes a test declared, so
+    /// `resolve_field_index` (the by-NAME form) can reach the model.
+    class_ids_by_name: UnsafeCell<HashMap<String, ClassId>>,
+    /// `ClassId -> class_name`, the inverse of `class_ids_by_name`.
+    class_names_by_id: UnsafeCell<HashMap<u32, String>>,
+    /// `object_pointer -> (ClassId, num_fields)` for objects minted through
+    /// `alloc_object`. Absent objects keep the historical answers
+    /// (`ClassId::new(0)` / `0` fields).
+    object_classes: UnsafeCell<HashMap<usize, (ClassId, usize)>>,
 }
 
 impl Default for MockNativeContext {
@@ -144,7 +172,65 @@ impl MockNativeContext {
             invoke_virtual_result: UnsafeCell::new(None),
             handle_slots: UnsafeCell::new(Vec::new()),
             handle_scope_bases: UnsafeCell::new(Vec::new()),
+            declared_fields: UnsafeCell::new(HashMap::new()),
+            class_ids_by_name: UnsafeCell::new(HashMap::new()),
+            class_names_by_id: UnsafeCell::new(HashMap::new()),
+            object_classes: UnsafeCell::new(HashMap::new()),
         }
+    }
+
+    /// Register a class with a known instance-field layout and return its
+    /// `ClassId`.
+    ///
+    /// Without this the mock has no class metadata at all, so
+    /// `resolve_field_index` / `resolve_field_index_by_class_id` can only ever
+    /// answer `None` — and the CLASS-SIDE WITNESS pattern
+    /// (`resolve_field_index_by_class_id(class_id, "<a field only the real JDK
+    /// class declares>").is_none()`, e.g.
+    /// `native-builtins/src/classloader.rs::cl_has_synthetic_layout`) then
+    /// takes its synthetic arm unconditionally. A unit test of a dual-layout
+    /// discriminator written against such a mock passes vacuously: it never
+    /// exercises the real-layout arm, and can be green while production takes
+    /// the other one.
+    ///
+    /// Both arms are reachable now:
+    ///
+    /// * REAL layout — `declare_class("p/Real", &[("parent", "Ljava/lang/ClassLoader;")])`,
+    ///   then `alloc_object(cid, n)`. The witness resolves and the predicate is
+    ///   false.
+    /// * FABRICATED layout — allocate under a `ClassId` that was never declared
+    ///   (or `fresh_object_ref`). The witness answers `None` and the predicate
+    ///   is true.
+    ///
+    /// `ClassId`s are handed out from 1 upward so that `ClassId::new(0)` stays
+    /// the "unknown class" answer `class_id_of_object` gives an undeclared
+    /// object.
+    pub fn declare_class(&self, class_name: &str, fields: &[(&str, &str)]) -> ClassId {
+        // SAFETY: single-threaded test code.
+        let by_name = unsafe { &mut *self.class_ids_by_name.get() };
+        if let Some(&existing) = by_name.get(class_name) {
+            return existing;
+        }
+        let class_id = ClassId::new(u32::try_from(by_name.len() + 1).expect("mock class overflow"));
+        by_name.insert(class_name.to_string(), class_id);
+        // SAFETY: single-threaded test code.
+        unsafe { &mut *self.class_names_by_id.get() }
+            .insert(class_id.as_u32(), class_name.to_string());
+        let metadata = fields
+            .iter()
+            .enumerate()
+            .map(|(slot_index, (name, descriptor))| FieldMetadata {
+                name: (*name).to_string(),
+                descriptor: (*descriptor).to_string(),
+                access_flags: 0,
+                slot_index,
+                declaring_class_id: class_id,
+                is_static: false,
+            })
+            .collect();
+        // SAFETY: single-threaded test code.
+        unsafe { &mut *self.declared_fields.get() }.insert(class_id.as_u32(), metadata);
+        class_id
     }
 
     /// Mint a brand-new heap pointer. Always non-null and 8-byte aligned.
@@ -217,11 +303,17 @@ impl NativeClassAccess for MockNativeContext {
         Ok(None)
     }
 
-    fn class_name_of_id(&self, _c: ClassId) -> Option<String> {
-        None
+    fn class_name_of_id(&self, c: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.class_names_by_id.get() }
+            .get(&c.as_u32())
+            .cloned()
     }
-    fn class_id_of_object(&self, _o: ObjectRef) -> ClassId {
-        ClassId::new(0)
+    fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.object_classes.get() }
+            .get(&(o.as_ptr() as usize))
+            .map_or(ClassId::new(0), |&(class_id, _)| class_id)
     }
     fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
         false
@@ -236,8 +328,9 @@ impl NativeClassAccess for MockNativeContext {
     fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
         None
     }
-    fn class_id_by_name(&self, _n: &str) -> Option<ClassId> {
-        None
+    fn class_id_by_name(&self, n: &str) -> Option<ClassId> {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.class_ids_by_name.get() }.get(n).copied()
     }
     fn loader_id_of_class(&self, _c: ClassId) -> i32 {
         2
@@ -255,8 +348,25 @@ impl NativeClassAccess for MockNativeContext {
         Vec::new()
     }
 
-    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
-        Vec::new()
+    fn declared_fields(&self, c: ClassId) -> Vec<FieldMetadata> {
+        // SAFETY: single-threaded test code.
+        // `FieldMetadata` is not `Clone`, so rebuild each entry by hand.
+        unsafe { &*self.declared_fields.get() }
+            .get(&c.as_u32())
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|meta| FieldMetadata {
+                        name: meta.name.clone(),
+                        descriptor: meta.descriptor.clone(),
+                        access_flags: meta.access_flags,
+                        slot_index: meta.slot_index,
+                        declaring_class_id: meta.declaring_class_id,
+                        is_static: meta.is_static,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
     fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
         Vec::new()
@@ -460,11 +570,23 @@ impl NativeHeapAccess for MockNativeContext {
         let key = (obj.as_ptr() as usize, field_name.to_string());
         self.fields_mut().insert(key, value);
     }
-    fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-        None
+    /// Resolve against the class model a test registered with
+    /// [`MockNativeContext::declare_class`]. `None` — the answer for every
+    /// class before that model existed — now means "this class was never
+    /// declared to the mock", which is what makes the class-side-witness
+    /// predicate FALSIFIABLE here rather than constant. Matches production
+    /// (`vm/src/vm/vm_exec.rs:10637-10650`), which resolves the name in the
+    /// hierarchy and answers `None` only when it is genuinely absent.
+    fn resolve_field_index(&self, c: &str, f: &str) -> Option<usize> {
+        self.resolve_field_index_by_class_id(self.class_id_by_name(c)?, f)
     }
-    fn resolve_field_index_by_class_id(&self, _c: ClassId, _f: &str) -> Option<usize> {
-        None
+    fn resolve_field_index_by_class_id(&self, c: ClassId, f: &str) -> Option<usize> {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.declared_fields.get() }
+            .get(&c.as_u32())?
+            .iter()
+            .find(|meta| !meta.is_static && meta.name == f)
+            .map(|meta| meta.slot_index)
     }
 
     // --------------------------------------------------------------
@@ -537,14 +659,22 @@ impl NativeHeapAccess for MockNativeContext {
         self.fresh_object_ref()
     }
 
-    fn alloc_object(&mut self, _c: ClassId, _num_fields: usize) -> ObjectRef {
-        // Field count is irrelevant — the field store grows on demand. We
-        // just mint a fresh pointer; subsequent get_field / set_field calls
-        // on it will land in the HashMap.
-        self.fresh_object_ref()
+    fn alloc_object(&mut self, c: ClassId, num_fields: usize) -> ObjectRef {
+        // The field store grows on demand, so the count does not bound writes.
+        // Both are recorded anyway so `class_id_of_object` /
+        // `object_num_fields` can answer for this object — the class-side
+        // witness needs the receiver's `ClassId` to be its own, not a constant.
+        let obj = self.fresh_object_ref();
+        // SAFETY: single-threaded test code.
+        unsafe { &mut *self.object_classes.get() }
+            .insert(obj.as_ptr() as usize, (c, num_fields));
+        obj
     }
-    fn object_num_fields(&self, _obj: ObjectRef) -> usize {
-        0
+    fn object_num_fields(&self, obj: ObjectRef) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.object_classes.get() }
+            .get(&(obj.as_ptr() as usize))
+            .map_or(0, |&(_, num_fields)| num_fields)
     }
 
     fn heap_allocated_bytes(&self) -> usize {

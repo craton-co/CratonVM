@@ -8047,6 +8047,48 @@ impl GarbageCollector for G1Collector {
         }
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
+        // returns `None` for TWO different reasons and the `unwrap_or` below
+        // treats them as one: "this is a legacy object" (correct — the uniform
+        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
+        // object (`GC_FLAG_COMPACT`, set at allocation) whose
+        // `(class_id, num_slots)` no longer resolves to a registered layout"
+        // (its `class_layout_for_fields(..)?` early return — e.g. a class
+        // redefinition racing the layout registry).
+        //
+        // For the second, `alloc_object` above sized this object's body with
+        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
+        // `num_slots()` on a compact object is the FIELD COUNT — so the
+        // `index >= num_slots` screen above does not bound the legacy stride,
+        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
+        // the allocation. That is the read half of the `SIGSEGV` observed
+        // against the real `DefaultCatalogAndSchemaTest` workload.
+        //
+        // `is_compact_object(header)` is the per-object header bit, read
+        // independently of the registry, and is exactly how this collector's
+        // own walkers already separate the two cases — see
+        // `for_each_flat_object_reference` and the concurrent mark's object
+        // arm, both of which then simply skip the object when
+        // `with_class_layout` misses. An accessor cannot skip, so it degrades
+        // as this function's neighbouring guards do: benign null read, loud
+        // `cratonvm::gc::guard` record, no panic. Matches
+        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
+        // rationale and the open `TODO` about the unchecked `layout_domain` on
+        // the read path.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
         let (payload_off, payload_size) = compact
             .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
@@ -8158,6 +8200,32 @@ impl GarbageCollector for G1Collector {
         }
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
+        // on the matching guard in `get_field` above for why this `None` is
+        // two different states and why only the legacy one may reach the
+        // `unwrap_or` below. This half is the more damaging: the legacy stride
+        // does not merely read past a compact-sized body, it *writes* a
+        // 16-byte `Value` cell over whatever follows the object.
+        //
+        // The SATB pre-barrier above has already run, and in this state its
+        // `self.get_field(obj, index)` returned `Value::Object(None)` through
+        // that same guard — so no bogus edge was logged, and the second
+        // `cratonvm::gc::guard` record it emits for this object is expected.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "g1::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the write rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
         let (payload_off, payload_size) = compact
             .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
@@ -9161,6 +9229,50 @@ mod tests {
         assert!(
             bytes.iter().all(|&byte| byte == 0),
             "G1 must return a fully zeroed TLAB even from dirty recycled Eden"
+        );
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side. `compact_object_field_storage`
+    /// returns `None` both for a legacy object and for a genuinely compact one
+    /// whose `(class_id, field_count)` no longer resolves to a registered
+    /// layout, and `get_field`/`set_field` collapsed the two into
+    /// `.unwrap_or((index * SLOT_SIZE, SLOT_SIZE))`. On a real instance of the
+    /// second state `alloc_object` sized the body with
+    /// `compact_object_body_size` and `num_slots()` is the FIELD COUNT, so the
+    /// `index >= num_slots` screen does not bound that legacy stride: the read
+    /// escapes the allocation and the write puts a 16-byte `Value` cell past
+    /// it. This collector's own walkers already separate the two cases via the
+    /// `GC_FLAG_COMPACT` header bit; the accessors must too.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let gc = make_collector();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY and the cells written below are real, readable cells. Setting
+        // the bit afterwards reproduces the racing state (header says compact,
+        // registry cannot serve it) without a live redefinition.
+        let obj = gc.alloc_object(ClassId::new(999_997), 4);
+        gc.set_field(obj, 0, Value::Int(1));
+        gc.set_field(obj, 1, Value::Int(2));
+
+        // SAFETY: flips the per-object compact bit on a live, fully
+        // initialized allocation; both flag helpers take `&self` and drive the
+        // atomic mark word.
+        let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(gc.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        gc.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert!(
+            matches!(gc.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
         );
     }
 

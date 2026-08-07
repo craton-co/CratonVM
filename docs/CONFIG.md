@@ -299,6 +299,24 @@ ignored. [`docs/flag-tokens.md`](flag-tokens.md) lists every token in every
 group; the tables below cover the ones worth setting when *running* an
 application rather than debugging the VM.
 
+> **Adding a `CRATONVM_*` flag? The procedure is in the source, and it is four
+> files.** The canonical, maintained-next-to-the-table version is the doc
+> comment on `INVENTORY` in
+> [`types/src/flag_groups.rs`](../types/src/flag_groups.rs), under *"Adding a
+> `CRATONVM_*` flag: the four files, all of them"*. Two things to know before
+> you start:
+>
+> * **Enforcement is `cargo test`, not `cargo check`.** `flag_declaration_guard.rs`,
+>   `flag_surface.rs` and `flag_docs_generated.rs` are `assert!`s, so
+>   `cargo check --all-targets` stays green while any of the four files is
+>   missing its row.
+> * **Declaration is bidirectional.** A literal with no row fails the guard, and
+>   a **row with no reader** fails check 5 of `tools/flag-census/check-surface.sh`.
+>   Land the declaration and its consumer in the same change.
+>
+> No `types/src/flags.rs` field is needed — `VmFlags::legacy_var_os` serves every
+> declared name from one map.
+
 ### The ten grouped variables
 
 | Variable | Covers | Tokens |

@@ -101,6 +101,8 @@ fn annotation_proxy_field_indices_constant() {
     assert_eq!(ANN_PROXY_ELEM_VALUES, 3);
 }
 
+mod common;
+
 #[test]
 fn annotation_proxy_probe_compiled_class_files_exist() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -109,11 +111,20 @@ fn annotation_proxy_probe_compiled_class_files_exist() {
         .unwrap()
         .join("apps")
         .join("annotation_proxy_probe");
-    if !probe_dir.exists() {
-        return; // Fixture not staged.
-    }
+    // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+    // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12), so
+    // this fixture was never tracked and is absent from the tree.
     let main_cls = probe_dir.join("AnnotationProxyProbe.class");
-    if !main_cls.exists() {
+    if !probe_dir.exists() || !main_cls.exists() {
+        let _ = common::require_fixture(
+            "wp2_7_annotation_proxy",
+            "the WP2.7 fixture `AnnotationProxyProbe` (AnnotationProxyProbe.class, compiled from \
+             AnnotationProxyProbe.java; this test pins its Test/Other/TargetA annotation types)",
+            &[
+                main_cls.clone(),
+                probe_dir.join("AnnotationProxyProbe.java"),
+            ],
+        );
         return;
     }
     // The annotation types should also be staged.
@@ -135,7 +146,15 @@ fn annotation_proxy_probe_loads_under_cratonvm_when_staged() {
         .join("apps")
         .join("annotation_proxy_probe");
     if !probe_dir.join("AnnotationProxyProbe.class").exists() {
-        eprintln!("annotation_proxy_probe class not staged — skipping load test");
+        let _ = common::require_fixture(
+            "wp2_7_annotation_proxy",
+            "the WP2.7 fixture `AnnotationProxyProbe` (AnnotationProxyProbe.class, compiled from \
+             AnnotationProxyProbe.java)",
+            &[
+                probe_dir.join("AnnotationProxyProbe.class"),
+                probe_dir.join("AnnotationProxyProbe.java"),
+            ],
+        );
         return;
     }
 
@@ -153,8 +172,36 @@ fn annotation_member_hash_recipe_for_synthetic_string_member() {
     let name_h = java_string_hash("value");
     let val_h = java_string_hash("hello");
     let expected = 127i32.wrapping_mul(name_h) ^ val_h;
-    // The `annotation_member_hash` helper is private; we re-derive it
-    // here so test breakage flags either a recipe drift or a hash
-    // function drift.
-    let _ = expected;
+    // The `annotation_member_hash` helper is private (`vm_exec.rs`, and its
+    // `ctx_` twin in `native-builtins/src/lang_class.rs`), so this test cannot
+    // call it. It CAN pin the two things it can reach: the recipe's shape, and
+    // the `java_string_hash` primitive the recipe is built on.
+    //
+    // This assertion used to be `let _ = expected;` — every line above ran and
+    // nothing was checked, so a drift in `java_string_hash` (the load-bearing
+    // primitive named in this file's own module docs) passed straight through.
+    //
+    // The constant is derived, not guessed:
+    //   "value".hashCode() == 111972721  (pinned by
+    //                                     java_string_hash_matches_jdk_for_value_keyword)
+    //   "hello".hashCode() ==  99162322
+    //   127 * 111972721 == 14_220_535_567, which wraps to 1_335_633_679 as i32
+    //   1_335_633_679 ^ 99_162_322 == 1_249_198_045
+    //
+    // The wrap is the interesting part: the JLS recipe is defined on Java `int`
+    // arithmetic, so an implementation that widened to i64 anywhere would
+    // produce 14_220_535_567 ^ 99_162_322 instead and fail here.
+    assert_eq!(
+        name_h, 111972721,
+        "java_string_hash(\"value\") drifted; the annotation-member recipe below is derived from it"
+    );
+    assert_eq!(
+        val_h, 99162322,
+        "java_string_hash(\"hello\") drifted; the annotation-member recipe below is derived from it"
+    );
+    assert_eq!(
+        expected, 1249198045,
+        "the JLS annotation-member hash recipe `(127 * nameHash) ^ valueHash` must be evaluated in \
+         wrapping 32-bit arithmetic"
+    );
 }

@@ -3813,7 +3813,16 @@ fn bb_define_layout(ctx: &dyn NativeContext, bb: ObjectRef) -> BbDefineLayout {
     }
 }
 
-fn read_byte_buffer_define_class_slice(
+/// `pub(crate)`: this is the ONLY `defineClass2` ByteBuffer decoder in the
+/// crate. `classloader::cl_define_class2` — which SHADOWS this module's
+/// `defineClass2` registration in synthetic-JDK mode, because
+/// `register_classloader_natives` runs after `register_essential_natives` and
+/// `NativeMethodRegistry::register` is last-wins — used to carry a second,
+/// unhardened copy that hardcoded slot 0 as the backing array and CLAMPED
+/// out-of-range `(off, len)` instead of rejecting them. Both entry points now
+/// call this one, so the layout witness above and the `checked_add` bounds
+/// below cannot be in effect for one caller and inert for the other.
+pub(crate) fn read_byte_buffer_define_class_slice(
     ctx: &dyn NativeContext,
     bb: ObjectRef,
     offset: usize,

@@ -1,43 +1,67 @@
 # The compact reference-field layout corrupts `FileChannelImpl.fileLockTable`, so every file lock fails
 
 ## Status
-**FIXED 2026-08-07** — and *not* by anything in the compact reference-field
-layout. See the `monitorexit-erases-object-header-quartet-FIXED-20260807`
-write-up next to this file for the fix and its regression tests.
+**✅ FIXED 2026-08-07.** One line in `vm/src/threading/monitor.rs`:
+`try_thin_unlock`'s last release stored the bare `MARK_NEUTRAL` constant into
+the mark word, erasing the `kind` / `element_type` / `gc_age` / `gc_flags`
+quartet that moved into bits 48..61 when the header shrank. `GC_FLAG_COMPACT`
+lives in that quartet, so **the first `synchronized` block on a compact object
+converted it to "legacy" on exit**, and every field read after that decoded a
+compact-packed body as 16-byte cells.
 
-The mechanism is one line in `vm/src/threading/monitor.rs`: `try_thin_unlock`'s
-final-release arm stored a bare `types::MARK_NEUTRAL`, which since the header
-shrink erases the object's `kind` / `element_type` / `gc_flags` / `gc_age`
-quartet from mark-word bits 48..63. `FileChannelImpl.fileLockTable()` is
-double-checked locking around `synchronized (this)`, so the `gc_flags=0x0` this
-page recorded is that store — the object was allocated **compact** and
-un-compacted by monitorexit. `probes/CompactLayoutFileLockProbe` goes from
-`PROBE-FAILURES=1` to `PROBE-OK` on the fix, `--nojit`, same binary otherwise.
+The title is therefore half right: the compact layout is not corrupt, and the
+writers were not wrong. The reader was reading a header the monitor had
+rewritten. Regression test:
+`monitor::tests::a_thin_lock_round_trip_preserves_the_mark_word_quartet`; the
+witness this page shipped, `probes/CompactLayoutFileLockProbe.java`, goes
+`PROBE-FAILURES=1` -> `PROBE-OK`.
 
-**This page's "leading hypothesis" below is refuted, and the refutation is worth
-keeping.** It argued "allocated legacy, written compact" — a per-class writer
-gate (`interpreter.rs`'s precomputed `compact_field_slot`, the two `jit_bridge`
-sites, `jit/helpers.rs`) racing `plan_object_alloc`'s per-allocation decision,
-and proposed closing that seam. `CRATONVM_DBG=compact-legacy` prints one line
-for **every** allocation that actually takes the legacy fallback, and prints
-nothing for `FileChannelImpl` or for the second victim found later
-(`java.util.Collections$SynchronizedSet`, which failed every Spring Boot test
-class at JUnit discovery). Both objects were allocated compact. The writers
-named below are not implicated and the `plan_object_alloc` seam is not what
-failed here — though "per-allocation decision, per-class consumption cannot be
-right either way" remains a fair design observation, now without a bug behind
-it.
+### The leading hypothesis below was wrong — three measurements killed it
 
-`CRATONVM_COMPACT_REF_FIELDS=0` worked as a workaround for the same reason it
-misled: with the compact layout off there is no `GC_FLAG_COMPACT` to lose.
+This page proposed *"allocated legacy, written compact"*: an object that took
+the legacy fallback in `plan_object_alloc` and was then written by the several
+writers that decide compact-ness per CLASS from the global flag. Not so.
 
-The original page follows unchanged from here.
+| measurement | result |
+|---|---|
+| `CRATONVM_DBG=compact-legacy` | never names `FileChannelImpl` — it does not take the legacy fallback |
+| allocation-site probe | `id=413 num_fields=17 compact_body=Some(96)` — a compact layout IS registered and chosen |
+| birth-header probe | `gc_flags=0x4` when `ctx.new_object` returns, `0x0` at the failing read of the SAME object |
+
+The object is **born compact and loses the flag**. That reframes the search from
+"which writer used the wrong offset" to "what rewrote the header", and the
+window is one `synchronized` block. The per-CLASS writers the page pointed at
+(`interpreter.rs`, `jit_bridge.rs`, `jit/helpers.rs`) are JIT-codegen metadata
+and are not on this path at all — `--nojit` reproduces byte-identically, which
+the page itself records.
+
+`CRATONVM_COMPACT_REF_FIELDS=0` is a complete workaround for the honest reason
+that with the layout off nothing is born compact, so losing the flag is a no-op.
+
+### It does not close the whole cluster
+
+First 40 H2 suite classes, same host and cap:
+
+| build | PASS | FAIL | HANG |
+|---|---|---|---|
+| `1ec856c2c` (before the header landing) | 34 | 1 | 5 |
+| broken dev | **1** | 38 | 1 |
+| with this fix | **29** | 5 | 6 |
+
+So this was the large majority of it and every file-lock failure, but five
+classes short of the old baseline. The sibling defect on the same landing is
+GC-driven `Reference` enqueue: `probes/EnqProbe.java` shows a `WeakReference`
+whose referent is unreachable gets CLEARED but never ENQUEUED after
+`System.gc()`, byte-identically with and without this fix, where HotSpot
+enqueues it. `TestLob`, `TestMemoryUsage` and `TestLIRSMemoryConsumption` are
+the shape that would notice. That one still needs its own hunt.
+
+**Everything below is the original OPEN write-up, kept for its bisect and its
+ruled-out list, both of which stand.**
 
 ---
 
-# The compact reference-field layout corrupts `FileChannelImpl.fileLockTable`, so every file lock fails
-
-## Status (as originally filed)
+## Status (original)
 **OPEN, regression, deterministic (2026-08-07).** Bisected to
 `6ba350cdd` — *"Merge perf/header-16-and-field-packing-20260806: HEADER_SIZE 24
 -> 16"*. Its first parent `9ddbc9c61` is clean; `6ba350cdd` fails, and so does
@@ -52,6 +76,51 @@ word UNCONDITIONALLY"*), which landed for a Spring Boot `read_slot` corruption
 from the same header change. That one is in the JIT's inline allocator; this one
 reproduces with **`--nojit`**, byte-identically, and is still present on the tip
 that contains it.
+
+## The second victim, found independently from the other end
+
+While re-running the two 2026-08 full-suite G1 comparisons, the same defect
+turned up as **every Spring Boot test class (1975) failing at JUnit
+discovery** on dev tip — under the default collector, JIT or not:
+
+```
+Exception in thread "main" org.junit.platform.commons.JUnitException:
+  TestEngine with ID 'junit-jupiter' failed to discover tests
+Caused by: java.lang.NullPointerException: Cannot invoke
+  "java.util.Iterator.hasNext()" because "<local5>" is null
+    at ...EngineDiscoveryResultValidator.getCyclicGraphInfo
+```
+
+`AbstractTestDescriptor.children` is a `Collections.synchronizedSet`, and
+`getCyclicGraphInfo` walks `descriptor.getChildren().iterator()`. The first
+`synchronized` inside that wrapper de-compacted it, so the native reading its
+backing collection out of field 0 got the corrupt-cell guard and returned null.
+
+Reduced to eight lines with no JUnit, no H2 and no JIT — this is
+`probes/MonitorQuartetProbe.java`:
+
+```java
+Set<String> s = Collections.synchronizedSet(new LinkedHashSet<>());
+s.iterator();          // java.util.HashMap$KeyItr
+synchronized (s) { }   // quartet wiped here
+s.iterator();          // null, on a broken build
+```
+
+The `CRATONVM_DBG=cellcorrupt` witness for it names the two packed references
+being read as one 16-byte cell — `raw0` the backing `LinkedHashSet`, `raw1` the
+object itself, which is `SynchronizedCollection`'s `mutex = this`:
+
+```
+[CELLCORRUPT] holder=0x200c2c45078 class_id=450
+  class=java/util/Collections$SynchronizedSet num_slots=2 gc_flags=0x0 index=0
+  raw0=0x00000200c2c069a8 raw1=0x00000200c2c45078
+[CELLCORRUPT]   target-header: class=java/util/LinkedHashSet
+```
+
+Same `gc_flags=0x0`-on-a-compact-body signature as the `FileChannelImpl` case
+above, from a completely different workload — which is what makes the
+monitor-release diagnosis, rather than anything about the layout, the one that
+explains both.
 
 ## Severity
 **HIGH.** `FileChannel.tryLock()` / `lock()` is how every file-backed database

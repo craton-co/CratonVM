@@ -24,6 +24,22 @@
 #       under modules/, and the class-path service resources under resources/).
 #       Implied when CRATONVM_ARGS names --jdk-only.
 #
+#   SUITE=core|jdk-only|all
+#       Which class list to schedule: `core` (default, the historical set),
+#       `jdk-only` (the RJdk* corpus INSTEAD of core), `all` (both). This is
+#       the spelling regression-suite/README.md, CHANGELOG.md and ROADMAP.md
+#       have always documented; until 2026-08 it was not implemented here at
+#       all, so `SUITE=jdk-only bash run.sh` and `SUITE=all RELEASES=...`
+#       quietly ran the CORE set and reported green — a documented invocation
+#       whose result said nothing about the corpus it named. An unrecognised
+#       value is a hard error, never a silent fall-back to core.
+#
+#   STRICT_COVERAGE=1
+#       Make the coverage census fatal: a src/*.java vector that appears in no
+#       class list (and is not named in UNREGISTERED_CLASSES with a reason)
+#       counts as a failure instead of a warning. Off by default only because
+#       vectors land from several branches at once; CI should set it.
+#
 #   RELEASES="17 21 25"
 #       Compile and run the suite once per `javac --release` level instead of
 #       once with the default target. A level with no usable javac is SKIPPED
@@ -69,21 +85,100 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
 # *expected* to fail where --real-jdk passes, so these must not move the green
 # baseline of a plain `bash regression-suite/run.sh`.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure"
-# Keep the list to vectors that actually exist on disk, so adding/removing a
-# source file does not silently turn into a "no PASS line" failure.
-present=""
-for c in $JDKONLY_CLASSES; do
-  [ -f "$HERE/src/$c.java" ] && present="$present $c"
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure"
+
+# Vectors that deliberately belong to NO class list. Every entry needs a
+# reason, because "not scheduled" is indistinguishable from "forgotten" once
+# the reason is only in someone's head.
+#
+#   RConcurrent      heavy multi-threaded execution; trips the documented
+#                    cross-thread JIT-frame root-scan gap (README "Known
+#                    gaps") and flakes. Run with ONLY="RConcurrent".
+#   RPriorityQueueGc needs BOTH --nojit and --Xmx 64m (a live JIT frame
+#                    downgrades the young gen to a non-moving sweep, under
+#                    which the stale reference still resolves; the small heap
+#                    is what makes a collection happen inside the native at
+#                    all). With --nojit alone the vector PASSES ON A BROKEN
+#                    VM -- it becomes a no-op gate that reads as green.
+#                    See class_cv_args.
+#   RTreeRangeGc     needs a small heap (--Xmx 64m) or no collection happens
+#                    during the walk at all. It must NOT get --nojit: it
+#                    reproduces with the JIT on, so registering it keeps the
+#                    compiling config under test. See class_cv_args.
+#
+# Both GC vectors pass on HotSpot 25 with byte-identical output over repeated
+# runs, so they are sound vectors; what is missing is a CratonVM run under the
+# arguments their own doc comments assume. Registering them is a task for a
+# lane that can build and run the VM.
+#
+# NOTE on history: these two were NOT "never run under this runner". Both were
+# in CLASSES with a cv_extra_args hook when their fixes landed (6cd01bcba,
+# b2e13e441) and both were validated FAIL-then-PASS under it. A later run.sh
+# merge resolution silently discarded the registrations and the hook.
+UNREGISTERED_CLASSES="RConcurrent RPriorityQueueGc RTreeRangeGc"
+
+# ---- list hygiene, computed before anything is pruned --------------------
+#
+# Two failure modes, both of which used to read as green:
+#
+#   * a src/*.java vector named in no list. It compiles (compile_suite globs
+#     src/*.java) and never runs, so it looks like coverage and is not. This
+#     is how RJdkPhaser — 240 checks — arrived inert.
+#   * a list entry whose .java is gone. The JDK-only list used to filter these
+#     out silently, so renaming a vector deleted its coverage and only lowered
+#     the "N passed" count, which nobody diffs.
+LISTED_CLASSES="$CORE_CLASSES $JDKONLY_CLASSES"
+UNREGISTERED_FOUND=""
+for f in "$HERE"/src/*.java; do
+  [ -f "$f" ] || continue
+  b=$(basename "$f" .java)
+  case " $LISTED_CLASSES $UNREGISTERED_CLASSES " in
+    *" $b "*) ;;
+    *) UNREGISTERED_FOUND="$UNREGISTERED_FOUND $b" ;;
+  esac
 done
-JDKONLY_CLASSES="${present# }"
+STALE_UNREGISTERED=""
+for c in $UNREGISTERED_CLASSES; do
+  [ -f "$HERE/src/$c.java" ] || STALE_UNREGISTERED="$STALE_UNREGISTERED $c"
+done
+# Prune missing entries from what gets scheduled, but REMEMBER them: each one
+# is counted as a failure in the summary below. The result comes back in
+# $PRUNED rather than on stdout on purpose — `X=$(prune_missing ...)` runs the
+# function in a SUBSHELL, so the MISSING_CLASSES it appends to would be
+# discarded and the check would silently never fire.
+MISSING_CLASSES=""
+prune_missing() {
+  PRUNED=""
+  for c in $1; do
+    if [ -f "$HERE/src/$c.java" ]; then PRUNED="$PRUNED $c"
+    else MISSING_CLASSES="$MISSING_CLASSES $c"; fi
+  done
+  PRUNED="${PRUNED# }"
+}
+prune_missing "$CORE_CLASSES";    CORE_CLASSES="$PRUNED"
+prune_missing "$JDKONLY_CLASSES"; JDKONLY_CLASSES="$PRUNED"
 
 # `--jdk-only` in CRATONVM_ARGS implies the JDK-only corpus. The trailing space
 # in the pattern keeps `--jdk-only-report <FILE>` from matching on its own.
 case " ${CRATONVM_ARGS:-} " in
   *" --jdk-only "*) JDK_ONLY=1 ;;
 esac
-CLASSES="${ONLY:-$CORE_CLASSES${JDK_ONLY:+ $JDKONLY_CLASSES}}"
+# SUITE selects the list; JDK_ONLY=1 stays additive on top of it.
+SUITE_SET=""
+case "${SUITE:-core}" in
+  core)     SUITE_SET="$CORE_CLASSES${JDK_ONLY:+ $JDKONLY_CLASSES}" ;;
+  jdk-only) SUITE_SET="$JDKONLY_CLASSES" ;;
+  all)      SUITE_SET="$CORE_CLASSES $JDKONLY_CLASSES" ;;
+  *) echo "ERROR: SUITE='$SUITE' is not one of core|jdk-only|all"; exit 3 ;;
+esac
+CLASSES="${ONLY:-$SUITE_SET}"
+# A run that schedules nothing must not print a green summary. Reachable via
+# ONLY=" ", an emptied list, or SUITE=jdk-only against a checkout with no
+# RJdk* sources.
+if [ -z "$(printf '%s' "$CLASSES" | tr -d ' \t')" ]; then
+  echo "ERROR: no classes scheduled (SUITE=${SUITE:-core} ONLY='${ONLY:-}') — nothing would run."
+  exit 3
+fi
 
 [ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }
@@ -135,13 +230,31 @@ compile_suite() {
   return 0
 }
 
-# Launcher arguments a specific vector needs on top of CRATONVM_ARGS. Emitted
+# Launcher arguments a specific vector needs, in a spelling BOTH VMs accept —
+# these are handed to HotSpot too, so the oracle runs the same shape. Emitted
 # as a word list, consumed unquoted.
 class_args() {
   case "$1" in
     RJdkModule)
       [ -n "$HAVE_MODULE" ] && printf '%s' "--module-path $MODBUILD --add-modules $JDKONLY_MODULE"
       ;;
+    *) : ;;
+  esac
+}
+
+# CratonVM-ONLY arguments for a vector: launcher flags in CratonVM's own
+# spelling, which HotSpot would reject outright. Kept separate from class_args
+# for exactly that reason — a `--nojit` in class_args would make the oracle
+# exit non-zero, its key lines come back empty, and every such vector would
+# fail the cross-VM diff for a reason that has nothing to do with the VM.
+#
+# The two entries below are the reproduction conditions their vectors' own doc
+# comments already claim the suite supplies; both vectors are still in
+# UNREGISTERED_CLASSES until a lane that can run the VM verifies them.
+class_cv_args() {
+  case "$1" in
+    RPriorityQueueGc) printf '%s' "--nojit --Xmx 64m" ;;
+    RTreeRangeGc)     printf '%s' "--Xmx 64m" ;;
     *) : ;;
   esac
 }
@@ -193,12 +306,17 @@ run_pass() {
   echo "== compiling regression-suite$label =="
   compile_modules || { echo "ERROR: javac failed on module $JDKONLY_MODULE"; return 3; }
   compile_suite   || { echo "ERROR: javac failed"; return 3; }
+  # Say so out loud. Without HotSpot only check (1)-(3) run; the byte-for-byte
+  # cross-VM diff — the check that catches a miscompiled checksum — is gone,
+  # and a green summary from such a run means much less than it looks like.
+  [ -x "$HS" ] || echo "  NOTE: no HotSpot at $HS — cross-VM output diff SKIPPED for every class"
 
   for c in $CLASSES; do
     extra=$(class_args "$c")
-    # $CRATONVM_ARGS and $extra are intentionally unquoted: both are flag
-    # lists, not single paths.
-    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $extra -cp "$BUILD" "$c" 2>&1)
+    cvextra=$(class_cv_args "$c")
+    # $CRATONVM_ARGS, $extra and $cvextra are intentionally unquoted: all three
+    # are flag lists, not single paths.
+    cvout=$(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$CV" --java-home "$JDK" ${CRATONVM_ARGS:-} $cvextra $extra -cp "$BUILD" "$c" 2>&1)
     cvrc=$?
     cvkey=$(printf '%s\n' "$cvout" | extract)
     # A failed assertion throws AssertionError → non-zero exit (handled by the rc
@@ -212,11 +330,14 @@ run_pass() {
       [ -n "$sig" ] && why="rc=$cvrc: $sig"
     elif printf '%s' "$cvout" | grep -qaiE 'SIGSEGV|rust panic|fatal runtime error|stack overflow'; then
       state=FAIL; why="VM crash"
-    elif ! printf '%s\n' "$cvkey" | grep -qaE "^PASS $c"; then
+    # Anchored on a word boundary: a bare `^PASS $c` would let `PASS RJdkPhaser`
+    # satisfy a check for a class named `RJdkPhase`.
+    elif ! printf '%s\n' "$cvkey" | grep -qaE "^PASS $c([^A-Za-z0-9_]|\$)"; then
       state=FAIL; why="no PASS line"
     fi
     # Cross-VM diff against HotSpot (when present). HotSpot gets the vector's
-    # own arguments but never CRATONVM_ARGS — the oracle must stay unmodified.
+    # own cross-VM arguments but never CRATONVM_ARGS and never $cvextra — the
+    # oracle must stay unmodified.
     if [ "$state" = PASS ] && [ -x "$HS" ]; then
       hskey=$(timeout "$TIMEOUT" "$HS" $extra -cp "$BUILD" "$c" 2>&1 | extract)
       if [ "$cvkey" != "$hskey" ]; then
@@ -271,5 +392,37 @@ else
 fi
 
 echo "---------------------------------------------"
+
+# ---- list hygiene, reported where the summary is actually read -----------
+#
+# A list entry with no source is ALWAYS a failure. It used to be filtered out
+# in silence, which turned "this vector was renamed and its coverage is gone"
+# into a slightly smaller pass count.
+for c in $MISSING_CLASSES; do
+  echo "  LIST ERROR: '$c' is in a class list but src/$c.java does not exist"
+  total_fail=$((total_fail+1)); total_failed="$total_failed missing:$c"
+done
+for c in $STALE_UNREGISTERED; do
+  echo "  LIST ERROR: '$c' is in UNREGISTERED_CLASSES but src/$c.java does not exist"
+  total_fail=$((total_fail+1)); total_failed="$total_failed stale:$c"
+done
+
+# A src/*.java that no list schedules compiles and never runs. WARNING by
+# default because vectors land here from several branches at once and the
+# lane that lands next must not inherit someone else's red; STRICT_COVERAGE=1
+# makes it fatal, which is what CI should run.
+if [ -n "$UNREGISTERED_FOUND" ]; then
+  for c in $UNREGISTERED_FOUND; do
+    if [ -n "${STRICT_COVERAGE:-}" ]; then
+      echo "  COVERAGE ERROR: src/$c.java is in no class list — it compiles and never runs"
+      total_fail=$((total_fail+1)); total_failed="$total_failed unregistered:$c"
+    else
+      echo "  COVERAGE WARNING: src/$c.java is in no class list — it compiles and never runs."
+      echo "    Add it to CORE_CLASSES or JDKONLY_CLASSES, or to UNREGISTERED_CLASSES with a"
+      echo "    reason. Set STRICT_COVERAGE=1 to make this a failure."
+    fi
+  done
+fi
+
 echo "REGRESSION SUITE: $total_pass passed, $total_fail failed${total_failed:+ ( failed:$total_failed )}"
 [ "$total_fail" -eq 0 ]

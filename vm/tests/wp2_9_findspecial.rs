@@ -61,6 +61,8 @@ fn findspecial_signature_takes_four_class_args() {
     assert!(inner.contains("Ljava/lang/invoke/MethodType;"));
 }
 
+mod common;
+
 #[test]
 fn findspecial_app_fixture_class_files_exist_when_staged() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -71,7 +73,16 @@ fn findspecial_app_fixture_class_files_exist_when_staged() {
         .join("findspecial_probe")
         .join("classes");
     if !probe.exists() {
-        return; // Fixture not staged in this build.
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12),
+        // so this fixture was never tracked and is absent from the tree.
+        let _ = common::require_fixture(
+            "wp2_9_findspecial",
+            "the WP2.9 fixture directory `findspecial_probe/classes` (built from \
+             FindSpecialProbe.java; this test pins FindSpecialProbe$A / $C / $I)",
+            &[probe.clone()],
+        );
+        return;
     }
     // If the classes dir exists, expect the main class.
     let main = probe.join("FindSpecialProbe.class");
@@ -138,7 +149,12 @@ fn findspecial_probe_runs_to_completion() {
         .join("findspecial_probe")
         .join("classes");
     if !probe.exists() {
-        eprintln!("findspecial_probe/classes not staged — skipping");
+        let _ = common::require_fixture(
+            "wp2_9_findspecial",
+            "the WP2.9 fixture directory `findspecial_probe/classes` (built from \
+             FindSpecialProbe.java)",
+            &[probe.clone()],
+        );
         return;
     }
 

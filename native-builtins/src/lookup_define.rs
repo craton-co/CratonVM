@@ -139,9 +139,7 @@ fn lookup_class_code_source(ctx: &mut dyn NativeContext, this_lookup: ObjectRef)
         },
     };
     // CodeSource.location is a URL — try `getLocation` style by-name
-    // first, fall back to slot 0. The URL itself stringifies via
-    // `URL.toString` which for our synthetic URLs is just the stored
-    // string.
+    // first, fall back to slot 0.
     let url_obj_or_str = match ctx.get_field_by_name(cs, "location") {
         Value::Object(Some(u)) => u,
         _ => match ctx.get_field(cs, 0) {
@@ -149,18 +147,15 @@ fn lookup_class_code_source(ctx: &mut dyn NativeContext, this_lookup: ObjectRef)
             _ => return None,
         },
     };
-    // If it's already a String mirror, read directly. Otherwise try
-    // reading slot 0 of a URL object (synthetic URL stores the string
-    // form there).
-    if let Some(s) = ctx.read_string(url_obj_or_str) {
-        return Some(s);
-    }
-    if let Value::Object(Some(s)) = ctx.get_field(url_obj_or_str, 0) {
-        if let Some(s) = ctx.read_string(s) {
-            return Some(s);
-        }
-    }
-    None
+    // Stringify through the shared reader. The previous code read slot 0 of
+    // the location and, if that was a String, returned it — which is right
+    // only for the LEGACY 6-slot synthetic URL that cached the whole spec
+    // there. On a real `java.net.URL` slot 0 is `protocol`, also a String, so
+    // `read_string` SUCCEEDED and a real ProtectionDomain's CodeSource
+    // stringified to `"file"` or `"jar"`. Not hypothetical: this sits behind
+    // a by-name `Class.protectionDomain` -> `codesource` lookup, so it fires
+    // precisely when the mirror carries a REAL ProtectionDomain.
+    crate::classloader::url_to_external_form(ctx, url_obj_or_str)
 }
 
 /// Resolve the loader_id to use when defining a class on behalf of the
@@ -297,27 +292,39 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
     // access check reads as powerless.
     //
     // Write by NAME on the real layout; keep the index writes as the
-    // synthetic-only fallback. The discriminator is the wave-3 one: an ABSENT
-    // field answers `Int(0)` from `get_field_by_name`, so a `Value::Object`
-    // answer for `prevLookupClass` means the real JDK class is what we
-    // allocated.
+    // synthetic-only fallback. The discriminator is a CLASS-side witness:
+    // `resolve_field_index_by_class_id` asks the CLASS whether it declares
+    // `prevLookupClass`. A fabricated stub names its fields `_f0.._fN`
+    // (`ensure_synthetic_class`), so it misses there and the synthetic arm
+    // runs.
     //
-    // W6-3 hardening, two additions:
+    // It used to be a DISJUNCTION of that witness with the older value-shape
+    // test, `matches!(get_field_by_name(obj, "prevLookupClass"),
+    // Value::Object(_))`, kept on the stated grounds that an absent field
+    // answers `Int(0)` and so a `Value::Object` answer proved the real layout.
+    // **That premise is false, and the disjunct inverted the discriminator.**
+    // Production `get_field_by_name` (`vm/src/vm/vm_exec.rs`) returns
+    // `Value::Object(None)` for a name it cannot resolve — the trait spells it
+    // out (`native-api/src/registry.rs`: "Returns `Value::Object(None)` if the
+    // field is not found"). `Int(0)` is `test_utils::MockNativeContext`'s
+    // answer, which is why the unit tests below never saw this. `Object(None)`
+    // matches `Value::Object(_)`, so in production the disjunct was
+    // UNCONDITIONALLY TRUE and the synthetic arm was unreachable: on a
+    // fabricated Lookup both `set_field_by_name` calls silently no-op, the
+    // verify below then finds `allowedModes` unlanded, and the real arm's
+    // `resolve_field_index_by_class_id` misses too — so the mode word was
+    // written NOWHERE and `defineHiddenClass` handed back a Lookup reporting 0
+    // modes. That is precisely the powerless-Lookup failure the verify step
+    // was added to prevent, reintroduced through the discriminator.
     //
-    //  1. A POSITIVE class-side witness. `resolve_field_index_by_class_id` asks
-    //     the CLASS whether it declares the field, so unlike the value-shape
-    //     test it does not have to distinguish "absent" (`Int(0)`) from "a real
-    //     reference field that is currently null" (`Object(None)`) — the two
-    //     answers a fresh object of either layout can give. A fabricated stub
-    //     names its fields `_f0.._fN`, so this misses there and the synthetic
-    //     arm still runs; the old value-shape test is kept as a disjunct so
-    //     this is a strict superset of the previous condition.
+    // Absent and present-but-null are not merely hard to tell apart from the
+    // value — they are identical. Only the class can answer.
     //
-    //  2. The by-name write is VERIFIED. Pinning only the positive half is what
-    //     made the original bug invisible: a `Lookup` whose `allowedModes` never
-    //     received the value reads back 0 — "no access at all" — and throws
-    //     nothing. If the named write did not land, fall through to the
-    //     synthetic indices rather than returning a powerless Lookup.
+    // The by-name write is still VERIFIED below. Pinning only the positive half
+    // is what made the original bug invisible: a `Lookup` whose `allowedModes`
+    // never received the value reads back 0 — "no access at all" — and throws
+    // nothing. If the named write did not land, fall through to the synthetic
+    // indices rather than returning a powerless Lookup.
     let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
     // Slot 0 is `lookupClass` in BOTH layouts.
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(lookup_mirror)));
@@ -326,10 +333,6 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
         let cid = ctx.class_id_of_object(obj);
         ctx.resolve_field_index_by_class_id(cid, "prevLookupClass")
             .is_some()
-            || matches!(
-                ctx.get_field_by_name(obj, "prevLookupClass"),
-                Value::Object(_)
-            )
     };
     if real_layout {
         ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
@@ -341,13 +344,30 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
         // REFERENCE slot — an integer the GC would have scanned as an oop.
     }
     // Negative half: a named write that silently did not land leaves a Lookup
-    // reporting zero modes. Re-assert on the synthetic indices in that case.
+    // reporting zero modes. Re-assert — but on the layout the object ACTUALLY
+    // has.
+    //
+    // W7-7: the re-assert used to run the synthetic indices unconditionally.
+    // On the real layout that is not a wrong answer, it is heap corruption:
+    // slot 1 is `prevLookupClass` and slot 3 is `cachedProtectionDomain`, both
+    // REFERENCES the GC scans as oops, so `Int(0x5F)` in either is a bogus
+    // pointer for the collector to mark and move. It is the same defect the
+    // block above was written to fix, reintroduced through the failure branch —
+    // pinning only the positive half a second time. On the real layout, resolve
+    // the DECLARED slot instead and write that; never a fixed index.
     let modes_landed =
         matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == LK_FULL_POWER);
     if !modes_landed {
-        ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
-        ctx.set_field(obj, 2, Value::Object(None));
-        ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+        if real_layout {
+            let cid = ctx.class_id_of_object(obj);
+            if let Some(slot) = ctx.resolve_field_index_by_class_id(cid, "allowedModes") {
+                ctx.set_field(obj, slot, Value::Int(LK_FULL_POWER));
+            }
+        } else {
+            ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
+            ctx.set_field(obj, 2, Value::Object(None));
+            ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+        }
     }
     obj
 }
@@ -590,9 +610,16 @@ const CLASS_OPTION_FLAG_NESTMATE: i32 = 0x01;
 ///
 /// Each step below decides only on POSITIVE evidence and otherwise falls
 /// through, so an unrecognised shape degrades to the historical behaviour
-/// rather than guessing. In particular a by-name read of an ABSENT field
-/// answers `Int(0)`, which is why the flag step requires a non-zero value:
-/// both real constants have one (`NESTMATE = 0x1`, `STRONG = 0x4`).
+/// rather than guessing. The flag step requiring a NON-ZERO value is part of
+/// that, though not for the reason this note used to give ("a by-name read of
+/// an ABSENT field answers `Int(0)`" — that is `MockNativeContext`; production
+/// answers `Value::Object(None)`, which the `Value::Int` pattern rejects
+/// outright). The reason that survives both contexts is that a PRESENT but
+/// never-written `int` slot decodes as `Int(0)`, and so does a fabricated
+/// stub's slot under the mock — while both real constants carry a non-zero
+/// flag (`NESTMATE = 0x1`, `STRONG = 0x4`). So `Int(0)` is never positive
+/// evidence, and step 3 below is the one that reads a zero, deliberately, as
+/// the synthetic ORDINAL rather than as a flag.
 fn class_option_is_nestmate(ctx: &mut dyn NativeContext, opt: ObjectRef) -> bool {
     // 1. Real-JDK layout, primary witness: the enum constant's own name.
     if let Value::Object(Some(name_ref)) = ctx.get_field_by_name(opt, "name") {
@@ -1429,6 +1456,14 @@ mod tests {
     /// fabricated stub (`_f0.._f3`), the by-name lookups all miss, and the
     /// synthetic indices must still be written — `allowedModes` at slot 1.
     /// A by-name-only fix would have left this arm powerless.
+    ///
+    /// This test was GREEN while production took the opposite arm. The mock's
+    /// `get_field_by_name` answers `Int(0)` for an unresolvable name;
+    /// production answers `Value::Object(None)`, which the discriminator's old
+    /// `matches!(.., Value::Object(_))` disjunct accepted as proof of the real
+    /// layout. The discriminator is now the class-side witness alone, which
+    /// both contexts answer identically, so this assertion means in production
+    /// what it means here.
     #[test]
     fn alloc_lookup_for_still_writes_the_synthetic_indices() {
         let mut ctx = MockNativeContext::new();

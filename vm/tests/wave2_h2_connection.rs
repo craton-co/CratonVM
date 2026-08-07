@@ -98,12 +98,24 @@ fn h2test_connect_and_select_roundtrip() {
         }
     };
     let probe = h2_dir();
+    // Loud, and a failure under CRATONVM_REQUIRE_E2E — see `common::require_fixture`.
     if !probe.join("H2Test.class").exists() {
-        eprintln!("[wave2_h2] skipping: H2Test.class missing");
+        let _ = common::require_fixture(
+            "wave2_h2",
+            "the Wave 2 H2 fixture `H2Test` (H2Test.class, compiled from H2Test.java)",
+            &[probe.join("H2Test.class"), probe.join("H2Test.java")],
+        );
         return;
     }
     if !h2_jar().exists() {
-        eprintln!("[wave2_h2] skipping: h2-2.2.224.jar missing under apps/h2/lib");
+        // NOTE: `.gitignore` line 14 is `**/*.jar`, so this jar can never be
+        // committed — it is a genuine download prerequisite.
+        let _ = common::require_fixture(
+            "wave2_h2",
+            "the H2 database jar `h2-2.2.224.jar` (a DOWNLOAD prerequisite: `**/*.jar` is \
+             gitignored, so it is staged, never committed)",
+            &[h2_jar()],
+        );
         return;
     }
     let mut cmd = Command::new(&bin);

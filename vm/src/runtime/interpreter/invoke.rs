@@ -313,6 +313,47 @@ pub(super) fn resolved_private_invokevirtual_target(
 /// interface stash so the default-method rescue at the NSME emit site never
 /// fires for non-interface dispatch (which could otherwise re-route to a
 /// stale receiver class on Java-exception unwinding through unrelated invokes).
+/// May the stale-`java.lang.Thread`-mirror recovery consult the former-mirror
+/// address table for a receiver with this class id and this header?
+///
+/// **`class_id == 0` on its own is not the question**, and getting that wrong
+/// is what made the recovery substitute a thread mirror for a live `long[]`.
+/// Three unrelated things wear `ClassId(0)` (see `memory::reclaim_guard`):
+///
+/// * a span the collector reclaimed and zeroed — the case the recovery exists
+///   for, and the only one where the former-address table's identity argument
+///   holds;
+/// * a genuine `new Object()` — since H1, one with a non-zero identity hash;
+/// * **every primitive array.** An array header carries its COMPONENT class id
+///   (JVMS §4.4.1) and `long[]`/`int[]`/`byte[]` have none, so `Newarray`
+///   stamps `ClassId::new(0)`.
+///
+/// Only the first has an all-zero header: an array has a non-zero `kind`,
+/// `element_type` and `shape`, and a live object has a non-zero identity hash.
+/// Same 16 bytes, and the same test, as `execute_invoke_kind`'s own
+/// stale-pointer detector further down.
+#[inline]
+pub(super) fn stale_mirror_recovery_applies(
+    class_id: ClassId,
+    header: &[u8; cratonvm_types::HEADER_SIZE],
+) -> bool {
+    class_id == ClassId::new(0) && *header == [0u8; cratonvm_types::HEADER_SIZE]
+}
+
+/// [`stale_mirror_recovery_applies`] against a live receiver, reading its
+/// header only after confirming the address is inside a heap region.
+fn receiver_is_a_reclaimed_span(shared: &SharedVm, recv: ObjectRef) -> bool {
+    if shared.mem.heap.is_heap_addr(recv.as_ptr() as usize).is_none() {
+        return false;
+    }
+    // SAFETY: `is_heap_addr` just confirmed the address is inside a heap
+    // region, and every heap object begins with a readable header at least
+    // 16 bytes long.
+    let header: [u8; cratonvm_types::HEADER_SIZE] =
+        unsafe { std::ptr::read(recv.as_ptr() as *const [u8; cratonvm_types::HEADER_SIZE]) };
+    stale_mirror_recovery_applies(shared.mem.heap.class_id_of(recv), &header)
+}
+
 pub(super) fn execute_invoke_kind(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -449,9 +490,48 @@ pub(super) fn execute_invoke_kind(
     // dereferences the stale receiver (or a stale object argument) while
     // resolving/invoking the callee. Refresh while the forwarding header is
     // still available, before any class lookup or native call can touch it.
+    // The receiver exactly as the operand stack handed it over, before the
+    // barrier above may have rewritten it. Kept so the invariant check further
+    // down can say WHICH of the two is the bad one: a receiver that was already
+    // wrong on the stack is a root-remap gap, whereas one that only became
+    // wrong here means `load_and_forward` redirected a live reference through a
+    // forwarding word it should not have trusted. Nothing but a `Copy` of an
+    // already-materialised `Value`; no allocation, no branch on the hot path.
+    let recv_before_refresh = match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
     for value in &mut args {
         if let Value::Object(Some(obj)) = value {
+            let before = *obj;
+            // The word the barrier is about to decide on, read once here so a
+            // later report can quote it. The barrier itself re-loads it; a
+            // disagreement between the two is itself the finding.
+            // SAFETY: `before` is a reference popped from the operand stack and
+            // is about to be dereferenced by `load_and_forward` anyway;
+            // `MARK_WORD_OFFSET` is inside the header of any heap object.
+            let mark = if shared
+                .mem
+                .heap
+                .is_heap_addr(before.as_ptr() as usize)
+                .is_some()
+            {
+                unsafe {
+                    std::ptr::read(
+                        before.as_ptr().add(cratonvm_types::MARK_WORD_OFFSET) as *const u64
+                    )
+                }
+            } else {
+                0
+            };
             *obj = shared.mem.heap.load_and_forward(*obj);
+            if obj.as_ptr() != before.as_ptr() {
+                crate::memory::reclaim_guard::note_barrier_rewrite(
+                    before.as_ptr() as usize,
+                    mark,
+                    obj.as_ptr() as usize,
+                );
+            }
         }
     }
     let args_root_guard = InvokeArgsRootGuard::new(thread, &args);
@@ -681,15 +761,46 @@ pub(super) fn execute_invoke_kind(
     //
     // Precise / no false substitutions: the former-address table is populated
     // *only* by GC mirror relocations, and we consult it *only* when the
-    // receiver header is genuinely all-zero (`class_id == 0`). A from-space
-    // slot reused for a live object has a non-zero class_id and never reaches
-    // the lookup; a vacated address uniquely identified one thread's mirror,
-    // so identity is preserved. We additionally verify the recovered mirror is
-    // itself live before substituting.
+    // receiver header is genuinely all-zero. A vacated address uniquely
+    // identified one thread's mirror, so identity is preserved, and we
+    // additionally verify the recovered mirror is itself live before
+    // substituting.
+    //
+    // "Genuinely all-zero" is a **16-byte header comparison, not
+    // `class_id == 0`**, and the difference is this whole recovery's
+    // correctness. `class_id == 0` is worn by three unrelated things (see
+    // `memory::reclaim_guard`), and one of them is not stale at all:
+    //
+    //   **every primitive array.** `Instruction::Newarray` allocates with
+    //   `ClassId::new(0)` because an array header carries its COMPONENT class
+    //   id (JVMS §4.4.1) and `long[]`/`int[]`/`byte[]` have none.
+    //
+    // So the `class_id == 0` form matched a perfectly live `long[]` whose
+    // address happened to appear in `former_mirror_addrs` — the young allocator
+    // re-serves vacated addresses constantly — and replaced the receiver with a
+    // `java.lang.Thread`. Measured on `org.h2.test.db.TestTempTables`: 5
+    // occurrences in ~50 `--nojit` runs, every one of them
+    // `java/util/Arrays.copyOf(long[], int)`'s `original.clone()` dispatching
+    // into a thread mirror, surfacing as
+    // `CloneNotSupportedException` from a `java/lang/Thread.clone` frame (the
+    // mirror's inherited `Thread.clone` body) and costing two sessions on a
+    // hunt for a GC bug that was not there. The substituted class was
+    // `java/lang/Thread`, `jdk/internal/misc/InnocuousThread` and
+    // `org/h2/mvstore/FileStore$BackgroundWriterThread` on different runs —
+    // whichever mirror had previously occupied the address.
+    // See `fixed-suite-bugs/h2-suite-bugs/
+    // bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+    //
+    // The all-zero test is exactly what the recovery was written for — the
+    // Tomcat `TestDigestAuthenticator` case dispatches on a *zeroed* object —
+    // and it is the same test the stale-pointer detector further down this
+    // function already applies. A live object cannot pass it: `init_object_header`
+    // mints a non-zero identity hash at allocation (H1), and an array carries a
+    // non-zero `kind`/`element_type`/`shape`.
     if !is_special {
         let recovered: Option<ObjectRef> = if let Value::Object(Some(recv)) = &args[0] {
             let recv = *recv;
-            if shared.mem.heap.class_id_of(recv) == ClassId::new(0) {
+            if receiver_is_a_reclaimed_span(shared, recv) {
                 shared
                     .threads
                     .thread_registry
@@ -846,6 +957,31 @@ pub(super) fn execute_invoke_kind(
         None
     };
 
+    // An array-typed call site whose receiver is not an array is a provable
+    // invariant violation: the verifier guarantees the operand is `[J`, and
+    // nothing in a well-formed heap turns a `[J` into a plain object. Report it
+    // where both facts are still in hand — the dispatch below no longer looks at
+    // the receiver's header at such a site, so without this the corruption would
+    // pass through silently and surface later as a `ClassCastException` on the
+    // `checkcast` that follows `clone()`.
+    //
+    // Costs one byte compare per non-special invoke on a name the caller has
+    // already resolved; the body is reached only when the invariant is broken.
+    if !is_special && method_class_name.starts_with('[') {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            if shared.mem.heap.kind_of(recv) != cratonvm_types::ObjectKind::Array {
+                crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
+                    shared,
+                    thread,
+                    recv,
+                    "array-typed call site, non-array receiver",
+                    &format!("{method_class_name}.{method_name}{method_descriptor}"),
+                    recv_before_refresh,
+                );
+            }
+        }
+    }
+
     // Determine the class to invoke on.
     // invoke_class: Arc<str> — cheap clone, derefs to &str for all downstream calls.
     let invoke_class: Arc<str> = if is_special {
@@ -862,6 +998,37 @@ pub(super) fn execute_invoke_kind(
         )
     } else if let Some((_declaring_id, declaring_name)) = &private_virtual_target {
         Arc::clone(declaring_name)
+    } else if method_class_name.starts_with('[') {
+        // The call SITE names an array type, so JVMS §4.4.1 settles the target
+        // statically: an array class declares no methods of its own and its
+        // method table is `java.lang.Object`'s. There is no subclass of `[J`
+        // that could override `clone()`, so the receiver's header has nothing
+        // to contribute and must not be consulted.
+        //
+        // The receiver-driven branch below reaches the same answer for a
+        // receiver whose header says `kind == Array`, and that is the whole
+        // 2026-07-31 fix. What it cannot do is answer correctly for a receiver
+        // whose header does NOT say array — a block reclaimed while still
+        // referenced and then re-served now describes whatever occupies it, and
+        // `class_id_of` then picks that occupant's `clone()` body. That is how
+        // `java/util/Arrays.copyOf(long[], int)`'s `original.clone()` — an
+        // `invokevirtual "[J".clone:()Ljava/lang/Object;` — reached
+        // `java.lang.Thread.clone`, whose body is `throw new
+        // CloneNotSupportedException()` and nothing else, in
+        // `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame`.
+        // Deciding from the call site instead of from the header removes that
+        // route by construction, for every array-typed call site and every
+        // reason a header might lie.
+        //
+        // A non-Object member at an array-typed call site cannot come from real
+        // javac output; keep the CP name for it so the S111r8 synthetic-shape
+        // rescue below (and `try_stackless_invoke`'s `[`-prefix rewrite) behave
+        // exactly as before.
+        if crate::vm::is_object_member(&method_name, &method_descriptor) {
+            Arc::from("java/lang/Object")
+        } else {
+            method_class_name.clone()
+        }
     } else {
         match &args[0] {
             Value::Object(Some(obj_ref)) => {
@@ -1726,23 +1893,13 @@ pub(super) fn execute_invoke_kind(
         && &*method_descriptor == "()Ljava/lang/Object;"
     {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            let addr = recv.as_ptr() as usize;
-            tracing::error!(
-                target: "cratonvm::gc::guard",
-                obj = format!("{addr:#x}"),
-                receiver_kind = ?shared.mem.heap.kind_of(recv),
-                receiver_class_id = shared.mem.heap.class_id_of(recv).as_u32(),
-                "clone() dispatched to java.lang.Thread.clone, which only ever throws. \
-                 The receiver's header does not describe what the caller is holding — \
-                 either an array dispatched through its COMPONENT class id, or a block \
-                 that was reclaimed while still referenced and then re-served.",
-            );
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
+            crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
                 shared,
-                addr,
+                thread,
+                recv,
                 "Thread.clone dispatch",
                 "java/lang/Thread.clone()Ljava/lang/Object;",
-                shared.mem.heap.class_id_of(recv).as_u32(),
+                None,
             );
         }
     }
@@ -2714,10 +2871,18 @@ pub(super) fn try_stackless_invoke(
     // this exact shape for enum-typed arrays) or the stale/reclaimed-ObjectRef
     // family seen through `clone()` instead of through a `checkcast`.
     //
-    // `java.lang.Thread.clone()` has the identical property and its own,
-    // richer reporter earlier in this file (site "Thread.clone dispatch",
-    // landed 2026-08-03) -- deliberately NOT repeated here, so a real event
-    // produces one verdict rather than two.
+    // `java.lang.Thread.clone()` has the identical property and is reported
+    // here too. It also has a reporter in `execute_invoke_kind`, and that used
+    // to be the only one — which left the route that matters UNCOVERED: a
+    // JIT-compiled call site reaches `invoke_or_native` ->
+    // `invoke_on_class_shared_inner` -> here, and never passes through
+    // `execute_invoke_kind` at all. The H2 suite sweep that reopened
+    // `bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame`
+    // ran on a binary that already carried the `execute_invoke_kind` reporter
+    // and quoted no verdict with the trace, and the suite runner's default mode
+    // is JIT-on. A duplicate verdict on the interpreter route costs one extra
+    // rate-limited log line; a missing one on the JIT route costs the session.
+    // The `site` string distinguishes them.
     //
     // This closes what the retired
     // `bug-h2-testmultithread-concurrent-update-timeout` write-up asked for:
@@ -2732,14 +2897,15 @@ pub(super) fn try_stackless_invoke(
     //
     // Cost on a healthy run: one `&str` comparison per stackless invoke, which
     // fails on length for every method whose name is not five bytes.
-    if method_name == "clone" && class_name == "java/lang/Enum" {
+    if method_name == "clone" && matches!(class_name, "java/lang/Enum" | "java/lang/Thread") {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            crate::memory::reclaim_guard::report_reclaimed_receiver(
+            crate::memory::reclaim_guard::report_impossible_dispatch_terminal(
                 shared,
-                recv.as_ptr() as usize,
-                "Enum.clone dispatch",
+                thread,
+                recv,
+                "impossible clone (stackless invoke)",
                 &format!("{class_name}.{method_name}{descriptor}"),
-                shared.mem.heap.class_id_of(recv).as_u32(),
+                None,
             );
         }
     }

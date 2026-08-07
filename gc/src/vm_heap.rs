@@ -513,18 +513,59 @@ impl VmHeap {
 
     /// `[lo, hi)` envelope containing every address [`Self::is_object_address`]
     /// can possibly accept, or `None` when the backend cannot cheaply supply
-    /// one (ZGC keeps live bases in a registry, not a contiguous arena).
+    /// one.
     ///
     /// Purely an optimization hint for conservative stack scanning: a word
     /// outside the envelope is definitely not an object address, so the
     /// caller can skip the full per-word validator. A word inside it still
-    /// has to go through `is_object_address`.
+    /// has to go through `is_object_address` — the envelope is a **filter**,
+    /// never an answer. Rooting a word on the strength of the range test alone
+    /// would accept object *interiors* as bases, which is precisely the
+    /// unsoundness [`Self::is_addr_live`]'s ZGC arm was fixed for (see the
+    /// coalesced-free-block argument on that arm below).
     pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
         match self {
             VmHeap::Generational(h) => h.conservative_addr_span(),
             VmHeap::G1(h) => h.conservative_addr_span(),
+            // ZGC answers `None` — but NOT, as this doc used to claim, because
+            // "ZGC keeps live bases in a registry, not a contiguous arena".
+            // The registry is only the live-base *index*; `ZgcRealHeap` backs
+            // every object and array with one `Mutex<Arena>` (`zgc.rs:1464`)
+            // through the single chokepoint `alloc_raw` (`zgc.rs:1772`), and
+            // that arena is built once by `with_capacity` (`zgc.rs:1629`) and
+            // never grown (no `Arena::grow` call exists in `zgc.rs`). The
+            // envelope therefore EXISTS and is immutable for the heap's
+            // lifetime — `[Arena::base_ptr(), +Arena::capacity())` — it is
+            // simply not reachable from here: the field is private to the
+            // `zgc` module and the only bound it publishes is
+            // `heap_capacity()`, a length with no base.
+            //
+            // What the `None` costs: `conservative_roots.rs:4052-4064` hoists
+            // this envelope out of the JIT frame scan exactly so the
+            // overwhelming majority of stack words — return addresses, ints,
+            // native pointers — die on an inline compare. With `None` every
+            // 8-byte stack word instead calls `ZgcRealHeap::is_object_address`
+            // (`zgc.rs:1892`), whose first act is `self.registry.lock()`: one
+            // mutex acquire PER STACK WORD, per root-gathering pass, per
+            // thread. `docs/gc/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
+            // as a competing explanation for the 35 PASS→HANG classes in
+            // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`,
+            // whose ApplicationContext boot/teardown shape is exactly deep
+            // stacks × many threads. `zgc.rs:1467-1474` records that the same
+            // shape already "read as a hang at scale" once — that fix covered
+            // only the exact-base probe, never the per-word lock.
+            //
+            // Landed 2026-08-07: `ZgcRealHeap::conservative_addr_span` now
+            // publishes the arena envelope, captured once in `with_capacity`
+            // as two plain `usize` fields and answered without taking the
+            // arena lock — the span exists to let the caller reject a word
+            // with a range compare and NO lock, so locking to answer it
+            // would defeat the point. Sound because the arena is never
+            // grown. The arm's old `None` was justified by "ZGC keeps live
+            // bases in a registry, not a contiguous arena" — a false
+            // premise, and the reason this went unfixed.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => None,
+            VmHeap::Zgc(h) => h.conservative_addr_span(),
         }
     }
 
@@ -611,8 +652,52 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.is_heap_addr(addr),
             VmHeap::G1(h) => h.is_heap_addr(addr),
+            // ZGC: apply this method's own stated screen — *alignment* +
+            // containment — before entering the backend, because
+            // `ZgcRealHeap::is_heap_addr` (`zgc.rs:1902`) is the one
+            // implementation that performs neither test. Both shipping
+            // backends open with this exact line (`gen_heap.rs:3293`,
+            // `g1.rs:7601`); ZGC goes straight to `registry.lock()`.
+            //
+            // Why it matters more here than there: on ZGC a *miss* is not
+            // cheap. After the exact-base hash probe misses, `is_heap_addr`
+            // drops the registry lock, RE-TAKES it, and walks the entire live
+            // registry dereferencing each base's header to test extents —
+            // O(live) per probe, under the mutex (`zgc.rs:1908-1919`). The
+            // callers are per-slot conservative root scanners over ambiguous
+            // JVM-long-vs-jobject operand slots (`value_stack.rs:1301`,
+            // `:1587`, `memory/roots.rs:200`, `frame.rs:1831`,
+            // `interpreter/gc_and_alloc.rs:4260`), whose dominant population
+            // is zeros, small integers and long bit patterns — every one of
+            // which currently buys a full walk of the heap.
+            // `docs/gc/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
+            // instrument-separable hypotheses for the 35 PASS→HANG classes in
+            // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`.
+            //
+            // Why it cannot lose a root. The guard only ever returns `None`
+            // sooner; it can never turn a `None` into a `Some`, so no interior
+            // address can be promoted to a base by it.
+            //   * `addr == 0`: no live base is 0 and `0 >= base` is false for
+            //     every base, so the extent walk already answered `None`. Pure
+            //     work elimination, bit-identical result.
+            //   * misaligned: every ZGC allocation base is 8-aligned
+            //     (`alloc_raw` calls `arena.alloc(size, 8)`, `zgc.rs:1775`),
+            //     so no *base* is reachable this way and none can be dropped.
+            //     Only a misaligned *interior* word could previously have been
+            //     rooted, and that is a word Generational and G1 have rejected
+            //     since this method existed — this arm converges on the
+            //     contract, it does not invent one.
+            //
+            // See the `TODO(zgc)` on `conservative_addr_span` above: once
+            // `ZgcRealHeap` publishes its arena envelope, the range compare
+            // belongs here too, ahead of the lock.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.is_heap_addr(addr),
+            VmHeap::Zgc(h) => {
+                if addr == 0 || addr & 0x7 != 0 {
+                    return None;
+                }
+                h.is_heap_addr(addr)
+            }
         }
     }
 
@@ -1136,13 +1221,59 @@ impl VmHeap {
     /// allocates only from inside natives never reaches ANY safepoint and G1's
     /// infallible allocator aborts the process on a heap full of garbage (see
     /// `fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
+    ///
+    /// ZGC: the same defect was live here, verbatim. `ZgcRealHeap` is an
+    /// infallible allocator too — `alloc_object` and `alloc_array` end in
+    /// `eprintln!("FATAL: ZGC(real): out of heap space …"); std::process::abort()`
+    /// (`ZgcRealHeap`'s `GarbageCollector` impl) — and this arm answered a
+    /// hardwired `false`, so the one hook that can run a collection on behalf of
+    /// a native (`safe_native_call_impl`, `vm/src/vm/vm_exec.rs`) never fired on
+    /// this backend. An
+    /// allocate-only-from-natives workload therefore reached no safepoint at
+    /// all and died by `abort()` on a heap full of garbage, with no Java-visible
+    /// `OutOfMemoryError` ever thrown.
+    ///
+    /// 2026-08-07: this arm used to COMPUTE the signal from `h.needs_gc()`
+    /// alone, carrying a `TODO(zgc)` that asserted `ZgcRealHeap` had no pressure
+    /// field and that this file could not add one. That claim stopped being true
+    /// the same day, and the stale comment was the only thing keeping the gap
+    /// open: `zgc.rs` now owns a real `native_alloc_pressure: AtomicBool` on
+    /// `ZgcRealHeap` — armed in `alloc_raw`, disarmed at the end of
+    /// `collect_garbage` where `gc_rearm` is recomputed — behind the same
+    /// `native_alloc_pressure()` / `clear_native_alloc_pressure()` /
+    /// `note_native_alloc_pressure()` trio G1 exposes. The two halves of one fix
+    /// were written from opposite ends and never met; these three arms are the
+    /// join.
+    ///
+    /// The latch ADDS to the occupancy test rather than replacing it, which is
+    /// where this deliberately differs from the G1 arm above (a bare latch
+    /// read). G1 can afford that because `note_region_consumed_locked` re-arms
+    /// on every region consumption below the threshold. Here, dropping
+    /// `|| h.needs_gc()` would NARROW behaviour that is already load-bearing:
+    /// the consumer (`vm/src/vm/vm_exec.rs`) clears unconditionally after
+    /// acting — including when its own gates said no — so a just-cleared latch
+    /// would answer `false` over a heap that is genuinely over its trigger. The
+    /// disjunction keeps the `abort()` case covered by construction, and the
+    /// latch adds the edge the occupancy test cannot see (a caller that noted
+    /// pressure below the trigger).
+    ///
+    /// Neither term can recreate the `gc_rearm` GC storm. The latch is armed on
+    /// `needs_gc`'s predicate VERBATIM — `allocated >= gc_threshold &&
+    /// allocated >= gc_rearm`, inlined in `ZgcRealHeap::alloc_raw` — so it
+    /// inherits the re-arm floor each collection raises to
+    /// `live + max(headroom/4, 64 KiB)`, and can never ask for a collection
+    /// `needs_gc` would refuse. The second term IS `needs_gc`, i.e. exactly what
+    /// this arm answered before. And the consumer re-checks both
+    /// `gc_overhead_limit_exceeded` and `needs_gc` before running anything, so
+    /// even the externally-noted edge (which bypasses the heap's own predicate,
+    /// by design) buys at most one gate evaluation per note.
     #[inline]
     pub fn young_spill_pressure(&self) -> bool {
         match self {
             VmHeap::Generational(h) => h.young_spill_pressure(),
             VmHeap::G1(h) => h.native_alloc_pressure(),
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => false,
+            VmHeap::Zgc(h) => h.native_alloc_pressure() || h.needs_gc(),
         }
     }
 
@@ -1152,8 +1283,16 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.clear_young_spill_pressure(),
             VmHeap::G1(h) => h.clear_native_alloc_pressure(),
+            // 2026-08-07: was a no-op, on the (by then false) grounds that ZGC's
+            // signal was computed rather than latched and so had nothing to
+            // clear. `ZgcRealHeap` owns the latch now, so this is G1's plain
+            // delegation. Idempotent and cheap on purpose — the consumer clears
+            // unconditionally after acting, including when its own gates said
+            // no. Note this lowers only the LATCH; the `|| h.needs_gc()` half of
+            // [`Self::young_spill_pressure`] is the heap's own occupancy and
+            // clears itself when a collection actually runs.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => h.clear_native_alloc_pressure(),
         }
     }
 
@@ -1164,8 +1303,28 @@ impl VmHeap {
         match self {
             VmHeap::Generational(h) => h.note_young_spill_pressure(),
             VmHeap::G1(h) => h.note_native_alloc_pressure(),
+            // 2026-08-07: was a no-op under a `TODO(zgc)` specifying the latch
+            // `ZgcRealHeap` should grow. It grew it (field + arming edge in
+            // `alloc_raw` + disarm in `collect_garbage` + the accessor trio), so
+            // the TODO is discharged and this is G1's plain delegation.
+            //
+            // What the no-op cost: `Self::young_spill_pressure` read the heap's
+            // own occupancy, which covers the case that actually aborts the
+            // process (the heap really is over the trigger) but NOT a caller
+            // that spilled BELOW the trigger and wants the next native boundary
+            // to collect anyway. That was a gap in the mechanism rather than a
+            // live defect — this method still has no call site outside `gc/` —
+            // but a silently-dropped signal is a bad thing to leave armed for
+            // the first caller that does appear.
+            //
+            // This edge deliberately bypasses the `gc_threshold` / `gc_rearm`
+            // predicate the heap applies to itself: the caller is asserting
+            // pressure the heap's counters cannot see. It cannot storm, because
+            // the consumer re-checks `gc_overhead_limit_exceeded` and
+            // `needs_gc` before collecting and clears the latch either way, so
+            // one note buys one gate evaluation.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {}
+            VmHeap::Zgc(h) => h.note_native_alloc_pressure(),
         }
     }
 
@@ -1973,10 +2132,17 @@ impl VmHeap {
                 // but log that GC logging was requested.
                 tracing::info!("[GC] Verbose GC logging enabled (generational collector)");
             }
+            // 2026-08-07: this arm used to answer with an honest "unavailable"
+            // `tracing::info!` instead of enabling anything, because
+            // `ZgcRealHeap` had no toggle to flip and no gated statement to flip
+            // it for — so a user running `--verbose:gc -XX:+UseZGC` got nothing
+            // for the whole run. `zgc.rs` has since grown the `gc_log_enabled:
+            // AtomicBool` field, the `enable_gc_logging` / `disable_gc_logging`
+            // pair mirroring G1's, and the per-collection `eprintln!` in
+            // `collect_garbage` that reads the flag — so the honest answer is
+            // now a plain delegation, exactly like G1's arm above.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(_) => {
-                tracing::info!("[GC] Verbose GC logging enabled (ZGC-real collector)");
-            }
+            VmHeap::Zgc(h) => h.enable_gc_logging(),
         }
     }
 
@@ -1987,6 +2153,25 @@ impl VmHeap {
     pub fn print_gc_summary(&self) {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
+        }
+        // ZGC: the same unconditional-counts treatment the generational branch
+        // below gets, and for the same reason — without it a `--verbose:gc` run
+        // on this backend printed NOTHING at all (there is no ZGC branch in any
+        // logging path; `enable_gc_logging` above only ever emitted a claim),
+        // so "did this configuration collect more?" — the first question to ask
+        // about the open ZGC HANG/FAIL classes — could not be answered from a
+        // log. `occupancy` is the post-sweep live figure, because the sweep
+        // stores retained bytes back into `allocated` (`zgc.rs:2472`); it is
+        // therefore directly comparable across runs, unlike a bump cursor.
+        // Cheap: two relaxed loads and one arena lock at shutdown.
+        #[cfg(feature = "zgc")]
+        if let VmHeap::Zgc(h) = self {
+            eprintln!(
+                "[GC] zgc-real: collections={} occupancy={}/{} bytes",
+                h.gc_count(),
+                h.allocated_bytes(),
+                h.heap_capacity(),
+            );
         }
         // Collection COUNTS, unconditionally. Without these the summary is not
         // comparable across configurations: the moving-young line below only
@@ -2159,8 +2344,43 @@ impl VmHeap {
                 h.is_live_old_gen_addr(addr) || h.is_live_young_survivor(addr)
             }
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
+            // ZGC: the EXACT registry-base test (`zgc.rs:1715` — one hash
+            // probe), deliberately NOT the loose `is_heap_addr` this arm used
+            // to call. The two differ only in `is_heap_addr`'s interior
+            // fallback (`zgc.rs:1731-1743`), and that fallback is exactly what
+            // made this arm unsound.
+            //
+            // The ZGC sweep zeroes each dead object, returns its span to the
+            // arena free list, and then COALESCES adjacent free spans into
+            // maximal blocks. A later allocation carved from the head of a
+            // coalesced block therefore covers the interior of what used to be
+            // several dead objects — so a *dead* object's pre-GC base becomes
+            // an interior address of an innocent LIVE object, and the extent
+            // walk answered `true` for it. Reference processing then read that
+            // as "the referent survived", and because ZGC's `pointer_map` is
+            // always empty (`zgc.rs:2489`, non-moving) the consumer at
+            // `interpreter/gc_and_alloc.rs:2287` falls back to the stale
+            // address and does `set_field(obj, 0, Value::Object(None))` on it
+            // — a null written into the middle of a live object, and at the
+            // weak/phantom restore site a non-null reference written there.
+            // That is precisely the HIB-CV-32 stale-referent-write corruption
+            // shape the guard chain around `watched_pre_gc_addr_survived`
+            // exists to prevent, reproduced on this backend through a
+            // predicate whose own consumer doc (below, "registry lookup")
+            // already believed it was exact. It is exact now.
+            //
+            // Not merely a correctness fix: `is_heap_addr`'s fallback is
+            // O(live) *under the registry mutex*, and this predicate runs once
+            // per tracked reference per collection. `is_object_address` is one
+            // locked hash probe.
+            //
+            // Contrast G1's arm above, which IS deliberately loose
+            // (region-granular): G1 emits identity `pointer_map` entries for
+            // every self-forwarded live object, so the map hit fires first and
+            // the loose predicate is only a fallback. ZGC has no such map, so
+            // its predicate is load-bearing alone and must be exact.
             #[cfg(feature = "zgc")]
-            VmHeap::Zgc(h) => h.is_heap_addr(addr).is_some(),
+            VmHeap::Zgc(h) => h.is_object_address(addr).is_some(),
         }
     }
 

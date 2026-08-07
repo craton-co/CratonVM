@@ -22,9 +22,11 @@
 //! also picks up the other's provider.
 //!
 //! Requires a local WildFly 32.0.1.Final distribution unpacked at
-//! `WILDFLY_DIST_MODULES` (default: `/data/data/wildfly-dist/wildfly-32.0.1.Final/modules`)
+//! `WILDFLY_DIST_MODULES` (default: `<repo>/apps/wildfly-dist/wildfly-32.0.1.Final/modules`)
 //! plus `javac` on `PATH`; skips (rather than fails) when either is absent
 //! so this doesn't break environments without the real distribution staged.
+//! The skip is LOUD and `CRATONVM_REQUIRE_E2E=1` promotes it to a failure —
+//! see `common::require_fixture`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,10 +36,34 @@ fn fixture_dir() -> PathBuf {
     manifest.join("tests").join("wildfly_boot_fixtures")
 }
 
+/// Locate a staged WildFly `modules/` tree.
+///
+/// The fallback used to be the absolute `/data/data/wildfly-dist/…` — the Azure
+/// Linux build host's layout, which resolves on exactly one machine. Everywhere
+/// else `is_dir()` was false and the single test in this file reported `ok`
+/// while asserting nothing. The fallback is now repo-root-relative, so a
+/// developer who unpacks the distribution into the repo gets a real run;
+/// `WILDFLY_DIST_MODULES` remains the portable override.
 fn wildfly_dist_modules() -> PathBuf {
-    std::env::var("WILDFLY_DIST_MODULES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/data/data/wildfly-dist/wildfly-32.0.1.Final/modules"))
+    if let Ok(v) = std::env::var("WILDFLY_DIST_MODULES") {
+        return PathBuf::from(v);
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    for rel in [
+        "apps/wildfly-dist/wildfly-32.0.1.Final/modules",
+        "target/fixtures/wildfly-32.0.1.Final/modules",
+    ] {
+        let candidate = root.join(rel);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    // Nothing staged: return the preferred location so the skip/panic message
+    // names a path the reader can actually create.
+    root.join("apps/wildfly-dist/wildfly-32.0.1.Final/modules")
 }
 
 /// The `org.jboss.as.controller` module's jar — needed on the probe's own
@@ -179,10 +205,15 @@ fn run_probe(
 fn jboss_module_service_provider_lookup_is_module_scoped() {
     let modules_root = wildfly_dist_modules();
     if !modules_root.is_dir() {
-        eprintln!(
-            "[wildfly_jboss_module_service_leak] {} not present; skipping \
-             (set WILDFLY_DIST_MODULES to a WildFly modules/ tree to run this test)",
-            modules_root.display()
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. A WildFly distribution is a genuine staging
+        // prerequisite (it is far too large to commit), but its absence must not
+        // read as a pass.
+        let _ = common::require_fixture(
+            "wildfly_jboss_module_service_leak",
+            "a WildFly 32.0.1.Final `modules/` tree (set WILDFLY_DIST_MODULES, or unpack the \
+             distribution at one of the paths below)",
+            &[modules_root.clone()],
         );
         return;
     }

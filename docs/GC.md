@@ -1,10 +1,10 @@
 # Garbage Collection in CratonVM — architecture and current state
 
-*Last updated 2026-07-27. The historical four-wave G1/ZGC correctness
-audit is retained in
+*Last updated 2026-08-07 (ZGC sections only; the rest is as of 2026-07-27).
+The historical four-wave G1/ZGC correctness audit is retained in
 the internal fixed-issue archive.*
 
-CratonVM ships three garbage-collector backends behind one dispatcher
+CratonVM has three garbage-collector backends behind one dispatcher
 (`gc/src/vm_heap.rs::VmHeap`). All are stop-the-world at the collection
 level; G1 additionally runs its marking phase concurrently. Selection is
 java-launcher-compatible:
@@ -17,6 +17,18 @@ java-launcher-compatible:
 
 Unrecognized `-XX:+Use*GC` selectors warn and fall back to Generational.
 Heap size comes from `-Xmx`/`-Xms` as usual.
+
+**Only two of the three are in a stock build.** ZGC is behind the
+default-off `zgc` Cargo feature (`gc/Cargo.toml:90`, `vm/Cargo.toml:106`),
+which gates the `GcAlgorithm::Zgc` variant and its `parse_gc_algorithm` arm
+(`vm/src/config.rs:51`) as well as the `VmHeap::Zgc` arms — so in a default
+build `-XX:+UseZGC` takes the fall-back path above. A ZGC-capable launcher
+is `cargo build -p cratonvm-cli --features zgc`. It is default-off because
+it is not at parity: measured 2026-08-07 on the 1975-class Spring Boot
+suite, 1860 PASS vs. Generational's 1902, 49 HANG vs. 18
+([record](known-issues/springboot/zgc-real-fullsuite-regression-20260807.md)). The plan to make
+it a real, concurrent, generational, compacting ZGC is
+[`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 
 ## The VM ↔ GC protocol
 
@@ -234,8 +246,15 @@ Allocation failure escalates: young pause → synchronous full mark cycle
 registry of allocation bases. `needs_gc` triggers at 75 % occupancy with
 a post-sweep re-arm so a large live set cannot storm. The sweep prunes
 dead bases in place and feeds the exact dead list to the monitor
-registry. Non-moving ⇒ the pointer map is always empty and no barriers
-are needed; reference semantics come entirely from the VM-level
+registry. Non-moving ⇒ the pointer map is always empty (`zgc.rs:2464`) and
+no barriers are needed; reference semantics come entirely from the VM-level
 protocol. Mutators have no TLABs on this backend (every allocation takes
-the arena lock) — it is a correctness-first reference backend, not a
-throughput one.
+the arena lock, `vm_heap.rs:2114`) — it is a correctness-first reference
+backend, not a throughput one.
+
+The always-empty pointer map and the neutral `VmHeap::Zgc` arms that go
+with it are correct *only* while the collector is non-moving, and they fail
+silently rather than loudly if it ever moves an object. That is tracked as
+Phase 4 of
+[`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md),
+which must land before any compaction does.

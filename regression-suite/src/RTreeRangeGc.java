@@ -29,10 +29,14 @@ import java.util.TreeSet;
  * views, which reused an element read before the comparison that moved it.
  *
  * compareTo() allocates deliberately so the collection lands inside the native.
- * The suite runs this class with --Xmx 64m: on the default heap no collection
- * happens during the walk at all and the defect is invisible. (Unlike
- * RPriorityQueueGc this one does NOT need --nojit - it reproduces with the JIT
- * on, 3/3, as long as the heap is small enough to collect.)
+ *
+ * REQUIRED CratonVM ARGUMENT: --Xmx 64m, and only that (see run.sh
+ * class_cv_args). On the default heap no collection happens during the walk at
+ * all and the class passes on a broken VM. Unlike RPriorityQueueGc this one
+ * does NOT need --nojit - it reproduces with the JIT on, 3/3 (b2e13e441), so
+ * registering it leaves the default compiling configuration under test.
+ * HotSpot deliberately does not get the flag: it is a CratonVM spelling and
+ * the expected output does not depend on the heap size.
  */
 public class RTreeRangeGc {
 
@@ -163,10 +167,16 @@ public class RTreeRangeGc {
 
         // keySet / toString walk the same snapshot through allocating code.
         long keySum = 0;
+        int keyCount = 0;
         for (K k : m.keySet()) {
             check(k.payload == k.key * 3 + 1, "keySet: corrupted " + k);
             keySum += k.key;
+            keyCount++;
         }
+        // An empty keySet() would walk no elements, assert nothing, and print a
+        // CK line that only the HotSpot diff could catch - and run.sh skips that
+        // diff when no HotSpot is present.
+        check(keyCount == ENTRIES, "keySet yielded " + keyCount + " of " + ENTRIES);
         System.out.println("CK tm-keyset " + keySum);
         check(m.toString().length() > ENTRIES, "toString truncated");
 

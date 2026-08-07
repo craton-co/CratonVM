@@ -168,25 +168,85 @@ mod tests {
     use crate::test_utils::mock_ctx;
     // The heap accessors these tests drive (`new_object`, `create_string`,
     // `get_field_by_name`, `set_field_by_name`) are trait methods, and the
-    // trait has to be in scope to call them on the mock.
-    use cratonvm_native_api::NativeHeapAccess;
+    // trait has to be in scope to call them on the mock. `class_id_of_object`
+    // is declared on the `NativeClassAccess` supertrait, which must be named
+    // separately for method resolution.
+    use cratonvm_native_api::{FieldMetadata, NativeClassAccess, NativeHeapAccess};
 
-    /// The mock's `get_field_by_name` mirrors the production hazard for an
-    /// unresolvable name: it answers `Value::Int(0)`, not `Object(None)`
-    /// (`test_utils.rs:1804-1807`). That is the exact tag an unwritten
-    /// reference slot produces in the VM, so it is the right stand-in here.
+    /// Declare `class_id` as owning a single instance field, so the name
+    /// RESOLVES on objects of that class without anything ever writing the
+    /// slot.
+    fn declare_one_field(
+        ctx: &crate::test_utils::MockNativeContext,
+        class_id: cratonvm_types::ClassId,
+        name: &str,
+        descriptor: &str,
+    ) {
+        ctx.set_declared_fields(
+            class_id,
+            vec![FieldMetadata {
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: class_id,
+                is_static: false,
+            }],
+        );
+    }
+
+    /// The `Value::Int(0)` this module is about is the one production really
+    /// produces: a name that **resolves**, to a **reference** slot that has
+    /// never been written.
+    ///
+    /// This test used to assert `Int(0)` for an *unresolvable* name and cite it
+    /// as production behaviour. It is not: production
+    /// (`vm/src/vm/vm_exec.rs:10613-10623`, and the trait contract at
+    /// `native-api/src/registry.rs:2351-2354`) answers `Value::Object(None)`
+    /// there. Only `MockNativeContext` answers `Int(0)` to an absent name, and
+    /// that divergence is deliberate and opt-out
+    /// (`test_utils.rs::set_absent_field_answers_null`). Encoding it here made
+    /// the mock's lie look like a documented VM fact, and three lanes reasoned
+    /// from it. So: turn the faithful answer ON, and assert the two cases
+    /// apart.
     #[test]
-    fn by_name_read_of_an_unresolvable_name_is_int_zero_not_null() {
+    fn by_name_read_of_a_resolvable_unwritten_reference_slot_is_int_zero() {
         let mut ctx = mock_ctx();
-        let obj = match ctx.new_object("java/lang/Object").unwrap() {
+        ctx.set_absent_field_answers_null(true);
+        let obj = match ctx.new_object("p/Unwritten").unwrap() {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected an object, got {other:?}"),
         };
+        let cid = ctx.class_id_of_object(obj);
+        declare_one_field(&ctx, cid, "payload", "Ljava/lang/String;");
+
+        // The name resolves ...
+        assert!(
+            declares_field(&ctx, obj, "payload"),
+            "the hazard is about a field the class DOES declare"
+        );
+        // ... and nothing has written slot 0. `new_object` hands back a
+        // zero-filled field block, which is the state `alloc_object` leaves a
+        // reference slot in: `init_primitive_fields`
+        // (`vm/src/runtime/interpreter.rs:2798`) writes a typed zero for every
+        // PRIMITIVE field and deliberately skips reference fields. The raw
+        // by-name read applies no descriptor decode, so those zero bytes come
+        // back as the niche-0 discriminant.
+        assert_eq!(
+            ctx.get_field_by_name(obj, "payload"),
+            Value::Int(0),
+            "THIS is the production Int(0): a resolvable, unwritten reference slot"
+        );
+        // The absent name is a different thing and answers null.
         assert_eq!(
             ctx.get_field_by_name(obj, "no_such_field_at_all"),
-            Value::Int(0),
-            "premise of this module: the by-name read does not answer null here"
+            Value::Object(None),
+            "an unresolvable name answers null in production -- not Int(0)"
         );
+        // Both are indistinguishable to a caller that wants a reference, and
+        // `ref_field` is the reader that gets both right.
+        assert_eq!(ref_field(&ctx, obj, "payload"), Value::Object(None));
+        assert!(ref_field_is_null(&ctx, obj, "payload"));
     }
 
     #[test]
@@ -246,18 +306,53 @@ mod tests {
         assert!(ref_field_is_null(&ctx, obj, "name"));
     }
 
+    /// The fail-open guard shape, reproduced against the PRODUCTION answer for
+    /// an absent name.
+    ///
+    /// This is the `sun/nio/ch/FileChannelImpl.truncate` defect in miniature.
+    /// The old version of this test asserted `get_field_by_name(obj, "rounds")
+    /// == Value::Int(0)` — the mock's divergent answer — and so demonstrated
+    /// the opposite of the real hazard: under the mock the negated `Int(0)`
+    /// match fails CLOSED, which is exactly why a unit test of `truncate`'s
+    /// guard read as protective while production truncated the file.
     #[test]
     fn int_field_strict_refuses_an_unresolvable_field() {
         let mut ctx = mock_ctx();
-        let obj = match ctx.new_object("java/lang/Object").unwrap() {
+        // Opt in to production's answer for an unresolvable name
+        // (`test_utils.rs::set_absent_field_answers_null`). Without it both
+        // guard forms below agree and the test proves nothing.
+        ctx.set_absent_field_answers_null(true);
+        let obj = match ctx.new_object("p/Fabricated").unwrap() {
             Some(Value::Object(Some(o))) => o,
             other => panic!("expected an object, got {other:?}"),
         };
-        // The by-name read would answer `Int(0)` and a `match .. { Int(v) => v,
-        // _ => default }` would accept it as a real value. The strict reader
-        // refuses instead, so the caller can fail closed.
-        assert_eq!(ctx.get_field_by_name(obj, "rounds"), Value::Int(0));
-        assert_eq!(int_field_strict(&ctx, obj, "rounds"), None);
+
+        assert!(!declares_field(&ctx, obj, "writable"));
+        assert_eq!(
+            ctx.get_field_by_name(obj, "writable"),
+            Value::Object(None),
+            "production answers null for a name the receiver's class does not declare"
+        );
+        // `Object(None)` is not `Int(0)`, so the negated match reads TRUE —
+        // "this channel is writable" — about a receiver that never declared
+        // the field. A guard written that way FAILS OPEN.
+        assert!(
+            !matches!(ctx.get_field_by_name(obj, "writable"), Value::Int(0)),
+            "the retired guard shape admits an undeclared field as `true`"
+        );
+        // The strict reader refuses, so the same guard FAILS CLOSED instead.
+        assert_eq!(int_field_strict(&ctx, obj, "writable"), None);
+        assert!(
+            !matches!(int_field_strict(&ctx, obj, "writable"), Some(v) if v != 0),
+            "the replacement guard denies the operation on an undeclared field"
+        );
+
+        // ... and it is not vacuous: a declared, written `int` still reads.
+        let cid = ctx.class_id_of_object(obj);
+        declare_one_field(&ctx, cid, "writable", "Z");
+        ctx.set_field_by_name(obj, "writable", Value::Int(1));
+        assert_eq!(int_field_strict(&ctx, obj, "writable"), Some(1));
+        assert!(matches!(int_field_strict(&ctx, obj, "writable"), Some(v) if v != 0));
     }
 
     #[test]

@@ -178,10 +178,24 @@ fn fat_jar_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // Default landing zone documented in the Spring Boot fat-jar SCOPE.
-    let candidate = PathBuf::from("C:/Users/Admin/AppData/Local/Temp/insurance-backend.jar");
-    if candidate.exists() {
-        return Some(candidate);
+    // Repo-relative landing zone. This used to be a hardcoded
+    // `C:/Users/Admin/AppData/Local/Temp/insurance-backend.jar` — one developer's
+    // machine, one Windows account name. It could never resolve for anyone else,
+    // so on every other checkout `run_fat_jar` returned `None` and the test below
+    // reported `ok` while asserting nothing. A relative default at least resolves
+    // for whoever stages the artefact; the env override stays the portable route.
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent();
+    if let Some(root) = repo_root {
+        for rel in [
+            // Preferred: alongside the other Spring Boot suite material.
+            "apps/spring-boot-suite-runner/insurance-backend.jar",
+            "target/fixtures/insurance-backend.jar",
+        ] {
+            let candidate = root.join(rel);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
     }
     None
 }
@@ -239,11 +253,21 @@ fn spring_boot_fatjar_launcher_bypasses_archive_npe() {
     // in environments without the Spring Boot sample (e.g. CI runners
     // that have not copied the insurance-backend artefact).
     let Some((stdout, stderr, _code)) = run_fat_jar(Duration::from_secs(45)) else {
-        eprintln!(
-            "wave3_spring_boot_fatjar: fat-jar fixture missing; skipping. \
-             Set CRATONVM_SPRING_BOOT_FATJAR or copy a Spring Boot 3.2 \
-             executable jar to C:/Users/Admin/AppData/Local/Temp/\
-             insurance-backend.jar to enable the run-time pin."
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. `**/*.jar` is gitignored (.gitignore line
+        // 14), so this artefact is always staged, never committed.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let _ = common::require_fixture(
+            "wave3_spring_boot_fatjar",
+            "a Spring Boot 3.2 executable fat jar (or a `cratonvm` binary / JAVA_HOME). Set \
+             CRATONVM_SPRING_BOOT_FATJAR to point at one",
+            &[
+                root.join("apps/spring-boot-suite-runner/insurance-backend.jar"),
+                root.join("target/fixtures/insurance-backend.jar"),
+            ],
         );
         return;
     };

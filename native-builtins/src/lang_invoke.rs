@@ -62,7 +62,7 @@ const NAME_INVOKE: &str = "invoke";
 /// argument shape at the call site: for an array-element access the layout is
 /// always `[vh, array_object, index, ...]`. When args[1] is an array object
 /// and args[2] is an Int, treat the call as array-element access.
-fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, usize)> {
+fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, i32)> {
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
         _ => return None,
@@ -71,10 +71,54 @@ fn vh_array_call(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectR
         return None;
     }
     let idx = match args.get(2) {
-        Some(Value::Int(i)) => *i as usize,
+        Some(Value::Int(i)) => *i,
         _ => return None,
     };
     Some((arr, idx))
+}
+
+/// Range-check an array-element VarHandle coordinate, then narrow it to the
+/// `usize` the heap accessors take.
+///
+/// EVERY array-element VarHandle access funnels through [`vh_array_call`] and
+/// then through here, which is the point: the bounds check belongs on the
+/// funnel, not on the individual accessors, because there are eight of them
+/// (`get`/`set`/`compareAndSet`/`compareAndExchange`/`getAndSet`/`getAndAdd`/
+/// `getAndBitwise*`/the ordering variants) and a check added to seven of them
+/// is a silent hole in the eighth.
+///
+/// Why it has to be here at all: the heap DOES range-check
+/// (`GenerationalHeap::get_array_element` returns `Err(index)` past the
+/// length), but `vm_exec.rs`'s `NativeContext` impl swallows the result —
+/// `get_array_element` ends in `.unwrap_or(Value::Int(0))` and
+/// `set_array_element` in `let _ = ...`. So `va.get(arr, 7)` on a 3-element
+/// array answered `0` and `va.set(arr, 7, x)` dropped the write, both without
+/// a whisper. HotSpot throws for every access mode; measured on JDK 25:
+///
+/// ```text
+/// va.get(arr, 7)          ArrayIndexOutOfBoundsException: Index 7 out of bounds for length 3
+/// va.get(arr, -1)         ArrayIndexOutOfBoundsException: Index -1 out of bounds for length 3
+/// va.set/getAndSet/CAS/getAndAdd at 7 or -1 — same exception, same wording
+/// ```
+///
+/// `RuntimeError::aioobe` is the constructor that produces exactly that text
+/// (it is `Preconditions.checkIndex`'s, character for character), so the
+/// message a caller catches and prints matches HotSpot's.
+///
+/// The negative case is the one that mattered most: the old code did
+/// `*i as usize`, so `-1` became `usize::MAX` and only the heap's own
+/// `index >= array_length` test stopped it from being a wild read.
+/// regression-suite `RJdkHandles:263-269` asserts the throw.
+fn vh_array_index(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    idx: i32,
+) -> Result<usize, MethodCallFailed> {
+    let len = ctx.array_length(arr);
+    if idx < 0 || (idx as usize) >= len {
+        return Err(RuntimeError::aioobe(idx, len as i32).into());
+    }
+    Ok(idx as usize)
 }
 
 /// Read the VH_FIELD_DESC string from a VarHandle object. Prefers the
@@ -130,6 +174,37 @@ const VH_FIELD_INDEX: usize = 4; // Int
 /// Cached ClassId of the declaring class
 const VH_CLASS_ID: usize = 5; // Int (ClassId raw)
 const VH_FIELD_COUNT: usize = 6;
+
+// --- SHARED SLOT MAP: read this before adding a slot ------------------------
+//
+// `java/lang/invoke/VarHandle` is written by TWO files, and the slot numbers
+// above are only half the map. `phases_late/reflect_invoke.rs`
+// (`register_p59_varhandle`, synthetic-JDK only) imposes its own 3-slot
+// meaning on 0-2 and used to put its two describe-yourself `Class` mirrors at
+// 4 and 5 — the SAME slots as `VH_FIELD_INDEX` / `VH_CLASS_ID` here, with
+// incompatible types (`Object(Class)` vs `Int`).
+//
+// That collision never corrupted anything, because every read on both sides
+// is a tag match (`Value::Object(Some(_))` there, `Value::Int(_)` here) and
+// the heap stores tagged 16-byte cells that the collector walks by tag — a
+// cross-write degrades an answer to "unknown", it does not produce a
+// mis-typed value or a scanned-as-oop integer. It was still a landmine: the
+// two writers were one changed guard away from meeting on one object.
+//
+// So the two describe-yourself slots now live HERE, past everything this file
+// uses, and `reflect_invoke.rs` imports them instead of declaring its own.
+// One block, one map, and a `usize` that cannot silently mean two things.
+/// Slot 6 (`reflect_invoke.rs` only): the `Class` mirror of the variable the
+/// handle accesses — exactly what `varType()` must return.
+pub(crate) const VH_META_VAR_TYPE: usize = 6; // Object(Class)
+/// Slot 7 (`reflect_invoke.rs` only): the `Class` mirror of the handle's
+/// LEADING coordinate; `null` for a static-field handle, which has none.
+pub(crate) const VH_META_COORD0: usize = 7; // Object(Class)
+/// Allocation size for a VarHandle that carries the two slots above.
+/// (`reflect_invoke.rs` re-publishes this as its `VH_META_NUM_FIELDS`; the
+/// name differs here only so the two do not collide in `lib.rs`, which
+/// glob-imports `lang_invoke::*`.)
+pub(crate) const VH_META_SLOT_COUNT: usize = 8;
 
 const VH_KIND_INSTANCE: i32 = 0;
 const VH_KIND_STATIC: i32 = 1;
@@ -853,6 +928,33 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(lookup))))
     });
 
+    // NOT REGISTERED HERE: `MethodHandles.arrayElementVarHandle`.
+    //
+    // It is registered in `phases_late/reflect_invoke.rs`'s
+    // `register_p59_varhandle`, which reaches the registry only through
+    // `register_synthetic_overrides` — synthetic-JDK mode only. The obvious
+    // move is to mirror it onto this (live in every mode) path so `--jdk-only`
+    // gets a side-table entry for array handles. Measurement says do NOT:
+    //
+    //  * The real JDK bytecode for this factory ALREADY runs correctly in
+    //    real-JDK mode and hands back a genuine `VarHandleInts$Array`.
+    //    `vm/tests/clinit_first_call_compile_order.rs` is the witness — its
+    //    probe does `arrayElementVarHandle(int[].class)`, `vh.set(arr,3,42)`,
+    //    `vh.get(arr,3)` under `--java-home <real jdk>` and asserts `42`.
+    //  * The accessors do not need the side table for the array case: every
+    //    one of them routes through [`vh_array_call`], which recognises the
+    //    access from the ARGUMENT SHAPE (`[vh, array, int]`) and never reads a
+    //    synthetic slot off the receiver.
+    //  * That same probe exists because `arrayElementVarHandle` is the cheapest
+    //    trigger for the `VarForm` -> `MethodType` -> `sun/invoke/util/Wrapper`
+    //    -> `ConstantDescs.<clinit>` chain. A native here short-circuits the
+    //    chain and the regression test goes green while covering nothing.
+    //
+    // So the real object stays, and the two things it was missing are supplied
+    // without replacing it: the bounds check lives on the `vh_array_call`
+    // funnel, and `varType()`/`coordinateTypes()` read the real handle's own
+    // identity in [`real_array_var_handle_descriptors`].
+
     // byteArrayViewVarHandle(<T>[].class, ByteOrder) — view a byte[] as a wider
     // primitive at a BYTE index. The real JDK VarHandle's get/set route through
     // our `varhandle_get`/`_set`, but those would mis-detect it as an
@@ -1014,6 +1116,38 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "accessModeTypeUncached",
         "(Ljava/lang/invoke/VarHandle$AccessType;)Ljava/lang/invoke/MethodType;",
         varhandle_access_mode_type_uncached,
+    );
+
+    // VarHandle.varType() / coordinateTypes() — the describe-yourself pair.
+    //
+    // Both are CONCRETE bytecode in JDK 25, so they need the `check_override`
+    // entry in `vm/src/vm/vm_exec.rs` (`class_name ==
+    // "java/lang/invoke/VarHandle" && ("varType", "()Ljava/lang/Class;") |
+    // ("coordinateTypes", "()Ljava/util/List;")`) to be consulted at all. The
+    // real bodies cannot run here: both call `accessModeType`, which reads
+    // `this.vform` and walks a `VarForm`/`MethodType` chain — and a CratonVM
+    // VarHandle is `alloc_concurrent_synthetic("java/lang/invoke/VarHandle",
+    // VH_FIELD_COUNT)` with CratonVM's own meaning imposed on the slots, so
+    // slot 0 (`vform`) holds an `Int` kind tag. See RJdkHandles:244-245.
+    //
+    // REGISTERED HERE, not in `phases_late/reflect_invoke.rs`'s
+    // `register_p59_varhandle`, and that is the whole point: `p59` reaches the
+    // registry only through `register_phase59_natives` ->
+    // `register_synthetic_overrides`, which `vm_init.rs` calls ONLY under
+    // `config.use_synthetic_jdk`. In `--real-jdk`/`--jdk-only` the live
+    // VarHandle surface is this file's (`register_phase54_method_handle` plus
+    // `register_p63_method_handles_lookup`, both called from the real-JDK arm),
+    // so a `varType` registered over there is dead in exactly the mode the
+    // strict corpus runs. The answers come from the WP4.2 side table
+    // (`VarHandleMeta`), which `findVarHandle`/`findStaticVarHandle` already
+    // populate with the field descriptor and the declaring class name — no
+    // layout change needed.
+    r.register(vh, "varType", "()Ljava/lang/Class;", varhandle_var_type);
+    r.register(
+        vh,
+        "coordinateTypes",
+        "()Ljava/util/List;",
+        varhandle_coordinate_types,
     );
 
     // VarHandle.toMethodHandle(AccessMode) -> MethodHandle.
@@ -1597,6 +1731,192 @@ fn p67_memory_segment_varhandle_descriptor(
     None
 }
 
+/// What a CratonVM VarHandle addresses, as JVM descriptors: the variable type
+/// and the coordinate types, plus whether the coordinates are the REAL ones.
+///
+/// Derived from the WP4.2 side table, falling back to the synthetic slots. One
+/// function so `accessModeType` and `varType`/`coordinateTypes` can never
+/// disagree about what a handle points at.
+///
+/// `coords_exact == false` means a coordinate had to be erased to
+/// `java/lang/Object` because the metadata does not record the real class.
+/// `accessModeType` tolerates that — an erased `MethodType` still dispatches —
+/// but `coordinateTypes()` must NOT, because there its answer would be a
+/// fabricated `Class` presented as fact.
+///
+/// `VH_KIND_ARRAY` used to be the standing example: its producer
+/// (`MethodHandles.arrayElementVarHandle`) was registered only in
+/// `phases_late/reflect_invoke.rs`, which does not run in real-JDK mode, so an
+/// array handle reached here with no side-table entry and the leading
+/// coordinate had to be erased. That factory is now registered on the live
+/// path in this file and records the array class, so the erasure fires only
+/// for a handle CratonVM did not mint — where refusing is the right answer.
+/// Read a `Class`-typed field off a REAL JDK object and return its descriptor.
+///
+/// The `Object(Some(_))` match is what separates "the field is there and holds
+/// a mirror" from "this is not the class I thought it was".
+///
+/// **Corrected 2026-08-07.** This used to say `get_field_by_name` answers
+/// `Int(0)` for a field that does not exist. It does not. PRODUCTION
+/// (`vm/src/vm/vm_exec.rs::get_field_by_name`) resolves the name in the
+/// hierarchy and returns **`Value::Object(None)`** when it cannot — the
+/// `Int(0)` is `MockNativeContext`'s (`native-builtins/src/test_utils.rs`) and
+/// nobody else's; `native-api/src/test_mock.rs` agrees with production. The
+/// code here is right either way (both `Object(None)` and `Int(0)` fall to the
+/// `_` arm), but the reasoning was not, and the sharper hazard the old note
+/// hid is that an absent field is INDISTINGUISHABLE from a real null: a
+/// `matches!(…, Value::Object(_))` layout discriminator matches BOTH. Never
+/// write one.
+fn vh_real_class_field_desc(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    field: &str,
+) -> Option<String> {
+    match ctx.get_field_by_name(obj, field) {
+        Value::Object(Some(mirror)) => Some(mirror_to_descriptor(ctx, mirror).into_owned()),
+        _ => None,
+    }
+}
+
+/// `(element descriptor, coordinate descriptors)` for a REAL-JDK array-element
+/// VarHandle — the object `MethodHandles.arrayElementVarHandle` hands back when
+/// its own bytecode runs, which is what happens in `--real-jdk`/`--jdk-only`
+/// (this file registers no native for that factory; see the note next to
+/// `byteArrayViewVarHandle`). `None` for anything else.
+///
+/// Such a handle carries no WP4.2 side-table entry, so without this the
+/// describe-yourself accessors refuse — and they are FORCED to run by the
+/// `check_override` entry in `vm/src/vm/vm_exec.rs`, which pins
+/// `VarHandle.varType`/`coordinateTypes` to the registry for every receiver.
+/// The refusal would therefore replace an answer the real bytecode could have
+/// given, which is a worse outcome than the gap it was written for.
+///
+/// The real object knows its own type; the only question is where. Measured on
+/// JDK 25, `MethodHandles.arrayElementVarHandle(T[].class).getClass()`:
+///
+/// ```text
+/// int[]      VarHandleInts$Array       varType int      coords [class [I, int]
+/// long[]     VarHandleLongs$Array      varType long     coords [class [J, int]
+/// byte[]     VarHandleBytes$Array      varType byte     coords [class [B, int]
+/// short[]    VarHandleShorts$Array     varType short    coords [class [S, int]
+/// char[]     VarHandleChars$Array      varType char     coords [class [C, int]
+/// float[]    VarHandleFloats$Array     varType float    coords [class [F, int]
+/// double[]   VarHandleDoubles$Array    varType double   coords [class [D, int]
+/// boolean[]  VarHandleBooleans$Array   varType boolean  coords [class [Z, int]
+/// String[]   VarHandleReferences$Array varType String   coords [class [Ljava.lang.String;, int]
+/// int[][]    VarHandleReferences$Array varType [I       coords [class [[I, int]
+/// ```
+///
+/// Two facts drive the shape. `varType()` is the COMPONENT type, not the array
+/// type; and there are TWO coordinates, `{arrayClass, int}`, where a field
+/// handle has one. The primitive families encode the element type in the class
+/// NAME and declare only `abase`/`ashift`; `References$Array` is the sole
+/// family that cannot, and it declares `arrayType`/`componentType` `Class`
+/// fields instead (`javap -p`) — which is why it is the one arm that reads
+/// fields rather than parsing a name.
+fn real_array_var_handle_descriptors(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+) -> Option<(String, Vec<String>)> {
+    let class_id = ctx.class_id_of_object(vh);
+    let name = ctx.class_name_of_id(class_id)?;
+    let family = name.strip_prefix("java/lang/invoke/VarHandle")?;
+    let elem = match family {
+        "Ints$Array" => DESC_INT,
+        "Longs$Array" => DESC_LONG,
+        "Bytes$Array" => DESC_BYTE,
+        "Shorts$Array" => DESC_SHORT,
+        "Chars$Array" => DESC_CHAR,
+        "Floats$Array" => DESC_FLOAT,
+        "Doubles$Array" => DESC_DOUBLE,
+        "Booleans$Array" => DESC_BOOLEAN,
+        "References$Array" => {
+            // Both halves or neither: a coordinate list without a variable
+            // type (or the reverse) would let one accessor answer while the
+            // other invents.
+            let array_desc = vh_real_class_field_desc(ctx, vh, "arrayType")?;
+            let component_desc = vh_real_class_field_desc(ctx, vh, "componentType")?;
+            return Some((component_desc, vec![array_desc, DESC_INT.to_string()]));
+        }
+        _ => return None,
+    };
+    Some((
+        elem.to_string(),
+        vec![format!("[{elem}"), DESC_INT.to_string()],
+    ))
+}
+
+fn vh_value_and_coordinate_descriptors(
+    ctx: &mut dyn NativeContext,
+    vh: ObjectRef,
+) -> (i32, String, Vec<String>, bool) {
+    let meta = vh_meta_get(ctx, vh);
+    // A real-JDK array handle has no side-table entry and its slots belong to
+    // the real class, so the fallbacks below would read `vform` as a kind tag.
+    // Ask the object what it is instead. Checked only when the side table has
+    // nothing: a handle CratonVM minted is described by the metadata CratonVM
+    // recorded for it.
+    if meta.is_none() {
+        if let Some((value_desc, coords)) = real_array_var_handle_descriptors(ctx, vh) {
+            return (VH_KIND_ARRAY, value_desc, coords, true);
+        }
+    }
+    let kind = meta
+        .as_deref()
+        .map(|m| m.kind)
+        .or_else(|| ctx.get_field(vh, VH_KIND).as_int())
+        .unwrap_or(VH_KIND_INSTANCE);
+    let value_desc = meta
+        .as_deref()
+        .map(|m| Cow::Owned(m.field_desc.clone()))
+        .unwrap_or_else(|| vh_field_desc(ctx, vh));
+    let mut coords_exact = true;
+    let coords = match kind {
+        VH_KIND_STATIC => Vec::new(),
+        VH_KIND_ARRAY => {
+            // `class_name` is the ARRAY class's internal name (`[I`,
+            // `[Ljava/lang/String;`), written by this file's
+            // `arrayElementVarHandle`. Absent it, the leading coordinate would
+            // be an erasure rather than the `int[]`/`String[]` the JDK
+            // reports, and `coords_exact` goes false so `coordinateTypes()`
+            // refuses instead of naming `Object`.
+            let arr = meta
+                .as_deref()
+                .map(|m| m.class_name.as_str())
+                .filter(|n| !n.is_empty())
+                .map(|n| class_name_to_descriptor(n).into_owned());
+            match arr {
+                Some(a) => vec![a, DESC_INT.to_string()],
+                None => {
+                    coords_exact = false;
+                    vec![DESC_OBJECT.to_string(), DESC_INT.to_string()]
+                }
+            }
+        }
+        VH_KIND_BYTE_VIEW_LE | VH_KIND_BYTE_VIEW_BE => {
+            vec!["[B".to_string(), DESC_INT.to_string()]
+        }
+        VH_KIND_BYTE_BUFFER_VIEW_LE | VH_KIND_BYTE_BUFFER_VIEW_BE => {
+            vec!["Ljava/nio/ByteBuffer;".to_string(), DESC_INT.to_string()]
+        }
+        _ => {
+            let receiver = meta
+                .as_deref()
+                .map(|m| m.class_name.as_str())
+                .filter(|n| !n.is_empty())
+                .map(|n| class_name_to_descriptor(n).into_owned());
+            match receiver {
+                Some(r) => vec![r],
+                None => {
+                    coords_exact = false;
+                    vec![DESC_OBJECT.to_string()]
+                }
+            }
+        }
+    };
+    (kind, value_desc.into_owned(), coords, coords_exact)
+}
+
 fn varhandle_access_mode_type_uncached(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1611,39 +1931,173 @@ fn varhandle_access_mode_type_uncached(
     let desc = if let Some(desc) = p67_memory_segment_varhandle_descriptor(ctx, this, access_type) {
         desc
     } else {
-        let meta = vh_meta_get(ctx, this);
-        let kind = meta
-            .as_deref()
-            .map(|m| m.kind)
-            .or_else(|| ctx.get_field(this, VH_KIND).as_int())
-            .unwrap_or(VH_KIND_INSTANCE);
-        let value_desc = meta
-            .as_deref()
-            .map(|m| Cow::Owned(m.field_desc.clone()))
-            .unwrap_or_else(|| vh_field_desc(ctx, this));
-        let coords = match kind {
-            VH_KIND_STATIC => Vec::new(),
-            VH_KIND_ARRAY => vec![DESC_OBJECT.to_string(), DESC_INT.to_string()],
-            VH_KIND_BYTE_VIEW_LE | VH_KIND_BYTE_VIEW_BE => {
-                vec!["[B".to_string(), DESC_INT.to_string()]
-            }
-            VH_KIND_BYTE_BUFFER_VIEW_LE | VH_KIND_BYTE_BUFFER_VIEW_BE => {
-                vec!["Ljava/nio/ByteBuffer;".to_string(), DESC_INT.to_string()]
-            }
-            _ => {
-                let receiver = meta
-                    .as_deref()
-                    .map(|m| class_name_to_descriptor(&m.class_name).into_owned())
-                    .unwrap_or_else(|| DESC_OBJECT.to_string());
-                vec![receiver]
-            }
-        };
+        let (_kind, value_desc, coords, _exact) = vh_value_and_coordinate_descriptors(ctx, this);
         vh_access_mode_descriptor(access_type, &coords, &value_desc)
     };
 
     match build_method_type_from_descriptor(ctx, &desc) {
         Some(mt) => Ok(Some(Value::Object(Some(mt)))),
         None => Ok(None),
+    }
+}
+
+/// The `Class` mirror for a JVM field descriptor — `"I"` → `int.class`,
+/// `"Ljava/lang/String;"` → `String.class`.
+///
+/// Both lookups are canonical caches (`primitive_mirrors` in `vm_object.rs`,
+/// `get_or_create_class_mirror` for reference types), which is what makes
+/// `vi.varType() == int.class` an IDENTITY match: the mirror the vector gets
+/// from `getstatic Integer.TYPE` and the one produced here are the same object.
+/// Same idiom as `build_method_type_from_descriptor` above.
+fn vh_descriptor_mirror(ctx: &mut dyn NativeContext, desc: &str) -> ObjectRef {
+    // An ARRAY descriptor has to go through `lang_class`, which knows to ask
+    // the class manager to intern `[I` and falls back to a synthetic mirror.
+    // The generic path below would end at `primitive_class_mirror("[I")` —
+    // a fabricated PRIMITIVE mirror named `[I`, which is not `int[].class`
+    // and would not compare equal to it. This matters for the array-element
+    // handle's leading coordinate (`coordinateTypes()[0]`), which HotSpot
+    // reports as the array class itself (measured: `[class [I, int]`).
+    if desc.starts_with('[') {
+        return crate::lang_class::descriptor_to_class_mirror(ctx, desc);
+    }
+    let name = descriptor_to_class_name(desc);
+    match ctx.class_id_by_name(&name) {
+        Some(cid) => ctx.get_class_mirror(cid),
+        None => ctx.primitive_class_mirror(&name),
+    }
+}
+
+/// The refusal both describe-yourself accessors raise when the receiver's
+/// metadata cannot name what it addresses.
+///
+/// There is no JDK failure mode here — every real VarHandle can describe
+/// itself — so any exception is a CratonVM deviation. It is still the right
+/// one: the alternative is inventing a `Class`, and a fabricated variable type
+/// is exactly the "plausible value where the VM does not know" shape the
+/// strict corpus exists to find. `UnsupportedOperationException` is catchable
+/// and cannot be mistaken for an answer.
+fn vh_undescribable(what: &str, kind: i32) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "VarHandle.{what}: this CratonVM VarHandle carries no variable/coordinate type \
+             metadata (kind {kind}); it was minted by a factory that does not record it, so \
+             the answer is unknown rather than absent"
+        ),
+    }
+    .into()
+}
+
+/// Build the `List<Class<?>>` that `coordinateTypes()` returns.
+///
+/// `List.of(Object[])` is the JDK-owned immutable-list construction, so the
+/// result `equals` the `List.of(...)` a caller compares it against
+/// (`RJdkHandles:245` asserts exactly that). `Arrays.asList` is the
+/// synthetic-JDK fallback, matching `lang_system.rs`'s `boxed_int_list`.
+///
+/// Every mirror is pinned across the allocations: `new_array` and the `List.of`
+/// invocation can both collect, and a raw `ObjectRef` held over a collection is
+/// stale.
+fn vh_class_list(ctx: &mut dyn NativeContext, descs: &[String]) -> Option<Value> {
+    let mut mirrors: Vec<ObjectRef> = Vec::with_capacity(descs.len());
+    let mut pins: Vec<usize> = Vec::with_capacity(descs.len());
+    let mut base: Option<usize> = None;
+    for d in descs {
+        // Re-read every earlier mirror: resolving this one can allocate.
+        for (i, h) in pins.iter().enumerate() {
+            mirrors[i] = ctx.read_native_pin(*h, mirrors[i]);
+        }
+        let m = vh_descriptor_mirror(ctx, d);
+        let h = ctx.pin_native_root(m);
+        if base.is_none() {
+            base = Some(h);
+        }
+        mirrors.push(m);
+        pins.push(h);
+    }
+    let array = ctx.new_array(ArrayElementType::Reference, descs.len());
+    let array_pin = ctx.pin_native_root(array);
+    if base.is_none() {
+        base = Some(array_pin);
+    }
+    let mut array = array;
+    for (i, h) in pins.iter().enumerate() {
+        let m = ctx.read_native_pin(*h, mirrors[i]);
+        array = ctx.read_native_pin(array_pin, array);
+        ctx.set_array_element(array, i, Value::Object(Some(m)));
+    }
+    array = ctx.read_native_pin(array_pin, array);
+    let list = ctx
+        .invoke(
+            "java/util/List",
+            "of",
+            "([Ljava/lang/Object;)Ljava/util/List;",
+            &[Value::Object(Some(array))],
+        )
+        .ok()
+        .flatten();
+    let list = match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => {
+            let array = ctx.read_native_pin(array_pin, array);
+            ctx.invoke(
+                "java/util/Arrays",
+                "asList",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(array))],
+            )
+            .ok()
+            .flatten()
+        }
+    };
+    if let Some(b) = base {
+        ctx.unpin_native_roots(b);
+    }
+    match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => None,
+    }
+}
+
+/// Is this handle's metadata authoritative enough to describe itself?
+///
+/// The WP4.2 side table is "the canonical truth" (see its banner) — every
+/// factory in this file writes one. Without an entry, `vh_field_desc` falls
+/// back to `DESC_OBJECT`, which is a workable erasure for `accessModeType` but
+/// would make `varType()` report `Object` for, say, a real-JDK `int[]` handle
+/// that reached us without going through our factories. Reporting a fabricated
+/// `Class` is the one outcome these accessors must not produce.
+///
+/// A REAL-JDK array-element VarHandle is the documented second source of
+/// truth: it has no side-table entry, but it names its own element and array
+/// types (see [`real_array_var_handle_descriptors`]), and an answer read off
+/// the object is not a fabrication.
+fn vh_meta_is_authoritative(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
+    vh_meta_get(ctx, vh).is_some() || real_array_var_handle_descriptors(ctx, vh).is_some()
+}
+
+fn varhandle_var_type(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (kind, value_desc, _coords, _exact) = vh_value_and_coordinate_descriptors(ctx, this);
+    // An empty or non-authoritative descriptor is "we never recorded one",
+    // not a type.
+    if value_desc.is_empty() || !vh_meta_is_authoritative(ctx, this) {
+        return Err(vh_undescribable("varType", kind));
+    }
+    let mirror = vh_descriptor_mirror(ctx, &value_desc);
+    Ok(Some(Value::Object(Some(mirror))))
+}
+
+fn varhandle_coordinate_types(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let (kind, _value_desc, coords, exact) = vh_value_and_coordinate_descriptors(ctx, this);
+    if !exact || !vh_meta_is_authoritative(ctx, this) {
+        return Err(vh_undescribable("coordinateTypes", kind));
+    }
+    match vh_class_list(ctx, &coords) {
+        Some(v) => Ok(Some(v)),
+        // Returning null here would be a null `coordinateTypes()`, which no
+        // real VarHandle ever answers.
+        None => Err(vh_undescribable("coordinateTypes", kind)),
     }
 }
 
@@ -2276,6 +2730,98 @@ fn segment_vh_set(
     })())
 }
 
+/// The descriptor of the variable a `VarHandle` access reads or writes, for the
+/// call shape in `args`.
+///
+/// It answers the same question the access natives themselves answer when they
+/// pick a branch, in the SAME order, so the descriptor cannot disagree with the
+/// value the native produced:
+///
+/// 1. `vh_array_call` matches → the array's element type. Every RMW native
+///    probes this first (see `varhandle_get_and_set` / `_add` / `_bitwise` /
+///    `compare_and_exchange`), including for byte-array-view handles, which
+///    those natives do not special-case.
+/// 2. otherwise the handle's own `field_desc`, via the meta side table
+///    (`vh_type_desc`), which is what the instance/static branches read.
+///
+/// Falls back to `DESC_REF` when nothing resolves. That is deliberate and
+/// lossless: `box_value`'s catch-all arm returns the value untouched for a
+/// reference descriptor, so an unresolvable handle keeps exactly today's
+/// behaviour instead of guessing a wrapper class.
+fn vh_access_value_desc(ctx: &mut dyn NativeContext, args: &[Value]) -> Cow<'static, str> {
+    if let Some((arr, _)) = vh_array_call(ctx, args) {
+        return Cow::Borrowed(array_element_desc(ctx, arr));
+    }
+    match args.first() {
+        Some(Value::Object(Some(this))) => vh_type_desc(ctx, *this),
+        _ => Cow::Borrowed(DESC_REF),
+    }
+}
+
+/// THE boxing funnel for every `VarHandle` access mode that HANDS BACK the
+/// accessed variable.
+///
+/// # The defect this closes
+///
+/// Every such mode is registered under the erased
+/// `([Ljava/lang/Object;)Ljava/lang/Object;` descriptor, so the native's own
+/// contract is "return a reference". `varhandle_get` honoured it (it calls
+/// `box_value`); `getAndSet`, `getAndAdd`, `getAndBitwise*` and
+/// `compareAndExchange` returned the BARE primitive `Value`. Nothing
+/// downstream repairs that — `vm_exec.rs`'s `unbox_poly_return` passes
+/// `b'L' | b'['` through untouched — so a call site with no cast, whose
+/// descriptor therefore ends in `)Ljava/lang/Object;`, received a raw `Int`
+/// into a reference return slot. Measured: `System.out.println(
+/// va.getAndSet(arr, 1, 20))` printed `null` where HotSpot 25.0.3 prints `2`.
+/// The cast form `(int) va.getAndSet(...)` was correct only because its
+/// descriptor is then `([III)I` and the coercion path accepts a raw `Int`.
+///
+/// # Why the boxing has to be HERE and not at the poly-return boundary
+///
+/// `Value::Int` carries `boolean`, `byte`, `char`, `short` AND `int` (see
+/// `cratonvm_types::Value`), so the value's tag does not name its wrapper.
+/// Measured on the JDK 25 oracle, HotSpot boxes by the VARIABLE's type:
+/// `boolean[]` → `java.lang.Boolean` (prints `true`), `int[]` →
+/// `java.lang.Integer`. `unbox_poly_return` sees only the value and the
+/// call-site descriptor, and an erased call site says nothing but "Object" —
+/// boxing there would have to guess `Integer` and would print `1` for a
+/// `boolean[]`. The native is the only layer that knows the element/field
+/// descriptor, so this is the only layer that can be right.
+///
+/// # Idempotent by construction
+///
+/// A value that is already `Value::Object(_)` passes straight through. That
+/// covers `null`, a reference-typed variable, and `varhandle_get`'s own inline
+/// `box_value` calls, so routing a mode through this funnel can never
+/// double-box. It is also why `varhandle_get` keeps its inline boxing: the two
+/// cannot fight.
+///
+/// # Relationship to `varhandle_reference_return_mismatch` (vm_exec.rs)
+///
+/// That check fires when a BOXED primitive reaches a call site whose declared
+/// reference return type the wrapper is not assignable to — i.e. it can only
+/// ever see values this funnel produces, and it accepts `java/lang/Object` and
+/// every wrapper supertype. So the two agree by construction: this funnel makes
+/// `Object o = vh.getAndSet(...)` correct (the check declines — `Object` is a
+/// supertype), and makes `String s = (String) vh.getAndSet(...)` reach the
+/// check that HotSpot answers with `WrongMethodTypeException`. Before this fix
+/// the raw `Int` was not an object at all, so the check silently could not fire
+/// on the RMW modes; there is no shape where both act.
+fn vh_box_access_result(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    result: MethodCallResult,
+) -> MethodCallResult {
+    let Some(value) = result? else {
+        return Ok(None);
+    };
+    if matches!(value, Value::Object(_)) {
+        return Ok(Some(value));
+    }
+    let desc = vh_access_value_desc(ctx, args);
+    Ok(Some(box_value(ctx, value, &desc)))
+}
+
 /// VarHandle.get(receiver) → value
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver] for instance fields.
@@ -2330,6 +2876,7 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // signature-polymorphic call-site descriptor steers it to the right
     // primitive return slot.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let desc = array_element_desc(ctx, arr);
         let value = ctx.get_array_element(arr, idx);
         return Ok(Some(box_value(ctx, value, desc)));
@@ -2413,7 +2960,15 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 Some(Value::Int(i)) => *i as usize,
                 _ => 0,
             };
-            Ok(Some(ctx.get_array_element(arr, idx)))
+            // W8-13: this branch returned the BARE element — the one
+            // unboxed return left in `varhandle_get`, and the same defect the
+            // RMW modes had. It is normally shadowed by the `vh_array_call`
+            // fast path above, which matches whenever args[2] is an `Int`; it
+            // is reachable only when the index coordinate is absent or not an
+            // `Int`, i.e. exactly the shape a partial fix would leave behind.
+            let value = ctx.get_array_element(arr, idx);
+            let desc = array_element_desc(ctx, arr);
+            Ok(Some(box_value(ctx, value, desc)))
         }
         _ => Ok(Some(Value::Object(None))),
     }
@@ -2462,6 +3017,7 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // C38: Array-element VarHandle.set — args = [vh, array, idx, value]. Handles
     // real-JDK VarHandleLongs$Array / VarHandleInts$Array / etc.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let value = args.get(3).cloned().unwrap_or(Value::Int(0));
         ctx.set_array_element(arr, idx, value);
         return Ok(None);
@@ -2534,6 +3090,7 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = obj_arg(args, 0)?;
     // C38: Array-element CAS — args = [vh, array, idx, expected, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let expected = args.get(3).cloned().unwrap_or(Value::Int(0));
         let new_val = args.get(4).cloned().unwrap_or(Value::Int(0));
         // LOW-finding fix: atomic compare-and-set. The old get/compare/set was
@@ -2628,10 +3185,23 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 /// VarHandle.compareAndExchange(receiver, expected, new) → witness value
 /// Signature-polymorphic: args = [vh_ref, receiver, expected, new_value]
+///
+/// Boxes through [`vh_box_access_result`] — see there for why the erased
+/// `Object` call site needs it and why the boxing cannot live at the
+/// poly-return boundary.
 fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw = varhandle_compare_and_exchange_raw(ctx, args);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_compare_and_exchange_raw(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // C38: Array-element compareAndExchange — args = [vh, array, idx, expected, new].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let expected = args.get(3).cloned().unwrap_or(Value::Int(0));
         let new_val = args.get(4).cloned().unwrap_or(Value::Int(0));
         // LOW-finding fix: atomic compare-and-exchange. The previous
@@ -2728,10 +3298,20 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 /// VarHandle.getAndSet(receiver, new) → old value
 /// Signature-polymorphic: args = [vh_ref, receiver, new_value]
+///
+/// Boxes through [`vh_box_access_result`] — see there for why the erased
+/// `Object` call site needs it and why the boxing cannot live at the
+/// poly-return boundary.
 fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw = varhandle_get_and_set_raw(ctx, args);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_get_and_set_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // C38: Array-element getAndSet — args = [vh, array, idx, new_value].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let new_val = args.get(3).cloned().unwrap_or(Value::Int(0));
         // LOW-finding fix: atomic getAndSet via a bounded CAS retry loop
         // (was a non-atomic get-then-set → lost updates under contention).
@@ -2833,9 +3413,16 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// - Instance kind: args = [vh, receiver, delta].
 /// - Static kind: args = [vh, delta].
 ///
-/// Delta can be Int, Long, Float, or Double. Returns previous value (unboxed to
-/// match the call-site descriptor; the polymorphic dispatch wraps it as needed).
+/// Delta can be Int, Long, Float, or Double. Returns the previous value BOXED
+/// through [`vh_box_access_result`], which the erased `Object` call site
+/// requires; `unbox_poly_return` then unwraps it for a primitive call site such
+/// as H2's `([III)I`.
 fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let raw = varhandle_get_and_add_raw(ctx, args);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_get_and_add_raw(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
 
     fn add_values(current: &Value, delta: &Value) -> Value {
@@ -2879,6 +3466,7 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // so real-JDK VarHandleLongs$Array / VarHandleInts$Array calls work even
     // when the VH's slot 0 is not our synthetic VH_KIND Int.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let delta = args.get(3).cloned().unwrap_or(Value::Int(0));
         return Ok(Some(array_get_and_add(ctx, arr, idx, &delta)));
     }
@@ -3001,7 +3589,20 @@ enum VhBitOp {
 /// field is updated with `STATE.getAndBitwiseOr(this, flag)` during
 /// connect/accept; without it the real-JDK Socket path throws
 /// `NoSuchMethodError`. See `reference_server_socket_gap`.
+///
+/// Boxes through [`vh_box_access_result`] — see there for why the erased
+/// `Object` call site needs it and why the boxing cannot live at the
+/// poly-return boundary.
 fn varhandle_get_and_bitwise(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    op: VhBitOp,
+) -> MethodCallResult {
+    let raw = varhandle_get_and_bitwise_raw(ctx, args, op);
+    vh_box_access_result(ctx, args, raw)
+}
+
+fn varhandle_get_and_bitwise_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     op: VhBitOp,
@@ -3049,6 +3650,7 @@ fn varhandle_get_and_bitwise(
 
     // Array-element form — args = [vh, array, idx, mask].
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let idx = vh_array_index(ctx, arr, idx)?;
         let mask = args.get(3).cloned().unwrap_or(Value::Int(0));
         return Ok(Some(array_get_and_bitwise(ctx, arr, idx, &mask, op)));
     }
@@ -3352,34 +3954,90 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
 // Lookup = 2-field (lookupClass=0, allowedModes=1)
 // =============================================================================
 
+/// The slot the LEGACY synthetic `Lookup` layout puts `allowedModes` in
+/// (`lookupClass`=0, `allowedModes`=1). On the real JDK layout slot 1 is
+/// `prevLookupClass` — see [`lk_allowed_modes_slot`].
+const LK_SYNTHETIC_ALLOWED_MODES: usize = 1;
+
+/// The slot of the DECLARED `allowedModes` field, or `None` when the receiver
+/// does not carry the real `java.lang.invoke.MethodHandles$Lookup` layout.
+///
+/// The witness is CLASS-side, and that is the whole point. `get_field_by_name`
+/// answers `Int(0)` for an ABSENT field, which is indistinguishable from a
+/// genuine `allowedModes == 0` — and a FABRICATED Lookup stub has no
+/// `allowedModes` at all, it names its slots `_f0..`. The previous
+/// "by name first, synthetic slot second" reader therefore returned 0 for
+/// every synthetic Lookup and NEVER reached the slot-1 fallback below it: that
+/// fallback was unreachable code.
+///
+/// Asking the class separates "absent" from "present and zero" with no
+/// ambiguity, and is descriptor-safe — `resolve_field_index_by_class_id`
+/// resolves the declared `int allowedModes` on `MethodHandles$Lookup` rather
+/// than a same-named field of some other type in the hierarchy.
+///
+/// Measured layout (`javap -p java.lang.invoke.MethodHandles$Lookup`, OpenJDK
+/// 25.0.3): `lookupClass`(0), `prevLookupClass`(1), `allowedModes`(2),
+/// `cachedProtectionDomain`(3). Slot 1 is a REFERENCE.
+///
+/// This duplicates `classloader::lk_real_allowed_modes_slot` /
+/// `classloader::lk_modes_of`, which are private to that module. Collapsing
+/// the two needs a one-line `pub(crate)` on `classloader::lk_modes_of`; see
+/// the lane report.
+fn lk_allowed_modes_slot(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "allowedModes")
+}
+
 /// Write a `MethodHandles$Lookup`'s `allowedModes` so it lands on the correct
 /// field regardless of whether the object carries the **real** JDK 3-field
 /// layout (`lookupClass`, `prevLookupClass`, `allowedModes`) or the legacy
 /// **synthetic** 2-field layout (`lookupClass`=0, `allowedModes`=1).
 ///
-/// The old code wrote the modes int to fixed slot 1. In the real layout slot 1
-/// is the *reference* field `prevLookupClass`, so `lookupModes()` (real
+/// The original code wrote the modes int to fixed slot 1. In the real layout
+/// slot 1 is the *reference* field `prevLookupClass`, so `lookupModes()` (real
 /// bytecode reading the real `allowedModes` at slot 2) saw 0 — i.e. NO `PACKAGE`
 /// access — and Spring CGLIB's `ReflectUtils.defineClass` failed every concrete
-/// class proxy with "Lookup does not have PACKAGE access". Writing by name puts
-/// it in the real `allowedModes`; the slot-1 fallback only fires when the
-/// by-name write cannot resolve (pure synthetic class with no named fields).
+/// class proxy with "Lookup does not have PACKAGE access".
+///
+/// The two arms below are now mutually exclusive by construction, which the
+/// "by name, then slot 1 if the read-back disagrees" form was NOT:
+///
+/// * `modes == 0` on a fabricated Lookup read back as `Int(0)` from the absent
+///   field, so the write "landed" and the synthetic slot never got it;
+/// * any read-back disagreement on a REAL Lookup fell through to slot 1 and
+///   put an `Int` in the `prevLookupClass` reference slot — heap corruption
+///   the GC scans as an oop, not merely a wrong answer.
 fn lk_write_allowed_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i32) {
-    ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
-    let landed = matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == modes);
-    if !landed {
-        // Synthetic layout: allowedModes lives at slot 1.
-        ctx.set_field(obj, 1, Value::Int(modes));
+    if let Some(slot) = lk_allowed_modes_slot(ctx, obj) {
+        ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
+        if !matches!(ctx.get_field(obj, slot), Value::Int(m) if m == modes) {
+            // Named write did not land; go through the resolved index. Never
+            // through the synthetic slot — see the note above.
+            ctx.set_field(obj, slot, Value::Int(modes));
+        }
+        return;
     }
+    ctx.set_field(obj, LK_SYNTHETIC_ALLOWED_MODES, Value::Int(modes));
 }
 
-/// Read a `Lookup`'s `allowedModes`, by name first (real layout slot 2),
-/// falling back to synthetic slot 1.
+/// Read a `Lookup`'s `allowedModes` from whichever layout the receiver has.
+///
+/// See [`lk_allowed_modes_slot`] for why the class-side witness comes first:
+/// the previous by-name-first form answered 0 for every fabricated Lookup
+/// (absent field == `Int(0)`), which made `lookupModes()` report 0, made
+/// `lk_enforce_find_access` take its "modes unknown, stay permissive" valve,
+/// and — compounding with the old `Lookup.in` default — turned that 0 into
+/// FULL_POWER on the way out of `in()`.
 fn lk_read_allowed_modes(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
-        return m;
+    if let Some(slot) = lk_allowed_modes_slot(ctx, this) {
+        if let Value::Int(m) = ctx.get_field(this, slot) {
+            return m;
+        }
+        if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
+            return m;
+        }
+        return 0;
     }
-    if let Value::Int(m) = ctx.get_field(this, 1) {
+    if let Value::Int(m) = ctx.get_field(this, LK_SYNTHETIC_ALLOWED_MODES) {
         return m;
     }
     0
@@ -3547,8 +4205,15 @@ fn lk_enforce_find_access(
 /// Do the two `Class` mirrors live in the same package?
 ///
 /// A mirror we cannot name answers `true` — "cannot tell, so do not narrow".
-/// The only caller is `Lookup.in`, where a wrong `false` would silently strip
-/// PRIVATE from a legitimate same-package lookup.
+///
+/// **Superseded and CALLER-FREE.** `Lookup.in` was its only caller and now uses
+/// `classloader::lk_class_relation`, which answers the same question plus the
+/// two this one cannot: is the target the lookup class itself, and is it a
+/// member of the same top-level class (`VerifyAccess.isSamePackageMember`).
+/// A same-package test ALONE cannot see the nestmate reduction, so anything
+/// wired back to this function will over-grant PRIVATE|PROTECTED — measured 31
+/// where OpenJDK 25.0.3 returns 25. Use `lk_class_relation` instead; this is
+/// kept only because two docs refer to it by name.
 fn lk_same_package(ctx: &dyn NativeContext, a: Value, b: Value) -> bool {
     fn package_of(ctx: &dyn NativeContext, v: Value) -> Option<String> {
         let m = match v {
@@ -3565,6 +4230,152 @@ fn lk_same_package(ctx: &dyn NativeContext, a: Value, b: Value) -> bool {
         (Some(x), Some(y)) => x == y,
         _ => true,
     }
+}
+
+/// `PRIVATE|MODULE` — the exact pair `MethodHandles.privateLookupIn` demands
+/// of its `caller` argument, and the pair whose absence produces the JDK's
+/// `"caller does not have PRIVATE and MODULE lookup mode"`.
+const LK_MODE_PRIVATE_AND_MODULE: i32 = LK_MODE_PRIVATE | LK_MODE_MODULE;
+
+/// The refusals `MethodHandles.privateLookupIn(targetClass, caller)` performs
+/// before it mints anything.
+///
+/// This native used to grant `0x1F` **unconditionally** — it never looked at
+/// `caller` at all — so every caller the JDK refuses got full private access
+/// to the target instead. Re-measured for this lane on OpenJDK 25.0.3
+/// (`p.PliProbe`, caller class `p.PliProbe` in the unnamed module):
+///
+/// ```text
+/// caller                       target                     answer
+/// ---------------------------- -------------------------- ---------------------------------------------
+/// lookup()            (95)     p.Mate                     OK modes=31 prev=null
+/// lookup()            (95)     p.PliProbe (own class)     OK modes=31 prev=null
+/// lookup()            (95)     p.PliProbe$Nested          OK modes=31 prev=null
+/// lookup()            (95)     q.Other (other package)    OK modes=31 prev=null
+/// dropLookupMode(PROTECTED)(27) p.Mate                    OK modes=31 prev=null   (27 still has PRIVATE|MODULE)
+/// dropLookupMode(PRIVATE) (25) p.Mate                     IllegalAccessException: caller does not have PRIVATE and MODULE lookup mode
+/// dropLookupMode(MODULE)   (1) p.Mate                     IllegalAccessException: (same)
+/// dropLookupMode(PACKAGE) (17) p.Mate                     IllegalAccessException: (same)
+/// dropLookupMode(PUBLIC)   (0) p.Mate                     IllegalAccessException: (same)
+/// publicLookup()          (32) p.Mate                     IllegalAccessException: (same)
+/// lookup().in(q.Other)    (17) q.Other                    IllegalAccessException: (same)
+/// lookup().in(String)      (1) p.Mate                     IllegalAccessException: (same)
+/// lookup()            (95)     java.lang.String           IllegalAccessException: module java.base does not open java.lang to unnamed module @8bcc55f
+/// lookup()            (95)     java.util.HashMap          IllegalAccessException: module java.base does not open java.util to unnamed module @8bcc55f
+/// lookup()            (95)     int.class / void.class     IllegalArgumentException: int is a primitive class
+/// lookup()            (95)     int[].class                IllegalArgumentException: class [I is an array class
+/// lookup()            (95)     p.Mate[].class             IllegalArgumentException: class [Lp.Mate; is an array class
+/// lookup()            (95)     null                       NullPointerException: Cannot invoke "java.lang.Class.isPrimitive()" because "targetClass" is null
+/// null                         p.Mate                     NullPointerException: Cannot read field "allowedModes" because "caller" is null
+/// lookup()            (95)     java.lang.String           OK modes=15 prev=p.PliProbe2   *with* --add-opens java.base/java.lang=ALL-UNNAMED
+/// ```
+///
+/// Two orderings fall straight out of the null cases and are reproduced here:
+/// `caller.allowedModes` is read FIRST (a null `caller` NPEs before the target
+/// is examined at all), and the primitive/array `IllegalArgumentException`s
+/// come BEFORE the mode check — measured, `publicLookup()` with `int.class`
+/// raises the primitive `IllegalArgumentException`, not the access one.
+///
+/// ## What is enforced, and the one deliberate hole
+///
+/// * `caller == null` / `targetClass == null` — the two NPEs above.
+/// * `allowedModes == -1` (`TRUSTED`) — the JDK returns `new Lookup(targetClass)`
+///   from the top of the method without running ANY of the checks below, so we
+///   short-circuit in the same place.
+/// * primitive / array target — `IllegalArgumentException`, JDK wording.
+/// * `(modes & PRIVATE|MODULE) != PRIVATE|MODULE` — `IllegalAccessException`,
+///   **except** when `modes == 0`.
+///
+/// `modes == 0` is the house valve, the same one [`lk_enforce_find_access`]
+/// takes and for the same reason: `lk_read_allowed_modes` answers 0 both for a
+/// Lookup that genuinely has no modes AND for one whose modes we could not
+/// read (unresolvable class, fabricated stand-in, a layout we do not model).
+/// The JDK refuses a true 0; refusing our "cannot tell" 0 would turn every
+/// Lookup CratonVM does not model into an `IllegalAccessException`, which is
+/// the one failure mode a new exception path on this method must not have.
+/// So the refusal fires only on a POSITIVELY read, nonzero, weak mode word —
+/// which in this VM means exactly `publicLookup()` (0x20), an explicit
+/// `dropLookupMode`, and a narrowing `Lookup.in` (1/17/25). All three are
+/// cases HotSpot refuses too.
+///
+/// **Not enforced** (one-directional — can only admit what HotSpot refuses,
+/// never refuse what HotSpot admits): the module `canRead`/`isOpen` pair, and
+/// the cross-module success shape (`modes = 15`, `prevLookupClass = caller
+/// class`) it gates. CratonVM has no module graph to answer `isOpen` against —
+/// every class is effectively in the unnamed module here — so a faithful check
+/// would refuse `privateLookupIn(java.util.HashMap.class, lookup())`, which
+/// the VM's own machinery reaches. See the lane report.
+fn pli_enforce(
+    ctx: &mut dyn NativeContext,
+    target: Value,
+    caller: Value,
+) -> Result<(), MethodCallFailed> {
+    // (1) `caller.allowedModes` — the JDK's first dereference.
+    let caller_ref = match caller {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read field \"allowedModes\" because \"caller\" is null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    let modes = lk_read_allowed_modes(ctx, caller_ref);
+    // (2) TRUSTED short-circuits the whole method, primitive/array included.
+    if modes == -1 {
+        return Ok(());
+    }
+    // (3) `targetClass.isPrimitive()`.
+    let target_ref = match target {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot invoke \"java.lang.Class.isPrimitive()\" because \"targetClass\" is null"
+                        .to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    // Read the name before the `&mut` borrow below, and keep it: it is both the
+    // array discriminator and the text of both `IllegalArgumentException`s.
+    let target_name = mirror_class_name(ctx, target_ref);
+    let is_primitive = matches!(
+        crate::lang_class::native_class_is_primitive(ctx, &[Value::Object(Some(target_ref))]),
+        Ok(Some(Value::Int(1)))
+    );
+    if is_primitive {
+        // `Class.toString()` of a primitive is bare — "int", "void" — so the
+        // JDK's `targetClass + " is a primitive class"` has no "class " prefix.
+        let name = target_name.unwrap_or_else(|| "?".to_string());
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("{name} is a primitive class"),
+        }
+        .into());
+    }
+    // (4) `targetClass.isArray()`. Array mirrors are the ones whose name starts
+    // with '[' (`lang_class::native_class_is_array` uses the same test).
+    // `Class.toString()` of an array IS prefixed, and prints the BINARY name:
+    // "class [I", "class [Lp.Mate;".
+    if let Some(name) = target_name {
+        if name.starts_with('[') {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("class {} is an array class", name.replace('/', ".")),
+            }
+            .into());
+        }
+    }
+    // (5) the mode gate, with the `modes == 0` valve documented above.
+    if modes != 0 && (modes & LK_MODE_PRIVATE_AND_MODULE) != LK_MODE_PRIVATE_AND_MODULE {
+        return Err(RuntimeError::IllegalAccessException {
+            message: "caller does not have PRIVATE and MODULE lookup mode".to_string(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
@@ -3671,12 +4482,40 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     );
     r.register(mh, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, args| {
         let target = args.first().copied().unwrap_or(Value::Object(None));
+        let caller = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Refuse BEFORE allocating anything — see [`pli_enforce`] for the
+        // measured JDK 25 contract and for the one check deliberately omitted.
+        pli_enforce(ctx, target, caller)?;
+        // `alloc_concurrent_synthetic` can run a moving GC, after which the
+        // `target` ObjectRef the VM handed us in `args` is stale. Same fix, and
+        // the same API, as `Lookup.ensureInitialized` further down; the old code
+        // wrote the pre-GC ref straight into `lookupClass`.
+        let pinned = match target {
+            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+            _ => None,
+        };
         let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+        let target = match pinned {
+            Some((handle, o)) => {
+                let current = ctx.read_native_pin(handle, o);
+                ctx.unpin_native_roots(handle);
+                Value::Object(Some(current))
+            }
+            None => target,
+        };
         ctx.set_field_by_name(obj, "lookupClass", target);
+        // Slot 1 of the REAL layout is the `prevLookupClass` REFERENCE. Give it
+        // an explicit null so nothing downstream can read an unwritten slot as
+        // an Int, and so the same-module `prev == null` shape the JDK produces
+        // is what `previousLookupClass()` sees.
+        ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
+        // Slot-0 lookupClass fallback for the pure-synthetic layout.
         ctx.set_field(obj, 0, target);
         // privateLookupIn grants full private access but drops ORIGINAL:
         // PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE = 0x1F (incl. PACKAGE 0x08,
-        // which Lookup.defineClass requires).
+        // which Lookup.defineClass requires). Measured: 31 for every target the
+        // JDK admits in the SAME module as the caller — which, with no module
+        // graph modelled, is every target we admit.
         lk_write_allowed_modes(ctx, obj, 0x1F);
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -3750,36 +4589,59 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
-            // JDK 25 `Lookup.in(requestedLookupClass)`:
-            //   newModes = (allowedModes & FULL_POWER_MODES) & ~ORIGINAL
-            //   newModes &= ~(PACKAGE|PRIVATE|PROTECTED)  if not same package
-            //   newModes &= ~MODULE                        if not same module
-            // UNCONDITIONAL is never *gained* by `in()`. Measured on JDK 25,
-            // `MethodHandles.lookup().in(String.class).lookupModes()` == 1
-            // (PUBLIC). The old constant here was PUBLIC|UNCONDITIONAL (0x21)
-            // — a combination the JDK treats as impossible (`Lookup.toString`
-            // has a `case UNCONDITIONAL` arm and no `PUBLIC|UNCONDITIONAL`
-            // arm) — and, worse, it dropped PRIVATE even for a same-package
-            // `in()`, which the access check added alongside this would then
-            // have turned into a spurious IllegalAccessException.
+            // `Lookup.in` applies FOUR reductions, not two. Re-measured for
+            // this lane on OpenJDK 25.0.3 (`p.LkProbe2`, receiver
+            // `MethodHandles.lookup()` == 95):
+            //
+            //   in(LkProbe2.class)         the lookup class itself   -> 95
+            //   in(LkProbe2$Nested.class)  a NESTMATE                -> 31
+            //   in(p.Mate.class)           same package, other file  -> 25
+            //   in(String.class)           other module              ->  1
+            //   receiver 32 (publicLookup()), any target             -> 32
+            //   receiver 25, same package / nestmate                 -> 25
+            //   receiver 25, other module                            ->  1
+            //   receiver  1, any target we model                     ->  1
+            //   receiver  0, any target INCLUDING its own class      ->  0
+            //
+            // Three defects lived here, each measurable:
+            //
+            //  (a) `if prev == 0 { FULL_POWER }` — `in()` GRANTING full-power
+            //      access to a lookup that had NONE. Compounded with the
+            //      `Int(0)`-for-an-absent-field trap in
+            //      `lk_read_allowed_modes` (fixed above), which made `prev` 0
+            //      for every fabricated Lookup, so the default fired routinely
+            //      rather than never.
+            //  (b) no `same_class` arm — `in(lookupClass())` returns `this` in
+            //      the JDK, ORIGINAL included (95), and answered 31 here.
+            //  (c) `if modes == 0 { PUBLIC }` — a floor manufacturing PUBLIC
+            //      where the JDK returns 0.
+            //
+            // And the reduction both copies of this method originally missed:
+            // `VerifyAccess.isSamePackageMember`. A same-package class that is
+            // not a member of the same top-level class is a "cousin" and loses
+            // PRIVATE|PROTECTED, so 95 -> &0x1F = 31 -> &~6 = 25. Returning 31
+            // handed a package-mate lookup PRIVATE access the JDK does not
+            // grant — the direction that turns a `find*` which SHOULD raise
+            // `IllegalAccessException` into a silent success. Verified: a
+            // 25-mode `p.Mate` lookup is refused `private LkProbe2.secret`.
+            //
+            // The arithmetic and the class-relation test are `classloader`'s,
+            // shared deliberately so the two competing `in` registrations (this
+            // one wins in real-JDK mode, `classloader`'s in synthetic-JDK mode)
+            // cannot drift apart again.
             let prev = lk_read_allowed_modes(ctx, this);
-            let base = if prev == 0 {
-                LK_MODE_FULL_POWER
-            } else {
-                prev & LK_MODE_FULL_POWER
-            };
             let lookup_class = ctx.get_field(this, 0);
-            let modes = if lk_same_package(ctx, lookup_class, target_class) {
-                base
+            let (same_class, same_package, same_nest) =
+                crate::classloader::lk_class_relation(ctx, lookup_class, target_class);
+            // A Lookup reporting 0 has no modes to narrow, and `in()` never
+            // GRANTS. Measured: `lookup().dropLookupMode(PUBLIC)` is 0 and its
+            // `.in(<own class>)` / `.in(<package mate>)` / `.in(String.class)`
+            // are all 0.
+            let modes = if prev == 0 {
+                0
             } else {
-                LK_MODE_PUBLIC
+                crate::classloader::lk_in_modes(prev, same_class, same_package, same_nest)
             };
-            // Never store a bare 0: `lk_enforce_find_access` reads 0 as "modes
-            // unknown, stay permissive", and a genuinely powerless lookup must
-            // not inherit that valve. PUBLIC-only refuses every non-public
-            // member, which is the behaviour a 0-mode JDK Lookup has for
-            // everything we model.
-            let modes = if modes == 0 { LK_MODE_PUBLIC } else { modes };
             let lookup =
                 alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
             ctx.set_field_by_name(lookup, "lookupClass", target_class);
@@ -11038,9 +11900,57 @@ mod tests {
         vh
     }
 
+    /// A mock with a PRIVATE vm identity, for any test whose subject reaches
+    /// `box_value`.
+    ///
+    /// `box_value` allocates through `alloc_wrapper`, whose wrapper-`ClassId`
+    /// cache is PROCESS-GLOBAL and keyed by `(vm_identity, wrapper)`. Every
+    /// untouched `MockNativeContext` reports identity `0`, while each one's
+    /// `ClassId` counter is independent — so two such tests running in parallel
+    /// share one cache row, and the second would allocate its box under the
+    /// FIRST test's `ClassId`, making `class_name_of_id` name the wrong class.
+    /// (Same shape as the parallel-test crash already recorded against these
+    /// process-global native caches.) A per-test identity makes the row
+    /// private, so each test resolves the wrapper against its own class table.
+    fn boxing_ctx() -> MockNativeContext {
+        static NEXT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0x5713_0000);
+        let ctx = MockNativeContext::new();
+        ctx.set_vm_identity(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        ctx
+    }
+
+    /// W8-13: every value-returning `VarHandle` access mode is registered under
+    /// the erased `…)Ljava/lang/Object;` descriptor and must therefore hand back
+    /// a BOX, not a bare primitive — see [`vh_box_access_result`]. This asserts
+    /// both halves at once: the wrapper class the JDK 25 oracle names for the
+    /// variable's type, and the payload in slot 0.
+    ///
+    /// Written as an assertion rather than a bare unwrap on purpose: the four
+    /// tests below previously read `Some(Value::Int(n))` and so PASSED on the
+    /// unboxed shape that printed `null` at an `Object` call site.
+    fn expect_boxed(
+        ctx: &MockNativeContext,
+        result: MethodCallResult,
+        wrapper: &str,
+        payload: Value,
+    ) {
+        let obj = match result {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("expected a boxed {wrapper}, got {other:?}"),
+        };
+        let cid = ctx.class_id_of_object(obj);
+        assert_eq!(
+            ctx.class_name_of_id(cid).as_deref(),
+            Some(wrapper),
+            "boxed with the wrong wrapper class"
+        );
+        assert_eq!(ctx.get_field(obj, 0), payload, "boxed payload");
+    }
+
     #[test]
     fn get_and_add_resolves_via_meta_not_synthetic_kind() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Counter").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11067,13 +11977,9 @@ mod tests {
                 Value::Object(Some(recv)),
                 Value::Int(5),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            old,
-            Some(Value::Int(10)),
-            "must return old value via meta, not 0"
         );
+        // Old value via meta (not 0), boxed per the erased Object return.
+        expect_boxed(&ctx, old, "java/lang/Integer", Value::Int(10));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(15),
@@ -11081,9 +11987,98 @@ mod tests {
         );
     }
 
+    /// W8-13, and the reason the boxing CANNOT live at the poly-return
+    /// boundary in `vm_exec.rs`.
+    ///
+    /// `Value::Int` carries `boolean`, `byte`, `char`, `short` and `int` alike,
+    /// so the value's tag does not name its wrapper. Only the native knows the
+    /// array's element type. Measured on the JDK 25 oracle, HotSpot prints
+    /// `true` for `System.out.println(booleanVh.getAndSet(arr, 1, false))` —
+    /// i.e. it boxes a `java.lang.Boolean`. A boundary fix that inferred the
+    /// wrapper from the `Value` tag would produce `java.lang.Integer` and print
+    /// `1`. This test is the falsifier for that design.
+    #[test]
+    fn get_and_set_on_boolean_array_boxes_boolean_not_integer() {
+        let mut ctx = boxing_ctx();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Boolean, 3);
+        ctx.set_array_element(arr, 1, Value::Int(1)); // true
+        let old = varhandle_get_and_set(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Int(0), // false
+            ],
+        );
+        expect_boxed(&ctx, old, "java/lang/Boolean", Value::Int(1));
+        assert_eq!(
+            ctx.get_array_element(arr, 1),
+            Value::Int(0),
+            "element must hold the new value"
+        );
+    }
+
+    /// The same argument one type over: a `long[]` element must box to
+    /// `java.lang.Long`, which is what pins `getAndAdd`'s witness to the
+    /// element descriptor rather than to the `Value` tag.
+    #[test]
+    fn get_and_add_on_long_array_boxes_long() {
+        let mut ctx = boxing_ctx();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Long, 3);
+        ctx.set_array_element(arr, 1, Value::Long(7));
+        let old = varhandle_get_and_add(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Long(5),
+            ],
+        );
+        expect_boxed(&ctx, old, "java/lang/Long", Value::Long(7));
+        assert_eq!(ctx.get_array_element(arr, 1), Value::Long(12), "old + delta");
+    }
+
+    /// A REFERENCE-typed variable must pass through the funnel untouched — the
+    /// idempotence property that lets `varhandle_get`'s own inline `box_value`
+    /// and this funnel coexist without double-boxing.
+    #[test]
+    fn get_and_set_on_reference_array_is_not_reboxed() {
+        let mut ctx = boxing_ctx();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let arr = ctx.new_array(ArrayElementType::Reference, 3);
+        let a = match ctx.new_object("Alpha").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        let b = match ctx.new_object("Beta").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_array_element(arr, 1, Value::Object(Some(a)));
+        let old = varhandle_get_and_set(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(arr)),
+                Value::Int(1),
+                Value::Object(Some(b)),
+            ],
+        );
+        assert_eq!(
+            old.unwrap(),
+            Some(Value::Object(Some(a))),
+            "a reference witness must be returned as-is, never wrapped"
+        );
+        assert_eq!(ctx.get_array_element(arr, 1), Value::Object(Some(b)));
+    }
+
     #[test]
     fn get_and_set_resolves_via_meta_not_synthetic_kind() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Holder").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11110,13 +12105,9 @@ mod tests {
                 Value::Object(Some(recv)),
                 Value::Int(99),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            old,
-            Some(Value::Int(20)),
-            "must return old value via meta, not null"
         );
+        // Old value via meta (not null), boxed per the erased Object return.
+        expect_boxed(&ctx, old, "java/lang/Integer", Value::Int(20));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(99),
@@ -11167,7 +12158,7 @@ mod tests {
 
     #[test]
     fn compare_and_exchange_resolves_via_meta_not_synthetic_kind() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Cell").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11196,13 +12187,9 @@ mod tests {
                 Value::Int(30),
                 Value::Int(77),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            witness,
-            Some(Value::Int(30)),
-            "witness must be old value via meta"
         );
+        // Witness = old value via meta, boxed per the erased Object return.
+        expect_boxed(&ctx, witness, "java/lang/Integer", Value::Int(30));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(77),
@@ -11218,7 +12205,7 @@ mod tests {
     // exercises the new linearizable path.
     #[test]
     fn compare_and_exchange_mismatch_does_not_write() {
-        let mut ctx = MockNativeContext::new();
+        let mut ctx = boxing_ctx();
         let vh = vh_with_garbage_kind(&mut ctx);
         let recv = match ctx.new_object("Cell").unwrap() {
             Some(Value::Object(Some(o))) => o,
@@ -11247,13 +12234,9 @@ mod tests {
                 Value::Int(99),
                 Value::Int(77),
             ],
-        )
-        .unwrap();
-        assert_eq!(
-            witness,
-            Some(Value::Int(30)),
-            "witness must be the current value on mismatch"
         );
+        // Witness = the current value on mismatch, boxed per the erased return.
+        expect_boxed(&ctx, witness, "java/lang/Integer", Value::Int(30));
         assert_eq!(
             ctx.get_field(recv, 0),
             Value::Int(30),

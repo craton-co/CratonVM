@@ -7766,9 +7766,54 @@ fn ph_set(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize, v: i32) {
     ctx.set_array_element(h, idx, Value::Int(v));
 }
 
+/// The message JDK 25's `Phaser.badArrive` builds, in its measured shape.
+///
+/// Measured on OpenJDK 25.0.3:
+///
+/// ```text
+/// Attempted arrival of unregistered party for
+/// java.util.concurrent.Phaser@44c03695[phase = 0 parties = 0 arrived = 0]
+/// ```
+///
+/// The real one is `"Attempted arrival of unregistered party for " + this`,
+/// i.e. it goes through `Phaser.toString()`. This model registers no
+/// `toString`, so the tail is reconstructed from the holder rather than left
+/// off — a caller that string-matches the message sees the same text.
+fn ph_bad_arrive_message(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let phase = ph_get(ctx, this, PH_H_PHASE);
+    let parties = ph_get(ctx, this, PH_H_PARTIES);
+    let arrived = ph_get(ctx, this, PH_H_ARRIVALS);
+    let id = ctx.identity_hash_code(this);
+    format!(
+        "Attempted arrival of unregistered party for \
+         java.util.concurrent.Phaser@{id:x}[phase = {phase} parties = {parties} arrived = {arrived}]"
+    )
+}
+
+/// SYNTHETIC-MODE ONLY, and tagged accordingly.
+///
+/// Every triple below is dead under `--real-jdk` and `--jdk-only`: no real
+/// `Phaser` method is `ACC_NATIVE`, real `Phaser` declares `Code` for all of
+/// them, none is in `force_native_over_real_jdk_bytecode`, and the only call
+/// chain that reaches this registrar is
+/// `register_phase51_natives` <- `register_synthetic_overrides` <-
+/// `register_builtins`, which `vm_init` runs only inside
+/// `if config.use_synthetic_jdk`.
+///
+/// The category was `Intrinsic`, which is a claim this model cannot support —
+/// `NativeKind::Intrinsic` means "returns the same answer the real bytecode
+/// would, just faster" (native-api/src/registry.rs). It does not: the
+/// int\[3\] holder has no queues, no parent/root tree, no `onAdvance` hook, and
+/// eight `Phaser` methods are missing outright (`bulkRegister`, `onAdvance`,
+/// `getParent`, `getRoot`, `awaitAdvance`, `awaitAdvanceInterruptibly`,
+/// `<init>(Phaser,int)`, `toString`). `SyntheticStub` is byte-identical under
+/// `CompatibilityMode::Compatible` — which is what BOTH `--synthetic-jdk` and
+/// `--real-jdk` run, since `NativeKind::allowed_in` returns `true` for every
+/// kind there — and it makes `--jdk-only` refuse these at registration instead
+/// of letting an approximation win silently.
 pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/concurrent/Phaser";
     r.register(c, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -7796,9 +7841,20 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (this, _) = ph_holder(ctx, this);
         ctx.monitor_enter(this);
+        let phase = ph_get(ctx, this, PH_H_PHASE);
+        // A TERMINATED phaser answers its terminal phase and registers
+        // NOTHING. JDK 25's `doRegister` breaks out before it touches the
+        // counts (`if ((phase = (int)(s >>> PHASE_SHIFT)) < 0) break;`).
+        // Measured on OpenJDK 25.0.3: `new Phaser(1); forceTermination();
+        // register()` returns 0x80000000 and `getRegisteredParties()` is
+        // still 1. Incrementing here handed a terminated phaser a party that
+        // could never arrive.
+        if phase < 0 {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(phase)));
+        }
         let p = ph_get(ctx, this, PH_H_PARTIES);
         ph_set(ctx, this, PH_H_PARTIES, p + 1);
-        let phase = ph_get(ctx, this, PH_H_PHASE);
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(phase)))
     });
@@ -7809,8 +7865,28 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
         let arrivals = ph_get(ctx, this, PH_H_ARRIVALS);
         let parties = ph_get(ctx, this, PH_H_PARTIES);
         let phase = ph_get(ctx, this, PH_H_PHASE);
+        // JDK 25's `doArrive` asks these two questions, in this order, BEFORE
+        // it touches any count.
+        //
+        // The first is not a nicety: without it, `forceTermination()` then
+        // `arrive()` read phase -1, wrote `phase + 1 == 0`, and
+        // `isTerminated()` flipped back to FALSE. A terminated phaser must
+        // stay terminated.
+        if phase < 0 {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(phase)));
+        }
+        // The second turns a silent no-op into the specified failure.
+        // Measured on OpenJDK 25.0.3: `new Phaser(0).arrive()` throws
+        // IllegalStateException("Attempted arrival of unregistered party
+        // for ...").
+        if parties <= 0 {
+            let message = ph_bad_arrive_message(ctx, this);
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalStateException { message }.into());
+        }
         let new_arrivals = arrivals + 1;
-        if new_arrivals >= parties && parties > 0 {
+        if new_arrivals >= parties {
             ph_set(ctx, this, PH_H_ARRIVALS, 0);
             ph_set(ctx, this, PH_H_PHASE, phase + 1);
             // Notify all waiting threads that phase has advanced
@@ -7828,8 +7904,22 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
         let arrivals = ph_get(ctx, this, PH_H_ARRIVALS);
         let parties = ph_get(ctx, this, PH_H_PARTIES);
         let phase = ph_get(ctx, this, PH_H_PHASE);
+        // Same two `doArrive` preconditions as `arrive()` above — this method
+        // is an arrival too, and without the `phase < 0` guard the `phase + 1`
+        // below resurrects a terminated phaser. Measured on OpenJDK 25.0.3:
+        // `new Phaser(1); forceTermination(); arriveAndAwaitAdvance()` returns
+        // 0x80000000 without blocking.
+        if phase < 0 {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(phase)));
+        }
+        if parties <= 0 {
+            let message = ph_bad_arrive_message(ctx, this);
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalStateException { message }.into());
+        }
         let new_arrivals = arrivals + 1;
-        if new_arrivals >= parties && parties > 0 {
+        if new_arrivals >= parties {
             // Last party to arrive — advance phase and notify all waiters
             ph_set(ctx, this, PH_H_ARRIVALS, 0);
             let np = phase + 1;
@@ -7862,17 +7952,38 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
         let parties = ph_get(ctx, this, PH_H_PARTIES);
         let arrivals = ph_get(ctx, this, PH_H_ARRIVALS);
         let phase = ph_get(ctx, this, PH_H_PHASE);
+        // `doArrive(ONE_DEREGISTER)` — the same two preconditions.
+        if phase < 0 {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(phase)));
+        }
+        if parties <= 0 {
+            let message = ph_bad_arrive_message(ctx, this);
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalStateException { message }.into());
+        }
         let new_parties = (parties - 1).max(0);
         ph_set(ctx, this, PH_H_PARTIES, new_parties);
-        // Check if remaining parties are all arrived after deregistration
-        let new_arrivals = arrivals + 1;
-        if new_arrivals >= new_parties && new_parties > 0 {
+        if new_parties == 0 {
+            // The only remaining registered party just arrived, so the phase
+            // COMPLETES and only then does the phaser terminate. The terminal
+            // phase is `Integer.MIN_VALUE | phase` with that advance already
+            // applied — not -1. Measured on OpenJDK 25.0.3:
+            // `new Phaser(1).arriveAndDeregister()` leaves `getPhase()` at
+            // 0x80000001, and so does `new Phaser(2)` after two of them.
+            ph_set(ctx, this, PH_H_ARRIVALS, 0);
+            ph_set(ctx, this, PH_H_PHASE, (phase + 1) | i32::MIN);
+            ctx.monitor_notify_all(this)?;
+        } else if arrivals >= new_parties {
+            // `arrivals`, NOT `arrivals + 1`. Deregistering removes the
+            // party's registration AND its arrival together: `unarrived` drops
+            // by one because `parties` did, so the ARRIVED count does not
+            // move. Comparing `arrivals + 1` advanced the phase one arrival
+            // early — measured on OpenJDK 25.0.3,
+            // `new Phaser(2).arriveAndDeregister()` leaves phase 0 /
+            // registered 1 / arrived 0, where this model reported phase 1.
             ph_set(ctx, this, PH_H_ARRIVALS, 0);
             ph_set(ctx, this, PH_H_PHASE, phase + 1);
-            ctx.monitor_notify_all(this)?;
-        } else if new_parties == 0 {
-            // No more parties — terminate
-            ph_set(ctx, this, PH_H_PHASE, -1);
             ctx.monitor_notify_all(this)?;
         }
         ctx.monitor_exit(this);
@@ -7905,7 +8016,17 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let (this, _) = ph_holder(ctx, this);
         ctx.monitor_enter(this);
-        ph_set(ctx, this, PH_H_PHASE, -1);
+        // `Integer.MIN_VALUE | phase`, NOT -1: the phase NUMBER survives
+        // termination and `getPhase()` must still report it. Measured on
+        // OpenJDK 25.0.3 — forcing at phase 0 gives 0x80000000, at phase 2
+        // gives 0x80000002, and the party counts are PRESERVED (a
+        // `new Phaser(3)` still reports 3 registered / 3 unarrived after).
+        // -1 is 0xFFFFFFFF, which reads as "terminated at phase 0x7FFFFFFF".
+        // The `>= 0` test keeps a second call idempotent.
+        let phase = ph_get(ctx, this, PH_H_PHASE);
+        if phase >= 0 {
+            ph_set(ctx, this, PH_H_PHASE, phase | i32::MIN);
+        }
         let notify_result = ctx.monitor_notify_all(this);
         ctx.monitor_exit(this);
         notify_result?;
@@ -9793,44 +9914,22 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     // `awaitQuiescence` must observe the FutureTask roots created by the
     // real-worker `execute(Runnable)` bridge. The old constant true could say
     // the pool was idle while a worker was blocked inside user code.
+    //
+    // THIS REGISTRAR IS THE ONLY ONE THAT RUNS UNDER `--synthetic-jdk`:
+    // `vm_init`'s `if config.use_synthetic_jdk` arm calls `register_builtins`
+    // (which reaches here through `register_essential_natives`) and never
+    // calls `lib::register_forkjoin_quiescence`. On the real-JDK arms BOTH
+    // run, and `register` is last-write-wins — so the two must install the
+    // same callback or the answer would depend on which arm booted. They used
+    // to be two independently-written bodies. `native_forkjoin_await_quiescence`
+    // is now the single implementation, and it consults BOTH the tracked
+    // `FutureTask` roots this body used to poll and the `ASYNC_POOL` executor
+    // the other one did.
     r.register(
         "java/util/concurrent/ForkJoinPool",
         "awaitQuiescence",
         "(JLjava/util/concurrent/TimeUnit;)Z",
-        |ctx, args| {
-            let timeout = match args.get(1) {
-                Some(Value::Long(value)) => (*value).max(0) as u64,
-                Some(Value::Int(value)) => (*value).max(0) as u64,
-                _ => 0,
-            };
-            let nanos = match args.get(2).copied() {
-                Some(Value::Object(Some(unit))) => match ctx.invoke_virtual(
-                    unit,
-                    "toNanos",
-                    "(J)J",
-                    &[Value::Long(timeout.min(i64::MAX as u64) as i64)],
-                ) {
-                    Ok(Some(Value::Long(value))) if value > 0 => value as u64,
-                    Ok(Some(Value::Int(value))) if value > 0 => value as u64,
-                    _ => timeout.saturating_mul(1_000_000),
-                },
-                _ => timeout.saturating_mul(1_000_000),
-            };
-            let deadline = std::time::Instant::now()
-                .checked_add(std::time::Duration::from_nanos(nanos))
-                .unwrap_or_else(std::time::Instant::now);
-            loop {
-                if crate::util_concurrent_ext::async_tasks_quiescent(ctx) {
-                    return Ok(Some(Value::Int(1)));
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Ok(Some(Value::Int(0)));
-                }
-                ctx.begin_blocking_region();
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                ctx.end_blocking_region();
-            }
-        },
+        crate::native_forkjoin_await_quiescence,
     );
 
     // ForkJoinTask.fork / join / invoke / get / isDone / isCompletedNormally /

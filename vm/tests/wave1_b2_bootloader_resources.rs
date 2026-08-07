@@ -312,6 +312,23 @@ fn wave1_b2_jimage_service_descriptor_enumerated() {
         total >= 0,
         "[wave1_b2] total must be a non-negative integer; got total={total}"
     );
+    // `total >= 0` on its own is near-vacuous: `parse_total` already panics when
+    // the line is absent, and a resource count is never negative, so the only
+    // thing left for it to catch is a `total=-1` sentinel nobody emits. The real
+    // property available here is INTERNAL CONSISTENCY — the probe prints one
+    // `url: <u>` line per enumerated URL and then `total=<count>` (see PROBE_SRC
+    // at the top of this file), so the two must agree. A boot-loader enumeration
+    // that returned duplicates, or that counted entries it never yielded, moves
+    // these apart while leaving `total >= 0` perfectly happy.
+    let url_lines = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("url: "))
+        .count() as i64;
+    assert_eq!(
+        url_lines, total,
+        "[wave1_b2] the probe printed {url_lines} `url:` line(s) but reported total={total}; the \
+         enumeration and its count disagree.\nstdout: {stdout}\nstderr: {stderr}"
+    );
     // If the JDK reachable via `bin` exposes a jimage (the typical case for
     // Adoptium 25), `total` should be exactly 1 — `java.base` ships this
     // service descriptor exactly once. Use a soft assert: tolerate 0 only

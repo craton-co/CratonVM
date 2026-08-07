@@ -128,8 +128,20 @@ required, and neither is visible from the arm that was green.
   then `ClassOption.flag` against `NESTMATE_CLASS = 0x1`, then the synthetic
   slot-0 ordinal. An unrecognised shape falls through to the historical
   behaviour rather than guessing. The flag step requires a **non-zero** value
-  because a by-name read of an absent field answers `Int(0)`; both real
+  ~~because a by-name read of an absent field answers `Int(0)`~~; both real
   constants have a non-zero flag (`NESTMATE = 0x1`, `STRONG = 0x4`).
+
+  > **CORRECTED 2026-08-07 — the stated reason is false; the guard is still
+  > right, for a different reason.** Production `get_field_by_name`
+  > (`vm/src/vm/vm_exec.rs`) answers `Value::Object(None)` for an **absent**
+  > field, so an `Int` match never sees the absent case at all and the non-zero
+  > test does nothing about it. What the non-zero test does guard is the
+  > *present-but-**unwritten*** slot, which really does decode as `Int(0)` —
+  > `docs/feature-designs/by-name-field-reads.md` §1. Absent-vs-present is
+  > answered by asking the class
+  > (`resolve_field_index_by_class_id(class_id_of_object(o), name)`), never by
+  > the value. See
+  > [§4 of *Natives over real JDK classes*](../../architecture/natives-over-real-jdk-classes.md).
 
 `ClassOrigin` classification deliberately keeps reading the *declared* nest
 host, so no origin verdict changes: `GeneratedLambda { host }` is a provenance
