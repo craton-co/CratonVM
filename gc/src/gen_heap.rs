@@ -1908,7 +1908,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots_u32,
             );
@@ -1971,7 +1970,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots_u32,
             );
@@ -2135,7 +2133,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
                 length_u32,
                 length_u32,
             );
@@ -2209,7 +2206,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
                 length_u32,
                 length_u32,
             );
@@ -2310,7 +2306,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots_u32,
             );
@@ -2377,7 +2372,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
                 length_u32,
                 length_u32,
             );
@@ -2476,7 +2470,6 @@ impl GenerationalHeap {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             length_u32,
             length_u32,
         );
@@ -2531,7 +2524,6 @@ impl GenerationalHeap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             array_len,
             u32::try_from(num_fields).ok()?,
         );
@@ -2586,7 +2578,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots,
             );
@@ -2878,41 +2869,6 @@ impl GenerationalHeap {
                 // identity hash that changes under a live object -- which a
                 // test calling it once cannot see.
                 crate::collector::displaced_identity_hash(mark)
-            }
-        }
-    }
-
-    /// Lazily mint and durably install a non-zero identity hash for an
-    /// object whose header field is still 0. Safe to call concurrently:
-    /// the header field is written via a CAS from 0, so a losing racer's
-    /// mint is discarded and every caller (including the loser) converges
-    /// on the single value that actually ends up stored.
-    fn mint_identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        let minted = match self.next_hash() {
-            0 => i32::MAX,
-            h => h,
-        };
-        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code`
-        // is a plain `i32` field at a fixed offset within `ObjectHeader` on
-        // every heap backend (see `types/src/heap_types.rs`). This is the
-        // sole writer that mutates this field post-allocation, and it only
-        // ever moves it 0 -> nonzero via CAS, so treating the field as an
-        // `AtomicI32` for this one operation cannot race with the plain
-        // (non-atomic) reads the rest of the codebase performs elsewhere: a
-        // naturally-aligned 4-byte load/store is already atomic at the ISA
-        // level, and no other writer can observe/produce a torn value. Same
-        // pragmatic accommodation this file already makes for `mark_word`
-        // (see the "Round-2 fix (T2-4)" comment on the GC-copy path above).
-        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code` is a naturally-aligned
-        // 4-byte field (full rationale in the block above), so this one CAS cannot tear or race the plain reads elsewhere.
-        unsafe {
-            let field_ptr = std::ptr::addr_of_mut!(
-                (*(obj_ref.as_ptr() as *mut ObjectHeader)).identity_hash_code
-            );
-            let atomic = &*(field_ptr as *const AtomicI32);
-            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => minted,
-                Err(existing) => existing,
             }
         }
     }
@@ -12685,7 +12641,6 @@ impl GenerationalHeap {
                 std::ptr::addr_of!((*h).class_id).read(),
                 std::ptr::addr_of!((*h).kind).read(),
                 std::ptr::addr_of!((*h).element_type).read(),
-                std::ptr::addr_of!((*h).identity_hash_code).read(),
                 0,
                 0,
             );
@@ -13071,7 +13026,9 @@ impl GenerationalHeap {
                     eprintln!(
                         "[desctrace-fwd] {} ihash={} old=0x{:x} new=0x{:x} promoted={} age={} jit_active={} moving_young={}",
                         cname,
-                        header.identity_hash_code,
+                        ObjectHeader::neutral_hash(
+                            header.mark_word.load(Ordering::Relaxed),
+                        ),
                         old_ptr as usize,
                         new_ptr as usize,
                         landed_in_old_gen,
@@ -15999,7 +15956,6 @@ mod tests {
             ArrayElementType::Reference,
             0,
             0,
-            0,
         );
         assert_eq!(
             gen_object_total_size(&filler),
@@ -16013,7 +15969,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::HumongousFiller,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16045,7 +16000,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::HumongousFiller,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16281,7 +16235,6 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Reference,
             0,
-            0,
             3,
         );
         assert_eq!(gen_object_total_size(&obj), HEADER_SIZE + 3 * SLOT_SIZE);
@@ -16290,7 +16243,6 @@ mod tests {
             ClassId::new(8),
             ObjectKind::Array,
             ArrayElementType::Int,
-            0,
             10,
             0,
         );
@@ -16301,7 +16253,6 @@ mod tests {
             ClassId::new(9),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16325,7 +16276,6 @@ mod tests {
             ClassId::new(1),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16567,7 +16517,6 @@ mod tests {
                     ClassId::new(7),
                     ObjectKind::Object,
                     ArrayElementType::Reference,
-                    1,
                     0,
                     3,
                 ),
@@ -16861,7 +16810,6 @@ mod tests {
                         ClassId::new(123),
                         ObjectKind::Object,
                         ArrayElementType::Reference,
-                        7,
                         0,
                         0,
                     );

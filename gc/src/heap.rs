@@ -394,8 +394,7 @@ impl Heap {
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
-            ArrayElementType::Reference, // unused for objects
-            0, // hash installed lazily in the mark word on first request
+            ArrayElementType::Reference, // hash installed lazily in the mark word on first request
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
@@ -505,8 +504,7 @@ impl Heap {
             let mut header = ObjectHeader::new(
                 class_id,
                 ObjectKind::Object,
-                ArrayElementType::Reference,
-                0, // hash installed lazily in the mark word on first request
+                ArrayElementType::Reference, // hash installed lazily in the mark word on first request
                 0,
                 u32::try_from(num_fields).ok()?,
             );
@@ -546,8 +544,7 @@ impl Heap {
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
-            element_type,
-            0, // hash installed lazily in the mark word on first request
+            element_type, // hash installed lazily in the mark word on first request
             u32::try_from(length).expect("array length exceeds u32::MAX"),
             u32::try_from(length).expect("array length exceeds u32::MAX"),
         );
@@ -586,8 +583,7 @@ impl Heap {
             let header = ObjectHeader::new(
                 class_id,
                 ObjectKind::Array,
-                element_type,
-                0, // hash installed lazily in the mark word on first request
+                element_type, // hash installed lazily in the mark word on first request
                 u32::try_from(length).ok()?,
                 u32::try_from(length).ok()?,
             );
@@ -1280,8 +1276,7 @@ impl Heap {
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
-            ArrayElementType::Reference, // unused for objects
-            0, // hash installed lazily in the mark word on first request
+            ArrayElementType::Reference, // hash installed lazily in the mark word on first request
             0,
             u32::try_from(num_fields).ok()?,
         );
@@ -1313,8 +1308,7 @@ impl Heap {
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
-            element_type,
-            0, // hash installed lazily in the mark word on first request
+            element_type, // hash installed lazily in the mark word on first request
             u32::try_from(length).ok()?,
             u32::try_from(length).ok()?,
         );

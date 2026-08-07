@@ -477,7 +477,6 @@ impl RegionHeap {
                     ArrayElementType::Reference,
                     0,
                     0,
-                    0,
                 );
                 // SAFETY: region_addr is the base of a continuation region
                 // we just claimed; the first HEADER_SIZE bytes are exclusive
@@ -768,7 +767,6 @@ impl RegionHeap {
                             (*dst_hdr).class_id = (*src_hdr).class_id;
                             (*dst_hdr).kind = (*src_hdr).kind;
                             (*dst_hdr).element_type = (*src_hdr).element_type;
-                            (*dst_hdr).identity_hash_code = (*src_hdr).identity_hash_code;
                             (*dst_hdr).shape = (*src_hdr).shape;
                             (*dst_hdr).gc_age = (*src_hdr).gc_age;
                             (*dst_hdr).gc_flags = (*src_hdr).gc_flags;

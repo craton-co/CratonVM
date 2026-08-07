@@ -1728,7 +1728,6 @@ mod tests {
                         cratonvm_types::ClassId::new(1),
                         ObjectKind::Object,
                         ArrayElementType::Reference,
-                        i as i32,
                         0,
                         slots,
                     ),
@@ -2175,7 +2174,7 @@ mod tests {
             // B is left UNMARKED (would be floating garbage without the guard).
             let b_hdr = &mut *(b as *mut ObjectHeader);
             b_hdr.set_num_slots(1);
-            b_hdr.identity_hash_code = B_TAG;
+            b_hdr.mark_word.store(ObjectHeader::make_neutral_hashed(B_TAG), std::sync::atomic::Ordering::Relaxed);
         }
 
         let map = og.compact();
@@ -2203,7 +2202,7 @@ mod tests {
             // proving we did not leave the slot pointing at zeroed memory.
             let b_hdr = &*(b_new as *const ObjectHeader);
             assert_eq!(
-                b_hdr.identity_hash_code, B_TAG,
+                ObjectHeader::neutral_hash(b_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)), B_TAG,
                 "B data lost across compaction"
             );
             // GC metadata cleared on the survivor.
@@ -2307,7 +2306,7 @@ mod tests {
             let c_hdr = &mut *(c as *mut ObjectHeader);
             c_hdr.set_num_slots(1);
             c_hdr.gc_flags |= GC_FLAG_MARKED;
-            c_hdr.identity_hash_code = C_TAG;
+            c_hdr.mark_word.store(ObjectHeader::make_neutral_hashed(C_TAG), std::sync::atomic::Ordering::Relaxed);
         }
 
         // Return B's block to the free list WITHOUT zeroing it — the exact
@@ -2351,7 +2350,7 @@ mod tests {
             // C did not slide over the filler, and its mark bit was cleared so
             // the next cycle starts from a clean slate.
             let c_hdr = &*(c as *const ObjectHeader);
-            assert_eq!(c_hdr.identity_hash_code, C_TAG, "C must not have moved");
+            assert_eq!(ObjectHeader::neutral_hash(c_hdr.mark_word.load(std::sync::atomic::Ordering::Relaxed)), C_TAG, "C must not have moved");
             assert_eq!(c_hdr.gc_flags & GC_FLAG_MARKED, 0, "marks must be cleared");
             assert!(!c_hdr.is_forwarded());
         }

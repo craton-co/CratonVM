@@ -459,7 +459,6 @@ fn inline_tlab_header_writes_stay_inside_the_header() {
     for (name, off, width) in [
         ("class_id", 0usize, 4usize),
         ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
-        ("identity_hash_code", IDENTITY_HASH_CODE_OFFSET, 4),
         ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
         // `forwarding_ptr` was here until the 2026-08-06 shrink folded it into
         // the mark word; there is no separate field, and the emitter no longer
@@ -472,9 +471,13 @@ fn inline_tlab_header_writes_stay_inside_the_header() {
              ({HEADER_SIZE}) — that store would land in the object body"
         );
     }
-    assert_eq!(
-        IDENTITY_HASH_CODE_OFFSET,
-        std::mem::offset_of!(cratonvm_types::ObjectHeader, identity_hash_code)
+    // The emitter used to also write a zero at the identity-hash dword. That
+    // field left the header on 2026-08-07 and `shape` took over its offset, so
+    // the store now zeroes the MARK WORD instead -- see the comment at that
+    // emission for why that matters more than the hash ever did.
+    assert!(
+        cratonvm_types::MARK_WORD_OFFSET + 8 <= HEADER_SIZE,
+        "the inline-TLAB emitter zeroes the 8-byte mark word; it must fit"
     );
 }
 
@@ -830,7 +833,6 @@ fn every_header_field_is_dword_addressable() {
     for (name, off, width) in [
         ("class_id", 0usize, 4usize),
         ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
-        ("identity_hash_code", IDENTITY_HASH_CODE_OFFSET, 4),
         ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
         // `forwarding_ptr` was here until the 2026-08-06 shrink folded it into
         // the mark word; there is no separate field, and the emitter no longer

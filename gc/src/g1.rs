@@ -1704,30 +1704,6 @@ impl G1Collector {
         self.next_hash_code.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Lazily mint and durably install a non-zero identity hash for an
-    /// object whose header field is still 0 (the JIT inline `new` fast path
-    /// leaves it TLAB-zeroed — see `identity_hash_code`'s doc comment).
-    /// Safe under concurrency: the header field is written via CAS from 0,
-    /// so a losing racer's mint is discarded and every caller converges on
-    /// the single value that ends up durably stored.
-    fn mint_identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let minted = match self.next_hash() {
-            0 => i32::MAX,
-            h => h,
-        };
-        // SAFETY: see the identical justification in
-        // `gen_heap::GenerationalHeap::mint_identity_hash_code`.
-        unsafe {
-            let field_ptr =
-                std::ptr::addr_of_mut!((*(obj.as_ptr() as *mut ObjectHeader)).identity_hash_code);
-            let atomic = &*(field_ptr as *const AtomicI32);
-            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => minted,
-                Err(existing) => existing,
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Allocation
     // -----------------------------------------------------------------------
@@ -4886,14 +4862,29 @@ impl G1Collector {
 
         let is_zeroed = |addr: usize| -> bool {
             let h = unsafe { &*(addr as *const ObjectHeader) };
-            // identity_hash_code is stamped non-zero on every allocation, so
-            // requiring it zero here keeps a live bare `new Object()` (which
-            // legitimately has class_id 0 / no slots) from false-positiving.
+            // WEAKER THAN IT WAS, deliberately and visibly.
+            //
+            // This used to end `&& h.identity_hash_code == 0`, justified by
+            // "identity_hash_code is stamped non-zero on every allocation, so
+            // requiring it zero keeps a live bare `new Object()` from
+            // false-positiving". That premise died on 2026-08-07: the identity
+            // hash left the header for the mark word and is now installed
+            // LAZILY, on first request, so a live never-hashed object has a
+            // zero word exactly like reclaimed memory does.
+            //
+            // The mark word is kept in the conjunction because it is the
+            // strictly-better version of the same test (it also excludes
+            // anything locked or forwarded), but it does NOT restore the old
+            // discriminator: a live, never-hashed, never-locked `new Object()`
+            // with class_id 0 is now indistinguishable from zeroed memory here.
+            // This predicate is diagnostic, so the cost is a misleading label
+            // rather than a wrong decision -- but it is a real loss and should
+            // not be read as equivalent to what it replaced.
             h.class_id.as_u32() == 0
                 && h.num_slots() == 0
                 && (h.kind as u8) == 0
                 && h.array_length() == 0
-                && h.identity_hash_code == 0
+                && h.mark_word.load(Ordering::Relaxed) == 0
         };
 
         let mut stack: Vec<usize> = Vec::new();
@@ -6867,7 +6858,6 @@ impl G1Collector {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).ok()?,
         );
@@ -6938,7 +6928,6 @@ impl G1Collector {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             u32::try_from(length).ok()?,
             u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
         );
@@ -7755,7 +7744,6 @@ impl GarbageCollector for G1Collector {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
@@ -7798,7 +7786,6 @@ impl GarbageCollector for G1Collector {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             u32::try_from(length).expect("array length exceeds u32::MAX"),
             u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
         );
@@ -7826,11 +7813,16 @@ impl GarbageCollector for G1Collector {
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let existing = self.get_header(obj).identity_hash_code;
-        if existing != 0 {
-            return existing;
+        let header = self.get_header(obj);
+        match header.mark_word_identity_hash(|| match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => crate::collector::displaced_identity_hash(
+                header.mark_word.load(Ordering::Relaxed),
+            ),
         }
-        self.mint_identity_hash_code(obj)
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {

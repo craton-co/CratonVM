@@ -464,7 +464,6 @@ fn try_forward_object(
             std::ptr::addr_of!((*h).class_id).read(),
             std::ptr::addr_of!((*h).kind).read(),
             std::ptr::addr_of!((*h).element_type).read(),
-            std::ptr::addr_of!((*h).identity_hash_code).read(),
             0,
             0,
         );

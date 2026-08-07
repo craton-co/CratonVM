@@ -887,14 +887,37 @@ impl Compiler {
         // (and the four array_length bytes) explicitly. Two extra dwords
         // per `new` is negligible vs. the safety guarantee.
         // `OBJECT_KIND_OFFSET` (4) names the dword that packs
-        // kind/element_type/gc_age/gc_flags; `IDENTITY_HASH_CODE_OFFSET` (8)
-        // names the identity-hash dword. Both were bare literals until the
+        // kind/element_type/gc_age/gc_flags. It was a bare literal until the
         // 2026-07-26 header-offset audit — see
         // `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
         self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
         if !zero_elision {
-            // identity_hash_code = 0 (lazy-mint contract).
-            self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
+            // The mark word, NOT the identity hash. That field left the header
+            // on 2026-08-07 and its dword at offset 8 is now `shape` — this
+            // store used to write a 0 there, which after the move would have
+            // been a zero written over the field count (harmless only by the
+            // accident that the `shape` store below happens to come second).
+            //
+            // Zeroing the mark word matters far more than zeroing the hash ever
+            // did, and for the reason stated directly above: "TLAB refill zeroes
+            // the region" was EMPIRICALLY VIOLATED here (`kind=Object &&
+            // array_length=0x01010101` on freshly bumped slots). A garbage
+            // identity hash was a wrong number. A garbage mark word is a bogus
+            // lock state — `0x01010101…` has tag `0b01`, so the object reads as
+            // THIN_LOCKED by a thread that does not exist; other tag values
+            // hand `inflated_monitor()` a wild pointer or make a live object
+            // claim it has been forwarded. `MARK_NEUTRAL` is 0, so two dword
+            // stores establish it.
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::MARK_WORD_OFFSET as i32,
+                0,
+            );
+            self.emit_mov_dword_mem_disp32_imm32(
+                R11,
+                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+                0,
+            );
         }
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;

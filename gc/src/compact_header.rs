@@ -621,10 +621,13 @@ pub fn migrate_to_compact(
     };
 
     // Migrate identity hash code to side table if non-zero.
-    if old.identity_hash_code != 0 {
+    let old_hash = crate::heap::ObjectHeader::neutral_hash(
+        old.mark_word.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if old_hash != 0 {
         // Force the same hash value into the table.
         let mut write = hash_table.table.write();
-        write.insert(obj_addr, old.identity_hash_code);
+        write.insert(obj_addr, old_hash);
         drop(write);
         header.set_has_hash_code();
     }
@@ -822,7 +825,6 @@ pub enum HeaderView {
         element_type: u8,
         array_length: u32,
         num_slots: u32,
-        identity_hash_code: i32,
         gc_age: u8,
         gc_flags: u8,
         is_forwarded: bool,
@@ -848,7 +850,6 @@ impl HeaderView {
             element_type: h.element_type as u8,
             array_length: h.array_length(),
             num_slots: h.num_slots(),
-            identity_hash_code: h.identity_hash_code,
             gc_age: h.gc_age,
             gc_flags: h.gc_flags,
             is_forwarded: h.is_forwarded(),
@@ -1669,7 +1670,6 @@ mod tests {
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
             0,
-            0,
             2,
         );
         old.gc_age = 9;
@@ -1687,7 +1687,6 @@ mod tests {
             cratonvm_types::ClassId::new(10),
             crate::heap::ObjectKind::Array,
             crate::heap::ArrayElementType::Int,
-            0,
             5,
             5,
         );
@@ -1706,9 +1705,14 @@ mod tests {
             cratonvm_types::ClassId::new(1),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
-            42,
             0,
             0,
+        );
+        // The hash rides in the mark word now, not in a header field, so the
+        // migration source has to be set up the way a real hashed object is.
+        old.mark_word.store(
+            crate::heap::ObjectHeader::make_neutral_hashed(42),
+            std::sync::atomic::Ordering::Relaxed,
         );
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 1, &ht, 0x6000);
@@ -1966,7 +1970,6 @@ mod tests {
             cratonvm_types::ClassId::new(10),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
-            42,
             0,
             3,
         );
@@ -1995,7 +1998,6 @@ mod tests {
             cratonvm_types::ClassId::new(1),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
-            0,
             0,
             0,
         );

@@ -520,7 +520,6 @@ impl Tlab {
             class_id,
             ObjectKind::Array,
             ArrayElementType::Int,
-            0,
             length,
             0,
         );

@@ -1238,7 +1238,6 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Reference,
             0,
-            0,
             33_000_000, // far past the 1<<24 (~16.7M) cap
         );
         assert_eq!(object_body_size(&header), IMPLAUSIBLE_BODY_SIZE);
@@ -1256,7 +1255,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             4,
         );
@@ -1279,7 +1277,6 @@ mod tests {
             ClassId::new(999_999), // no layout ever registered for this id
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             4,
         );

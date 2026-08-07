@@ -2687,7 +2687,6 @@ pub(crate) fn tlab_alloc_byte_array(
             ClassId::new(0),
             ObjectKind::Array,
             ArrayElementType::Byte,
-            shared.mem.heap.next_identity_hash(),
             length_u32,
             length_u32,
         );
@@ -3017,12 +3016,19 @@ impl TlabShape {
     #[inline(always)]
     unsafe fn init_header(self, ptr: *mut u8, class_id: ClassId, hash: i32) {
         match self {
-            // H1: mint a fresh non-zero identity hash at allocation time so
-            // the object header is never all-zero. This matches the slow-path
-            // allocators (`alloc_object`/`alloc_array`) and prevents the
-            // stale-pointer detector in `execute_invoke` from mis-flagging
-            // legitimate `new Object()` instances as stale memory.
-            TlabShape::Object { num_fields } => init_object_header(ptr, class_id, num_fields, hash),
+            // H1 USED TO mint a non-zero identity hash here so a fresh header
+            // was never all-zero, which the stale-pointer detector relied on to
+            // avoid mis-flagging legitimate `new Object()` instances.
+            //
+            // The identity hash left the header on 2026-08-07 and is installed
+            // lazily in the mark word, so that discriminator is gone: a live,
+            // never-hashed, never-locked bare Object now reads all-zero exactly
+            // like reclaimed memory. The detector's predicates were rewritten
+            // to test the mark word instead and are documented as WEAKER --
+            // see `gc/src/g1.rs`'s zeroed-region closure. Minting eagerly is
+            // not an option to get it back: a non-zero mark word loses the
+            // thin-lock CAS, so every `synchronized` block would inflate.
+            TlabShape::Object { num_fields } => init_object_header(ptr, class_id, num_fields),
             TlabShape::Array {
                 element_type,
                 length_u32,
@@ -3032,7 +3038,6 @@ impl TlabShape {
                     class_id,
                     ObjectKind::Array,
                     element_type,
-                    hash,
                     length_u32,
                     length_u32,
                 );
@@ -3275,13 +3280,12 @@ pub(super) fn tlab_alloc_shaped_inner(
 /// `gc::g1` have always assigned a fresh hash here; this brings the
 /// fast path into agreement with them.
 #[inline(always)]
-pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identity_hash_code: i32) {
+pub(super) fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize) {
     use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind};
     let header = ObjectHeader::new(
         class_id,
         ObjectKind::Object,
         ArrayElementType::Reference,
-        identity_hash_code,
         0,
         // A class-file field table is u16-sized, so this is unreachable for a
         // verified Java class. Keep the allocation path panic-free if a corrupt

@@ -1155,7 +1155,6 @@ mod tests {
             ClassId::new(240),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            1,
             0,
             2,
         );

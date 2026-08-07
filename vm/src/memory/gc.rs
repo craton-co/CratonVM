@@ -1297,7 +1297,7 @@ pub fn verify_heap_object_fields(
         }
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
-            && h.identity_hash_code == 0
+            && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
             && h.num_slots() == 0
             && h.array_length() == 0
         {
@@ -1395,7 +1395,7 @@ pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
         // the header bytes are readable.
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
-            && h.identity_hash_code == 0
+            && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
             && h.num_slots() == 0
             && h.array_length() == 0
         {
@@ -1528,7 +1528,7 @@ fn verify_no_stale_refs(
                     // an opt-in debug path.
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
-                        && h.identity_hash_code == 0
+                        && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
                         && h.num_slots() == 0
                         && h.array_length() == 0
                     {
@@ -1584,7 +1584,7 @@ fn verify_no_stale_refs(
                     // SAFETY: see locals comment above.
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
-                        && h.identity_hash_code == 0
+                        && h.mark_word.load(std::sync::atomic::Ordering::Relaxed) == 0
                         && h.num_slots() == 0
                         && h.array_length() == 0
                     {

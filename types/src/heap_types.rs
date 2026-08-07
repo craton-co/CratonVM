@@ -312,31 +312,19 @@ const _: () = assert!(
 );
 
 /// Byte offset of the array-length/object-shape word.
-pub const ARRAY_LENGTH_OFFSET: usize = 12;
-pub const NUM_SLOTS_OFFSET: usize = 12;
+// 8, not 12, since `identity_hash_code` left the header on 2026-08-07 and
+// `shape` moved up into its place. Every JIT array-length load is emitted
+// from this constant, so the displacement follows automatically -- which is
+// the whole reason it is a named constant and not a literal.
+pub const ARRAY_LENGTH_OFFSET: usize = 8;
+pub const NUM_SLOTS_OFFSET: usize = 8;
 pub const GC_AGE_OFFSET: usize = 6;
 pub const GC_FLAGS_OFFSET: usize = 7;
-
-/// Byte offset of the `identity_hash_code` field within [`ObjectHeader`].
-///
-/// Added per request R3 of
-/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §7: this was
-/// the only header field without a named constant, and it is baked as a literal
-/// in at least two places outside `types` (`jit/src/x64.rs` derived its own via
-/// `offset_of!` to avoid one; `vm/src/jit/helpers.rs` still writes a bare
-/// `raw_ptr.add(8)`). Those should re-export this constant — see
-/// `arch-2026-07-26/header-shrink.md` §6.
-pub const IDENTITY_HASH_CODE_OFFSET: usize = 8;
 
 // Compile-time check that the offset is correct.
 const _: () = assert!(
     std::mem::offset_of!(ObjectHeader, shape) == ARRAY_LENGTH_OFFSET,
     "ARRAY_LENGTH_OFFSET must match ObjectHeader layout"
-);
-
-const _: () = assert!(
-    std::mem::offset_of!(ObjectHeader, identity_hash_code) == IDENTITY_HASH_CODE_OFFSET,
-    "IDENTITY_HASH_CODE_OFFSET must match ObjectHeader layout"
 );
 
 // The array-length load is emitted as a signed disp8 in 16 places in
@@ -499,7 +487,6 @@ pub struct ObjectHeader {
     pub gc_age: u8,
     /// GC flags -- old/marked/compact layout bits.
     pub gc_flags: u8,
-    pub identity_hash_code: i32,
     /// Arrays store their length directly. Objects store the full 32-bit
     /// hierarchy-wide instance-field count.
     pub shape: u32,
@@ -563,7 +550,6 @@ impl ObjectHeader {
         class_id: ClassId,
         kind: ObjectKind,
         element_type: ArrayElementType,
-        identity_hash_code: i32,
         array_length: u32,
         num_slots: u32,
     ) -> Self {
@@ -578,7 +564,6 @@ impl ObjectHeader {
             element_type,
             gc_age: 0,
             gc_flags: 0,
-            identity_hash_code,
             shape,
             mark_word: AtomicU64::new(MARK_NEUTRAL),
         }
@@ -904,7 +889,6 @@ mod tests {
             ArrayElementType::Boolean,
             0,
             0,
-            0,
         )
     }
 
@@ -923,7 +907,6 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(ObjectHeader, gc_age), GC_AGE_OFFSET);
         assert_eq!(std::mem::offset_of!(ObjectHeader, gc_flags), GC_FLAGS_OFFSET);
-        assert_eq!(std::mem::offset_of!(ObjectHeader, identity_hash_code), 8);
         assert_eq!(std::mem::offset_of!(ObjectHeader, shape), NUM_SLOTS_OFFSET);
         assert_eq!(
             std::mem::offset_of!(ObjectHeader, mark_word),
@@ -1286,7 +1269,6 @@ mod tests {
             ClassId::new(5),
             ObjectKind::Array,
             ArrayElementType::Int,
-            12345,
             100,
             0,
         );
@@ -1294,7 +1276,9 @@ mod tests {
         assert_eq!(header.kind, ObjectKind::Array);
         assert_eq!(header.element_type, ArrayElementType::Int);
         assert_eq!(header.array_length(), 100);
-        assert_eq!(header.identity_hash_code, 12345);
+        // The identity hash is no longer a header field; it is installed
+        // lazily into the mark word on first request.
+        assert_eq!(header.mark_word.load(Ordering::Relaxed), MARK_NEUTRAL);
         assert_eq!(header.gc_age, 3);
     }
 
@@ -1891,38 +1875,56 @@ mod tests {
         );
     }
 
-    /// `identity_hash_code` is a **dedicated header field**, not a mark-word
-    /// resident, so it is orthogonal to every lock transition. This is the
-    /// real co-occurrence matrix for this VM: a hash installed once survives
-    /// NEUTRAL -> THIN_LOCKED -> INFLATED unchanged. (There is deliberately no
-    /// "hashed" mark-word state: folding the hash into the mark word saves
-    /// zero bytes — see `shrink_candidate_sizes_are_what_the_doc_claims` — so
-    /// inventing one would add a collision surface for no gain.)
+    /// The identity hash is NOT orthogonal to the mark word any more, and
+    /// this test records the co-occurrence rules that replaced orthogonality.
+    ///
+    /// It used to assert the opposite -- the hash was a dedicated header field,
+    /// so it survived NEUTRAL -> THIN_LOCKED -> INFLATED untouched -- and its
+    /// doc argued against folding it in because doing so "saves zero bytes".
+    /// That arithmetic was right in isolation and wrong as a conclusion: the
+    /// fold buys nothing ALONE (the freed 4 bytes reappear as padding) and is a
+    /// prerequisite for the 24 -> 16 shrink, which buys 8.
+    ///
+    /// What holds now:
+    ///   * NEUTRAL carries the hash in its upper bits;
+    ///   * a hashed object cannot be THIN_LOCKED at all, because
+    ///     `try_thin_lock` CASes from the literal `MARK_NEUTRAL`;
+    ///   * INFLATED and FORWARDED carry a pointer, so `neutral_hash` must
+    ///     report 0 for them and the caller must go to the displaced hash in
+    ///     the object's `Monitor`.
     #[test]
-    fn identity_hash_is_orthogonal_to_every_mark_word_state() {
-        let mut header = make_header();
-        header.identity_hash_code = 0x5EED_1234u32 as i32;
+    fn the_identity_hash_shares_the_mark_word_and_is_displaced_by_inflation() {
+        let header = make_header();
+        let hash = header
+            .mark_word_identity_hash(|| 0x5EED_1234 & 0x7FFF_FFFF)
+            .expect("a fresh object is NEUTRAL");
 
+        // Still NEUTRAL, and readable straight out of the word.
+        let mark = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(ObjectHeader::mark_state(mark), MARK_NEUTRAL);
+        assert_eq!(ObjectHeader::neutral_hash(mark), hash);
+
+        // A hashed word is non-zero, which is exactly what makes the thin-lock
+        // CAS fail and the object inflate instead.
+        assert_ne!(mark, MARK_NEUTRAL);
+
+        // Once the word holds a pointer, the hash is not in it, and asking for
+        // one must report absence rather than decode the pointer.
         let slot: u64 = 0;
         let monitor = &slot as *const u64 as usize;
-        let thin = ObjectHeader::make_thin_locked(77, 3);
-        let inflated = ObjectHeader::make_inflated(monitor);
-
-        for state in [MARK_NEUTRAL, thin, inflated] {
+        for state in [
+            ObjectHeader::make_thin_locked(77, 3),
+            ObjectHeader::make_inflated(monitor),
+            ObjectHeader::make_forwarded(monitor),
+        ] {
             header.mark_word.store(state, Ordering::Release);
             assert_eq!(
-                header.identity_hash_code, 0x5EED_1234u32 as i32,
-                "the identity hash must be unaffected by mark-word state {state:#x}"
+                ObjectHeader::neutral_hash(state),
+                0,
+                "state {state:#x} must not report a hash"
             );
+            assert!(header.mark_word_identity_hash(|| 1).is_err());
         }
-        // ...and the mark word is likewise unaffected by rewriting the hash.
-        header.mark_word.store(inflated, Ordering::Release);
-        header.identity_hash_code = -1;
-        assert_eq!(header.mark_word.load(Ordering::Acquire), inflated);
-        assert_eq!(
-            ObjectHeader::inflated_monitor(header.mark_word.load(Ordering::Acquire)) as usize,
-            monitor
-        );
     }
 
     /// Forwarding is a **destructive** mark-word transition: it overwrites
@@ -2084,15 +2086,19 @@ mod tests {
         let _ = ObjectHeader::make_forwarded(0);
     }
 
+    /// `identity_hash_code` left the header on 2026-08-07; `shape` moved up
+    /// into the dword it used to occupy.
+    ///
+    /// The offset that matters now is `shape`'s, because the JIT's inline
+    /// allocator writes the field count through `NUM_SLOTS_OFFSET` and used to
+    /// write a zero through the hash's offset. Those were 12 and 8; if the hash
+    /// constant had been left behind at 8 they would now be the same dword.
     #[test]
-    fn identity_hash_code_offset_is_named_and_pinned() {
-        assert_eq!(IDENTITY_HASH_CODE_OFFSET, 8);
-        assert_eq!(
-            std::mem::offset_of!(ObjectHeader, identity_hash_code),
-            IDENTITY_HASH_CODE_OFFSET
-        );
-        // It must not overlap the neighbouring fields.
-        assert!(GC_FLAGS_OFFSET < IDENTITY_HASH_CODE_OFFSET);
-        assert!(IDENTITY_HASH_CODE_OFFSET + 4 <= NUM_SLOTS_OFFSET);
+    fn the_shape_word_took_over_the_identity_hash_offset() {
+        assert_eq!(NUM_SLOTS_OFFSET, 8);
+        assert_eq!(ARRAY_LENGTH_OFFSET, NUM_SLOTS_OFFSET);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, shape), NUM_SLOTS_OFFSET);
+        assert!(GC_FLAGS_OFFSET < NUM_SLOTS_OFFSET);
+        assert!(NUM_SLOTS_OFFSET + 4 <= MARK_WORD_OFFSET);
     }
 }

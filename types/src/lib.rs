@@ -85,7 +85,7 @@ pub use heap_types::{
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
     GC_AGE_OFFSET, GC_FLAGS_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
     MARK_HASH_MASK, MARK_HASH_SHIFT,
-    IDENTITY_HASH_CODE_OFFSET, INFLATED_PTR_MASK, MARK_FORWARDED, MARK_INFLATED, MARK_NEUTRAL,
+    INFLATED_PTR_MASK, MARK_FORWARDED, MARK_INFLATED, MARK_NEUTRAL,
     MARK_STATE_MASK, MARK_THIN_LOCKED, MARK_WORD_OFFSET, NUM_SLOTS_OFFSET, OBJECT_KIND_OFFSET,
     REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
     THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
@@ -230,7 +230,6 @@ mod tests {
         // it. Stating it against `HEADER_SIZE` would make this assert fail on a
         // correct layout, which is the wrong way for an invariant to break.
         assert!(ARRAY_LENGTH_OFFSET + 4 <= ARRAY_DATA_OFFSET);
-        assert!(IDENTITY_HASH_CODE_OFFSET + 4 <= HEADER_SIZE);
         assert!(
             ARRAY_DATA_OFFSET >= HEADER_SIZE && ARRAY_DATA_OFFSET % 8 == 0,
             "array data starts at or past the header end, on the 8-byte grid"
@@ -278,8 +277,6 @@ mod tests {
         // The last header field that had no named constant. `jit/src/x64.rs`
         // derived its own via `offset_of!` and `vm/src/jit/helpers.rs` still
         // writes a bare `raw_ptr.add(8)`; both should use this.
-        assert_eq!(IDENTITY_HASH_CODE_OFFSET % 4, 0, "dword-addressable");
-        assert!(IDENTITY_HASH_CODE_OFFSET < HEADER_SIZE);
     }
 
     #[test]
@@ -309,7 +306,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::Object,
             ArrayElementType::Boolean,
-            0,
             0,
             0,
         );

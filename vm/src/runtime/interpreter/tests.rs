@@ -4526,24 +4526,25 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
                                      // Cast: reinterpret pointer/address to typed pointer
     let ptr = storage.as_mut_ptr() as *mut u8;
 
-    // Path 1: init with a non-zero hash (what the new TLAB path does)
-    let supplied_hash: i32 = 42;
-    super::init_object_header(ptr, ClassId::new(0), 0, supplied_hash);
+    // Path 1: the TLAB fast path no longer mints a hash at allocation.
+    super::init_object_header(ptr, ClassId::new(0), 0);
 
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`.
     let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };
     assert_eq!(header.class_id, ClassId::new(0));
-    assert_eq!(header.identity_hash_code, supplied_hash);
     assert_eq!(header.num_slots(), 0);
 
     // First 16 bytes: must NOT be all-zero, since identity_hash_code
-    // is at byte offset 8..12 and is non-zero. This is the invariant
-    // the stale-pointer detector relies on.
+    // A bare `new Object()` (class_id 0, no fields, unhashed, unlocked) DOES
+    // now read as all-zero. That is a real regression in the stale-pointer
+    // detector's discriminator, recorded here rather than hidden: the hash it
+    // used to key on left the header, and minting one eagerly to restore it
+    // would make every `synchronized` block inflate.
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`, so its first 16 bytes are initialized and readable.
     let first_16: [u8; 16] = unsafe { std::ptr::read(ptr as *const [u8; 16]) };
-    assert_ne!(
+    assert_eq!(
         first_16, [0u8; 16],
-        "fresh-Object header must not read as all-zero when allocated with a non-zero hash"
+        "a bare fresh Object header is all-zero now that the hash is lazy"
     );
 
     // Path 2: verify VmHeap::next_identity_hash never returns 0

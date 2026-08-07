@@ -75,17 +75,6 @@ pub use cpu_features::{
     has_avx2, has_bmi1, has_lzcnt, has_pclmulqdq, has_popcnt, has_sse41, has_sse42,
 };
 
-/// Byte offset of `ObjectHeader::identity_hash_code`.
-///
-/// `types` exports a named constant for every other header field but not this
-/// one, and the inline TLAB emitter needs it to zero the hash slot explicitly
-/// (the lazy-mint contract). Derived from the struct via `offset_of!` rather
-/// than written as a literal `8`, so the planned 32→16-byte `ObjectHeader`
-/// shrink (fold `forwarding_ptr` + `identity_hash_code` into the mark word)
-/// cannot silently leave this emission pointing at the wrong dword. See
-/// `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
-const IDENTITY_HASH_CODE_OFFSET: usize =
-    std::mem::offset_of!(cratonvm_types::ObjectHeader, identity_hash_code);
 
 // ---------------------------------------------------------------------------
 // Switch-instruction validation helpers (HIGH security, task #8)
