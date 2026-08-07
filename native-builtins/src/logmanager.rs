@@ -533,9 +533,9 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> Result<Obj
     } else {
         Ok(None)
     };
-    let obj = match chose_property_class {
-        Ok(Some(o)) => o,
-        Ok(None) => allocate_log_manager(ctx, class_name)?,
+    let obj = match chose_property_class? {
+        Some(o) => o,
+        None => allocate_log_manager(ctx, class_name)?,
     };
     let mut guard = singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *guard {
@@ -614,10 +614,10 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef,
         // `Logger.getLogger("com.example.Foo").getParent()` answer with a
         // `com.example` logger HotSpot never creates (it answers with the root).
         let parent_name = nearest_existing_ancestor_name(ctx.vm_identity(), name);
-        let parent = get_or_create_logger(ctx, &parent_name);
-        let parent_pin = ctx.pin_native_root(parent?);
+        let parent = get_or_create_logger(ctx, &parent_name)?;
+        let parent_pin = ctx.pin_native_root(parent);
         obj = ctx.read_native_pin(obj_pin, obj);
-        let parent = ctx.read_native_pin(parent_pin, parent?);
+        let parent = ctx.read_native_pin(parent_pin, parent);
         ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(Some(parent)));
         ctx.unpin_native_roots(parent_pin);
     }
@@ -990,12 +990,12 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
             return unsafe { Ok(object_from_u64(address)) };
         }
     }
-    let logger = allocate_logger(ctx, name);
+    let logger = allocate_logger(ctx, name)?;
     // This factory re-enters real JULI bytecode and allocates handler state.
     // Keep its new Logger rooted throughout, refreshing it after every
     // GC-capable boundary before it is stored or returned.
-    let logger_pin = ctx.pin_native_root(logger?);
-    let mut logger = logger?;
+    let logger_pin = ctx.pin_native_root(logger);
+    let mut logger = logger;
     // Do not merely cache the child: Tomcat's addLogger bytecode applies the
     // current context-class-loader configuration, wires its parent chain and
     // instantiates any per-logger handlers. Bypassing this path was why the

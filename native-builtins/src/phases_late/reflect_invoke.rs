@@ -2573,10 +2573,10 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr_pin = ctx.pin_native_root(arr);
     let mut arr = arr;
     for (i, entry) in frames.iter().enumerate() {
-        let sf = populate_stack_frame(ctx, entry, retain_class_ref);
-        let sf_pin = ctx.pin_native_root(sf?);
+        let sf = populate_stack_frame(ctx, entry, retain_class_ref)?;
+        let sf_pin = ctx.pin_native_root(sf);
         arr = ctx.read_native_pin(arr_pin, arr);
-        let sf = ctx.read_native_pin(sf_pin, sf?);
+        let sf = ctx.read_native_pin(sf_pin, sf);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
         ctx.unpin_native_roots(sf_pin);
     }
@@ -2627,10 +2627,10 @@ pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
     let mut failure = None;
     for entry in &frames {
-        let sf = populate_stack_frame(ctx, entry, retain_class_ref);
-        let sf_pin = ctx.pin_native_root(sf?);
+        let sf = populate_stack_frame(ctx, entry, retain_class_ref)?;
+        let sf_pin = ctx.pin_native_root(sf);
         let consumer = ctx.read_native_pin(pin_base, consumer);
-        let sf = ctx.read_native_pin(sf_pin, sf?);
+        let sf = ctx.read_native_pin(sf_pin, sf);
         let call = ctx.invoke_virtual(
             consumer,
             "accept",

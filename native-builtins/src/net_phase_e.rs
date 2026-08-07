@@ -15498,8 +15498,8 @@ fn re10_dispatch_pending(
                 // common case.
                 let hctx = ctx.read_native_pin(hctx_pin, hctx0);
                 let gate = re10_authenticate(ctx, hctx, ex_pin, ex0);
-                match gate {
-                    Ok(AuthGate::Proceed) => {
+                match gate? {
+                    AuthGate::Proceed => {
                         // Re-read both pinned roots immediately before the invoke
                         // (the exchange-build allocations above, and any
                         // authenticator bytecode, may have relocated them).
@@ -15512,7 +15512,7 @@ fn re10_dispatch_pending(
                             &[Value::Object(Some(ex))],
                         );
                     }
-                    Ok(AuthGate::Reject(code)) => {
+                    AuthGate::Reject(code) => {
                         // Same idiom as the `HttpHandler.handle` backstop in
                         // `phases_late::net_channels`: report the status through
                         // the exchange's own natives (`-1` = no response body)

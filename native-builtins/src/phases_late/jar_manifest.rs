@@ -2627,10 +2627,10 @@ pub(crate) fn sb2_launcher_build_archive_list(
     // truncates the pin vec at native exit); the refs are re-read right
     // before returning.
     let mut pins: Vec<usize> = Vec::new();
-    let classes_url = p59_alloc_url(ctx, &classes_url_str);
-    let classes_url_pin = ctx.pin_native_root(classes_url?);
+    let classes_url = p59_alloc_url(ctx, &classes_url_str)?;
+    let classes_url_pin = ctx.pin_native_root(classes_url);
     let classes_archive = try_alloc_concurrent_synthetic(ctx, archive_class, 3)?;
-    let classes_url = ctx.read_native_pin(classes_url_pin, classes_url?);
+    let classes_url = ctx.read_native_pin(classes_url_pin, classes_url);
     // SB2 JarFileArchive layout: 0=jarFile, 1=url, 2=tempUnpackDirectory
     ctx.set_field(classes_archive, 1, Value::Object(Some(classes_url)));
     pins.push(ctx.pin_native_root(classes_archive));
@@ -2643,10 +2643,10 @@ pub(crate) fn sb2_launcher_build_archive_list(
                     let name = entry.name().to_string();
                     if name.starts_with("BOOT-INF/lib/") && name.ends_with(".jar") {
                         let url_str = format!("jar:file:/{jar_uri_path}!/{name}!/");
-                        let url = p59_alloc_url(ctx, &url_str);
-                        let url_pin = ctx.pin_native_root(url?);
+                        let url = p59_alloc_url(ctx, &url_str)?;
+                        let url_pin = ctx.pin_native_root(url);
                         let nested = try_alloc_concurrent_synthetic(ctx, archive_class, 3)?;
-                        let url = ctx.read_native_pin(url_pin, url?);
+                        let url = ctx.read_native_pin(url_pin, url);
                         ctx.set_field(nested, 1, Value::Object(Some(url)));
                         pins.push(ctx.pin_native_root(nested));
                         archives.push(Value::Object(Some(nested)));
@@ -3666,7 +3666,7 @@ pub(crate) fn p59_manifest_init_from_input_stream_at(
         // Install on the Manifest, re-reading every ref after the allocations.
         let this = ctx.read_native_pin(this_pin, this);
         let main_attrs = ctx.read_native_pin(main_pin, main_attrs);
-        let entries_map = ctx.read_native_pin(entries_pin, entries_map?);
+        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
         ctx.set_field(this, 0, Value::Object(Some(main_attrs)));
         ctx.set_field(this, 1, Value::Object(Some(entries_map)));
         ctx.set_field_by_name(this, "attr", Value::Object(Some(main_attrs)));

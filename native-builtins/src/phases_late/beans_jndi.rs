@@ -200,10 +200,10 @@ fn p72_prefs_child_or_create(
     // pin first: the map lookup above can have moved it.
     let this = ctx.read_native_pin(this_pin, this);
     let user = p72_prefs_is_user(ctx, this);
-    let child = p72_alloc_prefs(ctx, user);
-    let child_pin = ctx.pin_native_root(child?);
+    let child = p72_alloc_prefs(ctx, user)?;
+    let child_pin = ctx.pin_native_root(child);
     let name_val = read_pinned_object_value(ctx, name_pin, name_val);
-    let child = ctx.read_native_pin(child_pin, child?);
+    let child = ctx.read_native_pin(child_pin, child);
     ctx.set_field(child, 1, name_val);
     let this = ctx.read_native_pin(this_pin, this);
     let child = ctx.read_native_pin(child_pin, child);
@@ -2317,9 +2317,9 @@ pub(crate) fn introspector_get_bean_info(
                     name,
                     desc,
                     method.access_flags,
-                );
-                let mm_all_pin = ctx.pin_native_root(mm_all?);
-                all_method_mirrors.push((mm_all_pin, mm_all?));
+                )?;
+                let mm_all_pin = ctx.pin_native_root(mm_all);
+                all_method_mirrors.push((mm_all_pin, mm_all));
             }
             // JavaBeans properties come from PUBLIC INSTANCE methods only
             // (java.beans uses Class.getMethods(), which is public-only — a
@@ -2353,15 +2353,15 @@ pub(crate) fn introspector_get_bean_info(
                     name,
                     desc,
                     method.access_flags,
-                );
-                let mm_pin = ctx.pin_native_root(mm?);
+                )?;
+                let mm_pin = ctx.pin_native_root(mm);
                 let mut ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
                 let mut ret_desc = ret_desc;
                 let mut ret_cid = ret_cid;
                 // Resolve `T` against the BEAN class, as java.beans does --
                 // see `resolve_accessor_type_in_bean`.
                 let bean_mirror_now = ctx.read_native_pin(class_mirror_pin, class_mirror);
-                let mm_now = ctx.read_native_pin(mm_pin, mm?);
+                let mm_now = ctx.read_native_pin(mm_pin, mm);
                 if let Some((rm, rcid, rdesc)) =
                     resolve_accessor_type_in_bean(ctx, bean_mirror_now, mm_now, true)
                 {
@@ -2371,7 +2371,7 @@ pub(crate) fn introspector_get_bean_info(
                 }
                 let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
                 let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
-                let mm = ctx.read_native_pin(mm_pin, mm?);
+                let mm = ctx.read_native_pin(mm_pin, mm);
                 let idx = prop_idx(&mut props, &prop_name)?;
                 let p = &mut props[idx];
                 if is_is {
@@ -2403,11 +2403,11 @@ pub(crate) fn introspector_get_bean_info(
                         name,
                         desc,
                         method.access_flags,
-                    );
-                    let mm_pin = ctx.pin_native_root(mm?);
+                    )?;
+                    let mm_pin = ctx.pin_native_root(mm);
                     let idx = prop_idx(&mut props, &prop_name)?;
                     if props[idx].indexed_read.is_none() {
-                        props[idx].indexed_read = Some((mm_pin, mm?));
+                        props[idx].indexed_read = Some((mm_pin, mm));
                     }
                 }
             }
@@ -2430,8 +2430,8 @@ pub(crate) fn introspector_get_bean_info(
                         name,
                         desc,
                         method.access_flags,
-                    );
-                    let mm_pin = ctx.pin_native_root(mm?);
+                    )?;
+                    let mm_pin = ctx.pin_native_root(mm);
                     let mut param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
                     let mut param_desc = params[0].clone();
                     let mut param_cid = param_cid;
@@ -2440,7 +2440,7 @@ pub(crate) fn introspector_get_bean_info(
                     // erased parameter and fails the assignable-chain check
                     // against a covariantly overridden getter.
                     let bean_mirror_now = ctx.read_native_pin(class_mirror_pin, class_mirror);
-                    let mm_now = ctx.read_native_pin(mm_pin, mm?);
+                    let mm_now = ctx.read_native_pin(mm_pin, mm);
                     if let Some((pm, pcid, pdesc)) =
                         resolve_accessor_type_in_bean(ctx, bean_mirror_now, mm_now, false)
                     {
@@ -2450,7 +2450,7 @@ pub(crate) fn introspector_get_bean_info(
                     }
                     let param_mirror_pin = ctx.pin_native_root(param_mirror);
                     let param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
-                    let mm = ctx.read_native_pin(mm_pin, mm?);
+                    let mm = ctx.read_native_pin(mm_pin, mm);
                     let idx = prop_idx(&mut props, &prop_name)?;
                     props[idx].write_methods.push((
                         (mm_pin, mm),
@@ -2469,12 +2469,12 @@ pub(crate) fn introspector_get_bean_info(
                         name,
                         desc,
                         method.access_flags,
-                    );
-                    let mm_pin = ctx.pin_native_root(mm?);
+                    )?;
+                    let mm_pin = ctx.pin_native_root(mm);
                     let idx = prop_idx(&mut props, &prop_name)?;
                     props[idx]
                         .indexed_write_candidates
-                        .push(((mm_pin, mm?), params[1].clone()));
+                        .push(((mm_pin, mm), params[1].clone()));
                 }
             }
         }
@@ -2566,12 +2566,12 @@ pub(crate) fn introspector_get_bean_info(
             "getClass",
             "()Ljava/lang/Class;",
             0x0001, /* ACC_PUBLIC */
-        );
-        let getter_pin = ctx.pin_native_root(getter?);
+        )?;
+        let getter_pin = ctx.pin_native_root(getter);
         let class_class_mirror = ctx.read_native_pin(class_class_mirror_pin, class_class_mirror);
         properties.push((
             "class".to_string(),
-            Some((getter_pin, getter?)),
+            Some((getter_pin, getter)),
             None,
             Some((class_class_mirror_pin, class_class_mirror)),
             None,

@@ -876,13 +876,13 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
         }
         set_app_loader(vm, None);
     }
-    let platform = get_or_create_platform_loader(ctx);
-    let platform_pin = ctx.pin_native_root(platform?);
+    let platform = get_or_create_platform_loader(ctx)?;
+    let platform_pin = ctx.pin_native_root(platform);
     let mut obj = alloc_classloader(ctx, LOADER_APP)?;
     let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("app");
     let name_pin = ctx.pin_native_root(name);
-    let mut platform = ctx.read_native_pin(platform_pin, platform?);
+    let mut platform = ctx.read_native_pin(platform_pin, platform);
     obj = ctx.read_native_pin(obj_pin, obj);
     let mut name = ctx.read_native_pin(name_pin, name);
     // L1: only on OUR layout — see the same guard in
@@ -1372,10 +1372,10 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     }
-    let pd = alloc_default_protection_domain(ctx);
-    let pd_pin = ctx.pin_native_root(pd?);
+    let pd = alloc_default_protection_domain(ctx)?;
+    let pd_pin = ctx.pin_native_root(pd);
     obj = ctx.read_native_pin(obj_pin, obj);
-    let pd = ctx.read_native_pin(pd_pin, pd?);
+    let pd = ctx.read_native_pin(pd_pin, pd);
     if synthetic_layout {
         ctx.set_field(obj, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }

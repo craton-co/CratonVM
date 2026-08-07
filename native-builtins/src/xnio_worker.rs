@@ -1283,16 +1283,16 @@ fn alloc_stream_connection_for_tcp(
     };
     let close_pin = ctx.pin_native_root(close_ref);
 
-    let source_obj = alloc_source_channel_obj(ctx, source_id);
-    let source_pin = ctx.pin_native_root(source_obj?);
-    let sink_obj = alloc_sink_channel_obj(ctx, sink_id);
-    let sink_pin = ctx.pin_native_root(sink_obj?);
+    let source_obj = alloc_source_channel_obj(ctx, source_id)?;
+    let source_pin = ctx.pin_native_root(source_obj);
+    let sink_obj = alloc_sink_channel_obj(ctx, sink_id)?;
+    let sink_pin = ctx.pin_native_root(sink_obj);
     let conn = try_alloc_concurrent_synthetic(ctx, "org/xnio/StreamConnection", 5)?;
     let conn_pin = ctx.pin_native_root(conn);
 
     let close_ref = ctx.read_native_pin(close_pin, close_ref);
-    let source_obj = ctx.read_native_pin(source_pin, source_obj?);
-    let sink_obj = ctx.read_native_pin(sink_pin, sink_obj?);
+    let source_obj = ctx.read_native_pin(source_pin, source_obj);
+    let sink_obj = ctx.read_native_pin(sink_pin, sink_obj);
     let conn = ctx.read_native_pin(conn_pin, conn);
     let io_thread = ctx.read_native_pin(io_thread_pin, io_thread);
     ctx.set_field_by_name(conn, "thread", Value::Object(Some(io_thread)));
@@ -1821,17 +1821,17 @@ fn native_iot_open_tcp_stream_connection(
         };
     let close_pin = ctx.pin_native_root(close_ref);
 
-    let source_obj = alloc_source_channel_obj(ctx, source_id);
-    let source_pin = ctx.pin_native_root(source_obj?);
-    let sink_obj = alloc_sink_channel_obj(ctx, sink_id);
-    let sink_pin = ctx.pin_native_root(sink_obj?);
+    let source_obj = alloc_source_channel_obj(ctx, source_id)?;
+    let source_pin = ctx.pin_native_root(source_obj);
+    let sink_obj = alloc_sink_channel_obj(ctx, sink_id)?;
+    let sink_pin = ctx.pin_native_root(sink_obj);
 
     let conn = try_alloc_concurrent_synthetic(ctx, "org/xnio/StreamConnection", 5)?;
     let conn_pin = ctx.pin_native_root(conn);
 
     let close_ref = ctx.read_native_pin(close_pin, close_ref);
-    let source_obj = ctx.read_native_pin(source_pin, source_obj?);
-    let sink_obj = ctx.read_native_pin(sink_pin, sink_obj?);
+    let source_obj = ctx.read_native_pin(source_pin, source_obj);
+    let sink_obj = ctx.read_native_pin(sink_pin, sink_obj);
     let conn = ctx.read_native_pin(conn_pin, conn);
     let io_thread = ctx.read_native_pin(io_thread_pin, io_thread);
     ctx.set_field_by_name(conn, "thread", Value::Object(Some(io_thread)));

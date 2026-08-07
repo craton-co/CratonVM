@@ -1411,10 +1411,10 @@ pub(crate) fn build_composite_data(
     // built FIRST so `build_string_keyed_map` can pin the item refs before
     // any allocation invalidates them.
     let composite_type_pin = composite_type.map(|o| ctx.pin_native_root(o));
-    let map = build_string_keyed_map(ctx, items);
-    let map_pin = ctx.pin_native_root(map?);
+    let map = build_string_keyed_map(ctx, items)?;
+    let map_pin = ctx.pin_native_root(map);
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/CompositeDataSupport", 4)?;
-    let map = ctx.read_native_pin(map_pin, map?);
+    let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let composite_type = match (composite_type_pin, composite_type) {
         (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),
@@ -1748,10 +1748,10 @@ pub(crate) fn build_tabular_data(
     // GC there would relocate them (native stale-local family). The map is
     // built first so only the carrier needs a pin across it.
     let tabular_type_pin = tabular_type.map(|o| ctx.pin_native_root(o));
-    let map = build_string_keyed_map(ctx, &[]);
-    let map_pin = ctx.pin_native_root(map?);
+    let map = build_string_keyed_map(ctx, &[])?;
+    let map_pin = ctx.pin_native_root(map);
     let obj = try_alloc_concurrent_synthetic(ctx, "javax/management/openmbean/TabularDataSupport", 4)?;
-    let map = ctx.read_native_pin(map_pin, map?);
+    let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field_by_name(obj, CONTENTS_FIELD, Value::Object(Some(map)));
     let tabular_type = match (tabular_type_pin, tabular_type) {
         (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),

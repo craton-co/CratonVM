@@ -33278,11 +33278,11 @@ fn native_charset_available_charsets(
     )?;
     let map_pin = ctx.pin_native_root(map);
     for name in charsets {
-        let value = charset_alloc(ctx, name);
-        let value_pin = ctx.pin_native_root(value?);
+        let value = charset_alloc(ctx, name)?;
+        let value_pin = ctx.pin_native_root(value);
         let key = ctx.create_string(name);
         let map = ctx.read_native_pin(map_pin, map);
-        let value = ctx.read_native_pin(value_pin, value?);
+        let value = ctx.read_native_pin(value_pin, value);
         cratonvm_native_collections::native_map_put_pub(
             ctx,
             &[

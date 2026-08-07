@@ -2261,9 +2261,9 @@ fn getinstance_get_service_provider(
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     let provider = read_arg_string(ctx, args, 2);
-    match resolve_service(ctx, &provider, &type_str, &algo) {
-        Ok(Some(svc)) => Ok(Some(Value::Object(Some(svc)))),
-        Ok(None) => Err(cratonvm_types::error::RuntimeError::NotImplemented {
+    match resolve_service(ctx, &provider, &type_str, &algo)? {
+        Some(svc) => Ok(Some(Value::Object(Some(svc)))),
+        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
             feature: format!(
                 "no {type_str} {algo} implementation registered for provider {provider}"
             ),
@@ -2789,9 +2789,9 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ProviderArgWording::Shared,
         ));
     }
-    match build_jca_instance(ctx, &provider, &type_str, &algo) {
-        Ok(Some(r)) => r,
-        Ok(None) => Err(throw_no_such_algorithm(
+    match build_jca_instance(ctx, &provider, &type_str, &algo)? {
+        Some(r) => r,
+        None => Err(throw_no_such_algorithm(
             ctx,
             // Real `GetInstance.getInstance` reports
             // "no such algorithm: <algo> for provider <p>"; the engine type is
@@ -2814,9 +2814,9 @@ fn getinstance_instance_provider_obj(
             .unwrap_or_default(),
         _ => String::new(),
     };
-    match build_jca_instance(ctx, &provider, &type_str, &algo) {
-        Ok(Some(r)) => r,
-        Ok(None) => Err(throw_no_such_algorithm(
+    match build_jca_instance(ctx, &provider, &type_str, &algo)? {
+        Some(r) => r,
+        None => Err(throw_no_such_algorithm(
             ctx,
             &format!("no {type_str} {algo} implementation for provider {provider}"),
         )),

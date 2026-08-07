@@ -976,9 +976,9 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                     }
                     None => Value::Object(None),
                 }),
-            };
+            }?;
             let owner_pin = match owner_val {
-                Ok(Value::Object(Some(owner))) => Some(ctx.pin_native_root(owner)),
+                Value::Object(Some(owner)) => Some(ctx.pin_native_root(owner)),
                 _ => None,
             };
             args = ctx.read_native_pin(args_pin, args);
@@ -986,11 +986,11 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             let nfields = ctx.class_num_total_fields(pti_cid).max(3);
             let pti = ctx.alloc_object(pti_cid, nfields);
             let owner_val = match (owner_val, owner_pin) {
-                (Ok(Value::Object(Some(owner))), Some(pin)) => {
+                (Value::Object(Some(owner)), Some(pin)) => {
                     Value::Object(Some(ctx.read_native_pin(pin, owner)))
                 }
                 _ => owner_val,
-            }?;
+            };
             ctx.set_field_by_name(pti, "rawType", Value::Object(Some(raw_mirror)));
             ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
             ctx.set_field_by_name(pti, "ownerType", owner_val);
@@ -1023,17 +1023,17 @@ fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Va
             // (`object_class_mirror` can allocate a lazily-created mirror),
             // so it sits unrooted in a Rust local across that call. Pin it
             // immediately and re-read the forwarded reference before use.
-            let b = typesig_to_real_type(ctx, sig);
+            let b = typesig_to_real_type(ctx, sig)?;
             let b_pin = match b {
-                Ok(Value::Object(Some(r))) => Some(ctx.pin_native_root(r)),
+                Value::Object(Some(r)) => Some(ctx.pin_native_root(r)),
                 _ => None,
             };
             let obj = object_class_mirror(ctx);
             let b = match (b, b_pin) {
-                (Ok(Value::Object(Some(r))), Some(pin)) => {
+                (Value::Object(Some(r)), Some(pin)) => {
                     Value::Object(Some(ctx.read_native_pin(pin, r)))
                 }
-                _ => b?,
+                _ => b,
             };
             Ok(real_wildcard_type(ctx, vec![obj], vec![b]))
         }

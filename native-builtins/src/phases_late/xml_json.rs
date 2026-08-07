@@ -3188,9 +3188,9 @@ pub(crate) fn json_str_to_value_depth(
             } else if val_str.starts_with("{") {
                 // Nested object — depth-limited deserialization
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
-                    match reflection_deserialize_from_json_depth(ctx, val_str, cid, depth + 1) {
-                        Ok(Some(nested)) => Ok(Value::Object(Some(nested))),
-                        Ok(None) => Ok(Value::Object(None)),
+                    match reflection_deserialize_from_json_depth(ctx, val_str, cid, depth + 1)? {
+                        Some(nested) => Ok(Value::Object(Some(nested))),
+                        None => Ok(Value::Object(None)),
                     }
                 } else {
                     Ok(Value::Object(None))

@@ -5346,12 +5346,12 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         mhp,
         "wrapperInstanceTarget",
         "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| match mhp_wrapper_handle(ctx, args) {
+        |ctx, args| match mhp_wrapper_handle(ctx, args)? {
             // Real JDK throws IllegalArgumentException for a non-wrapper; we
             // keep the historical null there so an existing caller that never
             // checked `isWrapperInstance` first does not start throwing.
-            Ok(Some(mh)) => Ok(Some(Value::Object(Some(mh)))),
-            Ok(None) => Ok(Some(Value::Object(None))),
+            Some(mh) => Ok(Some(Value::Object(Some(mh)))),
+            None => Ok(Some(Value::Object(None))),
         },
     );
     // `wrapperInstanceType` is deliberately NOT registered. The registration

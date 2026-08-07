@@ -2321,8 +2321,8 @@ pub(crate) fn native_attrs_put_value(
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_for_value(ctx, key);
-    let map_key_pin = ctx.pin_native_root(map_key?);
+    let map_key = native_attrs_key_for_value(ctx, key)?;
+    let map_key_pin = ctx.pin_native_root(map_key);
     let value = match value_pin {
         Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
             value_pin,
@@ -2334,7 +2334,7 @@ pub(crate) fn native_attrs_put_value(
         None => value,
     };
     let map = ctx.read_native_pin(map_pin, map);
-    let map_key = ctx.read_native_pin(map_key_pin, map_key?);
+    let map_key = ctx.read_native_pin(map_key_pin, map_key);
     let result = cratonvm_native_collections::native_map_put_pub(
         ctx,
         &[
@@ -2368,10 +2368,10 @@ pub(crate) fn native_attrs_get_value(
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_for_value(ctx, key);
-    let map_key_pin = ctx.pin_native_root(map_key?);
+    let map_key = native_attrs_key_for_value(ctx, key)?;
+    let map_key_pin = ctx.pin_native_root(map_key);
     let map = ctx.read_native_pin(map_pin, map);
-    let map_key = ctx.read_native_pin(map_key_pin, map_key?);
+    let map_key = ctx.read_native_pin(map_key_pin, map_key);
     let result = cratonvm_native_collections::native_map_get_pub(
         ctx,
         &[Value::Object(Some(map)), Value::Object(Some(map_key))],

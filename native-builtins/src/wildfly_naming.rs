@@ -1574,16 +1574,16 @@ fn native_context_names_bind_info_for(
     let obj_pin = ctx.pin_native_root(obj);
     // Mirror ContextNames$BindInfo's real field layout exactly: parent
     // ServiceName, binder ServiceName, bindName String, absolute name String.
-    let parent_obj = alloc_java_service_name(ctx, &info.parent_context_service_name);
-    let parent_pin = ctx.pin_native_root(parent_obj?);
-    let binder_obj = alloc_java_service_name(ctx, &info.binder_service_name);
-    let binder_pin = ctx.pin_native_root(binder_obj?);
+    let parent_obj = alloc_java_service_name(ctx, &info.parent_context_service_name)?;
+    let parent_pin = ctx.pin_native_root(parent_obj);
+    let binder_obj = alloc_java_service_name(ctx, &info.binder_service_name)?;
+    let binder_pin = ctx.pin_native_root(binder_obj);
     let bind_name_s = ctx.create_string(info.binding_name.as_ref());
     let bind_name_pin = ctx.pin_native_root(bind_name_s);
     let absolute_s = ctx.create_string(info.absolute_name.as_ref());
     let obj = ctx.read_native_pin(obj_pin, obj);
-    let parent_obj = ctx.read_native_pin(parent_pin, parent_obj?);
-    let binder_obj = ctx.read_native_pin(binder_pin, binder_obj?);
+    let parent_obj = ctx.read_native_pin(parent_pin, parent_obj);
+    let binder_obj = ctx.read_native_pin(binder_pin, binder_obj);
     let bind_name_s = ctx.read_native_pin(bind_name_pin, bind_name_s);
     ctx.set_field_by_name(obj, BIND_INFO_FIELD_PARENT, Value::Object(Some(parent_obj)));
     ctx.set_field_by_name(obj, BIND_INFO_FIELD_BINDER, Value::Object(Some(binder_obj)));

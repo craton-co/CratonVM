@@ -5788,9 +5788,9 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ok = match rwl_parent_addr(ctx, this) {
-            Ok(Some(a)) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
-            Ok(None) => false,
+        let ok = match rwl_parent_addr(ctx, this)? {
+            Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
+            None => false,
         };
         Ok(Some(Value::Int(i32::from(ok))))
     });
@@ -5806,9 +5806,9 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let ok = match rwl_parent_addr(ctx, this) {
-                Ok(Some(a)) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
-                Ok(None) => false,
+            let ok = match rwl_parent_addr(ctx, this)? {
+                Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
+                None => false,
             };
             Ok(Some(Value::Int(i32::from(ok))))
         },
@@ -5866,9 +5866,9 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ok = match rwl_parent_addr(ctx, this) {
-            Ok(Some(a)) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
-            Ok(None) => false,
+        let ok = match rwl_parent_addr(ctx, this)? {
+            Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
+            None => false,
         };
         Ok(Some(Value::Int(i32::from(ok))))
     });
@@ -5881,9 +5881,9 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let ok = match rwl_parent_addr(ctx, this) {
-                Ok(Some(a)) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
-                Ok(None) => false,
+            let ok = match rwl_parent_addr(ctx, this)? {
+                Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
+                None => false,
             };
             Ok(Some(Value::Int(i32::from(ok))))
         },
@@ -5906,9 +5906,9 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let held = match rwl_parent_addr(ctx, this) {
-            Ok(Some(a)) => crate::stamped_lock::rw_write_is_held(a, ctx.thread_id()),
-            Ok(None) => false,
+        let held = match rwl_parent_addr(ctx, this)? {
+            Some(a) => crate::stamped_lock::rw_write_is_held(a, ctx.thread_id()),
+            None => false,
         };
         Ok(Some(Value::Int(i32::from(held))))
     });
@@ -6231,9 +6231,9 @@ fn native_stamped_read_view_unlock(
 }
 
 fn native_stamped_optimistic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
+    let addr = match stamped_addr(ctx, args)? {
+        Some(a) => a,
+        None => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
     };
     Ok(Some(Value::Long(
         crate::stamped_lock::stamped_try_optimistic_read(addr),
@@ -6245,9 +6245,9 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Long(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let addr = match stamped_addr(ctx, args) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(Some(Value::Int(0))),
+    let addr = match stamped_addr(ctx, args)? {
+        Some(a) => a,
+        None => return Ok(Some(Value::Int(0))),
     };
     let valid = crate::stamped_lock::stamped_validate(addr, stamp);
     Ok(Some(Value::Int(i32::from(valid))))
@@ -6518,9 +6518,9 @@ fn native_stamped_try_write_lock_timed(
 }
 
 fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(Some(Value::Int(0))),
+    let addr = match stamped_addr(ctx, args)? {
+        Some(a) => a,
+        None => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(i32::from(
         crate::stamped_lock::stamped_is_locked(addr),
@@ -6528,9 +6528,9 @@ fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(Some(Value::Int(0))),
+    let addr = match stamped_addr(ctx, args)? {
+        Some(a) => a,
+        None => return Ok(Some(Value::Int(0))),
     };
     let held = crate::stamped_lock::stamped_is_write_locked(addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
@@ -6540,9 +6540,9 @@ fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(Some(Value::Int(0))),
+    let addr = match stamped_addr(ctx, args)? {
+        Some(a) => a,
+        None => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(i32::from(
         crate::stamped_lock::stamped_is_read_locked(addr),
@@ -6553,9 +6553,9 @@ fn native_stamped_get_read_lock_count(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
-        Ok(Some(a)) => a,
-        Ok(None) => return Ok(Some(Value::Int(0))),
+    let addr = match stamped_addr(ctx, args)? {
+        Some(a) => a,
+        None => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(
         crate::stamped_lock::stamped_get_read_lock_count(addr),

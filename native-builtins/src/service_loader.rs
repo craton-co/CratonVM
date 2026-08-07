@@ -402,13 +402,13 @@ fn impl_jars_load_class_inner(
         // that exact instance. Creating a fresh EmbeddedImplClassLoader here
         // would split the provider and its dependencies across two namespaces.
         if module_name == "x-content" && defining_loader.is_none() {
-            let app_loader = crate::classloader::get_or_create_app_loader(ctx);
+            let app_loader = crate::classloader::get_or_create_app_loader(ctx)?;
             // GC-safety: `create_string` below can trigger a moving GC;
             // `app_loader` (the shared application-classloader singleton) is
             // reused as an `invoke` argument afterward, unpinned otherwise.
-            let app_loader_pin = ctx.pin_native_root(app_loader?);
+            let app_loader_pin = ctx.pin_native_root(app_loader);
             let module_name_obj = ctx.create_string(&module_name);
-            let app_loader = ctx.read_native_pin(app_loader_pin, app_loader?);
+            let app_loader = ctx.read_native_pin(app_loader_pin, app_loader);
             ctx.unpin_native_roots(app_loader_pin);
             if let Ok(Some(Value::Object(Some(loader)))) = ctx.invoke(
                 "org/elasticsearch/core/internal/provider/EmbeddedImplClassLoader",

@@ -18989,8 +18989,8 @@ fn make_annotated_type_with_anns(
     let backing_pin = ctx.pin_native_root(backing_type);
     // Build the proxy array first (it allocates) before we allocate the
     // AnnotatedType object, mirroring the GC-ordering used elsewhere.
-    let ann_arr = build_annotation_array_for(ctx, declaring_class_id, anns);
-    let ann_pin = ctx.pin_native_root(ann_arr?);
+    let ann_arr = build_annotation_array_for(ctx, declaring_class_id, anns)?;
+    let ann_pin = ctx.pin_native_root(ann_arr);
     let backing_type = ctx.read_native_pin(backing_pin, backing_type);
 
     // Select the real-JDK impl class matching the backing Type's kind (see
@@ -19007,7 +19007,7 @@ fn make_annotated_type_with_anns(
     let obj = ctx.alloc_object(cid, num_fields);
     let obj_pin = ctx.pin_native_root(obj);
     let backing_type = ctx.read_native_pin(backing_pin, backing_type);
-    let ann_arr = ctx.read_native_pin(ann_pin, ann_arr?);
+    let ann_arr = ctx.read_native_pin(ann_pin, ann_arr);
     let obj = ctx.read_native_pin(obj_pin, obj);
 
     ctx.set_field_by_name(obj, "type", Value::Object(Some(backing_type)));

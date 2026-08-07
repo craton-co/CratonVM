@@ -1629,10 +1629,10 @@ fn native_service_controller_provides(
     let set_pin = ctx.pin_native_root(set);
     let mut set_cur = set;
     for name in names {
-        let name_obj = alloc_java_service_name(ctx, &name);
-        let name_pin = ctx.pin_native_root(name_obj?);
+        let name_obj = alloc_java_service_name(ctx, &name)?;
+        let name_pin = ctx.pin_native_root(name_obj);
         set_cur = ctx.read_native_pin(set_pin, set_cur);
-        let name_obj = ctx.read_native_pin(name_pin, name_obj?);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
         ctx.unpin_native_roots(name_pin);
         let _ = ctx.invoke_virtual(
             set_cur,
@@ -2885,10 +2885,10 @@ fn native_service_registry_get_service_names(
     };
     let list_pin = ctx.pin_native_root(list);
     for name in names {
-        let name_obj = alloc_java_service_name(ctx, &name);
-        let name_pin = ctx.pin_native_root(name_obj?);
+        let name_obj = alloc_java_service_name(ctx, &name)?;
+        let name_pin = ctx.pin_native_root(name_obj);
         let list = ctx.read_native_pin(list_pin, list);
-        let name_obj = ctx.read_native_pin(name_pin, name_obj?);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
         let result = ctx.invoke_virtual(
             list,
             "add",
@@ -3292,8 +3292,8 @@ fn drive_starts(
         // the current Java frame. Keep it rooted across StartContext creation
         // and dependency injection: both paths can invoke Java and move it.
         let svc_pin = ctx.pin_native_root(svc);
-        let sctx = build_start_context(ctx, id);
-        let sctx_pin = ctx.pin_native_root(sctx?);
+        let sctx = build_start_context(ctx, id)?;
+        let sctx_pin = ctx.pin_native_root(sctx);
         {
             let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
             map.entry(id).or_default().start_began = Some(std::time::Instant::now());
@@ -3309,7 +3309,7 @@ fn drive_starts(
         let res = match inject_dependency_values(ctx, id) {
             Ok(()) => {
                 let svc = ctx.read_native_pin(svc_pin, svc);
-                let sctx = ctx.read_native_pin(sctx_pin, sctx?);
+                let sctx = ctx.read_native_pin(sctx_pin, sctx);
                 ctx.invoke_virtual(
                     svc,
                     "start",

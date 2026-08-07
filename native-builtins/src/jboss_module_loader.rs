@@ -1264,14 +1264,14 @@ pub(crate) fn native_loader_load_module(
 
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    let module = build_module_object(ctx, &name, this, &resolved);
+    let module = build_module_object(ctx, &name, this, &resolved)?;
     // GC-safety: several calls further down this function (notably the
     // RKC19/WF39 brute-force block's `ensure_class_initialized` pre-warm loop,
     // gated on `is_brute_force_trigger` -- exactly the WildFly bootstrap
     // module path, e.g. `org.jboss.as.standalone`) can trigger a moving GC
     // before `module` is used again at `register_var_handle_root`/cache
     // insertion below.
-    let module_pin = ctx.pin_native_root(module?);
+    let module_pin = ctx.pin_native_root(module);
 
     // Stash the resolved module so the dependency-closure walker (used by
     // ModuleClassLoader.loadClass / getResource) can re-traverse without
@@ -1507,7 +1507,7 @@ pub(crate) fn native_loader_load_module(
     // Keep the Module alive + registry-remapped across GC moves
     // (VarHandle-root pattern, per cache entry); key computed on the
     // just-registered address, no allocation in between.
-    let module = ctx.read_native_pin(module_pin, module?);
+    let module = ctx.read_native_pin(module_pin, module);
     ctx.unpin_native_roots(module_pin);
     ctx.register_var_handle_root(module);
     let mkey = ctx.identity_hash_code(module);
