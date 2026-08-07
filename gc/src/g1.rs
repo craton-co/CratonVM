@@ -240,6 +240,15 @@ pub fn evacuation_refs_rejected() -> usize {
 /// header did not look like a live object. Expected to be ZERO.
 pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
 
+/// How many times the RSet source-region LINEAR walk found bytes that are not
+/// an object header where the next object should start, i.e. how many times a
+/// source region's object grid did not describe its contents.
+///
+/// Expected to be ZERO. Non-zero means the region was recycled or rewritten
+/// between the remembered-set edge being recorded and this pause walking it —
+/// which, before the check, became a wild read off the end of the region.
+pub static EVAC_SOURCE_WALK_DESYNC: AtomicUsize = AtomicUsize::new(0);
+
 /// How many holders' element walks were clamped to their region's extent —
 /// i.e. how many headers claimed more reference slots than could physically be
 /// there. Expected to be ZERO.
@@ -251,6 +260,11 @@ pub fn evacuation_holder_counts() -> (usize, usize) {
         EVAC_HOLDER_REJECTED.load(Ordering::Relaxed),
         EVAC_HOLDER_CLAMPED.load(Ordering::Relaxed),
     )
+}
+
+/// The value of [`EVAC_SOURCE_WALK_DESYNC`].
+pub fn evacuation_source_walk_desyncs() -> usize {
+    EVAC_SOURCE_WALK_DESYNC.load(Ordering::Relaxed)
 }
 
 // ===========================================================================
@@ -4190,6 +4204,7 @@ impl G1Collector {
     fn evacuation_candidate_is_an_object(
         &self,
         regions: &[G1Region],
+        site: &'static str,
         holder: *mut u8,
         slot: usize,
         raw: usize,
@@ -4209,7 +4224,7 @@ impl G1Collector {
                 (h.class_id.as_u32(), h.kind())
             };
             tracing::warn!(
-                "[g1] evacuation ref-scan REJECTED a non-object candidate (#{n}):                  holder=0x{:x} class_id={holder_class} kind={holder_kind:?} slot={slot}                  candidate=0x{raw:x} — the word is inside the region span but is not a live                  object header, so evacuating it would have dereferenced it. The slot is left                  unchanged and the pause continues.",
+                "[g1] {site}: REJECTED a non-object candidate (#{n}): holder=0x{:x} class_id={holder_class} kind={holder_kind:?} slot={slot} candidate=0x{raw:x} — the word is inside the region span but is not a live object header, so evacuating it would have dereferenced it. The slot is left unchanged and the pause continues.",
                 holder as usize,
             );
         }
@@ -4370,6 +4385,7 @@ impl G1Collector {
                     if raw != 0
                         && self.evacuation_candidate_is_an_object(
                             regions,
+                            "worklist-scan[array]",
                             obj_ptr,
                             i,
                             raw as usize,
@@ -4420,7 +4436,13 @@ impl G1Collector {
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
-                if !self.evacuation_candidate_is_an_object(regions, obj_ptr, raw, raw) {
+                if !self.evacuation_candidate_is_an_object(
+                    regions,
+                    "worklist-scan[object]",
+                    obj_ptr,
+                    raw,
+                    raw,
+                ) {
                     return;
                 }
                 let ref_ptr = raw as *mut u8;
@@ -4502,6 +4524,30 @@ impl G1Collector {
                 offset += gap;
                 continue;
             }
+            // The walk derives every step from bytes it has not validated.
+            // Its only rejection below is an implausible SIZE, and a ZEROED
+            // header passes that: `class_id=0`, `num_slots=0`, `kind=Object`
+            // gives exactly `HEADER_SIZE`. So a source region whose object grid
+            // no longer describes its contents is walked 16 bytes at a time
+            // through reclaimed memory until some stale bytes decode as an
+            // array with a large length — and the element loop below then reads
+            // off the end of the region. Validate first, and BREAK: a
+            // desynchronized linear walk cannot resynchronize, and continuing
+            // is what turns it into a wild read.
+            if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
+                let n = EVAC_SOURCE_WALK_DESYNC.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 8 || n.is_power_of_two() {
+                    let r = &regions[source_idx];
+                    tracing::warn!(
+                        "[g1] rset-source walk DESYNCED (#{n}): region={source_idx} type={:?} reuse_epoch={} recycled_in_generation={} offset={offset:#x} cursor={cursor:#x} obj=0x{:x} — the bytes there are not an object header, so this region's object grid does not describe its contents. Abandoning the walk; the pause continues.",
+                        r.region_type,
+                        r.reuse_epoch,
+                        r.recycled_in_generation,
+                        obj_ptr as usize,
+                    );
+                }
+                break;
+            }
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
             // Round-9 gc CRIT-1: humongous continuation filler covers the
             // entire region; skip without trying to follow any oops.
@@ -4526,10 +4572,21 @@ impl G1Collector {
             // scan_and_evacuate_refs helper).
             if header.kind() == ObjectKind::Array {
                 if header.element_type() == ArrayElementType::Reference {
-                    for i in 0..header.array_length() as usize {
+                    let declared = header.array_length() as usize;
+                    let len = self.holder_walkable_slots(regions, obj_ptr, declared);
+                    for i in 0..len {
                         let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                         let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                         if raw == 0 {
+                            continue;
+                        }
+                        if !self.evacuation_candidate_is_an_object(
+                            regions,
+                            "rset-source-scan[array]",
+                            obj_ptr,
+                            i,
+                            raw as usize,
+                        ) {
                             continue;
                         }
                         let ref_ptr = raw as usize as *mut u8;
@@ -4558,6 +4615,15 @@ impl G1Collector {
                 }
             } else {
                 for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                    if !self.evacuation_candidate_is_an_object(
+                        regions,
+                        "rset-source-scan[object]",
+                        obj_ptr,
+                        raw,
+                        raw,
+                    ) {
+                        return;
+                    }
                     let ref_ptr = raw as *mut u8;
                     if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
                         if cset.contains(&ridx) {
@@ -6986,8 +7052,8 @@ impl G1Collector {
         let rejected = evacuation_refs_rejected();
         let (holder_rejected, holder_clamped) = evacuation_holder_counts();
         eprintln!(
-            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} \
-             evac_holder_clamped={holder_clamped}"
+            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} evac_holder_clamped={holder_clamped} source_walk_desync={}",
+            evacuation_source_walk_desyncs(),
         );
         let Some(s) = self.pause_summary() else {
             return;
