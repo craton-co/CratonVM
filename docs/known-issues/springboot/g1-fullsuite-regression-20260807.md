@@ -23,7 +23,7 @@ EMPTY and BOTH-FAIL are identical on both arms, as expected (neither should
 be collector-sensitive). Only **14 classes changed status** — far fewer than
 ZGC-real's 50, consistent with G1 being "wired into the safepoint driver"
 (the more mature of the two non-default backends per
-`vm-cli/src/main.rs`'s own selector comment) rather than ZGC-real's
+`../../../vm-cli/src/main.rs`'s own selector comment) rather than ZGC-real's
 documented "non-moving, whole-heap stop-the-world... research vehicle"
 status.
 
@@ -89,7 +89,7 @@ Log:
 
 **This is very likely the same general defect family as an already-FIXED
 bug, but not the same fixed site.**
-[`gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`](../internal/fixed-suite-bugs/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md)
+[`gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`](../../internal/fixed-suite-bugs/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md)
 closed an unregistered-JIT-frame root-coverage gap for the Generational
 collector's moving young-gen (a frame invoked without a `JitEntryGuard`
 gets missed by `gc_quiescence`, so the collector relocates instead of

@@ -1718,7 +1718,7 @@ impl JniGlobalRefs {
     }
 
     /// Apply a GC pointer map: update all stored ObjectRefs to their new addresses.
-    pub fn update_after_gc(&mut self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    pub fn update_after_gc(&mut self, pointer_map: &cratonvm_types::PointerMap) {
         for &raw in &self.entries {
             // Safety: raw is a valid Box<ObjectRef> pointer that we own.
             let slot = raw as *mut ObjectRef;
@@ -1861,7 +1861,7 @@ pub fn collect_local_ref_roots(out: &mut Vec<ObjectRef>) {
 /// overwrite it with the relocated address so the native code's local jobject
 /// continues to resolve to the live object. Must be called on each thread that
 /// may hold local refs, after the heap has been compacted.
-pub fn update_local_refs_after_gc(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn update_local_refs_after_gc(pointer_map: &cratonvm_types::PointerMap) {
     JNI_LOCAL_FRAMES.with(|f| {
         for frame in f.borrow_mut().iter_mut() {
             for handle in frame.iter_mut() {
@@ -7963,7 +7963,7 @@ mod tests {
             "idle foreign thread must be excluded from the STW expected-set"
         );
         shared.mem.gc_barrier.wait_for_all(); // returns immediately — no deadlock
-        shared.mem.gc_barrier.complete_gc(HashMap::new());
+        shared.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
 
         // Teardown mirrors detach: mark dead, leave the region, reclaim.
         let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
@@ -8099,7 +8099,7 @@ mod tests {
             "in-native thread must be excluded from the STW expected-set"
         );
         shared.mem.gc_barrier.wait_for_all();
-        shared.mem.gc_barrier.complete_gc(HashMap::new());
+        shared.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
 
         assert!(host_thread_leave_native());
         // Same re-check as the twin below: a republish mid-body sends the
@@ -8193,7 +8193,7 @@ mod tests {
              never arrive to fill",
         );
         shared.mem.gc_barrier.wait_for_all(); // returns immediately — no hang
-        shared.mem.gc_barrier.complete_gc(HashMap::new());
+        shared.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
 
         assert!(host_thread_leave_native());
         // Re-checked, not assumed: the cell can be republished at any point in
@@ -8930,7 +8930,7 @@ mod tests {
         // Simulate GC moving the object to a new address.
         let old_addr = obj.as_ptr() as usize;
         let fake_new_addr = old_addr.wrapping_add(0x100); // pretend GC moved it
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, fake_new_addr);
         refs.update_after_gc(&pointer_map);
         // The handle must now resolve to the new address.
@@ -9111,7 +9111,7 @@ mod tests {
         let old_addr = obj.as_ptr() as usize;
         // Simulate GC moving the object to a new address.
         let new_addr = old_addr.wrapping_add(0x1000);
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         refs.update_after_gc(&pointer_map);
         let resolved = refs.resolve(handle).expect("handle should still resolve");
@@ -9164,7 +9164,7 @@ mod tests {
         let old_addr: JObject = 0x4_0000;
         track_local_ref(old_addr);
         let new_addr = (old_addr as usize).wrapping_add(0x1000);
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr as usize, new_addr);
 
         update_local_refs_after_gc(&pointer_map);

@@ -905,34 +905,6 @@ impl Compiler {
         // The mark-word zeroing below subsumes it: a plain object wants
         // kind=Object(0) and element_type=Reference(0), so the quartet bits it
         // needs are all zero anyway.
-        if !zero_elision {
-            // The mark word, NOT the identity hash. That field left the header
-            // on 2026-08-07 and its dword at offset 8 is now `shape` — this
-            // store used to write a 0 there, which after the move would have
-            // been a zero written over the field count (harmless only by the
-            // accident that the `shape` store below happens to come second).
-            //
-            // Zeroing the mark word matters far more than zeroing the hash ever
-            // did, and for the reason stated directly above: "TLAB refill zeroes
-            // the region" was EMPIRICALLY VIOLATED here (`kind=Object &&
-            // array_length=0x01010101` on freshly bumped slots). A garbage
-            // identity hash was a wrong number. A garbage mark word is a bogus
-            // lock state — `0x01010101…` has tag `0b01`, so the object reads as
-            // THIN_LOCKED by a thread that does not exist; other tag values
-            // hand `inflated_monitor()` a wild pointer or make a live object
-            // claim it has been forwarded. `MARK_NEUTRAL` is 0, so two dword
-            // stores establish it.
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                cratonvm_types::MARK_WORD_OFFSET as i32,
-                0,
-            );
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
-                0,
-            );
-        }
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
@@ -957,24 +929,38 @@ impl Compiler {
             // zeroing below, which would otherwise erase it.
             compact_flag_pending = true;
         }
-        // The opt-out also retains the older defensive mark_word stores. The
-        // default path gets their required zero values from the refill
-        // invariant; the field is not subsequently published with a non-zero
-        // initialization value.
+        // UNCONDITIONAL, and `zero_elision` must never gate it again.
         //
-        // The two `forwarding_ptr` stores that used to lead this block are gone
-        // with the field itself (the 32 -> 24 header shrink). Zeroing the mark
-        // word is now doing BOTH jobs — `MARK_NEUTRAL` is 0 and so is
-        // "not forwarded" — which is why this block still covers 8 bytes and
-        // not 16.
-        if !zero_elision {
-            self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
-                0,
-            );
-        }
+        // This was `if !zero_elision` for one release and it broke the Spring
+        // Boot suite outright: 178 of the first 184 classes died in JUnit
+        // discovery with `gen_heap::read_slot: corrupt Value cell`.
+        //
+        // The reason is that the mark word stopped being defensive padding and
+        // became CONTENT. It carries `kind`, `element_type`, `gc_age` and
+        // `gc_flags` in bits 48..62 as of the 24 -> 16 shrink. Skipping the
+        // write leaves an object wearing whatever the TLAB slot happened to
+        // hold: a stale `GC_FLAG_COMPACT` makes every accessor read a legacy
+        // tagged-`Value` object as bare compact pointers -- which is exactly
+        // what that diagnostic reports -- and a stale `kind` turns an object
+        // into an array or a region sentinel mid-walk.
+        //
+        // `zero_elision` is default-ON (opt-out only), so this was not a corner
+        // case; it was every JIT-inline allocation in the process.
+        //
+        // The dword store this replaced -- `kind`/`element_type`/`gc_age`/
+        // `gc_flags` at offset 4 -- was itself unconditional, and for exactly
+        // this reason. The comment above it already said why: "the historical
+        // assumption 'TLAB refill zeroes the region' was empirically violated
+        // on long runs". Moving those four bytes into the mark word did not
+        // move that argument with them; folding the write into the elision
+        // branch silently dropped it. Two dwords per `new` is the same price
+        // that comment already judged negligible.
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            0,
+        );
 
         // AFTER the mark-word zeroing, which would otherwise erase it.
         if compact_flag_pending {

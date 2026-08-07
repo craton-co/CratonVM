@@ -2164,7 +2164,7 @@ impl MonitorTable {
     ///   `gc/src/gen_heap.rs` — left to the owner of those files. Until then a
     ///   dead object's monitor is retained by the moving collectors, which is a
     ///   bounded leak and strictly preferable to a dangling mark word.
-    pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    pub fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -2268,7 +2268,7 @@ impl Default for MonitorTable {
 }
 
 impl cratonvm_gc::MonitorCleanup for MonitorTable {
-    fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         self.remap_after_gc(pointer_map);
     }
 
@@ -2540,7 +2540,7 @@ mod tests {
             .mark_word
             .store(old_mark, Ordering::Release);
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         table.remap_after_gc(&pointer_map);
 
@@ -2567,7 +2567,7 @@ mod tests {
             .mark_word
             .store(old_mark, Ordering::Release);
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         table.remap_after_gc(&pointer_map);
 
@@ -2594,7 +2594,7 @@ mod tests {
         // whole-heap collection in which `obj` was not forwarded (= dead).
         // (An empty map early-returns; use a dummy unrelated remap so the body
         // actually runs.)
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0xdead_0000usize, 0xbeef_0000usize);
         table.remap_after_gc(&pointer_map);
 
@@ -2629,7 +2629,7 @@ mod tests {
 
         // Partial GC: pointer_map mentions some *other* object, not `obj`
         // (which survived in place). Default flag is off → must NOT reclaim.
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0xfeed_0000usize, 0xface_0000usize);
         table.remap_after_gc(&pointer_map);
 
@@ -3052,7 +3052,7 @@ mod tests {
         // Populate this OS thread's raw-pointer cache, then simulate the
         // stop-the-world re-key that a moving collection performs.
         table.with_cas_lock(old_obj, || {});
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_obj.as_ptr() as usize, new_obj.as_ptr() as usize);
         table.remap_after_gc(&pointer_map);
 
@@ -3068,7 +3068,7 @@ mod tests {
         let tid = ThreadId(1);
 
         table.enter(obj, tid);
-        let empty_map = std::collections::HashMap::new();
+        let empty_map = cratonvm_types::PointerMap::default();
         table.remap_after_gc(&empty_map);
         // Monitor should still be accessible with original address
         assert!(table.exit(obj, tid).is_ok());

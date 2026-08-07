@@ -14,6 +14,23 @@ carry it, and a thread-scaling question this host cannot answer. It is
 deliberately **not** filed as "a bug" — the previous framing ("≈100x. That is
 the bug.") pointed three sessions at a problem no single fix could match.
 
+## BLOCKED as of 2026-08-07: no file-backed H2 database opens on dev tip
+
+`FileChannel.tryLock()` returns a corrupt `fileLockTable` cell under the compact
+reference-field layout that arrived with `HEADER_SIZE 24 -> 16`, so
+`H2UpdateScaleProbe` — and every other persistent H2 shape — dies on its first
+`getConnection`. Bisected, deterministic, `--nojit`-independent, and written up
+with a twelve-line reproducer in
+`docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md`.
+
+**Every measurement dated 2026-08-07 on this page was taken with
+`CRATONVM_COMPACT_REF_FIELDS=0`**, which is a complete workaround for that bug
+but is *not* the default configuration — it turns off the field packing the
+header change exists for. Treat those numbers as valid for questions about
+dispatch, GC roots and class resolution (none of which the packing changes) and
+**re-take them once the layout defect is fixed** before comparing against
+anything measured with packing on.
+
 ## Severity
 **MEDIUM.** No incorrect behaviour, but not benign either. The class takes
 20-45 minutes of CPU where HotSpot takes 17 seconds, and H2's internal
@@ -210,6 +227,83 @@ and so are the next targets:
   `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-callee`
   — which is its own question and has its own pages.
 
+## The same profile at 1 thread, on 2026-08-07 code
+
+The table above is 25 threads on 2026-08-02 code. This is **1 thread** on
+`51d68e1b7`, `CRATONVM_COMPACT_REF_FIELDS=0`, `H2UpdateScaleProbe 1 60000
+10000` — 60 000 updates in 279 s against a 37 s setup, so steady state is ~88 %
+of the samples. `sudo perf record -F 99 -g --call-graph=dwarf`, 34 K samples,
+`--sort symbol --no-children`. (`perf_event_paranoid` is 4 on this host, so perf
+needs `sudo -n`; do not change the sysctl, it is shared.)
+
+Single-threaded on purpose: it removes contention from the picture, so the
+difference between this list and the 25-thread one *is* the contention term.
+
+| self | symbol | vs the 25t list |
+| --- | --- | --- |
+| **5.80 %** | `gen_heap::is_object_address` | 1.87 % — now the single largest symbol |
+| 3.75 % | `interpreter::execute_frame_from_index` | 3.0 % |
+| 3.26 % | `__memcmp_evex_movbe` | 2.79 % |
+| 2.62 % | `_mi_page_malloc_zero` | 5.9 % |
+| 2.29 % | `dispatch_virtual::execute_invokevirtual_cached` | 1.83 % |
+| **1.60 %** | `JitCache::invalidate_for_class` | **not on it** |
+| 1.51 % | `jit::helpers::try_jit_site_cached_native_dispatch` | not on it |
+| 1.50 % | `jit::helpers::forward_jit_reference_args` | not on it |
+| 1.49 % | `vm_exec::invoke_on_class_shared_inner` | 2.42 % |
+| 1.38 % | `InvokeCache<JitMethod>::get` | 1.45 % |
+| **1.26 %** | `field_layout::object_body_size` | **not on it** (new code) |
+| **1.26 %** | `value::record_object_ref_payload_slow` | **not on it** |
+| 1.16 % | `NativeMethodRegistry::slot_for_exact` | 2.12 % |
+| 1.12 % | `resolve_field_ref_loader_aware` | not on it |
+| 0.94 / 0.91 / 0.68 / 0.65 % | `validate_code_ptr`, `pin_jit_code_range_owner`, `JitCache::get`, `compute_jit_key_hash` | not on it |
+| **0.64 %** | `SharedVm::load_class_concurrent_for` | **1.4 %** |
+
+### What this changes about the two named next targets
+
+**`load_class_concurrent` is a lock-contention term, not a class-loading one.**
+It is 1.4 % at 25 threads and **0.64 % at 1**, on a workload whose steady state
+resolves no new classes in either shape. A cost that halves when the threads go
+away is contention on the `ClassManager` read lock in the fast path, not work
+being done. The old framing — *"nothing should be resolving classes then; find
+out what is"* — asks the wrong question: the answer is "almost nothing is, and
+the 1.4 % is 25 threads queueing to find that out." The work item is the lock,
+which is the same item the page already closed once (two `read()` guards per
+invoke down to one) and evidently not all the way.
+
+**The conservative root scan is confirmed, and bigger than it looked.**
+`is_object_address` alone is 5.80 % single-threaded, above the whole
+GC-root cluster's 6.6 % at 25 threads. This one does not need contention to be
+expensive, and it is the clearest single target on the list.
+
+**Three clusters on this list are not on the old one at all**, which is what a
+five-day-old profile of a moving codebase is worth:
+
+* **JIT bookkeeping, ~5.4 %** — `invalidate_for_class` 1.60 %,
+  `try_jit_site_cached_native_dispatch` 1.51 %, `forward_jit_reference_args`
+  1.50 %, plus `validate_code_ptr` / `pin_jit_code_range_owner` /
+  `JitCache::get` / `compute_jit_key_hash` at ~3.2 % between them. On a
+  single-threaded run that is already past warm-up, `invalidate_for_class` at
+  1.6 % deserves its own look: something is invalidating compiled code in steady
+  state.
+* **Layout computation, 1.26 %** — `object_body_size` is new code from the
+  header change and is being called on a hot path.
+* **`record_object_ref_payload_slow`, 1.26 %** — a `_slow` suffix at over 1 %
+  is usually a fast path that stopped being taken.
+
+Same caveat as the old list, and it is the whole reason this page exists:
+**that is ~30 % of the profile and removing all of it is under 1.5x, against
+~10x.** These are targets, not a bug list.
+
+### Methodology: do not trust the caller graphs on this binary
+
+`--call-graph=dwarf` unwinds this build badly enough to be misleading, not just
+incomplete. Asking for the callers of `JitCache::invalidate_for_class` returns
+it *underneath* `RawVecInner::finish_grow` underneath `pin_native_root` — an
+incoherent chain, produced by unwinding through deeply inlined Rust. The flat
+self-attribution above needs no unwinding and is sound; every caller-side claim
+from this data set was discarded. If a caller question has to be answered, it
+needs an in-VM counter, not perf.
+
 ## Setup cost
 
 10 000 `MERGE` + VM start + H2 class load, single-threaded: HotSpot **2.2-3.0
@@ -267,6 +361,12 @@ to add after the old page's 4-thread arm turned out to be unresolvable.
 6. **Interleave the 0-update baseline as an ordinary arm**, and pair the arms
    within a rep. Taken once up front, the baseline carries that minute's load
    into every number derived from it.
+7. **Trust `perf`'s flat self-attribution here; do not trust its call graphs.**
+   See the methodology note above — dwarf unwinding through this binary's
+   inlining produces chains that are wrong, not merely shallow.
+8. **Measure single-threaded too.** One thread costs nothing extra to run and
+   splits every symbol into a work term and a contention term. That split is
+   what reclassified `load_class_concurrent` on this page.
 
 ## Reproducing
 
