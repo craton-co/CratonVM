@@ -2446,12 +2446,7 @@ fn report_maps_neighborhood(addr: u64) {
     const LBL_MAPPED: &[u8] = b"#  maps: fault pc IS MAPPED - perms are on the `here` line\n";
     const LBL_GAP: &[u8] = b"#  maps: fault pc is NOT MAPPED - it is the hole between these two\n";
     const LBL_ABOVE: &[u8] = b"#  maps: fault pc is NOT MAPPED - above the last mapping\n";
-    let fd = unsafe {
-        libc::open(
-            b"/proc/self/maps\0".as_ptr() as *const libc::c_char,
-            libc::O_RDONLY,
-        )
-    };
+    let fd = unsafe { libc::open(c"/proc/self/maps".as_ptr(), libc::O_RDONLY) };
     if fd < 0 {
         return;
     }
@@ -3016,7 +3011,7 @@ mod tests {
     #[test]
     fn dev_null_reports_even_a_bad_address_as_readable() {
         let fd = unsafe {
-            libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY)
+            libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY)
         };
         assert!(fd >= 0);
         assert!(

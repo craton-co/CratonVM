@@ -6871,6 +6871,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if let Ok(md) = std::fs::metadata(&path) {
                     let mut perms = md.permissions();
                     if perms.readonly() {
+                        // `set_readonly(false)` is right on Windows, where it
+                        // clears FILE_ATTRIBUTE_READONLY and that IS the whole
+                        // operation `allowDeleteReadOnlyFiles` asks for. On Unix
+                        // the same call writes mode 0o666 — it grants write to
+                        // group and other as well, which is a permission
+                        // widening nobody asked for (clippy::
+                        // permissions_set_readonly_false). Restore the owner
+                        // write bit only; that is the Unix reading of "make it
+                        // writable again", and deletion there depends on the
+                        // DIRECTORY's mode anyway.
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = perms.mode();
+                            perms.set_mode(mode | 0o200);
+                        }
+                        #[cfg(not(unix))]
                         perms.set_readonly(false);
                         let _ = std::fs::set_permissions(&path, perms);
                     }
@@ -16179,7 +16196,11 @@ mod named_attribute_tests {
             assert_eq!(attribute_write_kind(name), AttributeWrite::Time, "{name}");
         }
         for name in ["readonly", "hidden", "archive", "system"] {
-            assert_eq!(attribute_write_kind(name), AttributeWrite::DosFlag, "{name}");
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::DosFlag,
+                "{name}"
+            );
         }
         assert_eq!(
             attribute_write_kind("permissions"),

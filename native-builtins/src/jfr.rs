@@ -369,8 +369,7 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(obj)) => Some(*obj),
                 _ => None,
             })
-            .map(|obj| ctx.class_name_of_id(ctx.class_id_of_object(obj)))
-            .flatten()
+            .and_then(|obj| ctx.class_name_of_id(ctx.class_id_of_object(obj)))
             .unwrap_or_else(|| "jdk/jfr/Event".to_owned());
         ctx.jfr_emit_java_event(&event_class, epoch_nanos().max(0) as u64, 0);
         Ok(None)

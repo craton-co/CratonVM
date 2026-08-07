@@ -4865,7 +4865,7 @@ impl GenerationalHeap {
                         // `< a < end_a`, so a full `ObjectHeader` lies within the arena;
                         // fields are read defensively before trusting the contents.
                         let h = unsafe { &*(h_addr as *const ObjectHeader) };
-                        if ObjectHeader::kind_tag((h.mark_word.load(Ordering::Relaxed))) == 0
+                        if ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                             && h.array_length() == 0
                             && (h.num_slots() as usize) > fld
                             && h.num_slots() <= (1 << 20)
@@ -10507,8 +10507,8 @@ impl GenerationalHeap {
         // millions of entries even though nearly all of them are adjacent.
         // Keep `dead_regions` intact for the per-object diagnostics below, but
         // zero and publish only maximal contiguous spans.
-        let mut reclaimed_regions: Vec<(usize, usize)> = Vec::new();
-        reclaimed_regions.reserve(dead_regions.len().min(1024));
+        let mut reclaimed_regions: Vec<(usize, usize)> =
+            Vec::with_capacity(dead_regions.len().min(1024));
         for &(off, sz, _, _, _) in &dead_regions {
             if let Some(last) = reclaimed_regions.last_mut() {
                 let last_end = last.0 + last.1;
