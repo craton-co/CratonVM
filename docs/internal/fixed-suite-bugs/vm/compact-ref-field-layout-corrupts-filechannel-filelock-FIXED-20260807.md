@@ -38,6 +38,24 @@ the page itself records.
 `CRATONVM_COMPACT_REF_FIELDS=0` is a complete workaround for the honest reason
 that with the layout off nothing is born compact, so losing the flag is a no-op.
 
+### It does not close the whole cluster
+
+First 40 H2 suite classes, same host and cap:
+
+| build | PASS | FAIL | HANG |
+|---|---|---|---|
+| `1ec856c2c` (before the header landing) | 34 | 1 | 5 |
+| broken dev | **1** | 38 | 1 |
+| with this fix | **29** | 5 | 6 |
+
+So this was the large majority of it and every file-lock failure, but five
+classes short of the old baseline. The sibling defect on the same landing is
+GC-driven `Reference` enqueue: `probes/EnqProbe.java` shows a `WeakReference`
+whose referent is unreachable gets CLEARED but never ENQUEUED after
+`System.gc()`, byte-identically with and without this fix, where HotSpot
+enqueues it. `TestLob`, `TestMemoryUsage` and `TestLIRSMemoryConsumption` are
+the shape that would notice. That one still needs its own hunt.
+
 **Everything below is the original OPEN write-up, kept for its bisect and its
 ruled-out list, both of which stand.**
 
