@@ -428,13 +428,13 @@ pub(crate) fn attach_trust_managers_to_ctx(
         ctx.unpin_native_roots(base);
     }
     let mut table = ctx_trust_managers_table().lock();
-    if list.is_empty() Ok({
+    if list.is_empty() {
         table.remove(&key);
         ctx_accepted_issuers_table().lock().remove(&key);
-    }) else Ok({
+    } else {
         table.insert(key, list);
         ctx_accepted_issuers_table().lock().insert(key, issuers);
-    })
+    }
 }
 
 /// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
@@ -596,11 +596,11 @@ pub(crate) fn attach_key_managers_to_ctx(
         );
     }
     let mut table = ctx_key_managers_table().lock();
-    if list.is_empty() Ok({
+    if list.is_empty() {
         table.remove(&key);
-    }) else Ok({
+    } else {
         table.insert(key, list);
-    })
+    }
 }
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
@@ -645,7 +645,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
             key
         );
     }
-    if let Some(roots) = take_pending_tm_trust_roots() Ok({
+    if let Some(roots) = take_pending_tm_trust_roots() {
         if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] attach_pending_identity_to_ctx key={} storing {} roots",
@@ -654,12 +654,12 @@ pub(crate) fn attach_pending_identity_to_ctx(
             );
         }
         ctx_trust_roots_table().lock().insert(key, roots);
-    }) else if crate::nbflags().dbg_tls_auth_ok Ok({
+    } else if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending roots to store",
             key
         );
-    })
+    }
 }
 
 /// Look up the identity previously associated with an `SSLContext` object.
@@ -961,7 +961,7 @@ pub(crate) fn huc_default_key_managers_ctx_key() -> Option<u64> {
     *huc_default_km_ctx_key_slot().lock()
 }
 
-fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Ok(Result<(), MethodCallFailed>) {
+fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_managers = ctx_trust_managers_table()
         .lock()
@@ -982,7 +982,7 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 /// whose `SSLContext.init` passed a null/empty `KeyManager[]`) keeps falling
 /// back to `client_identity`/no-client-auth instead of spuriously trying (and
 /// failing) to consult an empty resolver.
-pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Ok(Result<(), MethodCallFailed>) {
+pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
     if crate::nbflags().dbg_tls_auth_ok {
@@ -998,7 +998,7 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
 /// This also runs for anonymous clients: `ctx_identity` transfers scoped trust
 /// roots even when it returns no client certificate, and every context needs a
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
-pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Ok(Result<(), MethodCallFailed>) {
+pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let ident = ctx_identity(ctx, ctx_obj)?;
     set_huc_default_client_identity(ident);
     capture_huc_key_managers_ctx_key(ctx, ctx_obj);
@@ -10799,7 +10799,7 @@ pub(crate) fn set_engine_trust_ctx_key(
     ctx: &mut dyn NativeContext,
     engine_obj: ObjectRef,
     ctx_obj: ObjectRef,
-) -> Ok(Result<(), MethodCallFailed>) {
+) -> Result<(), MethodCallFailed> {
     let key = ctx_obj_key(ctx, ctx_obj)?;
     let id = engine_id_or_alloc(ctx, engine_obj);
     if crate::nbflags().dbg_tls_auth_ok {

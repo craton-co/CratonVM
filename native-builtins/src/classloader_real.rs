@@ -378,7 +378,7 @@ pub(crate) fn init_urlclassloader_constructor_with_default_parent(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     urls: Value,
-) -> Ok(Result<(), MethodCallFailed>) {
+) -> Result<(), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let parent = get_or_create_system_cl(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
