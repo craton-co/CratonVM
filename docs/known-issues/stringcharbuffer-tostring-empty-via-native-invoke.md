@@ -106,7 +106,7 @@ JDK-faithful form pays a virtual `charAt` per character, so the change wants its
 own measurement rather than being folded into a CharBuffer fix.
 
 Found while closing
-[`charbuffer-wrap-string-subsequence-does-not-bounds-check`](../internal/charbuffer-wrap-string-subsequence-does-not-bounds-check-FIXED-20260806.md).
+`charbuffer-wrap-string-subsequence-does-not-bounds-check-FIXED-20260806.md`.
 That fix stops intercepting `CharBuffer.wrap(CharSequence)` in real-JDK mode,
 so it returns the real `StringCharBuffer` HotSpot returns — which is what
 brought this pre-existing defect onto the common path. Before it, only
