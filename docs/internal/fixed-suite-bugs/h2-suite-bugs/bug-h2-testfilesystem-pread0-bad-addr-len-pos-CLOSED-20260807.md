@@ -68,14 +68,32 @@ Printing the arguments as received separates the two without a rebuild.
 * **Which change fixed it**, if a change did. It was gone before this work
   started and was never bisected.
 * **Whether the original measurement was on Linux.** The original page names no
-  platform. `fd_from_descriptor` reads `handle` (Windows) before `fd` (Unix), and
-  the two platforms take different `FileDispatcherImpl` paths, so a
-  Windows-only refusal is a live hypothesis that this page did not test. That is
-  the first thing to check if it reappears: run the `TfsProbe` command below on
-  Windows before assuming a regression window.
+  platform, and `fd_from_descriptor` reads `handle` (Windows) before `fd`
+  (Unix), so "Windows-only" was the obvious hypothesis. It was tested and is
+  **not** it: a Windows release build of this same branch clears
+  `testConcurrent` on the plain-disk filesystem with no refusal of any kind, on
+  every prefix tried (plain disk, `nioMapped:`, `split:nioMapped:`).
 * **Whether the H2 checkout matters.** The measurements here used the H2 tree at
   `/data/data/h2database/h2` on the Azure host; the original page does not name
   the checkout it used.
+
+## What Windows does instead
+
+The Windows arm dies earlier in the same `testFileSystem(String)` body, at
+`testSetReadOnly`, with
+
+```
+java.lang.AbstractMethodError: method java/nio/file/spi/FileSystemProvider.setAttribute(...)
+    has no Code attribute
+```
+
+— `Files.setAttribute` reaching the *abstract* declaration instead of
+`WindowsFileSystemProvider`'s override. 3/3, on all three prefixes tried. That is
+a separate, Windows-only defect and has nothing to do with positional I/O; it is
+filed as `docs/known-issues/h2/bug-h2-windows-files-setattribute-abstract.md`.
+Note what it means for this page, though: on Windows `TestFileSystem` cannot
+currently reach `testConcurrent`'s later iterations at all, so a Windows report
+of the `pread0` refusal would have to predate that blocker.
 
 ## Reproducing (if it returns)
 
