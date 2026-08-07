@@ -1486,15 +1486,30 @@ impl ClassStore {
                 declared.push(cratonvm_types::FieldStorageKind::from_descriptor_byte(b)?);
             }
 
-            // The order offsets are *assigned* in. Widest first closes the
-            // alignment gaps; references before same-width primitives keeps the
-            // oop-map contiguous, which is what the GC scan walks. The
-            // declaration index is the final tiebreak, so the sort is total and
-            // deterministic — a redefine that produces the same field set
-            // produces the same layout, which the version registry relies on.
-            let mut order: Vec<usize> = (0..declared.len()).collect();
-            if pack_by_width {
-                order.sort_by_key(|&i| {
+            // The order offsets are *assigned* in.
+            //
+            // Plain width-descending is NOT enough, and `java.util.LinkedList`
+            // is the counterexample that proves it: `AbstractList` leaves the
+            // running offset at 4 (`int modCount`), and declaration order then
+            // happens to fill that 4-byte hole with `int size` before the two
+            // `Node` references, landing on 24. Sorting widest-first instead
+            // puts an 8-byte reference there, wastes the hole, and ends at 28 —
+            // which rounds to **32**. Width-first made it bigger.
+            //
+            // So the assignment is width-descending *with the current hole
+            // preferred*: at each step, take the widest remaining field that
+            // needs no padding where the cursor already is, and only pay for
+            // padding when nothing fits. That places `size` into the hole and
+            // gets LinkedList back to 24, while still packing `String` to 16.
+            let order: Vec<usize> = if pack_by_width {
+                let mut by_width: Vec<usize> = (0..declared.len()).collect();
+                // Widest first; references before same-width primitives so the
+                // oop-map the GC scan walks stays contiguous; declaration index
+                // as the final tiebreak, which makes the order total and
+                // deterministic — a redefine over the same field set must
+                // produce the same layout, because the version registry keys on
+                // it.
+                by_width.sort_by_key(|&i| {
                     let storage = declared[i];
                     (
                         std::cmp::Reverse(storage.size_runtime()),
@@ -1502,7 +1517,45 @@ impl ClassStore {
                         i,
                     )
                 });
-            }
+                let mut placed = vec![false; declared.len()];
+                let mut cursor = off;
+                let mut chosen: Vec<usize> = Vec::with_capacity(declared.len());
+                for _ in 0..declared.len() {
+                    // First choice: the widest unplaced field already aligned
+                    // at the cursor. Second: the widest unplaced field at all.
+                    let pick = by_width
+                        .iter()
+                        .copied()
+                        .find(|&i| {
+                            !placed[i] && cursor % declared[i].alignment_runtime() == 0
+                        })
+                        .or_else(|| by_width.iter().copied().find(|&i| !placed[i]));
+                    let Some(i) = pick else { break };
+                    placed[i] = true;
+                    let alignment = declared[i].alignment_runtime();
+                    cursor = (cursor + alignment - 1) & !(alignment - 1);
+                    cursor += declared[i].size_runtime();
+                    chosen.push(i);
+                }
+                // Insurance, not decoration: this makes "never larger than
+                // declaration order" a property of the output rather than a
+                // hope about the heuristic. The comparison is scoped to one
+                // ancestor's own contribution and uses only that ancestor's
+                // incoming offset, so both a parent's own layout and the same
+                // parent's prefix inside a child reach the identical verdict —
+                // which is what keeps inherited fields on identical offsets.
+                let declaration_end = declared.iter().fold(off, |acc, storage| {
+                    let alignment = storage.alignment_runtime();
+                    ((acc + alignment - 1) & !(alignment - 1)) + storage.size_runtime()
+                });
+                if cursor <= declaration_end {
+                    chosen
+                } else {
+                    (0..declared.len()).collect()
+                }
+            } else {
+                (0..declared.len()).collect()
+            };
 
             // Recorded per absolute index, not per assignment position: the
             // tables stay indexed the way every accessor indexes them.
@@ -2259,6 +2312,132 @@ mod tests {
             layout.ref_offsets
         );
         assert_eq!(layout.body_size, 32);
+    }
+
+    /// `java.util.LinkedList`, the shape that caught plain width-descending
+    /// making an object **bigger**.
+    ///
+    /// `AbstractList` contributes `int modCount` and leaves the running offset
+    /// at 4. Declaration order then fills that 4-byte hole with `int size`
+    /// before the two `Node` references and lands on 24. Naive widest-first put
+    /// a reference there instead, wasted the hole, ended at 28 and rounded to
+    /// **32** — a measured regression, found by censusing both arms of a real
+    /// run rather than by reading the sort. Hole-first placement must get it
+    /// back to 24.
+    #[test]
+    fn width_packing_fills_an_inherited_hole_instead_of_wasting_it() {
+        let mut store = ClassStore::new();
+
+        let parent = store.next_id();
+        store.add(make_class(
+            parent,
+            "java/util/AbstractList",
+            None,
+            vec![],
+            vec![typed_field("modCount", "I")],
+            vec![],
+            0,
+            1,
+        ));
+
+        let child = store.next_id();
+        store.add(make_class(
+            child,
+            "java/util/LinkedList",
+            Some(parent),
+            vec![],
+            vec![
+                typed_field("size", "I"),
+                typed_field("first", "Ljava/util/LinkedList$Node;"),
+                typed_field("last", "Ljava/util/LinkedList$Node;"),
+            ],
+            vec![],
+            1,
+            4,
+        ));
+
+        let packed = store.build_compact_layout_ordered(child, true).unwrap();
+        let declared = store.build_compact_layout_ordered(child, false).unwrap();
+        assert_eq!(declared.body_size, 24, "declaration order is already 24 here");
+        assert_eq!(
+            packed.body_size, 24,
+            "hole-first must match declaration order, not regress to 32"
+        );
+        // modCount @0, size @4 (into the hole), first @8, last @16.
+        assert_eq!(packed.field_offsets, vec![0, 4, 8, 16]);
+    }
+
+    /// The "never larger than declaration order" guarantee, asserted over every
+    /// arrangement of a field set chosen to expose the bad cases: an odd
+    /// leading primitive, mixed widths, and a reference that has to align.
+    ///
+    /// This is the property the fallback exists for. A heuristic that is
+    /// usually better is not the same as one that is never worse, and only the
+    /// second is safe to turn on by default across a whole heap.
+    #[test]
+    fn width_packing_is_never_larger_than_declaration_order() {
+        let descriptors = ["B", "Ljava/lang/Object;", "I", "J", "S", "Z", "[I"];
+        // Every rotation of the declaration order, so the incoming alignment
+        // and the tail both vary.
+        for rot in 0..descriptors.len() {
+            let mut store = ClassStore::new();
+            let id = store.next_id();
+            let fields: Vec<ClassFileField> = (0..descriptors.len())
+                .map(|i| {
+                    let d = descriptors[(i + rot) % descriptors.len()];
+                    typed_field(&format!("f{i}"), d)
+                })
+                .collect();
+            store.add(make_class(
+                id,
+                "Rotated",
+                None,
+                vec![],
+                fields,
+                vec![],
+                0,
+                descriptors.len(),
+            ));
+
+            let packed = store.build_compact_layout_ordered(id, true).unwrap();
+            let declared = store.build_compact_layout_ordered(id, false).unwrap();
+            assert!(
+                packed.body_size <= declared.body_size,
+                "rotation {rot}: packed {} > declaration order {}",
+                packed.body_size,
+                declared.body_size
+            );
+            // And every field must still be within the body and aligned.
+            for (i, (&offset, &kind)) in packed
+                .field_offsets
+                .iter()
+                .zip(packed.field_kinds.iter())
+                .enumerate()
+            {
+                assert_eq!(
+                    offset % kind.alignment_runtime(),
+                    0,
+                    "rotation {rot} field {i} at {offset} is misaligned for {kind:?}"
+                );
+                assert!(offset + kind.size_runtime() <= packed.body_size);
+            }
+            // No two fields may overlap.
+            let mut spans: Vec<(u32, u32)> = packed
+                .field_offsets
+                .iter()
+                .zip(packed.field_kinds.iter())
+                .map(|(&o, &k)| (o, o + k.size_runtime()))
+                .collect();
+            spans.sort_unstable();
+            for w in spans.windows(2) {
+                assert!(
+                    w[0].1 <= w[1].0,
+                    "rotation {rot}: fields overlap {:?} {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
     }
 
     /// A padded class is still refused outright, reorder or not — the reorder
