@@ -139,6 +139,15 @@ adds. What changes is the *shape* of the zipfs `setAttribute` failure, from
 Both are wrong; neither writes anywhere real, because the synthetic `JARFS…`
 path never resolves. Filed separately.
 
+## Follow-on: the rest of the surface (same day)
+
+The closing note below was acted on immediately. `isHidden` — the other abstract
+method with no `Files`-level native in front of it — was still failing after this
+fix, and `createDirectory`/`delete`/`copy`/`move` were unregistered but hidden by
+their `Files` natives. Those, the DOS read/write round-trip, `checkAccess`'s
+ignored `AccessMode[]`, and the `Files.delete` divergence flagged above are in
+[`bug-nio-filesystemprovider-abstract-surface-residuals-FIXED-20260807.md`](bug-nio-filesystemprovider-abstract-surface-residuals-FIXED-20260807.md).
+
 ## Note for whoever picks this up
 
 The registration is a workaround for the shape, not a cure. Every abstract
