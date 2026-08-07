@@ -14,8 +14,10 @@ is not the call sites. See *What is still open*.
 > done**: `native-io` and `native-collections` allocation funnels are fallible,
 > `native-builtins::alloc_concurrent_synthetic` is not, and the reason is
 > measured rather than estimated — see *Why `alloc_concurrent_synthetic` was
-> abandoned rather than finished*. `ensure_synthetic_class` therefore still
-> exists and this record stays here.
+> abandoned rather than finished*, now carrying a fourth attempt that leaves
+> **758** errors on a preserved, non-compiling branch and names the two rules
+> that got it there. `ensure_synthetic_class` therefore still exists and this
+> record stays here.
 
 The original defect: under `--jdk-only` this API recorded the violation and
 then fabricated the class anyway, so the run reported a violation while
@@ -176,18 +178,84 @@ Two things the third attempt established that the others could not:
   Accept `MachineApplicable`, plus `MaybeIncorrect` entries whose replacement is
   the original text with a `?` appended — that is the "use `?` to unwrap"
   suggestion, and rustc chose the span. One round applied **556**.
-* **The residue is not missing `?`, it is SEMANTICS.** At the stopping point:
-  631 `E0308 mismatched types` and — the signal that matters — **104 `E0382`
-  "use of moved value"**. Mechanically wrapping a tail in `Ok(..)` and threading
-  `?` through changes when values move. No textual tool can see that, and a
-  migration that compiles only after someone silences 104 borrow errors is not
-  a migration anyone should land.
+* **The residue looked like SEMANTICS, and was not.** At the stopping point:
+  631 `E0308 mismatched types` and — read at the time as the signal that
+  mattered — **104 `E0382` "use of moved value"**, which this record concluded
+  was ownership damage no textual tool could see. **Attempt 4 showed that
+  reading was wrong**; see below. The E0382s were an artefact of repairing the
+  right error in the wrong PLACE.
 
-**So the remaining work is a `syn`-based rewriter or hand work, module by
-module, over several sittings — not another loop.** Nothing from these three
-attempts was committed; `dev` has never carried a half-migrated
-`native-builtins`. Start from 775, not from 2,072, and start by deciding how
-ownership is preserved.
+Nothing from these three attempts was committed; `dev` has never carried a
+half-migrated `native-builtins`.
+
+### Attempt 4, 2026-08-07 — two real findings, and a hard floor at 758
+
+Same 1,904 sites, driven by rustc's suggestions again, plus two rules the
+earlier attempts did not have. Both are worth keeping; neither was enough.
+
+**Finding 1 — rustc will not suggest `?` until the enclosing function already
+returns `Result`.** Until then the same expression gets an `.expect(..)`
+suggestion instead, which is not the edit anyone wants and which the driver was
+correctly refusing. So the order matters: *widen the function first, then ask
+rustc again.* The trigger is an `E0308` whose expected/found pair is
+`expected T, found Result<T, MethodCallFailed>` — and that text lives on the
+span's **`label`**, not on `message`, which is only the string `"mismatched
+types"`. A first version of the rule matched on `message` and widened nothing.
+With the rule reading `label`, one run went **736 → 4**.
+
+**Finding 2 — the `?` belongs on the `let` BINDING, not on the uses, and that
+is where the E0382s came from.** When a `let` binds a now-fallible call, rustc
+reports the type error at *every use* of that local and suggests `?` at each
+one. Applying all of them unwraps the same value repeatedly:
+
+```rust
+let package = i2_alloc_synthetic_package(ctx, &name);   // Result
+let handle = ctx.add_global_root(package?);             // use 1
+Ok(Some(Value::Object(Some(package?))))                 // use 2 -> E0382
+```
+
+The repair is one edit above, and it fixes every use at once:
+
+```rust
+let package = i2_alloc_synthetic_package(ctx, &name)?;
+```
+
+That accounts for the "use of moved value" wall attempt 3 read as semantic
+damage. **It is not ownership damage — it is the correct fix applied at the
+wrong site.** A pass that moves the `?` to the binding fixed 719 of them.
+
+One trap inside that repair: stripping `name?` at *file* scope to clean up the
+uses also strips `?` from same-named locals in other functions that legitimately
+need it, so a pass can fix 342 bindings and leave the error count flat. Drop
+only the `?`s rustc itself flags (`` `?` operator has incompatible types ``),
+span-precise.
+
+**Where it stopped: 758, flat over six rounds** (528 `E0308`, 132 `E0382`,
+16 incompatible `match` arms, 14 `?`-on-`Option`, 12 `return;` in a non-unit
+fn, 8 `?`-in-a-closure). Concentrated in
+`phases_late/nio_file.rs` (73), `util_concurrent_ext.rs` (54),
+`lang_class.rs` (49), `lib.rs` (43), `lang_invoke.rs` (35),
+`phases_late/xml_json.rs` (34).
+
+The floor is where it is because the last errors are each a *shape* rather than
+an instance: a `match` whose arms must all be widened together, a closure that
+must become fallible along with the iterator adapter that takes it, an `Option`
+chain that has to choose between `ok_or` and a different return type. Each needs
+a decision, and 758 decisions is hand work.
+
+**This attempt WAS preserved,** unlike the first three, because starting from
+758 is worth more than starting from 2,072:
+
+    wip/jdk-only-concurrent-funnel-758-DO-NOT-MERGE   (532925266)
+
+It does **not compile** and must never be merged. It is a starting point for
+whoever does the hand pass, and nothing else. `dev` is unchanged.
+
+**Recommendation for attempt 5:** stop trying to converge the whole crate.
+Take the branch above, pick one file, finish it by hand until
+`cargo check` reports nothing in that file, commit, and repeat. The two findings
+above make the mechanical majority of each file free; the per-file residue is
+small enough to read. Six files carry 40% of what is left.
 
 ### What making a funnel fallible actually FINDS — the reason to do it at all
 
