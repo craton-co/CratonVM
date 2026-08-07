@@ -1910,7 +1910,7 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let iter_obj = match it {
         Some(Value::Object(Some(o))) => o,
         _ => {
-            return empty_optional(ctx)?;
+            return empty_optional(ctx);
         }
     };
     // GC-safety: `invoke`'s `hasNext` call below can trigger a moving GC;
@@ -1924,7 +1924,7 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     )?;
     if matches!(has_next, Some(Value::Int(0)) | None) {
         ctx.unpin_native_roots(iter_pin);
-        return empty_optional(ctx)?;
+        return empty_optional(ctx);
     }
     let iter_obj = ctx.read_native_pin(iter_pin, iter_obj);
     let first = ctx.invoke(
@@ -1937,7 +1937,7 @@ fn native_sl_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => o,
         _ => {
             ctx.unpin_native_roots(iter_pin);
-            return empty_optional(ctx)?;
+            return empty_optional(ctx);
         }
     };
     let first_pin = ctx.pin_native_root(first_obj);
@@ -2311,7 +2311,7 @@ fn drain_real_spliterator(
         );
     }
     let spl_pin = ctx.pin_native_root(spliterator);
-    let collector = crate::try_alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2)?;
+    let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
     let col_pin = ctx.pin_native_root(collector);
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     let initial_pin = ctx.pin_native_root(initial);

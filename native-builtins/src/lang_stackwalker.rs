@@ -39,7 +39,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry, Stack
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::Value;
 
-use crate::try_alloc_concurrent_synthetic;
+use crate::alloc_concurrent_synthetic;
 
 thread_local! {
     /// Stack of the *clean*, ordered frame lists captured by each in-progress
@@ -190,7 +190,7 @@ fn populate_sfi(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
     retain_class_ref: bool,
-) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+) -> cratonvm_types::ObjectRef {
     // Reuse the shared `dotted_class_name` cache (lang_class) so repeat
     // frames for the same class do not re-run `.replace('/', '.')` and
     // allocate a fresh `String` per frame. The cache returns an
@@ -242,9 +242,9 @@ fn populate_sfi(
         None => (None, None),
     };
     let mut sf =
-        try_alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS)?;
+        alloc_concurrent_synthetic(ctx, "java/lang/StackFrameInfo", STACK_FRAME_INFO_FIELDS);
     let h_sf = ctx.pin_native_root(sf);
-    let mut ste = try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
+    let mut ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
     let h_ste = ctx.pin_native_root(ste);
 
     // ---- All allocations done. Read every reference back through its pin so
@@ -330,7 +330,7 @@ fn populate_sfi(
     ctx.set_field(sf, SF_DECL_INTERNAL, Value::Object(Some(decl_internal)));
 
     ctx.unpin_native_roots(base);
-    Ok(sf)
+    sf
 }
 
 fn stack_walk_skip_internals(class_name: &str, method_name: &str) -> bool {
@@ -456,7 +456,7 @@ pub(crate) fn native_call_stack_walk(
     let fb_pin = ctx.pin_native_root(frame_buffer);
     let mut frame_buffer = frame_buffer;
     while written < capacity && pos < ordered.len() {
-        let sfi = populate_sfi(ctx, &ordered[pos], retain_class_ref)?;
+        let sfi = populate_sfi(ctx, &ordered[pos], retain_class_ref);
         frame_buffer = ctx.read_native_pin(fb_pin, frame_buffer);
         ctx.set_array_element(
             frame_buffer,
@@ -638,7 +638,7 @@ pub(crate) fn native_fetch_stack_frames(
         if written >= slack {
             break;
         }
-        let sfi = populate_sfi(ctx, entry, retain_class_ref)?;
+        let sfi = populate_sfi(ctx, entry, retain_class_ref);
         buffer = ctx.read_native_pin(buf_pin, buffer);
         ctx.set_array_element(buffer, start + written, Value::Object(Some(sfi)));
         written += 1;
@@ -933,7 +933,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             if let Value::Object(Some(ste)) = ctx.get_field_by_name(this, "ste") {
                 return Ok(Some(Value::Object(Some(ste))));
             }
-            let ste = try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
+            let ste = alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
             // Decode SFI slots into the values `fill_stack_trace_element`
             // needs. `SF_CLASSNAME` holds the dotted class name; the
             // `/`-separated internal name lives in `SF_DECL_INTERNAL`.

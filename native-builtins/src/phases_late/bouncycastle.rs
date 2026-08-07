@@ -213,7 +213,7 @@ pub(crate) fn bc_big_integers_mod_odd_inverse(
         return Ok(Some(Value::Object(Some(bi_alloc_int(
             ctx,
             &crate::bigint::BigInt::zero(),
-        )?))));
+        )))));
     }
 
     let mut x = bi_read_int(ctx, obj_arg(args, 1)?);
@@ -221,7 +221,7 @@ pub(crate) fn bc_big_integers_mod_odd_inverse(
         x = x.modulo(&modulus);
     }
     if variable_time && x.bit_length() == 1 && x.test_bit(0) {
-        return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &x)?))));
+        return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &x)))));
     }
 
     let inv = x.mod_inverse(&modulus).ok_or_else(|| {
@@ -229,7 +229,7 @@ pub(crate) fn bc_big_integers_mod_odd_inverse(
             message: "BigInteger not invertible.".into(),
         })
     })?;
-    Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv)?))))
+    Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv)))))
 }
 
 pub(crate) fn bc_long_array_bad_state(message: &str) -> MethodCallFailed {
@@ -3344,7 +3344,7 @@ pub(crate) fn bc_fp_alloc(
         _ => None,
     };
 
-    let x_obj = bi_alloc_int(ctx, x)?;
+    let x_obj = bi_alloc_int(ctx, x);
     let x_pin = ctx.pin_native_root(x_obj);
     let obj_result = ctx.new_object("org/bouncycastle/math/ec/ECFieldElement$Fp");
     let result = match obj_result {
@@ -3385,7 +3385,7 @@ pub(crate) fn bc_fp_return_bi(
     ctx: &mut dyn NativeContext,
     x: crate::bigint::BigInt,
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &x)?))))
+    Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &x)))))
 }
 
 pub(crate) fn bc_fp_bigint_arg(

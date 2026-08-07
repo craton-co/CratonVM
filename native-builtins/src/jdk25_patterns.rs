@@ -15,7 +15,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // 15.3 — Primitive Types in Patterns (JEP 507)
@@ -338,7 +338,7 @@ const SV_NUM_FIELDS: usize = 3;
 
 /// `of()Ljava/lang/StableValue;` — create an empty StableValue.
 fn native_stable_value_of_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StableValue", SV_NUM_FIELDS)?;
+    let obj = alloc_concurrent_synthetic(ctx, "java/lang/StableValue", SV_NUM_FIELDS);
     ctx.set_field(obj, SV_FIELD_VALUE, Value::Object(None));
     ctx.set_field(obj, SV_FIELD_IS_SET, Value::Int(0));
     ctx.set_field(obj, SV_FIELD_SUPPLIER, Value::Object(None));
@@ -354,7 +354,7 @@ fn native_stable_value_of_supplier(
         Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
         _ => Value::Object(None),
     };
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StableValue", SV_NUM_FIELDS)?;
+    let obj = alloc_concurrent_synthetic(ctx, "java/lang/StableValue", SV_NUM_FIELDS);
     ctx.set_field(obj, SV_FIELD_VALUE, Value::Object(None));
     ctx.set_field(obj, SV_FIELD_IS_SET, Value::Int(0));
     ctx.set_field(obj, SV_FIELD_SUPPLIER, supplier);
@@ -519,7 +519,7 @@ fn native_stable_value_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(n)) => *n,
         _ => 0,
     };
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/List", SV_LIST_NUM_FIELDS)?;
+    let obj = alloc_concurrent_synthetic(ctx, "java/util/List", SV_LIST_NUM_FIELDS);
     ctx.set_field(obj, SV_LIST_FIELD_SIZE, Value::Int(size));
     ctx.set_field(obj, SV_LIST_FIELD_INIT_COUNT, Value::Int(0));
     Ok(Some(Value::Object(Some(obj))))
@@ -527,7 +527,7 @@ fn native_stable_value_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// `map(Ljava/util/Set;)Ljava/util/Map;`
 fn native_stable_value_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Map", SV_MAP_NUM_FIELDS)?;
+    let obj = alloc_concurrent_synthetic(ctx, "java/util/Map", SV_MAP_NUM_FIELDS);
     ctx.set_field(obj, SV_MAP_FIELD_SIZE, Value::Int(0));
     ctx.set_field(obj, SV_MAP_FIELD_ENTRY_COUNT, Value::Int(0));
     Ok(Some(Value::Object(Some(obj))))

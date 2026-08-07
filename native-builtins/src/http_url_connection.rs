@@ -96,7 +96,7 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use cratonvm_native_io::eintr::{retry_eintr, EintrIo};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layout for sun.net.www.protocol.http.HttpURLConnection
@@ -873,7 +873,7 @@ fn make_response_input_stream(
     body: &[u8],
     truncated: bool,
 ) -> MethodCallResult {
-    let head = make_byte_array_input_stream(ctx, body)?;
+    let head = make_byte_array_input_stream(ctx, body);
     if !truncated {
         return Ok(Some(head));
     }
@@ -1015,14 +1015,14 @@ fn new_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
 
 /// Build a `java/io/ByteArrayInputStream` over `body` (4-field synthetic:
 /// buf=0, pos=1, mark=2, count=3).
-fn make_byte_array_input_stream(ctx: &mut dyn NativeContext, body: &[u8]) -> Result<Value, MethodCallFailed> {
+fn make_byte_array_input_stream(ctx: &mut dyn NativeContext, body: &[u8]) -> Value {
     let body_arr = new_byte_array(ctx, body);
-    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
     ctx.set_field(stream, 0, Value::Object(Some(body_arr)));
     ctx.set_field(stream, 1, Value::Int(0));
     ctx.set_field(stream, 2, Value::Int(0));
     ctx.set_field(stream, 3, Value::Int(body.len() as i32));
-    Ok(Value::Object(Some(stream)))
+    Value::Object(Some(stream))
 }
 
 /// Build a real `java.util.Map<String, java.util.List<String>>` from response
@@ -2114,11 +2114,11 @@ fn huc_verify_hostname(
     // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
     // `getPeerCertificates` from the side table populated just below. A
     // pinning verifier calls exactly that pair.
-    let session0 = try_alloc_concurrent_synthetic(
+    let session0 = alloc_concurrent_synthetic(
         ctx,
         "javax/net/ssl/SSLSession",
         crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
-    )?;
+    );
     let session_pin = ctx.pin_native_root(session0);
 
     let proto_s = ctx.read_native_pin(proto_pin, proto_s0);
@@ -2671,7 +2671,7 @@ fn perform(
             // STW-TAKEOVER-FIX note above for why both halves of that are
             // required, and why `read_response` in particular can no longer
             // call back into Java.
-            drop(active_ctx_guard)?;
+            drop(active_ctx_guard);
             ctx.begin_blocking_region();
             let exchange = https_post_handshake_exchange(&mut stream, &req, head);
             ctx.end_blocking_region();
@@ -3460,7 +3460,7 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
     let body_arr = new_byte_array(ctx, &body_bytes);
     let len = body_bytes.len() as i32;
-    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
     ctx.set_field(stream, 0, Value::Object(Some(body_arr)));
     ctx.set_field(stream, 1, Value::Int(0));
     ctx.set_field(stream, 2, Value::Int(0));
@@ -3506,7 +3506,7 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             let existing = ctx.read_var_handle_root(vkey).unwrap_or(stored);
             return Ok(Some(Value::Object(Some(existing))));
         }
-        let baos = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2)?;
+        let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
         // Family-1 fix (cce0079): `new_array` below can move the
         // still-unrooted `baos` — pin and refresh it before the field
         // stores and the registry insert.
@@ -3543,7 +3543,7 @@ fn huc_get_output_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if let Value::Object(Some(existing)) = ctx.get_field(this, HUC_REQ_BODY_STREAM) {
         return Ok(Some(Value::Object(Some(existing))));
     }
-    let baos = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2)?;
+    let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
     let backing = ctx.new_array(ArrayElementType::Byte, 0);
     ctx.set_field(baos, 0, Value::Object(Some(backing)));
     ctx.set_field(baos, 1, Value::Int(0));
@@ -4924,7 +4924,7 @@ mod http_url_connection_tests {
         let host = format!("test-closed-peer-{}", client.local_addr().unwrap().port());
         let port = 1;
         pool_put(&host, port, client);
-        drop(server)?; // peer close -> FIN visible to a peek on `client`
+        drop(server); // peer close -> FIN visible to a peek on `client`
         // Give the FIN a moment to actually land in the kernel buffer.
         std::thread::sleep(Duration::from_millis(50));
         assert!(pool_take(&host, port).is_none());

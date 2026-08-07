@@ -15,7 +15,7 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // Off-heap memory tracking (T8.4.2)
@@ -729,12 +729,12 @@ fn native_tracked_set_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for (&block_addr, block) in store.iter() {
         if addr >= block_addr && (addr - block_addr) < block.len() as u64 {
             let offset = (addr - block_addr) as usize;
-            drop(store)?;
+            drop(store);
             tracked_set_memory(block_addr, offset, count, value);
             return Ok(None);
         }
     }
-    drop(store)?;
+    drop(store);
 
     // Try direct address match (addr IS the block address with offset 0)
     tracked_set_memory(addr, 0, count, value);
@@ -785,7 +785,7 @@ fn native_tracked_copy_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
                 dst_inner_offset = (dst_offset - block_addr as u64) as usize;
             }
         }
-        drop(store)?;
+        drop(store);
         tracked_copy_memory(
             src_block_addr,
             src_inner_offset,

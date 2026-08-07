@@ -341,7 +341,7 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let produced = (output_consumed as usize).min(output_buf.len());
     st.adler = adler32_update(st.adler, &output_buf[..produced]);
 
-    drop(tbl)?;
+    drop(tbl);
 
     if let Some(a) = output_arr {
         if output_consumed > 0 {

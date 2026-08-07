@@ -20,21 +20,21 @@ pub(crate) fn p67_layout_object(
     class_name: &str,
     byte_size: i64,
     byte_alignment: i64,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, class_name, 4)?;
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, class_name, 4);
     ctx.set_field(obj, 0, Value::Long(byte_size));
     ctx.set_field(obj, 1, Value::Long(byte_alignment));
     ctx.set_field(obj, 2, Value::Int(0));
     ctx.set_field(obj, 3, Value::Object(None));
-    Ok(obj)
+    obj
 }
 
-pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
     let pinned = match value {
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
     let value = match pinned {
         Some((pin, obj)) => {
             let obj = ctx.read_native_pin(pin, obj);
@@ -44,7 +44,7 @@ pub(crate) fn p67_optional(ctx: &mut dyn NativeContext, value: Value) -> Result<
         None => Value::Object(None),
     };
     ctx.set_field(opt, 0, value);
-    Ok(opt)
+    opt
 }
 
 pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) -> Value {
@@ -64,7 +64,7 @@ pub(crate) fn p67_layout_name_value(ctx: &dyn NativeContext, layout: ObjectRef) 
 pub(crate) fn p67_layout_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name = p67_layout_name_value(ctx, this);
-    Ok(Some(Value::Object(Some(p67_optional(ctx, name)?))))
+    Ok(Some(Value::Object(Some(p67_optional(ctx, name)))))
 }
 
 pub(crate) fn p67_layout_carrier_name(class_name: &str) -> &'static str {
@@ -93,19 +93,19 @@ pub(crate) fn p67_layout_carrier_name(class_name: &str) -> &'static str {
     }
 }
 
-pub(crate) fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
     match class_name {
         "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
             ctx.primitive_class_mirror(class_name)
         }
         _ => {
             if let Some(cid) = ctx.class_id_by_name(class_name) {
-                return Ok(ctx.get_class_mirror(cid));
+                return ctx.get_class_mirror(cid);
             }
             if let Ok(cid) = ctx.ensure_class_initialized(class_name) {
-                return Ok(ctx.get_class_mirror(cid));
+                return ctx.get_class_mirror(cid);
             }
-            try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 2)?
+            alloc_concurrent_synthetic(ctx, "java/lang/Class", 2)
         }
     }
 }
@@ -119,7 +119,7 @@ pub(crate) fn p67_layout_carrier(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(Some(Value::Object(Some(p67_class_mirror(
         ctx,
         carrier_name,
-    )?))))
+    )))))
 }
 
 pub(crate) fn p67_layout_with_name(
@@ -143,7 +143,7 @@ pub(crate) fn p67_layout_with_name(
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
+    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
     let this = ctx.read_native_pin(this_pin, this);
     for i in 0..field_count {
         ctx.set_field(cloned, i, ctx.get_field(this, i));
@@ -171,7 +171,7 @@ pub(crate) fn p67_address_layout_target_layout(
     } else {
         Value::Object(None)
     };
-    Ok(Some(Value::Object(Some(p67_optional(ctx, target)?))))
+    Ok(Some(Value::Object(Some(p67_optional(ctx, target)))))
 }
 
 pub(crate) fn p67_address_layout_with_target_layout(
@@ -190,7 +190,7 @@ pub(crate) fn p67_address_layout_with_target_layout(
         Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
         _ => None,
     };
-    let cloned = try_alloc_concurrent_synthetic(ctx, &class_name, clone_fields)?;
+    let cloned = alloc_concurrent_synthetic(ctx, &class_name, clone_fields);
     let this = ctx.read_native_pin(this_pin, this);
     for i in 0..field_count {
         ctx.set_field(cloned, i, ctx.get_field(this, i));
@@ -214,14 +214,13 @@ pub(crate) fn p67_set_value_layout_static(
     class_name: &str,
     byte_size: i64,
     byte_alignment: i64,
-) -> Result<(), MethodCallFailed> {
-    let obj = p67_layout_object(ctx, class_name, byte_size, byte_alignment)?;
+) {
+    let obj = p67_layout_object(ctx, class_name, byte_size, byte_alignment);
     ctx.set_static_field_by_name(
         "java/lang/foreign/ValueLayout",
         field_name,
         Value::Object(Some(obj)),
     );
-    Ok(())
 }
 
 pub(crate) fn p67_value_layout_clinit(
@@ -321,7 +320,7 @@ pub(crate) fn p67_value_layout_clinit(
             1_i64,
         ),
     ] {
-        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment)?;
+        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment);
     }
     Ok(None)
 }
@@ -360,10 +359,10 @@ pub(crate) fn p67_layout_is_little(ctx: &dyn NativeContext, layout: ObjectRef) -
         .unwrap_or(true)
 }
 
-pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
+pub(crate) fn p67_byte_order_object(ctx: &mut dyn NativeContext, little_endian: bool) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
     ctx.set_field(obj, 0, Value::Int(if little_endian { 1 } else { 0 }));
-    Ok(obj)
+    obj
 }
 
 pub(crate) fn p67_layout_order(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -372,7 +371,7 @@ pub(crate) fn p67_layout_order(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(Some(p67_byte_order_object(
         ctx,
         little_endian,
-    )?))))
+    )))))
 }
 
 pub(crate) fn p67_layout_with_order(
@@ -393,7 +392,7 @@ pub(crate) fn p67_layout_with_order(
         Value::Int(v) => v as i64,
         _ => byte_size,
     };
-    let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment)?;
+    let obj = p67_layout_object(ctx, &class_name, byte_size, byte_alignment);
     ctx.set_field(
         obj,
         2,
@@ -439,17 +438,17 @@ const P67_SESSION_OWNER: usize = 2;
 const P67_SESSION_ACTIONS: usize = 3;
 const P67_SESSION_SLOTS: usize = 4;
 
-pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(
+pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
+    let obj = alloc_concurrent_synthetic(
         ctx,
         "jdk/internal/foreign/MemorySessionImpl",
         P67_SESSION_SLOTS,
-    )?;
+    );
     ctx.set_field(obj, P67_SESSION_STATE, Value::Int(1));
     ctx.set_field(obj, P67_SESSION_ACQUIRES, Value::Int(0));
     ctx.set_field(obj, P67_SESSION_OWNER, Value::Object(None));
     ctx.set_field(obj, P67_SESSION_ACTIONS, Value::Object(None));
-    Ok(Value::Object(Some(obj)))
+    Value::Object(Some(obj))
 }
 
 /// The session a segment or arena already owns, or a fresh one if it has none.
@@ -462,16 +461,16 @@ pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Result<Value, M
 /// `ArenaImpl.session`) — and that field holds one of OUR sessions, because the
 /// `createConfined`/`createShared` factories are force-dispatched here. A
 /// synthetic receiver has no such field; there, a fresh session is all there is.
-fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<Value, MethodCallFailed> {
+fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Value {
     // A real-JDK receiver carries it in a named field.
     for name in ["scope", "session"] {
         if let Value::Object(Some(session)) = ctx.get_field_by_name(receiver, name) {
-            return Ok(Value::Object(Some(session)));
+            return Value::Object(Some(session));
         }
     }
     // The receiver is itself a synthetic Arena.
     if let Some(session) = p67_arena_session(ctx, receiver) {
-        return Ok(Value::Object(Some(session)));
+        return Value::Object(Some(session));
     }
     // The receiver is a synthetic MemorySegment: slot 2 names the arena that
     // allocated it, and the answer is that arena's session — this is what makes
@@ -479,11 +478,11 @@ fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Res
     if ctx.object_num_fields(receiver) > P67_SEGMENT_ARENA {
         if let Value::Object(Some(arena)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
             if let Some(session) = p67_arena_session(ctx, arena) {
-                return Ok(Value::Object(Some(session)));
+                return Value::Object(Some(session));
             }
         }
     }
-    Ok(p67_memory_session(ctx)?)
+    p67_memory_session(ctx)
 }
 
 /// The session stored on a synthetic Arena, if this object is one.
@@ -505,12 +504,12 @@ fn p67_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<Object
 /// lifetime. `confined` records the calling thread as the session owner, which
 /// is what lets an off-thread access raise `WrongThreadException`; a shared or
 /// automatic arena leaves the owner null.
-fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRef, MethodCallFailed> {
-    let arena = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS)?;
+fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> ObjectRef {
+    let arena = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS);
     // The session allocation below can move the fresh arena (native stale-local
     // family).
     let arena_pin = ctx.pin_native_root(arena);
-    let session_value = p67_memory_session(ctx)?;
+    let session_value = p67_memory_session(ctx);
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
@@ -521,7 +520,7 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRe
             ctx.set_field(session, P67_SESSION_OWNER, Value::Object(Some(owner)));
         }
     }
-    Ok(arena)
+    arena
 }
 
 /// Allocate a synthetic segment owned by `arena`.
@@ -533,15 +532,15 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRe
 /// `p67_segment_byte_size`, `p67_segment_address`, and `panama_libffi
 /// ::segment_address`) — a 3-field segment takes the same branches a 2-field
 /// one did.
-fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> Result<ObjectRef, MethodCallFailed> {
+fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> ObjectRef {
     let arena_pin = ctx.pin_native_root(arena);
-    let segment = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 3)?;
+    let segment = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 3);
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(segment, 0, Value::Long(size));
     ctx.set_field(segment, 1, Value::Long(0)); // address
     p67_stamp_segment_arena(ctx, segment, arena);
-    Ok(segment)
+    segment
 }
 
 /// Stamp `arena` onto a freshly allocated synthetic segment so the segment can
@@ -965,10 +964,10 @@ pub(crate) fn p67_memory_layout_path_target(
     current
 }
 
-pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: ObjectRef) -> Value {
     let width = p67_layout_width_obj(ctx, layout);
     let little_endian = p67_layout_is_little(ctx, layout);
-    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
+    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
     ctx.set_field(
         vh,
         VH_CLASS_OR_TARGET,
@@ -977,14 +976,14 @@ pub(crate) fn p67_var_handle_for_layout(ctx: &mut dyn NativeContext, layout: Obj
     ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(width));
     ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
     crate::lang_invoke::register_p67_memory_segment_var_handle(ctx, vh, width);
-    Ok(Value::Object(Some(vh)))
+    Value::Object(Some(vh))
 }
 
-pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Value, MethodCallFailed> {
+pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Value {
     match args.first() {
-        Some(Value::Object(Some(layout))) => p67_var_handle_for_layout(ctx, *layout)?,
+        Some(Value::Object(Some(layout))) => p67_var_handle_for_layout(ctx, *layout),
         _ => {
-            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS)?;
+            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
             ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(1));
             ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(1));
             ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
@@ -1002,7 +1001,7 @@ pub(crate) fn p67_memory_layout_var_handle(
         Some(Value::Object(Some(path_arr))) => p67_memory_layout_path_target(ctx, this, *path_arr),
         _ => this,
     };
-    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)?))
+    Ok(Some(p67_var_handle_for_layout(ctx, target_layout)))
 }
 
 pub(crate) fn p67_segment_parts(
@@ -1542,25 +1541,25 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         arena,
         "ofConfined",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true)?)))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true))))),
     );
     r.register(
         arena,
         "ofAuto",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
     );
     r.register(
         arena,
         "ofShared",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
     );
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
     );
     r.register(
         arena,
@@ -1572,7 +1571,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let segment = p67_arena_segment(ctx, this, size)?;
+            let segment = p67_arena_segment(ctx, this, size);
             Ok(Some(Value::Object(Some(segment))))
         },
     );
@@ -1586,7 +1585,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let segment = p67_arena_segment(ctx, this, size)?;
+            let segment = p67_arena_segment(ctx, this, size);
             Ok(Some(Value::Object(Some(segment))))
         },
     );
@@ -1602,7 +1601,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 }
                 _ => 1,
             };
-            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)?))))
+            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)))))
         },
     );
     r.register(arena, "close", "()V", |ctx, args| {
@@ -1623,7 +1622,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemorySegment$Scope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)?))
+            Ok(Some(p67_receiver_session(ctx, this)))
         },
     );
     let session = "jdk/internal/foreign/MemorySessionImpl";
@@ -1634,7 +1633,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             // Static: arg 0 is the Arena whose session is being unwrapped.
             let arena = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, arena)?))
+            Ok(Some(p67_receiver_session(ctx, arena)))
         },
     );
     r.register(
@@ -1654,7 +1653,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(owner) => Some(ctx.pin_native_root(owner)),
                 None => None,
             };
-            let value = p67_memory_session(ctx)?;
+            let value = p67_memory_session(ctx);
             if let (Value::Object(Some(new_session)), Some(owner), Some(pin)) =
                 (value, owner, owner_pin)
             {
@@ -1671,19 +1670,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         session,
         "createShared",
         "()Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
     );
     r.register(
         session,
         "createImplicit",
         "(Ljava/lang/ref/Cleaner;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
     );
     r.register(
         session,
         "createHeap",
         "(Ljava/lang/Object;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
     );
     r.register(
         session,
@@ -1955,7 +1954,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     Value::Long(v) => v,
                     _ => 0,
                 };
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
                 ctx.set_field(seg, 0, Value::Long(base_ptr));
                 ctx.set_field(seg, 1, Value::Long(size));
                 ctx.set_field(seg, 2, ctx.get_field(this, 2));
@@ -1964,7 +1963,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 ctx.set_field(seg, 5, Value::Long(base_off + offset));
                 Ok(Some(Value::Object(Some(seg))))
             } else {
-                let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2)?;
+                let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
                 ctx.set_field(seg, 0, Value::Long(size));
                 ctx.set_field(seg, 1, Value::Long(offset));
                 Ok(Some(Value::Object(Some(seg))))
@@ -2022,7 +2021,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/foreign/MemorySegment$Scope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)?))
+            Ok(Some(p67_receiver_session(ctx, this)))
         },
     );
     r.register(
@@ -2030,7 +2029,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "NULL",
         "Ljava/lang/foreign/MemorySegment;",
         |ctx, _args| {
-            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2)?;
+            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
             ctx.set_field(seg, 0, Value::Long(0));
             ctx.set_field(seg, 1, Value::Long(0));
             Ok(Some(Value::Object(Some(seg))))
@@ -2084,7 +2083,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/foreign/MemorySegment$Scope;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(p67_receiver_session(ctx, this)?))
+                Ok(Some(p67_receiver_session(ctx, this)))
             },
         );
     }
@@ -2097,7 +2096,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_BYTE",
         "Ljava/lang/foreign/ValueLayout$OfByte;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfByte", 1, 1)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfByte", 1, 1);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2106,7 +2105,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_BOOLEAN",
         "Ljava/lang/foreign/ValueLayout$OfBoolean;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfBoolean", 1, 1)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfBoolean", 1, 1);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2115,7 +2114,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_CHAR",
         "Ljava/lang/foreign/ValueLayout$OfChar;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfChar", 2, 2)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfChar", 2, 2);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2124,7 +2123,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_SHORT",
         "Ljava/lang/foreign/ValueLayout$OfShort;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfShort", 2, 2)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfShort", 2, 2);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2133,7 +2132,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_INT",
         "Ljava/lang/foreign/ValueLayout$OfInt;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfInt", 4, 4)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfInt", 4, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2142,7 +2141,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_LONG",
         "Ljava/lang/foreign/ValueLayout$OfLong;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2151,7 +2150,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_FLOAT",
         "Ljava/lang/foreign/ValueLayout$OfFloat;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfFloat", 4, 4)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfFloat", 4, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2160,7 +2159,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "JAVA_DOUBLE",
         "Ljava/lang/foreign/ValueLayout$OfDouble;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfDouble", 8, 8)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/ValueLayout$OfDouble", 8, 8);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2169,7 +2168,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "ADDRESS",
         "Ljava/lang/foreign/AddressLayout;",
         |ctx, _args| {
-            let obj = p67_layout_object(ctx, "java/lang/foreign/AddressLayout", 8, 8)?;
+            let obj = p67_layout_object(ctx, "java/lang/foreign/AddressLayout", 8, 8);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2194,7 +2193,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             class,
             "varHandle",
             "()Ljava/lang/invoke/VarHandle;",
-            |ctx, args| Ok(Some(p67_var_handle(ctx, args)?)),
+            |ctx, args| Ok(Some(p67_var_handle(ctx, args))),
         );
     }
     for (class, specific_desc) in [
@@ -2488,7 +2487,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             }
             let total_size = ((offset + max_align - 1) / max_align) * max_align;
             let members_pin = ctx.pin_native_root(members);
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/StructLayout", 4);
             let members = ctx.read_native_pin(members_pin, members);
             ctx.set_field(obj, 0, Value::Long(total_size));
             ctx.set_field(obj, 1, Value::Long(max_align));
@@ -2507,7 +2506,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 1)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SequenceLayout", 1);
             ctx.set_field(obj, 0, Value::Long(count));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2517,7 +2516,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "unionLayout",
         "([Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/UnionLayout;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/UnionLayout", 1)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/UnionLayout", 1);
             ctx.set_field(obj, 0, Value::Long(0));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2531,7 +2530,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/PaddingLayout", 1)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/PaddingLayout", 1);
             ctx.set_field(obj, 0, Value::Long(size));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2577,7 +2576,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     .resolve_field_index("java/util/ArrayList", "size")
                     .unwrap_or(1);
                 let n_fields = std::cmp::max(data_slot, size_slot) + 1;
-                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields)?;
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", n_fields);
                 let members = ctx.read_native_pin(members_pin, members);
                 ctx.set_field(list, data_slot, Value::Object(Some(members)));
                 ctx.set_field(list, size_slot, Value::Int(len as i32));
@@ -2642,7 +2641,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(size)) => *size,
                 _ => 0,
             };
-            let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
             ctx.set_field(seg, 0, ctx.get_field(this, 0));
             ctx.set_field(seg, 1, Value::Long(size));
             ctx.set_field(seg, 2, ctx.get_field(this, 2));
@@ -2714,7 +2713,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "nativeLinker",
         "()Ljava/lang/foreign/Linker;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Linker", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2723,7 +2722,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "defaultLookup",
         "()Ljava/lang/foreign/SymbolLookup;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
             ctx.set_field(obj, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2770,7 +2769,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                     args.get(3).is_some()
                 );
             }
-            let dh = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5)?;
+            let dh = alloc_concurrent_synthetic(ctx, "java/lang/foreign/DowncallHandle", 5);
             ctx.set_field(dh, 0, Value::Long(fn_addr));
             ctx.set_field(dh, 1, Value::Object(Some(descriptor)));
             ctx.set_field(dh, 2, Value::Long(variadic_fixed));
@@ -2817,7 +2816,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(arr))) => *arr,
                 _ => ctx.new_array(ArrayElementType::Reference, 0),
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
             ctx.set_field(obj, 0, Value::Object(Some(return_layout)));
             ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))
@@ -2832,7 +2831,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(arr))) => *arr,
                 _ => ctx.new_array(ArrayElementType::Reference, 0),
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/FunctionDescriptor", 2);
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Object(Some(params)));
             Ok(Some(Value::Object(Some(obj))))

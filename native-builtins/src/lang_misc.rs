@@ -713,7 +713,7 @@ pub(crate) fn native_init_stack_trace_elements(
     // [0], `main` last) instead of being upside-down.
     let mut filled = 0usize;
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().take(cap).enumerate() {
-        let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
+        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
             Some(cid) => crate::lang_class::dotted_class_name(ctx.vm_identity(), cid, cls_slashed),
             None => std::sync::Arc::from(cls_slashed.replace('/', ".")),
@@ -745,7 +745,7 @@ pub(crate) fn native_init_stack_trace_elements(
     // unify the depth/elements lookup key; tracked separately.)
     if filled < cap {
         for i in filled..cap {
-            let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
+            let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
             fill_stack_trace_element(ctx, ste, "(unknown)", "(unknown)", "(unknown)", None, -1);
             ctx.set_array_element(elements, i, Value::Object(Some(ste)));
         }
@@ -1575,7 +1575,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     // stored trace is outermost-first; getStackTrace() wants index 0 = the
     // throw site (innermost), so fill the array reversed.
     for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().enumerate() {
-        let ste = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4)?;
+        let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         // Reuse the dotted-name cache shared with `Class.getName()` so
         // repeat frames in the same trace (recursion) hit the cached
         // Arc<str> instead of re-allocating.

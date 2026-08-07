@@ -33,7 +33,8 @@ use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::try_alloc_concurrent_synthetic;
+use crate::alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Package names seeded into every synthetic `Module.getPackages()` call.
 ///
@@ -261,7 +262,7 @@ fn module_packages_evict_if_needed(t: &mut std::collections::HashMap<i32, Vec<St
 fn build_boot_layer(
     ctx: &mut dyn NativeContext,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let layer = try_alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT)?;
+    let layer = alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT);
     let layer_pin = ctx.pin_native_root(layer);
 
     let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "layer parents")?;
@@ -306,7 +307,7 @@ fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRe
 
 /// Build a synthetic Module for `name`, bound to the boot layer.
 fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
-    let module = try_alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT)?;
+    let module = alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT);
     let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
     let module = ctx.read_native_pin(pin, module);
@@ -330,7 +331,7 @@ fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Re
     let mut t = module_packages_table().lock().unwrap();
     module_packages_evict_if_needed(&mut t, id);
     t.insert(id, packages);
-    drop(t)?;
+    drop(t);
     Ok(module)
 }
 
@@ -388,10 +389,10 @@ pub(crate) fn native_module_define_module0(
 }
 
 /// Wrap an ObjectRef as `Optional.of(value)`.
-fn wrap_optional_present(ctx: &mut dyn NativeContext, value: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
-    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+fn wrap_optional_present(ctx: &mut dyn NativeContext, value: ObjectRef) -> ObjectRef {
+    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
     ctx.set_field(opt, 0, Value::Object(Some(value)));
-    Ok(opt)
+    opt
 }
 
 /// `ModuleLayer.boot()` — produce the cached boot layer.
@@ -434,7 +435,7 @@ pub(crate) fn native_module_layer_find_module(
         _ => build_boot_layer(ctx)?,
     };
     let module = build_module(ctx, &name, layer_ref)?;
-    let opt = wrap_optional_present(ctx, module)?;
+    let opt = wrap_optional_present(ctx, module);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -665,7 +666,7 @@ fn build_unqualified_export(
     ctx: &mut dyn NativeContext,
     package_name: &str,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let export = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Exports", 4)?;
+    let export = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Exports", 4);
     let export_pin = ctx.pin_native_root(export);
     let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export mods")?;
     let targets = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export targets")?;
@@ -685,7 +686,7 @@ fn build_boot_resolved_module(
     package_names: &[&str],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
     let cfg_pin = ctx.pin_native_root(cfg);
-    let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+    let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
     let md_pin = ctx.pin_native_root(md);
     let module_name = ctx.create_string(name);
     let md = ctx.read_native_pin(md_pin, md);
@@ -731,12 +732,12 @@ fn build_boot_resolved_module(
     ctx.unpin_native_roots(packages_pin);
     ctx.unpin_native_roots(exports_pin);
 
-    let mref = try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
+    let mref = alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
     let mref_pin = ctx.pin_native_root(mref);
     let md = ctx.read_native_pin(md_pin, md);
     ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
 
-    let resolved = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ResolvedModule", 2)?;
+    let resolved = alloc_concurrent_synthetic(ctx, "java/lang/module/ResolvedModule", 2);
     let cfg = ctx.read_native_pin(cfg_pin, cfg);
     let mref = ctx.read_native_pin(mref_pin, mref);
     ctx.set_field_by_name(resolved, "cf", Value::Object(Some(cfg)));
@@ -788,7 +789,7 @@ pub(crate) fn native_module_layer_configuration(
         }
     }
 
-    let cfg = try_alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 5)?;
+    let cfg = alloc_concurrent_synthetic(ctx, "java/lang/module/Configuration", 5);
     let cfg_pin = ctx.pin_native_root(cfg);
 
     let parents = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "parents")?;

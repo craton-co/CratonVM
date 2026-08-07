@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::try_alloc_concurrent_synthetic;
+use crate::alloc_concurrent_synthetic;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::Value;
 
@@ -1284,7 +1284,7 @@ fn native_ssl_context_create_engine(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 3)?;
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 3);
     // Register a fresh TLS state machine for this engine
     let addr = obj.as_ptr() as usize;
     let mut engines = tls_engines().lock().unwrap();
@@ -1296,7 +1296,7 @@ fn native_ssl_context_create_engine_with_host(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> cratonvm_types::error::MethodCallResult {
-    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 3)?;
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 3);
     let addr = obj.as_ptr() as usize;
     let hostname = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),

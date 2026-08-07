@@ -78,7 +78,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // Principal — interned, immutable name; value-equality on name only.
@@ -933,7 +933,7 @@ fn native_subject_get_principals(ctx: &mut dyn NativeContext, args: &[Value]) ->
     }
 
     let principals = subject.get_principals();
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
     // Field 1 = size; track how many we synthesize so downstream code
     // that reflectively reads .size works.
     ctx.set_field(set, 1, Value::Int(principals.len() as i32));
@@ -1596,7 +1596,7 @@ fn native_security_identity_get_roles(
             }
             .into()
         })?;
-    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3)?;
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
     ctx.set_field(set, 1, Value::Int(count as i32));
     Ok(Some(Value::Object(Some(set))))
 }

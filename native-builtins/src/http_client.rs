@@ -47,7 +47,7 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use cratonvm_native_io::eintr::{retry_eintr, EintrIo};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // We read HPACK static-table indices and the RFC 7541 Huffman decoder from
 // `http2.rs` so we can speak HTTP/2 against servers that prefer it after ALPN.
@@ -1281,12 +1281,12 @@ fn alloc_response(
     resp: &WireResponse,
     request: ObjectRef,
     uri: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let out = try_alloc_concurrent_synthetic(
+) -> ObjectRef {
+    let out = alloc_concurrent_synthetic(
         ctx,
         "jdk/internal/net/http/HttpResponseImpl",
         HRS_NUM_FIELDS,
-    )?;
+    );
     ctx.set_field(out, HRS_STATUS, Value::Int(resp.status as i32));
     let body_arr = new_byte_array(ctx, &resp.body);
     ctx.set_field(out, HRS_BODY_BYTES, Value::Object(Some(body_arr)));
@@ -1309,7 +1309,7 @@ fn alloc_response(
     ctx.set_field(out, HRS_URI, Value::Object(Some(uri_str)));
     ctx.set_field(out, HRS_REQUEST, Value::Object(Some(request)));
     ctx.set_field(out, HRS_PREVIOUS, Value::Object(None));
-    Ok(out)
+    out
 }
 
 fn alloc_error_response(
@@ -1325,7 +1325,7 @@ fn alloc_error_response(
         body: msg.as_bytes().to_vec(),
         keep_alive: false,
     };
-    alloc_response(ctx, &resp, request, uri)?
+    alloc_response(ctx, &resp, request, uri)
 }
 
 // ---------------------------------------------------------------------------
@@ -1364,7 +1364,7 @@ fn hci_send_async(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Ok(None) => Value::Object(None),
         Err(_) => Value::Object(None),
     };
-    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
+    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
     // Field 0 = result, field 1 = completion flag, field 2 = exception, field 3 = stage count.
     ctx.set_field(cf, 0, resp_val);
     ctx.set_field(cf, 1, Value::Int(1));
@@ -1408,12 +1408,12 @@ fn do_send(
         follow,
     );
     let resp_obj = match result {
-        Ok(resp) => alloc_response(ctx, &resp, req, &uri)?,
+        Ok(resp) => alloc_response(ctx, &resp, req, &uri),
         Err(e) => alloc_error_response(ctx, req, &uri, &format!("HTTP error: {e}")),
     };
     // If a BodyHandler was supplied, deliver the body via apply(ResponseInfo).
     if let Some(Value::Object(Some(handler))) = body_handler {
-        let info = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$ResponseInfo", 3)?;
+        let info = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$ResponseInfo", 3);
         ctx.set_field(info, 0, ctx.get_field(resp_obj, HRS_STATUS));
         ctx.set_field(info, 1, ctx.get_field(resp_obj, HRS_HEADERS_ARR));
         ctx.set_field(info, 2, ctx.get_field(resp_obj, HRS_VERSION));
@@ -1450,7 +1450,7 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => s,
             _ => ctx.create_string(""),
         };
-        let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 1)?;
+        let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 1);
         ctx.set_field(uri_obj, 0, Value::Object(Some(uri_str)));
         Ok(Some(Value::Object(Some(uri_obj))))
     });
@@ -1469,7 +1469,7 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             ctx.set_field(opt, 0, ctx.get_field(this, HRS_PREVIOUS));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1490,7 +1490,7 @@ fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr_val = ctx.get_field(this, HRS_HEADERS_ARR);
-            let headers_obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 2)?;
+            let headers_obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 2);
             ctx.set_field(headers_obj, 0, arr_val);
             ctx.set_field(headers_obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(headers_obj))))
@@ -1525,19 +1525,19 @@ fn hreq_helpers_register(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => s,
             _ => ctx.create_string(""),
         };
-        let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 1)?;
+        let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 1);
         ctx.set_field(uri_obj, 0, Value::Object(Some(uri_str)));
         Ok(Some(Value::Object(Some(uri_obj))))
     });
     r.register(cls, "version", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, ctx.get_field(this, HRQ_VERSION));
         Ok(Some(Value::Object(Some(opt))))
     });
     r.register(cls, "timeout", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, ctx.get_field(this, HRQ_TIMEOUT_MS));
         Ok(Some(Value::Object(Some(opt))))
     });
@@ -1565,13 +1565,13 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
     );
     r.register(cls, "executor", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, ctx.get_field(this, HCI_EXECUTOR));
         Ok(Some(Value::Object(Some(opt))))
     });
     r.register(cls, "proxy", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, ctx.get_field(this, HCI_PROXY));
         Ok(Some(Value::Object(Some(opt))))
     });
@@ -1581,7 +1581,7 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             ctx.set_field(opt, 0, ctx.get_field(this, HCI_COOKIE_HANDLER));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1593,11 +1593,11 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let timeout = ctx.get_field(this, HCI_CONNECT_TIMEOUT_MS);
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             match timeout {
                 Value::Long(0) => ctx.set_field(opt, 0, Value::Object(None)),
                 Value::Long(ms) => {
-                    let dur = try_alloc_concurrent_synthetic(ctx, "java/time/Duration", 2)?;
+                    let dur = alloc_concurrent_synthetic(ctx, "java/time/Duration", 2);
                     ctx.set_field(dur, 0, Value::Long(ms / 1000));
                     ctx.set_field(dur, 1, Value::Int(((ms % 1000) * 1_000_000) as i32));
                     ctx.set_field(opt, 0, Value::Object(Some(dur)));
@@ -1613,7 +1613,7 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             ctx.set_field(opt, 0, ctx.get_field(this, HCI_AUTHENTICATOR));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1629,7 +1629,7 @@ fn hci_field_accessors_register(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(_)) => Ok(Some(v)),
                 _ => {
                     // Default SSLContext.
-                    let s = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 1)?;
+                    let s = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 1);
                     Ok(Some(Value::Object(Some(s))))
                 }
             }
@@ -2057,7 +2057,7 @@ mod http_client_tests {
             body: b"hello".to_vec(),
             keep_alive: true,
         };
-        let obj = alloc_response(&mut ctx, &resp, req, "http://example.com/")?;
+        let obj = alloc_response(&mut ctx, &resp, req, "http://example.com/");
         assert_eq!(ctx.get_field(obj, HRS_STATUS), Value::Int(200));
         assert_eq!(
             ctx.get_field(obj, HRS_VERSION),

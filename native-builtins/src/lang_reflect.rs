@@ -800,7 +800,7 @@ pub(crate) fn native_method_get_default_value(
         Some(class_id),
         container_loader,
         Some(class_id),
-    )?))
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -978,7 +978,7 @@ pub(crate) fn native_method_get_generic_exception_types(
                         _ => decl,
                     };
                     let _gscope = crate::generics::GenericDeclScope::new(decl);
-                    let v = crate::generics::type_sig_to_java(ctx, t)?;
+                    let v = crate::generics::type_sig_to_java(ctx, t);
                     let arr = ctx.read_native_pin(arr_pin, arr);
                     ctx.set_array_element(arr, i, v);
                 }

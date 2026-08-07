@@ -3212,12 +3212,12 @@ pub(crate) fn native_surefire_system_property_manager_load_properties(
     // layout (`properties` is the only declared field).  Use the
     // standard synthetic allocator so the class is initialised first.
     let wrapper =
-        try_alloc_concurrent_synthetic(ctx, "org/apache/maven/surefire/booter/PropertiesWrapper", 2)?;
+        alloc_concurrent_synthetic(ctx, "org/apache/maven/surefire/booter/PropertiesWrapper", 2);
     // Allocate a tiny placeholder map for the `properties` field so any
     // bytecode that touches the field (not via our overrides) sees a
     // non-null Map. Use a HashMap (well-known to our natives) rather
     // than ConcurrentHashMap to keep the placeholder layout-stable.
-    let placeholder = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?;
+    let placeholder = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8);
     if let Ok(_) =
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(placeholder))])
     {}
@@ -3328,7 +3328,7 @@ pub(crate) fn native_forkedbooter_create_surefire_properties_if_file_exists(
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i32));
     }
-    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.set_field(stream, 1, Value::Int(0));
     ctx.set_field(stream, 2, Value::Int(0));
@@ -3346,10 +3346,10 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
             let obj = if init_ok {
                 match ctx.new_object(class_name) {
                     Ok(Some(Value::Object(Some(o)))) => o,
-                    _ => try_alloc_concurrent_synthetic(ctx, class_name, 0)?,
+                    _ => alloc_concurrent_synthetic(ctx, class_name, 0),
                 }
             } else {
-                try_alloc_concurrent_synthetic(ctx, class_name, 0)?
+                alloc_concurrent_synthetic(ctx, class_name, 0)
             };
             // Use real object allocation + constructor init so surefire's internal
             // processor/channel fields are materialized with the expected layout.
@@ -3818,12 +3818,12 @@ pub(crate) fn native_javac_file_manager_check_not_module_oriented_location(
     Ok(None)
 }
 
-fn javac_empty_array_list(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(javac_array_list_from_values(ctx, &[])?)
+fn javac_empty_array_list(ctx: &mut dyn NativeContext) -> ObjectRef {
+    javac_array_list_from_values(ctx, &[])
 }
 
-fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
-    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -> ObjectRef {
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     let pin_base = ctx.pin_native_root(list);
     let value_pins: Vec<Option<(usize, ObjectRef)>> = values
         .iter()
@@ -3847,7 +3847,7 @@ fn javac_array_list_from_values(ctx: &mut dyn NativeContext, values: &[Value]) -
     ctx.set_field_by_name(list, "elementData", Value::Object(Some(data)));
     ctx.set_field_by_name(list, "size", Value::Int(values.len() as i32));
     ctx.unpin_native_roots(pin_base);
-    Ok(list)
+    list
 }
 
 fn javac_java_file_object_kind_class(ctx: &mut dyn NativeContext) -> Option<Value> {
@@ -3952,7 +3952,7 @@ pub(crate) fn native_javac_file_manager_list(
         if location_name == "CLASS_PATH"
             && (package_name == "java" || package_name.starts_with("java."))
         {
-            return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)?))));
+            return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
         }
         if let Some(module_name) = location_name
             .strip_prefix("SYSTEM_MODULES[")
@@ -3967,10 +3967,10 @@ pub(crate) fn native_javac_file_manager_list(
                     recurse,
                 );
                 if class_names.is_empty() {
-                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)?))));
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
                 }
                 let Some(kind_class) = javac_java_file_object_kind_class(ctx) else {
-                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)?))));
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
                 };
                 let kind_class_pin = match kind_class {
                     Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
@@ -4001,13 +4001,13 @@ pub(crate) fn native_javac_file_manager_list(
                     _ => false,
                 };
                 if !accepts_classes {
-                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)?))));
+                    return Ok(Some(Value::Object(Some(javac_empty_array_list(ctx)))));
                 }
                 // Materialize directly into a pinned Java list. java.lang alone
                 // contains hundreds of classes; retaining every JavaFileObject
                 // in a Rust Vec plus one native pin per entry exhausted the
                 // native-root window before javac reached annotation packages.
-                let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+                let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                 let list_pin = ctx.pin_native_root(list);
                 let data = ctx.new_array(
                     cratonvm_types::ArrayElementType::Reference,

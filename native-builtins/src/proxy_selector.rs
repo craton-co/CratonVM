@@ -48,7 +48,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
-use crate::try_alloc_concurrent_synthetic;
+use crate::alloc_concurrent_synthetic;
 
 // Synthetic field layouts ---------------------------------------------------
 
@@ -417,7 +417,7 @@ fn default_port_for(scheme: &str) -> u16 {
 // Java-side allocation helpers
 // ---------------------------------------------------------------------------
 
-fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16) -> ObjectRef {
     // Wave 3-B² (RE.4): mirror real-JDK layout — slot 0 of the
     // InetSocketAddress holds an `InetSocketAddressHolder`, and the holder
     // stores hostname/addr/port at slots 0/1/2. Without the inner holder,
@@ -425,16 +425,16 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: u16)
     // invokevirtuals `Holder.getPort()`) would dispatch onto the host String
     // and trip `java/lang/String.getPort()` NoSuchMethodError. See the
     // matching helper in `net_phase_e.rs`.
-    let isa = try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2)?;
+    let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 2);
     let holder =
-        try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
+        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
     let h = ctx.create_string(host);
     ctx.set_field(holder, 0, Value::Object(Some(h)));
     ctx.set_field(holder, 1, Value::Object(None));
     ctx.set_field(holder, 2, Value::Int(port as i32));
     ctx.set_field(isa, ISA_HOST, Value::Object(Some(holder)));
     ctx.set_field(isa, ISA_PORT, Value::Int(port as i32));
-    Ok(isa)
+    isa
 }
 
 /// The `java.net.Proxy$Type` enum constant for one of our `PROXY_TYPE` codes.
@@ -476,8 +476,8 @@ fn has_synthetic_proxy_layout(ctx: &mut dyn NativeContext, p: ObjectRef) -> bool
         .any(|f| !f.is_static && f.name == "type")
 }
 
-fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) -> Result<ObjectRef, MethodCallFailed> {
-    let p = try_alloc_concurrent_synthetic(ctx, "java/net/Proxy", 2)?;
+fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) -> ObjectRef {
+    let p = alloc_concurrent_synthetic(ctx, "java/net/Proxy", 2);
     let addr_val = match addr {
         Some(a) => Value::Object(Some(a)),
         None => Value::Object(None),
@@ -495,20 +495,20 @@ fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) 
         }
         ctx.set_field_by_name(p, "sa", addr_val);
     }
-    Ok(p)
+    p
 }
 
-fn alloc_proxy_list(ctx: &mut dyn NativeContext, proxies: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_proxy_list(ctx: &mut dyn NativeContext, proxies: &[ObjectRef]) -> ObjectRef {
     // Build a synthetic ArrayList<Proxy>. We use the same shape the rest of
     // the codebase does: 2 fields = (size, ref-array-storage).
-    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     ctx.set_field(list, 0, Value::Int(proxies.len() as i32));
     let backing = ctx.new_ref_array(ClassId::new(0), proxies.len().max(1));
     for (i, p) in proxies.iter().enumerate() {
         ctx.set_array_element(backing, i, Value::Object(Some(*p)));
     }
     ctx.set_field(list, 1, Value::Object(Some(backing)));
-    Ok(list)
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -558,16 +558,16 @@ fn select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(u) => u,
         None => {
             // Unparseable URI — return a NO_PROXY list per spec.
-            let np = alloc_proxy(ctx, PROXY_TYPE_DIRECT, None)?;
-            let list = alloc_proxy_list(ctx, &[np])?;
+            let np = alloc_proxy(ctx, PROXY_TYPE_DIRECT, None);
+            let list = alloc_proxy_list(ctx, &[np]);
             return Ok(Some(Value::Object(Some(list))));
         }
     };
 
     let settings = read_settings(ctx);
     if non_proxy_hosts_match(&settings, &uri_bits.host, uri_bits.port) {
-        let np = alloc_proxy(ctx, PROXY_TYPE_DIRECT, None)?;
-        let list = alloc_proxy_list(ctx, &[np])?;
+        let np = alloc_proxy(ctx, PROXY_TYPE_DIRECT, None);
+        let list = alloc_proxy_list(ctx, &[np]);
         return Ok(Some(Value::Object(Some(list))));
     }
 
@@ -593,12 +593,12 @@ fn select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
     let proxies = match chosen {
         Some((h, p, kind)) => {
-            let isa = alloc_inet_socket_address(ctx, &h, p)?;
-            vec![alloc_proxy(ctx, kind, Some(isa))?]
+            let isa = alloc_inet_socket_address(ctx, &h, p);
+            vec![alloc_proxy(ctx, kind, Some(isa))]
         }
-        None => vec![alloc_proxy(ctx, PROXY_TYPE_DIRECT, None)?],
+        None => vec![alloc_proxy(ctx, PROXY_TYPE_DIRECT, None)],
     };
-    let list = alloc_proxy_list(ctx, &proxies)?;
+    let list = alloc_proxy_list(ctx, &proxies);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -773,7 +773,7 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
             if let Some(installed) = installed_default_selector(ctx) {
                 return Ok(Some(Value::Object(Some(installed))));
             }
-            let ps = try_alloc_concurrent_synthetic(ctx, DEFAULT_PROXY_SELECTOR, 1)?;
+            let ps = alloc_concurrent_synthetic(ctx, DEFAULT_PROXY_SELECTOR, 1);
             Ok(Some(Value::Object(Some(ps))))
         },
     );

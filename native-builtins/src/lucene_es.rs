@@ -3881,7 +3881,7 @@ pub(crate) fn native_es_shutdown_now(
         ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
     }
     // Return empty list
-    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
     Ok(Some(Value::Object(Some(list))))
 }

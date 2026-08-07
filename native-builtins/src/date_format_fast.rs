@@ -994,7 +994,7 @@ pub(crate) fn register_date_format_fast(r: &mut NativeMethodRegistry) {
                     // Drop the lock before decoding the String: `read_string`
                     // allocates, and an allocation under this lock would put a
                     // GC on the wrong side of it.
-                    drop(cache)?;
+                    drop(cache);
                     let Some(text) = ctx.read_string(pattern_obj) else {
                         return format_via_bytecode(ctx, this, Some(date));
                     };

@@ -106,7 +106,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry, NativeThreadBlock
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -980,7 +980,7 @@ pub fn spawn_io_thread_with_ctx(
         // runs to completion).
         let reclaimed: Box<std::thread::JoinHandle<()>> =
             unsafe { Box::from_raw(raw as *mut std::thread::JoinHandle<()>) };
-        drop(reclaimed)?;
+        drop(reclaimed);
     }
     Ok(handle)
 }
@@ -1187,7 +1187,7 @@ fn native_iot_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if let Some(worker) = iot_worker_mirror(ctx, this) {
         return Ok(Some(Value::Object(Some(worker))));
     }
-    let stub = try_alloc_concurrent_synthetic(ctx, "org/xnio/XnioWorker", 4)?;
+    let stub = alloc_concurrent_synthetic(ctx, "org/xnio/XnioWorker", 4);
     Ok(Some(Value::Object(Some(stub))))
 }
 
@@ -1344,7 +1344,7 @@ fn native_iot_current_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
             // leak). Instead, allocate a fresh mirror shell that carries
             // the thread id/number so later getId() calls can re-resolve
             // through the registry.
-            let mirror = try_alloc_concurrent_synthetic(ctx, CLS_NIO_IO_THREAD, IOT_NUM_SLOTS)?;
+            let mirror = alloc_concurrent_synthetic(ctx, CLS_NIO_IO_THREAD, IOT_NUM_SLOTS);
             ctx.set_field_by_name(mirror, "id", Value::Long(handle.id as i64));
             ctx.set_field_by_name(mirror, "number", Value::Int(handle.id as i32));
             ctx.set_field_by_name(mirror, "state", Value::Int(STATE_RUNNING));
@@ -1419,7 +1419,7 @@ fn make_key_mirror(
     ctx: &mut dyn NativeContext,
     task_id: u64,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let key = try_alloc_concurrent_synthetic(ctx, CLS_EXECUTOR_KEY, KEY_NUM_SLOTS)?;
+    let key = alloc_concurrent_synthetic(ctx, CLS_EXECUTOR_KEY, KEY_NUM_SLOTS);
     ctx.set_field(key, KEY_FIELD_TASK_ID, Value::Long(task_id as i64));
     ctx.set_field(key, KEY_FIELD_CANCELLED, Value::Int(0));
     Ok(key)

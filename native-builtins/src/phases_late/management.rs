@@ -651,7 +651,7 @@ pub(crate) fn p59_get_memory_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryMXBean", 0)?;
+    let bean = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryMXBean", 0);
     Ok(Some(Value::Object(Some(bean))))
 }
 
@@ -659,7 +659,7 @@ pub(crate) fn p59_get_thread_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 0)?;
+    let bean = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 0);
     Ok(Some(Value::Object(Some(bean))))
 }
 
@@ -667,12 +667,12 @@ pub(crate) fn p59_get_runtime_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 0)?;
+    let bean = alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 0);
     Ok(Some(Value::Object(Some(bean))))
 }
 
 pub(crate) fn p59_get_os_mxbean(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 0)?;
+    let bean = alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 0);
     Ok(Some(Value::Object(Some(bean))))
 }
 
@@ -680,7 +680,7 @@ pub(crate) fn p59_get_classloading_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 0)?;
+    let bean = alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 0);
     Ok(Some(Value::Object(Some(bean))))
 }
 
@@ -688,12 +688,12 @@ pub(crate) fn p59_get_compilation_mxbean(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let bean = try_alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 0)?;
+    let bean = alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 0);
     Ok(Some(Value::Object(Some(bean))))
 }
 
 pub(crate) fn p59_heap_usage(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let mu = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
+    let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
     let used = ctx.heap_allocated_bytes() as i64;
     let rss = get_process_rss_bytes();
     let committed = if rss > 0 {
@@ -710,7 +710,7 @@ pub(crate) fn p59_heap_usage(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 }
 
 pub(crate) fn p59_nonheap_usage(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let mu = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
+    let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
     // Non-heap: metaspace/code cache estimate
     let rss = get_process_rss_bytes();
     let heap_used = ctx.heap_allocated_bytes() as i64;

@@ -355,7 +355,7 @@ pub(crate) fn register_net_natives(registry: &mut NativeMethodRegistry) {
         "getLoopbackAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
             let host = ctx.create_string("localhost");
             let addr = ctx.create_string("127.0.0.1");
             ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -837,7 +837,7 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             nfields, full
         );
     }
-    let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 6)?;
+    let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
     url_parse(ctx, uri, &full);
     Ok(Some(Value::Object(Some(uri))))
 }
@@ -1488,7 +1488,7 @@ fn native_uri_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 6)?;
+    let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 6);
     url_parse(ctx, uri, &url_str);
     // `url_parse` populates the synthetic *URL* slot layout (by index).
     // `java.net.URI` getters (`getScheme`/`getPath`/`getRawSchemeSpecificPart`)
@@ -1503,7 +1503,7 @@ fn native_uri_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn native_inet_localhost(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let hostname = resolve_real_hostname();
     let ip = resolve_primary_ipv4(&hostname);
-    let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+    let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
     let host_ref = ctx.create_string(&hostname);
     let addr_ref = ctx.create_string(&ip);
     ctx.set_field(ia, 0, Value::Object(Some(host_ref)));
@@ -1555,7 +1555,7 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
     // Handle null/localhost/loopback
     if hostname.is_empty() || hostname == "localhost" {
-        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
         let host = ctx.create_string("localhost");
         let addr = ctx.create_string("127.0.0.1");
         ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1567,7 +1567,7 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if hostname.parse::<std::net::Ipv4Addr>().is_ok()
         || hostname.parse::<std::net::Ipv6Addr>().is_ok()
     {
-        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
         let host = ctx.create_string(&hostname);
         let addr = ctx.create_string(&hostname);
         ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1579,7 +1579,7 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let lookup = format!("{}:0", hostname);
     if let Ok(mut addrs) = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
         if let Some(socket_addr) = addrs.next() {
-            let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
             let host = ctx.create_string(&hostname);
             let addr = ctx.create_string(&socket_addr.ip().to_string());
             ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1611,7 +1611,7 @@ fn native_inet_get_all_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let mut results = Vec::new();
     if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()) {
         for sa in addrs {
-            let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+            let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
             let host = ctx.create_string(&hostname);
             let addr = ctx.create_string(&sa.ip().to_string());
             ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1621,7 +1621,7 @@ fn native_inet_get_all_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }
     if results.is_empty() {
         // At least return localhost
-        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
         let host = ctx.create_string(&hostname);
         let addr = ctx.create_string("127.0.0.1");
         ctx.set_field(ia, 0, Value::Object(Some(host)));
@@ -1800,7 +1800,7 @@ mod new2_net_tests {
     /// Helper: allocate a minimal `InetAddress` synthetic carrying a
     /// hostname / address pair. Mirrors what the real natives produce.
     fn alloc_inet(ctx: &mut MockNativeContext, host: &str, addr: &str) -> ObjectRef {
-        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+        let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
         let h = ctx.create_string(host);
         let a = ctx.create_string(addr);
         ctx.set_field(ia, 0, Value::Object(Some(h)));

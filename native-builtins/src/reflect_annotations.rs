@@ -224,7 +224,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             let handlers = match jul_logger_handlers_get(ctx, logger) {
                 Some(list) => list,
                 None => {
-                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, logger, list);
                     list
@@ -889,14 +889,14 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                 // `concurrenthashmap-newkeyset-returns-a-plain-hashset`
                 // write-up.
                 if cname == "java/util/concurrent/ConcurrentHashMap" {
-                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m);
+                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m)?;
                     return Ok(Some(Value::Object(Some(view))));
                 }
             }
             let _map = map;
             let cap = 16usize;
             // Backing HashMap: slot 0 = buckets, slot 1 = size, slot 2 = capacity.
-            let backing = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+            let backing = crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
             let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
             for i in 0..cap {
                 ctx.set_array_element(buckets, i, Value::Object(None));
@@ -905,7 +905,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
             ctx.set_field(backing, 1, Value::Int(0));
             ctx.set_field(backing, 2, Value::Int(cap as i32));
             // HashSet: slot 0 = backing HashMap.
-            let set = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+            let set = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
             ctx.set_field(set, 0, Value::Object(Some(backing)));
             Ok(Some(Value::Object(Some(set))))
         },
@@ -1140,7 +1140,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // dies. Pin the functional `MH_KIND_CONSTANT` shim ahead of the (broken) JDK
     // bytecode; the companion `check_override` allow-list entry in
     // `vm/src/vm/vm_exec.rs` makes the native win at the call site.
-    crate::lang_invoke::register_method_handles_constant_bridge(registry)?;
+    crate::lang_invoke::register_method_handles_constant_bridge(registry);
 
     // METHODHANDLES.IDENTITY (real-JDK mode): like `constant`, the genuine
     // `MethodHandles.identity` bytecode yields a real
@@ -1148,7 +1148,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // species for primitives) the `MH_KIND_*` shims can't read — so
     // `identity().invoke()`/`.bindTo()` fail. Pin the functional
     // `MH_KIND_IDENTITY` shim (allow-listed in vm_exec.rs).
-    crate::lang_invoke::register_method_handles_identity_bridge(registry)?;
+    crate::lang_invoke::register_method_handles_identity_bridge(registry);
 
     // CALLSITE.DYNAMICINVOKER (real-JDK mode): `CallSite.makeDynamicInvoker`
     // does `getTargetHandle().bindArgumentL(0, this)` — a `BoundMethodHandle`
@@ -1158,7 +1158,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // hangs without this. Pin the functional `MH_KIND_DYNAMIC_INVOKER` shim on
     // `MutableCallSite`/`VolatileCallSite` (allow-listed in vm_exec.rs); it
     // delegates to the call site's current target.
-    crate::lang_invoke::register_callsite_dynamic_invoker_bridge(registry)?;
+    crate::lang_invoke::register_callsite_dynamic_invoker_bridge(registry);
 
     // METHODHANDLE COMBINATOR EXTRAS (real-JDK mode): functional
     // `MethodHandles.insertArguments` + `MethodHandle.asCollector`, and the
@@ -1166,7 +1166,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // natives Groovy's `IndyInterface` fallback construction needs (real
     // bytecode builds `BoundMethodHandle` species / hits a null
     // `MethodTypeForm` cache). Allow-listed in vm_exec.rs.
-    crate::lang_invoke::register_method_handle_combinator_extras_bridge(registry)?;
+    crate::lang_invoke::register_method_handle_combinator_extras_bridge(registry);
 
     // RECORD DESERIALIZATION (real-JDK mode): `ObjectInputStream.readRecord`
     // rebuilds a serialized record by invoking the `MethodHandle` returned by
@@ -1227,32 +1227,35 @@ fn module_builder_alloc_with_named_fields(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     fields: &[(&str, Value)],
-) -> Result<ObjectRef, MethodCallFailed> {
+) -> ObjectRef {
     // Allocate enough slots for the named fields plus a safety margin;
     // `alloc_concurrent_synthetic` widens to the real-JDK field count
     // when the class is loaded.
-    let obj = try_alloc_concurrent_synthetic(ctx, class_name, fields.len().max(4))?;
+    let obj = alloc_concurrent_synthetic(ctx, class_name, fields.len().max(4));
     for (name, value) in fields {
         ctx.set_field_by_name(obj, name, *value);
     }
-    Ok(obj)
+    obj
 }
 
-fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Value {
-    Value::Object(Some(
-        cratonvm_native_collections::make_hashset_with_elements(ctx, &[]),
-    ))
+fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+    Ok(Value::Object(Some(
+        cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?,
+    )))
 }
 
-fn module_builder_set_or_empty(ctx: &mut dyn NativeContext, value: Value) -> Value {
+fn module_builder_set_or_empty(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<Value, MethodCallFailed> {
     match value {
-        Value::Object(Some(_)) => value,
+        Value::Object(Some(_)) => Ok(value),
         _ => module_builder_empty_set(ctx),
     }
 }
 
-pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> ObjectRef {
-    cratonvm_native_collections::make_hashset_with_elements(ctx, &[])
+pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?)
 }
 
 fn module_descriptor_set_field(
@@ -1262,13 +1265,13 @@ fn module_descriptor_set_field(
 ) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx))))),
+        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx)?)))),
     };
     if let Value::Object(Some(v)) = ctx.get_field_by_name(this, field) {
         return Ok(Some(Value::Object(Some(v))));
     }
     let this_pin = ctx.pin_native_root(this);
-    let empty = module_descriptor_empty_set(ctx);
+    let empty = module_descriptor_empty_set(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, field, Value::Object(Some(empty)));
     ctx.unpin_native_roots(this_pin);
@@ -1397,15 +1400,15 @@ fn native_module_builder_new_exports_qualified(
 ) -> MethodCallResult {
     // (Set<Modifier>, String source, Set<String> targets) -> Exports
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets =
-        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)))?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
         &[("mods", mods), ("source", source), ("targets", targets)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1415,14 +1418,14 @@ fn native_module_builder_new_exports_unqualified(
 ) -> MethodCallResult {
     // (Set<Modifier>, String source) -> Exports
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_empty_set(ctx);
+    let targets = module_builder_empty_set(ctx)?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
         &[("mods", mods), ("source", source), ("targets", targets)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1431,15 +1434,15 @@ fn native_module_builder_new_opens_qualified(
     args: &[Value],
 ) -> MethodCallResult {
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets =
-        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)))?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
         &[("mods", mods), ("source", source), ("targets", targets)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1448,14 +1451,14 @@ fn native_module_builder_new_opens_unqualified(
     args: &[Value],
 ) -> MethodCallResult {
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_empty_set(ctx);
+    let targets = module_builder_empty_set(ctx)?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
         &[("mods", mods), ("source", source), ("targets", targets)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1465,14 +1468,14 @@ fn native_module_builder_new_requires_versioned(
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn, String compiledVersion) -> Requires
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Requires",
         &[("mods", mods), ("name", mn), ("compiledVersion", compiled)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1482,13 +1485,13 @@ fn native_module_builder_new_requires_short(
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn) -> Requires
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Requires",
         &[("mods", mods), ("name", mn)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1503,7 +1506,7 @@ fn native_module_builder_new_provides(
         ctx,
         "java/lang/module/ModuleDescriptor$Provides",
         &[("service", service), ("providers", providers)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1517,7 +1520,7 @@ fn native_module_builder_new_version(
         ctx,
         "java/lang/module/ModuleDescriptor$Version",
         &[("version", v)],
-    )?;
+    );
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -1596,7 +1599,7 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // is null in our boot. Allocate a synthetic ModuleDescriptor and copy
     // over the readable Builder state into matching named fields.
     let this = args.first().copied().unwrap_or(Value::Object(None));
-    let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+    let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
     let md_pin = ctx.pin_native_root(md);
     if let Value::Object(Some(builder)) = this {
         for f in [
@@ -1633,7 +1636,7 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             ctx.get_field_by_name(md_current, field),
             Value::Object(Some(_))
         ) {
-            let empty = module_builder_empty_set(ctx);
+            let empty = module_builder_empty_set(ctx)?;
             let md_current = ctx.read_native_pin(md_pin, md);
             ctx.set_field_by_name(md_current, field, empty);
         }
@@ -1839,11 +1842,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
         "ofSystem",
         "()Ljava/lang/module/ModuleFinder;",
         |ctx, _args| {
-            let finder = try_alloc_concurrent_synthetic(
+            let finder = alloc_concurrent_synthetic(
                 ctx,
                 "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
                 4,
-            )?;
+            );
             Ok(Some(Value::Object(Some(finder))))
         },
     );
@@ -1860,11 +1863,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 first_pin = Some(first_pin.map_or(name_pin, |pin: usize| pin.min(name_pin)));
 
                 let mref =
-                    try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
+                    alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
                 let mref_pin = ctx.pin_native_root(mref);
                 first_pin = Some(first_pin.map_or(mref_pin, |pin: usize| pin.min(mref_pin)));
 
-                let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+                let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
                 let name = ctx.read_native_pin(name_pin, name);
                 ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
                 let mref = ctx.read_native_pin(mref_pin, mref);
@@ -1875,7 +1878,7 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 .iter()
                 .map(|(pin, mref)| Value::Object(Some(ctx.read_native_pin(*pin, *mref))))
                 .collect();
-            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements);
+            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements)?;
             if let Some(pin) = first_pin {
                 ctx.unpin_native_roots(pin);
             }
@@ -1905,8 +1908,8 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
             // name and whose `readerSupplier` is left null — `open()` below
             // detects the null supplier and builds a SystemModuleReader.
             let mref =
-                try_alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8)?;
-            let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+                alloc_concurrent_synthetic(ctx, "jdk/internal/module/ModuleReferenceImpl", 8);
+            let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
             ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
             ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
             ctx.invoke(
@@ -1936,11 +1939,11 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
             },
             _ => return Ok(Some(Value::Object(None))),
         };
-        let reader = try_alloc_concurrent_synthetic(
+        let reader = alloc_concurrent_synthetic(
             ctx,
             "jdk/internal/module/SystemModuleFinders$SystemModuleReader",
             4,
-        )?;
+        );
         ctx.set_field_by_name(reader, "module", Value::Object(Some(name)));
         ctx.set_field_by_name(reader, "closed", Value::Int(0));
         Ok(Some(Value::Object(Some(reader))))
@@ -1974,7 +1977,7 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
         // `exports()`, `uses()`, `provides()`, and hash/equals methods without
         // tripping on partially initialized descriptor state. Cache it on the
         // ModuleReference instance.
-        let md = try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16)?;
+        let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
         let md_pin = ctx.pin_native_root(md);
         let name_str = ctx.create_string("synthetic");
         let md = ctx.read_native_pin(md_pin, md);
@@ -2109,7 +2112,7 @@ fn native_attrs_new_map(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Method
     match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
         Some(Value::Object(Some(map))) => Ok(map),
         _ => {
-            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
             Ok(map)
         }
@@ -2138,19 +2141,19 @@ fn native_attrs_name_text(ctx: &dyn NativeContext, name_obj: ObjectRef) -> Optio
     }
 }
 
-fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
+fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(name);
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_field(obj, 0, Value::Object(Some(s)));
     ctx.unpin_native_roots(obj_pin);
-    Ok(obj)
+    obj
 }
 
-fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> ObjectRef {
     match ctx.read_string(key) {
-        Some(name) => native_attrs_make_name(ctx, &name)?,
+        Some(name) => native_attrs_make_name(ctx, &name),
         None => key,
     }
 }
@@ -2190,7 +2193,7 @@ pub(crate) fn native_attrs_put_value(
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_for_value(ctx, key)?;
+    let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
     let value = match value_pin {
         Some(value_pin) => Value::Object(Some(ctx.read_native_pin(
@@ -2237,7 +2240,7 @@ pub(crate) fn native_attrs_get_value(
     let map = native_attrs_ensure_map(ctx, this)?;
     let map_pin = ctx.pin_native_root(map);
     let key = ctx.read_native_pin(key_pin, key);
-    let map_key = native_attrs_key_for_value(ctx, key)?;
+    let map_key = native_attrs_key_for_value(ctx, key);
     let map_key_pin = ctx.pin_native_root(map_key);
     let map = ctx.read_native_pin(map_pin, map);
     let map_key = ctx.read_native_pin(map_key_pin, map_key);
@@ -2408,7 +2411,7 @@ pub(crate) fn native_attrs_name_constant(
     ctx: &mut dyn NativeContext,
     name: &'static str,
 ) -> MethodCallResult {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1)?;
+    let obj = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes$Name", 1);
     let obj_pin = ctx.pin_native_root(obj);
     let s = ctx.create_string(name);
     let obj = ctx.read_native_pin(obj_pin, obj);
@@ -2984,7 +2987,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 (ctx.alloc_object(cid, n), use_real_super, Some(cid))
             }
             ProxyClassOutcome::Degrade => (
-                try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)?,
+                alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
                 false,
                 None,
             ),
@@ -2997,7 +3000,7 @@ fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                     return Err(throw_proxy_failure(ctx, stage));
                 }
                 (
-                    try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3)?,
+                    alloc_concurrent_synthetic(ctx, "java/lang/reflect/Proxy$Instance", 3),
                     false,
                     None,
                 )

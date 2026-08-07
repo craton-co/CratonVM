@@ -411,11 +411,10 @@ mod tests {
     }
 
     impl Drop for PolicyGuard {
-        fn drop(&mut self) -> Result<(), MethodCallFailed> {
+        fn drop(&mut self) {
             uninstall_capabilities(self.vm);
             reset_raw_memory_gate_memo();
-    Ok(())
-}
+        }
     }
 
     fn policy(vm: VmId, mode: CapabilityMode, grants: &str) -> CapabilitySet {
@@ -701,7 +700,7 @@ mod tests {
             ),
             "an fd that can write needs file-write too"
         );
-        drop(guard)?;
+        drop(guard);
 
         let both = format!("file-read:{root};file-write:{root}");
         let _guard = PolicyGuard::install(policy(vm, CapabilityMode::Enforce, &both));

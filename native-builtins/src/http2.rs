@@ -10,7 +10,7 @@
 //! Implements Java HTTP Client API (java.net.http) introduced in Java 11,
 //! with HTTP/2 (RFC 7540) and HPACK header compression (RFC 7541) stubs.
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
@@ -592,10 +592,10 @@ fn is_synthetic_shape(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str)
     ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
 }
 
-fn alloc_http_client(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 10)?;
+fn alloc_http_client(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 10);
     init_http_client_fields(ctx, obj);
-    Ok(obj)
+    obj
 }
 
 fn init_http_client_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
@@ -611,10 +611,10 @@ fn init_http_client_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, CLIENT_POOL_SIZE, Value::Int(DEFAULT_POOL_SIZE));
 }
 
-fn alloc_http_client_builder(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient$Builder", 8)?;
+fn alloc_http_client_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient$Builder", 8);
     init_http_client_builder_fields(ctx, obj);
-    Ok(obj)
+    obj
 }
 
 /// A `Builder` accumulates into the same 8 slots `build()` later copies out
@@ -631,10 +631,10 @@ fn init_http_client_builder_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) 
     ctx.set_field(obj, 7, Value::Int(0));
 }
 
-fn alloc_http_request(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 8)?;
+fn alloc_http_request(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 8);
     init_http_request_fields(ctx, obj);
-    Ok(obj)
+    obj
 }
 
 /// Shared by `HttpRequest` and `HttpRequest$Builder`: both carry the same 8
@@ -652,16 +652,16 @@ fn init_http_request_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, REQ_BODY_LEN, Value::Long(0));
 }
 
-fn alloc_http_request_builder(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 8)?;
+fn alloc_http_request_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 8);
     init_http_request_fields(ctx, obj);
-    Ok(obj)
+    obj
 }
 
-fn alloc_http_response(ctx: &mut dyn NativeContext, status: i32) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 7)?;
+fn alloc_http_response(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 7);
     init_http_response_fields(ctx, obj, status);
-    Ok(obj)
+    obj
 }
 
 fn init_http_response_fields(ctx: &mut dyn NativeContext, obj: ObjectRef, status: i32) {
@@ -679,10 +679,10 @@ fn alloc_http_headers(
     count: i32,
     has_ct: i32,
     has_cl: i32,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 3)?;
+) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 3);
     init_http_headers_fields(ctx, obj, count, has_ct, has_cl);
-    Ok(obj)
+    obj
 }
 
 fn init_http_headers_fields(
@@ -697,10 +697,10 @@ fn init_http_headers_fields(
     ctx.set_field(obj, HDR_HAS_CL, Value::Int(has_cl));
 }
 
-fn alloc_websocket(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/WebSocket", 4)?;
+fn alloc_websocket(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/WebSocket", 4);
     init_websocket_fields(ctx, obj);
-    Ok(obj)
+    obj
 }
 
 fn init_websocket_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
@@ -986,10 +986,10 @@ fn decode_chunked(input: &str) -> String {
     result
 }
 
-fn alloc_body_publisher(ctx: &mut dyn NativeContext, len: i64) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 2)?;
+fn alloc_body_publisher(ctx: &mut dyn NativeContext, len: i64) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 2);
     init_body_publisher_fields(ctx, obj, len);
-    Ok(obj)
+    obj
 }
 
 fn init_body_publisher_fields(ctx: &mut dyn NativeContext, obj: ObjectRef, len: i64) {
@@ -997,10 +997,10 @@ fn init_body_publisher_fields(ctx: &mut dyn NativeContext, obj: ObjectRef, len: 
     ctx.set_field(obj, 1, Value::Int(0)); // type idx
 }
 
-fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
     ctx.set_field(obj, 0, Value::Int(kind));
-    Ok(obj)
+    obj
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,8 +1017,8 @@ fn http2_send_async(
             let req = match args.get(1) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
-                    let resp = alloc_http_response(ctx, 0)?;
-                    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+                    let resp = alloc_http_response(ctx, 0);
+                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
                     return Ok(Some(Value::Object(Some(cf))));
@@ -1032,8 +1032,8 @@ fn http2_send_async(
             let uri_obj = match ctx.get_field(req, REQ_URI) {
                 Value::Object(Some(u)) => u,
                 _ => {
-                    let resp = alloc_http_response(ctx, 0)?;
-                    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+                    let resp = alloc_http_response(ctx, 0);
+                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
                     return Ok(Some(Value::Object(Some(cf))));
@@ -1042,8 +1042,8 @@ fn http2_send_async(
             let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
                 Some(parts) => parts,
                 None => {
-                    let resp = alloc_http_response(ctx, 0)?;
-                    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+                    let resp = alloc_http_response(ctx, 0);
+                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
                     return Ok(Some(Value::Object(Some(cf))));
@@ -1066,14 +1066,14 @@ fn http2_send_async(
             };
             let resp = match result {
                 Ok((status, body)) => {
-                    let r = alloc_http_response(ctx, status)?;
+                    let r = alloc_http_response(ctx, status);
                     let body_str = ctx.create_string(&body);
                     ctx.set_field(r, RESP_BODY_OBJ, Value::Object(Some(body_str)));
                     r
                 }
-                Err(_) => alloc_http_response(ctx, 0)?,
+                Err(_) => alloc_http_response(ctx, 0),
             };
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
             ctx.set_field(cf, 0, Value::Object(Some(resp)));
             ctx.set_field(cf, 1, Value::Int(1)); // completed
             Ok(Some(Value::Object(Some(cf))))
@@ -1127,7 +1127,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "newHttpClient",
         "()Ljava/net/http/HttpClient;",
         |ctx, _args| {
-            let obj = alloc_http_client(ctx)?;
+            let obj = alloc_http_client(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1138,7 +1138,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpClient$Builder;",
         |ctx, _args| {
-            let bld = alloc_http_client_builder(ctx)?;
+            let bld = alloc_http_client_builder(ctx);
             Ok(Some(Value::Object(Some(bld))))
         },
     );
@@ -1153,7 +1153,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
             let req = match args.get(1) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
-                    let resp = alloc_http_response(ctx, 0)?;
+                    let resp = alloc_http_response(ctx, 0);
                     return Ok(Some(Value::Object(Some(resp))));
                 }
             };
@@ -1170,7 +1170,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(u)) => u,
                 _ => {
                     // No URI — return a synthetic 0-status response
-                    let resp = alloc_http_response(ctx, 0)?;
+                    let resp = alloc_http_response(ctx, 0);
                     return Ok(Some(Value::Object(Some(resp))));
                 }
             };
@@ -1179,7 +1179,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
             let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
                 Some(parts) => parts,
                 None => {
-                    let resp = alloc_http_response(ctx, 0)?;
+                    let resp = alloc_http_response(ctx, 0);
                     return Ok(Some(Value::Object(Some(resp))));
                 }
             };
@@ -1210,7 +1210,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
             };
             match result {
                 Ok((status, body)) => {
-                    let resp = alloc_http_response(ctx, status)?;
+                    let resp = alloc_http_response(ctx, status);
                     let body_str = ctx.create_string(&body);
                     // Store body string on a dedicated field — we use RESP_HAS_PREV (3)
                     // as body_obj since it's unused for real responses
@@ -1224,7 +1224,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 }
                 Err(_e) => {
                     // Connection failed — return status 0 to signal error
-                    let resp = alloc_http_response(ctx, 0)?;
+                    let resp = alloc_http_response(ctx, 0);
                     return Ok(Some(Value::Object(Some(resp))));
                 }
             }
@@ -1289,7 +1289,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Long(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 2);
             ctx.set_field(opt, 0, Value::Int(if ms > 0 { 1 } else { 0 }));
             ctx.set_field(opt, 1, Value::Long(ms));
             Ok(Some(Value::Object(Some(opt))))
@@ -1319,7 +1319,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, Value::Int(has));
         Ok(Some(Value::Object(Some(opt))))
     });
@@ -1335,7 +1335,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             ctx.set_field(opt, 0, Value::Int(has));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1348,7 +1348,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
         ctx.set_field(opt, 0, Value::Int(has));
         Ok(Some(Value::Object(Some(opt))))
     });
@@ -1364,7 +1364,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             ctx.set_field(opt, 0, Value::Int(has));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -1376,7 +1376,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "sslContext",
         "()Ljavax/net/ssl/SSLContext;",
         |ctx, _args| {
-            let ssl = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 4)?;
+            let ssl = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 4);
             ctx.set_field(ssl, 0, Value::Int(2)); // TLSv1.3
             ctx.set_field(ssl, 1, Value::Int(1)); // initialized
             Ok(Some(Value::Object(Some(ssl))))
@@ -1389,7 +1389,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "sslParameters",
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, _args| {
-            let params = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4)?;
+            let params = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4);
             ctx.set_field(params, 0, Value::Int(0));
             ctx.set_field(params, 1, Value::Int(0));
             ctx.set_field(params, 2, Value::Int(0));
@@ -1404,7 +1404,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         "newWebSocketBuilder",
         "()Ljava/net/http/WebSocket$Builder;",
         |ctx, _args| {
-            let bld = try_alloc_concurrent_synthetic(ctx, "java/net/http/WebSocket$Builder", 3)?;
+            let bld = alloc_concurrent_synthetic(ctx, "java/net/http/WebSocket$Builder", 3);
             ctx.set_field(bld, 0, Value::Int(0)); // subprotocols set
             ctx.set_field(bld, 1, Value::Long(0)); // connect timeout
             ctx.set_field(bld, 2, Value::Int(0)); // header count
@@ -1591,7 +1591,7 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
     // build() -> HttpClient
     r.register(cls, "build", "()Ljava/net/http/HttpClient;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let client = alloc_http_client(ctx)?;
+        let client = alloc_http_client(ctx);
         // Copy builder fields into client
         for i in 0..8usize {
             let field_val = ctx.get_field(this, i);
@@ -1641,7 +1641,7 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpRequest$Builder;",
         |ctx, _args| {
-            let bld = alloc_http_request_builder(ctx)?;
+            let bld = alloc_http_request_builder(ctx);
             Ok(Some(Value::Object(Some(bld))))
         },
     );
@@ -1652,7 +1652,7 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
-            let bld = alloc_http_request_builder(ctx)?;
+            let bld = alloc_http_request_builder(ctx);
             let uri_val = args.get(0).copied().unwrap_or(Value::Object(None));
             ctx.set_field(bld, REQ_URI, uri_val);
             Ok(Some(Value::Object(Some(bld))))
@@ -1688,7 +1688,7 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => 0,
             };
-            let hdrs = alloc_http_headers(ctx, count, 0, 0)?;
+            let hdrs = alloc_http_headers(ctx, count, 0, 0);
             Ok(Some(Value::Object(Some(hdrs))))
         },
     );
@@ -1704,14 +1704,14 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 2);
             ctx.set_field(opt, 0, Value::Int(has_body));
             if has_body == 1 {
                 let len = match ctx.get_field(this, REQ_BODY_LEN) {
                     Value::Long(n) => n,
                     _ => 0,
                 };
-                let bp = alloc_body_publisher(ctx, len)?;
+                let bp = alloc_body_publisher(ctx, len);
                 ctx.set_field(opt, 1, Value::Object(Some(bp)));
             }
             Ok(Some(Value::Object(Some(opt))))
@@ -1725,7 +1725,7 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
             Value::Long(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 2);
         ctx.set_field(opt, 0, Value::Int(if ms > 0 { 1 } else { 0 }));
         ctx.set_field(opt, 1, Value::Long(ms));
         Ok(Some(Value::Object(Some(opt))))
@@ -1748,7 +1748,7 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 2);
         ctx.set_field(opt, 0, Value::Int(if ver != 0 { 1 } else { 0 }));
         ctx.set_field(opt, 1, Value::Int(if ver > 0 { ver - 1 } else { 0 }));
         Ok(Some(Value::Object(Some(opt))))
@@ -1979,7 +1979,7 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpRequest;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let req = alloc_http_request(ctx)?;
+            let req = alloc_http_request(ctx);
             for i in 0..8usize {
                 let v = ctx.get_field(this, i);
                 ctx.set_field(req, i, v);
@@ -2042,14 +2042,14 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
         "headers",
         "()Ljava/net/http/HttpHeaders;",
         |ctx, _args| {
-            let hdrs = alloc_http_headers(ctx, 2, 1, 1)?;
+            let hdrs = alloc_http_headers(ctx, 2, 1, 1);
             Ok(Some(Value::Object(Some(hdrs))))
         },
     );
 
     // uri() -> URI
     r.register(cls, "uri", "()Ljava/net/URI;", |ctx, _args| {
-        let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 2)?;
+        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 2);
         ctx.set_field(uri, 0, Value::Int(0));
         ctx.set_field(uri, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(uri))))
@@ -2077,7 +2077,7 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpRequest;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let req = alloc_http_request(ctx)?;
+            let req = alloc_http_request(ctx);
             let m = match ctx.get_field(this, RESP_METHOD) {
                 Value::Int(n) => n,
                 _ => METHOD_GET,
@@ -2098,7 +2098,7 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => 0,
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
             ctx.set_field(opt, 0, Value::Int(has));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -2111,10 +2111,10 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 2);
         ctx.set_field(opt, 0, Value::Int(has));
         if has == 1 {
-            let ssl = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6)?;
+            let ssl = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6);
             ctx.set_field(opt, 1, Value::Object(Some(ssl)));
         }
         Ok(Some(Value::Object(Some(opt))))
@@ -2164,7 +2164,7 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
             let match_name = queried.to_lowercase();
             let count = if match_name == "content-type" && has_ct == 1 {
                 1
@@ -2198,7 +2198,7 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 2)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 2);
             let lower = queried.to_lowercase();
             if lower == "content-type" && has_ct == 1 {
                 let sv = ctx.create_string("application/json");
@@ -2231,7 +2231,7 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/OptionalLong", 2)?;
+            let opt = alloc_concurrent_synthetic(ctx, "java/util/OptionalLong", 2);
             if queried.to_lowercase() == "content-length" && has_cl == 1 {
                 ctx.set_field(opt, 0, Value::Int(1));
                 ctx.set_field(opt, 1, Value::Long(20));
@@ -2250,7 +2250,7 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
             Value::Int(n) => n,
             _ => 0,
         };
-        let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2)?;
+        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 2);
         ctx.set_field(map, 0, Value::Int(count));
         ctx.set_field(map, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(map))))
@@ -2293,7 +2293,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
                 }
                 _ => 0,
             };
-            let bp = alloc_body_publisher(ctx, len)?;
+            let bp = alloc_body_publisher(ctx, len);
             Ok(Some(Value::Object(Some(bp))))
         },
     );
@@ -2308,7 +2308,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(n)) => *n as i64,
                 _ => 0,
             };
-            let bp = alloc_body_publisher(ctx, len)?;
+            let bp = alloc_body_publisher(ctx, len);
             Ok(Some(Value::Object(Some(bp))))
         },
     );
@@ -2319,7 +2319,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         "ofFile",
         "(Ljava/nio/file/Path;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let bp = alloc_body_publisher(ctx, -1)?; // unknown length
+            let bp = alloc_body_publisher(ctx, -1); // unknown length
             Ok(Some(Value::Object(Some(bp))))
         },
     );
@@ -2330,7 +2330,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         "ofInputStream",
         "(Ljava/util/function/Supplier;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let bp = alloc_body_publisher(ctx, -1)?;
+            let bp = alloc_body_publisher(ctx, -1);
             Ok(Some(Value::Object(Some(bp))))
         },
     );
@@ -2341,7 +2341,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         "noBody",
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let bp = alloc_body_publisher(ctx, 0)?;
+            let bp = alloc_body_publisher(ctx, 0);
             Ok(Some(Value::Object(Some(bp))))
         },
     );
@@ -2431,7 +2431,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         "ofString",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_body_handler(ctx, 0)?;
+            let bh = alloc_body_handler(ctx, 0);
             Ok(Some(Value::Object(Some(bh))))
         },
     );
@@ -2442,7 +2442,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_body_handler(ctx, 1)?;
+            let bh = alloc_body_handler(ctx, 1);
             Ok(Some(Value::Object(Some(bh))))
         },
     );
@@ -2453,7 +2453,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         "ofFile",
         "(Ljava/nio/file/Path;)Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_body_handler(ctx, 2)?;
+            let bh = alloc_body_handler(ctx, 2);
             Ok(Some(Value::Object(Some(bh))))
         },
     );
@@ -2464,7 +2464,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         "ofLines",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_body_handler(ctx, 3)?;
+            let bh = alloc_body_handler(ctx, 3);
             Ok(Some(Value::Object(Some(bh))))
         },
     );
@@ -2475,7 +2475,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         "discarding",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_body_handler(ctx, 4)?;
+            let bh = alloc_body_handler(ctx, 4);
             Ok(Some(Value::Object(Some(bh))))
         },
     );
@@ -2486,7 +2486,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
         "replacing",
         "(Ljava/lang/Object;)Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = alloc_body_handler(ctx, 5)?;
+            let bh = alloc_body_handler(ctx, 5);
             Ok(Some(Value::Object(Some(bh))))
         },
     );
@@ -2523,7 +2523,7 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;Z)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -2537,7 +2537,7 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;Z)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -2551,7 +2551,7 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -2565,7 +2565,7 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))
@@ -2582,7 +2582,7 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
             // Mark both directions closed
             ctx.set_field(this, WS_STATE, Value::Int(WS_CLOSING));
             ctx.set_field(this, WS_OUTPUT_CLOSED, Value::Int(1));
-            let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
             ctx.set_field(cf, 0, Value::Object(Some(this)));
             ctx.set_field(cf, 1, Value::Int(1));
             Ok(Some(Value::Object(Some(cf))))

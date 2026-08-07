@@ -168,7 +168,7 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 use cratonvm_native_io::eintr::{is_eintr, retry_eintr, EintrIo, EintrStream};
 
 use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Synthetic field layouts used by Phase E.
@@ -886,8 +886,8 @@ pub(crate) fn alloc_inet_address_external(
     ctx: &mut dyn NativeContext,
     host: &str,
     ip: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(alloc_inet_address(ctx, host, ip)?)
+) -> ObjectRef {
+    alloc_inet_address(ctx, host, ip)
 }
 
 /// Mint an `InetAddress` mirror that remembers **no hostName**, the way the JDK
@@ -898,7 +898,7 @@ pub(crate) fn alloc_inet_address_external(
 /// this is directly observable: HotSpot prints `/127.0.0.1` for
 /// `getByName("127.0.0.1")` and `getByAddress(byte[])`, and for every address
 /// the socket layer decodes from a peer's raw IP. CratonVM used to hand
-/// `alloc_inet_address(ip, ip)?` for all of those, which printed
+/// `alloc_inet_address(ip, ip)` for all of those, which printed
 /// `127.0.0.1/127.0.0.1`.
 ///
 /// **This is NOT the same question as "does host equal ip".** The wildcard
@@ -907,8 +907,8 @@ pub(crate) fn alloc_inet_address_external(
 /// get that row backwards. The distinction is "was a name supplied", which is
 /// only decidable HERE, at construction. Sites that want the named wildcard
 /// keep calling [`alloc_inet_address_external`] with an explicit host.
-pub(crate) fn alloc_inet_address_unnamed(ctx: &mut dyn NativeContext, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(alloc_inet_address(ctx, NO_HOST_NAME, ip)?)
+pub(crate) fn alloc_inet_address_unnamed(ctx: &mut dyn NativeContext, ip: &str) -> ObjectRef {
+    alloc_inet_address(ctx, NO_HOST_NAME, ip)
 }
 
 /// Mint a mirror for a RESOLVING entry point (`getByName`, `getAllByName`,
@@ -923,11 +923,11 @@ pub(crate) fn alloc_inet_address_for_input(
     ctx: &mut dyn NativeContext,
     input: &str,
     ip: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
+) -> ObjectRef {
     if host_input_is_numeric_literal(input) {
-        alloc_inet_address(ctx, NO_HOST_NAME, ip)?
+        alloc_inet_address(ctx, NO_HOST_NAME, ip)
     } else {
-        alloc_inet_address(ctx, input, ip)?
+        alloc_inet_address(ctx, input, ip)
     }
 }
 
@@ -1097,7 +1097,7 @@ fn populate_inet_holder(
     ia: ObjectRef,
     host: &str,
     ip: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
+) -> ObjectRef {
     // Cross-call GC-safety (2026-08-04). Every `alloc_concurrent_synthetic` /
     // `create_string` / `new_array` below ALLOCATES, and the first one is
     // especially dangerous: on a cold VM it also loads and initialises
@@ -1122,7 +1122,7 @@ fn populate_inet_holder(
     // Only populate if the class actually declares a `holder` field — i.e.
     // a real-JDK `InetAddress` is loaded. With a purely synthetic stub the
     // field is absent and `set_field_by_name` is a harmless no-op anyway.
-    let holder = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetAddress$InetAddressHolder", 3)?;
+    let holder = alloc_concurrent_synthetic(&mut *scope, "java/net/InetAddress$InetAddressHolder", 3);
     let holder_h = scope.root(holder);
     // An absent hostName must be a genuine `null`, not an empty String: the
     // real-JDK readers test the field for null, not for emptiness.
@@ -1167,7 +1167,7 @@ fn populate_inet_holder(
     // is ever reached. Populate it so the real path resolves v6 correctly.
     if let Ok(std::net::IpAddr::V6(v6)) = parsed {
         let h6 =
-            try_alloc_concurrent_synthetic(&mut *scope, "java/net/Inet6Address$Inet6AddressHolder", 5)?;
+            alloc_concurrent_synthetic(&mut *scope, "java/net/Inet6Address$Inet6AddressHolder", 5);
         let h6_h = scope.root(h6);
         let octets = v6.octets();
         let arr = scope.new_array(ArrayElementType::Byte, octets.len());
@@ -1189,7 +1189,7 @@ fn populate_inet_holder(
         let h6_cur = scope.get(&h6_h);
         scope.set_field_by_name(ia_cur, "holder6", Value::Object(Some(h6_cur)));
     }
-    Ok(scope.get(&ia_h))
+    scope.get(&ia_h)
 }
 
 /// Read one logical InetAddress field (`IA_HOST` or `IA_ADDR`) — side table
@@ -1479,7 +1479,7 @@ fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
     ctx: &mut dyn NativeContext,
     archive: &mut zip::ZipArchive<R>,
     lookup: &str,
-) -> Result<Value, MethodCallFailed> {
+) -> Value {
     let (name, size, csize, method) = match archive.by_name(lookup) {
         Ok(entry) => {
             let name = entry.name().to_string();
@@ -1491,13 +1491,13 @@ fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
         }
         Err(_) => return Value::Object(None),
     };
-    let je = try_alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4)?;
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
     let name_s = ctx.create_string(&name);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
     ctx.set_field(je, 3, Value::Int(method));
-    Ok(Value::Object(Some(je)))
+    Value::Object(Some(je))
 }
 
 /// Parse a `jar:[file:]<path>!/<entry>` external form and return the entry's
@@ -1653,7 +1653,7 @@ fn jmod_zip_entry_name<'a>(disk: &str, entry: &'a str) -> std::borrow::Cow<'a, s
     }
 }
 
-fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value, MethodCallFailed> {
+fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
     let after = match ext
         .strip_prefix("jar:file:")
         .or_else(|| ext.strip_prefix("jar:"))
@@ -1679,7 +1679,7 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value,
             Ok(a) => a,
             Err(_) => return Value::Object(None),
         };
-        return Ok(jar_entry_value_from_archive(ctx, &mut archive, entry_name)?);
+        return jar_entry_value_from_archive(ctx, &mut archive, entry_name);
     }
     let trimmed = jar_raw.trim_start_matches('/');
     let disk = if std::path::Path::new(trimmed).exists() {
@@ -1700,7 +1700,7 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value,
     // Extract the entry metadata into owned values, then drop the `archive`
     // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
     let lookup = jmod_zip_entry_name(&disk, entry_name);
-    Ok(jar_entry_value_from_archive(ctx, &mut archive, &lookup)?)
+    jar_entry_value_from_archive(ctx, &mut archive, &lookup)
 }
 
 /// Recover the originating `jar:…!/entry` URL from a synthetic
@@ -1944,7 +1944,7 @@ fn hotspot_ip_string(ip: &str) -> String {
     }
 }
 
-fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> ObjectRef {
     // Canonicalise the address string to HotSpot's exact textual form (v4-mapped
     // fold + uncompressed IPv6) — see [`hotspot_ip_string`] — so the mirror is an
     // `Inet4Address` with a 4-byte `getAddress()` where appropriate and
@@ -1958,7 +1958,7 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Resu
         Ok(std::net::IpAddr::V6(_)) => "java/net/Inet6Address",
         _ => "java/net/Inet4Address",
     };
-    let ia = try_alloc_concurrent_synthetic(ctx, class_name, 2)?;
+    let ia = alloc_concurrent_synthetic(ctx, class_name, 2);
     // Record host/IP in the ObjectRef-keyed side table — source of truth for
     // the natives we override. Do NOT write bare Strings into instance slots
     // 0/1: those are the real-JDK `holder` reference fields, and a String
@@ -1977,7 +1977,7 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Resu
     // on the pre-GC identity, but that table is a scanned+remapped root
     // (`gc_scan_inet_addr_roots` / `gc_update_inet_addr_refs`), so it follows
     // the relocation on its own.
-    Ok(populate_inet_holder(ctx, ia, host, ip)?)
+    populate_inet_holder(ctx, ia, host, ip)
 }
 
 /// `InetAddress.getByAddress(byte[])` — construct a concrete, layout-correct
@@ -2017,11 +2017,11 @@ fn native_inet_get_by_address(
     // must not remember one — HotSpot prints `/1.2.3.4`. The two-argument
     // factory `getByAddress(String, byte[])` is a different method and keeps
     // its host, however bogus (it is never resolved).
-    let obj = alloc_inet_address_unnamed(ctx, &ip_text)?;
+    let obj = alloc_inet_address_unnamed(ctx, &ip_text);
     Ok(Some(Value::Object(Some(obj))))
 }
 
-fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> Result<ObjectRef, MethodCallFailed> {
+fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> ObjectRef {
     // Wave 3-B² (RE.4): the real JDK `InetSocketAddress.getPort()` is
     //     getfield  holder
     //     invokevirtual InetSocketAddressHolder.getPort()
@@ -2039,13 +2039,13 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32)
     // are rooted and re-read before every write. See `populate_inet_holder`
     // for the failure this shape produced when it was missing.
     let mut scope = NativeHandleScope::new(ctx);
-    let isa = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2)?;
+    let isa = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2);
     let isa_h = scope.root(isa);
-    let holder = try_alloc_concurrent_synthetic(
+    let holder = alloc_concurrent_synthetic(
         &mut *scope,
         "java/net/InetSocketAddress$InetSocketAddressHolder",
         3,
-    )?;
+    );
     let holder_h = scope.root(holder);
     let h = scope.create_string(host);
     let holder_cur = scope.get(&holder_h);
@@ -2055,7 +2055,7 @@ fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32)
     let isa_cur = scope.get(&isa_h);
     scope.set_field(isa_cur, ISA_HOST, Value::Object(Some(holder_cur)));
     scope.set_field(isa_cur, ISA_PORT, Value::Int(port));
-    Ok(isa_cur)
+    isa_cur
 }
 
 /// Like [`alloc_inet_socket_address`], but populates the holder's `addr`
@@ -2074,22 +2074,22 @@ fn alloc_inet_socket_address_resolved(
     host: &str,
     ip: &str,
     port: i32,
-) -> Result<ObjectRef, MethodCallFailed> {
+) -> ObjectRef {
     // Cross-call GC-safety: see `alloc_inet_socket_address`. `alloc_inet_address`
     // in particular runs class initialisation on a cold VM, so everything held
     // across it must be rooted.
     let mut scope = NativeHandleScope::new(ctx);
-    let isa = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2)?;
+    let isa = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 2);
     let isa_h = scope.root(isa);
-    let holder = try_alloc_concurrent_synthetic(
+    let holder = alloc_concurrent_synthetic(
         &mut *scope,
         "java/net/InetSocketAddress$InetSocketAddressHolder",
         3,
-    )?;
+    );
     let holder_h = scope.root(holder);
     let h = scope.create_string(host);
     let h_h = scope.root(h);
-    let addr = alloc_inet_address(&mut *scope, host, ip)?;
+    let addr = alloc_inet_address(&mut *scope, host, ip);
     let addr_h = scope.root(addr);
     let holder_cur = scope.get(&holder_h);
     let h_cur = scope.get(&h_h);
@@ -2100,7 +2100,7 @@ fn alloc_inet_socket_address_resolved(
     let isa_cur = scope.get(&isa_h);
     scope.set_field(isa_cur, ISA_HOST, Value::Object(Some(holder_cur)));
     scope.set_field(isa_cur, ISA_PORT, Value::Int(port));
-    Ok(isa_cur)
+    isa_cur
 }
 
 fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallFailed> {
@@ -2840,8 +2840,8 @@ fn uri_recompose(
 /// real `java.net.URI` slot layout — writing by raw slot index would clobber
 /// e.g. the `path` field (real URI slot 6) with the full URI string and
 /// break `getPath()`/`new File(URI)`.
-fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> ObjectRef {
+    let uri_obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 18);
     let (scheme, authority, path, query, fragment) = uri_split(raw);
     let ssp = {
         let mut s = String::new();
@@ -2883,7 +2883,7 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodC
         "decodedSchemeSpecificPart",
         Value::Object(Some(dssp)),
     );
-    Ok(uri_obj)
+    uri_obj
 }
 
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
@@ -3318,7 +3318,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             );
         }
         // Build a simple 13-field synthetic URL (same layout as p59_alloc_url).
-        let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
+        let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
         let file = if proto.is_empty() {
             &raw[..]
         } else {
@@ -3450,7 +3450,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(Some(this))));
         }
         let recomposed = uri_recompose(&scheme, &authority, &norm, &query, &fragment);
-        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
+        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
     });
 
     // resolve(URI) → RFC 3986 §5.2 reference resolution. The previous
@@ -3471,7 +3471,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
             let resolved = uri_resolve_ref(&base, &reference);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
         },
     );
 
@@ -3489,7 +3489,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
             let resolved = uri_resolve_ref(&base, &reference);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
         },
     );
 
@@ -3526,14 +3526,14 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             }
             let rel = &t_norm[b_norm.len()..];
             if rel.is_empty() {
-                return Ok(Some(Value::Object(Some(make_uri(ctx, "")?))));
+                return Ok(Some(Value::Object(Some(make_uri(ctx, "")))));
             }
             if !b_norm.ends_with('/') && !rel.starts_with('/') {
                 return Ok(Some(Value::Object(Some(other))));
             }
             let rel = rel.strip_prefix('/').unwrap_or(rel);
             let recomposed = uri_recompose(&None, &None, rel, &t_query, &t_frag);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
         },
     );
 
@@ -3583,7 +3583,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
                     "Expected scheme-specific part at index {pos}: {s}"
                 )));
             }
-            Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
         },
     );
 }
@@ -4061,7 +4061,7 @@ fn re1_socket_adaptor_inet(
     // one and the numeric text otherwise, so route through the input-sensitive
     // allocator rather than assuming either.
     let ip = host.trim_matches(&['[', ']'][..]);
-    Ok(Some(alloc_inet_address_for_input(ctx, ip, ip)?))
+    Ok(Some(alloc_inet_address_for_input(ctx, ip, ip)))
 }
 
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
@@ -4526,7 +4526,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             let ip = resolve_host(&host)
                 .map(|i| i.to_string())
                 .unwrap_or_else(|_| host.clone());
-            let ia = alloc_inet_address(ctx, &host, &ip)?;
+            let ia = alloc_inet_address(ctx, &host, &ip);
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -4557,7 +4557,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             if let Some(addr) = re1_socket_adaptor_inet(ctx, this, true)? {
                 return Ok(Some(Value::Object(Some(addr))));
             }
-            let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1")?;
+            let ia = alloc_inet_address(ctx, "localhost", "127.0.0.1");
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -4577,11 +4577,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             // call on the rustls-aware stream adapter instead of treating its
             // high-offset id as a plain raw s2 socket id.
             if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
-                let is = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1)?;
+                let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
                 sock_set_for_create(ctx, is, 0, sid);
                 return Ok(Some(Value::Object(Some(is))));
             }
-            let is = try_alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3)?;
+            let is = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketInputStream", 3);
             // Side-table the stream's owner+sid so we don't depend on field
             // layout (real `Socket$SocketInputStream` has different fields
             // than the synthetic shape: `parent:Socket`, `in:InputStream`).
@@ -4600,11 +4600,11 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 return Err(ioex("Socket.getOutputStream: not connected"));
             }
             if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
-                let os = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1)?;
+                let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
                 sock_set_for_create(ctx, os, 0, sid);
                 return Ok(Some(Value::Object(Some(os))));
             }
-            let os = try_alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3)?;
+            let os = alloc_concurrent_synthetic(ctx, "java/net/Socket$SocketOutputStream", 3);
             stream_owner_set(ctx, os, this);
             Ok(Some(Value::Object(Some(os))))
         },
@@ -5259,7 +5259,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         }
         let lid = s.listener_id;
         let timeout_ms = s.so_timeout;
-        let sock = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 5)?;
+        let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
         sock_set(ctx, sock, |x| {
             x.port = 0;
             x.local_port = 0;
@@ -5468,9 +5468,9 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
                 .map(|parsed| parsed.is_unspecified())
                 .unwrap_or(false);
             let ia = if is_wildcard {
-                alloc_inet_address(ctx, &ip, &ip)?
+                alloc_inet_address(ctx, &ip, &ip)
             } else {
-                alloc_inet_address_unnamed(ctx, &ip)?
+                alloc_inet_address_unnamed(ctx, &ip)
             };
             Ok(Some(Value::Object(Some(ia))))
         },
@@ -5528,7 +5528,7 @@ fn re2_server_socket_local_address(ctx: &mut dyn NativeContext, args: &[Value]) 
     });
     Ok(Some(Value::Object(Some(alloc_inet_socket_address_resolved(
         ctx, &ip, &ip, port,
-    )?))))
+    )))))
 }
 
 /// `isBound()` — true once a bind has succeeded, and true forever after,
@@ -5571,7 +5571,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             // the name "localhost". A numeric literal carries none — HotSpot's
             // `getByName("127.0.0.1").toString()` is `/127.0.0.1` — which is
             // what `alloc_inet_address_for_input` decides.
-            let obj = alloc_inet_address_for_input(ctx, &name, &ip.to_string())?;
+            let obj = alloc_inet_address_for_input(ctx, &name, &ip.to_string());
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5621,7 +5621,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             };
             for (i, ip) in addrs.iter().enumerate() {
                 // Same rule as `getByName` above: a literal keeps no name.
-                let obj = alloc_inet_address_for_input(ctx, &name, ip)?;
+                let obj = alloc_inet_address_for_input(ctx, &name, ip);
                 ctx.set_array_element(arr, i, Value::Object(Some(obj)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -5633,7 +5633,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         "getLoopbackAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let obj = alloc_inet_address(ctx, "localhost", "127.0.0.1")?;
+            let obj = alloc_inet_address(ctx, "localhost", "127.0.0.1");
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5647,7 +5647,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
             let ip = resolve_host(&hostname)
                 .map(|i| i.to_string())
                 .unwrap_or_else(|_| "127.0.0.1".to_string());
-            let obj = alloc_inet_address(ctx, &hostname, &ip)?;
+            let obj = alloc_inet_address(ctx, &hostname, &ip);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -7260,7 +7260,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // Spring Boot's `new File(url.toURI().getSchemeSpecificPart())` path.
         // Layout per http2.rs:
         //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
-        let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
+        let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
         let raw_s = ctx.create_string(&url_str);
         ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
                                                            // Parse scheme.
@@ -7733,7 +7733,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // single-byte reads observe an empty stream even though bulk reads
         // appeared to work, which broke XML resources inherited through a
         // filtered URLClassLoader.
-        let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes)?;
+        let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
         Ok(Some(Value::Object(Some(stream))))
     });
 
@@ -7886,7 +7886,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // was false even though `openStream()` served the right 23755
             // bytes (core.io.ModuleResourceTests.existingClassFileResource).
             if ext.starts_with("jrt:") {
-                let conn = try_alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16)?;
+                let conn = alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16);
                 ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
                 ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
                 ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
@@ -7911,7 +7911,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             } else {
                 "java/net/HttpURLConnection"
             };
-            let conn = try_alloc_concurrent_synthetic(ctx, carrier, 16)?;
+            let conn = alloc_concurrent_synthetic(ctx, carrier, 16);
             // Field HUC_URL holds the originating URL so `huc_url_string`
             // and `getInputStream` can recover its external form.
             ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
@@ -8131,7 +8131,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let ext = jar_url_conn_ext(ctx, this);
-            Ok(Some(jar_url_lookup_entry(ctx, &ext)?))
+            Ok(Some(jar_url_lookup_entry(ctx, &ext)))
         },
     );
     // java/net/JarURLConnection.getEntryName() — the entry path inside the jar
@@ -8825,7 +8825,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 _ => ctx.new_array(ArrayElementType::Byte, 0),
             };
             let len = ctx.array_length(body) as i32;
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
             ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
             ctx.set_field(stream, 1, Value::Int(0)); // pos
             ctx.set_field(stream, 2, Value::Int(0)); // mark
@@ -9559,8 +9559,8 @@ const RE5_BUILDER_COOKIE_HANDLER: usize = 7;
 const RE5_BUILDER_SSL_PARAMETERS: usize = 8;
 const RE5_BUILDER_NUM_FIELDS: usize = 9;
 
-fn re5_alloc_client(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let client = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", RE5_CLIENT_NUM_FIELDS)?;
+fn re5_alloc_client(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let client = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", RE5_CLIENT_NUM_FIELDS);
     ctx.set_field(client, RE5_CLIENT_VERSION, Value::Object(None));
     ctx.set_field(client, RE5_CLIENT_REDIRECT, Value::Object(None));
     for field in [
@@ -9574,19 +9574,19 @@ fn re5_alloc_client(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCall
     ] {
         ctx.set_field(client, field, Value::Object(None));
     }
-    Ok(client)
+    client
 }
 
-fn re5_alloc_client_builder(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    let builder = try_alloc_concurrent_synthetic(
+fn re5_alloc_client_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let builder = alloc_concurrent_synthetic(
         ctx,
         "java/net/http/HttpClient$Builder",
         RE5_BUILDER_NUM_FIELDS,
-    )?;
+    );
     for field in 0..RE5_BUILDER_NUM_FIELDS {
         ctx.set_field(builder, field, Value::Object(None));
     }
-    Ok(builder)
+    builder
 }
 
 fn re5_optional(ctx: &mut dyn NativeContext, value: Value) -> MethodCallResult {
@@ -9709,8 +9709,8 @@ fn re5_build_response(
     headers: &[(String, String)],
     body: &[u8],
     handler_tag: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let out = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", RE5_RESP_NUM_FIELDS)?;
+) -> ObjectRef {
+    let out = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", RE5_RESP_NUM_FIELDS);
     ctx.set_field(out, RE5_RESP_STATUS, Value::Int(status));
     let body_arr = ctx.new_array(ArrayElementType::Byte, body.len());
     for (i, b) in body.iter().enumerate() {
@@ -9725,19 +9725,19 @@ fn re5_build_response(
     ctx.set_field(out, RE5_RESP_HEADERS, Value::Object(Some(hdr_arr)));
     let tag = ctx.create_string(handler_tag);
     ctx.set_field(out, RE5_RESP_HANDLER_TAG, Value::Object(Some(tag)));
-    Ok(out)
+    out
 }
 
 /// Build the synthetic `java.net.http.HttpHeaders` view over a `String[]` of
 /// `"key: value"` lines (the shape both the synthetic `HttpResponse` and the
 /// synthetic `ResponseInfo` carry). The array is pinned across the
 /// allocation so a moving collector can't leave the stored reference stale.
-fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> Result<ObjectRef, MethodCallFailed> {
+fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> ObjectRef {
     let pinned = match hdr_arr {
         Value::Object(Some(a)) => Some((ctx.pin_native_root(a), a)),
         _ => None,
     };
-    let headers = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1)?;
+    let headers = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 1);
     let arr_now = match pinned {
         Some((pin, a)) => Value::Object(Some(ctx.read_native_pin(pin, a))),
         None => Value::Object(None),
@@ -9746,7 +9746,7 @@ fn re5_make_http_headers(ctx: &mut dyn NativeContext, hdr_arr: Value) -> Result<
     if let Some((pin, _)) = pinned {
         ctx.unpin_native_roots(pin);
     }
-    Ok(headers)
+    headers
 }
 
 /// `Flow.Subscription.request(long)` for the one-shot replay subscription
@@ -9877,7 +9877,7 @@ fn re5_drive_body_handler(
 
     // ResponseInfo synthetic: statusCode + the same "key: value" String[]
     // shape the synthetic HttpResponse carries.
-    let ri = try_alloc_concurrent_synthetic(ctx, RE5_RESPONSE_INFO, RE5_RI_NUM_FIELDS)?;
+    let ri = alloc_concurrent_synthetic(ctx, RE5_RESPONSE_INFO, RE5_RI_NUM_FIELDS);
     ctx.set_field(ri, RE5_RI_STATUS, Value::Int(status));
     let ri_pin = ctx.pin_native_root(ri);
     let hdr_arr = ctx.new_ref_array(ClassId::new(0), headers.len());
@@ -9920,7 +9920,7 @@ fn re5_drive_body_handler(
         }
         Some((ctx.pin_native_root(arr), arr))
     };
-    let subscription = try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS)?;
+    let subscription = alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
     {
         let subscriber_now = ctx.read_native_pin(subscriber_pin, subscriber);
         ctx.set_field(
@@ -10206,7 +10206,7 @@ fn re5_collect_publisher_body(
     let collector = Arc::new(Re5PublisherBodyCollector::default());
     re5_body_collectors().lock().insert(id, collector.clone());
 
-    let subscriber = try_alloc_concurrent_synthetic(ctx, RE5_BODY_COLLECTOR_SUBSCRIBER, 1)?;
+    let subscriber = alloc_concurrent_synthetic(ctx, RE5_BODY_COLLECTOR_SUBSCRIBER, 1);
     ctx.set_field(subscriber, 0, Value::Long(id as i64));
     let sub_global = ctx.add_global_root(subscriber);
     let pin = ctx.pin_native_root(publisher);
@@ -10264,7 +10264,7 @@ fn re5_collect_publisher_body(
     let error = state.error.clone();
     let error_obj_root = state.error_obj_root.take();
     let out = state.bytes.clone();
-    drop(state)?;
+    drop(state);
     re5_body_collectors().lock().remove(&id);
     if sub_global != 0 {
         ctx.remove_global_root(sub_global);
@@ -10539,7 +10539,7 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let out = match real_handler {
         None => {
             let tag = handler_tag.unwrap_or_else(|| "inputstream".to_string());
-            re5_build_response(ctx, resp.status, &resp.headers, &resp.body, &tag)?
+            re5_build_response(ctx, resp.status, &resp.headers, &resp.body, &tag)
         }
         Some((handler_pin, handler)) => {
             // Drive the user's BodyHandler protocol against the wire bytes;
@@ -10552,7 +10552,7 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 _ => None,
             };
             let out =
-                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED)?;
+                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED);
             let body_obj_now = match body_obj_pin {
                 Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
                 None => Value::Object(None),
@@ -10652,7 +10652,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newHttpClient",
         "()Ljava/net/http/HttpClient;",
         |ctx, _args| {
-            let obj = re5_alloc_client(ctx)?;
+            let obj = re5_alloc_client(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -10661,7 +10661,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpClient$Builder;",
         |ctx, _args| {
-            let obj = re5_alloc_client_builder(ctx)?;
+            let obj = re5_alloc_client_builder(ctx);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -10669,7 +10669,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     let bld = "java/net/http/HttpClient$Builder";
     r.register(bld, "build", "()Ljava/net/http/HttpClient;", |ctx, args| {
         let builder = obj_arg(args, 0)?;
-        let obj = re5_alloc_client(ctx)?;
+        let obj = re5_alloc_client(ctx);
         for (from, to) in [
             (RE5_BUILDER_VERSION, RE5_CLIENT_VERSION),
             (RE5_BUILDER_REDIRECT, RE5_CLIENT_REDIRECT),
@@ -10958,7 +10958,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "()Ljava/net/http/HttpRequest$Builder;",
         |ctx, _args| {
-            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
+            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5);
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             ctx.set_field(b, 1, Value::Object(None));
@@ -10972,7 +10972,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "newBuilder",
         "(Ljava/net/URI;)Ljava/net/http/HttpRequest$Builder;",
         |ctx, args| {
-            let b = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5)?;
+            let b = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 5);
             let m = ctx.create_string("GET");
             ctx.set_field(b, 0, Value::Object(Some(m)));
             let uri = obj_arg(args, 0)?;
@@ -11190,7 +11190,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
 
     r.register(bl, "build", "()Ljava/net/http/HttpRequest;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let req = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5)?;
+        let req = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 5);
         for i in 0..5 {
             let v = ctx.get_field(this, i);
             ctx.set_field(req, i, v);
@@ -11205,7 +11205,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
             let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
             ctx.set_field(
                 body,
                 0,
@@ -11220,7 +11220,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "()Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
             let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
             let empty = ctx.create_string("");
             ctx.set_field(body, 0, Value::Object(Some(empty)));
             Ok(Some(Value::Object(Some(body))))
@@ -11232,7 +11232,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "([B)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, args| {
             let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
             // Keep the original byte[] rather than round-tripping it through a
             // Java String.  Request builders copy this literal value into their
             // request body slot, and `re5_request_body_bytes` already knows how
@@ -11257,7 +11257,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     ] {
         r.register(bps, "fromPublisher", desc, |ctx, args| {
             let body =
-                try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1)?;
+                alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 1);
             ctx.set_field(
                 body,
                 0,
@@ -11273,7 +11273,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofString",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
             let tag = ctx.create_string("string");
             ctx.set_field(bh, 0, Value::Object(Some(tag)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11284,7 +11284,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "discarding",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
             let tag = ctx.create_string("discarding");
             ctx.set_field(bh, 0, Value::Object(Some(tag)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11298,7 +11298,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofInputStream",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
             let t = ctx.create_string("inputstream");
             ctx.set_field(bh, 0, Value::Object(Some(t)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11309,7 +11309,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         "ofByteArray",
         "()Ljava/net/http/HttpResponse$BodyHandler;",
         |ctx, _args| {
-            let bh = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+            let bh = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$BodyHandler", 1);
             let t = ctx.create_string("bytearray");
             ctx.set_field(bh, 0, Value::Object(Some(t)));
             Ok(Some(Value::Object(Some(bh))))
@@ -11361,7 +11361,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr = ctx.get_field(this, RE5_RESP_HEADERS);
-            let headers = re5_make_http_headers(ctx, arr)?;
+            let headers = re5_make_http_headers(ctx, arr);
             Ok(Some(Value::Object(Some(headers))))
         },
     );
@@ -11380,7 +11380,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let arr = ctx.get_field(this, RE5_RI_HEADERS);
-            let headers = re5_make_http_headers(ctx, arr)?;
+            let headers = re5_make_http_headers(ctx, arr);
             Ok(Some(Value::Object(Some(headers))))
         },
     );
@@ -11514,7 +11514,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             {
                 return Err(ioex(format!("NoSuchAlgorithmException: {proto}")));
             }
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string(&proto);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(0));
@@ -11558,7 +11558,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // a fresh one each time (e.g. OtlpMetricsExportAutoConfigurationTests
             // .whenNoSslBundleDefaultHttpSenderHasDefaultSslContext asserts
             // `httpClient.sslContext()).isSameAs(SSLContext.getDefault())`).
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string("TLS");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
@@ -11693,7 +11693,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                     ctx.identity_hash_code(this)
                 );
             }
-            let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1)?;
+            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
             // Obtaining a factory has no connection scope. The HttpsURLConnection
             // setter captures it later, either as an instance-specific config
@@ -11708,7 +11708,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let f = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1)?;
+            let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(f))))
         },
@@ -11815,7 +11815,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
     ] {
         r.register(ctx_cls, "createSSLEngine", desc, |ctx, args| {
-            let eng0 = try_alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4)?;
+            let eng0 = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
             // Everything below this point allocates (a ReentrantLock, and the
             // peer-host String further down), so `eng` must be pinned and
             // re-read rather than held raw across those calls.
@@ -11888,7 +11888,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // object. Pin across the alloc and read the forwarded address.
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
             let this = ctx.read_native_pin(this_pin, this0);
             ssc_bind(ctx, obj, this, SSC_TAG_CLIENT);
             ctx.unpin_native_roots(this_pin);
@@ -11905,7 +11905,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
             let this = ctx.read_native_pin(this_pin, this0);
             ssc_bind(ctx, obj, this, SSC_TAG_SERVER);
             ctx.unpin_native_roots(this_pin);
@@ -11976,7 +11976,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // cheap, purely in-VM call even though it runs re-entrantly from
             // inside another native.
             if huc_factory_probe_mode() {
-                let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;
+                let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
                 let pin_base = ctx.pin_native_root(sock);
                 let sock = ctx.read_native_pin(pin_base, sock);
                 sock_set(ctx, sock, |s| {
@@ -12094,7 +12094,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
             ctx.end_blocking_region();
             let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
-            let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;
+            let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
             let pin_base = ctx.pin_native_root(sock);
             let sock = ctx.read_native_pin(pin_base, sock);
             sock_set(ctx, sock, |s| {
@@ -12973,7 +12973,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // The UDP socket's own bound address, read back as numeric text.
-            let ia = alloc_inet_address_unnamed(ctx, &addr)?;
+            let ia = alloc_inet_address_unnamed(ctx, &addr);
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -13029,7 +13029,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
                 .unwrap_or_else(|| "0.0.0.0".to_string());
             // The UDP socket's own bound address, read back as numeric text.
-            let ia = alloc_inet_address_unnamed(ctx, &addr)?;
+            let ia = alloc_inet_address_unnamed(ctx, &addr);
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -13183,7 +13183,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             if let Some((oh, op)) = origin.rsplit_once(':') {
                 let port = op.parse::<i32>().unwrap_or(0);
                 // The datagram's origin, as numeric text off the wire.
-                let ia = alloc_inet_address_unnamed(ctx, oh)?;
+                let ia = alloc_inet_address_unnamed(ctx, oh);
                 ctx.set_field(pkt, DP_ADDR, Value::Object(Some(ia)));
                 ctx.set_field(pkt, DP_PORT, Value::Int(port));
             }
@@ -13821,7 +13821,7 @@ const RE8_LOOPBACK_INDEX: i32 = 1;
 ///
 /// GC note: the returned reference is NOT pinned. A caller that allocates again
 /// before using it must pin it across that allocation.
-fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Result<Option<ObjectRef>, MethodCallFailed> {
+fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Option<ObjectRef> {
     let addr_cid = ctx
         .class_id_by_name("java/net/InetAddress")
         .unwrap_or(ClassId::new(0));
@@ -13838,7 +13838,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
         };
         // Allocates several objects, so re-read the array through its pin
         // before storing into it (native stale-local family).
-        let addr = alloc_inet_address(ctx, label, &ip.to_string())?;
+        let addr = alloc_inet_address(ctx, label, &ip.to_string());
         addrs = ctx.read_native_pin(base_pin, addrs);
         ctx.set_array_element(addrs, i, Value::Object(Some(addr)));
     }
@@ -13848,7 +13848,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => {
             ctx.unpin_native_roots(base_pin);
-            return Ok(None);
+            return None;
         }
     };
     let iface_pin = ctx.pin_native_root(iface0);
@@ -13882,7 +13882,7 @@ fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Resul
     ctx.set_field_by_name(iface, "displayName", Value::Object(Some(display)));
     let iface = ctx.read_native_pin(iface_pin, iface0);
     ctx.unpin_native_roots(base_pin);
-    Ok(Some(iface))
+    Some(iface)
 }
 
 /// `getAll()` — one REAL-layout carrier per host interface.
@@ -13903,7 +13903,7 @@ fn re8_all_interfaces(ctx: &mut dyn NativeContext) -> ObjectRef {
     let mut pinned: Vec<(usize, ObjectRef)> = Vec::new();
     let mut base_pin: Option<usize> = None;
     for host in &hosts {
-        if let Some(iface) = re8_make_interface(ctx, host)? {
+        if let Some(iface) = re8_make_interface(ctx, host) {
             let pin = ctx.pin_native_root(iface);
             if base_pin.is_none() {
                 base_pin = Some(pin);
@@ -13954,7 +13954,7 @@ fn re8_find_interface(
         };
     }
     let host = hosts.into_iter().find(select)?;
-    re8_make_interface(ctx, &host)?
+    re8_make_interface(ctx, &host)
 }
 
 /// Build the single REAL-layout loopback `NetworkInterface` ("lo", index 1,
@@ -15145,11 +15145,11 @@ fn re10_dispatch_pending(
                 // authentication gate below dereferences it after every one of
                 // those allocations.
                 let hctx_pin = ctx.pin_native_root(hctx0);
-                let ex0 = try_alloc_concurrent_synthetic(
+                let ex0 = alloc_concurrent_synthetic(
                     ctx,
                     "com/sun/net/httpserver/HttpExchange",
                     HEX_NUM_FIELDS,
-                )?;
+                );
                 let ex_pin = ctx.pin_native_root(ex0);
 
                 let m = ctx.create_string(&req.method);
@@ -15215,7 +15215,7 @@ fn re10_dispatch_pending(
                     Some(sa) => {
                         let ip = sa.ip().to_string();
                         let isa =
-                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32)?;
+                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
                         Value::Object(Some(isa))
                     }
                     None => Value::Object(None),
@@ -15226,7 +15226,7 @@ fn re10_dispatch_pending(
                     Some(sa) => {
                         let ip = sa.ip().to_string();
                         let isa =
-                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32)?;
+                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
                         Value::Object(Some(isa))
                     }
                     None => Value::Object(None),
@@ -15410,10 +15410,10 @@ fn re10_spawn_dispatcher(
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let dbg = crate::nbflags().dbg_httpsrv;
     for idx in 0..HS_DISPATCHER_POOL {
-        let runner = try_alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1)?;
+        let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
         ctx.set_field(runner, 0, Value::Int(server_id));
 
-        let worker = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS)?;
+        let worker = alloc_concurrent_synthetic(ctx, "java/lang/Thread", HS_THREAD_NUM_FIELDS);
         let name = ctx.create_string(&format!("cratonvm-httpserver-dispatch-{server_id}-{idx}"));
         // Populate the worker Thread via the registered
         // `Thread.<init>(ThreadGroup, Runnable, String)` native. This stores the
@@ -15593,7 +15593,7 @@ fn re10_start_server(server_id: i32) -> std::io::Result<()> {
                 match accepted {
                     Ok((stream, _peer)) => {
                         if !state_cl.running.load(Ordering::SeqCst) {
-                            drop(stream)?;
+                            drop(stream);
                             break;
                         }
                         // Parse each connection on its own short-lived thread so a
@@ -15664,7 +15664,7 @@ fn re10_alloc_server(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     bound: Option<(TcpListener, IpAddr, i32)>,
-) -> Result<ObjectRef, MethodCallFailed> {
+) -> ObjectRef {
     let (listener, endpoint) = match bound {
         Some((l, ip, port)) => (Some(l), Some((ip, port))),
         None => (None, None),
@@ -15680,7 +15680,7 @@ fn re10_alloc_server(
         bound_port: AtomicI32::new(bound_port),
     });
     server_registry().lock().insert(server_id, state);
-    let srv0 = try_alloc_concurrent_synthetic(ctx, class_name, 6)?;
+    let srv0 = alloc_concurrent_synthetic(ctx, class_name, 6);
     // `alloc_inet_socket_address_resolved` allocates, so a moving young GC can
     // relocate `srv` between the two — pin it and read the forwarded address
     // back (native stale-local family). The previous inline version wrote its
@@ -15694,7 +15694,7 @@ fn re10_alloc_server(
             let ip_str = ip.to_string();
             Some(alloc_inet_socket_address_resolved(
                 ctx, &ip_str, &ip_str, port,
-            )?)
+            ))
         }
         None => None,
     };
@@ -15706,7 +15706,7 @@ fn re10_alloc_server(
     ctx.set_field(srv, HS_PORT, Value::Int(bound_port));
     ctx.set_field(srv, HS_EXECUTOR, Value::Object(None));
     ctx.unpin_native_roots(srv_pin);
-    Ok(srv)
+    srv
 }
 
 /// `HttpServer.create(InetSocketAddress, int)`.
@@ -15732,7 +15732,7 @@ pub(crate) fn re10_create_server(
         Value::Object(Some(sa)) => Some(re10_open_listener(ctx, sa)?),
         _ => None,
     };
-    let srv = re10_alloc_server(ctx, class_name, bound)?;
+    let srv = re10_alloc_server(ctx, class_name, bound);
     Ok(Some(Value::Object(Some(srv))))
 }
 
@@ -15744,7 +15744,7 @@ pub(crate) fn re10_create_server(
 /// callers (`createContext(String)`, `getAttributes()`, `getServer()`) are
 /// exactly those. See [`re10_create_server`].
 pub(crate) fn re10_create_unbound_server(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let srv = re10_alloc_server(ctx, "com/sun/net/httpserver/HttpServer", None)?;
+    let srv = re10_alloc_server(ctx, "com/sun/net/httpserver/HttpServer", None);
     Ok(Some(Value::Object(Some(srv))))
 }
 
@@ -15783,7 +15783,7 @@ pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Pin `this` across the address allocation (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
     let ip_str = bound_ip.to_string();
-    let sa_echo = alloc_inet_socket_address_resolved(ctx, &ip_str, &ip_str, bound_port)?;
+    let sa_echo = alloc_inet_socket_address_resolved(ctx, &ip_str, &ip_str, bound_port);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, HS_ADDRESS, Value::Object(Some(sa_echo)));
     ctx.set_field(this, HS_PORT, Value::Int(bound_port));
@@ -15945,7 +15945,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // entry, and the context's slot 1, record the live address rather
             // than a vacated from-space slot.
             let h_pin = ctx.pin_native_root(handler0);
-            let hctx0 = try_alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2)?;
+            let hctx0 = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
             let hctx_pin = ctx.pin_native_root(hctx0);
             let path_s = ctx.create_string(&path);
             let hctx = ctx.read_native_pin(hctx_pin, hctx0);
@@ -16061,7 +16061,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        let uri = make_uri(ctx, &raw)?;
+        let uri = make_uri(ctx, &raw);
         Ok(Some(Value::Object(Some(uri))))
     });
     // Request/response headers are stored on the exchange as REAL
@@ -16106,7 +16106,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // `expected:<403> but was:<200>` under -Xmx1g GC pressure). Pin it
             // across the alloc and read the forwarded address back.
             let body_pin = ctx.pin_native_root(body0);
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
             let body = ctx.read_native_pin(body_pin, body0);
             ctx.set_field(stream, 0, Value::Object(Some(body))); // buf
             ctx.set_field(stream, 1, Value::Int(0)); // pos
@@ -16149,11 +16149,11 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             // response body. Pin it across the alloc and read it back forwarded.
             let this0 = obj_arg(args, 0)?;
             let this_pin = ctx.pin_native_root(this0);
-            let out = try_alloc_concurrent_synthetic(
+            let out = alloc_concurrent_synthetic(
                 ctx,
                 "com/sun/net/httpserver/HttpExchange$ResponseBody",
                 2,
-            )?;
+            );
             let this = ctx.read_native_pin(this_pin, this0);
             ctx.set_field(out, 0, Value::Object(Some(this)));
             ctx.set_field(out, 1, Value::Int(0));
@@ -16636,7 +16636,7 @@ mod tests {
         // HotSpot on the same bytes:
         //   getByAddress("example.invalid", bytes) -> example.invalid/fe80:0:0:0:…
         let named =
-            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e")?;
+            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e");
         assert_eq!(
             inet_addr_resolve(&ctx, named),
             Some((
@@ -16733,7 +16733,7 @@ mod tests {
     fn re5_handler_tag_classifies_synthetic_vs_real_handlers() {
         let mut ctx = MockNativeContext::new();
         // Synthetic tagged handler -> its tag.
-        let bh = try_alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+        let bh = alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1);
         let tag = ctx.create_string("string");
         ctx.set_field(bh, 0, Value::Object(Some(tag)));
         assert_eq!(
@@ -16747,11 +16747,11 @@ mod tests {
             Some("inputstream")
         );
         // A real user handler class -> None: drive the real protocol.
-        let real = try_alloc_concurrent_synthetic(
+        let real = alloc_concurrent_synthetic(
             &mut ctx,
             "org/springframework/http/client/JdkClientHttpRequest$DecompressingBodyHandler",
             1,
-        )?;
+        );
         assert_eq!(re5_handler_tag(&ctx, Some(Value::Object(Some(real)))), None);
     }
 
@@ -16779,7 +16779,7 @@ mod tests {
         subscriber: ObjectRef,
     ) -> ObjectRef {
         let subscription =
-            try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS)?;
+            alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS);
         ctx.set_field(
             subscription,
             RE5_SUB_SUBSCRIBER,
@@ -16794,7 +16794,7 @@ mod tests {
     fn re5_replay_subscription_delivers_completion_exactly_once() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
-        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2)?;
+        let subscriber = alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2);
         let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
 
         // Zero / negative demand: nothing delivered.
@@ -16834,7 +16834,7 @@ mod tests {
     fn re5_replay_subscription_cancel_before_demand_suppresses_delivery() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
-        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2)?;
+        let subscriber = alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2);
         let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
 
         re5_replay_subscription_cancel(&mut ctx, &[Value::Object(Some(subscription))]).unwrap();
@@ -16889,7 +16889,7 @@ mod tests {
         for (i, b) in bytes.iter().copied().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
-        let bb = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", 5)?;
+        let bb = alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", 5);
         ctx.set_field(bb, 0, Value::Object(Some(arr)));
         ctx.set_field(bb, 1, Value::Int(0));
         ctx.set_field(bb, 2, Value::Int(bytes.len() as i32));
@@ -16916,7 +16916,7 @@ mod tests {
             _ => return Some(Ok(None)),
         };
         let subscription =
-            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
+            alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
         if let Err(e) = re5_body_collector_on_subscribe(
             ctx,
             &[
@@ -16952,7 +16952,7 @@ mod tests {
             .expect("fromPublisher native is registered");
 
         let mut ctx = MockNativeContext::new();
-        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0)?;
+        let publisher = alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0);
         let body_publisher = match native(&mut ctx, &[Value::Object(Some(publisher))]).unwrap() {
             Some(Value::Object(Some(body_publisher))) => body_publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
@@ -16968,7 +16968,7 @@ mod tests {
     fn re5_request_body_bytes_drives_from_publisher_bytebuffers() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_scripted_publisher_subscribe);
-        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0)?;
+        let publisher = alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0);
 
         let body = re5_request_body_bytes(&mut ctx, Value::Object(Some(publisher))).unwrap();
 
@@ -17315,8 +17315,8 @@ mod tests {
             Some(Value::Object(Some(builder))) => builder,
             other => panic!("newBuilder returned {other:?}"),
         };
-        let executor = try_alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0)?;
-        let proxy = try_alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0)?;
+        let executor = alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0);
+        let proxy = alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0);
 
         for (method, descriptor, value) in [
             (

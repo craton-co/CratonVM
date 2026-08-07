@@ -371,14 +371,14 @@ pub(crate) fn xml_unescape(s: &str) -> String {
 }
 
 /// Build a DOM tree of synthetic objects from a parsed XML tree
-pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> ObjectRef {
     match node {
         XmlNode::Element {
             tag,
             attributes,
             children,
         } => {
-            let elem = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5)?;
+            let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
             // Pin across the string/attr/child allocs below — a moving young
             // GC there would relocate the fresh element/arrays (native
             // stale-local family).
@@ -394,7 +394,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
             );
             let attrs_pin = ctx.pin_native_root(attrs_arr);
             for (i, (name, value)) in attributes.iter().enumerate() {
-                let attr = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 3)?;
+                let attr = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 3);
                 let attr_pin = ctx.pin_native_root(attr);
                 let n = ctx.create_string(name);
                 let n_pin = ctx.pin_native_root(n);
@@ -416,7 +416,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
                 ctx.new_array(cratonvm_types::ArrayElementType::Reference, children.len());
             let children_pin = ctx.pin_native_root(children_arr);
             for (i, child) in children.iter().enumerate() {
-                let child_obj = xml_build_dom(ctx, child)?;
+                let child_obj = xml_build_dom(ctx, child);
                 let children_arr = ctx.read_native_pin(children_pin, children_arr);
                 ctx.set_array_element(children_arr, i, Value::Object(Some(child_obj)));
             }
@@ -429,7 +429,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
             elem_cur
         }
         XmlNode::Text(text) | XmlNode::CData(text) => {
-            let t = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2)?;
+            let t = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2);
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh node (native stale-local family).
             let t_pin = ctx.pin_native_root(t);
@@ -441,7 +441,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
             t
         }
         XmlNode::Comment(text) => {
-            let c = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Comment", 2)?;
+            let c = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Comment", 2);
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh node (native stale-local family).
             let c_pin = ctx.pin_native_root(c);
@@ -473,16 +473,16 @@ pub(crate) fn xml_read_input_stream(ctx: &mut dyn NativeContext, is: ObjectRef) 
 }
 
 /// Parse XML string and build DOM document
-pub(crate) fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str) -> Result<ObjectRef, MethodCallFailed> {
+pub(crate) fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str) -> ObjectRef {
     // Slot 2 carries the DTD-declared ID attributes — see `DOC_ID_ATTRS`.
-    let mut doc = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 3)?;
+    let mut doc = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 3);
     // Pin across the DOM build below — a moving young GC there would relocate
     // the fresh Document (native stale-local family).
     let doc_pin = ctx.pin_native_root(doc);
     let mut id_attributes = Vec::new();
     if let Some((root_node, ids)) = xml_parse_with_ids(xml_text) {
         id_attributes = ids;
-        let root_obj = xml_build_dom(ctx, &root_node)?;
+        let root_obj = xml_build_dom(ctx, &root_node);
         doc = ctx.read_native_pin(doc_pin, doc);
         ctx.set_field(doc, 0, Value::Object(Some(root_obj)));
     } else {
@@ -500,7 +500,7 @@ pub(crate) fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str)
         ctx.set_field(doc, DOC_ID_ATTRS, Value::Object(Some(s)));
     }
     ctx.unpin_native_roots(doc_pin);
-    Ok(doc)
+    doc
 }
 
 /// Document slot 2: the DTD-declared ID attributes, or null when the document
@@ -596,7 +596,7 @@ fn dom_find_by_id(
 }
 
 /// Walk a DOM tree for SAX callbacks
-pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) -> Result<(), MethodCallFailed> {
+pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &XmlNode) {
     // Pin across the string/attr allocs and SAX callbacks below — a moving
     // young GC there would relocate `handler` (native stale-local family).
     let handler_pin = ctx.pin_native_root(handler);
@@ -615,7 +615,7 @@ pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &X
             let qname_pin = ctx.pin_native_root(qname);
             // SAX Attributes = synthetic with attr data
             let sax_attrs =
-                try_alloc_concurrent_synthetic(ctx, "org/xml/sax/helpers/AttributesImpl", 1)?;
+                alloc_concurrent_synthetic(ctx, "org/xml/sax/helpers/AttributesImpl", 1);
             let sax_attrs_pin = ctx.pin_native_root(sax_attrs);
             let attrs_arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
@@ -655,7 +655,7 @@ pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &X
 
             for child in children {
                 let handler_cur = ctx.read_native_pin(handler_pin, handler);
-                sax_walk(ctx, handler_cur, child)?;
+                sax_walk(ctx, handler_cur, child);
             }
 
             let uri2 = ctx.create_string("");
@@ -700,7 +700,6 @@ pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &X
         XmlNode::Comment(_) => {} // SAX doesn't have a default comment handler
     }
     ctx.unpin_native_roots(handler_pin);
-    Ok(())
 }
 
 /// Recursively collect elements matching a tag name
@@ -714,7 +713,7 @@ pub(crate) fn dom_get_elements_by_tag(
     // Pin across the NodeList/array allocs below — a moving young GC there
     // would relocate the collected nodes (native stale-local family).
     let result_pins: Vec<usize> = results.iter().map(|o| ctx.pin_native_root(*o)).collect();
-    let nl = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2)?;
+    let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
     let nl_pin = ctx.pin_native_root(nl);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, results.len());
     let nl = ctx.read_native_pin(nl_pin, nl);
@@ -1141,7 +1140,7 @@ fn xslt_write_result(
     // can move the Result (native stale-local family).
     let result_pin = ctx.pin_native_root(result);
     if class_name.ends_with("DOMResult") {
-        let doc = xml_parse_to_document(ctx, text)?;
+        let doc = xml_parse_to_document(ctx, text);
         let doc_pin = ctx.pin_native_root(doc);
         let result = ctx.read_native_pin(result_pin, result);
         let doc = ctx.read_native_pin(doc_pin, doc);
@@ -1373,10 +1372,10 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "()Ljavax/xml/parsers/DocumentBuilderFactory;",
         |ctx, _args| {
             let obj =
-                try_alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilderFactory", 3)?;
+                alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilderFactory", 3);
             ctx.set_field(obj, 0, Value::Int(0)); // namespaceAware
             ctx.set_field(obj, 1, Value::Int(0)); // validating
-            let features = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+            let features = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))])
                 .ok();
             ctx.set_field(obj, 2, Value::Object(Some(features)));
@@ -1420,7 +1419,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
                 let val_int = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
                 // Store as Boolean wrapper
-                let bool_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
+                let bool_obj = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
                 ctx.set_field(bool_obj, 0, Value::Int(val_int));
                 cratonvm_native_collections::native_map_put_pub(
                     ctx,
@@ -1474,7 +1473,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             } else {
                 0
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilder", 2)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilder", 2);
             if ctx.object_num_fields(obj) > 1 {
                 ctx.set_field(obj, 0, Value::Int(ns));
                 ctx.set_field(obj, 1, Value::Int(validating));
@@ -1494,7 +1493,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(is))) => xml_read_input_stream(ctx, *is),
                 _ => String::new(),
             };
-            let doc = xml_parse_to_document(ctx, &xml_text)?;
+            let doc = xml_parse_to_document(ctx, &xml_text);
             Ok(Some(Value::Object(Some(doc))))
         },
     );
@@ -1512,7 +1511,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let xml_text = std::fs::read_to_string(&path).unwrap_or_default();
-            let doc = xml_parse_to_document(ctx, &xml_text)?;
+            let doc = xml_parse_to_document(ctx, &xml_text);
             Ok(Some(Value::Object(Some(doc))))
         },
     );
@@ -1528,7 +1527,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             };
             let path = uri.strip_prefix("file:").unwrap_or(&uri);
             let xml_text = std::fs::read_to_string(path).unwrap_or_default();
-            let doc = xml_parse_to_document(ctx, &xml_text)?;
+            let doc = xml_parse_to_document(ctx, &xml_text);
             Ok(Some(Value::Object(Some(doc))))
         },
     );
@@ -1537,7 +1536,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newDocument",
         "()Lorg/w3c/dom/Document;",
         |ctx, _args| {
-            let doc = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 2)?;
+            let doc = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 2);
             ctx.set_field(doc, 0, Value::Object(None));
             ctx.set_field(doc, 1, Value::Object(None));
             Ok(Some(Value::Object(Some(doc))))
@@ -1574,10 +1573,10 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/parsers/SAXParserFactory;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParserFactory", 3)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParserFactory", 3);
             ctx.set_field(obj, 0, Value::Int(0));
             ctx.set_field(obj, 1, Value::Int(0));
-            let features = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+            let features = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(features))])
                 .ok();
             ctx.set_field(obj, 2, Value::Object(Some(features)));
@@ -1620,7 +1619,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(features)) = ctx.get_field(this, 2) {
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
                 let val_int = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-                let bool_obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
+                let bool_obj = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
                 ctx.set_field(bool_obj, 0, Value::Int(val_int));
                 cratonvm_native_collections::native_map_put_pub(
                     ctx,
@@ -1664,7 +1663,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             } else {
                 0
             };
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParser", 1)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParser", 1);
             if ctx.object_num_fields(obj) > 0 {
                 ctx.set_field(obj, 0, Value::Int(ns));
             }
@@ -1689,7 +1688,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             };
             if let Some(root) = xml_parse(&xml_text) {
                 let _ = ctx.invoke_virtual(handler, "startDocument", "()V", &[]);
-                sax_walk(ctx, handler, &root)?;
+                sax_walk(ctx, handler, &root);
                 let _ = ctx.invoke_virtual(handler, "endDocument", "()V", &[]);
             }
             Ok(None)
@@ -1714,7 +1713,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             let xml_text = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(root) = xml_parse(&xml_text) {
                 let _ = ctx.invoke_virtual(handler, "startDocument", "()V", &[]);
-                sax_walk(ctx, handler, &root)?;
+                sax_walk(ctx, handler, &root);
                 let _ = ctx.invoke_virtual(handler, "endDocument", "()V", &[]);
             }
             Ok(None)
@@ -1748,7 +1747,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "createElement",
         "(Ljava/lang/String;)Lorg/w3c/dom/Element;",
         |ctx, args| {
-            let elem = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5)?;
+            let elem = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Element", 5);
             ctx.set_field(elem, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             let attrs = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
@@ -1763,7 +1762,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "createTextNode",
         "(Ljava/lang/String;)Lorg/w3c/dom/Text;",
         |ctx, args| {
-            let t = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2)?;
+            let t = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2);
             ctx.set_field(t, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(t, 1, Value::Object(None));
             Ok(Some(Value::Object(Some(t))))
@@ -1839,7 +1838,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             let root = match ctx.get_field(this, 0) {
                 Value::Object(Some(r)) => r,
                 _ => {
-                    let nl = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2)?;
+                    let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     ctx.set_field(nl, 0, Value::Object(Some(arr)));
                     ctx.set_field(nl, 1, Value::Int(0));
@@ -2005,7 +2004,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "()Lorg/w3c/dom/NodeList;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let nl = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2)?;
+            let nl = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NodeList", 2);
             ctx.set_field(nl, 0, ctx.get_field(this, 2)); // children array
             ctx.set_field(nl, 1, ctx.get_field(this, 3)); // child count
             Ok(Some(Value::Object(Some(nl))))
@@ -2065,7 +2064,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "()Lorg/w3c/dom/NamedNodeMap;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let nm = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/NamedNodeMap", 2)?;
+            let nm = alloc_concurrent_synthetic(ctx, "org/w3c/dom/NamedNodeMap", 2);
             let attrs = ctx.get_field(this, 1);
             let len = match attrs {
                 Value::Object(Some(arr)) => ctx.array_length(arr) as i32,
@@ -2292,7 +2291,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/transform/TransformerFactory;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/transform/TransformerFactory", 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/transform/TransformerFactory", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2304,7 +2303,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             // One slot for the output-property map (filled lazily by
             // `setOutputProperty`); no stylesheet, so this is the identity
             // transformer, which is what `newTransformer()` means.
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/transform/Transformer", 1)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/transform/Transformer", 1);
             ctx.set_field(obj, TRANSFORMER_PROPS, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -2331,7 +2330,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
                     let this_pin = ctx.pin_native_root(this);
                     let name_pin = pinned_object_value(ctx, name);
                     let value_pin = pinned_object_value(ctx, value);
-                    let props = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
+                    let props = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
                     let props_pin = ctx.pin_native_root(props);
                     cratonvm_native_collections::native_map_init(
                         ctx,
@@ -2452,7 +2451,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/xpath/XPathFactory;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/xpath/XPathFactory", 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/xpath/XPathFactory", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2461,7 +2460,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newXPath",
         "()Ljavax/xml/xpath/XPath;",
         |ctx, _args| {
-            let obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/xpath/XPath", 0)?;
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/xpath/XPath", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3076,7 +3075,7 @@ pub(crate) fn reflection_deserialize_from_json(
     json: &str,
     class_id: ClassId,
 ) -> Option<ObjectRef> {
-    reflection_deserialize_from_json_depth(ctx, json, class_id, 0)?
+    reflection_deserialize_from_json_depth(ctx, json, class_id, 0)
 }
 
 pub(crate) fn reflection_deserialize_from_json_depth(
@@ -3084,9 +3083,9 @@ pub(crate) fn reflection_deserialize_from_json_depth(
     json: &str,
     class_id: ClassId,
     depth: usize,
-) -> Result<Option<ObjectRef>, MethodCallFailed> {
+) -> Option<ObjectRef> {
     if depth > JSON_MAX_DEPTH || json.len() > JSON_MAX_INPUT_SIZE {
-        return Ok(None);
+        return None;
     }
     let fields = ctx.declared_fields(class_id);
     let instance_fields: Vec<_> = fields.into_iter().filter(|f| !f.is_static).collect();
@@ -3097,10 +3096,10 @@ pub(crate) fn reflection_deserialize_from_json_depth(
         // Match by field name or by @JsonProperty/@SerializedName alias
         let meta = instance_fields.iter().find(|f| {
             if f.name == *key {
-                return Ok(true);
+                return true;
             }
             if let Some(alias) = field_json_name(ctx, class_id, &f.name) {
-                return Ok(alias == *key);
+                return alias == *key;
             }
             false
         });
@@ -3108,11 +3107,11 @@ pub(crate) fn reflection_deserialize_from_json_depth(
             if field_has_json_ignore(ctx, class_id, &meta.name) {
                 continue;
             }
-            let value = json_str_to_value_depth(ctx, val_str, &meta.descriptor, depth + 1)?;
+            let value = json_str_to_value_depth(ctx, val_str, &meta.descriptor, depth + 1);
             ctx.set_field(obj, meta.slot_index, value);
         }
     }
-    Ok(Some(obj))
+    Some(obj)
 }
 
 /// Convert a JSON value string to a JVM Value based on the field descriptor.
@@ -3120,8 +3119,8 @@ pub(crate) fn json_str_to_value(
     ctx: &mut dyn NativeContext,
     val_str: &str,
     descriptor: &str,
-) -> Result<Value, MethodCallFailed> {
-    Ok(json_str_to_value_depth(ctx, val_str, descriptor, 0)?)
+) -> Value {
+    json_str_to_value_depth(ctx, val_str, descriptor, 0)
 }
 
 pub(crate) fn json_str_to_value_depth(
@@ -3129,9 +3128,9 @@ pub(crate) fn json_str_to_value_depth(
     val_str: &str,
     descriptor: &str,
     depth: usize,
-) -> Result<Value, MethodCallFailed> {
+) -> Value {
     if depth > JSON_MAX_DEPTH {
-        return Ok(Value::Object(None));
+        return Value::Object(None);
     }
     let val_str = val_str.trim();
     if val_str == "null" {
@@ -3160,33 +3159,33 @@ pub(crate) fn json_str_to_value_depth(
                 Value::Object(Some(s))
             } else if class_name == "java/lang/Integer" {
                 let n = val_str.parse::<i32>().unwrap_or(0);
-                let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
+                let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
                 ctx.set_field(boxed, 0, Value::Int(n));
                 Value::Object(Some(boxed))
             } else if class_name == "java/lang/Long" {
                 let n = val_str.parse::<i64>().unwrap_or(0);
-                let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
+                let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
                 ctx.set_field(boxed, 0, Value::Long(n));
                 Value::Object(Some(boxed))
             } else if class_name == "java/lang/Float" {
                 let n = val_str.parse::<f32>().unwrap_or(0.0);
-                let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Float", 1)?;
+                let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Float", 1);
                 ctx.set_field(boxed, 0, Value::Float(n));
                 Value::Object(Some(boxed))
             } else if class_name == "java/lang/Double" {
                 let n = val_str.parse::<f64>().unwrap_or(0.0);
-                let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
+                let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
                 ctx.set_field(boxed, 0, Value::Double(n));
                 Value::Object(Some(boxed))
             } else if class_name == "java/lang/Boolean" {
                 let b = if val_str == "true" { 1 } else { 0 };
-                let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
+                let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
                 ctx.set_field(boxed, 0, Value::Int(b));
                 Value::Object(Some(boxed))
             } else if val_str.starts_with("{") {
                 // Nested object — depth-limited deserialization
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
-                    match reflection_deserialize_from_json_depth(ctx, val_str, cid, depth + 1)? {
+                    match reflection_deserialize_from_json_depth(ctx, val_str, cid, depth + 1) {
                         Some(nested) => Value::Object(Some(nested)),
                         None => Value::Object(None),
                     }
@@ -3234,7 +3233,7 @@ pub(crate) fn json_str_to_value_depth(
                 };
                 let arr = ctx.new_array(arr_type, elements.len());
                 for (idx, elem_str) in elements.iter().enumerate() {
-                    let elem_val = json_str_to_value_depth(ctx, elem_str, elem_desc, depth + 1)?;
+                    let elem_val = json_str_to_value_depth(ctx, elem_str, elem_desc, depth + 1);
                     ctx.set_array_element(arr, idx, elem_val);
                 }
                 Value::Object(Some(arr))
@@ -3574,7 +3573,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => {
-                let g = try_alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1)?;
+                let g = alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1);
                 return Ok(Some(Value::Object(Some(g))));
             }
         };
@@ -3582,7 +3581,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v,
             _ => 0,
         };
-        let g = try_alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1)?;
+        let g = alloc_concurrent_synthetic(ctx, "com/google/gson/Gson", 1);
         ctx.set_field(g, GSON_CFG_FIELD, Value::Int(cfg));
         Ok(Some(Value::Object(Some(g))))
     });
@@ -3900,7 +3899,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             let name_ref = match args.get(1) {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
-                    let missing = alloc_json_node(ctx, -1)?; // missing node type
+                    let missing = alloc_json_node(ctx, -1); // missing node type
                     return Ok(Some(Value::Object(Some(missing))));
                 }
             };
@@ -3922,7 +3921,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let missing = alloc_json_node(ctx, -1)?;
+            let missing = alloc_json_node(ctx, -1);
             Ok(Some(Value::Object(Some(missing))))
         },
     );
@@ -3966,7 +3965,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     // A fresh `ObjectNode` is an EMPTY OBJECT node, not a blank slate. Leaving
     // the slots at their allocation defaults leaves JN_TYPE unset, so every
     // accessor above (`isObject`, `size`, `get`, `toString`) reads it as 0 and
-    // reports a NULL node. Stamp the same shape `alloc_json_node(ctx, 1)?`
+    // reports a NULL node. Stamp the same shape `alloc_json_node(ctx, 1)`
     // produces; the keys/children arrays stay null until the first entry is
     // added, since JN_COUNT is what drives the walks.
     r.register(on, "<init>", "()V", |ctx, args| {
@@ -3990,38 +3989,38 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
 }
 
 /// Allocate a JsonNode synthetic object with the given type.
-pub(crate) fn alloc_json_node(ctx: &mut dyn NativeContext, node_type: i32) -> Result<ObjectRef, MethodCallFailed> {
-    let node = try_alloc_concurrent_synthetic(ctx, "com/fasterxml/jackson/databind/JsonNode", 8)?;
+pub(crate) fn alloc_json_node(ctx: &mut dyn NativeContext, node_type: i32) -> ObjectRef {
+    let node = alloc_concurrent_synthetic(ctx, "com/fasterxml/jackson/databind/JsonNode", 8);
     ctx.set_field(node, 0, Value::Int(node_type));
     ctx.set_field(node, 2, Value::Long(0));
     ctx.set_field(node, 3, Value::Int(0));
     ctx.set_field(node, 6, Value::Int(0));
     ctx.set_field(node, 7, Value::Double(0.0));
-    Ok(node)
+    node
 }
 
 /// Build a JsonNode tree from a raw JSON string.
 pub(crate) fn build_json_tree_node(ctx: &mut dyn NativeContext, json: &str) -> ObjectRef {
-    build_json_tree_node_depth(ctx, json, 0)?
+    build_json_tree_node_depth(ctx, json, 0)
 }
 
 pub(crate) fn build_json_tree_node_depth(
     ctx: &mut dyn NativeContext,
     json: &str,
     depth: usize,
-) -> Result<ObjectRef, MethodCallFailed> {
+) -> ObjectRef {
     if depth > JSON_MAX_DEPTH || json.len() > JSON_MAX_INPUT_SIZE {
-        return Ok(alloc_json_node(ctx, 0)?); // null node
+        return alloc_json_node(ctx, 0); // null node
     }
     let trimmed = json.trim();
     if trimmed.is_empty() || trimmed == "null" {
-        return Ok(alloc_json_node(ctx, 0)?);
+        return alloc_json_node(ctx, 0);
     }
     if trimmed.starts_with('{') {
         // Object node
         let pairs = parse_json_object(trimmed);
         let count = pairs.len();
-        let node = alloc_json_node(ctx, 1)?;
+        let node = alloc_json_node(ctx, 1);
         let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
         let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
         for (i, (key, val_str)) in pairs.iter().enumerate() {
@@ -4038,7 +4037,7 @@ pub(crate) fn build_json_tree_node_depth(
             } else {
                 format!("\"{}\"", json_escape(val_str))
             };
-            let child = build_json_tree_node_depth(ctx, &child_json, depth + 1)?;
+            let child = build_json_tree_node_depth(ctx, &child_json, depth + 1);
             ctx.set_array_element(children, i, Value::Object(Some(child)));
         }
         ctx.set_field(node, 4, Value::Object(Some(children)));
@@ -4071,7 +4070,7 @@ pub(crate) fn build_json_tree_node_depth(
             elements.push(val);
         }
         let count = elements.len();
-        let node = alloc_json_node(ctx, 2)?;
+        let node = alloc_json_node(ctx, 2);
         let children = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
         for (idx, elem) in elements.iter().enumerate() {
             let child_json = if elem.starts_with('{') || elem.starts_with('[') {
@@ -4085,7 +4084,7 @@ pub(crate) fn build_json_tree_node_depth(
             } else {
                 format!("\"{}\"", json_escape(elem))
             };
-            let child = build_json_tree_node_depth(ctx, &child_json, depth + 1)?;
+            let child = build_json_tree_node_depth(ctx, &child_json, depth + 1);
             ctx.set_array_element(children, idx, Value::Object(Some(child)));
         }
         ctx.set_field(node, 4, Value::Object(Some(children)));
@@ -4094,23 +4093,23 @@ pub(crate) fn build_json_tree_node_depth(
     } else if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
         // String node
         let inner_str = json_unescape(&trimmed[1..trimmed.len() - 1]);
-        let node = alloc_json_node(ctx, 3)?;
+        let node = alloc_json_node(ctx, 3);
         let s = ctx.create_string(&inner_str);
         ctx.set_field(node, 1, Value::Object(Some(s)));
         node
     } else if trimmed == "true" || trimmed == "false" {
-        let node = alloc_json_node(ctx, 5)?;
+        let node = alloc_json_node(ctx, 5);
         ctx.set_field(node, 3, Value::Int(if trimmed == "true" { 1 } else { 0 }));
         node
     } else if let Ok(n) = trimmed.parse::<i64>() {
-        let node = alloc_json_node(ctx, 4)?;
+        let node = alloc_json_node(ctx, 4);
         ctx.set_field(node, 2, Value::Long(n));
         ctx.set_field(node, 7, Value::Double(n as f64));
         let s = ctx.create_string(trimmed);
         ctx.set_field(node, 1, Value::Object(Some(s)));
         node
     } else if let Ok(f) = trimmed.parse::<f64>() {
-        let node = alloc_json_node(ctx, 4)?;
+        let node = alloc_json_node(ctx, 4);
         ctx.set_field(node, 2, Value::Long(f as i64)); // truncated for asInt()/asLong()
         ctx.set_field(node, 7, Value::Double(f)); // full precision for asDouble()
         let s = ctx.create_string(trimmed);
@@ -4118,7 +4117,7 @@ pub(crate) fn build_json_tree_node_depth(
         node
     } else {
         // Bare string (unquoted) — treat as string
-        let node = alloc_json_node(ctx, 3)?;
+        let node = alloc_json_node(ctx, 3);
         let s = ctx.create_string(trimmed);
         ctx.set_field(node, 1, Value::Object(Some(s)));
         node

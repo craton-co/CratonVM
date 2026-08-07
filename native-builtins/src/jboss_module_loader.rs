@@ -73,7 +73,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, Vm
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::Mutex;
 
-use crate::try_alloc_concurrent_synthetic;
+use crate::alloc_concurrent_synthetic;
 use crate::jboss_module_xml::{parse_module_xml, ModuleXml, ServicesDisposition};
 
 // ===========================================================================
@@ -750,17 +750,17 @@ pub(crate) fn clear_boot_loader_for_test() {
 /// Called both from [`build_default_boot_holder_instance`] and from
 /// the lazy-rebuild path in [`native_loader_load_module`] when the
 /// caller didn't pass a real receiver.
-pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     {
         let slot = boot_loader_slot().lock();
         if let Some((key, cached)) = *slot {
             // Re-read the CURRENT address: the GC remaps the var-handle-root
             // registry entry after a move, not this raw static copy. Contexts
             // without a registry (mocks) fall back to the cached ref.
-            return Ok(ctx.read_var_handle_root(key).unwrap_or(cached));
+            return ctx.read_var_handle_root(key).unwrap_or(cached);
         }
     }
-    let loader = try_alloc_concurrent_synthetic(ctx, CN_MODULE_LOADER, LOADER_FIELD_COUNT)?;
+    let loader = alloc_concurrent_synthetic(ctx, CN_MODULE_LOADER, LOADER_FIELD_COUNT);
     // GC-safety: `create_string` below can trigger a moving GC; `loader` is
     // used again in the following `set_field` unpinned otherwise -- the same
     // "Family 1" stale-ObjectRef pattern as the WildFly boot-crash fixes (see
@@ -784,18 +784,18 @@ pub fn build_local_module_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRe
         // Double-checked locking: another thread may have raced us. (Our
         // orphaned registration is harmless — same trade-off as ASYNC_POOL.)
         if let Some((ekey, existing)) = *slot {
-            return Ok(ctx.read_var_handle_root(ekey).unwrap_or(existing));
+            return ctx.read_var_handle_root(ekey).unwrap_or(existing);
         }
         *slot = Some((key, loader));
     }
-    Ok(loader)
+    loader
 }
 
 /// Allocate the `DefaultBootModuleLoaderHolder.INSTANCE` value.  The
 /// caller (a post-clinit fixup in `vm_util.rs`) writes the result to
 /// the holder's static field.
-pub fn build_default_boot_holder_instance(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
-    Ok(build_local_module_loader(ctx)?)
+pub fn build_default_boot_holder_instance(ctx: &mut dyn NativeContext) -> ObjectRef {
+    build_local_module_loader(ctx)
 }
 
 // ===========================================================================
@@ -825,8 +825,8 @@ fn build_module_object(
     name: &str,
     loader: ObjectRef,
     resolved: &ResolvedModule,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let module = try_alloc_concurrent_synthetic(ctx, CN_MODULE, MOD_FIELD_COUNT)?;
+) -> ObjectRef {
+    let module = alloc_concurrent_synthetic(ctx, CN_MODULE, MOD_FIELD_COUNT);
     // GC-safety: `module` (and the `loader` parameter, reused below) are held
     // across several subsequent GC-triggering calls (`create_string`,
     // `build_resource_root_array`, the `mcl` allocation) before their last
@@ -846,7 +846,7 @@ fn build_module_object(
     let loader = ctx.read_native_pin(loader_pin, loader);
     ctx.set_field_by_name(module, "moduleLoader", Value::Object(Some(loader)));
     ctx.set_field(module, MOD_SLOT_RESOURCE_ROOTS, Value::Object(Some(arr)));
-    let mcl = try_alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT)?;
+    let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
     let module = ctx.read_native_pin(module_pin, module);
     ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(module)));
     // Real-JDK-mode fix: the real `org.jboss.modules.ModuleClassLoader` class
@@ -923,7 +923,7 @@ fn build_module_object(
     }
     let module = ctx.read_native_pin(module_pin, module);
     ctx.unpin_native_roots(module_pin);
-    Ok(module)
+    module
 }
 
 /// Throw `org.jboss.modules.ModuleNotFoundException` with `name`.
@@ -944,19 +944,19 @@ pub fn alloc_single_message_exception(
     class_name: &str,
     num_fields: usize,
     message: &str,
-) -> Result<ObjectRef, MethodCallFailed> {
-    let exc = try_alloc_concurrent_synthetic(ctx, class_name, num_fields)?;
+) -> ObjectRef {
+    let exc = alloc_concurrent_synthetic(ctx, class_name, num_fields);
     let exc_pin = ctx.pin_native_root(exc);
     let msg = ctx.create_string(message);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.unpin_native_roots(exc_pin);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
-    Ok(exc)
+    exc
 }
 
-fn throw_module_not_found(ctx: &mut dyn NativeContext, name: &str) -> Result<MethodCallFailed, MethodCallFailed> {
-    let exc = alloc_single_message_exception(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT, name)?;
-    Ok(MethodCallFailed::ExceptionThrown(exc))
+fn throw_module_not_found(ctx: &mut dyn NativeContext, name: &str) -> MethodCallFailed {
+    let exc = alloc_single_message_exception(ctx, CN_MODULE_NOT_FOUND, MNF_FIELD_COUNT, name);
+    MethodCallFailed::ExceptionThrown(exc)
 }
 
 /// WP2.1 — Extract the `File[]` roots that the user passed to
@@ -1100,7 +1100,7 @@ fn synthesize_platform_module(
             .entry(name.to_string())
             .or_insert_with(|| resolved.clone());
     }
-    let module = build_module_object(ctx, name, loader, &resolved)?;
+    let module = build_module_object(ctx, name, loader, &resolved);
     // Same keep-alive + race-loser discipline as the normal loadModule tail.
     ctx.register_var_handle_root(module);
     let mkey = ctx.identity_hash_code(module);
@@ -1121,7 +1121,7 @@ pub(crate) fn native_loader_load_module(
     // args[0] = this (LocalModuleLoader), args[1] = String name
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => build_local_module_loader(ctx)?,
+        _ => build_local_module_loader(ctx),
     };
     // GC-safety: `extract_receiver_roots` below internally calls
     // `invoke_virtual` (`File.getAbsolutePath()`), which can trigger a
@@ -1201,7 +1201,7 @@ pub(crate) fn native_loader_load_module(
         if crate::nbflags().dbg_wf {
             eprintln!("[jboss-module] loadModule({name}) no roots; receiver_has_finders={receiver_has_finders}");
         }
-        return Err(throw_module_not_found(ctx, &name)?);
+        return Err(throw_module_not_found(ctx, &name));
     }
 
     let dbg_wf = crate::nbflags().dbg_wf;
@@ -1252,7 +1252,7 @@ pub(crate) fn native_loader_load_module(
             if dbg_wf {
                 eprintln!("[jboss-module] loadModule({name}) not found in roots");
             }
-            return Err(throw_module_not_found(ctx, &name)?);
+            return Err(throw_module_not_found(ctx, &name));
         }
         Err(e) => {
             if dbg_wf {
@@ -1264,7 +1264,7 @@ pub(crate) fn native_loader_load_module(
 
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    let module = build_module_object(ctx, &name, this, &resolved)?;
+    let module = build_module_object(ctx, &name, this, &resolved);
     // GC-safety: several calls further down this function (notably the
     // RKC19/WF39 brute-force block's `ensure_class_initialized` pre-warm loop,
     // gated on `is_brute_force_trigger` -- exactly the WildFly bootstrap
@@ -2439,7 +2439,7 @@ pub(crate) fn native_module_get_class_loader(
     // -- this function is exactly the hazard those callers were protected
     // against, but it turns out it also needed to protect its own receiver.
     let this_pin = ctx.pin_native_root(this);
-    let mcl = try_alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT)?;
+    let mcl = alloc_concurrent_synthetic(ctx, CN_MODULE_CLASSLOADER, MCL_FIELD_COUNT);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_field(mcl, MCL_SLOT_MODULE, Value::Object(Some(this)));
@@ -2483,7 +2483,7 @@ pub(crate) fn native_module_load_class(
                 "java/lang/ClassNotFoundException",
                 1,
                 &class_name,
-            )?;
+            );
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
     }
@@ -2625,7 +2625,7 @@ pub(crate) fn native_module_classloader_load_class(
                     "java/lang/ClassNotFoundException",
                     1,
                     &class_name,
-                )?;
+                );
                 Err(MethodCallFailed::ExceptionThrown(exc))
             }
         };
@@ -2691,7 +2691,7 @@ pub(crate) fn native_module_classloader_load_class(
 
     if !visible {
         let exc =
-            alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name)?;
+            alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
         return Err(MethodCallFailed::ExceptionThrown(exc));
     }
 
@@ -2706,7 +2706,7 @@ pub(crate) fn native_module_classloader_load_class(
                 "java/lang/ClassNotFoundException",
                 1,
                 &class_name,
-            )?;
+            );
             Err(MethodCallFailed::ExceptionThrown(exc))
         }
     }
@@ -2758,7 +2758,7 @@ pub(crate) fn native_module_classloader_find_class(
     }
 
     let exc =
-        alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name)?;
+        alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
     Err(MethodCallFailed::ExceptionThrown(exc))
 }
 
@@ -2804,7 +2804,7 @@ pub(crate) fn native_module_classloader_get_resource(
             // the parent (system) loader — same parent-first contract as
             // loadClass.  Returns null if the parent doesn't have it.
             if !is_private && ctx.find_resource(&trimmed).is_some() {
-                let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
+                let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
                 let full = ctx.create_string(&format!("classpath:/{trimmed}"));
                 ctx.set_field(url, 5, Value::Object(Some(full)));
                 return Ok(Some(Value::Object(Some(url))));
@@ -2820,7 +2820,7 @@ pub(crate) fn native_module_classloader_get_resource(
         let path = hit_root.replace('\\', "/");
         format!("file:/{path}/{trimmed}")
     };
-    let url = build_synthetic_url(ctx, &url_string)?;
+    let url = build_synthetic_url(ctx, &url_string);
     Ok(Some(Value::Object(Some(url))))
 }
 
@@ -2837,8 +2837,8 @@ pub(crate) fn native_module_classloader_get_resource(
 /// This helper parses out `protocol` / `host` / `file` from the spec and writes
 /// them via `set_field_by_name`, then keeps the legacy slot 0 / slot 5
 /// writes for any synthetic-mode consumers that still index by slot.
-pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 13)?;
+pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> ObjectRef {
+    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 13);
     let (protocol, file_part) = if let Some(rest) = spec.strip_prefix("jar:") {
         ("jar", rest.to_string())
     } else if let Some(rest) = spec.strip_prefix("file:") {
@@ -2891,7 +2891,7 @@ pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> Re
     // Illegal character found in authority: '/'` (ResourceTests
     // #resourceCreateRelativeUnknown[UrlResource]). Leave `authority` null, as
     // set above.
-    Ok(url)
+    url
 }
 
 /// `ModuleClassLoader.findResources(String) -> Enumeration<URL>` and
@@ -2957,11 +2957,11 @@ pub(crate) fn native_module_classloader_find_resources(
     // once more building the enclosing Enumeration below.
     let arr_pin = ctx.pin_native_root(arr);
     for (i, u) in urls.iter().enumerate() {
-        let url_obj = build_synthetic_url(ctx, u)?;
+        let url_obj = build_synthetic_url(ctx, u);
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
-    let enm = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2)?;
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     ctx.set_field(enm, 0, Value::Object(Some(arr)));
@@ -2974,7 +2974,7 @@ fn build_empty_enumeration(ctx: &mut dyn NativeContext) -> MethodCallResult {
     // GC-safety: `alloc_concurrent_synthetic` below can trigger a moving GC;
     // `arr` is reused in the following `set_field` unpinned otherwise.
     let arr_pin = ctx.pin_native_root(arr);
-    let enm = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2)?;
+    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     ctx.set_field(enm, 0, Value::Object(Some(arr)));
@@ -3029,7 +3029,7 @@ pub(crate) fn native_module_classloader_get_resource_as_stream(
             // moving GC; `arr` is reused in the following `set_field`s
             // unpinned otherwise.
             let arr_pin = ctx.pin_native_root(arr);
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
@@ -3067,7 +3067,7 @@ pub(crate) fn native_module_get_module_loader(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            let l = build_local_module_loader(ctx)?;
+            let l = build_local_module_loader(ctx);
             return Ok(Some(Value::Object(Some(l))));
         }
     };
@@ -3079,7 +3079,7 @@ pub(crate) fn native_module_get_module_loader(
     // (it allocates the loader singleton on the first call); `this` is
     // reused in the following `set_field` unpinned otherwise.
     let this_pin = ctx.pin_native_root(this);
-    let l = build_local_module_loader(ctx)?;
+    let l = build_local_module_loader(ctx);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, MOD_SLOT_LOADER, Value::Object(Some(l)));
@@ -3098,7 +3098,7 @@ pub(crate) fn native_module_get_boot_or_caller_module_loader(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let loader = build_local_module_loader(ctx)?;
+    let loader = build_local_module_loader(ctx);
     Ok(Some(Value::Object(Some(loader))))
 }
 
@@ -3146,7 +3146,7 @@ pub(crate) fn native_module_get_property_names(
 ) -> MethodCallResult {
     // Return an empty ArrayList — this matches the "no properties set"
     // case the boot path expects.
-    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     // GC-safety: `new_array` below can trigger a moving GC; `list` is reused
     // in the following `set_field` unpinned otherwise.
     let list_pin = ctx.pin_native_root(list);
@@ -3168,7 +3168,7 @@ pub(crate) fn native_boot_holder_priv_action_run(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let loader = build_local_module_loader(ctx)?;
+    let loader = build_local_module_loader(ctx);
     Ok(Some(Value::Object(Some(loader))))
 }
 
@@ -3237,7 +3237,7 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
     // fixed-suite-bugs/wildfly/wildfly-parallel-boot-stale-objectref-residual.md.
     let service_pin = ctx.pin_native_root(service);
 
-    let loader = build_local_module_loader(ctx)?;
+    let loader = build_local_module_loader(ctx);
     let name_obj = ctx.create_string(&module_name);
     let module_val = native_loader_load_module(
         ctx,
@@ -3245,12 +3245,12 @@ pub(crate) fn native_module_load_service_from_caller_module_loader(
     )?;
     let module = match module_val {
         Some(Value::Object(Some(m))) => m,
-        _ => return Err(throw_module_not_found(ctx, &module_name)?),
+        _ => return Err(throw_module_not_found(ctx, &module_name)),
     };
     let class_loader_val = native_module_get_class_loader(ctx, &[Value::Object(Some(module))])?;
     let class_loader = match class_loader_val {
         Some(Value::Object(Some(cl))) => cl,
-        _ => return Err(throw_module_not_found(ctx, &module_name)?),
+        _ => return Err(throw_module_not_found(ctx, &module_name)),
     };
     let service = ctx.read_native_pin(service_pin, service);
     ctx.unpin_native_roots(service_pin);
@@ -4081,8 +4081,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let a = build_local_module_loader(&mut ctx)?;
-        let b = build_local_module_loader(&mut ctx)?;
+        let a = build_local_module_loader(&mut ctx);
+        let b = build_local_module_loader(&mut ctx);
         assert_eq!(a.as_ptr(), b.as_ptr());
     }
 
@@ -4092,9 +4092,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let a = build_default_boot_holder_instance(&mut ctx)?;
-        let b = build_default_boot_holder_instance(&mut ctx)?;
-        let c = build_local_module_loader(&mut ctx)?;
+        let a = build_default_boot_holder_instance(&mut ctx);
+        let b = build_default_boot_holder_instance(&mut ctx);
+        let c = build_local_module_loader(&mut ctx);
         assert_eq!(a.as_ptr(), b.as_ptr());
         assert_eq!(a.as_ptr(), c.as_ptr());
     }
@@ -4117,7 +4117,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("org.jboss.as.standalone");
         let result = native_loader_load_module(
             &mut ctx,
@@ -4148,7 +4148,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name1 = ctx.create_string("a.b");
         let r1 = native_loader_load_module(
             &mut ctx,
@@ -4177,7 +4177,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("ghost.module.never.exists");
         let err = native_loader_load_module(
             &mut ctx,
@@ -4199,7 +4199,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let err = native_loader_load_module(
             &mut ctx,
             &[Value::Object(Some(loader)), Value::Object(None)],
@@ -4215,7 +4215,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("../escape");
         let err = native_loader_load_module(
             &mut ctx,
@@ -4237,7 +4237,7 @@ mod tests {
         clear_boot_loader_for_test();
         set_mp_root_for_test(None);
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("anything");
         let err = native_loader_load_module(
             &mut ctx,
@@ -4264,7 +4264,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("foo.bar");
         let module = match native_loader_load_module(
             &mut ctx,
@@ -4296,7 +4296,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("zz.yy");
         let module = match native_loader_load_module(
             &mut ctx,
@@ -4354,7 +4354,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let boot = build_local_module_loader(&mut ctx)?;
+        let boot = build_local_module_loader(&mut ctx);
 
         for accessor in [
             "getBootModuleLoader",
@@ -4397,7 +4397,7 @@ mod tests {
         // the calls but use four distinct receiver/name pairs to
         // simulate concurrent traffic.
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let mut refs = Vec::new();
         for _ in 0..4 {
             let name = ctx.create_string("race.me");
@@ -4825,7 +4825,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("org.jboss.as.jmx");
         native_loader_load_module(
             &mut ctx,
@@ -4867,7 +4867,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let n1 = ctx.create_string("a");
         native_loader_load_module(
             &mut ctx,
@@ -4984,7 +4984,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx)?;
+        let loader = build_local_module_loader(&mut ctx);
         let name = ctx.create_string("leaf");
         native_loader_load_module(
             &mut ctx,

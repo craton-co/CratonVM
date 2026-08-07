@@ -19,7 +19,7 @@ use cratonvm_types::ArrayElementType;
 use cratonvm_types::ObjectRef;
 use cratonvm_types::Value;
 
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Calendar math helpers
@@ -1177,7 +1177,7 @@ fn make_hashtable_enumeration(
     // FIX: allocate 3 fields (was 2) so the type marker in field 2 has a
     // backing slot; fields 0/1 (array, cursor) keep the layout that
     // `register_enumeration_impl_natives` reads.
-    let en = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3)?;
+    let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3);
     ctx.set_field(en, 0, Value::Object(Some(arr)));
     ctx.set_field(en, 1, Value::Int(0));
     // FIX: stamp the keys/values discriminator into field 2.
@@ -2059,7 +2059,7 @@ mod tests {
     fn test_date_init_iii_epoch() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
 
         call_native(
             &reg,
@@ -2084,7 +2084,7 @@ mod tests {
     fn test_date_init_iiiii() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
 
         // year=70, month=0, day=1, hrs=1, min=0 → 1 hour
         call_native(
@@ -2111,7 +2111,7 @@ mod tests {
     fn test_date_init_iiiiii() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
 
         // year=70, month=0, day=1, hrs=0, min=0, sec=30 → 30 s
         call_native(
@@ -2147,7 +2147,7 @@ mod tests {
     fn test_date_init_string_no_longer_refuses() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
         let str_obj = ctx.create_string("2000-01-01");
 
         let res = call_native(
@@ -2181,7 +2181,7 @@ mod tests {
         min: i32,
         sec: i32,
     ) -> cratonvm_types::ObjectRef {
-        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Date", 4)?;
+        let obj = alloc_concurrent_synthetic(ctx, "java/util/Date", 4);
         let ms = date_fields_to_millis(year, month, date, hrs, min, sec);
         set_date_millis(ctx, obj, ms);
         obj
@@ -2243,7 +2243,7 @@ mod tests {
         // 1970-01-01 = Thursday = 4
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
         set_date_millis(&ctx, obj, 0);
 
         let res = call_native(
@@ -2299,7 +2299,7 @@ mod tests {
     fn test_date_get_timezone_offset_always_zero() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
 
         let res = call_native(
             &reg,
@@ -2495,7 +2495,7 @@ mod tests {
         ctx.set_array_element(arr, 1, Value::Int(0x42));
         ctx.set_array_element(arr, 2, Value::Int(0x43));
 
-        let this = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4)?;
+        let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
         call_native(
             &reg,
             &mut ctx,
@@ -2525,7 +2525,7 @@ mod tests {
         let arr = ctx.new_array(ArrayElementType::Byte, 1);
         ctx.set_array_element(arr, 0, Value::Int(0x41));
 
-        let this = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4)?;
+        let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
         call_native(
             &reg,
             &mut ctx,
@@ -2553,7 +2553,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
 
         let arr = ctx.new_array(ArrayElementType::Byte, 2);
-        let this = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4)?;
+        let this = alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4);
 
         // offset=1, count=3 → overflow
         let res = call_native(
@@ -2722,8 +2722,8 @@ mod tests {
     fn test_properties_save_delegates_to_store() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let props = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Properties", 0)?;
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/OutputStream", 0)?;
+        let props = alloc_concurrent_synthetic(&mut ctx, "java/util/Properties", 0);
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/OutputStream", 0);
         let header = ctx.create_string("# header");
 
         // Pre-arm invoke_virtual to confirm it is called.
@@ -2754,7 +2754,7 @@ mod tests {
     fn test_hashtable_elements_returns_enumerator() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let ht = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 0)?;
+        let ht = alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 0);
 
         let res = call_native(
             &reg,
@@ -2777,7 +2777,7 @@ mod tests {
     fn test_hashtable_keys_returns_enumerator() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let ht = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 0)?;
+        let ht = alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 0);
 
         let res = call_native(
             &reg,
@@ -2806,7 +2806,7 @@ mod tests {
         // test can only exercise the empty/registration path.)
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let ht = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 1)?;
+        let ht = alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 1);
 
         let res = call_native(
             &reg,
@@ -2833,7 +2833,7 @@ mod tests {
     fn test_sbis_read_sequential() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4)?;
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string("AB");
 
         call_native(
@@ -2883,7 +2883,7 @@ mod tests {
     fn test_sbis_available_and_reset() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4)?;
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string("XYZ");
 
         call_native(
@@ -2954,7 +2954,7 @@ mod tests {
     fn test_sbis_bulk_read() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let stream = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4)?;
+        let stream = alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string("Hello");
         let buf = ctx.new_array(ArrayElementType::Byte, 5);
 
@@ -3000,7 +3000,7 @@ mod tests {
         data: &str,
     ) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
         // We use a StringBufferInputStream as the underlying stream.
-        let sbis = try_alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4)?;
+        let sbis = alloc_concurrent_synthetic(ctx, "java/io/StringBufferInputStream", 4);
         let str_obj = ctx.create_string(data);
         call_native(
             reg,
@@ -3012,7 +3012,7 @@ mod tests {
         )
         .unwrap();
 
-        let lnis = try_alloc_concurrent_synthetic(ctx, "java/io/LineNumberInputStream", 4)?;
+        let lnis = alloc_concurrent_synthetic(ctx, "java/io/LineNumberInputStream", 4);
         call_native(
             reg,
             ctx,
@@ -3030,8 +3030,8 @@ mod tests {
     fn test_lnis_get_set_line_number() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4)?;
-        let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0)?;
+        let lnis = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
+        let inner = alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0);
 
         call_native(
             &reg,
@@ -3105,8 +3105,8 @@ mod tests {
     fn test_lnis_set_line_number_roundtrip() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4)?;
-        let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0)?;
+        let lnis = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
+        let inner = alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0);
         call_native(
             &reg,
             &mut ctx,
@@ -3142,8 +3142,8 @@ mod tests {
         // Manually set line number and saved line number fields, then call reset.
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let lnis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4)?;
-        let inner = try_alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0)?;
+        let lnis = alloc_concurrent_synthetic(&mut ctx, "java/io/LineNumberInputStream", 4);
+        let inner = alloc_concurrent_synthetic(&mut ctx, "java/io/InputStream", 0);
         call_native(
             &reg,
             &mut ctx,
@@ -3192,7 +3192,7 @@ mod tests {
     fn test_locale_get_iso3_language_english() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let locale = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4)?;
+        let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
         let lang = ctx.create_string("en");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
@@ -3216,7 +3216,7 @@ mod tests {
     fn test_locale_get_iso3_language_french() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let locale = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4)?;
+        let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
         let lang = ctx.create_string("fr");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
@@ -3240,7 +3240,7 @@ mod tests {
     fn test_locale_get_iso3_language_japanese() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let locale = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4)?;
+        let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
         let lang = ctx.create_string("ja");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
@@ -3264,7 +3264,7 @@ mod tests {
     fn test_locale_get_iso3_language_unknown_passthrough() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let locale = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4)?;
+        let locale = alloc_concurrent_synthetic(&mut ctx, "java/util/Locale", 4);
         let lang = ctx.create_string("xx");
         ctx.set_field(locale, 0, Value::Object(Some(lang)));
 
