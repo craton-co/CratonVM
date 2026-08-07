@@ -335,9 +335,30 @@ pub const NUM_SLOTS_OFFSET: usize = 4;
 // That last point is the load-bearing one and it is enforced, not assumed:
 // `make_inflated` and `make_forwarded` both assert `plausible_heap_pointer`.
 pub const MARK_QUARTET_SHIFT: u32 = 48;
-/// The 13 bits the quartet occupies. Everything outside it belongs to the
-/// state tag and its payload.
-pub const MARK_QUARTET_MASK: u64 = 0x3FFFu64 << MARK_QUARTET_SHIFT;
+/// The 16 bits the quartet occupies — the mark word's top two bytes, bits
+/// 48..63. Everything outside it belongs to the state tag and its payload.
+///
+/// This was `0x3FFF` (bits 48..61) until 2026-08-07, which is two bits short:
+/// the sub-fields below run `kind`(48..50) + `element_type`(50..54) + two
+/// spare + `gc_flags`(56..60) + `gc_age`(60..64), i.e. all the way to 64.
+/// A `gc_age` of 4 or more sets bit 62, and every consumer of this mask read
+/// that bit as lock-state payload rather than as the quartet:
+///
+///   * `try_thin_lock` requires `cur & !MARK_QUARTET_MASK == MARK_NEUTRAL`, so
+///     **an object that had survived four young collections could never take
+///     the thin-lock fast path again** — every `synchronized` on it inflated a
+///     `Monitor` instead. That is a pure throughput loss on exactly the
+///     long-lived, lock-heavy objects that a server workload keeps
+///     (`org.h2.mvstore.MVStore`, `MVMap`, `SessionLocal`, …).
+///   * `quartet_of` feeds `make_thin_locked` / `make_inflated` /
+///     `make_forwarded`, so each of those transitions silently truncated
+///     `gc_age` to its low two bits — an object aged 12 came back aged 0 and
+///     was re-aged from scratch, deferring its promotion indefinitely.
+///
+/// The `& !MARK_QUARTET_MASK` in `inflated_monitor_ptr` / `forwarding_target`
+/// only ever clears MORE high bits from a pointer that `plausible_heap_pointer`
+/// already caps at `2^47 - 1`, so widening the mask cannot change either.
+pub const MARK_QUARTET_MASK: u64 = 0xFFFFu64 << MARK_QUARTET_SHIFT;
 
 // The sub-fields are placed for the BENEFIT OF THE JIT, not for tidiness.
 //
@@ -1810,6 +1831,53 @@ mod tests {
         // JIT-emitted code reads class_id at offset 0 from the object base.
         // Adding the mark word must NOT have disturbed this contract.
         assert_eq!(std::mem::offset_of!(ObjectHeader, class_id), 0);
+    }
+
+    /// The quartet's mask must cover every sub-field the quartet declares.
+    ///
+    /// `gc_age` is four bits at 60..64, so bits 62 and 63 are quartet bits; a
+    /// mask that stops at 61 leaves them looking like lock-state payload, and
+    /// `try_thin_lock`'s `cur & !MARK_QUARTET_MASK == MARK_NEUTRAL` screen then
+    /// rejects every object aged 4 or more. Assert the relationship rather than
+    /// the literal, so moving a sub-field cannot desynchronise the two again.
+    #[test]
+    fn quartet_mask_covers_every_quartet_subfield() {
+        for age in 0..=MAX_GC_AGE {
+            let header = make_header();
+            header.set_gc_age(age);
+            let mark = header.mark_word.load(Ordering::Relaxed);
+            assert_eq!(
+                mark & !MARK_QUARTET_MASK,
+                MARK_NEUTRAL,
+                "gc_age {age} escaped the quartet mask — thin-locking is dead for it",
+            );
+            assert_eq!(header.gc_age(), age);
+            assert_eq!(
+                ObjectHeader::quartet_of(mark) >> MARK_QUARTET_SHIFT & 0xF000,
+                (mark >> MARK_QUARTET_SHIFT) & 0xF000,
+                "quartet_of must carry the whole age field through a transition",
+            );
+        }
+    }
+
+    /// A transition rebuilds the word from `quartet_of(prev)`; the age must
+    /// survive it for every value the field can hold.
+    #[test]
+    fn quartet_survives_a_lock_transition_at_every_age() {
+        for age in 0..=MAX_GC_AGE {
+            let header = make_header();
+            header.set_shape_tags(ObjectKind::Array, ArrayElementType::Long);
+            header.set_gc_age(age);
+            header.set_gc_flags(GC_FLAG_COMPACT);
+            let prev = header.mark_word.load(Ordering::Relaxed);
+
+            let locked = ObjectHeader::make_thin_locked(prev, 7, 0);
+            header.mark_word.store(locked, Ordering::Relaxed);
+            assert_eq!(header.gc_age(), age, "thin lock truncated gc_age {age}");
+            assert_eq!(header.gc_flags(), GC_FLAG_COMPACT);
+            assert_eq!(header.kind(), ObjectKind::Array);
+            assert_eq!(header.element_type(), ArrayElementType::Long);
+        }
     }
 
     #[test]
