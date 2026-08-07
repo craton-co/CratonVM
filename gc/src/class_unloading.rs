@@ -420,7 +420,7 @@ impl ClassUnloader {
     }
 
     /// Update loader addresses after GC relocation.
-    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         let mut inner = self.inner.lock();
         for loader in &mut inner.loaders {
             if let Some(&new_addr) = pointer_map.get(&loader.loader_addr) {
@@ -632,7 +632,7 @@ impl ClassLoaderHierarchy {
     /// loader address would collide with an entry already inserted this pass,
     /// and we reject any self-referential parent (`new_addr == new_parent`)
     /// produced by remapping.
-    pub fn update_after_gc(&mut self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_after_gc(&mut self, pointer_map: &cratonvm_types::PointerMap) {
         let old: Vec<(usize, Option<usize>)> = self.parents.drain().collect();
         for (addr, parent) in old {
             let new_addr = pointer_map.get(&addr).copied().unwrap_or(addr);
@@ -889,7 +889,7 @@ mod tests {
         u.register_class(0xA00, make_class("m/Hot", 3, 64));
         u.register_jit_code(3, "hot", 2048);
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0xA00, 0xC00);
         u.update_after_gc(&map);
 
@@ -993,7 +993,7 @@ mod tests {
         u.register_loader(0x1000, "Moved", false);
         u.register_class(0x1000, make_class("m/C", 1, 64));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x1000, 0x2000);
         u.update_after_gc(&map);
 
@@ -1211,7 +1211,7 @@ mod tests {
         h.register(0x100, None);
         h.register(0x200, Some(0x100));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x100, 0xA00);
         map.insert(0x200, 0xB00);
         h.update_after_gc(&map);
@@ -1265,7 +1265,7 @@ mod tests {
         h.register(0x100, Some(0x200));
         h.register(0x200, Some(0x100));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x100, 0x900);
         map.insert(0x200, 0x900); // collision onto the same new address
 
@@ -1285,7 +1285,7 @@ mod tests {
         let mut h = ClassLoaderHierarchy::new();
         h.register(0x100, Some(0x200));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x100, 0x500);
         map.insert(0x200, 0x500); // parent now points at the loader itself
 

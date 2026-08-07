@@ -187,7 +187,7 @@ fn post_gc_relocation_updates_all_addresses() {
     use std::collections::HashMap;
     let mut proc = ReferenceProcessor::new();
     proc.discover_reference(ReferenceType::Weak, 100, 200, Some(300));
-    let mut map = HashMap::new();
+    let mut map = cratonvm_types::PointerMap::default();
     map.insert(100, 1100);
     map.insert(200, 1200);
     map.insert(300, 1300);

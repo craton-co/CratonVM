@@ -1,6 +1,38 @@
 # `PulsarAutoConfigurationTests` — intermittent `ClassCastException: Object cannot be cast to MultiValueMap` inside `OnBeanCondition$Spec`, 2026-08-06
 
-**Status: OPEN — reproduced once; 5 further attempts clean.**
+**Status: the two symptoms on this class have diverged. The
+`ClassCastException` this page was opened for is ✅ FIXED (2026-08-07); the
+deterministic early HANG documented below is 🔴 OPEN, and is what keeps this
+page here.**
+
+**The `ClassCastException` was `Stream.collect(Collector)` holding unpinned
+references across a moving collection.** `collect_via_collector_protocol`'s
+ordinary-`Collector` path — the one
+`MergedAnnotationCollectors.toMultiValueMap` takes — held the accumulated
+container, the collector, the accumulator, the finisher and every element as
+raw `ObjectRef`s across five interpreter re-entries with no `pin_native_root`,
+while the same function's other arm pinned all of them. A young collection in
+that window handed the caller the container's pre-copy address, which reads
+back as an all-zero header, i.e. as `java.lang.Object`. Verified with a
+positive control (`probes/CollectorPinProbe.java`, A/B/B/A 296/300, 300/300,
+300/300, 296/300; HotSpot 300/300) and 3 clean 74/74 runs of this class. Full
+write-up:
+`pulsar-onbeancondition-multivaluemap-stream-collect-pin-FIXED-20260807`
+(retired).
+
+**This page's GC framing was right, and it talked itself out of it.** It
+recorded a `cratonvm::gc::guard` hit naming `MultiValueMap` and then set it
+aside under the standing "a reclaim-guard hit is about the address, not the
+object" caveat. That caveat is about *reused* addresses;
+`location=young TO-space (the inactive semispace)` with `span=…+0x0` is a
+different claim — nothing has been re-served there, so it is a reference that
+was never remapped. The companion guard lines said so outright: *"the holder
+is a frame local, a register, or a native side table — not a heap field"* and
+*"`in_published_snapshot=false` … a root COLLECTION gap"*. Read the guard's
+`location=` field before applying the caveat.
+
+Everything below about the site-alias census and the dispatch framing stands as
+a fact about the workload; it simply was not this bug.
 
 ## 2026-08-07 update: a SECOND, unrelated symptom on the same class — a deterministic early HANG, GC-backend-independent
 

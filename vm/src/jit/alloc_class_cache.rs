@@ -81,9 +81,8 @@ struct Chunk {
 
 impl Chunk {
     fn new_boxed() -> Box<Chunk> {
-        const NULL_ENTRY: AtomicPtr<ClassAllocInfo> = AtomicPtr::new(std::ptr::null_mut());
         Box::new(Chunk {
-            entries: [NULL_ENTRY; CHUNK_LEN],
+            entries: [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNK_LEN],
         })
     }
 }
@@ -101,9 +100,8 @@ impl Default for JitAllocClassCache {
 
 impl JitAllocClassCache {
     pub fn new() -> Self {
-        const NULL_CHUNK: AtomicPtr<Chunk> = AtomicPtr::new(std::ptr::null_mut());
         JitAllocClassCache {
-            chunks: Box::new([NULL_CHUNK; TOP_LEN]),
+            chunks: Box::new([const { AtomicPtr::new(std::ptr::null_mut()) }; TOP_LEN]),
         }
     }
 

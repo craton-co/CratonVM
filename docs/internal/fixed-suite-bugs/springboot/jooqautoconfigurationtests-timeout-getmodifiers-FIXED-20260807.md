@@ -165,6 +165,45 @@ back cheap copies, HotSpot-style — is **not needed** and was not attempted.
   never a regression of it. The 2026-08-05 page's own Correction §1 was right
   that this class hung identically in the 08-02 full suite.
 
+## The whole family, verified (2026-08-07)
+
+While this page was being written a concurrent session expanded the
+known-issues page from one class to **six**, attributing all of them to the
+same reflective cost — correctly as to the *mechanism being shared*, and
+incorrectly as to which native it is (that page still named
+`Class.getDeclaredMethods()`; see the Correction above). Its structural
+argument is worth keeping, because it is what makes the shared term
+verifiable rather than inferred: the three `@JooqTest` slices resolve through
+`AutoConfigureJooq.imports` straight to `JooqAutoConfiguration`, and
+`JooqFlywayDatabaseInitializationTests` constructs
+`new DefaultDSLContext(SQLDialect.H2)` directly — so every one of them builds
+the same 1003-method bean, and pays the same per-`getModifiers()` cost against
+it.
+
+All six are green on the fixed binary, every one inside the 300 s budget:
+
+| class | before | after |
+|---|---:|---|
+| `JooqAutoConfigurationTests` | 300 s HANG (1013.9 s uncapped) | **80.0 s**, 17/17 |
+| `JooqFlywayDatabaseInitializationTests` | 300.002 s HANG | **11.9 s**, 3/3 |
+| `JooqTestIntegrationTests` | 300.088 s HANG | **13.2 s**, 7/7 |
+| `JooqTestPropertiesIntegrationTests` | 300.010 s HANG | **15.1 s**, 2/2 |
+| `JooqTestWithAutoConfigureTestDatabaseIntegrationTests` | 300.182 s HANG | **14.1 s**, 1/1 |
+| `SpringApplicationTests` (`core/spring-boot`, no jOOQ at all) | 300.065 s HANG | **197.0 s**, 102/102 |
+
+The "before" column is that page's own full-suite figures
+(`craton-fullsuite-windows-20260806`, `-Xmx 2g`, 300 s/class), measured on a
+binary built from `dev` as of 08-06 — before this fix.
+
+`SpringApplicationTests` is the one worth noting: it has no jOOQ dependency,
+no `DefaultDSLContext` and no HikariPool, and that page filed it "by
+elimination" from its timing shape alone. It is the same bug. `getModifiers()`
+is charged per *candidate method pair* by `AnnotationsScanner.isOverride`, so
+any class whose context startup drives an annotation scan pays it — the jOOQ
+types are simply the extreme of the distribution, not a special case. That is
+the same point the original page made about `DefaultDSLContext` not being a
+jOOQ problem, now confirmed on a class with no jOOQ in it.
+
 ## Reproducing
 
 ```bash

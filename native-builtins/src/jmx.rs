@@ -54,7 +54,7 @@ pub fn gc_scan_platform_mbean_server_root(out: &mut Vec<ObjectRef>) {
     }
 }
 
-pub fn gc_update_platform_mbean_server_ref(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_platform_mbean_server_ref(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

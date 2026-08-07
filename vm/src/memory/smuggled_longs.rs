@@ -146,7 +146,7 @@ pub fn is_minted(heap: &VmHeap, bits: u64) -> bool {
 /// Only `heap`'s own table is touched. Another VM's handles are neither
 /// rewritten by this collector's map nor swept against this collector's
 /// heap — the two bugs described in the module docs.
-pub fn remap_and_sweep(pointer_map: &HashMap<usize, usize>, heap: &VmHeap) {
+pub fn remap_and_sweep(pointer_map: &cratonvm_types::PointerMap, heap: &VmHeap) {
     if !NONEMPTY.load(Ordering::Acquire) {
         return;
     }
@@ -264,7 +264,7 @@ mod tests {
         record_minted_long(&a, bits);
 
         // B collects. Nothing of A's may be consulted or discarded.
-        remap_and_sweep(&HashMap::new(), &b);
+        remap_and_sweep(&cratonvm_types::PointerMap::default(), &b);
 
         assert!(
             is_minted(&a, bits),
@@ -286,7 +286,7 @@ mod tests {
         record_minted_long(&a, bits);
 
         // B moves an object that happens to sit at the same address.
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(bits as usize, elsewhere as usize);
         remap_and_sweep(&map, &b);
 
@@ -317,7 +317,7 @@ mod tests {
         record_minted_long(&h, live_bits);
         record_minted_long(&h, dead_bits);
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(live_bits as usize, moved_bits as usize);
         remap_and_sweep(&map, &h);
 

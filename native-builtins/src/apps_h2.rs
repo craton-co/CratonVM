@@ -1606,12 +1606,12 @@ fn h2_range_cursor_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             _ => return Ok(Some(Value::Int(0))),
         };
         let value_pin = ctx.pin_native_root(value);
-        let row = (|| -> Result<ObjectRef, MethodCallFailed> {
+        let row = {
             let values = ctx.new_ref_array(ClassId::new(0), 1);
             let value = ctx.read_native_pin(value_pin, value);
             ctx.set_array_element(values, 0, Value::Object(Some(value)));
             h2_default_row_from_values(ctx, values, 1)
-        })();
+        };
         ctx.unpin_native_roots(value_pin);
         let row = row?;
         let cursor = ctx.read_native_pin(cursor_pin, cursor);

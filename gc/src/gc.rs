@@ -131,7 +131,7 @@ pub struct GcResult {
     pub stats: GcStats,
     /// Mapping from old pointer addresses to new pointer addresses.
     /// Used to remap monitor table keys and other external references.
-    pub pointer_map: HashMap<usize, usize>,
+    pub pointer_map: cratonvm_types::PointerMap,
 }
 
 /// Perform a semi-space garbage collection.
@@ -170,7 +170,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
     fire_gc_start();
     let bytes_before = from_space.used();
     let mut objects_copied: usize = 0;
-    let mut pointer_map = HashMap::new();
+    let mut pointer_map = cratonvm_types::PointerMap::default();
 
     // Phase 1: Forward all root objects
     for root in roots.iter_mut() {
@@ -373,7 +373,7 @@ fn forward_object(
     to_space: &mut Arena,
     old_ptr: *mut u8,
     objects_copied: &mut usize,
-    pointer_map: &mut HashMap<usize, usize>,
+    pointer_map: &mut cratonvm_types::PointerMap,
 ) -> *mut u8 {
     match try_forward_object(from_space, to_space, old_ptr, objects_copied, pointer_map) {
         Ok(new_ptr) => new_ptr,
@@ -398,7 +398,7 @@ fn try_forward_object(
     to_space: &mut Arena,
     old_ptr: *mut u8,
     objects_copied: &mut usize,
-    pointer_map: &mut HashMap<usize, usize>,
+    pointer_map: &mut cratonvm_types::PointerMap,
 ) -> Result<*mut u8, GcError> {
     // SAFETY: old_ptr is a valid heap object in from_space (verified by caller's
     // from_space.contains() check). The header is readable for the duration of GC.
@@ -653,7 +653,7 @@ pub fn collect_with_finalizers(
     fire_gc_start();
     let bytes_before = from_space.used();
     let mut objects_copied: usize = 0;
-    let mut pointer_map = HashMap::new();
+    let mut pointer_map = cratonvm_types::PointerMap::default();
 
     // Phase 1: Forward all root objects (same as collect)
     for root in roots.iter_mut() {
@@ -977,7 +977,7 @@ pub fn collect_with_finalizers(
 /// Update a Value's ObjectRef using the pointer map.
 /// If the value is `Object(Some(ref))` and the ref's address is in the map,
 /// update it to the new address.
-pub fn update_value_ref(value: &mut Value, pointer_map: &HashMap<usize, usize>) {
+pub fn update_value_ref(value: &mut Value, pointer_map: &cratonvm_types::PointerMap) {
     if let Value::Object(Some(ref mut obj_ref)) = value {
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_updates_known_ptr() {
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x1000usize, 0x2000usize);
 
         let obj_ref = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_leaves_unknown_ptr() {
-        let map = HashMap::new();
+        let map = cratonvm_types::PointerMap::default();
         let obj_ref = unsafe { ObjectRef::from_raw(0x9998 as *mut u8) }; // 8-byte aligned
         let mut val = Value::Object(Some(obj_ref));
         update_value_ref(&mut val, &map);
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_ignores_non_object() {
-        let map = HashMap::new();
+        let map = cratonvm_types::PointerMap::default();
         let mut val = Value::Int(42);
         update_value_ref(&mut val, &map);
         assert_eq!(val.as_int(), Some(42));

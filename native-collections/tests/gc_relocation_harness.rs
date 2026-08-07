@@ -274,7 +274,7 @@ fn fast_treemap_value_survives_relocation() {
         "relocate must hand back a fresh address"
     );
 
-    let mut pm: HashMap<usize, usize> = HashMap::new();
+    let mut pm = cratonvm_types::PointerMap::default();
     pm.insert(old_addr, new_addr);
     gc_update_collection_overlay_refs(&pm);
 
@@ -461,7 +461,7 @@ fn owner_seeded_roots_follow_the_owner_across_a_relocation() {
     // Move the COLLECTIONS and leave the values put — the mirror image of
     // `all_overlay_object_values_survive_relocation`, and the case the
     // address-keyed index actually depends on.
-    let mut pm: HashMap<usize, usize> = HashMap::new();
+    let mut pm = cratonvm_types::PointerMap::default();
     let mut moved_cols = [cols[0]; 5];
     for (i, c) in cols.iter().enumerate() {
         let post = ctx.relocate_object(*c);
@@ -515,7 +515,7 @@ fn all_overlay_object_values_survive_relocation() {
     // Relocate the VALUE objects only — the collection objects (overlay keys)
     // stay put so their reads still resolve. Build the pointer map the
     // collector would hand us in one pass.
-    let mut pm: HashMap<usize, usize> = HashMap::new();
+    let mut pm = cratonvm_types::PointerMap::default();
     let mut moved = [vals[0]; 5];
     for (i, v) in vals.iter().enumerate() {
         let post = ctx.relocate_object(*v);

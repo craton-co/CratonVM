@@ -66,7 +66,7 @@ struct GcBarrierInner {
     /// Number of threads that have arrived at the barrier.
     arrived: u32,
     /// Pointer map from the last GC, shared with threads for frame updates.
-    pointer_map: HashMap<usize, usize>,
+    pointer_map: cratonvm_types::PointerMap,
     /// GCAUDIT-0711-FIX (finding 1a): identities (`ThreadId.0`) that THIS
     /// pause's `request_stw_counted_with_live_blocked` census read as
     /// `in_blocked_region == true` and therefore excluded from `expected`.
@@ -133,7 +133,7 @@ impl GcBarrier {
                 initiator: None,
                 expected: 0,
                 arrived: 0,
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
                 excluded_blocked: HashSet::new(),
             }),
             all_arrived: Condvar::new(),
@@ -599,7 +599,7 @@ impl GcBarrier {
     /// Called by the GC initiator after running collection.
     ///
     /// Stores the pointer map so threads can update their own frames.
-    pub fn complete_gc(&self, pointer_map: HashMap<usize, usize>) {
+    pub fn complete_gc(&self, pointer_map: cratonvm_types::PointerMap) {
         let mut inner = self.inner.lock();
         inner.pointer_map = pointer_map;
         inner.initiator = None;
@@ -623,7 +623,7 @@ impl GcBarrier {
     /// excluded by `request_stw`); counting such a thread can satisfy the
     /// `arrived >= expected` quota early and release `wait_for_all` while a
     /// real mutator is still running.
-    pub fn arrive_and_wait(&self, tid: ThreadId) -> HashMap<usize, usize> {
+    pub fn arrive_and_wait(&self, tid: ThreadId) -> cratonvm_types::PointerMap {
         self.arrive_and_wait_inner(tid, Some(true))
     }
 
@@ -639,7 +639,7 @@ impl GcBarrier {
     /// counted mutator has not yet reached its safepoint, releasing the
     /// initiator's `wait_for_all` early and letting GC run under a live
     /// mutator.
-    pub fn arrive_and_wait_excluded(&self, tid: ThreadId) -> HashMap<usize, usize> {
+    pub fn arrive_and_wait_excluded(&self, tid: ThreadId) -> cratonvm_types::PointerMap {
         self.arrive_and_wait_inner(tid, Some(false))
     }
 
@@ -656,7 +656,7 @@ impl GcBarrier {
     /// matches what the census actually did for this pause, race-free. Safe
     /// to use unconditionally in place of `arrive_and_wait`: a caller never
     /// in `excluded_blocked` gets identical (participating) behavior.
-    pub fn arrive_and_wait_auto(&self, tid: ThreadId) -> HashMap<usize, usize> {
+    pub fn arrive_and_wait_auto(&self, tid: ThreadId) -> cratonvm_types::PointerMap {
         self.arrive_and_wait_inner(tid, None)
     }
 
@@ -669,7 +669,7 @@ impl GcBarrier {
     /// wrapper's doc). `mode = None` decides from `excluded_blocked`,
     /// read under the same lock `request_stw_counted_locked` populated it
     /// under, which is race-free by construction.
-    fn arrive_and_wait_inner(&self, tid: ThreadId, mode: Option<bool>) -> HashMap<usize, usize> {
+    fn arrive_and_wait_inner(&self, tid: ThreadId, mode: Option<bool>) -> cratonvm_types::PointerMap {
         // P1 shadow record: always self-called for the caller's own `tid`
         // (see the initiator short-circuit below), so this is the primary
         // binding point for the recorder.
@@ -677,7 +677,7 @@ impl GcBarrier {
         let mut inner = self.inner.lock();
         // If this is the initiator or STW is not active, return immediately
         if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
-            return HashMap::new();
+            return cratonvm_types::PointerMap::default();
         }
         // The state to restore when this pause ends. The barrier cannot know
         // whether the caller reached here from the interpreter poll, a
@@ -769,7 +769,7 @@ impl GcBarrier {
         }
         self.wait_for_all();
         work();
-        self.complete_gc(HashMap::new());
+        self.complete_gc(cratonvm_types::PointerMap::default());
         true
     }
 
@@ -791,7 +791,7 @@ impl GcBarrier {
         }
         self.wait_for_all();
         work();
-        self.complete_gc(HashMap::new());
+        self.complete_gc(cratonvm_types::PointerMap::default());
         true
     }
 }
@@ -896,7 +896,7 @@ mod tests {
         assert_ne!(unsafe { *addr }, 0, "expected nonzero after request_stw");
 
         barrier.wait_for_all();
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         // SAFETY: same as above.
         assert_eq!(unsafe { *addr }, 0, "expected false (0) after complete_gc");
     }
@@ -912,7 +912,7 @@ mod tests {
         barrier.wait_for_all();
 
         // Complete with empty pointer map
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         assert!(!barrier.stw_requested.load(Ordering::Relaxed));
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 1);
     }
@@ -934,7 +934,7 @@ mod tests {
         barrier.wait_for_all();
 
         // Complete GC with a pointer remap
-        let mut pm = HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(0x1000, 0x2000);
         barrier.complete_gc(pm);
 
@@ -951,7 +951,7 @@ mod tests {
         // Second request while first is active should fail
         assert!(!barrier.request_stw(ThreadId(1), 2));
         barrier.wait_for_all();
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     #[test]
@@ -962,7 +962,7 @@ mod tests {
         let map = barrier.arrive_and_wait(ThreadId(0));
         assert!(map.is_empty());
         barrier.wait_for_all();
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     /// B2 — an EXCLUDED (blocked) thread that wakes mid-STW and calls
@@ -1009,7 +1009,7 @@ mod tests {
         barrier.wait_for_all();
         assert_eq!(barrier.pending_count(), 0);
 
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         let _ = hm.join();
         let _ = hb.join();
     }
@@ -1023,7 +1023,7 @@ mod tests {
         let b2 = barrier.clone();
         let h = std::thread::spawn(move || b2.arrive_and_wait(ThreadId(1)));
         barrier.wait_for_all();
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         let _ = h.join();
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 1);
     }
@@ -1053,7 +1053,7 @@ mod tests {
             barrier.wait_for_all_timeout(std::time::Duration::from_millis(1)),
             "late takeover should satisfy the reduced barrier quota"
         );
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     #[test]
@@ -1074,7 +1074,7 @@ mod tests {
                 "dead blocked thread must not be subtracted from the live mutator quota",
             );
         }
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     #[test]
@@ -1095,7 +1095,7 @@ mod tests {
                 "manual dead blocked thread must not be subtracted from the live mutator quota",
             );
         }
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
     #[test]
     fn counted_request_ignores_stale_global_blocked_slots() {
@@ -1111,7 +1111,7 @@ mod tests {
             let inner = barrier.inner.lock();
             assert_eq!(inner.expected, 1);
         }
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     #[test]
@@ -1128,7 +1128,7 @@ mod tests {
             let inner = barrier.inner.lock();
             assert_eq!(inner.expected, 1);
         }
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     /// GCAUDIT-0711-FIX (finding 1a) — `arrive_and_wait_auto` must resolve
@@ -1161,7 +1161,7 @@ mod tests {
         barrier.wait_for_all();
         assert_eq!(barrier.pending_count(), 0);
 
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         let _ = hm.join();
         let _ = hb.join();
     }
@@ -1175,7 +1175,7 @@ mod tests {
         let b2 = barrier.clone();
         let h = std::thread::spawn(move || b2.arrive_and_wait_auto(ThreadId(1)));
         barrier.wait_for_all();
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         let _ = h.join();
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 1);
     }
@@ -1188,7 +1188,7 @@ mod tests {
     fn excluded_blocked_does_not_leak_across_generations() {
         let barrier = GcBarrier::new();
         assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 1, vec![1])));
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
 
         assert!(barrier.request_stw_counted_with_live_blocked(ThreadId(0), || (2, 0, vec![])));
         {
@@ -1198,7 +1198,7 @@ mod tests {
                 "stale exclusion from a completed pause must not survive complete_gc",
             );
         }
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
     }
 
     /// Finding 1(c) — `leave_blocked_region_flagged` must not clear the
@@ -1233,7 +1233,7 @@ mod tests {
             "expected was 0 (only initiator + excluded)"
         );
 
-        barrier.complete_gc(HashMap::new());
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         h.join().unwrap();
         assert!(
             !flag.load(Ordering::Acquire),

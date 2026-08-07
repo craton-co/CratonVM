@@ -655,11 +655,11 @@ impl RegionHeap {
         cset: &[usize],
         roots: &mut [usize],
         is_live: F,
-    ) -> HashMap<usize, usize>
+    ) -> cratonvm_types::PointerMap
     where
         F: Fn(usize) -> bool,
     {
-        let mut forwarding: HashMap<usize, usize> = HashMap::new();
+        let mut forwarding: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let cset_set: HashSet<usize> = cset.iter().copied().collect();
 
         for &region_idx in cset {
@@ -933,7 +933,7 @@ impl RegionHeap {
     }
 
     /// Update interior references in all non-free regions using a forwarding map.
-    pub fn update_references(&mut self, forwarding: &HashMap<usize, usize>) {
+    pub fn update_references(&mut self, forwarding: &cratonvm_types::PointerMap) {
         if forwarding.is_empty() {
             return;
         }
@@ -1065,7 +1065,7 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
 }
 
 /// Update reference fields in an object using the forwarding map.
-fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &HashMap<usize, usize>) {
+fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &cratonvm_types::PointerMap) {
     let data_start = obj_addr + HEADER_SIZE;
 
     if header.kind() == ObjectKind::Array {
