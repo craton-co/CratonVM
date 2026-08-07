@@ -221,18 +221,21 @@ use cratonvm_types::compat::CompatibilityMode;
 /// census finally sees a fake it had mislabelled, at the moment that fake stops
 /// being reachable on a real-JDK image.
 ///
-/// # 644 -> 697, 2026-08-06 (giving `--jdk-only` a real `java.lang.ProcessImpl`)
+/// # 644 -> 689, 2026-08-06 (giving `--jdk-only` a real `java.lang.ProcessImpl`)
 ///
-/// Fifty-three, and again **no new fake was added** — 53 registrations that
+/// Forty-five, and again **no new fake was added** — 45 registrations that
 /// were already fakes stopped being labelled `Bridge`. They fall in three
 /// groups, and the count is worth reading as three numbers rather than one:
 ///
-///  * **37** on `cratonvm/synthetic/{Process, ProcessPipeInputStream,
+///  * **29** on `cratonvm/synthetic/{Process, ProcessPipeInputStream,
 ///    ProcessPipeOutputStream, ProcessExitWaiter}` and
 ///    `cratonvm/synthetic/AnonymousObject$2` — receivers this VM mints and no
 ///    image contains, so §1.5's "what an `ACC_NATIVE` method binds to" has
 ///    nothing to point at. `Bridge` was keeping a fabricated class reachable
-///    under `--jdk-only`, which is what §5 forbids outright.
+///    under `--jdk-only`, which is what §5 forbids outright. (The adjudication
+///    that opened this counted 37; `58f0ffb30` deleted eight of them —
+///    `phases_late`'s duplicate `cratonvm/synthetic/Process` surface — while
+///    this change was in flight, so the retag lands on the 29 that remain.)
 ///  * **11** on `java/lang/ProcessBuilder` — every one shadowing ordinary
 ///    bytecode (`acc_native: false, has_code: true` for all eleven), so §1.4
 ///    gives the real method precedence. The cluster has to move together:
@@ -257,7 +260,7 @@ use cratonvm_types::compat::CompatibilityMode;
 /// command — is **byte-identical to HotSpot 25**. Compatible `--real-jdk` mode
 /// is byte-identical to the build before the change; it keeps every one of
 /// these registrations and still answers with the VM's own process object.
-const BASELINE_SYNTHETIC_STUBS: usize = 697;
+const BASELINE_SYNTHETIC_STUBS: usize = 689;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.

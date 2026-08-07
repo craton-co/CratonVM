@@ -48,14 +48,19 @@ The old record's plan was "retag the 37 rows". Retagging was necessary and was
 about a third of the work. Each of the other four was found by running the
 thing, not by reading it, and each hid the next.
 
-### 1. The 37 rows, retagged (planned)
+### 1. The rows, retagged (planned)
 
 Contract §1.5 defines a `Bridge` as what an `ACC_NATIVE` method binds to.
 `cratonvm/synthetic/{Process, ProcessPipeInputStream, ProcessPipeOutputStream,
 ProcessExitWaiter}` and `cratonvm/synthetic/AnonymousObject$2` are in no JDK
-image on any platform, so there is nothing for these to bridge to; all 37 were
+image on any platform, so there is nothing for these to bridge to; every one was
 `Bridge` by inheritance from an ambient `set_category` and by nothing else.
 Restated as `SyntheticStub`, strict mode drops them at registration.
+
+The adjudication opened with **37**. It landed on **29**: `58f0ffb30` deleted
+the other eight — `phases_late`'s duplicate `cratonvm/synthetic/Process` surface,
+superseded by `native-io`'s and reading pid from a slot that is now the stderr fd
+— while this change was in flight.
 
 ### 2. `ProcessImpl.forkAndExec` had to be written, and its `int[] fds` is the whole point
 
@@ -88,7 +93,7 @@ Two details worth keeping:
   and dropped every empty piece, which also drops a legitimately empty argument.
   `printf '[%s]' "" z` printed one field instead of two.
 
-### 3. The VM's handle is not the pid
+### 3. The VM's handle is not the pid — and a sibling session fixed it first
 
 `NEXT_HANDLE.fetch_add` versus `child.id()`. Invisible while the only callers
 were the VM's own `Process` natives, which carry the handle in a field — but the
@@ -96,15 +101,30 @@ real `ProcessImpl` never sees a handle. It keeps the **pid** and calls
 `ProcessHandleImpl.{waitForProcessExit0, isAlive0, destroy0, parent0}` with it,
 so every one of them looked up a handle that was never minted.
 
-A pid→handle index fixes it, and two return values had to become honest at the
-same time, because the JDK reads them as sentinels rather than data:
+This branch built a `pid_index` for it. `58f0ffb30` landed `handle_for_pid` for
+the same reason, with the same four callers, while it was in flight — so the
+duplicate was dropped at merge and dev's stands.
 
-* `waitForProcessExit0` answers `NOT_A_CHILD` (-2) for an unknown pid, not -1.
-  -1 is reported to the caller as a real exit status of -1.
-* `isAlive0` answers -1 (`STARTTIME_PROCESS_UNKNOWN`) for a pid that does not
-  exist, not 0. 0 means "exists, start time unavailable", and the reaper's
-  `NOT_A_CHILD` fallback loop is `while (startTime >= 0)` — it would never
-  leave.
+**Dev's is also right where this branch's was wrong, and the difference is
+exactly the bug dev measured.** `isAlive0` returns a start time, not a boolean:
+
+```java
+long startTime = isAlive0(pid);
+return startTime >= 0 && (startTime == this.startTime
+                          || startTime == 0 || this.startTime == 0);
+```
+
+so any value >= 0 means alive and -1 is the only way to say otherwise. This
+branch returned **0 for an exited child**, which is >= 0, and every handle
+`build_process_handle` mints has `this.startTime == 0` — so the third disjunct
+would have made `ProcessHandle.isAlive()` answer `true` for a child that had
+already been reaped. Dev's convention (alive 0, exited -1) is correct.
+
+Worth naming why this branch's own probes did not catch it:
+`RealProcessSurfaceProbe` asks `Process.isAlive()`, which on a real `ProcessImpl`
+is a field read behind a lock and never reaches the native. The failing question
+is `p.toHandle().isAlive()`, which dev's `probes/ProcHandleProbe.java` asks and
+this branch's does not. Two probes over the same subsystem, one blind spot each.
 
 ### 4. `destroy()` silently stopped working, because the reaper always holds the child
 
@@ -166,12 +186,12 @@ restated did.
 
 ## Counts
 
-53 registrations changed kind; **none of them is new**. The stub ratchet is
-re-frozen 644 → 697 and the kind-map baseline re-frozen from the same census.
+45 registrations changed kind; **none of them is new**. The stub ratchet is
+re-frozen 644 → 689 and the kind-map baseline re-frozen from the same census.
 
 | group | rows |
 |---|---:|
-| `cratonvm/synthetic/Process*` + `AnonymousObject$2` (the record's 37) | 37 |
+| `cratonvm/synthetic/Process*` + `AnonymousObject$2` (29 of the record's 37; dev deleted 8) | 29 |
 | `java/lang/ProcessBuilder` | 11 |
 | `java.io` constructors | 5 |
 
@@ -210,3 +230,17 @@ snapshotted before that rung and the source carries the ordering requirement.
 * **`ProcessBuilder$Redirect.PIPE`/`INHERIT`** are registered as methods the
   image does not declare (`Redirect.PIPE` is a field). Dead registrations, not
   reached by anything; left for a dead-row sweep.
+* **`waitForProcessExit0` answers -1 for a pid it did not spawn, where HotSpot's
+  own native answers `NOT_A_CHILD` (-2) on `ECHILD`.** The difference is real:
+  -1 completes `ProcessHandle.of(pid).onExit()` immediately with a fabricated
+  exit status of -1, while -2 makes the JDK poll `isAlive0` until the process
+  actually ends and then complete with 0. It only differs for a handle to a
+  process this VM did not spawn, no probe covers that path, and the code is
+  `58f0ffb30`'s and freshly probe-verified — so it is recorded here rather than
+  changed unmeasured. Fixing it is a one-line change plus a probe rung that
+  holds a foreign pid.
+* **`native-builtins/src/lib.rs`'s synthetic-mode `ProcessBuilder` block** —
+  `<init>` ×2, `command`, `start` — still carries the ambient `Bridge`. That
+  registrar is not on the default boot path, so no gate here measures it and the
+  strict-mode counts above are unaffected; it is the same adjudication as the 11
+  `phases_late` rows and should move with them in the reclassification wave.

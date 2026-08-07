@@ -1,32 +1,32 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 4587,
-      "bridge_without_acc_native": 9541,
+      "bridge_shadows_bytecode": 4581,
+      "bridge_without_acc_native": 9528,
       "jdk_version": "25.0.3",
       "mode": "compatible",
-      "note": "Giving --jdk-only a real java.lang.ProcessImpl: 55 registrations change kind, none of them new. 53 are this change (37 cratonvm/synthetic/Process* + AnonymousObject$2 receivers the VM mints and no image contains; 11 java/lang/ProcessBuilder rows that all shadow real bytecode, which must move as one cluster because restating start() alone leaves <init>([Ljava/lang/String;)V writing a raw String[] into the command field; 5 java.io constructors whose shims skip the real closeLock initializer, so every stream built through them throws NPE rather than IOException on its first close). The other 2 - ExecutorService/ThreadPoolExecutor.execute - are dev, whose ThreadPoolExecutor retirement landed without re-freezing this baseline; the gate was already red on this branch base and the two are absorbed here because both baselines must be frozen from one census. Verified: --jdk-only is byte-identical to HotSpot 25 on probes/RealProcessSurfaceProbe (21 lines), SubprocessKindProbe, SubprocessSubtypeProbe and UserProcessInterceptProbe; --real-jdk is byte-identical to the pre-change build.",
+      "note": "Giving --jdk-only a real java.lang.ProcessImpl. 45 registrations change kind and none is new: 29 on cratonvm/synthetic/Process*, ProcessExitWaiter and AnonymousObject$2 (receivers the VM mints, on no image, so there is no ACC_NATIVE method for a bridge to bind to); 11 java/lang/ProcessBuilder rows that all shadow real bytecode and must move as one cluster, because restating start() alone leaves <init>([Ljava/lang/String;)V writing a raw String[] into the command field and the JDK start() then dies on command.toArray; 5 java.io constructors whose shims skip the real closeLock initializer, so every stream built through them throws NPE rather than IOException on its first close. Re-taken on the merge with 58f0ffb30, which deleted 8 of the 37 synthetic-Process rows the adjudication opened with. Verified: --jdk-only byte-identical to HotSpot 25 on RealProcessSurfaceProbe (21 lines), SubprocessKindProbe, SubprocessSubtypeProbe and UserProcessInterceptProbe; classes fabricated in strict mode on a subprocess workload 4 -> 0.",
       "observed": {
         "bridge": {
-          "abstract_method": 1322,
+          "abstract_method": 1315,
           "acc_native": 776,
           "class_absent": 1153,
           "class_present_method_undeclared": 2479,
-          "rows": 10317,
-          "shadows_bytecode": 4587,
-          "without_acc_native": 9541
+          "rows": 10304,
+          "shadows_bytecode": 4581,
+          "without_acc_native": 9528
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 10317,
+          "bridge": 10304,
           "intrinsic": 681,
-          "synthetic-stub": 899
+          "synthetic-stub": 891
         },
         "schema": 1,
-        "total_rows": 11897
+        "total_rows": 11876
       },
       "os": "linux",
       "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"
