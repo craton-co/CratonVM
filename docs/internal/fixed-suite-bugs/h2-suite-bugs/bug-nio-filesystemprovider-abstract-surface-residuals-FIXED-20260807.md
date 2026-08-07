@@ -150,15 +150,22 @@ From the same HotSpot diff, three corrections to `write_named_attribute`:
 | Arm | Divergent lines before | after |
 |---|---|---|
 | Linux | 3 of 38 | **0 of 38 — byte-identical** |
-| Windows | 13 of 43 | 2 of 43 |
+| Windows | 13 of 43 | 3 of 43 |
 
-The two remaining Windows lines are both known and neither is this defect class:
+The three remaining Windows lines are known, and every one of them agrees with
+HotSpot on the exception **type** — what differs is a message or a separate
+defect:
 
 1. `probeContentType` → `UnsatisfiedLinkError:
    sun/nio/fs/WindowsNativeDispatcher.initIDs()V`. A missing JNI native in the
    Windows registry MIME lookup, not an abstract declaration. Filed as
    `docs/known-issues/nio/bug-files-probecontenttype-windows-nativedispatcher-20260807.md`.
-2. A `NoSuchFileException` message rendering the path with `/` where HotSpot
+2. The `ClassCastException` message. Both say `class java.lang.String cannot be
+   cast to class java.lang.Boolean`; HotSpot then appends `(java.lang.String and
+   java.lang.Boolean are in module java.base of loader 'bootstrap')` and
+   CratonVM appends `(setting 'dos:readonly')`. Reproducing HotSpot's clause
+   would mean asserting module and loader facts the call site has not looked up.
+3. A `NoSuchFileException` message rendering the path with `/` where HotSpot
    uses `\` — CratonVM's `Path` stores forward slashes; pre-existing and
    unrelated.
 
@@ -207,18 +214,39 @@ its bytecode reads. Filed as
 
 So on this branch's merged tip, `TestFileSystem` gets past `testSetReadOnly` —
 which is what this doc and its parent are about — and stops at `testSimple` for
-a reason that stops it on pristine `dev` too. The `setAttribute` verification
+a reason that stops it on pristine `dev` too. Confirmed on **both** platforms at
+the merged tip: the stack is `testSimple` → `FileChannel.tryLock` → `flt is
+null`, with no `AbstractMethodError` anywhere. The `setAttribute` verification
 above is quoted from `e3456d0e5` for that reason, and the `FilesSweep` diffs are
 quoted from the merged tip (they do not touch `FileChannel`).
 
-Rust gates, run on this branch and on pristine `origin/dev` with `cargo test
---workspace --no-fail-fast`: the failing-target sets are **identical** (12
-targets, red on dev) and the ratchet counts match to the digit — 1206 shadowed
-registrations, 53 kind disagreements, 435 raw lock constructions, 323 test-only
-public API entries. No new gate violation. Green on this branch:
+One consequence worth naming, because it changes what the probe prints: with
+`Files.delete` now reporting failure, `TfsProbe`'s own cleanup
+(`FileUtils.delete(base + "/fs")`) throws `DbException: Cannot delete file` when
+a failed run leaves the directory non-empty — instead of silently "succeeding"
+and printing `DONE failed=1`. That is HotSpot's behaviour too (`Files.deleteIfExists`
+on a non-empty directory is `DirectoryNotEmptyException` there); it only looks
+new because the delete used to lie.
+
+Rust gates re-run at the merged tip against pristine `dev` `cf4274fda`: 31
+failing test names on each arm, ratchet counts identical to the digit (1202
+shadowed registrations, 52 kind disagreements, 436 raw lock constructions, 323
+test-only public API). Four names differ between the arms in each direction and
+all four are known flakes — two wall-clock budgets
+(`t1_gc_pause_budget_100k_objects_under_200ms`,
+`re5_http_request_timeout_bounds_delayed_response_headers`), one port-binding
+test (`t4_8_1_jdwp_listening_transport`), and one
+(`compact_header::tests::forwarding_ptr_inline_boundary`) that passes in
+isolation on **both** arms and only fails under the suite's own parallelism.
+
+Rust gates at `e3456d0e5` against its own pristine base: failing-target sets
+**identical** (12 targets, red on dev) and ratchet counts identical to the digit
+— 1206 shadowed registrations, 53 kind disagreements, 435 raw lock
+constructions, 323 test-only public API entries. Green on that arm:
 `cargo test -p cratonvm-native-builtins --lib` 3338 passed / 0 failed,
 `--features synthetic-jdk` 3513 passed / 0 failed, `stub_ratchet` 7 passed,
-`cratonvm-native-io` 424 passed.
+`cratonvm-native-io` 424 passed. (The merged-tip re-run is above, under the dev
+regression.)
 
 Build note: the Linux binary is `LTO=thin, codegen-units=16` in its own target
 dir — the host was at load 8–19 and fat LTO SIGKILLs there. Legitimate for these
