@@ -77,7 +77,19 @@ real-JDK 25 (`/home/victor/jdk25`), CratonVM @ `origin/dev` `1082eb446`:
 |---|---|---|
 | HotSpot 25 | **0.38 s** | **5.17 s** |
 | CratonVM, JIT | **1.78 s** | **441.84 s**  (≈ **85×** HotSpot) |
-| CratonVM, `--nojit` | **3.39 s** | ≫ 300 s (never finished; see below) |
+| CratonVM, `--nojit` | **3.39 s** | **≫ 1 h** (see below) |
+
+`runBenchmark()` is nine phases: three `testToUpperCache()` then six
+`testSingleThread(100000)`. Under `--nojit` the *first* phase alone, measured
+by the benchmark's own timers, is:
+
+```
+cache        20 900 ms      (HotSpot:   124 ms —   169×)
+toUpperCase 1 194 295 ms    (HotSpot: 1 142 ms — 1 046×)
+```
+
+One phase of nine: **20 minutes**. Killed at that point; the class cannot
+complete under any per-class timeout the suite could plausibly set.
 
 The test half is 4.7–8.9× HotSpot — squarely the suite's ordinary CratonVM
 overhead. The benchmark half is 85×, and that is the entire reason the class

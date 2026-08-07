@@ -223,7 +223,11 @@ Same technique, same sweep. All fit the established signature:
   |---|---|---|
   | HotSpot | 0.38 s | 5.17 s |
   | CratonVM, JIT | 1.78 s | **441.84 s** (≈85×) |
-  | CratonVM, `--nojit` | 3.39 s | ≫300 s |
+  | CratonVM, `--nojit` | 3.39 s | **≫1 h** |
+
+  `runBenchmark()` is nine phases; under `--nojit` the first alone takes 20
+  minutes (`toUpperCase 1 194 295 ms` by the benchmark's own timer, against
+  HotSpot's `1 142 ms` — **1 046×** on that one loop).
 
   The test half is 4.7–8.9×, i.e. ordinary. The benchmark half is 85×:
   `runBenchmark → testToUpperCache → StringUtils.toUpperEnglish /
