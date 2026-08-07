@@ -1186,7 +1186,7 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_LONGROOT_STRICT` | JIT | `CRATONVM_JIT=longroot-strict` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_MAVEN_REPO_LOCAL` | — | `CRATONVM_MAVEN_REPO_LOCAL` | scalar | unset | behaviour | snapshot | native-builtins, types |
 | `CRATONVM_MAX_INFLATED_BYTES` | GC | `CRATONVM_GC=max-inflated-bytes` | opt-in | off | behaviour | snapshot | types |
-| `CRATONVM_MH_STRICT_INVOKEEXACT` | COMPAT | `CRATONVM_COMPAT=mh-strict-invokeexact` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_MH_STRICT_INVOKEEXACT` | COMPAT | `CRATONVM_COMPAT=mh-strict-invokeexact` | default-on | on | behaviour | snapshot | vm |
 | `CRATONVM_MOCKITO_LEGACY_SELECTORS` | COMPAT | `CRATONVM_COMPAT=mockito-legacy-selectors` | opt-in | off | behaviour | snapshot | types |
 | `CRATONVM_MOVING_YOUNG` | GC | `CRATONVM_GC=moving-young` | both | off | behaviour | snapshot | jit, types |
 | `CRATONVM_MOVING_YOUNG_BAND_DBG` | DBG | `CRATONVM_DBG=moving-young-band-dbg` | opt-in | off | diag | snapshot | vm |

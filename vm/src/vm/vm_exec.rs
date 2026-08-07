@@ -1499,7 +1499,40 @@ fn primitive_wrapper_for_ret_char(ret_char: u8) -> Option<&'static str> {
 fn mh_strict_invokeexact() -> bool {
     static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STRICT.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_MH_STRICT_INVOKEEXACT").is_some()
+        // DEFAULT FLIPPED 2026-08-07 (W5-4). Set the exact string `0` to
+        // restore the pre-W3-1 fabricated zero.
+        //
+        // The check's fire set is a strict SUBSET of the "fabricate a zero"
+        // set: the two wrapper tables are byte-identical, and the checked
+        // wrapper additionally declines an unresolvable class and a non-wrapper
+        // object, both of which the coercion still zeroes. So the only delta
+        // anywhere is: on a subset of today's fabricated zeros, an exception.
+        //
+        // One honest caveat, and it is why this needed an A/B rather than an
+        // argument: a fabricated zero is the CORRECT observable answer whenever
+        // the true answer is 0/false. "Nothing correct can become an exception"
+        // holds for the computation (that branch invents a value) but not for
+        // the outcome. The one mechanism where HotSpot would disagree is
+        // `asType`, which here is a passthrough leaving MH_DESC carrying the
+        // LEAF return type — already broken for every non-zero value, so this
+        // converts "silently wrong except at zero" into "loudly wrong always".
+        //
+        // Measured before flipping, interleaved, on the wave-4 binary:
+        //   Netty echo (`invokeExact(Thread)Z` — the one named risk that can
+        //     structurally reach the fire set): NETTY_OK in BOTH arms;
+        //   Groovy 4.0.21 (`IndyInterface`, which a strict check on this path
+        //     killed outright once before): identical PASS markers in both.
+        //   Groovy/Jackson/Spring/JRuby return REFERENCES, so they cannot reach
+        //     the fire set at any input.
+        //
+        // Permanent blind spot, recorded rather than papered over: Panama
+        // primitive downcalls can reach the fire set and have NO Java fixture
+        // in this tree — coverage is Rust-side only, and those calls do not
+        // route through `unbox_poly_return_checked`.
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_MH_STRICT_INVOKEEXACT").as_deref(),
+            Ok("0")
+        )
     })
 }
 

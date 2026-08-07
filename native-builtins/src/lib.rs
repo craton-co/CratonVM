@@ -18205,11 +18205,21 @@ pub fn register_essential_natives_with_shims(
     // loader, so resolve via the same classpath scan as the ClassLoader-side
     // native. Registered unconditionally (real-JDK + synthetic) like the
     // getResource overrides above.
+    // ENCAPSULATION (wave 5): this registration is the LAST one for this
+    // triple, so it decides the callback. It used to point at
+    // `classloader::module_get_resource_as_stream`, silently overwriting the
+    // encapsulating native `register_jboss_jdkspecific` had installed ~9k
+    // lines earlier in this same function — so a resource in a named module's
+    // non-open package was served to any caller (`RJdkModule.java:198`,
+    // HotSpot refuses). The jboss native applies the
+    // `java.lang.Module#getResourceAsStream` opens check and then DELEGATES to
+    // `classloader::module_get_resource_as_stream` for the actual bytes, so
+    // the kotlin-reflect behaviour this site was added for is unchanged.
     registry.register(
         "java/lang/Module",
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
-        classloader::module_get_resource_as_stream,
+        jboss_jdkspecific::native_module_get_resource_as_stream,
     );
     registry.register(
         "jdk/internal/loader/BootLoader",

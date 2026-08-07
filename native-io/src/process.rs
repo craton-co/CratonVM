@@ -4975,6 +4975,87 @@ mod tests {
         assert!(start >= 0, "this process exists, got {start}");
     }
 
+    /// The three answers `ProcessHandleImpl$Info.info(pid, startTime)` compares
+    /// must be ONE number.
+    ///
+    /// That method is real JDK bytecode this VM cannot influence:
+    ///
+    /// ```text
+    /// info.info0(pid);
+    /// if (startTime != info.startTime) { info.command = null; ... }
+    /// ```
+    ///
+    /// — a bare `!=`, with none of the `STARTTIME_ANY` wildcarding that
+    /// `equals()` and `isAlive()` apply. So `info0`'s stamp, `isAlive0`'s
+    /// return (which is what the handle's `startTime` field is built from) and
+    /// `current_process_start_time` (which builds THE `current()` handle) have
+    /// to agree exactly, or every field `info0` just wrote is discarded by its
+    /// own caller and `ProcessHandle.current().info()` reports an empty record
+    /// while nothing throws.
+    ///
+    /// This asserts the agreement, not a particular value: a host that cannot
+    /// read a start time at all legitimately answers `STARTTIME_ANY` (0) from
+    /// all three, and that is still a match.
+    #[test]
+    fn info0_stamps_the_start_time_isalive0_and_current_both_report() {
+        let mut ctx = MockNativeContext::new();
+        let pid = std::process::id() as i64;
+
+        let info = MockNativeContext::alloc_object(&mut ctx, 0);
+        native_proc_handle_info0(&mut ctx, &[Value::Object(Some(info)), Value::Long(pid)])
+            .expect("info0 must not throw");
+        let stamped = ctx.get_field_by_name(info, "startTime");
+
+        let answer = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(pid)]).unwrap();
+        let Some(alive) = answer else {
+            panic!("isAlive0 must answer a long, got {answer:?}");
+        };
+
+        assert_eq!(
+            stamped, alive,
+            "info0's Info.startTime and isAlive0's return are the two sides of \
+             `startTime != info.startTime` in ProcessHandleImpl$Info.info; a \
+             difference silently empties ProcessHandle.current().info()"
+        );
+        assert_eq!(
+            stamped,
+            Value::Long(current_process_start_time()),
+            "and current_process_start_time builds the handle that supplies the \
+             left-hand side of that same comparison"
+        );
+    }
+
+    /// `info0` must report a command for this very process.
+    ///
+    /// `RJdkProcess.java:135` guards its check with
+    /// `if (info.command().isPresent())`, so an empty `command` does not fail
+    /// the vector — it makes one `check(...)` silently not run, and HotSpot 25
+    /// runs it. `command` is the one `Info` field both platform arms can
+    /// source: `/proc/<pid>/cmdline` on Linux, `QueryFullProcessImageNameW` on
+    /// Windows.
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn info0_reports_a_command_for_this_process() {
+        let mut ctx = MockNativeContext::new();
+        let info = MockNativeContext::alloc_object(&mut ctx, 0);
+        native_proc_handle_info0(
+            &mut ctx,
+            &[
+                Value::Object(Some(info)),
+                Value::Long(std::process::id() as i64),
+            ],
+        )
+        .expect("info0 must not throw");
+        assert!(
+            matches!(
+                ctx.get_field_by_name(info, "command"),
+                Value::Object(Some(_))
+            ),
+            "Info.command must be a String, not the null the constructor leaves \
+             behind — an absent one takes RJdkProcess.java:136 with it"
+        );
+    }
+
     /// `destroy0` must refuse a pid whose start time disagrees with the
     /// caller's — that is the whole guard against acting on a recycled pid —
     /// and must trust a caller that never learned one.

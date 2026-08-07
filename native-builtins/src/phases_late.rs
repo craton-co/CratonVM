@@ -2149,28 +2149,29 @@ fn p60_current_handle_memo() -> &'static std::sync::Mutex<std::collections::Hash
 /// in `native-io/src/process.rs` (`isAlive0`, `parent0`, `destroy0`,
 /// `getProcessPids0`, `Info.info0`).
 ///
-/// 3. `startTime` was a hardcoded `0`. That is the JDK's `STARTTIME_ANY`
-///    wildcard, and it IS honoured by `ProcessHandleImpl.equals` and
-///    `.isAlive()` — which is why the handle still compared equal to the one
-///    `ProcessHandle.of(pid)` builds with a real start time, and why this went
-///    unnoticed. `ProcessHandleImpl$Info.info(long pid, long startTime)` does
-///    NOT honour it: its check is a bare `startTime != info.startTime`, and on
-///    a mismatch it nulls `command`, `arguments`, `startTime`, `totalTime` and
-///    `user` on the record `info0` has just filled in. With `0` on this side
-///    and a real start time from `info0` on the other, the mismatch was
-///    permanent and `ProcessHandle.current().info()` was permanently empty —
-///    silently, because every field of `Info` is an `Optional` and an empty one
-///    is a legal answer.
+/// A THIRD defect, found in wave 5 (W5-2): `startTime` was a hardcoded `0`.
 ///
-///    HotSpot's `<clinit>` seeds its own singleton with `new
-///    ProcessHandleImpl(pid, isAlive0(pid))`, so the correct value is whatever
-///    `isAlive0` reports; `current_process_start_time()` IS that function
-///    (`start_time_or_any`), which makes the three answers agree by
-///    construction. Measured: `regression-suite/src/RJdkProcess.java` runs 53
-///    checks on HotSpot 25 and ran 51 here, because the two `check(...)` calls
-///    guarded by `info.command().isPresent()` (:135) and
-///    `info.startInstant().isPresent()` (:138) never executed. Nothing threw;
-///    only the counter moved.
+/// That is the JDK's `STARTTIME_ANY` wildcard, and it IS honoured by
+/// `ProcessHandleImpl.equals` and `.isAlive()` — which is why the handle still
+/// compared equal to the one `ProcessHandle.of(pid)` builds with a real start
+/// time, and why this survived four waves unnoticed.
+/// `ProcessHandleImpl$Info.info(long pid, long startTime)` does NOT honour it:
+/// its check is a bare `startTime != info.startTime`, and on a mismatch it
+/// nulls `command`, `arguments`, `startTime`, `totalTime` and `user` on the
+/// record `info0` has just filled in. With `0` on this side and a real start
+/// time from `info0` on the other, the mismatch was permanent and
+/// `ProcessHandle.current().info()` was permanently empty — silently, because
+/// every field of `Info` is an `Optional` and an empty one is a legal answer.
+///
+/// HotSpot's `<clinit>` seeds its own singleton with
+/// `new ProcessHandleImpl(pid, isAlive0(pid))`, so the correct value is
+/// whatever `isAlive0` reports; `current_process_start_time()` IS that function
+/// (`start_time_or_any`), which makes the three answers agree by construction.
+/// Measured: `regression-suite/src/RJdkProcess.java` runs 53 checks on HotSpot
+/// 25 and ran 51 here, because the two `check(...)` calls guarded by
+/// `info.command().isPresent()` (:135) and `info.startInstant().isPresent()`
+/// (:138) never executed. Nothing threw; only the counter moved. See
+/// docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md.
 ///
 /// The bare-interface allocation stays as the synthetic-JDK fallback, where
 /// `java/lang/ProcessHandleImpl` does not exist; there the memo alone supplies
