@@ -2376,7 +2376,36 @@ impl VmHeap {
             return false;
         }
         match self {
-            VmHeap::Generational(h) => h.is_in_young_either(addr as *const u8),
+            // "Young and unmapped" is NOT a death certificate. It proves death
+            // only for a MOVING young collection, where every survivor gets a
+            // `pointer_map` entry. The non-moving sweep keeps survivors in
+            // place and produces NO map entries at all, so this arm condemned
+            // every live young object the moment the moving collector fell
+            // back — and it falls back on every collection in any workload
+            // with a live JIT frame it cannot map
+            // (`reason=innermost-rbp-belongs-to-unguarded-callee`).
+            //
+            // What that cost: `process_references_after_gc` skips the enqueue
+            // when either the `Reference` or its `ReferenceQueue` "did not
+            // survive", so NO reference was ever enqueued — a `WeakReference`
+            // was cleared but never delivered, and no `Cleaner` action ever
+            // ran. `EnqProbe` reports `gc enqueued it = false` where HotSpot
+            // enqueues; H2 then grows without bound, and the UPDATE workload
+            // that used to run in `--Xmx 1g` dies with `Out of memory` at 4g.
+            //
+            // `is_live_young_survivor` is the discriminator built for exactly
+            // this (see its soundness argument: STW-window-only, zeroed-span
+            // discriminator, moving-collection compatible), and it is already
+            // what the strict sibling `watched_pre_gc_addr_survived` uses for
+            // its young arm — these two must not disagree about the same
+            // address. The conjunction keeps the original verdict everywhere
+            // it was right: a genuinely dead young address, and the abandoned
+            // old address of an object a moving collection relocated, both
+            // still answer "did not survive", which is the `bc math-ec 0x4`
+            // protection this predicate exists for.
+            VmHeap::Generational(h) => {
+                h.is_in_young_either(addr as *const u8) && !h.is_live_young_survivor(addr)
+            }
             VmHeap::G1(_) => !self.is_addr_live(addr),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => !self.is_addr_live(addr),
