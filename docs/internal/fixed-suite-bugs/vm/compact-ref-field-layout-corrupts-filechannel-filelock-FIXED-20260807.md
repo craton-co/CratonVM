@@ -1,6 +1,67 @@
 # The compact reference-field layout corrupts `FileChannelImpl.fileLockTable`, so every file lock fails
 
 ## Status
+**✅ FIXED 2026-08-07.** One line in `vm/src/threading/monitor.rs`:
+`try_thin_unlock`'s last release stored the bare `MARK_NEUTRAL` constant into
+the mark word, erasing the `kind` / `element_type` / `gc_age` / `gc_flags`
+quartet that moved into bits 48..61 when the header shrank. `GC_FLAG_COMPACT`
+lives in that quartet, so **the first `synchronized` block on a compact object
+converted it to "legacy" on exit**, and every field read after that decoded a
+compact-packed body as 16-byte cells.
+
+The title is therefore half right: the compact layout is not corrupt, and the
+writers were not wrong. The reader was reading a header the monitor had
+rewritten. Regression test:
+`monitor::tests::a_thin_lock_round_trip_preserves_the_mark_word_quartet`; the
+witness this page shipped, `probes/CompactLayoutFileLockProbe.java`, goes
+`PROBE-FAILURES=1` -> `PROBE-OK`.
+
+### The leading hypothesis below was wrong — three measurements killed it
+
+This page proposed *"allocated legacy, written compact"*: an object that took
+the legacy fallback in `plan_object_alloc` and was then written by the several
+writers that decide compact-ness per CLASS from the global flag. Not so.
+
+| measurement | result |
+|---|---|
+| `CRATONVM_DBG=compact-legacy` | never names `FileChannelImpl` — it does not take the legacy fallback |
+| allocation-site probe | `id=413 num_fields=17 compact_body=Some(96)` — a compact layout IS registered and chosen |
+| birth-header probe | `gc_flags=0x4` when `ctx.new_object` returns, `0x0` at the failing read of the SAME object |
+
+The object is **born compact and loses the flag**. That reframes the search from
+"which writer used the wrong offset" to "what rewrote the header", and the
+window is one `synchronized` block. The per-CLASS writers the page pointed at
+(`interpreter.rs`, `jit_bridge.rs`, `jit/helpers.rs`) are JIT-codegen metadata
+and are not on this path at all — `--nojit` reproduces byte-identically, which
+the page itself records.
+
+`CRATONVM_COMPACT_REF_FIELDS=0` is a complete workaround for the honest reason
+that with the layout off nothing is born compact, so losing the flag is a no-op.
+
+### It does not close the whole cluster
+
+First 40 H2 suite classes, same host and cap:
+
+| build | PASS | FAIL | HANG |
+|---|---|---|---|
+| `1ec856c2c` (before the header landing) | 34 | 1 | 5 |
+| broken dev | **1** | 38 | 1 |
+| with this fix | **29** | 5 | 6 |
+
+So this was the large majority of it and every file-lock failure, but five
+classes short of the old baseline. The sibling defect on the same landing is
+GC-driven `Reference` enqueue: `probes/EnqProbe.java` shows a `WeakReference`
+whose referent is unreachable gets CLEARED but never ENQUEUED after
+`System.gc()`, byte-identically with and without this fix, where HotSpot
+enqueues it. `TestLob`, `TestMemoryUsage` and `TestLIRSMemoryConsumption` are
+the shape that would notice. That one still needs its own hunt.
+
+**Everything below is the original OPEN write-up, kept for its bisect and its
+ruled-out list, both of which stand.**
+
+---
+
+## Status (original)
 **OPEN, regression, deterministic (2026-08-07).** Bisected to
 `6ba350cdd` — *"Merge perf/header-16-and-field-packing-20260806: HEADER_SIZE 24
 -> 16"*. Its first parent `9ddbc9c61` is clean; `6ba350cdd` fails, and so does
