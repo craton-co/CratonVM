@@ -4855,10 +4855,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "copy",
         "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)Ljava/nio/file/Path;",
         |ctx, args| {
+            // Read the options FIRST: the probe re-enters Java, and a moving
+            // young GC there would relocate any `ObjectRef` already lifted out
+            // of `args` (the native stale-local family).
+            let replace_existing = copy_options_replace_existing(ctx, args.get(2));
             let src = obj_arg(args, 0)?;
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
+            // Without REPLACE_EXISTING, `Files.copy` onto an existing target
+            // must throw `FileAlreadyExistsException` — callers catch it BY
+            // TYPE, so a generic IOException will not do. `std::fs::copy`
+            // below overwrites unconditionally and the directory arm swallows
+            // `AlreadyExists`, so this is the only place the contract can be
+            // enforced. The sibling `Files.move` native already does exactly
+            // this with the same two helpers. Skip the check for jarfs-encoded
+            // targets (not real filesystem paths) and for a self-copy.
+            if !replace_existing
+                && src_path != dst_path
+                && jarfs_decode(&dst_path).is_none()
+                && std::fs::symlink_metadata(&dst_path).is_ok()
+            {
+                return Err(p57_file_already_exists(ctx, &dst_path));
+            }
             // Java `Files.copy(Path,Path,CopyOption...)`: copying a DIRECTORY
             // creates an (empty) directory at the target — it does NOT open the
             // source as a file. `std::fs::copy` only handles regular files and on
@@ -9797,6 +9816,17 @@ pub(crate) fn p57_visit_options_follow_links(
     // nothing else needs asking.
     if ctx.array_length(o) > 0 {
         return true;
+    }
+    // An EMPTY array is javac's zero-arg varargs form: no options were passed,
+    // so the answer is `false` and there is nothing to ask. Settle it here
+    // rather than falling through to the `isEmpty` probe below — a reference
+    // array reports its COMPONENT class by name (`registry.rs:2369-2376`), so
+    // that probe resolved `java/nio/file/FileVisitOption.isEmpty()Z` against
+    // the enum and logged a spurious `NoSuchMethodError` WARN on every
+    // `Files.walk(p)` / `deleteTree`. The verdict was already correct (the
+    // `_ => false` arm); only the noise was new.
+    if ctx.object_is_array(o) {
+        return false;
     }
     // Either an EMPTY array or the Set form
     // (`Files.walkFileTree(path, Set<FileVisitOption>, ...)`). Asking a Set is

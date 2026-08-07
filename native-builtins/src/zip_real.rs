@@ -993,6 +993,84 @@ fn crc32_update_byte_buffer_0(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 }
 
 // ---------------------------------------------------------------------------
+// Adler32 natives (real-JDK mode)
+// ---------------------------------------------------------------------------
+//
+// `java.util.zip.Adler32` in JDK 25 is pure Java holding a single `int adler`
+// field (seeded to 1 by the field initialiser) and delegating every mutation
+// to a *static* native that takes the current value and returns the new one:
+//
+//     private static native int update(int adler, int b);
+//     private static native int updateBytes(int adler, byte[] b, int off, int len);
+//     private static native int updateByteBuffer(int adler, long addr, int off, int len);
+//
+// Unlike `CRC32`, there is no concrete Java `updateBytes` wrapper in front of
+// an `updateBytes0` native — the range check lives in the *public*
+// `update(byte[],int,int)` body and `updateBytes` itself is the JNI entry
+// point. So the names above are exactly what has to be registered; missing
+// them is a hard `UnsatisfiedLinkError` from `Adler32.update` (seen as
+// `Missing native method in real-JDK mode
+// method=java/util/zip/Adler32.updateBytes(I[BII)I` in the regression suite's
+// `RJdkJni.zipNatives`).
+//
+// Also unlike CRC32, there is NO complement dance at the boundary: RFC 1950's
+// Adler-32 state *is* the externally visible value. `getValue()` is just
+// `(long) adler & 0xffffffffL`, and a fresh checksum is 1 (s1 = 1, s2 = 0),
+// not 0. `adler32_update` above already implements the rolling RFC 1950 §9
+// update in exactly that public representation — the same helper the
+// Deflater/Inflater `getAdler` bridges accumulate with — so these natives are
+// thin wrappers over it and can never drift from the zlib-stream checksums.
+//
+// Hand-verified vectors (see the unit tests below):
+//   Adler32("abc")       = 0x024D0127   (s1 = 1+97+98+99 = 295 = 0x127,
+//                                        s2 = 98+196+295 = 589 = 0x24D)
+//   Adler32("123456789") = 0x091E01DE   (the value RJdkJni.java:119 asserts)
+//
+// These are Bridge, not SyntheticStub: they implement a method that genuinely
+// has no Java body in the real JDK, so `--jdk-only` must keep them or the
+// real JDK class file cannot run at all.
+
+/// `private static native int update(int adler, int b)`.
+fn adler32_update_int(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let adler = arg_int(args, 0) as u32;
+    let b = (arg_int(args, 1) & 0xFF) as u8;
+    Ok(Some(Value::Int(adler32_update(adler, &[b]) as i32)))
+}
+
+/// `private static native int updateBytes(int adler, byte[] b, int off, int len)`.
+fn adler32_update_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let adler = arg_int(args, 0) as u32;
+    let arr = arg_obj(args, 1);
+    let off = arg_int(args, 2).max(0) as usize;
+    let len = arg_int(args, 3).max(0) as usize;
+    let bytes = match arr {
+        Some(a) => read_byte_array(ctx, a, off, len),
+        None => Vec::new(),
+    };
+    Ok(Some(Value::Int(adler32_update(adler, &bytes) as i32)))
+}
+
+/// `private static native int updateByteBuffer(int adler, long addr, int off, int len)`.
+///
+/// `addr` is the direct buffer's resolved native base address (the Java side
+/// already extracted it via `((DirectBuffer) buffer).address()`); `off`/`len`
+/// are the buffer's `position()`/remaining, mirroring the byte[] overload.
+fn adler32_update_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let adler = arg_int(args, 0) as u32;
+    let addr = arg_long(args, 1);
+    let off = arg_int(args, 2) as i64;
+    let len = arg_int(args, 3).max(0) as usize;
+    let mut bytes = vec![0u8; len];
+    if len > 0 && !ctx.copy_from_native_memory(addr + off, &mut bytes) {
+        return Err(RuntimeError::IOException {
+            message: "Adler32.updateByteBuffer: failed to read native buffer memory".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Int(adler32_update(adler, &bytes) as i32)))
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -1107,6 +1185,23 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
         "updateByteBuffer0",
         "(IJII)I",
         crc32_update_byte_buffer_0,
+        NativeKind::Bridge,
+    );
+
+    // Adler32 — the JDK 25 `java.util.zip.Adler32` natives. All three are
+    // static, take the running (== public) checksum and return the new one.
+    // The phases_late synthetic registers instance-level
+    // `<init>`/`update(I)V`/`update([BII)V`/`getValue`/`reset` against a
+    // synthetic 1-field Long layout; those descriptors are disjoint from the
+    // static ones below, so both sets coexist and each mode uses its own.
+    let ad = "java/util/zip/Adler32";
+    r.register_with_kind(ad, "update", "(II)I", adler32_update_int, NativeKind::Bridge);
+    r.register_with_kind(ad, "updateBytes", "(I[BII)I", adler32_update_bytes, NativeKind::Bridge);
+    r.register_with_kind(
+        ad,
+        "updateByteBuffer",
+        "(IJII)I",
+        adler32_update_byte_buffer,
         NativeKind::Bridge,
     );
 }
@@ -1650,5 +1745,75 @@ mod tests {
             1,
             "post-finish call must still report finished"
         );
+    }
+
+    /// RFC 1950 §9 known-answer vectors for the rolling helper the Adler32
+    /// natives (and the Deflater/Inflater `getAdler` bridges) share.
+    #[test]
+    fn adler32_known_vectors() {
+        // Fresh state is 1 (s1 = 1, s2 = 0), never 0 — unlike CRC32.
+        assert_eq!(adler32_update(1, b""), 1);
+        // "abc": s1 = 1+97+98+99 = 295 = 0x127;
+        //        s2 = 98+196+295 = 589 = 0x24D.
+        assert_eq!(adler32_update(1, b"abc"), 0x024D_0127);
+        // "123456789": the vector RJdkJni.zipNatives asserts.
+        assert_eq!(adler32_update(1, b"123456789"), 0x091E_01DE);
+        // Streaming in pieces must equal hashing the concatenation — this is
+        // the property `Adler32.update` relies on across native calls.
+        let split = adler32_update(adler32_update(1, b"1234"), b"56789");
+        assert_eq!(split, 0x091E_01DE);
+    }
+
+    /// The three registered natives must reproduce those vectors through the
+    /// `Value` boundary, byte-array reads included.
+    #[test]
+    fn adler32_natives_match_vectors() {
+        let mut ctx = mock_ctx();
+
+        // update(int adler, int b): 'a' from the seed => s1 = 98, s2 = 98.
+        let one = adler32_update_int(&mut ctx, &[Value::Int(1), Value::Int(b'a' as i32)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(one, Value::Int(0x0062_0062));
+
+        // Only the low 8 bits of `b` participate (JNI jbyte truncation).
+        let masked = adler32_update_int(&mut ctx, &[Value::Int(1), Value::Int(0x1_0061)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(masked, Value::Int(0x0062_0062));
+
+        // updateBytes(int adler, byte[] b, int off, int len) over "123456789"
+        // embedded in a larger array, to exercise the off/len slice.
+        let data = b"XX123456789XX";
+        let arr = ctx.new_array(ArrayElementType::Byte, data.len());
+        for (i, b) in data.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+        }
+        let bytes = adler32_update_bytes(
+            &mut ctx,
+            &[
+                Value::Int(1),
+                Value::Object(Some(arr)),
+                Value::Int(2),
+                Value::Int(9),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes, Value::Int(0x091E_01DE));
+
+        // A null array is a no-op rather than a panic.
+        let null_arr = adler32_update_bytes(
+            &mut ctx,
+            &[
+                Value::Int(1),
+                Value::Object(None),
+                Value::Int(0),
+                Value::Int(9),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(null_arr, Value::Int(1));
     }
 }

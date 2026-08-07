@@ -1375,11 +1375,172 @@ fn provider_construction_error(
     }
 }
 
+/// The service's binary name, for `ServiceConfigurationError` messages.
+///
+/// `serviceName` is a CratonVM-only field: `initialize_real_service_loader_fields`
+/// writes it, but a real JDK 25 `ServiceLoader` does not declare it, so the write
+/// is a no-op there and the read answers `Int(0)`. Fall back to the `service`
+/// mirror (named field, then the legacy slot 0 the synthetic layout uses) and ask
+/// it for its name, exactly as `discover_providers` does.
+fn sl_service_name(ctx: &mut dyn NativeContext, sl: cratonvm_types::ObjectRef) -> String {
+    if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(sl, "serviceName") {
+        let name = ctx.read_string(name_obj).unwrap_or_default();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    let service = match ctx.get_field_by_name(sl, "service") {
+        Value::Object(Some(c)) => c,
+        _ => match ctx.get_field(sl, 0) {
+            Value::Object(Some(c)) => c,
+            _ => return String::new(),
+        },
+    };
+    let service_pin = ctx.pin_native_root(service);
+    let service = ctx.read_native_pin(service_pin, service);
+    let name = match ctx.invoke(
+        "java/lang/Class",
+        "getName",
+        "()Ljava/lang/String;",
+        &[Value::Object(Some(service))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    ctx.unpin_native_roots(service_pin);
+    name
+}
+
+/// The JDK's `fail(service, "Provider " + cn + " not found")`: a
+/// `ServiceConfigurationError` with a message and NO cause, which is what
+/// `LazyClassPathLookupIterator.nextProviderClass` raises when a descriptor
+/// names a class the loader cannot resolve.
+///
+/// `None` when the error object itself cannot be built — a `ServiceLoader`
+/// running on a class library that has no usable `ServiceConfigurationError`
+/// must keep this file's historical behaviour (an empty iterator) rather than
+/// gain a brand-new, uncatchable internal failure.
+fn provider_not_found_error(
+    ctx: &mut dyn NativeContext,
+    service_name: &str,
+    provider: &str,
+) -> Option<MethodCallFailed> {
+    let text = format!("{service_name}: Provider {provider} not found");
+    let message = ctx.create_string(&text);
+    let message_pin = ctx.pin_native_root(message);
+    let message = ctx.read_native_pin(message_pin, message);
+    let built = ctx.new_object_initialized(
+        "java/util/ServiceConfigurationError",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(message))],
+    );
+    ctx.unpin_native_roots(message_pin);
+    match built {
+        Ok(Some(Value::Object(Some(error)))) => Some(MethodCallFailed::ExceptionThrown(error)),
+        _ => None,
+    }
+}
+
+/// The JDK's own per-loader instance cache: `ServiceLoader.instantiatedProviders`.
+///
+/// `initialize_real_service_loader_fields` allocates this list and
+/// `native_sl_reload` clears it, but until the caching arm of
+/// `native_sl_iterator` existed nothing ever read or wrote it — see that
+/// function's cache comment for what that cost.
+///
+/// Absent on a layout that does not declare the field (a fabricated
+/// synthetic-JDK `ServiceLoader`), where `get_field_by_name` answers
+/// `Int(0)` rather than an object; the caller then falls back to the
+/// re-discovering path this file has always taken.
+fn sl_instance_cache(
+    ctx: &mut dyn NativeContext,
+    sl: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    match ctx.get_field_by_name(sl, "instantiatedProviders") {
+        Value::Object(Some(list)) => Some(list),
+        _ => None,
+    }
+}
+
+/// `true` once a completed `iterator()` has published every provider into
+/// `instantiatedProviders`. Mirrors the real JDK field of the same name:
+/// `initialize_real_service_loader_fields` seeds it to 0 and
+/// `native_sl_reload` resets it to 0, so `reload()` still discards the cache.
+///
+/// A layout without the field answers `Int(0)` and therefore never reports a
+/// complete cache, which is what keeps this change inert wherever the named
+/// fields do not exist.
+fn sl_cache_is_complete(ctx: &mut dyn NativeContext, sl: cratonvm_types::ObjectRef) -> bool {
+    ctx.get_field_by_name(sl, "loadedAllProviders")
+        .as_int()
+        .unwrap_or(0)
+        != 0
+}
+
 fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sl = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // `java.util.ServiceLoader` is specified to CACHE: "Instances are cached
+    // and instantiated lazily ... Iterating over a ServiceLoader a second time
+    // yields the same instances, in the same order" — only `reload()` discards
+    // them. This native re-discovered and re-instantiated every provider on
+    // every `iterator()` call, so `sl.iterator().next() != sl.iterator().next()`
+    // for the SAME loader (regression-suite `RJdkServices.java:121`,
+    // "a single ServiceLoader caches its instances" — the check that failed in
+    // `--real-jdk` while `--jdk-only`, which refuses this SyntheticStub and runs
+    // the real `ServiceLoader` bytecode, passed).
+    //
+    // The cache the JDK uses for exactly this is `instantiatedProviders`, and
+    // this file already allocated it (`initialize_real_service_loader_fields`)
+    // and already cleared it on `reload()` (`native_sl_reload`) — it just had
+    // no reader and no writer, so `reload()`'s clear was a no-op and the
+    // "reload discards the cache" check only passed because there was no cache
+    // to discard. The two arms below are that missing reader and writer.
+    //
+    // `sl` must be rooted for the whole body: the publish step at the bottom
+    // writes two of its fields after the instantiation loop's many collections.
+    let sl_pin = ctx.pin_native_root(sl);
+    if sl_cache_is_complete(ctx, sl) {
+        if let Some(cache) = sl_instance_cache(ctx, sl) {
+            let cache_pin = ctx.pin_native_root(cache);
+            let cache_now = ctx.read_native_pin(cache_pin, cache);
+            // A non-empty cache is required, not just the flag. In the real JDK
+            // `loadedAllProviders` guards `loadedProviders` (the `stream()`
+            // Provider-wrapper cache), NOT `instantiatedProviders`; the real
+            // iterator tracks its own position by index instead. Every
+            // `ServiceLoader` that reaches this native has the flag written by
+            // this file (0 at construction, 0 on `reload`, 1 only by the publish
+            // step below), but requiring providers to actually be there means a
+            // loader that somehow arrived with the JDK's meaning of the flag
+            // re-discovers rather than reporting itself empty. A service with
+            // genuinely zero providers just takes the discovery path every time,
+            // which is what this native has always done.
+            let cached_len = match ctx.invoke(
+                "java/util/ArrayList",
+                "size",
+                "()I",
+                &[Value::Object(Some(cache_now))],
+            ) {
+                Ok(Some(Value::Int(n))) => n,
+                _ => 0,
+            };
+            if cached_len > 0 {
+                let cache_now = ctx.read_native_pin(cache_pin, cache);
+                let it = ctx.invoke(
+                    "java/util/ArrayList",
+                    "iterator",
+                    "()Ljava/util/Iterator;",
+                    &[Value::Object(Some(cache_now))],
+                );
+                ctx.unpin_native_roots(sl_pin);
+                return it;
+            }
+            ctx.unpin_native_roots(cache_pin);
+        }
+    }
+    let sl = ctx.read_native_pin(sl_pin, sl);
     // Extract and pin the non-builtin loader BEFORE discover_providers (which
     // triggers GC via invoke). If the loader is not re-pinned it becomes stale.
     let loader_pin_opt: Option<(_, cratonvm_types::ObjectRef)> =
@@ -1414,6 +1575,9 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             providers.len()
         );
     }
+    // Descriptor entries whose class could not be resolved at all. See the
+    // all-or-nothing `ServiceConfigurationError` decision after the loop.
+    let mut missing: Vec<String> = Vec::new();
     for fqn in providers {
         if diag {
             eprintln!("[SL-DBG]   instantiate provider={fqn}");
@@ -1423,12 +1587,16 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let loader_cur = loader_pin_opt
             .as_ref()
             .map(|(pin, orig)| ctx.read_native_pin(*pin, *orig));
-        let class = match load_provider_class(ctx, &fqn, loader_cur) {
+        // Bound outside the `match` so the shared borrow of `fqn` cannot outlive
+        // the call into the arms, where `fqn` is moved into `missing`.
+        let resolved = load_provider_class(ctx, &fqn, loader_cur);
+        let class = match resolved {
             Some(c) => c,
             None => {
                 if diag {
                     eprintln!("[SL-DBG]   skip (class not found for {fqn})");
                 }
+                missing.push(fqn);
                 continue;
             }
         };
@@ -1561,18 +1729,159 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         eprintln!("[SL-DBG] iterator() final list size={:?}", size);
         list = ctx.read_native_pin(list_pin, list);
     }
+    // A descriptor entry naming a class that cannot be resolved is a
+    // `ServiceConfigurationError` in the JDK — `LazyClassPathLookupIterator.
+    // nextProviderClass` catches `ClassNotFoundException` and calls
+    // `fail(service, "Provider " + cn + " not found")`, message only, no cause.
+    // This native instead skipped the entry silently, so
+    // `ServiceLoader.load(Broken.class)` iterated empty and never threw
+    // (regression-suite `RJdkServices.java:196`, reachable in `--real-jdk` only
+    // once the caching defect at :121 stops aborting the class first; HotSpot
+    // and `--jdk-only` both print `badProviderCause=none`, i.e. an SCE whose
+    // `getCause()` is null — exactly this shape).
+    //
+    // NARROWED ON PURPOSE to "not one single provider could be built". Full JDK
+    // parity would raise on the FIRST unresolvable entry, and this VM reaches
+    // that arm routinely for reasons the JDK never would: the flat classpath
+    // scan unions the descriptors of every jar on the path, so an optional
+    // provider whose class this VM cannot yet load is common, and today every
+    // caller of such a service gets the working subset. Raising there would
+    // convert working partial discovery into a hard failure across the
+    // Spring/Tomcat/Elasticsearch/WildFly suites in one step, with no way to
+    // measure it from this lane. When nothing at all resolved, there is no
+    // subset to protect and the caller's alternative is an empty iterator that
+    // silently lies about the descriptor it just read.
+    if !missing.is_empty() {
+        let loaded = match ctx.invoke(al_cls, "size", "()I", &[Value::Object(Some(list))]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => 0,
+        };
+        list = ctx.read_native_pin(list_pin, list);
+        if loaded == 0 {
+            let sl_now = ctx.read_native_pin(sl_pin, sl);
+            let service_name = sl_service_name(ctx, sl_now);
+            if let Some(error) = provider_not_found_error(ctx, &service_name, &missing[0]) {
+                ctx.unpin_native_roots(sl_pin);
+                return Err(error);
+            }
+            list = ctx.read_native_pin(list_pin, list);
+        }
+    }
+    // Publish the freshly instantiated providers into `instantiatedProviders`
+    // and mark the cache complete, so the NEXT `iterator()` on this same
+    // ServiceLoader replays these very objects instead of building new ones.
+    // The iterator we hand back is the cache's own iterator on this path, which
+    // is what makes the first and second iterations agree by construction
+    // rather than by a copy that could drift.
+    //
+    // Every step degrades to today's behaviour rather than failing: no cache
+    // field (synthetic layout) or a copy step that does not resolve leaves
+    // `loadedAllProviders` at 0, so the next call simply re-discovers.
+    //
+    // The copy uses only calls this file already drives against these exact
+    // objects — `List.clear` (`native_sl_reload`), `List.get`
+    // (`discover_providers`' jarMetas walk), `ArrayList.size` (the diag branch
+    // above) and `ArrayList.add` (the instantiation loop above) — rather than
+    // `addAll`, which nothing here has ever exercised.
+    let mut iterate_over = list;
+    let mut published = false;
+    let sl_now = ctx.read_native_pin(sl_pin, sl);
+    if let Some(cache) = sl_instance_cache(ctx, sl_now) {
+        let cache_pin = ctx.pin_native_root(cache);
+        let cache_now = ctx.read_native_pin(cache_pin, cache);
+        let mut copied = ctx
+            .invoke(
+                "java/util/List",
+                "clear",
+                "()V",
+                &[Value::Object(Some(cache_now))],
+            )
+            .is_ok();
+        list = ctx.read_native_pin(list_pin, list);
+        let count = match ctx.invoke(al_cls, "size", "()I", &[Value::Object(Some(list))]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => {
+                copied = false;
+                0
+            }
+        };
+        for i in 0..count {
+            list = ctx.read_native_pin(list_pin, list);
+            let element = match ctx.invoke(
+                "java/util/List",
+                "get",
+                "(I)Ljava/lang/Object;",
+                &[Value::Object(Some(list)), Value::Int(i)],
+            ) {
+                Ok(Some(value @ Value::Object(Some(_)))) => value,
+                _ => {
+                    copied = false;
+                    break;
+                }
+            };
+            // The element is a native local across `add`'s own pre-dispatch
+            // resolve window, exactly like `inst` in the loop above.
+            let element_pin = match element {
+                Value::Object(Some(object)) => Some(ctx.pin_native_root(object)),
+                _ => None,
+            };
+            let element = match (element, element_pin) {
+                (Value::Object(Some(original)), Some(pin)) => {
+                    Value::Object(Some(ctx.read_native_pin(pin, original)))
+                }
+                (value, _) => value,
+            };
+            let cache_now = ctx.read_native_pin(cache_pin, cache);
+            let added = ctx.invoke(
+                al_cls,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(cache_now)), element],
+            );
+            if let Some(pin) = element_pin {
+                ctx.unpin_native_roots(pin);
+            }
+            if added.is_err() {
+                copied = false;
+                break;
+            }
+        }
+        if copied {
+            let sl_now = ctx.read_native_pin(sl_pin, sl);
+            ctx.set_field_by_name(sl_now, "loadedAllProviders", Value::Int(1));
+            iterate_over = ctx.read_native_pin(cache_pin, cache);
+            published = true;
+        } else {
+            // Leave the flag at 0: a half-copied cache must never be replayed.
+            let cache_now = ctx.read_native_pin(cache_pin, cache);
+            let _ = ctx.invoke(
+                "java/util/List",
+                "clear",
+                "()V",
+                &[Value::Object(Some(cache_now))],
+            );
+            ctx.unpin_native_roots(cache_pin);
+            iterate_over = ctx.read_native_pin(list_pin, list);
+        }
+    }
+    if diag {
+        eprintln!("[SL-DBG] iterator() cache published={published}");
+    }
     let it = ctx.invoke(
         al_cls,
         "iterator",
         "()Ljava/util/Iterator;",
-        &[Value::Object(Some(list))],
+        &[Value::Object(Some(iterate_over))],
     )?;
-    // The returned iterator now keeps `list` reachable via the Java object
-    // graph, so the native pins can be released.
+    // The returned iterator now keeps its backing list reachable via the Java
+    // object graph, so the native pins can be released. `sl_pin` is the first
+    // pin owned by this scope, so truncating to it also releases the loader,
+    // list and cache pins taken after it.
     ctx.unpin_native_roots(list_pin);
     if let Some((pin, _)) = loader_pin_opt {
         ctx.unpin_native_roots(pin);
     }
+    ctx.unpin_native_roots(sl_pin);
     Ok(it)
 }
 

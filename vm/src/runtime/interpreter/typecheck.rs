@@ -276,6 +276,20 @@ pub(super) fn lambda_proxy_satisfies(
             return shared.lambda_proxy_serializability(obj_class_id)
                 != cratonvm_native_api::LambdaSerializability::NotSerializable;
         }
+        // `altMetafactory`'s FLAG_MARKERS block names ADDITIONAL interfaces the
+        // spun proxy implements on top of the functional interface. The proxy's
+        // synthetic ClassId has no ClassStore `interfaces` vector to hold them,
+        // so they live in a side table beside `lambda_proxies`; ask it before
+        // falling through to the functional interface, or an intersection-cast
+        // lambda fails its own `instanceof` / `checkcast`.
+        if crate::runtime::invokedynamic::lambda_proxy_marker_satisfies(
+            shared,
+            obj_class_id,
+            target_class_id,
+            &target_name,
+        ) {
+            return true;
+        }
         // A lambda proxy is defined for precisely this functional-interface
         // name. Its synthetic VM-only ClassId has no ClassStore hierarchy, and
         // a global reload can select a different loader's mirror during forked

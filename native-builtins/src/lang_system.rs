@@ -4076,13 +4076,20 @@ pub(crate) fn native_classloader_define_class0(
 
     // `init` (boolean) at arg 7: run <clinit> after define.
     let initialize = matches!(args.get(7), Some(Value::Int(v)) if *v != 0);
-    // `flags` (int) at arg 8: bit 0 = HIDDEN, bit 1 = STRONG, bit 2 = NESTMATE.
+    // `flags` (int) at arg 8. JDK 25 `MethodHandleNatives.Constants`:
+    //   NESTMATE_CLASS = 0x01, HIDDEN_CLASS = 0x02, STRONG_LOADER_LINK = 0x04,
+    //   ACCESS_VM_ANNOTATIONS = 0x08.
+    // This block previously read bit 0 as HIDDEN (that is NESTMATE) and bit 2
+    // as NESTMATE (that is STRONG), so a non-nestmate `defineHiddenClass`
+    // (flags 0x02) decoded as `hidden = false` and collided on a duplicate
+    // define. `classloader.rs:4048-4057` has carried the correct constants all
+    // along — see DEFINE_CLASS0_FLAG_* there.
     let flags = match args.get(8) {
         Some(Value::Int(f)) => *f,
         _ => 0,
     };
-    let hidden = (flags & 0x1) != 0;
-    let nestmate = (flags & 0x4) != 0;
+    let nestmate = (flags & 0x1) != 0;
+    let hidden = (flags & 0x2) != 0;
 
     // If hidden, mangle the name uniquely.
     let (effective_name, override_name) = if hidden {

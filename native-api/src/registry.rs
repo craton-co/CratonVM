@@ -606,6 +606,23 @@ pub trait NativeClassAccess {
         0
     }
 
+    /// Record the `LambdaMetafactory.altMetafactory` MARKER INTERFACES of a
+    /// proxy just returned by `register_lambda_proxy`.
+    ///
+    /// `altMetafactory`'s `FLAG_MARKERS` (0x2) block names interfaces the spun
+    /// proxy implements IN ADDITION to its functional interface, so
+    /// `marker.isInstance(lambda)` and a `checkcast` to the marker must both
+    /// succeed. They are not part of the SAM metadata `register_lambda_proxy`
+    /// carries, so they are handed over separately, right after it.
+    ///
+    /// `proxy_class_id` is the raw `u32` that `register_lambda_proxy` returned
+    /// (`0` means it declined — nothing to record). `marker_interfaces` are
+    /// internal names (`java/lang/Cloneable`). No-op by default: a host with no
+    /// lambda-proxy table (test mocks) has nowhere to put them.
+    fn register_lambda_proxy_markers(&mut self, proxy_class_id: u32, marker_interfaces: &[String]) {
+        let _ = (proxy_class_id, marker_interfaces);
+    }
+
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 
@@ -5572,6 +5589,17 @@ impl NativeMethodRegistry {
                     // abnormally completed task, so it cannot disagree with
                     // join()/get() about whether the task failed.
                     | ("getException", "()Ljava/lang/Throwable;")
+                    // L12: the STATIC `invokeAll` overloads. JDK 25's
+                    // `invokeAll(t1, t2)` runs one task inline and then blocks
+                    // in `awaitDone` for the FORKED sibling — which the lazy
+                    // `fork()` above never schedules and no worker thread
+                    // exists to run. RJdkForkJoin hung there forever.
+                    | (
+                        "invokeAll",
+                        "(Ljava/util/concurrent/ForkJoinTask;Ljava/util/concurrent/ForkJoinTask;)V",
+                    )
+                    | ("invokeAll", "([Ljava/util/concurrent/ForkJoinTask;)V")
+                    | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/Collection;")
             );
         if real_forkjoinpool_enabled()
             && matches!(

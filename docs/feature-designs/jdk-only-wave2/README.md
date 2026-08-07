@@ -110,9 +110,20 @@ their kind, and 58 triples `--jdk-only` was admitting by registration order are
 refused — including the `Function$Identity` / `UnaryOperator.identity` copies in
 `phases_late/streams.rs` that L7 item 4 did not reach.
 
-**Every lane but L12 is done.** (L1–L8 landed; L9 closed 2026-08-04; L10 landed
-2026-08-06 and with it the last blocker, and L11 spent it the same day — item 7's
-nine dispatch sites are deleted. L12 — item 11's residuals — is what is left.)
+**Every lane in the table above is done but L12.** (L1–L8 landed; L9 closed
+2026-08-04; L10 landed 2026-08-06 and with it the last blocker, and L11 spent it
+the same day — item 7's nine dispatch sites are deleted. L12 — item 11's
+residuals — is what is left.)
+
+**A SECOND, separately numbered pool is in flight, and its lane numbers collide
+with this table's.** The strict-corpus campaign of 2026-08-06/07 staffed one
+lane per corpus failure and filed each under
+`docs/known-issues/jdk-only/L<n>-*.md`. Those numbers have **nothing** to do with
+the rows above: `L3-scanner-membername-residual.md` in *this* directory is the
+Scanner/MemberName layout lane, while
+`known-issues/jdk-only/L3-definehiddenclass-returns-null.md` is
+`Lookup.defineHiddenClass`. **Cite the full path, never the bare lane number.**
+Campaign record: [`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md).
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -141,7 +152,13 @@ measured as working and were not.
    that error made an inert guard read as a working one on 2026-08-04.
 2. **Both modes plus a HotSpot control.** `--jdk-only`, `--real-jdk`, and real
    HotSpot on the same probe. A divergence present in *both* CratonVM modes is
-   not a strict-mode defect.
+   not a strict-mode defect. **Give the control the same arguments the suite
+   gives it** — class path, `--module-path`, `--add-modules`, the lot.
+   `regression-suite/run.sh` builds those from one variable per arm precisely so
+   they cannot drift; an ad-hoc control that drops or mistypes one measures
+   nothing, and on 2026-08-06 that produced a wrong classification (see *Failure
+   modes*). If the control fails, run it three times before believing it: an
+   intermittent failure is a racy assertion in the vector, not a contract.
 3. **Check exit status, not just stdout.** A timed-out run prints a truncated
    transcript that reads exactly like a short clean one.
 4. **Gate the crate you actually edited.** An earlier gate set omitted
@@ -187,6 +204,20 @@ above looks paranoid.
   (24 named slots), and L10's own verification bullet, "`cargo test --release -p
   cratonvm-native-collections --lib` (94 tests)" — it is 105, and the lane never
   edited that crate. Take the census before sizing anything.
+* **A verdict measured against a broken oracle is worse than no verdict.** The
+  strict-corpus campaign's ad-hoc HotSpot arm ran `RJdkModule` with the module
+  name `cratonvm.regression.jdkonly`; the module in this tree is
+  `cratonvm.jdkonly.svc` (`regression-suite/modules/cratonvm.jdkonly.svc/module-info.java`,
+  and `run.sh:58`). HotSpot 25 duly failed, the vector was written off as a bad
+  one, and a **real CratonVM defect** — `Module.getLayer()` not answering the
+  boot layer, in both modes, `RJdkModule.java:57` — was nearly suppressed for the
+  whole campaign. With the right invocation HotSpot prints `PASS RJdkModule (44
+  checks)`. **A "HotSpot fails it too" verdict is only as good as the
+  invocation**, and step 2 of the protocol above is where it gets earned.
+  `RJdkProcess` is the same question with the opposite answer — HotSpot really
+  does fail it, intermittently, and the *intermittency* was the tell — so the
+  rule is not "distrust the oracle", it is "run the oracle the way the suite
+  runs it, and run it more than once".
 * **An absent instrument reads exactly like a satisfied one.** L10's first A-arm
   reading was `true=0 false=0`, which says "these dispatch sites are dead" — a
   tidy finding, and wrong: the binary was linked before the flag existed. Print
@@ -235,8 +266,24 @@ above looks paranoid.
    defects turned out to be. **Not green**, and now measured on every CI run by
    `scripts/jdk-only-strict-probes.sh` — see
    L8 retired (`jdk-only-wave2-L8-strict-corpus-green-RETIRED-20260805.md`).
-   Four open records stand between here and green, all four **compatibility**
-   defects that `--jdk-only` did not introduce.
+   The open records between here and green are all **compatibility** defects
+   that `--jdk-only` did not introduce. *(The count "four open records" was
+   written on 2026-08-05 and is not re-verified here — treat it as
+   **UNVERIFIED**; the 2026-08-06/07 corpus run below is the current number.)*
+
+   **Two instruments answer criterion 6 and they disagree by an order of
+   magnitude. Never quote one alone.**
+
+   | instrument | what it measures | reading, 2026-08-07 |
+   |---|---|---|
+   | `scripts/jdk-only-strict-probes.sh` | five breadth probes, scored section-by-section against a HotSpot control | **2 baselined divergences** (`scripts/baselines/jdk-only-strict-corpus-25-linux.txt`, both `JdkOnlyPlatformProbe/*/vthreads` — one per arm, so neither is strict-only) |
+   | `regression-suite/run.sh` `JDKONLY_CLASSES` | 21 hostile vectors, asserting JDK contracts check by check | **14 failures** |
+
+   Both are honest; they ask different questions. Reading criterion 6 off the
+   probe baseline **alone** badly overstates where the mode is — a green ratchet
+   over a narrow instrument is evidence about the instrument's reach, not about
+   the mode. Quote both, always. See
+   [`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md).
 
 ## State as of 2026-08-05
 
@@ -433,10 +480,14 @@ Three findings worth carrying into the other lanes:
   `register_unmodifiable_natives`.
 
 **Update, 2026-08-05 — L8 is retired, and criterion 6 is measured on every
-build.** One new probe over the five surfaces nothing covered (ProcessBuilder,
-security providers, virtual threads, agents/attach, JNI) found four divergences
-on its first run, and two of those were binding failures hiding three more
-underneath. Seven defects: five fixed, four filed. **Zero were introduced by
+build.** *(By the probe gate, which is not the whole of criterion 6 — the corpus
+asks a different question and got a much worse answer. See the two-instrument
+table under* Definition of done *.)* One new probe over the five surfaces nothing
+covered (ProcessBuilder, security providers, virtual threads, agents/attach, JNI)
+found four divergences on its first run, and two of those were binding failures
+hiding three more underneath. Seven defects: five fixed, four filed. *(5 + 4 ≠ 7;
+the arithmetic here is **UNVERIFIED** — it is not re-derivable from this
+document, and the retired lane doc is where the list lives.)* **Zero were introduced by
 `--jdk-only`** — every one was already wrong in `Compatible` mode and had simply
 never been executed, which is this wave's central pattern confirmed again.
 
@@ -548,3 +599,49 @@ document:
   other branch fire — `probes/L10ShapeInstrumentControlProbe` did it with
   `Unsafe.allocateInstance` until both it and the flag were retired with the
   predicate on 2026-08-06 — or the zero is unfalsifiable.
+
+**Update, 2026-08-06/07 — the strict corpus was run properly for the first time,
+and it reported 14 failures.** A separate pool took one lane per failure. The
+campaign record, with the per-lane table and what still has to be measured, is
+[`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md); the
+evidence is one `L<n>-*.md` per lane in
+[`docs/known-issues/jdk-only/`](../../known-issues/jdk-only/).
+
+**Nothing from that campaign has been built or re-measured.** No lane could run
+`cargo` or the VM; every fix is source-level and unverified by execution, and
+five lanes handed patches to files they did not own, which is the most likely
+thing to be missing from a merged tree. Read every "FIXED" in those records as
+*"fixed in source, unverified"* — most of them say so in their own headers. The
+one exception is L10, which changed a **Java vector** and measured it 26/26.
+
+Four things from it belong here rather than only in the campaign record:
+
+* **The headline: of the 14 failures, 12 fail in `--real-jdk` too, and ZERO are
+  strict-only.** `--jdk-only` is not rejecting legitimate things; it is
+  *executing* paths `Compatible` mode was papering over with synthetic stubs, and
+  the code underneath is wrong in both modes. The remaining work is ordinary
+  subsystem bug-fixing that fixes BOTH modes, not `--jdk-only` contract work.
+  This is L8's 2026-08-05 finding — "**Zero** were introduced by `--jdk-only`" —
+  at corpus scale.
+* **The disease shape has a name now, and four lanes found it independently: a
+  synthetic stub or placeholder shadowing real JDK bytecode that already works.**
+  Registration is last-write-wins on the triple, so a placeholder registered
+  *later* in the boot sequence silently outranks a correct implementation
+  registered earlier — no exception, no warning, no census row that looks wrong.
+  The sharpest instance is `Lookup.defineHiddenClass`: a phase-54 placeholder
+  that ignored its arguments and never wrote slot 0 (`lookupClass`) shadowed the
+  real WP2.3-B implementation, and **one deletion fixes two regression classes**
+  (`RJdkHidden` and `RJdkStrict` — they are ONE root cause, not two; both die on
+  `NullPointerException: Cannot invoke "java.lang.Class.isHidden()"`).
+* **`RJdkModule` had been written off as a bad vector and is not one.** The
+  correction is in *Failure modes* above, because the lesson is about method.
+  It is a real CratonVM defect, in both modes, at `RJdkModule.java:57`; lane L9
+  has it and has filed no record yet.
+* **Every pre-2026-08-06 `RJdkProcess` result is void.** The vector asserted
+  three separate live-process-table snapshots against a child (`cmd.exe /c exit
+  3`) chosen *because* it exits immediately — three coin flips, which HotSpot 25
+  also loses. A failure at `RJdkProcess.java:132`/`:134` carries zero information
+  about CratonVM. The rewritten vector points the tree section at a live child
+  and the exit-code section at the exiting one, **adding 7 assertions and
+  removing none** (46 → 53 checks), and measured 26/26 green including 18 runs
+  under load.

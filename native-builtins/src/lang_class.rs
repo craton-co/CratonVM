@@ -540,8 +540,19 @@ fn check_access(
     )
 }
 
+/// `read_field_meta` collapses an unreadable `clazz` mirror onto
+/// `ClassId::new(0)`, which is also a perfectly valid id (ids are handed out
+/// from `classes.len()`, so the first class loaded *is* 0). The two cases are
+/// indistinguishable by the time [`check_field_access`] sees the value, so the
+/// caller-entitlement step below refuses to run on it: on the sentinel reading
+/// it as a real declaring class would answer JLS questions about the wrong
+/// class (notably `caller_is_subclass_of(_, java/lang/Object)`, which is true
+/// for every caller). Skipping keeps this degenerate input at exactly today's
+/// behaviour.
+const UNRESOLVED_DECLARING_CLASS_ID: u32 = 0;
+
 /// Check a reflective field access using the caller-sensitive part of the
-/// ordinary Java member-access rules.
+/// ordinary Java member-access rules (JLS §6.6.1, JEP 181).
 ///
 /// `Field.get` is not intrinsically a deep-reflection operation.  In
 /// particular, code may reflectively read a private field it declares itself
@@ -550,10 +561,22 @@ fn check_access(
 /// state.  The old blanket non-public rejection incorrectly treated that
 /// legal same-class read as an access violation.
 ///
-/// Keep the existing conservative rule for callers outside the declaring
-/// class: those still need a public member or the explicit accessible
-/// override.  JPMS/open-package validation remains in the caller after this
-/// check and continues to govern cross-class deep reflection.
+/// L15: the same rule reaches further than the declaring class itself. A
+/// **nestmate** may read a `private` field of its nest sibling, and a
+/// same-runtime-package or subclass caller may read a package-private /
+/// `protected` one — all without `setAccessible(true)`. That is the field
+/// shaped twin of the `Method.invoke` gap L1 fixed (see
+/// `native_method_invoke`, and `docs/known-issues/jdk-only/
+/// L15-nestmate-access-field-and-constructor.md`); it is routed through the
+/// same `lang_reflect::caller_may_access_member` predicate so the two paths
+/// cannot drift.
+///
+/// This is **pure widening**: the step is only consulted after the old rule
+/// has already answered "not public and not overridden", it only ever returns
+/// an *allow*, and when the caller cannot be resolved (`resolve_caller_class_id
+/// == None`) the fallback below is reached unchanged.  JPMS/open-package
+/// validation remains in the caller after this check and continues to govern
+/// cross-module deep reflection.
 fn check_field_access(
     ctx: &mut dyn NativeContext,
     modifiers: i32,
@@ -564,8 +587,28 @@ fn check_field_access(
     if accessible || (modifiers & ACC_PUBLIC) != 0 {
         return Ok(());
     }
-    if resolve_caller_class_id(ctx) == Some(declaring_class_id) {
+    // Resolved once and reused: `resolve_caller_class_id` walks the frame
+    // stack, and both arms below ask the same question of it.
+    let caller_cid = resolve_caller_class_id(ctx);
+    if caller_cid == Some(declaring_class_id) {
         return Ok(());
+    }
+    if declaring_class_id.as_u32() != UNRESOLVED_DECLARING_CLASS_ID {
+        if let Some(caller) = caller_cid {
+            // No `ObjectRef` crosses this call, and every `NativeContext`
+            // method it reaches is a `&self` metadata lookup (`class_name_of_id`
+            // / `loader_id_of_class` / `nest_host_name` / `nest_member_names` /
+            // `class_id_by_name_near` / `superclass_of`) — none of them
+            // re-enters Java, so no moving-GC pin is required here.
+            if crate::lang_reflect::caller_may_access_member(
+                ctx,
+                caller,
+                declaring_class_id,
+                modifiers,
+            ) {
+                return Ok(());
+            }
+        }
     }
     check_access(modifiers, false, member_desc)
 }
@@ -7366,11 +7409,31 @@ pub(crate) fn native_method_invoke(
     // Most framework reflection invokes public methods. Do not format an
     // exception-only diagnostic string on that successful hot path.
     if !accessible && !is_public {
-        check_access(
-            modifiers,
-            false,
-            &format!("Method.invoke: {}.{}", class_name, method_name),
-        )?;
+        // JLS 6.6.1 / JEP 181: a non-public method is still reachable without
+        // `setAccessible(true)` when the CALLER is entitled to it — the
+        // declaring class itself, a confirmed nestmate (private), or a
+        // same-runtime-package / subclass caller (package-private, protected).
+        // `check_access` takes no `ctx` and so cannot ask that question; it
+        // rejected `RJdkReflect$Subject.secret` invoked from its own nest host
+        // (regression-suite/src/RJdkReflect.java:160), which HotSpot 25 allows.
+        // `check_field_access` is the field-shaped half of the same rule.
+        // Pure widening: the fallback below is unchanged for every input the
+        // caller step does not accept.
+        let declaring_cid = mirror_class_id(ctx, declaring_mirror);
+        let caller_cid = resolve_caller_class_id(ctx);
+        let caller_entitled = match (caller_cid, declaring_cid) {
+            (Some(caller), Some(declaring)) => {
+                crate::lang_reflect::caller_may_access_member(ctx, caller, declaring, modifiers)
+            }
+            _ => false,
+        };
+        if !caller_entitled {
+            check_access(
+                modifiers,
+                false,
+                &format!("Method.invoke: {}.{}", class_name, method_name),
+            )?;
+        }
     }
     // NEW-19: module-level opens check (JPMS). When `accessible == true`
     // the override flag short-circuits the deep check (JEP 403).
@@ -21189,6 +21252,126 @@ mod tests {
         assert!(check_field_access(
             &mut ctx,
             0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // L15 - check_field_access consults the caller (JLS 6.6.1 / JEP 181),
+    // the field-shaped twin of the Method.invoke widening.
+    // -----------------------------------------------------------------------
+
+    /// A package-private field is reachable from another class in the SAME
+    /// runtime package with no `setAccessible(true)`. Before L15 this was
+    /// rejected (only the declaring class itself was admitted).
+    #[test]
+    fn field_access_allows_package_private_field_from_same_runtime_package() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/PkgPeer")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            "Field.get(pkgValue)"
+        )
+        .is_ok());
+    }
+
+    /// The widening stops at the package boundary: a foreign-package caller
+    /// still needs the accessible override.
+    #[test]
+    fn field_access_rejects_package_private_field_from_a_foreign_package() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/Foreign")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            "Field.get(pkgValue)"
+        )
+        .is_err());
+    }
+
+    /// A `protected` field is reachable from a subclass in a foreign package
+    /// (JLS 6.6.2).
+    #[test]
+    fn field_access_allows_protected_field_from_a_foreign_package_subclass() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/ProtOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/ProtChild")
+            .expect("caller class");
+        ctx.set_superclass(caller, declaring);
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0004, // protected
+            false,
+            declaring,
+            "Field.get(protValue)"
+        )
+        .is_ok());
+    }
+
+    /// Fail CLOSED when there is no resolvable Java caller frame: the
+    /// entitlement step must never be reached, so the old blanket rule stands.
+    #[test]
+    fn field_access_rejects_private_field_when_no_caller_frame_resolves() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        ctx.set_frame_class_ids(Vec::new());
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    /// A private field of a class in the same package is still NOT reachable
+    /// without a confirmed nest relationship - `private` is nest-scoped, never
+    /// package-scoped (JEP 181). This pins the one arm that must not widen.
+    #[test]
+    fn field_access_rejects_private_field_from_a_same_package_non_nestmate() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/NestlessOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/NestlessPeer")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002, // private
             false,
             declaring,
             "Field.get(privateValue)"

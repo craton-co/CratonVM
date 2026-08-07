@@ -61,6 +61,60 @@ fn io_error(message: impl Into<String>) -> MethodCallFailed {
     }))
 }
 
+/// Build a REAL `java/nio/file/FileAlreadyExistsException` naming `path`.
+///
+/// Every file-creating `java.nio.file` entry point (`Files.copy`, `Files.move`,
+/// `createFile`, `newByteChannel`/`newOutputStream` with `CREATE_NEW`) must
+/// reject an already-existing target with this EXACT class when the caller did
+/// not pass `StandardCopyOption.REPLACE_EXISTING`. Callers discriminate by
+/// TYPE, not by message — `regression-suite/src/RJdkNio.java:99` is a bare
+/// `catch (FileAlreadyExistsException expected)`, and H2's
+/// `FilePathDisk.moveTo` catches the same class to translate it into
+/// `DbException(FILE_RENAME_FAILED_2)`. So neither a bare `IOException` with a
+/// matching message nor (worse) a silent overwrite satisfies the contract:
+/// `RuntimeError` has no `FileAlreadyExistsException` variant, which is why
+/// this is built explicitly instead of going through `io_error`.
+///
+/// Constructed through the class's REAL single-`String` constructor rather
+/// than a fabricated synthetic layout, for two reasons: the object is handed
+/// straight to real JDK bytecode (`getFile()`, `Throwable` formatting) which
+/// reads real field offsets, and a fabricated stand-in is exactly what
+/// `--jdk-only` refuses. Mirrors `native-builtins`'
+/// `phases_late::nio_file::p57_file_already_exists`, which does the same thing
+/// for the natives registered on that side.
+///
+/// GC: the fresh exception is pinned across `create_string`, which allocates
+/// and can therefore relocate it under a moving young collection (the native
+/// stale-local family) — the ref is re-read from the pin before every use.
+///
+/// The `IOException` fallback fires only when the class itself cannot be
+/// loaded, i.e. when there is no `FileAlreadyExistsException` to throw.
+///
+/// `pub` (not `pub(crate)`): `native-io` declares `pub mod nio_native`, so a
+/// crate-private helper here would trip `dead_code` until its only caller —
+/// the `java/nio/file/Files.copy` native in this crate's `lib.rs` — is wired
+/// up. Exporting it also lets the `native-builtins` side reuse one builder
+/// instead of keeping a third copy of this constructor dance.
+pub fn file_already_exists(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/FileAlreadyExistsException")
+    {
+        let pin = ctx.pin_native_root(exc);
+        let file_str = ctx.create_string(path);
+        let exc_cur = ctx.read_native_pin(pin, exc);
+        let _ = ctx.invoke(
+            "java/nio/file/FileAlreadyExistsException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc_cur)), Value::Object(Some(file_str))],
+        );
+        let exc_cur = ctx.read_native_pin(pin, exc);
+        ctx.unpin_native_roots(pin);
+        return MethodCallFailed::ExceptionThrown(exc_cur);
+    }
+    io_error(format!("FileAlreadyExistsException: {path}"))
+}
+
 fn fd_arg(args: &[Value], idx: usize) -> Result<ObjectRef, MethodCallFailed> {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => Ok(*o),

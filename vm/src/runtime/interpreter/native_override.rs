@@ -1705,6 +1705,16 @@ pub(crate) fn is_forkjoin_native_override(
             // completed task, so it cannot disagree with join()/get() about
             // whether the task failed.
             | ("getException", "()Ljava/lang/Throwable;")
+            // L12: the STATIC `invokeAll` overloads — the last real-bytecode
+            // route from the lazy `fork()` above to an `awaitDone()` that no
+            // worker thread can satisfy. Must stay in step with
+            // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | (
+                "invokeAll",
+                "(Ljava/util/concurrent/ForkJoinTask;Ljava/util/concurrent/ForkJoinTask;)V"
+            )
+            | ("invokeAll", "([Ljava/util/concurrent/ForkJoinTask;)V")
+            | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/Collection;")
     )
 }
 

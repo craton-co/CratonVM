@@ -768,13 +768,60 @@ fn net_fd_is_nonblocking(fd: i32) -> bool {
         .unwrap_or(false)
 }
 
-/// Per-socket option store (SO_REUSEADDR / SO_KEEPALIVE / TCP_NODELAY / etc.).
-/// Rust's `std::net` exposes a subset directly — for options it doesn't
-/// expose (SO_LINGER on TcpListener, IP_TOS, …) we remember the value so
-/// `getIntOption0` returns what `setIntOption0` last set.
-fn net_opts() -> &'static RwLock<FxHashMap<(i32, i32, i32), i32>> {
-    static OPTS: OnceLock<RwLock<FxHashMap<(i32, i32, i32), i32>>> = OnceLock::new();
+/// Per-socket option store (SO_REUSEADDR / SO_KEEPALIVE / TCP_NODELAY / etc.),
+/// keyed fd → `(level, optname)` → value.
+///
+/// This is NOT the answer `getIntOption0` prefers — a live socket is asked
+/// directly (see [`net_getsockopt_int`]). It is the record of what
+/// `setIntOption0` was told while the fd had no OS socket to apply it to:
+/// `socket0` hands out an id without creating anything, so every option set
+/// between `socket0` and `bind0`/`connect0` lands here first and is replayed
+/// onto the real socket by [`net_apply_recorded_options`] the moment one
+/// exists.
+///
+/// The outer key is the fd so that (a) the replay costs O(options on this fd)
+/// rather than a scan of every socket the process ever opened, and (b)
+/// [`close_net_fd`] can drop a socket's whole option set in one `remove` —
+/// before, entries were never removed at all and the map grew without bound
+/// for the life of the VM.
+fn net_opts() -> &'static RwLock<FxHashMap<i32, FxHashMap<(i32, i32), i32>>> {
+    static OPTS: OnceLock<RwLock<FxHashMap<i32, FxHashMap<(i32, i32), i32>>>> = OnceLock::new();
     OPTS.get_or_init(|| RwLock::new(FxHashMap::default()))
+}
+
+/// Remember what `setIntOption0` was asked for.
+fn net_opt_record(fd: i32, level: i32, opt: i32, value: i32) {
+    net_opts()
+        .write()
+        .entry(fd)
+        .or_default()
+        .insert((level, opt), value);
+}
+
+/// What `setIntOption0` was last told for this option, if anything.
+fn net_opt_recall(fd: i32, level: i32, opt: i32) -> Option<i32> {
+    net_opts()
+        .read()
+        .get(&fd)
+        .and_then(|opts| opts.get(&(level, opt)).copied())
+}
+
+/// Every option recorded for `fd`, as `(level, optname, value)`.
+fn net_opt_snapshot(fd: i32) -> Vec<(i32, i32, i32)> {
+    net_opts()
+        .read()
+        .get(&fd)
+        .map(|opts| {
+            opts.iter()
+                .map(|((level, opt), value)| (*level, *opt, *value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Drop a closed socket's option set.
+fn net_opt_forget_fd(fd: i32) {
+    net_opts().write().remove(&fd);
 }
 
 fn next_net_fd() -> i32 {
@@ -821,6 +868,7 @@ fn close_net_fd(fd: i32) {
         map.insert(fd, NetSocketHandle::Closed)
     };
     net_pending_nonblocking().write().remove(&fd);
+    net_opt_forget_fd(fd);
     if io_flags().dbg_net {
         let kind = match &old {
             Some(NetSocketHandle::Unbound) => "unbound",
@@ -1186,6 +1234,10 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         fd,
         NetSocketHandle::Listener(Arc::new(Mutex::new(listener))),
     );
+    // `ServerSocket.setReceiveBufferSize`/`setReuseAddress` before `bind()` is
+    // the documented JDK ordering, and until now those requests reached the
+    // record but never the socket.
+    net_apply_recorded_options(fd);
     dbgnet!("bind0 OK fd={fd:#x} bound_port={bound_port}");
     Ok(None)
 }
@@ -1395,6 +1447,10 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     net_sockets()
         .write()
         .insert(fd, NetSocketHandle::Stream(Arc::new(stream)));
+
+    // There is finally an OS socket for the options set between `socket0` and
+    // here (`Socket.setKeepAlive`/`setReceiveBufferSize`/… before `connect`).
+    net_apply_recorded_options(fd);
 
     // Return 1 to indicate connection completed (matching JDK IOStatus).
     Ok(Some(Value::Int(1)))
@@ -2285,11 +2341,388 @@ fn net_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // Option level + opt id pairs commonly seen (mirroring sun.nio.ch.Net
 // constants). Values match SOL_SOCKET=1 on POSIX; Rust's std::net handles the
 // platform translation, so we only compare against the JDK-level constants.
+//
+// CAUTION: these are the **Linux** numbering and are used ONLY by the
+// `std`-typed fallback below, which is reached when there is no raw socket to
+// address. `sun.nio.ch.Net.{get,set}IntOption0` are handed the *platform's own*
+// `(level, optname)` pair — they come from `sun.nio.ch.SocketOptionRegistry`,
+// which OpenJDK generates per target OS, so on Windows `SOL_SOCKET` arrives as
+// 0xFFFF and `SO_KEEPALIVE` as 0x0008 and none of these constants match. The
+// raw `getsockopt`/`setsockopt` path below does not compare against them at
+// all: it passes whatever the JDK gave straight through to the C API, which is
+// correct on every platform by construction.
 const SOL_SOCKET: i32 = 1;
 const SO_REUSEADDR: i32 = 2;
 const SO_KEEPALIVE: i32 = 9;
 const IPPROTO_TCP: i32 = 6;
 const TCP_NODELAY: i32 = 1;
+
+/// Raw `getsockopt`/`setsockopt` for a live OS socket.
+///
+/// Declared inline in the same style as the `WSAPoll` / `ioctlsocket` / poll
+/// shims elsewhere in this crate (raw `#[link]` FFI on Windows, `libc` on
+/// Unix) so no new dependency is pulled in — `socket2` is not in `native-io`'s
+/// dependency tree.
+#[cfg(unix)]
+mod sockopt_sys {
+    pub(super) type RawSock = std::os::unix::io::RawFd;
+
+    pub(super) const SOL_SOCKET: i32 = libc::SOL_SOCKET as i32;
+    pub(super) const SO_LINGER: i32 = libc::SO_LINGER as i32;
+    pub(super) const IPPROTO_IP: i32 = 0;
+    pub(super) const IP_MULTICAST_TTL: i32 = libc::IP_MULTICAST_TTL as i32;
+    pub(super) const IP_MULTICAST_LOOP: i32 = libc::IP_MULTICAST_LOOP as i32;
+
+    pub(super) fn raw_of<T: std::os::unix::io::AsRawFd>(s: &T) -> RawSock {
+        s.as_raw_fd()
+    }
+
+    pub(super) fn get_raw(
+        fd: RawSock,
+        level: i32,
+        name: i32,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let mut len = buf.len() as libc::socklen_t;
+        // SAFETY: `buf`/`len` are a valid out-pointer pair for exactly
+        // `buf.len()` bytes, and `fd` is a live descriptor kept alive by the
+        // registry handle the caller holds for the duration of this call.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level as libc::c_int,
+                name as libc::c_int,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            Ok(len as usize)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn set_raw(fd: RawSock, level: i32, name: i32, buf: &[u8]) -> std::io::Result<()> {
+        // SAFETY: `buf` is readable for exactly the byte count handed to the
+        // kernel, and `fd` is a live descriptor for the duration of the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level as libc::c_int,
+                name as libc::c_int,
+                buf.as_ptr().cast::<libc::c_void>(),
+                buf.len() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+mod sockopt_sys {
+    pub(super) type RawSock = usize;
+
+    // Winsock numbering (winsock2.h / ws2ipdef.h). `SocketOptionRegistry` is
+    // generated with these on Windows, so this is what arrives from Java.
+    pub(super) const SOL_SOCKET: i32 = 0xffff;
+    pub(super) const SO_LINGER: i32 = 0x0080;
+    pub(super) const IPPROTO_IP: i32 = 0;
+    pub(super) const IP_MULTICAST_TTL: i32 = 10;
+    pub(super) const IP_MULTICAST_LOOP: i32 = 11;
+
+    // Signatures are deliberately IDENTICAL to the extended-option block in
+    // `ext_opt_sys` below: two `#[link]` declarations of the same symbol are
+    // fine, but disagreeing signatures would trip `clashing_extern_declarations`.
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+
+    pub(super) fn raw_of<T: std::os::windows::io::AsRawSocket>(s: &T) -> RawSock {
+        s.as_raw_socket() as usize
+    }
+
+    pub(super) fn get_raw(
+        fd: RawSock,
+        level: i32,
+        name: i32,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let mut len = buf.len() as i32;
+        // SAFETY: `buf`/`len` are a valid out-pointer pair for exactly
+        // `buf.len()` bytes, and `fd` is a live SOCKET borrowed from a
+        // registry handle held across this call.
+        let rc = unsafe { getsockopt(fd, level, name, buf.as_mut_ptr(), &mut len) };
+        if rc == 0 {
+            Ok(len.max(0) as usize)
+        } else {
+            // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
+            Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }))
+        }
+    }
+
+    pub(super) fn set_raw(fd: RawSock, level: i32, name: i32, buf: &[u8]) -> std::io::Result<()> {
+        // SAFETY: `buf` is readable for exactly the byte count handed to
+        // Winsock, and `fd` is a live SOCKET for the duration of the call.
+        let rc = unsafe { setsockopt(fd, level, name, buf.as_ptr(), buf.len() as i32) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            // SAFETY: WSAGetLastError has no pointer arguments or preconditions.
+            Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }))
+        }
+    }
+}
+
+/// Platforms with neither `libc` nor Winsock available: every option query
+/// falls back to the recorded value, exactly as before this path existed.
+#[cfg(not(any(unix, windows)))]
+mod sockopt_sys {
+    pub(super) type RawSock = i32;
+
+    pub(super) const SOL_SOCKET: i32 = 1;
+    pub(super) const SO_LINGER: i32 = 13;
+    pub(super) const IPPROTO_IP: i32 = 0;
+    pub(super) const IP_MULTICAST_TTL: i32 = 33;
+    pub(super) const IP_MULTICAST_LOOP: i32 = 34;
+
+    fn unsupported() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket options are not supported on this platform",
+        )
+    }
+
+    pub(super) fn raw_of<T>(_s: &T) -> RawSock {
+        -1
+    }
+
+    pub(super) fn get_raw(
+        _fd: RawSock,
+        _level: i32,
+        _name: i32,
+        _buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        Err(unsupported())
+    }
+
+    pub(super) fn set_raw(
+        _fd: RawSock,
+        _level: i32,
+        _name: i32,
+        _buf: &[u8],
+    ) -> std::io::Result<()> {
+        Err(unsupported())
+    }
+}
+
+/// The live OS socket behind a `sun.nio.ch.Net` fd id.
+enum NetLiveSocket {
+    Stream(Arc<TcpStream>),
+    Listener(Arc<Mutex<TcpListener>>),
+}
+
+/// Run `f` against the raw OS handle of `fd`'s live socket.
+///
+/// `None` means "this fd has no OS socket to ask", which happens in two cases:
+///
+///  * the fd is still `Unbound` — `socket0` hands Java an id without creating
+///    anything, the real socket appears at `bind0`/`connect0`;
+///  * the fd is a listener whose mutex is currently held. `net_accept` keeps
+///    that mutex for the whole (unbounded) accept, so a blocking `lock()` here
+///    would stall an option query on an idle `ServerSocket` until some client
+///    happened to connect. `try_lock` and fall back instead.
+///
+/// `f` must be a non-blocking syscall: it runs with the listener mutex held.
+/// The handle is cloned out of the registry first, so the socket cannot be
+/// closed and its descriptor recycled while `f` is using it.
+fn with_net_raw_socket<R>(fd: i32, f: impl FnOnce(sockopt_sys::RawSock) -> R) -> Option<R> {
+    let live = {
+        let map = net_sockets().read();
+        match map.get(&fd) {
+            Some(NetSocketHandle::Stream(s)) => NetLiveSocket::Stream(Arc::clone(s)),
+            Some(NetSocketHandle::Listener(l)) => NetLiveSocket::Listener(Arc::clone(l)),
+            _ => return None,
+        }
+    };
+    match live {
+        NetLiveSocket::Stream(s) => Some(f(sockopt_sys::raw_of(&*s))),
+        NetLiveSocket::Listener(l) => {
+            let guard = l.try_lock()?;
+            Some(f(sockopt_sys::raw_of(&*guard)))
+        }
+    }
+}
+
+/// `SO_LINGER` is a `struct linger`, not an int — see `Net.c`.
+fn opt_is_linger(level: i32, opt: i32) -> bool {
+    level == sockopt_sys::SOL_SOCKET && opt == sockopt_sys::SO_LINGER
+}
+
+/// The two IPv4 multicast options are carried as a single `u_char` on Unix.
+/// The Windows body of `Net.c` has no such case — they are `DWORD`s there.
+#[cfg(unix)]
+fn opt_is_char(level: i32, opt: i32) -> bool {
+    level == sockopt_sys::IPPROTO_IP
+        && (opt == sockopt_sys::IP_MULTICAST_TTL || opt == sockopt_sys::IP_MULTICAST_LOOP)
+}
+
+#[cfg(not(unix))]
+fn opt_is_char(_level: i32, _opt: i32) -> bool {
+    false
+}
+
+/// `struct linger` is `{ int, int }` on every Unix `libc` we build for and
+/// `{ u_short, u_short }` on Winsock. Encoded/decoded byte-wise so no
+/// `transmute` or repr assumption is needed.
+#[cfg(windows)]
+const LINGER_FIELD_BYTES: usize = 2;
+#[cfg(not(windows))]
+const LINGER_FIELD_BYTES: usize = 4;
+
+fn linger_decode(buf: &[u8]) -> (i32, i32) {
+    if LINGER_FIELD_BYTES == 2 {
+        if buf.len() < 4 {
+            return (0, 0);
+        }
+        (
+            i32::from(u16::from_ne_bytes([buf[0], buf[1]])),
+            i32::from(u16::from_ne_bytes([buf[2], buf[3]])),
+        )
+    } else {
+        if buf.len() < 8 {
+            return (0, 0);
+        }
+        (
+            i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]),
+        )
+    }
+}
+
+fn linger_encode(onoff: i32, secs: i32) -> Vec<u8> {
+    if LINGER_FIELD_BYTES == 2 {
+        let mut buf = vec![0u8; 4];
+        buf[0..2].copy_from_slice(&(onoff as u16).to_ne_bytes());
+        buf[2..4].copy_from_slice(&(secs as u16).to_ne_bytes());
+        buf
+    } else {
+        let mut buf = vec![0u8; 8];
+        buf[0..4].copy_from_slice(&onoff.to_ne_bytes());
+        buf[4..8].copy_from_slice(&secs.to_ne_bytes());
+        buf
+    }
+}
+
+/// Read one socket option off a live socket exactly the way the JDK's
+/// `Net.c::getIntOption0` does — including its two non-int argument shapes and
+/// its collapse of `struct linger` to a single JDK int.
+fn net_getsockopt_int(raw: sockopt_sys::RawSock, level: i32, opt: i32) -> std::io::Result<i32> {
+    if opt_is_linger(level, opt) {
+        let mut buf = vec![0u8; LINGER_FIELD_BYTES * 2];
+        sockopt_sys::get_raw(raw, level, opt, &mut buf)?;
+        let (onoff, secs) = linger_decode(&buf);
+        // `Net.c`: `linger.l_onoff ? linger.l_linger : -1`.
+        return Ok(if onoff != 0 { secs } else { -1 });
+    }
+    if opt_is_char(level, opt) {
+        let mut buf = [0u8; 1];
+        sockopt_sys::get_raw(raw, level, opt, &mut buf)?;
+        return Ok(i32::from(buf[0]));
+    }
+    let mut buf = [0u8; 4];
+    let n = sockopt_sys::get_raw(raw, level, opt, &mut buf)?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!("getsockopt level={level} opt={opt} returned no value"),
+        ));
+    }
+    Ok(i32::from_ne_bytes(buf))
+}
+
+/// Write one socket option to a live socket the way `Net.c::setIntOption0`
+/// does: a negative `SO_LINGER` argument means "linger off".
+fn net_setsockopt_int(
+    raw: sockopt_sys::RawSock,
+    level: i32,
+    opt: i32,
+    val: i32,
+) -> std::io::Result<()> {
+    if opt_is_linger(level, opt) {
+        let buf = linger_encode(i32::from(val >= 0), val.max(0));
+        return sockopt_sys::set_raw(raw, level, opt, &buf);
+    }
+    if opt_is_char(level, opt) {
+        return sockopt_sys::set_raw(raw, level, opt, &[val as u8]);
+    }
+    sockopt_sys::set_raw(raw, level, opt, &val.to_ne_bytes())
+}
+
+/// What a FRESH socket reports for `(level, opt)` on this platform.
+///
+/// `socket0` creates no OS socket, so an option read on a `java.net.Socket`
+/// that exists but has not connected yet has nothing to query — and this
+/// native used to answer a flat `0`. For SO_RCVBUF / SO_SNDBUF that is not a
+/// legal answer anywhere: HotSpot reports the kernel's default buffer size,
+/// and `regression-suite/src/RJdkNet.java:180` asserts
+/// `getReceiveBufferSize() > 0` on exactly such a socket. Open a throwaway
+/// socket once per option and report the default it comes up with — which IS
+/// the value the not-yet-connected socket would report on HotSpot, because
+/// nothing has changed it. `None` when the platform cannot answer at all.
+fn net_default_int_option(level: i32, opt: i32) -> Option<i32> {
+    static DEFAULTS: OnceLock<RwLock<FxHashMap<(i32, i32), Option<i32>>>> = OnceLock::new();
+    let cache = DEFAULTS.get_or_init(|| RwLock::new(FxHashMap::default()));
+    if let Some(cached) = cache.read().get(&(level, opt)) {
+        return *cached;
+    }
+    // A real `std` socket rather than a raw `socket()` call: on Windows that
+    // also guarantees Winsock is initialised. `WSAStartup` is done lazily by
+    // `std::net`, so a bare FFI `socket()` reached before anything else in the
+    // process opened one fails with WSANOTINITIALISED — and the whole point of
+    // this probe is that it runs on a VM that has NOT opened an OS socket yet.
+    // The listener is closed again as this statement ends.
+    let probed = TcpListener::bind(("127.0.0.1", 0u16))
+        .ok()
+        .and_then(|l| net_getsockopt_int(sockopt_sys::raw_of(&l), level, opt).ok());
+    dbgnet!("default level={level} opt={opt} -> {probed:?}");
+    cache.write().insert((level, opt), probed);
+    probed
+}
+
+/// Re-apply every option recorded for `fd` to the OS socket that has just
+/// appeared behind it.
+///
+/// A `setIntOption0` arriving before `bind0`/`connect0` has no socket to write
+/// to and is only remembered (see [`net_opts`]). Push those requests through
+/// now that one exists: otherwise the option a caller set before connecting
+/// never reaches the kernel at all, and — since [`net_get_int_option0`] asks
+/// the live socket first — the answer would flip the instant the socket went
+/// live. Best-effort: an option the platform rejects is logged, not raised. It
+/// was silently dropped before this existed.
+fn net_apply_recorded_options(fd: i32) {
+    for (level, opt, val) in net_opt_snapshot(fd) {
+        match with_net_raw_socket(fd, |raw| net_setsockopt_int(raw, level, opt, val)) {
+            Some(Ok(())) => dbgnet!("replay fd={fd:#x} level={level} opt={opt} val={val}"),
+            Some(Err(e)) => {
+                dbgnet!("replay fd={fd:#x} level={level} opt={opt} val={val} failed: {e}");
+            }
+            // No live socket after all — nothing more to replay.
+            None => return,
+        }
+    }
+}
 
 /// `setIntOption0(FileDescriptor fd, boolean mayNeedConversion, int level,
 ///                int opt, int arg, boolean isIPv6) -> void`
@@ -2302,46 +2735,47 @@ fn net_set_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("setIntOption0: FileDescriptor has no fd id"))?;
 
-    // AUDIT 2026-05-17: clone the per-stream Arc under the map read-lock
-    // so the actual setsockopt happens without the global map lock held.
-    let stream_handle = {
-        let map = net_sockets().read();
-        match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
-            _ => None,
+    // Preferred path: the real `setsockopt`, with the `(level, optname)` pair
+    // the JDK handed us. This is what makes SO_KEEPALIVE / SO_LINGER /
+    // SO_RCVBUF / SO_SNDBUF actually reach the kernel — the previous code
+    // modelled TCP_NODELAY only and remembered everything else, so a
+    // documented CONTRACT-DRIFT (2026-05-24) had keepalive be a silent no-op
+    // for want of a `socket2` dependency this crate still does not have.
+    let applied = match with_net_raw_socket(fd, |raw| net_setsockopt_int(raw, level, opt, val)) {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
+            // Not fatal: an option this platform refuses used to be dropped
+            // without comment, and failing the caller's `setOption` now would
+            // be a strictly worse regression than recording it below.
+            dbgnet!("setIntOption0 fd={fd:#x} level={level} opt={opt} val={val} failed: {e}");
+            false
         }
+        None => false,
     };
-    if let Some(s) = stream_handle {
-        match (level, opt) {
-            (IPPROTO_TCP, TCP_NODELAY) => {
+
+    if !applied {
+        // Fallback for a handle shape the raw path could not address (an
+        // `Unbound` fd, or a listener whose mutex a blocked accept holds).
+        // AUDIT 2026-05-17: clone the per-stream Arc under the map read-lock
+        // so the actual setsockopt happens without the global map lock held.
+        let stream_handle = {
+            let map = net_sockets().read();
+            match map.get(&fd) {
+                Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
+                _ => None,
+            }
+        };
+        if let Some(s) = stream_handle {
+            if (level, opt) == (IPPROTO_TCP, TCP_NODELAY) {
                 s.set_nodelay(val != 0)
                     .map_err(|e| net_err("TCP_NODELAY", e))?;
             }
-            (SOL_SOCKET, SO_KEEPALIVE) => {
-                // CONTRACT-DRIFT (documented 2026-05-24): the JDK
-                // contract for `setOption(StandardSocketOptions.SO_KEEPALIVE,
-                // true)` is that the kernel will start sending TCP
-                // keepalive probes on the connection after the
-                // SO_KEEPALIVE timer expires. `std::net::TcpStream`
-                // exposes no setter for this; wiring through
-                // `socket2::SockRef::set_keepalive` would require
-                // adding the `socket2` crate to `Cargo.toml` (it is
-                // NOT currently in our workspace dependency tree
-                // despite what some older docs suggest).
-                //
-                // We persist the value in `net_opts` so
-                // `getIntOption0` returns what the user set, but the
-                // kernel-side keepalive probe is a SILENT NO-OP. Java
-                // code that relies on keepalive timer behaviour to
-                // detect dead peers will not see those callbacks.
-                //
-                // Resolution path: add `socket2` dep + use
-                // `SockRef::from(&*s).set_keepalive(val != 0)`.
-            }
-            _ => {}
         }
     }
-    net_opts().write().insert((fd, level, opt), val);
+
+    // Recorded either way: an option set on an `Unbound` fd is replayed onto
+    // the real socket by `net_apply_recorded_options` at bind0/connect0.
+    net_opt_record(fd, level, opt, val);
     Ok(None)
 }
 
@@ -2354,29 +2788,31 @@ fn net_get_int_option0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("getIntOption0: FileDescriptor has no fd id"))?;
 
-    // Prefer the live socket state when std exposes it.
-    // AUDIT 2026-05-17: clone the Arc under the map read-lock; query
-    // the OS without the map lock held.
-    let stream_handle = {
-        let map = net_sockets().read();
-        match map.get(&fd) {
-            Some(NetSocketHandle::Stream(s)) => Some(Arc::clone(s)),
-            _ => None,
-        }
-    };
-    if let Some(s) = stream_handle {
-        if level == IPPROTO_TCP && opt == TCP_NODELAY {
-            let v = s.nodelay().unwrap_or(false);
-            return Ok(Some(Value::Int(if v { 1 } else { 0 })));
+    // 1. Ask the socket. Previously only TCP_NODELAY was answered from live
+    //    state and EVERY other option came out of the request cache, so an
+    //    option nobody had set read back as 0 — including SO_RCVBUF, where 0
+    //    is not a value any real socket ever reports.
+    if let Some(result) = with_net_raw_socket(fd, |raw| net_getsockopt_int(raw, level, opt)) {
+        match result {
+            Ok(v) => {
+                dbgnet!("getIntOption0 fd={fd:#x} level={level} opt={opt} -> {v} (live)");
+                return Ok(Some(Value::Int(v)));
+            }
+            Err(e) => dbgnet!("getIntOption0 fd={fd:#x} level={level} opt={opt} failed: {e}"),
         }
     }
-    // Otherwise return what was last set, defaulting to 0.
-    let v = net_opts()
-        .read()
-        .get(&(fd, level, opt))
-        .copied()
-        .unwrap_or(0);
-    Ok(Some(Value::Int(v)))
+
+    // 2. What `setIntOption0` was last told, for an fd with no OS socket yet.
+    if let Some(v) = net_opt_recall(fd, level, opt) {
+        return Ok(Some(Value::Int(v)));
+    }
+
+    // 3. Never set and nothing to ask: report the platform's default for a
+    //    fresh socket, which is what the JDK's own fd would answer here.
+    if let Some(v) = net_default_int_option(level, opt) {
+        return Ok(Some(Value::Int(v)));
+    }
+    Ok(Some(Value::Int(0)))
 }
 
 // ---------- Address queries ----------
@@ -4096,36 +4532,65 @@ mod tests {
     fn t19_5_setIntOption_so_reuseaddr_accepts_both_sides() {
         // Register a dummy fd, then set/get SO_REUSEADDR through the opt map.
         let fd = make_fd_with_id(0x5000_0001);
-        net_opts().write().insert((fd, SOL_SOCKET, SO_REUSEADDR), 1);
-        let v = net_opts()
-            .read()
-            .get(&(fd, SOL_SOCKET, SO_REUSEADDR))
-            .copied();
-        assert_eq!(v, Some(1));
+        net_opt_record(fd, SOL_SOCKET, SO_REUSEADDR, 1);
+        assert_eq!(net_opt_recall(fd, SOL_SOCKET, SO_REUSEADDR), Some(1));
         // Also set to 0 to confirm toggling.
-        net_opts().write().insert((fd, SOL_SOCKET, SO_REUSEADDR), 0);
-        let v2 = net_opts()
-            .read()
-            .get(&(fd, SOL_SOCKET, SO_REUSEADDR))
-            .copied();
-        assert_eq!(v2, Some(0));
+        net_opt_record(fd, SOL_SOCKET, SO_REUSEADDR, 0);
+        assert_eq!(net_opt_recall(fd, SOL_SOCKET, SO_REUSEADDR), Some(0));
         remove_fd(fd);
-        net_opts().write().remove(&(fd, SOL_SOCKET, SO_REUSEADDR));
+        net_opt_forget_fd(fd);
+    }
+
+    /// A closed fd must not leave its options behind.
+    ///
+    /// The store used to be keyed by `(fd, level, opt)` and nothing ever
+    /// removed an entry, so a long-lived VM accumulated one row per option per
+    /// socket it had EVER opened, forever.
+    #[test]
+    fn net_opts_are_dropped_when_the_socket_closes() {
+        let fd = make_fd_with_id(0x5000_0011);
+        net_opt_record(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+        assert_eq!(net_opt_snapshot(fd), vec![(IPPROTO_TCP, TCP_NODELAY, 1)]);
+        close_net_fd(fd);
+        assert_eq!(net_opt_recall(fd, IPPROTO_TCP, TCP_NODELAY), None);
+        assert!(net_opt_snapshot(fd).is_empty());
+        remove_fd(fd);
+    }
+
+    /// An option nobody ever set must not read back as 0 on a socket that has
+    /// no OS descriptor yet.
+    ///
+    /// This is `RJdkNet.loopbackTcp`'s `SO_RCVBUF is positive` assertion: the
+    /// test calls `getReceiveBufferSize()` on a `new Socket()` that was never
+    /// connected, so `socket0` has handed out an id with no OS socket behind
+    /// it. HotSpot answers the kernel default; we used to answer 0.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn so_rcvbuf_default_is_positive_without_a_live_socket() {
+        // The platform's own SO_RCVBUF numbering — the same pair the JDK's
+        // generated SocketOptionRegistry hands the native.
+        #[cfg(windows)]
+        const SO_RCVBUF: i32 = 0x1002;
+        #[cfg(unix)]
+        const SO_RCVBUF: i32 = libc::SO_RCVBUF as i32;
+
+        let level = sockopt_sys::SOL_SOCKET;
+        let probed = net_default_int_option(level, SO_RCVBUF);
+        assert!(
+            matches!(probed, Some(v) if v > 0),
+            "a fresh socket must report a positive SO_RCVBUF, got {probed:?}"
+        );
     }
 
     #[test]
     fn t19_5_getIntOption_returns_same_value_after_set() {
         let fd = make_fd_with_id(0x5000_0002);
         // Simulate setIntOption0 writing directly to the opts map.
-        net_opts().write().insert((fd, IPPROTO_TCP, TCP_NODELAY), 1);
-        let out = net_opts()
-            .read()
-            .get(&(fd, IPPROTO_TCP, TCP_NODELAY))
-            .copied()
-            .unwrap_or(-1);
+        net_opt_record(fd, IPPROTO_TCP, TCP_NODELAY, 1);
+        let out = net_opt_recall(fd, IPPROTO_TCP, TCP_NODELAY).unwrap_or(-1);
         assert_eq!(out, 1);
         remove_fd(fd);
-        net_opts().write().remove(&(fd, IPPROTO_TCP, TCP_NODELAY));
+        net_opt_forget_fd(fd);
     }
 
     #[test]

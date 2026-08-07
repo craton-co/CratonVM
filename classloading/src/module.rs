@@ -1207,6 +1207,322 @@ pub fn is_platform_module_name(name: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// `--module-path` / `--add-modules` resolution
+// ---------------------------------------------------------------------------
+//
+// Background — why this exists at all.
+//
+// `--module-path` and `--add-modules` were parsed by the launcher into
+// `VmConfig::module_path` / `VmConfig::add_modules` and then read by NOBODY:
+// `grep -rn '\.module_path\b|\.add_modules\b'` over the whole workspace found
+// exactly two hits, both *writes* in `vm-cli/src/main.rs`. Same disease as the
+// already-recorded `--add-opens was parsed then ignored`. The consequence is
+// that a launch of the shape
+//
+//     --module-path <dir> --add-modules <name> -cp <dir> Main
+//
+// resolved no module at all: the module's classes were not on any search path,
+// and `ModuleLayer.boot().findModule(<name>)` had no module to find. (It
+// answered `Optional.of(...)` regardless, because the synthetic
+// `ModuleLayer.findModule` native fabricates a Module for any syntactically
+// valid name — see `native-builtins/src/jboss_jdkspecific.rs`.)
+//
+// This module does the *resolution* half: turn the raw `--module-path` entries
+// into the set of named modules `--add-modules` actually selects, together with
+// the filesystem root each one lives at and the package set it declares. The
+// caller (`vm_init`) puts those roots on the application search path — the real
+// JDK also defines module-path classes to the application loader — and
+// registers the descriptors here with `automatic == false`, i.e. as EXPLICIT
+// modules whose `exports`/`opens` are enforced. That last part is the whole
+// point of a module path: a jar on the *class* path gets automatic-module
+// semantics (read/export/open everything, see `ModuleDescriptor::automatic`),
+// and a module resolved from a *module* path does not.
+
+/// One named module found on the `--module-path`.
+#[derive(Debug, Clone)]
+pub struct ModulePathModule {
+    /// Filesystem root to add to the class search path: an exploded module
+    /// directory, or a modular JAR.
+    pub root: String,
+    /// The parsed `module-info.class` descriptor. `automatic` is always
+    /// `false` — a module resolved from a real module path is explicit.
+    pub descriptor: ModuleDescriptor,
+    /// Packages the module contains, slash format (`"com/example/svc"`).
+    pub packages: Vec<String>,
+}
+
+/// `--add-modules ALL-MODULE-PATH` (JEP 261): resolve every observable module
+/// on the module path, whether or not anything requires it.
+pub const ALL_MODULE_PATH: &str = "ALL-MODULE-PATH";
+
+/// Parse `module-info.class` bytes into a descriptor plus whatever packages
+/// its `ModulePackages` attribute declares.
+///
+/// The package list is frequently EMPTY and that is not an error: `javac` does
+/// not emit `ModulePackages` for an exploded compilation. Verified with
+/// `javap -v regression-suite/build-modules/cratonvm.jdkonly.svc/module-info.class`
+/// — the attribute list is `SourceFile` + `Module`, nothing else. Only `jar` /
+/// `jlink` add it. Callers must fall back to scanning the tree
+/// ([`exploded_packages`] / the JAR entry list), exactly as the real JDK's
+/// `jdk.internal.module.ModulePath` does.
+pub fn parse_module_info(bytes: &[u8]) -> Option<(ModuleDescriptor, Vec<String>)> {
+    let mut class_file = cratonvm_reader::read_class(bytes).ok()?;
+    cratonvm_reader::attribute::force_decode_all(
+        &mut class_file.attributes,
+        &class_file.constant_pool,
+    )
+    .ok()?;
+    let desc = class_file.attributes.iter().find_map(|a| {
+        a.as_decoded()
+            .and_then(|d| descriptor_from_module_attribute(d, &class_file.constant_pool))
+    })?;
+    let packages = class_file
+        .attributes
+        .iter()
+        .find_map(|a| {
+            a.as_decoded()
+                .and_then(|d| packages_from_module_packages_attribute(d, &class_file.constant_pool))
+        })
+        .unwrap_or_default();
+    Some((desc, packages))
+}
+
+/// Is `segment` usable as one dot-separated component of a package name?
+///
+/// The real JDK drops directories that cannot be package components rather
+/// than inventing an illegal package name — this is what keeps `META-INF`
+/// (illegal: contains `-`) out of a module's package set.
+fn is_package_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c == '$' || c.is_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c == '$' || c.is_alphanumeric())
+}
+
+/// Walk an exploded module directory and collect the packages it contains,
+/// in slash format.
+///
+/// Counts a directory as a package when it holds at least one regular file —
+/// not only `.class` files. That matches `ModulePath::explodedPackages`, and
+/// it matters here: a package that is opened purely to expose a resource still
+/// has to appear in `ModuleDescriptor.packages()`.
+///
+/// Symlinks are not followed (`file_type()` reports `is_symlink`, so they are
+/// neither descended into nor counted), which bounds the walk on a cyclic
+/// tree.
+fn exploded_packages(root: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, pkg)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut has_file = false;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !is_package_segment(&name) {
+                    continue;
+                }
+                let child = if pkg.is_empty() {
+                    name
+                } else {
+                    format!("{pkg}/{name}")
+                };
+                stack.push((entry.path(), child));
+            } else if file_type.is_file() {
+                has_file = true;
+            }
+        }
+        if has_file && !pkg.is_empty() && !out.contains(&pkg) {
+            out.push(pkg);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Read `module-info.class` out of a modular JAR, together with the package
+/// set derived from its entry names.
+fn modular_jar_module(path: &std::path::Path) -> Option<(ModuleDescriptor, Vec<String>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+
+    // Collect names first: `by_name` needs `&mut archive`, so the borrow of
+    // `file_names()` must be finished before the read below.
+    let names: Vec<String> = archive.file_names().map(|n| n.to_string()).collect();
+
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read as _;
+        let mut entry = archive.by_name("module-info.class").ok()?;
+        entry.read_to_end(&mut bytes).ok()?;
+    }
+    let (descriptor, declared) = parse_module_info(&bytes)?;
+
+    let packages = if declared.is_empty() {
+        let mut pkgs: Vec<String> = Vec::new();
+        for name in &names {
+            if name.ends_with('/') {
+                continue;
+            }
+            let Some(pos) = name.rfind('/') else {
+                continue;
+            };
+            let pkg = &name[..pos];
+            if pkg.split('/').all(is_package_segment) && !pkgs.iter().any(|p| p == pkg) {
+                pkgs.push(pkg.to_string());
+            }
+        }
+        pkgs.sort();
+        pkgs
+    } else {
+        declared
+    };
+    Some((descriptor, packages))
+}
+
+/// Try to read `path` as a single module root (exploded directory or modular
+/// JAR). Returns `None` when it carries no `module-info.class`.
+fn module_at(path: &std::path::Path) -> Option<ModulePathModule> {
+    let root = path.to_string_lossy().into_owned();
+    if path.is_dir() {
+        let info = path.join("module-info.class");
+        let bytes = std::fs::read(&info).ok()?;
+        let (mut descriptor, declared) = parse_module_info(&bytes)?;
+        descriptor.automatic = false;
+        let packages = if declared.is_empty() {
+            exploded_packages(path)
+        } else {
+            declared
+        };
+        return Some(ModulePathModule {
+            root,
+            descriptor,
+            packages,
+        });
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext.eq_ignore_ascii_case("jar") {
+        let (mut descriptor, packages) = modular_jar_module(path)?;
+        descriptor.automatic = false;
+        return Some(ModulePathModule {
+            root,
+            descriptor,
+            packages,
+        });
+    }
+    None
+}
+
+/// Every module *observable* on `entries` — i.e. present on the module path,
+/// whether or not `--add-modules` selects it.
+///
+/// A `--module-path` entry is either a module root itself (a directory holding
+/// `module-info.class`, or a modular JAR) or a directory *of* module roots;
+/// `java` accepts both spellings and so does this.
+pub fn scan_module_path(entries: &[String]) -> Vec<ModulePathModule> {
+    let mut found: Vec<ModulePathModule> = Vec::new();
+    for entry in entries {
+        let path = std::path::Path::new(entry);
+        if let Some(m) = module_at(path) {
+            found.push(m);
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(path) else {
+            continue;
+        };
+        let mut child_paths: Vec<std::path::PathBuf> =
+            children.flatten().map(|c| c.path()).collect();
+        // `read_dir` order is filesystem-dependent; sort so the resulting
+        // search-path order (and therefore split-package shadowing) is the
+        // same on every run and every OS.
+        child_paths.sort();
+        for child in child_paths {
+            if let Some(m) = module_at(&child) {
+                found.push(m);
+            }
+        }
+    }
+    found
+}
+
+/// Resolve the `--add-modules` root set against the modules observable on
+/// `--module-path`, returning the selected modules plus everything they
+/// (transitively) require that also lives on the module path.
+///
+/// Returns an empty vec when nothing is selected — which is the correct answer
+/// for a plain `-cp` launch, and the reason this is safe to call
+/// unconditionally at VM init.
+///
+/// `--add-modules` accepts a comma-separated list per occurrence, so tokens are
+/// split on `,` here as well as across occurrences. `ALL-MODULE-PATH` selects
+/// every observable module. `ALL-DEFAULT` / `ALL-SYSTEM` select system modules,
+/// none of which are on a module path, so they select nothing here.
+pub fn resolve_module_path(entries: &[String], add_modules: &[String]) -> Vec<ModulePathModule> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let observable = scan_module_path(entries);
+    if observable.is_empty() {
+        return Vec::new();
+    }
+
+    let mut roots: Vec<String> = Vec::new();
+    let mut all = false;
+    for spec in add_modules {
+        for token in spec.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if token == ALL_MODULE_PATH {
+                all = true;
+            } else {
+                roots.push(token.to_string());
+            }
+        }
+    }
+
+    if all {
+        return observable;
+    }
+
+    // Transitive closure of `requires`, restricted to what is observable.
+    // `requires static` is compile-time only and does NOT pull a module into
+    // the graph at run time, matching `build_readability_graph`'s seeding.
+    let mut selected: FxHashSet<String> = FxHashSet::default();
+    let mut work: Vec<String> = roots;
+    while let Some(name) = work.pop() {
+        if !selected.insert(name.clone()) {
+            continue;
+        }
+        if let Some(m) = observable.iter().find(|m| m.descriptor.name == name) {
+            for req in &m.descriptor.requires {
+                if !req.is_static && !selected.contains(&req.module_name) {
+                    work.push(req.module_name.clone());
+                }
+            }
+        }
+    }
+
+    let mut out: Vec<ModulePathModule> = observable
+        .into_iter()
+        .filter(|m| selected.contains(&m.descriptor.name))
+        .collect();
+    out.sort_by(|a, b| a.descriptor.name.cmp(&b.descriptor.name));
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1946,5 +2262,30 @@ mod tests {
         assert!(reg
             .check_module_access("modA", "modB", "com/internal")
             .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // `--module-path` resolution
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn package_segment_rejects_non_identifiers() {
+        // The filter that keeps `META-INF` (and `build-modules`-style names)
+        // out of a module's package set.
+        assert!(is_package_segment("svc"));
+        assert!(is_package_segment("_x"));
+        assert!(is_package_segment("$y"));
+        assert!(is_package_segment("a1"));
+        assert!(!is_package_segment("META-INF"));
+        assert!(!is_package_segment("1abc"));
+        assert!(!is_package_segment(""));
+    }
+
+    #[test]
+    fn empty_module_path_resolves_nothing() {
+        // The unconditional call at VM init must be a no-op for a plain
+        // `-cp` launch — no filesystem probing, no modules selected.
+        assert!(resolve_module_path(&[], &[]).is_empty());
+        assert!(resolve_module_path(&[], &["some.module".to_string()]).is_empty());
     }
 }

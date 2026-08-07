@@ -377,6 +377,28 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // The hidden class is named "<original>/0x<id>" so multiple defines
 // from the same template get distinct synthetic names.
 
+/// The base name a hidden class's mangled name is built from.
+///
+/// HotSpot names a hidden class `<this_class>/0x<addr>`, where `this_class` is
+/// the name in the SUPPLIED BYTES — not the lookup class's name. Deriving it
+/// from the lookup class produced `RJdkHidden/0x1` for a `RJdkHidden$Payload`
+/// class file defined through a lookup on `RJdkHidden`, failing
+/// `RJdkHidden.java:97`'s `getName().startsWith("RJdkHidden$Payload/0x")`.
+/// `classloader.rs:8140` already does this correctly via `extract_this_class_name`.
+/// Falls back to the lookup class name, then to a constant, so bytes this
+/// reader cannot parse still get a unique name from the counter suffix.
+fn hidden_class_base_name(class_bytes: &[u8], lookup_name: Option<&str>) -> String {
+    if let Ok(class_file) = cratonvm_reader::read_class(class_bytes) {
+        let this_class = class_file.this_class.to_string();
+        if !this_class.is_empty() {
+            return this_class;
+        }
+    }
+    lookup_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "HiddenClass".to_string())
+}
+
 fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this_lookup = obj_arg(args, 0)?;
     let class_bytes = decode_byte_array(ctx, args.get(1), "defineHiddenClass")?;
@@ -411,15 +433,14 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
         resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
-    // Keep the original name for the mangled hidden-class label.
+    // Keep the lookup class name only as the FALLBACK label.
     let nest_host_class_name_for_label = lookup_name;
 
-    // Mint a unique mangled name. The class file's own `this_class` may
-    // hold a placeholder; we pass `override_name` so the backend stamps
-    // the new name into the class metadata.
-    let original = nest_host_class_name_for_label
-        .clone()
-        .unwrap_or_else(|| "HiddenClass".to_string());
+    // Mint a unique mangled name from the class file's own `this_class` (the
+    // name HotSpot uses); we pass `override_name` so the backend stamps the
+    // mangled name into the class metadata.
+    let original =
+        hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 
@@ -576,9 +597,10 @@ fn lk_define_hidden_class_with_class_data(
         resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
     let nest_host_class_name_for_label = lookup_name;
 
-    let original = nest_host_class_name_for_label
-        .clone()
-        .unwrap_or_else(|| "HiddenClass".to_string());
+    // Same rule as the plain variant: the label comes from the class file's
+    // own `this_class`, with the lookup class name as the fallback.
+    let original =
+        hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 

@@ -6694,6 +6694,21 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         }
     }
 
+    fn register_lambda_proxy_markers(&mut self, proxy_class_id: u32, marker_interfaces: &[String]) {
+        if proxy_class_id == 0 || marker_interfaces.is_empty() {
+            return;
+        }
+        let names: Vec<std::sync::Arc<str>> = marker_interfaces
+            .iter()
+            .map(|n| std::sync::Arc::from(n.as_str()))
+            .collect();
+        crate::runtime::invokedynamic::record_lambda_proxy_markers(
+            self.shared.vm_identity,
+            ClassId::new(proxy_class_id),
+            &names,
+        );
+    }
+
     fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
         self.shared
             .classes
@@ -22225,8 +22240,27 @@ fn invoke_on_class_shared_inner(
                         // bytecode → species); Groovy's dispatch chains use
                         // `asCollector(Object[].class, n)` / `asSpreader(...)`. Pin
                         // `MH_KIND_COLLECT` / `MH_KIND_SPREAD`.
+                        // ASVARARGSCOLLECTOR/ASFIXEDARITY: the real bytecode wraps
+                        // the receiver in `MethodHandleImpl$AsVarargsCollector`, a
+                        // `DelegatingMethodHandle` whose ctor runs `makeReinvokerForm`
+                        // -> `mtype.form().cachedLambdaForm(LF_DELEGATE)` and then
+                        // needs a LambdaForm reinvoker to re-enter our synthetic
+                        // handle via `invokeBasic` (no body in the `MH_KIND_*` shim
+                        // model). regression-suite RJdkHandles died there with
+                        // `Cannot load from object array because "this.lambdaForms"
+                        // is null` in BOTH --real-jdk and --jdk-only. Pin the
+                        // identity shims registered in
+                        // `register_method_handle_combinator_extras_bridge`;
+                        // CratonVM applies collector semantics at dispatch
+                        // (`collect_trailing_varargs`).
                         || (class_name == "java/lang/invoke/MethodHandle"
-                            && matches!(method_name, "asCollector" | "asSpreader"))
+                            && matches!(
+                                method_name,
+                                "asCollector"
+                                    | "asSpreader"
+                                    | "asVarargsCollector"
+                                    | "asFixedArity"
+                            ))
                         // CALLSITE.DYNAMICINVOKER: `MutableCallSite`/
                         // `VolatileCallSite.dynamicInvoker()` — the real
                         // `makeDynamicInvoker` does `bindArgumentL` (BoundMethodHandle

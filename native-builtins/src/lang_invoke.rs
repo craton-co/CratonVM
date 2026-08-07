@@ -967,16 +967,21 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
 
-    // Lookup.defineHiddenClass(byte[], boolean, ClassOption...) → Lookup
-    // Simplified: allocates a synthetic hidden class and returns a Lookup for it.
-    r.register(lk, "defineHiddenClass", "([BZ[Ljava/lang/invoke/MethodHandles$Lookup$ClassOption;)Ljava/lang/invoke/MethodHandles$Lookup;",
-        |ctx, _args| {
-            // For simplicity, return a Lookup wrapping a synthetic hidden class mirror.
-            // Full implementation would parse the byte[] and define the class.
-            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1);
-            Ok(Some(Value::Object(Some(lookup))))
-        }
-    );
+    // Lookup.defineHiddenClass: NOT registered here, deliberately.
+    //
+    // This file's registrar runs LATE (`register_phase54_method_handle`,
+    // vm_init.rs:2648) and the triple table is last-write-wins, so the
+    // placeholder that used to live here SHADOWED the real WP2.3-B
+    // implementation in `lookup_define.rs:684` (wired on the essential path
+    // at vm_init.rs:2120). The placeholder ignored its arguments and returned
+    // a `MethodHandles$Lookup` whose slot 0 (`lookupClass`) was never written,
+    // so `lookupClass()` answered null and every caller NPE'd on the result —
+    // regression-suite RJdkHidden.defineNestmate:91 and RJdkStrict
+    // .generatedClassesStillAllowed:247, in BOTH --real-jdk and --jdk-only.
+    //
+    // Note the header comment above this block already stated the intended
+    // rule ("we do not provide stub overrides here — the real ones take
+    // precedence"); this registration was the one violation of it.
 
     // --- VarHandle real ops ---
     let vh = "java/lang/invoke/VarHandle";
@@ -4767,6 +4772,53 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
         },
     );
 
+    // MethodHandle.asVarargsCollector(arrayType) / MethodHandle.asFixedArity()
+    // → the receiver, unchanged.
+    //
+    // Why the real bytecode cannot run here: `asVarargsCollector` wraps the
+    // receiver in `MethodHandleImpl$AsVarargsCollector`, a
+    // `DelegatingMethodHandle` whose constructor runs
+    // `chooseDelegatingForm` → `DelegatingMethodHandle.makeReinvokerForm` →
+    // `mtype.form().cachedLambdaForm(LF_DELEGATE)`, i.e. it demands a real
+    // `MethodTypeForm` cache and then a real `LambdaForm` reinvoker that would
+    // have to re-enter the receiver through `invokeBasic`. CratonVM's handles
+    // are the `MH_KIND_*` shim model, which has no `invokeBasic` body, so even
+    // a fully-populated form only moves the failure one frame deeper.
+    // (regression-suite `RJdkHandles.adaptation` line 137 died on the FIRST of
+    // those two: `Cannot load from object array because "this.lambdaForms" is
+    // null` — in BOTH --real-jdk and --jdk-only, while HotSpot 25 passes.
+    // `populate_method_type_form` now allocates that cache, but this handle
+    // must still never reach the reinvoker.)
+    //
+    // Why the identity is the right shim rather than a new adapter kind:
+    // CratonVM applies varargs-collector semantics at DISPATCH, not on the
+    // handle — `collect_trailing_varargs` collects the excess arguments of an
+    // `invoke` that supplies more flat values than the target descriptor
+    // declares into a fresh array of the array-typed parameter's component
+    // type. That trigger is arity/shape driven, so a "this handle is a
+    // collector" marking adds nothing to it. `asFixedArity()` is the inverse
+    // and is likewise the identity: `collect_trailing_varargs` returns an
+    // already-packed call (exactly N args, an array in the array slot)
+    // untouched, which is precisely fixed-arity behaviour.
+    //
+    // Known deviation, deliberately not papered over: `isVarargsCollector()`
+    // keeps answering `false` (the base-class bytecode) because the marking is
+    // not stored anywhere. Recording it would need a sixth synthetic slot on
+    // every MethodHandle (`MH_BOUND + 1` is the allocated width today), and no
+    // caller in the corpus reads the flag back.
+    for (name, desc) in [
+        (
+            "asVarargsCollector",
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        ),
+        ("asFixedArity", "()Ljava/lang/invoke/MethodHandle;"),
+    ] {
+        r.register("java/lang/invoke/MethodHandle", name, desc, |_ctx, args| {
+            // args[0] is the receiver; hand it straight back.
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        });
+    }
+
     // MethodHandles.explicitCastArguments(target, newType) → passthrough that
     // stamps the new type (mirrors the `asType` shim). The real bytecode runs
     // strict `explicitCastArgumentsChecks` that rejects synthetic handles whose
@@ -5059,7 +5111,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // `cs.getTarget().bindTo(..).invoke()` yields a working SAM instance
             // whose abstract method runs the impl method.
             if let Some(ccs) = build_reflective_lambda_callsite(
-                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, false,
+                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, false, &[],
             ) {
                 if key.impl_ != 0 {
                     lambda_callsite_cache().lock().insert(key, ccs);
@@ -5095,7 +5147,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // instantiatedMethodType, flags, markerInterfaces, ...) into
             // args[3]: Object[]. invokedType is args[2] (factory signature).
             let invoked_type = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
-            let (sam_type, impl_method, inst_type, ser_flag) = match args.get(3) {
+            let (sam_type, impl_method, inst_type, flags, marker_names) = match args.get(3) {
                 Some(Value::Object(Some(arr))) => {
                     let arr = *arr;
                     let len = ctx.array_length(arr);
@@ -5118,17 +5170,55 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                     } else {
                         0
                     };
-                    (e(ctx, 0), e(ctx, 1), e(ctx, 2), (flags & 0x1) != 0)
+                    // FLAG_MARKERS (0x2): arr[4] is markerCount, then that many
+                    // `Class` objects — interfaces the spun proxy must implement
+                    // ON TOP of the SAM. Same layout the `invokedynamic`
+                    // bootstrap reads out of the BSM static args (see
+                    // `vm/src/runtime/invokedynamic.rs::read_marker_interfaces`).
+                    let mut markers: Vec<String> = Vec::new();
+                    if (flags & 0x2) != 0 {
+                        let count = if 4 < len {
+                            match ctx.get_array_element(arr, 4) {
+                                Value::Int(i) => i.max(0) as usize,
+                                Value::Object(Some(b)) => match ctx.get_field_by_name(b, "value") {
+                                    Value::Int(i) => i.max(0) as usize,
+                                    _ => 0,
+                                },
+                                _ => 0,
+                            }
+                        } else {
+                            0
+                        };
+                        for k in 0..count {
+                            if let Some(m) = e(ctx, 5 + k) {
+                                if let Some(name) = mirror_class_name(ctx, m) {
+                                    markers.push(name);
+                                }
+                            }
+                        }
+                    }
+                    (e(ctx, 0), e(ctx, 1), e(ctx, 2), flags, markers)
                 }
-                _ => (None, None, None, false),
+                _ => (None, None, None, 0, Vec::new()),
             };
+            let ser_flag = (flags & 0x1) != 0;
             let key = LambdaKey {
                 invoked: lambda_key_of(invoked_type),
                 sam: lambda_key_of(sam_type),
                 impl_: lambda_key_of(impl_method),
                 instantiated: lambda_key_of(inst_type),
             };
-            if key.impl_ != 0 {
+            // The identity cache keys ONLY on the four bootstrap-arg objects.
+            // The JDK interns `MethodType`s, so
+            //   metafactory(lookup, "add", ()LAdder;, (II)I, impl, (II)I)
+            // and
+            //   altMetafactory(lookup, "add", ()LAdder;,
+            //                  {(II)I, impl, (II)I, FLAG_MARKERS, 1, Cloneable})
+            // produce the SAME key while needing DIFFERENT proxy interface
+            // lists. A flags-bearing call site must therefore neither read nor
+            // populate the cache. Flags are rare on this reflective path.
+            let cacheable = flags == 0;
+            if cacheable && key.impl_ != 0 {
                 if let Some(cached) = { let c = lambda_callsite_cache().lock(); c.get(&key).copied() } {
                     return Ok(Some(Value::Object(Some(cached))));
                 }
@@ -5139,8 +5229,9 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             };
             if let Some(ccs) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, ser_flag,
+                &marker_names,
             ) {
-                if key.impl_ != 0 {
+                if cacheable && key.impl_ != 0 {
                     lambda_callsite_cache().lock().insert(key, ccs);
                 }
                 return Ok(Some(Value::Object(Some(ccs))));
@@ -5989,6 +6080,9 @@ fn build_reflective_lambda_callsite(
     // `LambdaMetafactory.FLAG_SERIALIZABLE`, as passed by a reflective
     // `altMetafactory`. Plain `metafactory` has no flags word: `false`.
     serializable: bool,
+    // `LambdaMetafactory.FLAG_MARKERS` interfaces (internal names), as passed by
+    // a reflective `altMetafactory`. Always empty for plain `metafactory`.
+    marker_interfaces: &[String],
 ) -> Option<cratonvm_types::ObjectRef> {
     let invoked_mt = invoked_type?;
     let impl_mh = impl_method?;
@@ -6037,6 +6131,10 @@ fn build_reflective_lambda_callsite(
         if proxy_cid == 0 {
         return None;
     }
+    // The proxy implements its functional interface PLUS every marker. That
+    // list is not part of the SAM metadata above, so it rides a second
+    // hand-off; without it `(Adder & Cloneable)`-style casts fail.
+    ctx.register_lambda_proxy_markers(proxy_cid, marker_interfaces);
 
     // Factory MethodHandle: MH_CLASS = proxy ClassId (decimal), MH_DESC = the
     // factory signature (so type()/arity and capture-count are derivable).
@@ -8532,6 +8630,9 @@ pub fn build_method_type_from_descriptor(
 /// Reads the `ptypes` array (slot 1) to compute slot/primitive counts and
 /// stores `mt` itself as both erasedType and basicType — a minimal stand-in
 /// so downstream `form.erasedType()` returns a non-null MethodType.
+///
+/// Slots 4/5 (`methodHandles`, `lambdaForms`) are the JDK's two lazy caches
+/// and MUST be non-null arrays here — see `MTF_LF_CACHE_LEN` below.
 pub(crate) fn populate_method_type_form(
     ctx: &mut dyn NativeContext,
     mt: cratonvm_types::ObjectRef,
@@ -8554,13 +8655,68 @@ pub(crate) fn populate_method_type_form(
             }
         }
     }
+    // GC-safety: `alloc_concurrent_synthetic` and the two `new_array` calls
+    // below can each trigger a collection that relocates `mt` and `form`.
+    // Pin both and re-read the forwarded reference before every use.
+    let mt_pin = ctx.pin_native_root(mt);
     let form = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodTypeForm", 7);
+    let form_pin = ctx.pin_native_root(form);
+    let mt = ctx.read_native_pin(mt_pin, mt);
     ctx.set_field(form, 0, Value::Int(slot_count));
     ctx.set_field(form, 1, Value::Int(primitive_count));
     ctx.set_field(form, 2, Value::Object(Some(mt)));
     ctx.set_field(form, 3, Value::Object(Some(mt)));
+    // Slots 4/5 are the JDK's two lazy caches, `methodHandles` and
+    // `lambdaForms`. Leaving them null is a state the real constructor NEVER
+    // produces for a form that claims `basicType == erasedType` — which is
+    // exactly what the two writes above claim for this form. The real
+    // `MethodTypeForm(MethodType)` allocates BOTH arrays on that branch and
+    // only leaves them null on the non-basic branch, whose accessors the JDK
+    // then never calls (every caller routes through `basicType().form()`).
+    //
+    // Every JDK reader is a bare indexed load with no null check:
+    //   MethodTypeForm.cachedLambdaForm   -> `lambdaForms[which]`
+    //   MethodTypeForm.cachedMethodHandle -> `methodHandles[which]`
+    // so a null slot is not a cache miss, it is a NullPointerException in
+    // real-JDK bytecode we cannot patch. Observed twice:
+    //   * `CallSite.makeUninitializedCallSite` NPE'd on the null
+    //     `methodHandles` — worked around by shimming that method instead
+    //     (see the `makeUninitializedCallSite` registration below).
+    //   * `MethodHandle.asVarargsCollector` -> `DelegatingMethodHandle
+    //     .makeReinvokerForm` -> `mtype.form().cachedLambdaForm(LF_DELEGATE)`
+    //     NPE'd with `Cannot load from object array because "this.lambdaForms"
+    //     is null` (regression-suite RJdkHandles, BOTH --real-jdk and
+    //     --jdk-only; HotSpot 25 passes).
+    // Allocating empty arrays turns those reads back into ordinary cache
+    // MISSES (null entry), which is what the JDK expects on a fresh form.
+    let method_handles =
+        ctx.new_array(cratonvm_types::ArrayElementType::Reference, MTF_MH_CACHE_LEN);
+    let form = ctx.read_native_pin(form_pin, form);
+    ctx.set_field(form, 4, Value::Object(Some(method_handles)));
+    let lambda_forms =
+        ctx.new_array(cratonvm_types::ArrayElementType::Reference, MTF_LF_CACHE_LEN);
+    let form = ctx.read_native_pin(form_pin, form);
+    ctx.set_field(form, 5, Value::Object(Some(lambda_forms)));
+    let mt = ctx.read_native_pin(mt_pin, mt);
     ctx.set_field(mt, 2, Value::Object(Some(form)));
+    ctx.unpin_native_roots(mt_pin);
 }
+
+/// Length of the fabricated `MethodTypeForm.methodHandles` cache (slot 4).
+/// JDK 25's `MethodTypeForm.MH_LIMIT` is 3.
+///
+/// Deliberately sized PAST the JDK constant. Both caches are `private` fields
+/// touched only by `MethodTypeForm`'s own accessors, and only ever by an
+/// indexed load/store — nothing reads `.length`, nothing iterates them — so an
+/// over-long array is indistinguishable from an exact one to every reader,
+/// while an array sized from a stale constant would be an
+/// `ArrayIndexOutOfBoundsException` the day a JDK release adds a cache index.
+const MTF_MH_CACHE_LEN: usize = 16;
+
+/// Length of the fabricated `MethodTypeForm.lambdaForms` cache (slot 5).
+/// JDK 25's `MethodTypeForm.LF_LIMIT` is 26. Over-sized for the reason given
+/// on `MTF_MH_CACHE_LEN`.
+const MTF_LF_CACHE_LEN: usize = 64;
 
 /// Parse a sequence of JVM type descriptors from a parameter string.
 /// e.g. "ILjava/lang/String;D" → ["int", "java/lang/String", "double"]

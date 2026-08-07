@@ -53,6 +53,22 @@ const METAFACTORY: &str = "metafactory";
 /// The LambdaMetafactory.altMetafactory bootstrap method name (advanced flags variant).
 const ALT_METAFACTORY: &str = "altMetafactory";
 
+/// `LambdaMetafactory.FLAG_SERIALIZABLE` — the spun proxy implements
+/// `java.io.Serializable` and carries a `writeReplace()`.
+const FLAG_SERIALIZABLE: i32 = 1;
+
+/// `LambdaMetafactory.FLAG_MARKERS` — the flags word is followed by
+/// `markerCount` and then that many `Class` bootstrap arguments, each an
+/// ADDITIONAL interface the spun proxy class implements. Emitted by javac for
+/// an intersection target type (`(Adder & Cloneable) (a, b) -> a + b`) and by
+/// any hand-written `altMetafactory` call.
+///
+/// The block that follows the markers is `FLAG_BRIDGES` (0x4): a `bridgeCount`
+/// then that many `MethodType`s. Markers come FIRST, so the marker block's
+/// extent is computable without looking at the bridge bit — and CratonVM's SAM
+/// dispatch is descriptor-driven, so it needs no spun bridge methods.
+const FLAG_MARKERS: i32 = 2;
+
 /// The SwitchBootstraps bootstrap method class name (JEP 441, Java 21).
 const SWITCH_BOOTSTRAPS: &str = "java/lang/runtime/SwitchBootstraps";
 
@@ -452,8 +468,12 @@ pub fn execute_invokedynamic(
         && (info.bsm_method == METAFACTORY || info.bsm_method == ALT_METAFACTORY)
     {
         // altMetafactory has additional bootstrap arguments (flags, marker interfaces,
-        // bridges) beyond the 3 standard ones, but the core lambda proxy creation is
-        // identical — extra args are advisory and not needed for dispatch.
+        // bridges) beyond the 3 standard ones. The core lambda proxy creation is
+        // identical, and the bridge block genuinely is advisory here (SAM dispatch is
+        // descriptor-driven) — but the FLAG_SERIALIZABLE bit and the MARKER INTERFACE
+        // list are NOT: they change the spun proxy's interface list, so
+        // `instanceof`/`checkcast`/`Class.isInstance` against a marker must succeed.
+        // `bootstrap_lambda` reads both.
         bootstrap_lambda(shared, thread, frame_idx, cp_index, &info)
     } else if info.bsm_class == SWITCH_BOOTSTRAPS && info.bsm_method == TYPE_SWITCH {
         bootstrap_type_switch(shared, thread, frame_idx, cp_index, &info)
@@ -1215,19 +1235,38 @@ fn bootstrap_lambda(
     // so the reflective surfaces can tell the two apart. A plain `metafactory`
     // site has no flags word and is never serializable BY FLAG (it can still be
     // serializable by inheritance -- see `SharedVm::lambda_proxy_serializability`).
-    let serializable_flag = info.bsm_method == ALT_METAFACTORY
-        && info
-            .bootstrap_arg_indices
+    //
+    // The WHOLE word is kept, not just bit 0: `FLAG_MARKERS` below decides
+    // whether more bootstrap arguments follow.
+    let alt_flags: i32 = if info.bsm_method == ALT_METAFACTORY {
+        info.bootstrap_arg_indices
             .get(3)
             .and_then(|idx| {
                 let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(current_class_id)?;
                 match class.constant_pool.get(*idx) {
-                    Some(ConstantPoolEntry::Integer(flags)) => Some((flags & 0x1) != 0),
+                    Some(ConstantPoolEntry::Integer(flags)) => Some(*flags),
                     _ => None,
                 }
             })
-            .unwrap_or(false);
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let serializable_flag = (alt_flags & FLAG_SERIALIZABLE) != 0;
+
+    // `FLAG_MARKERS` names ADDITIONAL interfaces the spun proxy implements on
+    // top of the functional interface. Real HotSpot puts them in the generated
+    // class's `implements` clause, so `marker.isInstance(lambda)` and a
+    // `checkcast` to the marker both succeed. CratonVM's proxy is a synthetic
+    // ClassId with no ClassStore hierarchy, so the list has to be carried
+    // beside it — see `record_lambda_proxy_markers`. Dropping it (which this
+    // path used to do) makes every intersection-cast lambda fail its own cast.
+    let marker_interfaces: Vec<Arc<str>> = if (alt_flags & FLAG_MARKERS) != 0 {
+        read_marker_interfaces(shared, current_class_id, &info.bootstrap_arg_indices)
+    } else {
+        Vec::new()
+    };
 
     // Allocate a synthetic proxy ClassId
     let proxy_class_id = shared.alloc_lambda_proxy_id();
@@ -1265,6 +1304,7 @@ fn bootstrap_lambda(
             .lambda_proxy_hosts
             .write()
             .insert(proxy_class_id, current_class_id);
+        record_lambda_proxy_markers(shared.vm_identity, proxy_class_id, &marker_interfaces);
     }
     shared.classes.resolution_cache.write().put_call_site(
         current_class_id,
@@ -1274,6 +1314,155 @@ fn bootstrap_lambda(
 
     // Now execute: pop captured values, allocate proxy object, push it
     allocate_lambda_proxy(shared, thread, frame_idx, proxy_class_id, &capture_types)
+}
+
+/// Read `altMetafactory`'s `FLAG_MARKERS` block out of the bootstrap static
+/// arguments: `arg[4]` is `markerCount` (an int), `arg[5 .. 5+markerCount]` are
+/// `CONSTANT_Class` entries. Returns the internal names, in declaration order.
+///
+/// Tolerant by construction: a short or malformed block yields the prefix it
+/// could read rather than an error. A bootstrap-method attribute that disagrees
+/// with its own flags word is a broken class file, but refusing to link the
+/// call site would turn a wrong `instanceof` answer into a hard failure of an
+/// otherwise-working lambda.
+fn read_marker_interfaces(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    arg_indices: &[u16],
+) -> Vec<Arc<str>> {
+    let cm = shared.classes.class_manager.read();
+    let Some(class) = cm.get_class(current_class_id) else {
+        return Vec::new();
+    };
+    let count = match arg_indices.get(4).and_then(|i| class.constant_pool.get(*i)) {
+        Some(ConstantPoolEntry::Integer(n)) if *n > 0 => *n as usize,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<Arc<str>> = Vec::with_capacity(count);
+    for k in 0..count {
+        let Some(idx) = arg_indices.get(5 + k) else {
+            break;
+        };
+        if let Some(name) = class.constant_pool.get_class_name_arc(*idx) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// altMetafactory marker interfaces
+//
+// A spun lambda proxy implements its functional interface PLUS every interface
+// named in `altMetafactory`'s `FLAG_MARKERS` block. CratonVM's proxy classes
+// are synthetic ClassIds (>= 0x8000_0000) that are deliberately absent from the
+// ClassStore, so they have no `interfaces` vector to append to and
+// `LambdaCallSite` (`classloading/src/resolution.rs`) records only the single
+// `functional_interface`. The marker list therefore lives in a side table keyed
+// by `(vm_identity, proxy_class_id)`, exactly like `LAMBDA_SINGLETON_CACHE`
+// above: `alloc_lambda_proxy_id` never recycles an id, and the `vm_identity`
+// half keeps two VMs in one test process from aliasing each other.
+//
+// Entries hold plain interned names, never `ObjectRef`s, so unlike the
+// singleton cache this table needs no GC root scan or post-compaction remap.
+// It is populated only by intersection-cast lambdas, which are rare; the
+// `ANY_LAMBDA_MARKERS` gate keeps the (hot) `instanceof`-on-a-lambda path from
+// taking the lock at all in the overwhelmingly common empty case.
+// ---------------------------------------------------------------------------
+
+/// `true` once any proxy in this process has recorded a marker interface.
+/// Read before the mutex on every marker query; see the module note above.
+static ANY_LAMBDA_MARKERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[allow(clippy::type_complexity)]
+static LAMBDA_PROXY_MARKERS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), Arc<[Arc<str>]>>>,
+> = std::sync::OnceLock::new();
+
+#[allow(clippy::type_complexity)]
+fn lambda_proxy_markers(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), Arc<[Arc<str>]>>> {
+    LAMBDA_PROXY_MARKERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the `altMetafactory` marker interfaces of a freshly-registered lambda
+/// proxy. A no-op for the (usual) empty list.
+///
+/// `pub` because the REFLECTIVE metafactory path reaches this from outside the
+/// `vm` crate: `native-builtins`' `LambdaMetafactory.altMetafactory` shim reads
+/// the packed `Object[]` and hands the names back through
+/// `NativeContext::register_lambda_proxy_markers`, whose `vm` implementation
+/// calls this.
+pub fn record_lambda_proxy_markers(
+    vm_identity: usize,
+    proxy_class_id: ClassId,
+    markers: &[Arc<str>],
+) {
+    if markers.is_empty() {
+        return;
+    }
+    let mut table = lambda_proxy_markers().lock();
+    // Same cap as `lambda_proxies` itself — a proxy that could not be
+    // registered has no marker list to answer for either.
+    if table.len() >= crate::vm::MAX_LAMBDA_PROXIES {
+        return;
+    }
+    table.insert((vm_identity, proxy_class_id), Arc::from(markers.to_vec()));
+    drop(table);
+    ANY_LAMBDA_MARKERS.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// The `altMetafactory` marker interfaces recorded for `proxy_class_id`, or
+/// `None` when it has none (the common case).
+pub fn lambda_proxy_marker_interfaces(
+    vm_identity: usize,
+    proxy_class_id: ClassId,
+) -> Option<Arc<[Arc<str>]>> {
+    if !ANY_LAMBDA_MARKERS.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    lambda_proxy_markers()
+        .lock()
+        .get(&(vm_identity, proxy_class_id))
+        .cloned()
+}
+
+/// Does lambda proxy `proxy_class_id` satisfy `target` by way of one of its
+/// `altMetafactory` marker interfaces?
+///
+/// A marker satisfies the target when it IS the target or extends it — a marker
+/// of `java/util/List` also answers `instanceof Collection`, because HotSpot put
+/// `List` in the spun class's `implements` clause and the ordinary interface
+/// hierarchy takes it from there. Called from
+/// `runtime::interpreter::typecheck::lambda_proxy_satisfies`, the single choke
+/// point for `checkcast` / `instanceof` / `Class.isInstance` /
+/// `Class.isAssignableFrom` on a lambda proxy.
+pub fn lambda_proxy_marker_satisfies(
+    shared: &SharedVm,
+    proxy_class_id: ClassId,
+    target_class_id: ClassId,
+    target_name: &str,
+) -> bool {
+    let Some(markers) = lambda_proxy_marker_interfaces(shared.vm_identity, proxy_class_id) else {
+        return false;
+    };
+    for marker in markers.iter() {
+        if &**marker == target_name {
+            return true;
+        }
+        if let Ok(marker_id) = shared.load_class_concurrent(marker) {
+            if shared
+                .classes
+                .class_manager
+                .read()
+                .is_subclass_of(marker_id, target_class_id)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Execute a cached lambda call site: pop captures, allocate proxy, push result.

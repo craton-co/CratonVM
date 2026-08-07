@@ -6617,12 +6617,264 @@ pub(crate) const NEW15_FJP_ACTIVE: usize = 1;
 /// `ForkJoinPool.getCommonPoolParallelism()`, which the JDK specifies as equal.
 pub(crate) const NEW15_COMMON_POOL_PARALLELISM: i32 = 1;
 
+// ---------------------------------------------------------------------------
+// L12 — the STATIC `ForkJoinTask.invokeAll` family
+// ---------------------------------------------------------------------------
+//
+// `regression-suite/src/RJdkForkJoin.java` hung forever (300 s budget, ZERO
+// checkpoint output) in BOTH `--real-jdk` and `--jdk-only`. The VM's own
+// watchdog dumped ONE thread, 34 frames: seven nested
+// `FillAction.compute -> ForkJoinTask.invokeAll(pc=25) -> doExec ->
+// RecursiveAction.exec` cycles above a final `invokeAll(pc=83) ->
+// awaitDone(ZJ)I -> awaitDone(FJP,IZJ)I`, parked.
+//
+// The cause is a hole in the eager-inline pool model, NOT a missing worker
+// thread. JDK 25's `ForkJoinTask.invokeAll(t1, t2)` is
+//
+//     t2.fork(); t1.doExec(); t2.awaitDone(...)
+//
+// — it runs one task inline on the caller and WAITS for the forked sibling.
+// Our `ForkJoinTask.fork()` Bridge is deliberately lazy: it only marks the
+// task queued, and `join()` / `get()` / `invoke()` are what actually drive
+// `compute()`. `invokeAll` calls none of those. It goes straight to
+// `awaitDone`, real JDK bytecode that blocks until some OTHER thread completes
+// the task — and this pool runs everything on the calling thread, so no other
+// thread will ever exist. pc=25 is the inline `doExec()` arm; pc=83 is the
+// wait-for-the-fork arm, and that is exactly where the dump is parked.
+//
+// Every other entry point into the model is already an inline Bridge:
+// `ForkJoinPool.invoke` / `submit` / `execute` / `invokeAll(Collection)` /
+// `invokeAny` / `lazySubmit`, and `ForkJoinTask.join` / `get` / `invoke`. The
+// three STATIC `ForkJoinTask.invokeAll` overloads were simply never
+// registered, so they were the last real-bytecode route from a lazy `fork()`
+// to an `awaitDone()` that nothing can satisfy.
+//
+// THREE lists must agree entry-for-entry or a registration here is silently
+// inert (the `awaitQuiescence` bug documented in `registry.rs` is the
+// precedent):
+//   1. this registration;
+//   2. `keep_real_forkjointask_bridge` in `native-api/src/registry.rs` — an
+//      unlisted `ForkJoinTask` native is DROPPED at registration in real-JDK
+//      mode;
+//   3. `is_forkjoin_native_override` in
+//      `vm/src/runtime/interpreter/native_override.rs` — what forces the
+//      native to win over the real JDK bytecode.
+
+/// A set of `ForkJoinTask`s kept GC-rooted for the whole of one `invokeAll`.
+///
+/// Running one task body allocates freely, so a sibling held as a bare address
+/// would be stale by the next iteration (the native stale-local family). Every
+/// task is pinned as it is collected and re-read through its own handle before
+/// use; `release` truncates the pin stack back to the first handle taken.
+struct FjtPinnedTasks {
+    /// Pin-stack watermark to truncate back to; `None` until the first pin.
+    base: Option<usize>,
+    handles: Vec<(usize, ObjectRef)>,
+}
+
+impl FjtPinnedTasks {
+    fn new() -> Self {
+        Self {
+            base: None,
+            handles: Vec::new(),
+        }
+    }
+
+    /// Pin `obj` as an extra GC root that is NOT a task — the source array or
+    /// collection. Must be called before any [`Self::push_task`] so the
+    /// watermark covers it too.
+    fn pin_extra(&mut self, ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
+        let handle = ctx.pin_native_root(obj);
+        if self.base.is_none() {
+            self.base = Some(handle);
+        }
+        handle
+    }
+
+    fn push_task(&mut self, ctx: &mut dyn NativeContext, task: ObjectRef) {
+        let handle = ctx.pin_native_root(task);
+        if self.base.is_none() {
+            self.base = Some(handle);
+        }
+        self.handles.push((handle, task));
+    }
+
+    fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// The current address of task `i`, re-read through its pin.
+    fn element(&self, ctx: &dyn NativeContext, i: usize) -> ObjectRef {
+        let (handle, obj) = self.handles[i];
+        ctx.read_native_pin(handle, obj)
+    }
+
+    fn release(self, ctx: &mut dyn NativeContext) {
+        if let Some(base) = self.base {
+            ctx.unpin_native_roots(base);
+        }
+    }
+}
+
+/// `invokeAll` is specified to raise `NullPointerException` for a null task
+/// (confirmed against the host JDK: `invokeAll(t, null)` throws before running
+/// anything). Skipping the element instead would silently run a SHORTER batch
+/// than the caller submitted.
+fn fjt_null_task() -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some("null ForkJoinTask passed to invokeAll".to_string()),
+    }
+    .into()
+}
+
+/// Run every task in `batch` to completion, in submission order.
+///
+/// `join()` is the entry point rather than a direct `compute()` invoke because
+/// it IS the coherent model: the side-table-backed Bridge native computes a
+/// task that has not run yet, hands back the memoised result for one that has
+/// (so a task already driven by an enclosing `join()` is not run twice), and
+/// rethrows the task's own throwable UNWRAPPED — which is exactly what the
+/// real `invokeAll` does via `reportExecutionException`. The first failure
+/// aborts the batch, again matching the JDK: `invokeAll(t1, t2)` never reaches
+/// `t2`'s wait if `t1` completed abnormally.
+fn fjt_invoke_all_inline(
+    ctx: &mut dyn NativeContext,
+    batch: &FjtPinnedTasks,
+) -> Result<(), MethodCallFailed> {
+    for i in 0..batch.len() {
+        let task = batch.element(ctx, i);
+        let _ = ctx.invoke_virtual(task, "join", "()Ljava/lang/Object;", &[])?;
+    }
+    Ok(())
+}
+
+/// Drain a `Collection` receiver into a pinned batch.
+///
+/// Iterates through the real `Iterator` bytecode rather than assuming a
+/// concrete container: `invokeAll(Collection)` accepts any `Collection`, and a
+/// `Set` or an unmodifiable view has to work identically. Each element is
+/// pinned as it is seen because `hasNext`/`next` can both allocate.
+///
+/// `live_coll` must already be pinned by the caller (its handle is the batch
+/// watermark) and re-read through that pin — this helper never touches it
+/// again after the `iterator()` call.
+fn fjt_collect_collection(
+    ctx: &mut dyn NativeContext,
+    batch: &mut FjtPinnedTasks,
+    live_coll: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let iter = match ctx.invoke_virtual(live_coll, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => return Ok(()),
+    };
+    let iter_pin = batch.pin_extra(ctx, iter);
+    let mut live_iter = iter;
+    loop {
+        live_iter = ctx.read_native_pin(iter_pin, live_iter);
+        match ctx.invoke_virtual(live_iter, "hasNext", "()Z", &[])? {
+            Some(Value::Int(v)) if v != 0 => {}
+            _ => break,
+        }
+        live_iter = ctx.read_native_pin(iter_pin, live_iter);
+        match ctx.invoke_virtual(live_iter, "next", "()Ljava/lang/Object;", &[])? {
+            Some(Value::Object(Some(element))) => batch.push_task(ctx, element),
+            _ => return Err(fjt_null_task()),
+        }
+    }
+    Ok(())
+}
+
+/// Register the static `ForkJoinTask.invokeAll` overloads as eager-inline
+/// Bridges. See the block comment above for why they are load-bearing.
+pub(crate) fn register_forkjointask_invoke_all_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let fjt = "java/util/concurrent/ForkJoinTask";
+
+    // invokeAll(ForkJoinTask, ForkJoinTask) — the overload `RecursiveAction`
+    // divide-and-conquer bodies use, and the one RJdkForkJoin hangs on.
+    r.register_with_kind(
+        fjt,
+        "invokeAll",
+        "(Ljava/util/concurrent/ForkJoinTask;Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            // STATIC: no receiver slot, so args[0]/args[1] are t1/t2.
+            let t1 = obj_arg(args, 0)?;
+            let t2 = obj_arg(args, 1)?;
+            let mut batch = FjtPinnedTasks::new();
+            batch.push_task(ctx, t1);
+            batch.push_task(ctx, t2);
+            let outcome = fjt_invoke_all_inline(ctx, &batch);
+            batch.release(ctx);
+            outcome?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // invokeAll(ForkJoinTask...) — the varargs overload. The array is pinned
+    // before the first task runs; `get_array_element` does not allocate, so
+    // the whole batch can be collected up front.
+    r.register_with_kind(
+        fjt,
+        "invokeAll",
+        "([Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            let array = obj_arg(args, 0)?;
+            let mut batch = FjtPinnedTasks::new();
+            let array_pin = batch.pin_extra(ctx, array);
+            let live_array = ctx.read_native_pin(array_pin, array);
+            let len = ctx.array_length(live_array);
+            for idx in 0..len {
+                match ctx.get_array_element(live_array, idx) {
+                    Value::Object(Some(task)) => batch.push_task(ctx, task),
+                    _ => {
+                        batch.release(ctx);
+                        return Err(fjt_null_task());
+                    }
+                }
+            }
+            let outcome = fjt_invoke_all_inline(ctx, &batch);
+            batch.release(ctx);
+            outcome?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // invokeAll(Collection) — returns the SAME collection it was handed, per
+    // the JDK contract (the tasks are completed in place, not re-wrapped).
+    r.register_with_kind(
+        fjt,
+        "invokeAll",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        |ctx, args| {
+            let collection = obj_arg(args, 0)?;
+            let mut batch = FjtPinnedTasks::new();
+            let coll_pin = batch.pin_extra(ctx, collection);
+            let entry_coll = ctx.read_native_pin(coll_pin, collection);
+            let mut outcome = fjt_collect_collection(ctx, &mut batch, entry_coll);
+            if outcome.is_ok() {
+                outcome = fjt_invoke_all_inline(ctx, &batch);
+            }
+            let live_coll = ctx.read_native_pin(coll_pin, collection);
+            batch.release(ctx);
+            outcome?;
+            Ok(Some(Value::Object(Some(live_coll))))
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_new15_continuation(r);
     register_new15_continuation_scope(r);
     register_new15_forkjoinpool_common(r);
+    register_forkjointask_invoke_all_bridge(r);
     register_wp4_8_continuation_support(r);
     register_wp4_8_virtual_thread_natives(r);
     r.set_category(__prev_cat);
@@ -6639,6 +6891,11 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_new15_forkjoinpool_common(r);
+    // L12: the static `ForkJoinTask.invokeAll` overloads ride the same
+    // real-JDK essentials hook. They are the last real-bytecode route from a
+    // lazy `fork()` to an `awaitDone()` that no worker thread can satisfy —
+    // see the block comment on `register_forkjointask_invoke_all_bridge`.
+    register_forkjointask_invoke_all_bridge(r);
     r.set_category(__prev_cat);
 }
 
