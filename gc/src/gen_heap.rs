@@ -14411,6 +14411,45 @@ fn mark_and_push_old_gen(
     if !old_gen.contains(ptr) {
         return;
     }
+    // A plausible-looking header is NECESSARY but not SUFFICIENT.
+    //
+    // The screen decodes bytes, so any interior address whose bytes happen to
+    // read as a well-formed header passes it. That used to be a coincidence one
+    // could not construct on purpose; since `identity_hash_code` left the
+    // header (2026-08-07) it is systematic. `obj + 8` now lands the header's
+    // 4-byte tail padding on `OBJECT_KIND_OFFSET`, and zero is a perfectly
+    // valid `ObjectKind::Object`, while `num_slots` reads the low half of an
+    // unhashed, unlocked mark word -- also zero. So EVERY object's `obj + 8`
+    // decodes as a plausible empty object.
+    //
+    // (The old layout rejected it for an incidental reason: `shape` sat at
+    // +12, so `obj + 8` put the field count on the kind byte, and a count of 2
+    // exceeds `ObjectKind::Array`. A negative control that depended on a field
+    // count not colliding with a kind tag was never testing the invariant it
+    // claimed to.)
+    //
+    // When the caller has a walk, the base list is authoritative for the span
+    // it covers, so an address inside that span that is not a base is interior
+    // by construction -- whatever its bytes say. Marking one writes a mark bit
+    // into a live object's payload, which is the corruption this screen exists
+    // to stop. Outside the walked span, and when there is no walk at all, the
+    // screen remains the only evidence available and still decides.
+    let addr = ptr as usize;
+    let interior_to_the_walk = match walked_bases.first() {
+        // Bounded by the FIRST base only, not by the last: the walk is
+        // contiguous from there to the end of the used region, so every
+        // allocated byte at or above it belongs to some object the walk
+        // returned. Bounding by the last base instead reaches only the final
+        // object's own base address and misses its body entirely -- with a
+        // single walked object the span collapses to one point and catches
+        // nothing, which is exactly how the first attempt at this failed.
+        Some(&lo) => addr > lo && walked_bases.binary_search(&addr).is_err(),
+        None => false,
+    };
+    if interior_to_the_walk {
+        note_rejected_old_mark_candidate(ptr, site);
+        return;
+    }
     if !old_gen_mark_candidate_plausible(ptr, old_gen, false) {
         if !rescue_mark_candidate_by_walk(ptr, old_gen, walked_bases) {
             note_rejected_old_mark_candidate(ptr, site);
