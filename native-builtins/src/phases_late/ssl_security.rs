@@ -2409,7 +2409,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            let alpn = ssl_sock_negotiated_alpn(ctx, this)?.unwrap_or_default();
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getApplicationProtocol sock={:?} -> {:?}",
@@ -2427,7 +2427,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            let alpn = ssl_sock_negotiated_alpn(ctx, this)?.unwrap_or_default();
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getHandshakeApplicationProtocol sock={:?} -> {:?}",

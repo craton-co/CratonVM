@@ -12149,11 +12149,14 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // already relies on — populated by the same `getSocketFactory()`
             // call, just read through a path that isn't sensitive to which
             // object ends up at field 0.
-            let client_ident = match ctx.get_field(this_factory, 0) {
-                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx),
-                _ => Ok(None),
-            }
-            .or_else(crate::t27_tls::huc_default_client_identity);
+            let configured_ident = match ctx.get_field(this_factory, 0) {
+                Value::Object(Some(sslctx)) => crate::t27_tls::ctx_identity(ctx, sslctx)?,
+                _ => None,
+            };
+            let client_ident = match configured_ident {
+                Some(identity) => Some(identity),
+                None => crate::t27_tls::huc_default_client_identity(),
+            };
             #[cfg(unix)]
             let legacy_dsa_roots = crate::t27_tls::selected_context_trust_root_ders();
             #[cfg(unix)]

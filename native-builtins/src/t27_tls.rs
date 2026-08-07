@@ -797,8 +797,8 @@ pub(crate) fn client_config_for_ssl_context_with_ciphers(
     ctx_obj: ObjectRef,
     enabled_ciphers: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
-    let key = ctx_obj_key(ctx, ctx_obj)?;
-    let identity = ctx_identity(ctx, ctx_obj);
+    let key = ctx_obj_key(ctx, ctx_obj).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
+    let identity = ctx_identity(ctx, ctx_obj).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
     build_engine_client_config_with_identity_ciphers(
         &["http/1.1"],
         identity
@@ -2340,10 +2340,10 @@ impl JavaKeyManagerResolver {
         sigschemes: &[SignatureScheme],
     ) -> Result<Option<Arc<CertifiedKey>>, MethodCallFailed> {
         let dbg = crate::nbflags().dbg_tls_auth_ok;
-        let mut km_list = ctx_key_managers_table()
-            .lock()
-            .get(&self.km_ctx_key)?
-            .clone();
+        let mut km_list = match ctx_key_managers_table().lock().get(&self.km_ctx_key) {
+            Some(list) => list.clone(),
+            None => return Ok(None),
+        };
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::resolve km_ctx_key={} km_count={} root_hint_subjects={} sigschemes={:?}",
@@ -2580,9 +2580,14 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
         // from a cause other than the stale-`ObjectRef` one fixed alongside
         // this is diagnosable from an ordinary run's log.
         let had_key_managers = self.has_certs();
+        // `resolve` is rustls' own trait method and returns `Option`: there
+        // is nowhere to put a refusal. Absorb it to "no key", which is what
+        // rustls already does when a resolver has nothing to offer. The
+        // `--jdk-only` violation was recorded when the class was refused.
         let out = with_active_native_context(|ctx| {
             self.resolve_via_java(ctx, root_hint_subjects, sigschemes)
-        })?;
+        })
+        .and_then(|r| r.ok());
         if dbg && out.is_none() {
             eprintln!("[dbg-tls-auth] JavaKeyManagerResolver::resolve NO active native context");
         }
@@ -3781,13 +3786,15 @@ pub(crate) fn stash_pending_layered_socket(
     // `drive_pending_layered_handshake`, once any `setEnabledCipherSuites`
     // narrowing is known too.
     let use_java_trust_manager = java_tm_key.is_some();
-    let client_identity = ctx_identity(ctx, ssl_context)?;
+    let client_identity = ctx_identity(ctx, ssl_context).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
     // Server identity: same resolution `rustls_server_handshake_over_stream`'s
     // former caller used (this SSLContext's own identity, else the
     // process-wide runtime-configured one) — resolved here too so SERVER mode
     // never needs to touch `ssl_context` again.
-    let server_identity = ctx_identity(ctx, ssl_context)
-        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)))?;
+    let server_identity = match ctx_identity(ctx, ssl_context).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())? {
+        Some(identity) => Some(identity),
+        None => runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)),
+    };
     let mut pending = pending_layered_sockets().lock();
     let mut id = 1i32;
     while pending.contains_key(&id) {
@@ -4407,23 +4414,23 @@ fn create_ssl_server_socket(
     // have been replaced by an unrelated client context by the time LDAPS
     // starts its listener. getDefault() returns an unbound factory and keeps
     // the established runtime-identity fallback for that case.
-    let identity = args
-        .first()
-        .and_then(|value| match value {
-            Value::Object(Some(factory)) if ctx.object_num_fields(*factory) > 0 => {
-                match ctx.get_field(*factory, 0) {
-                    Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context)?,
-                    _ => None,
-                }
+    let configured = match args.first() {
+        Some(Value::Object(Some(factory))) if ctx.object_num_fields(*factory) > 0 => {
+            match ctx.get_field(*factory, 0) {
+                Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context)?,
+                _ => None,
             }
-            _ => None,
-        })
+        }
+        _ => None,
+    };
+    let fallback = require_runtime_tls_identity()?;
+    let identity = configured
         .map(|(cert_pem, key_pem)| RuntimeTlsIdentity {
             cert_pem,
             key_pem,
             client_ca_pem: None,
         })
-        .unwrap_or(require_runtime_tls_identity()?);
+        .unwrap_or(fallback);
     let config = build_server_config_single_cert(
         &identity.cert_pem,
         &identity.key_pem,
