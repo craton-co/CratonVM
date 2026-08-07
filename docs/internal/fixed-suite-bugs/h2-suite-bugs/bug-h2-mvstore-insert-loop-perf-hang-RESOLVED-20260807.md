@@ -25,28 +25,32 @@ Run to completion it is not a cliff.
 connection, one local temporary IDENTITY table, one `PreparedStatement`, 10 000
 autocommit `insert into test default values`. Phases are timed separately so
 the ~40 CPU-s VM-start + H2-class-load tax is not folded into the loop.
-`--Xmx 1g`, real-JDK 25, single-threaded, third rep (warm), Azure host at
-load 15-20:
+`--Xmx 1g`, real-JDK 25, single-threaded, third rep (warm), all four arms
+within one hour on an Azure host at load 8-16:
 
 | 10 000-row insert loop | time | µs/row | vs HotSpot C2 | vs HotSpot `-Xint` |
 | --- | --- | --- | --- | --- |
-| HotSpot 25, C2 | **74 ms** | 7.4 | 1× | 0.04× |
-| HotSpot 25, `-Xint` | **1 919 ms** | 192 | 26× | 1× |
-| CratonVM, JIT | **10 449 ms** | 1 045 | **141×** | **5.4×** |
-| CratonVM, `--nojit` | 16 615 ms | 1 661 | 223× | 8.7× |
+| HotSpot 25, C2 | **15.4 ms** | 1.5 | 1× | 0.013× |
+| HotSpot 25, `-Xint` | **1 208 ms** | 121 | 78× | 1× |
+| CratonVM, JIT | **8 565 ms** | 857 | **556×** | **7.1×** |
+| CratonVM, `--nojit` | **12 649 ms** | 1 265 | 821× | **10.5×** |
 
-So the workload is **5.4× slower than HotSpot's own interpreter** — inside, and
-at the good end of, the flat 9.9-10.7× band the UPDATE page measured across
-MERGE / UPDATE / SELECT / INSERT. There is no insert-specific pathology.
+The bottom row is the one to read first. **Interpreter against interpreter,
+INSERT is 10.5×** — dead centre of the flat 9.9-10.7× band the UPDATE page
+measured across MERGE / UPDATE / SELECT / INSERT. There is no insert-specific
+pathology; this workload is the band.
 
 What makes the ratio against a *default* HotSpot look like a cliff is the other
-column: **C2 is worth 26× on this shape** — a tight, hot, monomorphic loop
-around one prepared statement is close to the best case for a tiered JIT —
-while CratonVM's JIT recovers ~1.3-1.7× (unchanged from the UPDATE page's
-finding, and re-confirmed here: 10.4 s with the JIT against 16.6 s `--nojit`).
-The gap is JIT reach, not interpreter cost, and it is the same gap everywhere
-else. `~90×` and `~5×` were never two different phenomena; they were one
-phenomenon measured against two different HotSpot configurations.
+column: **C2 is worth 78× on this shape**. A tight, hot, monomorphic loop
+around one prepared statement is close to the best case for a tiered JIT, and
+CratonVM's JIT recovers **1.5×** of it (8.6 s against 12.6 s) — unchanged from
+the UPDATE page's 1.3-1.7×. The gap is JIT reach, not interpreter cost, and it
+is the same gap everywhere else. `~90×` and `~5×` were never two different
+phenomena; they were one phenomenon measured against two different HotSpot
+configurations, and the number moves with the host: the same four arms at load
+15-20 read 74 ms / 1 919 ms / 10 449 ms / 16 615 ms, i.e. 141× and 5.4×.
+**Quote the interpreter-against-interpreter ratio, not the C2 one** — it is the
+stable quantity.
 
 ## The suspected hot spots: all four answered, none of them it
 

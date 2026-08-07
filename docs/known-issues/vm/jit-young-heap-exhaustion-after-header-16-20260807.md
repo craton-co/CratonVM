@@ -23,7 +23,13 @@ inside ten minutes.
 | `6ba350cdd` — the merge | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 79 s** |
 | `6ba350cdd` + the two mark-word fixes on this branch | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 127 s** |
 | ... the same binary | default | **OOM 110 s** |
+| dev tip `70bf05ed3` + this branch | default | **OOM 63 s** |
+| dev tip `70bf05ed3` + this branch | `--nojit` | **PASS 190 s** |
 | HotSpot 25 | — | PASS 4 s |
+
+The last two rows are the same tree this record ships on, so the regression is
+current, not a snapshot: 190 s with the JIT off matches the first parent's
+174 s with it on, and turning the JIT on turns a pass into an OOM.
 
 Three things follow directly:
 

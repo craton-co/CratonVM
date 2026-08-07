@@ -159,18 +159,25 @@ rep, load 15-20:
 
 | 10 000-row insert loop | time | µs/row | vs C2 | vs `-Xint` |
 | --- | --- | --- | --- | --- |
-| HotSpot 25, C2 | 74 ms | 7.4 | 1x | 0.04x |
-| HotSpot 25, `-Xint` | 1 919 ms | 192 | 26x | 1x |
-| cratonvm, JIT | 10 449 ms | 1 045 | **141x** | **5.4x** |
-| cratonvm, `--nojit` | 16 615 ms | 1 661 | 223x | 8.7x |
+| HotSpot 25, C2 | 15.4 ms | 1.5 | 1x | 0.013x |
+| HotSpot 25, `-Xint` | 1 208 ms | 121 | 78x | 1x |
+| cratonvm, JIT | 8 565 ms | 857 | **556x** | **7.1x** |
+| cratonvm, `--nojit` | 12 649 ms | 1 265 | 821x | **10.5x** |
 
-5.4x against HotSpot's own interpreter is the good end of this page's flat
-9.9-10.7x band, so INSERT has no pathology of its own either. The 141x against
+**10.5x interpreter against interpreter** is dead centre of this page's flat
+9.9-10.7x band, so INSERT has no pathology of its own either. The 556x against
 a default HotSpot is the same two-halves story this page already tells, with
-the halves unusually lopsided: **C2 is worth 26x on this shape** (a tight,
-hot, monomorphic loop around one prepared statement is close to its best case)
-where cratonvm's JIT is worth 1.6x. That single number is why the insert page
-read its ratio as a distinct cliff.
+the halves unusually lopsided: **C2 is worth 78x on this shape** (a tight, hot,
+monomorphic loop around one prepared statement is close to its best case) where
+cratonvm's JIT is worth 1.5x. That single number is why the insert page read
+its ratio as a distinct cliff.
+
+It is also a warning about which ratio to quote. The same four arms taken on
+the same host at load 15-20 instead of 8-16 read 74 / 1 919 / 10 449 / 16 615
+ms — the C2 column moves from 556x to 141x while the `-Xint` column barely
+moves (10.5x to 8.7x). **HotSpot's C2 arm is the load-sensitive one**, because
+it is the only arm short enough for scheduler noise to dominate. Compare
+interpreters.
 
 **The profile is flat, which is the answer to "find the dominant cost".**
 `--stack-sample-ms 20 --nojit`, 887 samples over one 10 000-row loop,
