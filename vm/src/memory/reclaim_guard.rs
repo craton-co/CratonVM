@@ -88,7 +88,47 @@ pub(crate) fn report_reclaimed_receiver(
     target: &str,
     actual_cid: u32,
 ) -> bool {
-    let zero_header = actual_cid == 0;
+    report_reclaimed_receiver_inner(shared, addr, site, target, actual_cid, false)
+}
+
+/// The same verdict, with the free-list question asked REGARDLESS of what the
+/// header's class id says.
+///
+/// The `actual_cid == 0` gate on [`report_reclaimed_receiver`] exists because
+/// its callers include terminals that fire in bulk on a HEALTHY run, and the
+/// free-list question takes both heap locks. That gate is exactly wrong for a
+/// terminal that is *never* legitimate: a `clone()` dispatch that lands in
+/// `java.lang.Thread.clone` or `java.lang.Enum.clone` — bodies that consist of
+/// nothing but `throw new CloneNotSupportedException()` — is not something any
+/// program asked for, so it should pay for the full verdict on its first
+/// occurrence.
+///
+/// It also happens to be the case the gate cannot see. A prematurely freed
+/// block reads as `java.lang.Object` only until the allocator hands it out
+/// again; afterwards the stale reference sees a *valid* header of an unrelated
+/// class, `actual_cid != 0`, and the un-forced call skips both the free-list
+/// location and the `live_holders_of` scan — i.e. it goes quiet precisely on
+/// the RE-SERVED face, which is the one that reaches the reader as
+/// `Thread.clone` rather than as `ClassId(0)`.
+pub(crate) fn report_reclaimed_receiver_forced(
+    shared: &SharedVm,
+    addr: usize,
+    site: &'static str,
+    target: &str,
+    actual_cid: u32,
+) -> bool {
+    report_reclaimed_receiver_inner(shared, addr, site, target, actual_cid, true)
+}
+
+fn report_reclaimed_receiver_inner(
+    shared: &SharedVm,
+    addr: usize,
+    site: &'static str,
+    target: &str,
+    actual_cid: u32,
+    force: bool,
+) -> bool {
+    let zero_header = actual_cid == 0 || force;
     let mut verdict = false;
     if zero_header {
         if let Some((what, span, size)) = shared.mem.heap.reclaimed_hole_at(addr) {
@@ -248,6 +288,189 @@ pub(crate) fn report_reclaimed_receiver(
         }
     }
     verdict
+}
+
+/// The full verdict for a dispatch that PROVES its receiver is not the object
+/// the call site is holding.
+///
+/// Three sites qualify, and none of them is reachable from well-formed code:
+///
+/// * `java.lang.Thread.clone` and `java.lang.Enum.clone` — bodies that are
+///   `throw new CloneNotSupportedException()` and nothing else. javac will not
+///   compile a call to either (`Enum.clone` is `protected final`; nothing
+///   clones a Thread), so an arrival means virtual dispatch was driven by a
+///   receiver whose class is not the one the call site named;
+/// * an **array-typed call site with a non-array receiver** — the verifier
+///   guarantees the operand of `invokevirtual "[J".clone()` is a `[J`, so a
+///   receiver whose header says otherwise is a broken heap, full stop. This one
+///   fires one step EARLIER than the two above (before the target is chosen at
+///   all), which is what makes it independent of which wrong body the corrupt
+///   header happened to select.
+///
+/// Two defects produce these and this is what tells them apart:
+///
+/// * `receiver_kind=Array` — an array dispatched through its COMPONENT class
+///   id, the defect fixed 2026-07-31 (arrays carry the component class id in
+///   the header, so `someArray.m()` must be routed through `java/lang/Object`);
+/// * `receiver_kind=Object` with a concrete `receiver_class` — the receiver's
+///   block was reclaimed while still referenced and then RE-SERVED, so the
+///   header now describes whatever occupies it. This is the
+///   `ClassId(0)`-family's re-served face, and it is invisible to anything
+///   gated on a zero header.
+///
+/// Three questions get asked, and the second and third are what the earlier
+/// call-site-local version did not ask:
+///
+/// 1. the reclamation verdict, FORCED — see
+///    [`report_reclaimed_receiver_forced`] for why the `actual_cid == 0` gate
+///    is exactly wrong here;
+/// 2. the OWNING thread's root bookkeeping, unconditionally rather than only
+///    when the free-list verdict fired. Gating on that return value loses the
+///    re-served face, which is the one this terminal reports;
+/// 3. the interpreter frames, so the reader learns *which* call site handed
+///    over the bad receiver (`java/util/Arrays.copyOf` at the `original.clone()`
+///    bytecode, in the H2 witness) rather than only that one did.
+///
+/// Rate-limited as a whole: one impossible dispatch cascades into many once the
+/// caller retries, and the first few carry everything.
+pub(crate) fn report_impossible_dispatch_terminal(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    recv: cratonvm_types::ObjectRef,
+    site: &'static str,
+    target: &str,
+    pre_refresh: Option<cratonvm_types::ObjectRef>,
+) {
+    static R: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if R.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= MAX_REPORTS {
+        return;
+    }
+    let addr = recv.as_ptr() as usize;
+    let cid = shared.mem.heap.class_id_of(recv).as_u32();
+    // The raw header, because every competing explanation makes a different
+    // prediction about it: all-zero is the collector's own wipe, a plausible
+    // class id with `kind=Array` is the component-class-dispatch defect, and a
+    // plausible class id with `kind=Object` is a re-served block.
+    // SAFETY: `recv` is a live `ObjectRef` popped as this invoke's receiver;
+    // the interpreter has already read its class id and kind through the same
+    // header, one line above.
+    //
+    // All 24 bytes, not the first 16: `mark_word` sits at `MARK_WORD_OFFSET`
+    // (16) and it is where `is_forwarded` lives since the 2026-08-06 header
+    // shrink. A 16-byte dump stops exactly one field short of the bit that
+    // decides whether `load_and_forward` will redirect through this object —
+    // which is the question the pre-refresh line below exists to answer.
+    let header: [u8; 24] = unsafe { std::ptr::read(recv.as_ptr() as *const [u8; 24]) };
+    tracing::error!(
+        target: "cratonvm::gc::guard",
+        obj = format!("{addr:#x}"),
+        site = site,
+        target_method = %target,
+        receiver_kind = ?shared.mem.heap.kind_of(recv),
+        receiver_class_id = cid,
+        receiver_class = %class_name_of(shared, cid),
+        in_heap = shared.mem.heap.is_heap_addr(addr).is_some(),
+        // Which generation, asked unconditionally. `reclaimed_hole_at` answers
+        // only while the block is still FREE, so on the re-served face — the one
+        // this terminal exists for — it says nothing at all, and the log would
+        // otherwise not even record which half of the heap to look in.
+        in_young = shared.mem.heap.is_in_young_addr(addr),
+        header = format!("{header:02x?}"),
+        // The `ClassId(0)` family's own page closes with "if a ClassId(0)
+        // receiver reappears, reopen this page and check
+        // `object_degradation_count()` first" — the counter its 2026-08-06 root
+        // cause (a `SUB_OBJECT` slot the encoder minted and the decoder refused)
+        // increments. Nothing in the VM read it, so that instruction was not
+        // actionable on a real run; a relaxed load on an already-failed path is.
+        // Non-zero means live references degraded to `Value::Long` in this
+        // process and `scan_local_objects` skipped them.
+        object_degradations = cratonvm_types::compact_value::object_degradation_count(),
+        "clone() dispatched to a body that only ever throws \
+         CloneNotSupportedException. The receiver's header does not describe \
+         what the caller is holding — either an array dispatched through its \
+         COMPONENT class id, or a block that was reclaimed while still \
+         referenced and then re-served.",
+    );
+    // Did the invoke's own forwarding read barrier produce this receiver?
+    //
+    // `execute_invoke_kind` runs `load_and_forward` over every reference it
+    // pops, to repair a from-space address a moving collection left in a frame
+    // slot. That barrier trusts one bit of the source object's header
+    // (`is_forwarded`) and then a pointer word next to it. If a LIVE object's
+    // header carries a stale forwarded bit — never cleared when its memory was
+    // re-served — the barrier redirects a perfectly good reference to whatever
+    // that word names, and the target validation only checks that the
+    // destination *is* some live object, which a re-served block is.
+    //
+    // The two explanations make opposite predictions here and nothing else in
+    // this report separates them:
+    //
+    // * `pre == post` — the operand stack already held the wrong address, so
+    //   the loss is upstream: a root the collector did not remap (or freed).
+    // * `pre != post` — the stack held one address and the barrier handed back
+    //   another. Then the frames are innocent, which is exactly what
+    //   `holder=<not found in frames>` looks like from the outside, and the
+    //   forwarding word is the thing to distrust.
+    if let Some(pre) = pre_refresh {
+        let pre_addr = pre.as_ptr() as usize;
+        // SAFETY: same contract as the receiver header read above — `pre` was
+        // popped as this invoke's receiver and `load_and_forward` already
+        // dereferenced its header.
+        let pre_header: [u8; 24] = unsafe { std::ptr::read(pre.as_ptr() as *const [u8; 24]) };
+        let pre_cid = shared.mem.heap.class_id_of(pre).as_u32();
+        // The mark word AS THE BARRIER READ IT, versus what it says now. The
+        // barrier's whole decision is `mark & 0b11 == MARK_FORWARDED`, and the
+        // first witness had a source whose word read `MARK_NEUTRAL` by the time
+        // the report ran — so only the recorded value can say whether the
+        // barrier saw a genuine forwarding marker (and was handed a wrong
+        // target) or read a word that was never a forwarding marker at all.
+        let (b_src, b_mark, b_dst) = last_barrier_rewrite().unwrap_or((0, 0, 0));
+        // SAFETY: `pre` is a live heap object (`load_and_forward` validated the
+        // address); `MARK_WORD_OFFSET` is inside its header by construction.
+        let mark_now: u64 = unsafe {
+            std::ptr::read(pre.as_ptr().add(cratonvm_types::MARK_WORD_OFFSET) as *const u64)
+        };
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            pre_refresh_obj = format!("{pre_addr:#x}"),
+            barrier_rewrote = pre_addr != addr,
+            barrier_src = format!("{b_src:#x}"),
+            barrier_mark_at_read = format!("{b_mark:#x}"),
+            barrier_mark_state = b_mark & cratonvm_types::MARK_STATE_MASK,
+            barrier_dst = format!("{b_dst:#x}"),
+            pre_mark_now = format!("{mark_now:#x}"),
+            pre_refresh_kind = ?shared.mem.heap.kind_of(pre),
+            pre_refresh_class = %class_name_of(shared, pre_cid),
+            pre_refresh_header = format!("{pre_header:02x?}"),
+            "…and this is the receiver as the OPERAND STACK handed it over, \
+             before `load_and_forward`. `barrier_rewrote=true` means the frame \
+             was holding a different address and the invoke's forwarding read \
+             barrier replaced it — the stale forwarding word is then the \
+             suspect, not the root scan.",
+        );
+    }
+    report_reclaimed_receiver_forced(shared, addr, site, target, cid);
+    report_root_slice_provenance(shared, thread, addr, site);
+    if let Some(pre) = pre_refresh {
+        let pre_addr = pre.as_ptr() as usize;
+        if pre_addr != addr {
+            // The pre-barrier address is the one the frames should still hold,
+            // so run the same provenance question against it too.
+            report_root_slice_provenance(shared, thread, pre_addr, "pre-refresh receiver");
+        }
+    }
+    for (i, f) in thread.frames.iter().enumerate().rev().take(12) {
+        tracing::error!(
+            target: "cratonvm::gc::guard",
+            obj = format!("{addr:#x}"),
+            site = site,
+            frame = i,
+            at = format!("{}.{}{} @pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc),
+            "…frame",
+        );
+    }
 }
 
 /// Walk a thread's interpreter frames and report any object slot that now
@@ -491,6 +714,19 @@ pub(crate) fn report_root_slice_provenance(
 }
 
 thread_local! {
+    /// The last time this thread's invoke forwarding read barrier actually
+    /// CHANGED a reference: `(source, mark word the barrier read, destination)`.
+    ///
+    /// The barrier's decision is a single relaxed load of the source object's
+    /// mark word, and by the time any reader-side reporter looks at that object
+    /// the word can already say something else. The 2026-08-07 `TestTempTables`
+    /// witness is exactly that shape: the barrier redirected a live `long[1]` to
+    /// an old-gen `java.lang.Thread`, and a millisecond later the same source
+    /// header read `MARK_NEUTRAL` — so "was the source really forwarded?" is not
+    /// answerable after the fact and has to be recorded AT the decision.
+    static LAST_BARRIER_REWRITE: std::cell::Cell<Option<(usize, u64, usize)>> =
+        const { std::cell::Cell::new(None) };
+
     /// Collection count at this thread's last root-snapshot publish, and the
     /// top frame's pc at that moment.
     ///
@@ -505,6 +741,18 @@ thread_local! {
     /// hook fires on object-RETURNING native calls, so nothing between
     /// `new` and the failing `put` necessarily republishes.
     static LAST_PUBLISH: std::cell::Cell<(u64, u32)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+}
+
+/// Record that the invoke forwarding read barrier rewrote a reference, with the
+/// mark word it based that on. One `Cell` store, on a path that already loaded
+/// the word — see [`LAST_BARRIER_REWRITE`].
+pub(crate) fn note_barrier_rewrite(src: usize, mark_at_read: u64, dst: usize) {
+    LAST_BARRIER_REWRITE.with(|c| c.set(Some((src, mark_at_read, dst))));
+}
+
+/// The last barrier rewrite this thread performed, if any.
+pub(crate) fn last_barrier_rewrite() -> Option<(usize, u64, usize)> {
+    LAST_BARRIER_REWRITE.with(std::cell::Cell::get)
 }
 
 /// Stamp the current collection count and top-frame pc as this thread's last

@@ -1645,7 +1645,15 @@ unsafe fn virtual_dispatch_target_for_receiver(
     receiver: ObjectRef,
     info: &JitInvokeInfo,
 ) -> VirtualDispatchTarget {
-    if vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+    // An array-typed call site resolves against `java.lang.Object`'s method
+    // table by JVMS §4.4.1, whatever the receiver's header says — decide it from
+    // the SITE, above the header check below. See the matching comment in
+    // `runtime::interpreter::invoke`'s `execute_invoke_kind`: the header-driven
+    // form is correct only while the header is trustworthy, and a
+    // reclaimed-and-re-served block's is not.
+    if info.class_name.starts_with('[')
+        || vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array
+    {
         return VirtualDispatchTarget {
             class_name: std::sync::Arc::from("java/lang/Object"),
             cacheable_receiver: false,
@@ -2174,7 +2182,16 @@ unsafe fn virtual_dispatch_target_cached(
     // KC26: array receivers store their COMPONENT class id in the header, so
     // the `(site, class id)` key cannot tell `X[]` from `X`. Resolve them
     // directly — array classes inherit Object's method table (JVMS §4.4.1).
-    if vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+    //
+    // An array-typed call SITE gets the same answer without asking the header
+    // at all, which is the form that survives a header that lies: a block
+    // reclaimed while still referenced and then re-served reads back as a
+    // perfectly ordinary object of whatever now occupies it, and the
+    // receiver-driven form would then resolve `"[J".clone()` against that
+    // occupant's class.
+    if info.class_name.starts_with('[')
+        || vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array
+    {
         return CachedDispatchTarget {
             class_name: std::rc::Rc::from("java/lang/Object"),
             cacheable_receiver: false,
