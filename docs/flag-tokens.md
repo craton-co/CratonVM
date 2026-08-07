@@ -59,13 +59,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-418 tokens.
+419 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `a2` | `CRATONVM_DBG_A2` |
 | `sweep-liveness` | `CRATONVM_DBG_SWEEP_LIVENESS` |
 | `callee-deopt` | `CRATONVM_DBG_CALLEE_DEOPT` |
+| `layout-alias` | `CRATONVM_DBG_LAYOUT_ALIAS` |
 | `check-override` | `CRATONVM_DBG_CHECK_OVERRIDE` |
 | `direct-memory` | `CRATONVM_DBG_DM` |
 | `dupx-trace` | `CRATONVM_DBG_DUPX_TRACE` |
@@ -659,13 +660,14 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-36 tokens.
+37 tokens.
 
 | Token | Expands to |
 | --- | --- |
 | `card-metrics` | `CRATONVM_GC_CARD_METRICS` |
 | `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
 | `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
+| `pack-fields-by-width` | `CRATONVM_PACK_FIELDS_BY_WIDTH` |
 | `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
 | `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
