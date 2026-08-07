@@ -2033,7 +2033,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 "com/sun/management/HotSpotDiagnosticMXBean" => None,
                 _ => None,
             };
-            Ok(Some(Value::Object(bean)))
+            Ok(Some(Value::Object(bean.transpose()?)))
         },
     );
 
@@ -5215,11 +5215,12 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
             }
             let thread = ctx.enumerate_threads(usize::MAX).into_iter().find(|thread| {
                 matches!(ctx.get_field_by_name(*thread, "tid"), Value::Long(id) if id == thread_id)
-            })?;
-            Ok(Some(Value::Object(thread.and_then(|thread| {
-                ctx.thread_jmx_snapshot(thread)
-                    .map(|snapshot| alloc_snapshot_thread_info(ctx, snapshot))
-            }))))
+            });
+            let info = match thread.and_then(|thread| ctx.thread_jmx_snapshot(thread)) {
+                Some(snapshot) => Some(alloc_snapshot_thread_info(ctx, snapshot)?),
+                None => None,
+            };
+            Ok(Some(Value::Object(info)))
         },
     );
     // REAL: one ThreadInfo per requested id. All four overloads share
