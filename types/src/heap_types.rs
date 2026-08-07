@@ -225,6 +225,48 @@ pub const MAX_SEQUENTIAL_CLASS_ID: u32 = u32::MAX;
 // pinned at test time rather than compile time (see
 // `autobox_class_id_is_reserved` in the tests module below).
 
+/// Byte offset of an array's **data area** from the object base.
+///
+/// Equal to [`HEADER_SIZE`] today, and deliberately a separate name anyway.
+///
+/// `HEADER_SIZE` currently means two different things across its ~860 call
+/// sites: "where an object's instance fields start" and "where an array's
+/// elements start". They are the same integer, so **the source does not record
+/// which site means which** — and the 24 → 16 shrink needs them to differ. A
+/// 16-byte header cannot hold a 31-bit array length (see
+/// `arch-2026-07-26/header-16-and-field-packing-20260806.md` §2: `class_id`
+/// (32) + length (31) + `kind`/`element_type`/`gc_age`/`gc_flags` (13) is 76
+/// bits, while `AtomicU64` alignment leaves only 64 ahead of the mark word), so
+/// the length has to move into an 8-byte prefix at the head of the array's
+/// body: objects 16, array data still at 24.
+///
+/// Migrating array sites to this name while the two constants are still equal
+/// is a no-op refactor by construction, which is the point — it separates the
+/// *classification*, which needs review and can be silently wrong, from the
+/// flip, which is one line.
+///
+/// # This constant cannot be tested while it equals `HEADER_SIZE`
+///
+/// A suite that passes with `ARRAY_DATA_OFFSET == HEADER_SIZE` says nothing
+/// about whether the classification is right: every site reads the same number
+/// either way. That is the shape of a guard that cannot fail. Before trusting
+/// the migration, build once with this set to a deliberately absurd value (64)
+/// and run the suite — every array site that should have been migrated and was
+/// not then reads 40 bytes off its own array and fails loudly.
+pub const ARRAY_DATA_OFFSET: usize = HEADER_SIZE;
+
+// The data area must begin at or after the header's end and stay on the 8-byte
+// object grid, and it is emitted as a signed disp8 against the object base for
+// exactly the same reason `HEADER_SIZE` is (see that assert above).
+const _: () = assert!(
+    ARRAY_DATA_OFFSET >= HEADER_SIZE && ARRAY_DATA_OFFSET % 8 == 0,
+    "ARRAY_DATA_OFFSET must sit at or past the header end, on the 8-byte grid"
+);
+const _: () = assert!(
+    ARRAY_DATA_OFFSET <= 127,
+    "ARRAY_DATA_OFFSET must fit a signed disp8 for JIT array element access"
+);
+
 /// Byte offset of the array-length/object-shape word.
 pub const ARRAY_LENGTH_OFFSET: usize = 12;
 pub const NUM_SLOTS_OFFSET: usize = 12;

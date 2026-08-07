@@ -27,7 +27,7 @@ use parking_lot::Mutex;
 
 use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_COMPACT, GC_FLAG_MARKED,
-    GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
+    ARRAY_DATA_OFFSET, GC_FLAG_OLD_GEN, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
@@ -867,7 +867,7 @@ impl ConcurrentMarker {
                 // Reference array: compact 8-byte pointer per element.
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, offset is within the allocated array object.
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let slot_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     // SAFETY: slot_ptr points to a valid 8-byte reference element in the array.
                     let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                     if raw != 0 {

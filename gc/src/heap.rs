@@ -50,7 +50,8 @@ use crate::gc_flags;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 pub use cratonvm_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
+    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    ARRAY_ELEMENT_TYPE_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
     HEADER_SIZE, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };

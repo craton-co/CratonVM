@@ -1248,7 +1248,7 @@ pub fn verify_heap_object_fields(
 ) {
     use crate::types::Value;
     use cratonvm_types::{
-        ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+        ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE,
     };
 
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
@@ -1335,7 +1335,7 @@ pub fn verify_heap_object_fields(
             // Reference array (Object[]): elements are 8-byte compact pointers.
             let len = hdr.array_length() as usize;
             for i in 0..len {
-                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * ref_element_size()) };
+                let s_ptr = unsafe { (ptr as *const u8).add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                 let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
                     eprintln!(

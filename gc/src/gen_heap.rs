@@ -41,7 +41,8 @@ use crate::gc::GcResult;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, read_prim_element,
     write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
-    AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, OBJECT_KIND_OFFSET,
+    ARRAY_DATA_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    OBJECT_KIND_OFFSET,
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
@@ -6129,7 +6130,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * ref_element_size())
+                        .add(ARRAY_DATA_OFFSET + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
@@ -7863,7 +7864,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * ref_element_size())
+                        .add(ARRAY_DATA_OFFSET + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
@@ -13268,7 +13269,7 @@ impl GenerationalHeap {
                     let elems = (header.array_length() as usize).min(max_elems);
                     for i in 0..elems {
                         // SAFETY: `i` < capped element count; offset within array data region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                        let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                         let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
@@ -13881,7 +13882,7 @@ fn seedhunt_scan_obj(
     } else if h.kind == ObjectKind::Array && h.element_type == ArrayElementType::Reference {
         for i in 0..h.array_length() as usize {
             // SAFETY: `i < array_length`; offset stays within the array data.
-            let sp = unsafe { optr.add(HEADER_SIZE + i * ref_element_size()) };
+            let sp = unsafe { optr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
             let raw = unsafe { read_ref_slot(sp) } as usize;
             if raw != 0 && raw < 0x1000 {
                 count += 1;
@@ -15390,7 +15391,7 @@ pub(crate) unsafe fn for_each_ref_slot(
             // of slots into unmapped memory.
             let elems = (header.array_length() as usize).min(1 << 24);
             for i in 0..elems {
-                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let s = obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size());
                 let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     f(raw as usize as *mut u8, i);
@@ -15466,7 +15467,7 @@ pub(crate) unsafe fn forward_ref_slots(
             // HIB-DCAST-LATEPHASE.1: see the matching cap in `for_each_ref_slot`.
             let elems = (header.array_length() as usize).min(1 << 24);
             for i in 0..elems {
-                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let s = obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size());
                 let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {

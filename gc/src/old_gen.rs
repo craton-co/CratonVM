@@ -33,7 +33,8 @@ use std::collections::HashMap;
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_MARKED, HEADER_SIZE,
+    ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_MARKED,
+    HEADER_SIZE,
     OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
@@ -1374,7 +1375,7 @@ impl OldGen {
                 let max_elems = body_bytes / ref_element_size();
                 let elems = (array_length as usize).min(max_elems);
                 for i in 0..elems {
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let slot = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     let raw: u64 = unsafe { read_ref_slot(slot) };
                     if raw != 0 {
                         let ref_ptr = raw as usize;

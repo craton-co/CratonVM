@@ -79,7 +79,8 @@ pub use handle::{HandleScope, HandleStorage, RootedHandle};
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
+    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    ARRAY_ELEMENT_TYPE_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
     GC_AGE_OFFSET, GC_FLAGS_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
@@ -221,8 +222,23 @@ mod tests {
              load; same failure mode as HEADER_SIZE above"
         );
         assert!(ARRAY_LENGTH_OFFSET > 0);
-        assert!(ARRAY_LENGTH_OFFSET + 4 <= HEADER_SIZE);
+        // The length word bounds against the *data* offset, not the header
+        // size. They are the same today; they stop being the same at
+        // HEADER_SIZE = 16, where the length moves into an 8-byte prefix at the
+        // head of the array's body and only `ARRAY_DATA_OFFSET` still sits past
+        // it. Stating it against `HEADER_SIZE` would make this assert fail on a
+        // correct layout, which is the wrong way for an invariant to break.
+        assert!(ARRAY_LENGTH_OFFSET + 4 <= ARRAY_DATA_OFFSET);
         assert!(IDENTITY_HASH_CODE_OFFSET + 4 <= HEADER_SIZE);
+        assert!(
+            ARRAY_DATA_OFFSET >= HEADER_SIZE && ARRAY_DATA_OFFSET % 8 == 0,
+            "array data starts at or past the header end, on the 8-byte grid"
+        );
+        assert!(
+            ARRAY_DATA_OFFSET <= 127,
+            "ARRAY_DATA_OFFSET is the signed disp8 of the JIT's array element \
+             addressing; same failure mode as HEADER_SIZE above"
+        );
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
         assert_eq!(OBJECT_KIND_OFFSET, 4);
