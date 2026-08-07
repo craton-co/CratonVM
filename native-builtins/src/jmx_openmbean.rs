@@ -528,7 +528,7 @@ pub(crate) fn build_method_mirror(
             declaring_class_id,
             exceptions: Vec::new(),
         };
-        return Ok(crate::lang_class::create_method_object(ctx, &meta));
+        return Ok(crate::lang_class::create_method_object(ctx, &meta)?);
     }
     // Fallback when we can't resolve the declaring class id — fill in only
     // the JDK-named fields we can. Method.invoke will still error, but the

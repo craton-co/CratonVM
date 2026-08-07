@@ -3180,7 +3180,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Object(Some(build_real_layout_string_hashset(
                 ctx, &keys,
-            )))))
+            )?))))
         },
     );
 

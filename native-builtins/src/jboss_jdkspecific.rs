@@ -348,9 +348,9 @@ fn build_boot_layer(
 /// just on `HashSet` instead of `Module`. The real-layout helper builds an
 /// actual `HashMap` with real `HashMap$Node` buckets, so unforced real
 /// bytecode reads it correctly with no detection/adaptation needed.
-fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRef {
+fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> Result<ObjectRef, MethodCallFailed> {
     let keys: Vec<ObjectRef> = packages.iter().map(|pkg| ctx.create_string(pkg)).collect();
-    crate::build_real_layout_string_hashset(ctx, &keys)
+    Ok(crate::build_real_layout_string_hashset(ctx, &keys)?)
 }
 
 /// The package set to record for `name` in `module_packages_table`.

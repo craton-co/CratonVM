@@ -1402,7 +1402,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                                     if let Some(meta) = ctx.declared_methods(child_declaring).into_iter().find(
                                         |meta| meta.name == name && meta.descriptor == descriptor,
                                     ) {
-                                        method = Some(crate::lang_class::create_method_object(ctx, &meta));
+                                        method = Some(crate::lang_class::create_method_object(ctx, &meta)?);
                                     }
                                 }
                             }

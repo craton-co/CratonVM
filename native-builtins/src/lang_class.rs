@@ -6631,7 +6631,7 @@ fn method_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 pub(crate) fn create_method_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let class_id = ctx
         .ensure_class_initialized("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
@@ -6877,7 +6877,7 @@ pub(crate) fn create_method_object(
     );
 
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 /// Read the CratonVM-specific raw descriptor extra slot from a Method object.
@@ -8981,7 +8981,7 @@ pub(crate) fn native_class_get_declared_methods(
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
         let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
-            Ok(create_method_object(ctx, visible[i]))
+            Ok(create_method_object(ctx, visible[i])?)
         })?;
         Ok(Some(Value::Object(Some(arr))))
     })();
@@ -9287,7 +9287,7 @@ fn wf_shim_synth_main_method(
         "synthesising no-op main(String[]) Method for {} (getDeclaredMethod / getMethod)",
         class_name
     );
-    Some(create_method_object(ctx, &meta))
+    Some(create_method_object(ctx, &meta)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -9432,7 +9432,7 @@ fn constructor_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 pub(crate) fn create_constructor_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let class_id = ctx
         .ensure_class_initialized("java/lang/reflect/Constructor")
         .unwrap_or(ClassId::new(0));
@@ -9551,7 +9551,7 @@ pub(crate) fn create_constructor_object(
     register_constructor_mirror_side(obj, &meta.descriptor, param_descs.len() as i32, false);
 
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 pub(crate) fn read_constructor_descriptor(
@@ -10156,7 +10156,7 @@ pub(crate) fn native_class_get_declared_constructors(
     // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
     let constructor_component = reflection_component_id(ctx, "java/lang/reflect/Constructor");
     let arr = build_mirror_array_comp(ctx, constructor_component, constructors.len(), |ctx, i| {
-        Ok(create_constructor_object(ctx, constructors[i]))
+        Ok(create_constructor_object(ctx, constructors[i])?)
     })?;
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -10269,7 +10269,7 @@ pub(crate) fn native_class_get_declared_constructor(
 fn collect_public_fields(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let mut metas: Vec<FieldMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut stack = vec![class_id];
@@ -10298,9 +10298,9 @@ fn collect_public_fields(
         }
     }
     let field_component = reflection_component_id(ctx, "java/lang/reflect/Field");
-    build_mirror_array_comp(ctx, field_component, metas.len(), |ctx, i| {
+    Ok(build_mirror_array_comp(ctx, field_component, metas.len(), |ctx, i| {
         Ok(create_field_object(ctx, &metas[i]))
-    })?
+    })?)
 }
 
 /// Collect all public methods from the class hierarchy.
@@ -10399,7 +10399,7 @@ fn collect_public_methods_from(
 fn collect_public_methods(
     ctx: &mut dyn NativeContext,
     class_id: cratonvm_types::ClassId,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let mut metas: Vec<MethodMetadata> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     // Class.getMethods() retains all public declarations of the most-specific
@@ -10472,9 +10472,9 @@ fn collect_public_methods(
     // GC-safety (2026-07-16): see `collect_public_fields`'s doc comment --
     // same fix, same residual-gap doc reference.
     let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
-    build_mirror_array_comp(ctx, method_component, metas.len(), |ctx, i| {
-        Ok(create_method_object(ctx, &metas[i]))
-    })?
+    Ok(build_mirror_array_comp(ctx, method_component, metas.len(), |ctx, i| {
+        Ok(create_method_object(ctx, &metas[i])?)
+    })?)
 }
 
 pub(crate) fn native_class_get_fields(
@@ -10867,7 +10867,7 @@ pub(crate) fn native_class_get_constructors(
 
     let constructor_component = reflection_component_id(ctx, "java/lang/reflect/Constructor");
     let arr = build_mirror_array_comp(ctx, constructor_component, public_ctors.len(), |ctx, i| {
-        Ok(create_constructor_object(ctx, public_ctors[i]))
+        Ok(create_constructor_object(ctx, public_ctors[i])?)
     })?;
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -11805,19 +11805,19 @@ fn ctx_annotation_proxy_elements(
     Ok(out)
 }
 
-fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> i32 {
+fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> Result<i32, MethodCallFailed> {
     match val {
-        Value::Int(i) => i,
-        Value::Long(l) => (l ^ (l >> 32)) as i32,
-        Value::Float(f) => f.to_bits() as i32,
+        Value::Int(i) => Ok(i),
+        Value::Long(l) => Ok((l ^ (l >> 32)) as i32),
+        Value::Float(f) => Ok(f.to_bits() as i32),
         Value::Double(d) => {
             let bits = d.to_bits() as i64;
-            (bits ^ (bits >> 32)) as i32
+            Ok((bits ^ (bits >> 32)) as i32)
         }
-        Value::Object(None) | Value::Uninitialized => 0,
+        Value::Object(None) | Value::Uninitialized => Ok(0),
         Value::Object(Some(obj)) => {
             if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-                return ctx_annotation_array_hash(ctx, obj);
+                return Ok(ctx_annotation_array_hash(ctx, obj));
             }
             let cname = ctx_class_name_of(ctx, obj);
             if ctx_wrapper_class_to_primitive(&cname).is_some() {
@@ -11826,19 +11826,19 @@ fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> i32 {
             }
             if cname == "java/lang/String" {
                 if let Some(s) = ctx.read_string(obj) {
-                    return ctx_java_string_hash(&s);
+                    return Ok(ctx_java_string_hash(&s));
                 }
             }
             if cname == "java/lang/annotation/AnnotationProxy" {
-                return ctx_annotation_proxy_hash_code(ctx, obj)?;
+                return Ok(ctx_annotation_proxy_hash_code(ctx, obj)?);
             }
             // Class mirror, Enum constant, and any other reference-typed
             // member hash via `value.hashCode()` вЂ” identity hash, matching
             // `annotation_value_hash` in vm_exec.rs (Class/Enum do not
             // override `Object.hashCode()`).
-            ctx.identity_hash_code(obj)
+            Ok(ctx.identity_hash_code(obj))
         }
-        _ => 0,
+        _ => Ok(0),
     }
 }
 
@@ -11861,7 +11861,7 @@ fn ctx_annotation_member_hash(ctx: &mut dyn NativeContext, name: &str, val: Valu
 
 /// Mirrors `annotation_proxy_hash_code` in vm_exec.rs.
 pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> Result<i32, MethodCallFailed> {
-    let elems = ctx_annotation_proxy_elements(ctx, proxy);
+    let elems = ctx_annotation_proxy_elements(ctx, proxy)?;
     let mut h: i32 = 0;
     for (name, val) in elems {
         h = h.wrapping_add(ctx_annotation_member_hash(ctx, &name, val));
@@ -11869,49 +11869,49 @@ pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy:
     Ok(h)
 }
 
-fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) -> bool {
+fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) -> Result<bool, MethodCallFailed> {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Long(x), Value::Long(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
-        (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
-        (Value::Object(None), Value::Object(None)) => true,
-        (Value::Object(None), _) | (_, Value::Object(None)) => false,
+        (Value::Int(x), Value::Int(y)) => Ok(x == y),
+        (Value::Long(x), Value::Long(y)) => Ok(x == y),
+        (Value::Float(x), Value::Float(y)) => Ok(x.to_bits() == y.to_bits()),
+        (Value::Double(x), Value::Double(y)) => Ok(x.to_bits() == y.to_bits()),
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
         (Value::Object(Some(x)), Value::Object(Some(y))) => {
             if x == y {
-                return true;
+                return Ok(true);
             }
             let xk = ctx.heap_kind_of(x);
             let yk = ctx.heap_kind_of(y);
             if xk == cratonvm_types::ObjectKind::Array || yk == cratonvm_types::ObjectKind::Array {
                 if xk != yk {
-                    return false;
+                    return Ok(false);
                 }
                 let nx = ctx.array_length(x);
                 let ny = ctx.array_length(y);
                 if nx != ny {
-                    return false;
+                    return Ok(false);
                 }
                 for i in 0..nx {
                     let av = ctx.get_array_element(x, i);
                     let bv = ctx.get_array_element(y, i);
                     if !ctx_annotation_values_equal(ctx, av, bv) {
-                        return false;
+                        return Ok(false);
                     }
                 }
-                return true;
+                return Ok(true);
             }
             let xname = ctx_class_name_of(ctx, x);
             let yname = ctx_class_name_of(ctx, y);
             if xname == "java/lang/annotation/AnnotationProxy"
                 && yname == "java/lang/annotation/AnnotationProxy"
             {
-                return ctx_annotation_proxy_equals(ctx, x, Value::Object(Some(y)))?;
+                return Ok(ctx_annotation_proxy_equals(ctx, x, Value::Object(Some(y)))?);
             }
             if xname == "java/lang/String" && yname == "java/lang/String" {
                 let sx = ctx.read_string(x).unwrap_or_default();
                 let sy = ctx.read_string(y).unwrap_or_default();
-                return sx == sy;
+                return Ok(sx == sy);
             }
             if xname == "java/lang/Class" && yname == "java/lang/Class" {
                 let xcid_field = ctx.get_field(x, 0);
@@ -11938,9 +11938,9 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
                     return sx == sy && xname == yname;
                 }
             }
-            x == y
+            Ok(x == y)
         }
-        _ => false,
+        _ => Ok(false),
     }
 }
 
@@ -11980,18 +11980,18 @@ pub(crate) fn ctx_annotation_proxy_equals(
     if a_desc != b_desc {
         return Ok(false);
     }
-    let a_elems = ctx_annotation_proxy_elements(ctx, a);
-    let b_elems = ctx_annotation_proxy_elements(ctx, other);
+    let a_elems = ctx_annotation_proxy_elements(ctx, a)?;
+    let b_elems = ctx_annotation_proxy_elements(ctx, other)?;
     if a_elems.len() != b_elems.len() {
-        return false;
+        return Ok(false);
     }
     for (name, av) in &a_elems {
         let bv = match b_elems.iter().find(|(n, _)| n == name) {
             Some((_, v)) => *v,
-            None => return false,
+            None => return Ok(false),
         };
         if !ctx_annotation_values_equal(ctx, *av, bv) {
-            return false;
+            return Ok(false);
         }
     }
     Ok(true)
@@ -12017,20 +12017,20 @@ fn ctx_java_string_escape(s: &str) -> String {
     out
 }
 
-fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> String {
+fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Result<String, MethodCallFailed> {
     match val {
-        Value::Object(None) => "null".to_string(),
-        Value::Int(i) => i.to_string(),
-        Value::Long(l) => l.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Double(d) => d.to_string(),
+        Value::Object(None) => Ok("null".to_string()),
+        Value::Int(i) => Ok(i.to_string()),
+        Value::Long(l) => Ok(l.to_string()),
+        Value::Float(f) => Ok(f.to_string()),
+        Value::Double(d) => Ok(d.to_string()),
         Value::Object(Some(obj)) => {
             if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-                return ctx_format_annotation_array(ctx, obj);
+                return Ok(ctx_format_annotation_array(ctx, obj));
             }
             let cname = ctx_class_name_of(ctx, obj);
             if cname == "java/lang/annotation/AnnotationProxy" {
-                return ctx_annotation_proxy_to_string(ctx, obj)?;
+                return Ok(ctx_annotation_proxy_to_string(ctx, obj)?);
             }
             if cname == "java/lang/String" {
                 if let Some(s) = ctx.read_string(obj) {
@@ -12043,7 +12043,7 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Strin
                         return format!("{}.class", cls_name.replace('/', "."));
                     }
                 }
-                return "<unknown>.class".to_string();
+                return Ok("<unknown>.class".to_string());
             }
             if let Some(prim_name) = ctx_wrapper_class_to_primitive(&cname) {
                 let inner = ctx.get_field(obj, 0);
@@ -12058,14 +12058,14 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Strin
             if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 0) {
                 if let Some(name) = ctx.read_string(name_ref) {
                     if !name.is_empty() {
-                        return name;
+                        return Ok(name);
                     }
                 }
             }
-            cname.replace('/', ".")
+            Ok(cname.replace('/', "."))
         }
-        Value::Uninitialized => "null".to_string(),
-        _ => "null".to_string(),
+        Value::Uninitialized => Ok("null".to_string()),
+        _ => Ok("null".to_string()),
     }
 }
 
@@ -12101,7 +12101,7 @@ pub(crate) fn ctx_annotation_proxy_to_string(
             desc.clone()
         };
     let dotted = class_name.replace('/', ".");
-    let mut elems = ctx_annotation_proxy_elements(ctx, proxy);
+    let mut elems = ctx_annotation_proxy_elements(ctx, proxy)?;
     elems.sort_by(|a, b| a.0.cmp(&b.0));
     let mut s = String::with_capacity(64);
     s.push('@');

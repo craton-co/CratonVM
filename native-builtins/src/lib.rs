@@ -30318,7 +30318,7 @@ fn convert_time_unit_to_millis(value: i64, ordinal: i32) -> i64 {
 pub(crate) fn build_real_layout_string_hashset(
     ctx: &mut dyn NativeContext,
     keys: &[ObjectRef],
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_types::ClassId;
 
     // Resolve real HashMap + HashMap$Node + HashSet field layout.
@@ -30426,7 +30426,7 @@ pub(crate) fn build_real_layout_string_hashset(
         let set_n_fields = (s_map + 1).max(ctx.class_num_total_fields(hashset_cid));
         let set = ctx.alloc_object(hashset_cid, set_n_fields);
         ctx.set_field(set, s_map, Value::Object(Some(map)));
-        return set;
+        return Ok(set);
     }
 
     // Fallback: legacy synthetic-2-field (data_array, size) layout used by
@@ -30438,7 +30438,7 @@ pub(crate) fn build_real_layout_string_hashset(
     }
     ctx.set_field(set, 0, Value::Object(Some(arr)));
     ctx.set_field(set, 1, Value::Int(keys.len() as i32));
-    set
+    Ok(set)
 }
 
 // ---------------------------------------------------------------------------
