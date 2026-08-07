@@ -254,13 +254,45 @@ fn module_packages_evict_if_needed(t: &mut std::collections::HashMap<i32, Vec<St
     }
 }
 
-/// Build a synthetic boot ModuleLayer with the real JDK collection fields
-/// initialized. Older code treated ModuleLayer as a one-slot synthetic object,
-/// but real JDK bytecode reads fields such as `parents` when defining child
-/// layers.
+/// Per-VM memo of THE boot `ModuleLayer` object, as a JNI-global-root handle
+/// (`NativeContext::add_global_root`) — never a raw `ObjectRef`, because this
+/// table outlives any number of collections and a global ref is the one root
+/// form the moving GC both keeps alive and remaps.
+///
+/// Keyed by `ctx.vm_identity()`: Rust tests build several `Vm`s in one process,
+/// and a process-global object cache goes stale across VM lifetimes.
+fn boot_layer_memo() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Build (or return) the synthetic boot ModuleLayer, with the real JDK
+/// collection fields initialized. Older code treated ModuleLayer as a one-slot
+/// synthetic object, but real JDK bytecode reads fields such as `parents` when
+/// defining child layers.
+///
+/// `ModuleLayer.boot()` is a singleton — `ModuleLayer.boot() ==
+/// ModuleLayer.boot()` and `someModule.getLayer() == ModuleLayer.boot()` are
+/// both spec'd identities, and JDK code compares layers with `==`. This used to
+/// allocate a FRESH layer on every call, so both comparisons were always false
+/// (measured: `regression-suite/src/RJdkModule.java:57` fails with "module must
+/// be in the boot layer" in real-jdk AND jdk-only, while HotSpot 25 passes).
+/// Memoise per VM instead.
 fn build_boot_layer(
     ctx: &mut dyn NativeContext,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let vm = ctx.vm_identity();
+    let mut memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = memo.get(&vm).copied() {
+        drop(memo);
+        if let Some(cached) = ctx.resolve_global_root(handle) {
+            return Ok(cached);
+        }
+        memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    }
+    drop(memo);
+
     let layer = alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT);
     let layer_pin = ctx.pin_native_root(layer);
 
@@ -278,6 +310,22 @@ fn build_boot_layer(
     ctx.set_field_by_name(layer, "modules", Value::Object(Some(modules)));
 
     ctx.unpin_native_roots(layer_pin);
+    // Publish. `new_initialized_object` above runs Java, so a re-entrant
+    // `ModuleLayer.boot()` could have published first; prefer whatever is
+    // already there so identity never changes under a caller that has one.
+    let mut memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = memo.get(&vm).copied() {
+        drop(memo);
+        if let Some(cached) = ctx.resolve_global_root(handle) {
+            return Ok(cached);
+        }
+        memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    }
+    let handle = ctx.add_global_root(layer);
+    if handle != 0 {
+        memo.insert(vm, handle);
+    }
+    drop(memo);
     Ok(layer)
 }
 

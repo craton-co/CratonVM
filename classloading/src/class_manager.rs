@@ -18044,6 +18044,39 @@ mod tests {
         assert!(mgr.cds_class_cache.get("cds/Missing").is_none());
     }
 
+    /// L16 — the descriptor split that keeps `ClassNotFoundException` and
+    /// `NoClassDefFoundError` apart at the `ClassLoader.loadClass` boundary.
+    ///
+    /// Every dimension must be stripped: `[[Lp/X;`'s element class is `p/X`,
+    /// not `[Lp/X;`, because §5.3.3 recurses through the inner array to the
+    /// same element. A primitive element has no element *class*, and a
+    /// non-array name is not an array descriptor at all — both `None`, so a
+    /// caller using this as a guard leaves those cases' behaviour unchanged.
+    #[test]
+    fn l16_array_descriptor_element_class_strips_every_dimension() {
+        // Reference arrays — the element class, at every rank.
+        assert_eq!(array_descriptor_element_class("[Lp/X;"), Some("p/X"));
+        assert_eq!(array_descriptor_element_class("[[Lp/X;"), Some("p/X"));
+        assert_eq!(array_descriptor_element_class("[[[Lp/X;"), Some("p/X"));
+        assert_eq!(
+            array_descriptor_element_class("[Lcom/cratonvm/absent/NoSuchClass20260731;"),
+            Some("com/cratonvm/absent/NoSuchClass20260731")
+        );
+
+        // Primitive elements have no element class.
+        assert_eq!(array_descriptor_element_class("[I"), None);
+        assert_eq!(array_descriptor_element_class("[[D"), None);
+
+        // Not an array descriptor at all.
+        assert_eq!(array_descriptor_element_class("java/lang/String"), None);
+        assert_eq!(array_descriptor_element_class("Lp/X;"), None);
+        assert_eq!(array_descriptor_element_class(""), None);
+
+        // Malformed: no trailing `;`, or an empty element name.
+        assert_eq!(array_descriptor_element_class("[Lp/X"), None);
+        assert_eq!(array_descriptor_element_class("[L;"), None);
+    }
+
     #[test]
     fn class_is_record_with_components() {
         let mut store = ClassStore::new();
@@ -19582,6 +19615,45 @@ fn note_bootstrap_appended_jar(path: &str) {
     for n in names {
         set.insert(n);
     }
+}
+
+/// The ELEMENT class of a reference-array descriptor, in internal/slash form.
+///
+/// `[Lp/X;` → `Some("p/X")`; `[[[Lp/X;` → `Some("p/X")` (every dimension is
+/// stripped, because §5.3.3 recurses through them to the same element class);
+/// `[I` / `[[D` → `None` (primitive element — there is no element *class* to
+/// load); a non-array name, or a malformed descriptor, → `None`.
+///
+/// Exists so a caller can tell the two failure shapes of array-class creation
+/// apart, which look identical at the `Err` boundary. JVMS §5.3.3 creates an
+/// array class *from* its element type — no `.class` file for the array itself
+/// is ever consulted — so an absent element means the **requested** thing is
+/// absent, not that a dependency of something already found is missing. The
+/// two must not be conflated:
+///
+/// * absent element → `ClassNotFoundException` (the request itself failed),
+/// * present element whose own supertype/interface is absent →
+///   `NoClassDefFoundError` naming that supertype (JVMS §5.3/§5.4).
+///
+/// Verified against HotSpot 25 on 2026-08-06:
+/// `Class.forName("[Lcom.cratonvm.absent.NoSuchClass;")` throws a bare
+/// `ClassNotFoundException` (cause `null`) — never a `NoClassDefFoundError`.
+/// Because `ClassNotFoundException` is a checked `Exception` and
+/// `NoClassDefFoundError` is an `Error`, a `catch (ClassNotFoundException)`
+/// does not catch the latter, so getting this wrong is not a cosmetic
+/// message difference — it escapes the caller's handler entirely.
+///
+/// See `docs/known-issues/jdk-only/L16-classnotfound-vs-noclassdeffound-shapes.md`.
+pub fn array_descriptor_element_class(descriptor: &str) -> Option<&str> {
+    let element = descriptor.trim_start_matches('[');
+    if element.len() == descriptor.len() {
+        // No leading `[` was stripped — not an array descriptor at all.
+        return None;
+    }
+    element
+        .strip_prefix('L')
+        .and_then(|inner| inner.strip_suffix(';'))
+        .filter(|inner| !inner.is_empty())
 }
 
 /// Whether `internal` (slash-form) names a class made loadable by a jar
