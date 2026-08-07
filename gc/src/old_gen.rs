@@ -919,7 +919,7 @@ impl OldGen {
                 break;
             }
             let raw_size = if kind == ObjectKind::Array {
-                HEADER_SIZE
+                ARRAY_DATA_OFFSET
                     + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
@@ -981,7 +981,7 @@ impl OldGen {
                 break;
             }
             let raw_size = if kind == ObjectKind::Array {
-                HEADER_SIZE
+                ARRAY_DATA_OFFSET
                     + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {

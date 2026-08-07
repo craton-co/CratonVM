@@ -60,7 +60,8 @@ use cratonvm_jit_api::npe_action;
 #[allow(unused_imports)]
 use cratonvm_types::narrow_oop::{narrow_base, narrow_oops_enabled};
 use cratonvm_types::{
-    ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
+    ARRAY_DATA_OFFSET, ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET,
+    FIELD_CELL_PAYLOAD64_OFFSET,
     FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use rustc_hash::{FxHashMap, FxHashSet};

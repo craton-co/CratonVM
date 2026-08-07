@@ -2093,7 +2093,7 @@ impl GenerationalHeap {
     ) -> ObjectRef {
         let data_size = array_data_size(length, element_type)
             .unwrap_or_else(|_| { eprintln!("FATAL: array data size overflow in gen_heap alloc_array (length={}, element_type={:?})", length, element_type); std::process::abort(); });
-        let total_size = HEADER_SIZE.checked_add(data_size).unwrap_or_else(|| {
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size).unwrap_or_else(|| {
             eprintln!(
                 "FATAL: array size overflow in gen_heap alloc_array (length={}, element_type={:?})",
                 length, element_type
@@ -2193,7 +2193,7 @@ impl GenerationalHeap {
         length: usize,
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let length_u32 = u32::try_from(length).ok()?;
 
         // Humongous path: skip young, allocate straight into old gen.
@@ -2355,7 +2355,7 @@ impl GenerationalHeap {
         length: usize,
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let length_u32 = u32::try_from(length).ok()?;
 
         // Humongous path: route straight to old gen so a single array
@@ -2470,7 +2470,7 @@ impl GenerationalHeap {
         // checked arithmetic just in case the validated path is ever
         // narrowed in a future refactor.
         let data_size = array_data_size(length_u32 as usize, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
 
         let mut header = ObjectHeader::new(
             class_id,
@@ -3159,7 +3159,7 @@ impl GenerationalHeap {
         // landing inside the victim array's real `array_length` field.
         let claimed_extent = if is_array {
             match array_data_size(header.array_length() as usize, header.element_type) {
-                Ok(data) => HEADER_SIZE.checked_add(data),
+                Ok(data) => ARRAY_DATA_OFFSET.checked_add(data),
                 Err(_) => None,
             }
         } else {
@@ -4000,7 +4000,7 @@ impl GenerationalHeap {
         // buffer `out` is freshly allocated with the same length. The regions do
         // not overlap because `out` is on the Rust heap, not in the GC arena.
         unsafe {
-            let src = obj_ref.as_ptr().add(HEADER_SIZE);
+            let src = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 2);
         }
         out
@@ -4015,7 +4015,7 @@ impl GenerationalHeap {
         // `HEADER_SIZE` plus the data region, so advancing by `HEADER_SIZE`
         // yields a pointer within the allocation. Caller is responsible for
         // bounds and element-type correctness.
-        unsafe { obj_ref.as_ptr().add(HEADER_SIZE) }
+        unsafe { obj_ref.as_ptr().add(ARRAY_DATA_OFFSET) }
     }
 
     /// Get an array element at the given index.
@@ -4031,7 +4031,7 @@ impl GenerationalHeap {
         // was allocated with sufficient data space for all elements after the header.
         // `read_prim_element` reads the correctly typed element at the given index.
         unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             Ok(read_prim_element(base, index, header.element_type))
         }
     }
@@ -4051,7 +4051,7 @@ impl GenerationalHeap {
         // SAFETY: Bounds check above guarantees `index < array_length`. The array
         // data region is within the allocation.
         let value = unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             read_prim_element(base, index, header.element_type)
         };
         if header.element_type == ArrayElementType::Reference {
@@ -4151,7 +4151,7 @@ impl GenerationalHeap {
         // correct element offset. For reference arrays, autobox wrappers are
         // allocated on this heap and thus valid.
         unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             // Compact ref arrays only store 8-byte pointers. If a non-Object
             // value is written (e.g. Value::Int from a native collection),
             // auto-box it into a 1-field wrapper object.
@@ -15161,7 +15161,7 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
     }
     let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 warn_corrupt_array_header(header);
                 0
@@ -16279,7 +16279,7 @@ mod tests {
             10,
             0,
         );
-        assert_eq!(gen_object_total_size(&arr), HEADER_SIZE + 10 * 4);
+        assert_eq!(gen_object_total_size(&arr), ARRAY_DATA_OFFSET + 10 * 4);
 
         // The `num_slots` cap still re-syncs the walker.
         let mut huge = ObjectHeader::new(

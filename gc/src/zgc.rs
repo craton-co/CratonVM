@@ -79,7 +79,7 @@ use crate::collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 use crate::gc::{GcResult, GcStats};
 use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
-    ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
+    ObjectKind, GC_FLAG_MARKED, ARRAY_DATA_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -1633,7 +1633,7 @@ impl ZgcRealHeap {
             return None;
         }
         let data_size = array_data_size(length, element_type).ok()?;
-        let total = HEADER_SIZE.checked_add(data_size)?;
+        let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let ptr = self.alloc_raw(total)?;
         let len_u32 = u32::try_from(length).ok()?;
         let header = ObjectHeader::new(
@@ -1760,7 +1760,7 @@ impl ZgcRealHeap {
             ObjectKind::Array => {
                 let data =
                     array_data_size(header.array_length() as usize, header.element_type).unwrap_or(0);
-                HEADER_SIZE + data
+                ARRAY_DATA_OFFSET + data
             }
         }
     }
@@ -1831,7 +1831,7 @@ impl ZgcRealHeap {
                     let len = header.array_length() as usize;
                     // SAFETY: data area begins at base + HEADER_SIZE; each ref
                     // element is REF_ELEMENT_SIZE and `i < len`.
-                    let data = unsafe { base.add(HEADER_SIZE) };
+                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
                     for i in 0..len {
                         let val =
                             unsafe { read_prim_element(data, i, ArrayElementType::Reference) };
@@ -2126,7 +2126,7 @@ impl GarbageCollector for ZgcRealHeap {
         }
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         let val = unsafe {
-            let base = obj.as_ptr().add(HEADER_SIZE);
+            let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
             read_prim_element(base, index, header.element_type)
         };
         Ok(val)
@@ -2143,7 +2143,7 @@ impl GarbageCollector for ZgcRealHeap {
         let element_type = header.element_type;
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         unsafe {
-            let base = obj.as_ptr().add(HEADER_SIZE);
+            let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
             if element_type == ArrayElementType::Reference {
                 match value {
                     Value::Object(_) => {

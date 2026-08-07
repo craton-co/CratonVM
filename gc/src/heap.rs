@@ -575,7 +575,7 @@ impl Heap {
             return None;
         }
         let data_size = array_data_size_checked(length, element_type)?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         // See `alloc_zeroed` for the NUMA hint rationale.
         let _node = self.refresh_numa_hint();
         let mut from = self.from_space.lock();
@@ -814,7 +814,7 @@ impl Heap {
         // `base + index * element_byte_size(et)`, which is within the
         // allocated data area of size `array_data_size(length, et)`.
         unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             Ok(read_prim_element(base, index, header.element_type))
         }
     }
@@ -839,7 +839,7 @@ impl Heap {
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
         let value = unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             read_prim_element(base, index, header.element_type)
         };
         if header.element_type == ArrayElementType::Reference {
@@ -928,7 +928,7 @@ impl Heap {
         // For reference arrays, non-Object values are auto-boxed into wrapper
         // objects allocated on this heap before being stored.
         unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             // Compact ref arrays only store 8-byte pointers. If a non-Object
             // value is written (e.g. Value::Int from a native collection),
             // auto-box it into a 1-field wrapper object.
@@ -1293,7 +1293,7 @@ impl Heap {
             return None;
         }
         let data_size = array_data_size_checked(length, element_type)?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let ptr = self.try_alloc_zeroed(total_size)?;
 
         let header = ObjectHeader::new(

@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::JitInvokeInfo;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value, ARRAY_DATA_OFFSET};
 
 #[test]
 fn gc_inert_selfrec_accepts_forward_field_walk_and_rejects_gc_edges() {
@@ -5738,7 +5738,7 @@ fn bulk_zero_byte_fill_executes_range_and_skips_empty_null_range() {
     // plus eight data bytes.
     unsafe {
         (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
-        std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 7, byte_len);
     }
 
     // SAFETY: the compiled method receives a correctly laid out live array.
@@ -5749,7 +5749,7 @@ fn bulk_zero_byte_fill_executes_range_and_skips_empty_null_range() {
     };
     assert_eq!(result, 6);
     // SAFETY: the eight-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     assert_eq!(data, &[7, 7, 0, 0, 0, 0, 7, 7]);
 
     // An empty range does not dereference the array, even when it is null.
@@ -5850,7 +5850,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     };
     assert_eq!(result, 9);
     // SAFETY: the eight-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
 
     // A bound beyond the array conservatively takes the scalar path. This
@@ -5858,7 +5858,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     // completes normally and demonstrates that guard failure preserves
     // the bytecode's exact store sequence.
     unsafe {
-        std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 0, byte_len);
+        std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 0, byte_len);
     }
     // SAFETY: the array is live and every reached strided index is valid.
     let conservative = unsafe {
@@ -5868,7 +5868,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     };
     assert_eq!(conservative, 9);
     // SAFETY: the eight-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
 
     // Empty ranges retain Java's condition-before-array-access behavior.
@@ -5949,7 +5949,7 @@ fn detects_and_executes_canonical_byte_sieve_loop_nest() {
     // SAFETY: `words` is aligned and contains the VM header plus data.
     unsafe {
         (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
-        std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 7, byte_len);
     }
     // SAFETY: the compiled method receives a correctly laid out live array.
     let count = unsafe {
@@ -5959,7 +5959,7 @@ fn detects_and_executes_canonical_byte_sieve_loop_nest() {
     };
     assert_eq!(count, 11);
     // SAFETY: the 32-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     for prime in [2usize, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31] {
         assert_eq!(data[prime], 0, "{prime} must remain prime");
     }

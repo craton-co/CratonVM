@@ -1014,7 +1014,7 @@ pub(crate) fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option
         tag if tag == ObjectKind::Array as u8 => {
             let element_type = array_element_type_from_tag(snapshot.element_tag)?;
             let data_size = array_data_size(snapshot.array_length() as usize, element_type).ok()?;
-            HEADER_SIZE.checked_add(data_size)
+            ARRAY_DATA_OFFSET.checked_add(data_size)
         }
         tag if tag == ObjectKind::Object as u8 => {
             let known_flags = GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT;

@@ -31,7 +31,7 @@ use crate::gc::{GcResult, GcStats};
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_OLD_GEN, ARRAY_DATA_OFFSET, HEADER_SIZE,
     OBJECT_KIND_OFFSET, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
@@ -4443,7 +4443,7 @@ impl G1Collector {
         header: &ObjectHeader,
         out: &mut Vec<(usize, usize)>,
     ) {
-        let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
+        let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
                 for k in 0..header.array_length() as usize {
@@ -4551,7 +4551,7 @@ impl G1Collector {
                     break;
                 }
 
-                let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
+                let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
                 if header.kind == ObjectKind::Array {
                     if header.element_type == ArrayElementType::Reference {
                         for k in 0..header.array_length() as usize {
@@ -4741,7 +4741,7 @@ impl G1Collector {
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
                     break;
                 }
-                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
+                let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
                 if header.kind == ObjectKind::Array {
                     if header.element_type == ArrayElementType::Reference {
                         for k in 0..header.array_length() as usize {
@@ -4841,7 +4841,7 @@ impl G1Collector {
                 if sz < HEADER_SIZE || off + sz > cursor {
                     break;
                 }
-                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
+                let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
                 if header.kind == ObjectKind::Array {
                     if header.element_type == ArrayElementType::Reference {
                         for k in 0..header.array_length() as usize {
@@ -4962,7 +4962,7 @@ impl G1Collector {
             let header = unsafe { &*(addr as *const ObjectHeader) };
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
-                    let data = unsafe { (addr as *const u8).add(HEADER_SIZE) };
+                    let data = unsafe { (addr as *const u8).add(ARRAY_DATA_OFFSET) };
                     for k in 0..header.array_length() as usize {
                         let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
                         check_push(raw, addr, "array-elem", k, &mut stack, &mut seen, &mut bad);
@@ -4997,7 +4997,7 @@ impl G1Collector {
                 rseen.insert(addr);
                 while let Some(a) = rstack.pop() {
                     let h = unsafe { &*(a as *const ObjectHeader) };
-                    let data = unsafe { (a as *const u8).add(HEADER_SIZE) };
+                    let data = unsafe { (a as *const u8).add(ARRAY_DATA_OFFSET) };
                     if h.kind == ObjectKind::Array {
                         if h.element_type == ArrayElementType::Reference {
                             for k in 0..h.array_length() as usize {
@@ -5601,6 +5601,22 @@ impl G1Collector {
                 _ => None,
             }
         };
+        // UNRESOLVED FORK, blocking HEADER_SIZE = 16.
+        //
+        // `read_ref`/`read_value` below are shared between the array walk (which
+        // passes element offsets) and the object walk (which passes compact
+        // field offsets), so at 16 bytes this base has to become
+        // ARRAY_DATA_OFFSET for one caller and HEADER_SIZE for the other. Both
+        // shapes of that change -- `header.payload_offset()` in the closure, and
+        // a `payload_base` hoisted out of it -- were tried on 2026-08-07 and
+        // both left `cargo test -p cratonvm-gc --lib` timing out at 500s.
+        //
+        // That is NOT established as cause: the same suite also hung and also
+        // failed `parallel_matches_serial_no_loss_or_dup` on runs with this code
+        // untouched (6 runs: hang / 979 pass / hang / 978+1 / hang / hang), so
+        // the g1 parallel set is unstable here independently and cannot serve as
+        // the control. Left at HEADER_SIZE -- correct today, since the two
+        // constants are equal -- until that instability is separated out.
         // Read an 8-byte ref word at logical payload offset `payload_off`.
         let read_ref = |payload_off: usize| -> u64 {
             if let Some((start, total_payload)) = humongous_start {
@@ -6909,7 +6925,7 @@ impl G1Collector {
         length: usize,
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let (ptr, _region) = self.alloc_in_region(total_size)?;
 
         // Mirror `length` into BOTH `array_length` and `num_slots`, matching
@@ -7400,7 +7416,7 @@ impl G1Collector {
         if regions[idx].region_type != RegionType::HumongousStart {
             return None;
         }
-        let payload_bytes = total_object_size.saturating_sub(HEADER_SIZE);
+        let payload_bytes = total_object_size.saturating_sub(ARRAY_DATA_OFFSET);
         Some((idx, payload_bytes))
     }
 
@@ -7467,7 +7483,7 @@ impl G1Collector {
         // region's integer base address (not the `Deref` slice, whose `len` is
         // only `region_size`) so the pointer carries arena provenance across
         // region boundaries.
-        let phys = (regions[start].data.addr() + HEADER_SIZE + payload_off) as *mut u8;
+        let phys = (regions[start].data.addr() + ARRAY_DATA_OFFSET + payload_off) as *mut u8;
         // SAFETY: `payload_off + len <= total_payload`, and the humongous span
         // reserved `ceil(size/region_size)` contiguous arena regions covering
         // `HEADER_SIZE + total_payload` bytes from `start_addr`, so
@@ -7761,7 +7777,7 @@ impl GarbageCollector for G1Collector {
     ) -> ObjectRef {
         let data_size = array_data_size(length, element_type)
             .expect("array data size overflow in g1 alloc_array");
-        let total_size = HEADER_SIZE + data_size;
+        let total_size = ARRAY_DATA_OFFSET + data_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
             eprintln!(
                 "FATAL: G1: out of heap space for array allocation ({} bytes) \
@@ -7896,7 +7912,7 @@ impl GarbageCollector for G1Collector {
         // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
         // which covered g1::scan_object_refs but not this mutator-side path).
-        let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+        let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
         if let Some((_, storage)) = compact {
             unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
         } else {
@@ -8000,7 +8016,7 @@ impl GarbageCollector for G1Collector {
                 // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare
                 // `ptr::write::<Value>` -- see the matching note on
                 // `get_field`'s read side above.
-                let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                 if let Some((_, storage)) = compact {
                     unsafe {
                         cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
@@ -8089,7 +8105,7 @@ impl GarbageCollector for G1Collector {
             // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
             // total so the humongous span / payload bound is exact.
             let total_size =
-                HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 if !self.humongous_copy(
                     &regions,
@@ -8105,7 +8121,7 @@ impl GarbageCollector for G1Collector {
             } else {
                 // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)`
                 // is inside the array's single-region payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
                 }
@@ -8152,7 +8168,7 @@ impl GarbageCollector for G1Collector {
         let stored = {
             let regions = self.regions.lock();
             let total_size =
-                HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             let span = self.humongous_span(&regions, obj, total_size);
 
             if is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
@@ -8169,7 +8185,7 @@ impl GarbageCollector for G1Collector {
                     ),
                     None => {
                         // SAFETY: `index < len` so the slot is inside the payload.
-                        let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                        let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 slot_ptr,
@@ -8201,7 +8217,7 @@ impl GarbageCollector for G1Collector {
                 )
             } else {
                 // SAFETY: `index < len` so the slot is inside the array payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
                 }
@@ -8541,7 +8557,7 @@ fn find_contiguous_free(regions: &[G1Region], count: usize) -> Option<usize> {
 fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
                 // caller's `total_size < HEADER_SIZE` guard fires (matching the
@@ -8733,7 +8749,7 @@ fn update_object_refs(
     header: &ObjectHeader,
     pointer_map: &HashMap<usize, usize>,
 ) {
-    let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
+    let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
 
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
@@ -9276,7 +9292,7 @@ mod tests {
 
         // Raw flat base pointer to element 0 — what the JIT computes from the
         // array oop (`obj + HEADER_SIZE`), with no region-aware translation.
-        let base = unsafe { arr.as_ptr().add(HEADER_SIZE) as *mut i32 };
+        let base = unsafe { arr.as_ptr().add(ARRAY_DATA_OFFSET) as *mut i32 };
 
         // 1) GC accessor writes, flat pointer reads back — including the tail
         //    element, which lives in a continuation region.
@@ -9311,7 +9327,7 @@ mod tests {
         // 3) Contiguity invariant: the byte just past the last element stays
         //    inside the reserved span [start, start + regions_needed*region_size).
         let rs = gc.config.region_size;
-        let total = HEADER_SIZE + n * 4;
+        let total = ARRAY_DATA_OFFSET + n * 4;
         let regions_needed = total.div_ceil(rs);
         let start_base = arr.as_ptr() as usize;
         assert!(

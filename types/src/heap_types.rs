@@ -628,6 +628,30 @@ impl ObjectHeader {
         );
     }
 
+    /// Byte offset of this object's **payload** from its base: instance-field
+    /// data for an object, element data for an array.
+    ///
+    /// The two are the same number today and stop being the same at
+    /// `HEADER_SIZE = 16`, where an array's length moves into an 8-byte prefix
+    /// at the head of its body. Code that addresses a payload *without knowing
+    /// which kind it has* — a closure shared between the array and object
+    /// walks, a generic scan — must go through this rather than pick one
+    /// constant, because picking one is right for half its callers and silently
+    /// wrong for the other half.
+    ///
+    /// Code that already knows the kind should name the constant directly:
+    /// [`HEADER_SIZE`] for instance fields, [`ARRAY_DATA_OFFSET`] for elements.
+    /// That keeps the classification visible at the site rather than deferring
+    /// it to a runtime branch on a header the caller has already matched on.
+    #[inline]
+    pub fn payload_offset(&self) -> usize {
+        if self.kind == ObjectKind::Array {
+            ARRAY_DATA_OFFSET
+        } else {
+            HEADER_SIZE
+        }
+    }
+
     /// Returns true if this object is in the old generation.
     pub fn is_old_gen(&self) -> bool {
         self.gc_flags & GC_FLAG_OLD_GEN != 0
@@ -1435,7 +1459,7 @@ mod tests {
                 ArrayElementType::Long,
                 ArrayElementType::Reference,
             ] {
-                let total = HEADER_SIZE + array_data_size(len, et).unwrap();
+                let total = ARRAY_DATA_OFFSET + array_data_size(len, et).unwrap();
                 assert_eq!(
                     total % 8,
                     0,

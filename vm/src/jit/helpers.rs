@@ -3394,7 +3394,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     let Ok(data_size) = cratonvm_types::array_data_size(length as usize, elem_type) else {
         return jit_newarray_oom(vm, length as usize);
     };
-    let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    let total_size = cratonvm_types::ARRAY_DATA_OFFSET + data_size;
     // Fastest path: bump this thread's TLAB, taking no lock at all. Unlike the
     // `new` site there is no inline TLAB bump in codegen for arrays, so this
     // helper is not a slow path — it is the ONLY path a JIT-compiled
@@ -4603,7 +4603,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
     // slow path.
     let data_size =
         cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference).unwrap_or(0);
-    let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    let total_size = cratonvm_types::ARRAY_DATA_OFFSET + data_size;
     // Lock-free TLAB bump first — see the same arm in `jit_newarray` for why
     // this is the only path a JIT-compiled array allocation has, and what the
     // global `young_from` mutex below cost when it was the only option.

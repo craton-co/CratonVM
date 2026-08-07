@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use rustc_hash::FxHashMap;
 
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 
@@ -986,7 +986,7 @@ impl RegionHeap {
 fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
                 // caller's `total_size < HEADER_SIZE` guard fires (matching the

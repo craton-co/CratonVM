@@ -599,7 +599,7 @@ fn try_forward_object(
 pub fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
                 // caller's `total_size < HEADER_SIZE` guard fires (matching the
@@ -1193,7 +1193,7 @@ mod tests {
         // Check the array's first element points to the copied elem
         // Reference array elements are stored as compact 8-byte pointers (REF_ELEMENT_SIZE).
         let new_arr = roots[0];
-        let slot0_ptr = unsafe { new_arr.as_ptr().add(HEADER_SIZE) };
+        let slot0_ptr = unsafe { new_arr.as_ptr().add(ARRAY_DATA_OFFSET) };
         let raw: u64 = unsafe { std::ptr::read(slot0_ptr as *const u64) };
         assert_ne!(raw, 0, "Expected array[0] to be a non-null reference");
         let new_elem = unsafe { ObjectRef::from_raw(raw as usize as *mut u8) };

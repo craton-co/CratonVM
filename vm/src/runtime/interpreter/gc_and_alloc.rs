@@ -2775,10 +2775,10 @@ pub(crate) fn tlab_alloc_array_guarded_refill(
     element_type: ArrayElementType,
     length: usize,
 ) -> Option<ObjectRef> {
-    use cratonvm_gc::heap::{ObjectKind, HEADER_SIZE};
+    use cratonvm_gc::heap::{ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE};
     let length_u32 = u32::try_from(length).ok()?;
     let data_size = cratonvm_gc::heap::array_data_size_checked(length, element_type)?;
-    let total_size = HEADER_SIZE.checked_add(data_size)?;
+    let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
     // Anything at or above the TLAB's per-allocation cap goes down the ordinary
     // path, which owns the young-vs-old-gen (humongous) routing decision.
     if total_size > cratonvm_gc::tlab::tlab_max_alloc() {
@@ -3462,10 +3462,10 @@ pub(super) fn tlab_alloc_array(
     element_type: ArrayElementType,
     length: usize,
 ) -> Option<ObjectRef> {
-    use cratonvm_gc::heap::{ObjectKind, HEADER_SIZE};
+    use cratonvm_gc::heap::{ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE};
     let length_u32 = u32::try_from(length).ok()?;
     let data_size = cratonvm_gc::heap::array_data_size_checked(length, element_type)?;
-    let total_size = HEADER_SIZE.checked_add(data_size)?;
+    let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
     // Keep well clear of the humongous threshold: anything at or above the
     // TLAB's per-allocation cap goes down the ordinary path, which owns the
     // young-vs-old-gen routing decision.
