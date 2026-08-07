@@ -2096,7 +2096,7 @@ pub(super) fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             // Truncation: integer -> u8 (intentional low 8 bits)
-                            h.class_id.as_u32(), h.num_slots(), h.array_length(), h.kind as u8,
+                            h.class_id.as_u32(), h.num_slots(), h.array_length(), cratonvm_types::ObjectHeader::kind_tag(h.mark_word.load(std::sync::atomic::Ordering::Relaxed)),
                             field_name.as_deref().unwrap_or("?"),
                             field.field_index, field.is_reference, value,
                         );

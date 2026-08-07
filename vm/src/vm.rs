@@ -76301,7 +76301,6 @@ public class SkippedTest {
             cratonvm_types::ClassId::new(42),
             cratonvm_gc::heap::ObjectKind::Array,
             cratonvm_gc::heap::ArrayElementType::Long,
-            777,
             10,
             0,
         );
