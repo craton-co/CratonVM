@@ -44263,7 +44263,24 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let (arr, total) = ksv_snapshot_array(ctx, this);
     let arr_pin = ctx.pin_native_root(arr);
-    let itr = try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)?;
+    // Same landing as `native_hs_iterator`: no JDK declares
+    // `java.util.HashMap$KeyItr` (the real one is `HashMap$KeyIterator`), so
+    // `--jdk-only` refuses this shape — and a refusal with nowhere to go took
+    // out `for (String x : ConcurrentHashMap.newKeySet())` entirely, which is
+    // what `RChmKeySetView` caught. Hand the same snapshot back through a real
+    // `Arrays$ArrayItr`.
+    //
+    // Not `?`: `this_pin` is this frame's pin base, and unwinding past the
+    // `unpin_native_roots` below would strand it and everything pinned above.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let real = real_snapshot_iterator(ctx, arr, total);
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let arr = ctx.read_native_pin(arr_pin, arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));
