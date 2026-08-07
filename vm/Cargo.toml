@@ -57,7 +57,11 @@ exclude = [
 #
 # ZGC remains selectable with `--features zgc`. The `experimental-features` CI
 # job builds and runs the whole optional surface, because this repository has
-# already lost 1,522 tests to a configuration that nothing compiled.
+# already lost 1,522 tests to a configuration that nothing compiled. For `zgc`
+# that job's library-scoped steps were NOT the whole surface: it also builds
+# `-p cratonvm-cli --features zgc` (the launcher binary, where the gated
+# `GcAlgorithm::Zgc` variant and `parse_gc_algorithm` arm actually get linked)
+# and runs `cargo test -p cratonvm-gc --lib --features zgc`.
 default = ["awt", "management"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets
@@ -102,7 +106,24 @@ experimental-t19-diag = []
 # safepoint coordination. Off by default. With this feature off, the VM crate
 # compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
 gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cratonvm-native-builtins/gpu-offload", "dep:bytemuck"]
-# Selectable memory-backed ZGC-real backend (`-XX:+UseZGC`).
+# Selectable memory-backed ZGC-real backend (`-XX:+UseZGC`). Gates the
+# `GcAlgorithm::Zgc` variant, its `parse_gc_algorithm` "z" | "zgc" arm
+# (`src/config.rs`) and the `GcBackend::Zgc` selection in `vm/src/vm/vm_init.rs`
+# — i.e. whole dispatch paths, not just a module. Default-off because the
+# backend is not yet at pass-rate parity with `Generational`; see
+# `gc/Cargo.toml`'s note and
+# `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`.
+# `cratonvm-cli` has a matching pass-through, so the launcher is built with
+# `cargo build -p cratonvm-cli --features zgc`.
+# SCOPE, as of 2026-08-07: `cratonvm-gc` grew ELEVEN new `src/zgc/` modules that
+# day (colored pointers/vaddr, load barrier, pages, forwarding, metrics,
+# remembered set, marking, generations, relocation, TLABs, reference-slot
+# census) — ~26k lines and ~270 unit tests. NONE is wired into `ZgcRealHeap`, so
+# what this feature selects at runtime is unchanged — still stop-the-world,
+# non-moving, non-generational, no TLABs, no load barrier, no compaction.
+# Read the module list off the `pub mod` block in `gc/src/zgc.rs`, not off this
+# comment, and see `gc/Cargo.toml`'s longer note for the three-way maturity
+# split behind the flag.
 zgc = ["cratonvm-gc/zgc"]
 
 [dependencies]

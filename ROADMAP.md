@@ -41,7 +41,12 @@ as a wish list.
   section below.
 - JNI: full function-table coverage and OnLoad/OnUnload protocol.
 - JCK compliance run on Java SE 25 (see [docs/legal.md](docs/legal.md)).
-- Concurrent garbage collector (G1 maturity, ZGC experimentation).
+- Concurrent garbage collector: G1 maturity, and production low-latency ZGC.
+  The `-XX:+UseZGC` backend that exists today is real and selectable but is a
+  stop-the-world non-moving mark-sweep, and it is compiled in only behind the
+  default-off `zgc` feature, so a stock build does not have it. The plan for a
+  genuinely concurrent, compacting one is
+  [docs/feature-designs/zgc-production-implementation-plan.md](docs/feature-designs/zgc-production-implementation-plan.md).
 - JFR event coverage matching OpenJDK 25.
 
 ## Longer-term

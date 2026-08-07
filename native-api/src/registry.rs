@@ -5327,6 +5327,21 @@ impl NativeMethodRegistry {
         self.drop_real_layout_synthetic = drop;
     }
 
+    /// Whether this registry is being populated for a REAL-JDK arm.
+    ///
+    /// Read this at a registration SITE when a cluster has no working
+    /// real-bytecode fallback to drop to and so cannot be expressed as a rule
+    /// in `register` — the synthetic `FileInputStream`/`FileOutputStream`
+    /// `<init>` block in `native-io` is the case this exists for. A
+    /// `#[cfg(feature = "synthetic-jdk")]` guard is NOT equivalent and must
+    /// not be used for this: the Cargo feature decides what is COMPILED, the
+    /// launcher flag decides which CLASS LIBRARY loads, and a feature-enabled
+    /// binary run `--real-jdk` satisfies the cfg while facing real JDK
+    /// classes.
+    pub fn drops_real_layout_synthetic(&self) -> bool {
+        self.drop_real_layout_synthetic
+    }
+
     /// Set the category applied to all subsequent `register()` calls until
     /// changed again. Prefer [`with_category`](Self::with_category) for a
     /// scoped set/restore.
@@ -6049,6 +6064,52 @@ impl NativeMethodRegistry {
                     | "java/nio/charset/CharsetEncoder"
                     | "java/nio/charset/CharsetDecoder"
             )
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `FileChannel.open` FACTORY.
+        //
+        // `native_fc_open` (native-io) is the THIRD producer of an abstract
+        // `java/nio/channels/FileChannel` instance, and the one the suite's
+        // `RChannelInterrupt` actually reaches. The other two —
+        // `FileSystemProvider.newFileChannel`'s fallback and
+        // `RandomAccessFile.getChannel` — were audited first and are not on
+        // this path; that audit is why this took two rounds to find.
+        //
+        // It does `alloc_object(FileChannel, 2)` and writes an fd id and a
+        // position into slots 0/1. So `FileChannel.open(p, WRITE).getClass()`
+        // was `java.nio.channels.FileChannel` itself where HotSpot 25 answers
+        // `sun.nio.ch.FileChannelImpl`, and every method with no native to
+        // intercept it resolved to an ABSTRACT declaration:
+        // `AbstractMethodError: FileChannel.write(Ljava/nio/ByteBuffer;J)I has
+        // no Code attribute`. Only the no-position `write(ByteBuffer)` had a
+        // native at all. The same object also has no `interruptor`, which is
+        // the field `AbstractInterruptibleChannel.begin()` dereferences — the
+        // very defect `RChannelInterrupt` was written for.
+        //
+        // It is also wrong in a quieter way: the implementation is documented
+        // "simplified" and calls `open_read`, IGNORING the `OpenOption[]`
+        // entirely. `FileChannel.open(p, WRITE)` handed back a READ-ONLY fd.
+        //
+        // Dropping it is the whole fix because the real path is already built
+        // and already forced: `FileChannel.open` bytecode calls
+        // `FileSystemProvider.newFileChannel`, which is force-listed in
+        // `native_override.rs` and routed to the base-class registration, and
+        // that shim's RECONCILE-WITH-REAL block constructs a genuine
+        // `sun.nio.ch.FileChannelImpl` via its 7-arg `open`. Instrumenting that
+        // block previously produced NO output on this path — because
+        // `native_fc_open` intercepted the call before the provider was ever
+        // consulted. Its synthetic fallback stays in place, so a host where the
+        // real construction fails keeps exactly today's behaviour.
+        //
+        // Scoped to `open` BY NAME. The instance natives on this class
+        // (`read`/`write`/`position`/`size`/`close`) still serve that fallback
+        // object; they do not intercept a real `FileChannelImpl`, whose own
+        // declarations win because native dispatch keys on the resolved
+        // method's declaring class.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/nio/channels/FileChannel"
+            && method_name == "open"
         {
             return;
         }
