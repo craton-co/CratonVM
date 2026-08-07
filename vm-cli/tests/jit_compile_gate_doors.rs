@@ -24,10 +24,32 @@
 //!   here passes on a run that never compiled anything, which is exactly how a
 //!   Spring test class (**zero** OSR entries) made an earlier "0 violations"
 //!   reading meaningless.
-//! * `eager-first-call: admitted > 0`, in its own arm — that door is dormant
-//!   under the default configuration (`bg-compile` is default-ON and reroutes
-//!   first-call compiles to the background worker), so the default arm proves
-//!   nothing about it. `CRATONVM_JIT=bg-compile=0` is what wakes it.
+//! * `eager-first-call` — **dynamically unreachable in every configuration this
+//!   probe can produce, measured 2026-08-06.** The arm used to assert
+//!   `admitted > 0` under `CRATONVM_JIT=bg-compile=0`, on the reasoning that
+//!   turning the background worker off falls through to `execute()`'s
+//!   historical eager first-call compile. It does not any more: `execute()`
+//!   reaches that block only through `compiled.or_else(..)`, i.e. only for a
+//!   method the JIT cache does not already hold, and the dispatcher's
+//!   method-entry door gets there first. Four configurations were tried against
+//!   the built binary — `bg-compile=0`, and that plus `tiered=0`,
+//!   `c2-first-call=0`, and both — and the counter read `admitted=0` in all
+//!   four while `method-entry` read 3.
+//!
+//!   The arm now asserts what is still true and still worth pinning: with the
+//!   background worker off, **nothing reaches the backend ungated**. That is
+//!   the invariant the whole file exists for, and the one an unwired eager door
+//!   would break — `ungated-backend-entries` counts backend entries with no
+//!   token open, so a live-but-unwired door shows up there whether or not this
+//!   probe can reach it.
+//!
+//!   It deliberately does NOT delete the arm, the other remedy the old failure
+//!   message offered. The door is not gone: the
+//!   `admit(.., CompileDoor::EagerFirstCall)` call is still in
+//!   `vm/src/runtime/interpreter.rs`, and deleting the arm would remove the
+//!   place anyone would notice it becoming reachable again. **If you find a
+//!   workload that reaches it, restore the `admitted > 0` assertion** — the
+//!   counter is still published.
 //! * `osr-contract-violations == 0` / `osr-coordinate-mismatches == 0` — the
 //!   two fail-closed OSR metadata checks. Both are compiler-bug detectors that
 //!   silently cost a method its OSR service, so "it never fires" has to be a
@@ -370,13 +392,15 @@ fn every_backend_door_goes_through_the_admission_gate() {
          conversion — a plausible integer in the wrong pc space.\nstderr:\n{stderr}"
     );
 
-    // ── Arm 2: the eager first-call door ──────────────────────────────
+    // Arm 2: the background worker off.
     //
-    // Dormant under the default configuration: `bg-compile` is default-ON and
-    // reroutes a first-call compile to the background worker, so arm 1 says
-    // nothing about that door at all. Without this arm the gate could be
-    // missing from it entirely and both `admitted=0` and
-    // `ungated-backend-entries=0` would still hold.
+    // `bg-compile` is default-ON and reroutes a first-call compile to the
+    // background worker, so arm 1 exercises a different route to the backend
+    // entirely. Turning it off is a second, independent one, and the
+    // ungated-entry invariant has to hold on it too.
+    //
+    // See the module doc for why this arm no longer asserts
+    // `eager-first-call: admitted > 0`.
     let (stdout, stderr) = run_probe(
         &bin,
         &jdk,
@@ -390,10 +414,20 @@ fn every_backend_door_goes_through_the_admission_gate() {
         0,
         "[jit_compile_gate_doors] ungated backend entry under bg-compile=0.\nstderr:\n{stderr}"
     );
+    // Anti-vacuity: this arm must still COMPILE something, or the assertion
+    // above is the "0 violations on a run that compiled nothing" reading the
+    // module doc calls out. Summed over every door, so it keeps holding
+    // whichever one this configuration routes through — and
+    // `DOOR_EAGER_FIRST_CALL` stays referenced, which is what keeps the
+    // constant from rotting while that door is dormant.
+    let compiled_here: usize = [DOOR_METHOD_ENTRY, DOOR_EAGER_FIRST_CALL, DOOR_OSR]
+        .into_iter()
+        .map(|door| nth(&fields, "admitted", door))
+        .sum();
     assert!(
-        nth(&fields, "admitted", DOOR_EAGER_FIRST_CALL) > 0,
-        "[jit_compile_gate_doors] the eager first-call door admitted nothing even with \
-         `bg-compile=0`, so this arm proves nothing about it. If that path has been \
-         removed, delete this arm; if it moved, re-point the gate.\nstderr:\n{stderr}"
+        compiled_here > 0,
+        "[jit_compile_gate_doors] no door admitted anything with `bg-compile=0`, so the          ungated-entry assertion above is vacuous for this arm.
+stderr:
+{stderr}"
     );
 }
