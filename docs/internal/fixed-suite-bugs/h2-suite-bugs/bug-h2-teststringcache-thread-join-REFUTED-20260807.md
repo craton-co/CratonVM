@@ -9,7 +9,7 @@ frame chain for a thread that was *running*, with nothing marking it stale.
 `Thread.join()`s — completes in **1.8–3.4 s** on CratonVM and **20/20**
 consecutive `--nojit` runs finish clean. The class trips the suite's per-class
 timeout for an entirely different reason, folded into
-[`bug-h2-mvstore-insert-loop-perf-hang.md`](../../../known-issues/h2/bug-h2-mvstore-insert-loop-perf-hang.md):
+[`bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`](../../../known-issues/h2/bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md):
 its `main()` runs a **benchmark** after the test, and that benchmark is ~85×
 slower than HotSpot.
 
@@ -250,7 +250,7 @@ live JIT frame could not prove a complete rewritable root map. Unrelated to
 this doc's question; noted for whoever owns the moving-young fallback cluster.
 
 ## Related
-* [`bug-h2-mvstore-insert-loop-perf-hang.md`](../../../known-issues/h2/bug-h2-mvstore-insert-loop-perf-hang.md)
+* [`bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`](../../../known-issues/h2/bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md)
   — where this class belongs; it is listed there as a confirmed instance.
 * `docs/internal/fixed-suite-bugs/springboot/onclasscondition-join-never-returns-20260801-FIXED.md`
 * `docs/internal/fixed-suite-bugs/elasticsearch-suite/ES-HANG-20260719-threadjoin-randomizedrunner-worker-windows-FIXED.md`
