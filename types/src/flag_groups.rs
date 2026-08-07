@@ -1016,6 +1016,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "default-watchdog-sec", on_key: Some("CRATONVM_DEFAULT_WATCHDOG_SEC"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "eqe-sync-execute", on_key: Some("CRATONVM_EQE_SYNC_EXECUTE"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "exec-depth-ceiling", on_key: Some("CRATONVM_EXEC_DEPTH_CEILING"), off_key: None, off_word: None },
+    // L19 — `ForkJoinTask.fork()` runs the body inline instead of only marking
+    // the task queued. `1`/`cc`/`counted` = eager for a `CountedCompleter`
+    // receiver only (the family with no intercepted consumer); `all` = eager
+    // for every task. Unset or unrecognised keeps today's lazy fork.
+    E { group: Group::THREADS, token: "fjp-eager-fork", on_key: Some("CRATONVM_FJP_EAGER_FORK"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "inherit-thread-ccl", on_key: Some("CRATONVM_INHERIT_THREAD_CCL"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "inherit-tl-workaround", on_key: Some("CRATONVM_INHERIT_TL_WORKAROUND"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "lock-order-check", on_key: Some("CRATONVM_LOCK_ORDER_CHECK"), off_key: None, off_word: None },

@@ -6868,6 +6868,230 @@ pub(crate) fn register_forkjointask_invoke_all_bridge(r: &mut NativeMethodRegist
     r.set_category(__prev_cat);
 }
 
+// ---------------------------------------------------------------------------
+// L19 — `CountedCompleter` starves under a lazy `fork()`; the gated eager fork
+// ---------------------------------------------------------------------------
+//
+// The eager-inline pool model above works by intercepting the CONSUMER of a
+// forked task: `fork()` only marks the task queued, and `join()` / `get()` /
+// `invoke()` / (since L12) the static `invokeAll` overloads are what actually
+// drive `compute()` and memoise the outcome.
+//
+// `java.util.concurrent.CountedCompleter` has no consumer. Its protocol is
+//
+//     setPendingCount(2);
+//     child1.fork();
+//     child2.fork();
+//     tryComplete();          // decrement pending; at zero call onCompletion()
+//
+// and the parent never touches a child again — completion flows UP from the
+// child, driven by the child's own `tryComplete()`. So there is no method on
+// the parent side to intercept: every one of `tryComplete` /
+// `propagateCompletion` / `complete` / `helpComplete` is real JDK bytecode
+// that only reads a pending counter, and the counter can only fall if the
+// CHILD ran. Under the lazy fork the children never run, the count never
+// reaches zero, `onCompletion` never fires — and, unlike the L12 `awaitDone`
+// hang, nothing blocks: the task tree quietly does a fraction of the work and
+// reports success. `regression-suite/src/RJdkForkJoin.java:175`
+// (`check(leaves.get() == 64, "CountedCompleter leaves: " + ...)`) is that
+// failure written down.
+//
+// Bridging the protocol methods was considered and rejected: none of them can
+// reach the children. The side table is keyed by task address and holds no
+// parent->child edge, so a Bridge on `tryComplete()` would have to enumerate
+// every queued-not-done entry in a process-global map and read a `completer`
+// field off each raw address to find its own children — nondeterministic in
+// order, and a stale key would be dereferenced as an object. The producer side
+// is where the work has to happen.
+//
+// Hence: run the body AT `fork()`. `ForkJoinPool.execute(ForkJoinTask)V`
+// already does exactly this via `fjp_compute_for_submit`
+// (`native-builtins/src/lib.rs`), which RECORDS the completion in the side
+// table, so a later `join()` returns the memoised result instead of running
+// `compute()` a second time. Running the child inside the parent's `fork()` is
+// a legal fork-join schedule — it is what a worker that steals the child
+// immediately produces — so the completion protocol observes an interleaving
+// the JDK can also produce.
+//
+// It is nevertheless an ORDERING change for every workload that forks, so it
+// is OFF by default and selected per run by `CRATONVM_FJP_EAGER_FORK`
+// (grouped spelling `CRATONVM_THREADS=fjp-eager-fork=...`):
+//
+//   unset / `0` / anything unrecognised  today's lazy fork (DEFAULT)
+//   `1` / `cc` / `counted`               eager ONLY for a CountedCompleter
+//                                        receiver — the narrow cure
+//   `all`                                eager for every ForkJoinTask — the
+//                                        broad variant, for measuring the
+//                                        ordering blast radius
+//
+// NO out-of-file list edits are needed for this one, which is the other reason
+// to prefer it: `("fork", "()Ljava/util/concurrent/ForkJoinTask;")` is ALREADY
+// on both `keep_real_forkjointask_bridge` (`native-api/src/registry.rs`) and
+// `is_forkjoin_native_override`
+// (`vm/src/runtime/interpreter/native_override.rs`) for all three task
+// classes. Registering a `CountedCompleter` native instead would have needed
+// both lists extended — and `registry.rs` drops the whole `CountedCompleter`
+// class under `CRATONVM_REAL_FORKJOINPOOL` while its keep-list does not even
+// name the class.
+
+/// The env var that selects [`fjt_fork_mode`].
+pub(crate) const FJT_EAGER_FORK_ENV: &str = "CRATONVM_FJP_EAGER_FORK";
+
+/// What `ForkJoinTask.fork()` does in this VM.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FjtForkMode {
+    /// Mark the task queued and return. Today's behaviour, and the default.
+    Lazy,
+    /// Run the body inline when the receiver is a `CountedCompleter`, which is
+    /// the only family with no intercepted consumer; lazy for everything else.
+    CountedCompleterEager,
+    /// Run the body inline for every task. Ordering-perturbing; measurement
+    /// arm only.
+    AlwaysEager,
+}
+
+/// Read [`FJT_EAGER_FORK_ENV`].
+///
+/// Called ONCE per registry build (i.e. once per `Vm`), not per `fork()`, so
+/// there is no per-call env cost and no `OnceLock` memo of its own here.
+///
+/// **It does latch, one level down, and that is unavoidable.** The name is a
+/// DECLARED flag (`CRATONVM_THREADS=fjp-eager-fork`, `flag_groups::INVENTORY`),
+/// because `tools/flag-census/check-surface.sh` fails CI on any
+/// `"CRATONVM_*"` literal that is not declared. `runtime_var_os` therefore
+/// serves it from the immutable process-wide `VmFlags` snapshot, which latches
+/// on its first read anywhere in the process. So: **set it in the environment
+/// before launching the process.** A `std::env::set_var` executed after the
+/// snapshot has been taken — which for an in-process test means after almost
+/// any VM code has run — is invisible, the failure mode recorded as "declared
+/// flags latch, so set-var is invisible to tests". An in-process test must use
+/// `flags::with_process_overrides(&[("CRATONVM_FJP_EAGER_FORK", Some("1"))], ..)`
+/// *and* build its `Vm` inside that guard.
+///
+/// An unrecognised value means LAZY, so a typo cannot silently change
+/// behaviour.
+pub(crate) fn fjt_fork_mode() -> FjtForkMode {
+    let Some(raw) = cratonvm_types::flags::runtime_var_os(FJT_EAGER_FORK_ENV) else {
+        return FjtForkMode::Lazy;
+    };
+    let raw = raw.to_string_lossy().trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "1" | "on" | "true" | "yes" | "cc" | "counted" | "countedcompleter" => {
+            FjtForkMode::CountedCompleterEager
+        }
+        "all" | "always" | "2" => FjtForkMode::AlwaysEager,
+        _ => FjtForkMode::Lazy,
+    }
+}
+
+/// Does `task`'s runtime class transitively extend
+/// `java.util.concurrent.CountedCompleter`?
+///
+/// Walks the superclass chain rather than testing the exact class, because the
+/// classes that matter are always subclasses: the user's own completer, and
+/// `java.util.stream.AbstractTask` (which every parallel-stream leaf task
+/// extends). The walk is bounded so a corrupt or self-referential hierarchy
+/// cannot loop — the same shape as `is_fjp_subclass_blocklisted` in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`.
+fn fjt_is_counted_completer(ctx: &dyn NativeContext, task: ObjectRef) -> bool {
+    let mut cid = ctx.class_id_of_object(task);
+    for _ in 0..64 {
+        match ctx.class_name_of_id(cid) {
+            Some(name) if name == "java/util/concurrent/CountedCompleter" => return true,
+            Some(_) => {}
+            None => return false,
+        }
+        match ctx.superclass_of(cid) {
+            Some(parent) if parent != cid => cid = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Run `this` now and record the completion, then hand back the (possibly
+/// relocated) task — `fork()` is specified to return the receiver.
+///
+/// `fjp_compute_for_submit` is the SUBMIT-shaped entry point on purpose: the
+/// real `fork()` does not raise the task's exception at the forking site, it
+/// records it for the eventual join / completion. An internal VM error still
+/// propagates.
+fn fjt_fork_run_now(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let (done, _) = crate::phases_early::fjp_state_get(this);
+    if done {
+        // Already driven by an enclosing join()/invoke(). Re-running would
+        // double-execute the body — the bug `fjp_compute_for_submit`'s own
+        // comment records for the bare `exec()` invoke it replaced.
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    let live = crate::phases_early::fjp_compute_for_submit(ctx, this)?;
+    Ok(Some(Value::Object(Some(live))))
+}
+
+/// `fork()` under `CRATONVM_FJP_EAGER_FORK=1`: eager for a `CountedCompleter`
+/// receiver, byte-identical to the lazy Bridge for everything else.
+fn fjt_fork_counted_completer_eager(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if !fjt_is_counted_completer(ctx, this) {
+        crate::phases_early::fjp_state_mark_queued(this);
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    fjt_fork_run_now(ctx, this)
+}
+
+/// `fork()` under `CRATONVM_FJP_EAGER_FORK=all`: eager for every task.
+fn fjt_fork_always_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    fjt_fork_run_now(ctx, this)
+}
+
+/// Re-register `fork()` over the lazy Bridge installed by
+/// `phases_early::register_forkjoin_natives` /
+/// `register_real_jdk_forkjoin_essentials`, when the gate asks for it.
+///
+/// Re-registering a triple UPDATES THE EXISTING SLOT IN PLACE (see the
+/// `match prior_slot` arm of `NativeMethodRegistry::register`), and both call
+/// sites of this function run after the `phases_early` ones on their
+/// respective boot paths (`register_phase51_natives` precedes
+/// `register_new15_loom` inside `register_builtins`;
+/// `register_real_jdk_forkjoin_essentials` precedes
+/// `register_t19_k3_forkjoinpool_common` inside `register_essential_natives`),
+/// so this wins in both.
+///
+/// In `Lazy` mode it returns without touching the registry at all — the
+/// default path is not merely equivalent to today's, it is untouched, kind and
+/// slot included.
+pub(crate) fn register_forkjointask_eager_fork_gate(r: &mut NativeMethodRegistry) {
+    let mode = fjt_fork_mode();
+    let callback: cratonvm_native_api::NativeCallback = match mode {
+        FjtForkMode::Lazy => return,
+        FjtForkMode::CountedCompleterEager => fjt_fork_counted_completer_eager,
+        FjtForkMode::AlwaysEager => fjt_fork_always_eager,
+    };
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // All three classes, because which of them a given dispatch route resolves
+    // `fork()` against differs between the synthetic and real-JDK paths, and a
+    // gate that covered only one would be mode-dependent.
+    for task_class in [
+        "java/util/concurrent/ForkJoinTask",
+        "java/util/concurrent/RecursiveTask",
+        "java/util/concurrent/RecursiveAction",
+    ] {
+        r.register_with_kind(
+            task_class,
+            "fork",
+            "()Ljava/util/concurrent/ForkJoinTask;",
+            callback,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+    }
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6875,6 +7099,10 @@ pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     register_new15_continuation_scope(r);
     register_new15_forkjoinpool_common(r);
     register_forkjointask_invoke_all_bridge(r);
+    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
+    // `phases_early::register_forkjoin_natives`, which it is —
+    // `register_phase51_natives` runs earlier in `register_builtins`.
+    register_forkjointask_eager_fork_gate(r);
     register_wp4_8_continuation_support(r);
     register_wp4_8_virtual_thread_natives(r);
     r.set_category(__prev_cat);
@@ -6896,6 +7124,10 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     // lazy `fork()` to an `awaitDone()` that no worker thread can satisfy —
     // see the block comment on `register_forkjointask_invoke_all_bridge`.
     register_forkjointask_invoke_all_bridge(r);
+    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
+    // `phases_early::register_real_jdk_forkjoin_essentials`, which it is —
+    // `register_essential_natives` calls that first (native-builtins/src/lib.rs).
+    register_forkjointask_eager_fork_gate(r);
     r.set_category(__prev_cat);
 }
 
