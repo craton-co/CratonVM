@@ -447,6 +447,20 @@ pub fn are_nestmates(a: &Class, b: &Class, store: &ClassStore) -> bool {
 /// a hidden class's name as its host still goes through full confirmation
 /// (and fails, since a hidden class is not in `find_by_name`'s index under a
 /// name any classfile could spell).
+///
+/// # W3-2 complement: the exemption only ever sees a claim it can trust
+///
+/// The `class.hidden` arm below trusts `class.nest_host` because it was
+/// supplied by the defining `Lookup` rather than read from the class file. For
+/// that premise to hold, a hidden class defined WITHOUT `ClassOption::NESTMATE`
+/// must not be carrying a class-file `NestHost` attribute at all — and javac
+/// emits one for every nested class, so re-defining already-compiled bytes as
+/// a hidden class used to smuggle exactly such a claim in here.
+/// `class_manager::hidden_class_drops_class_file_nest_host` now discards it at
+/// definition time, so a non-NESTMATE hidden class reaches the `None` arm and
+/// is its own nest host — no private access to the class it was compiled
+/// inside, which is the JEP 371 contract and what
+/// `regression-suite/src/RJdkHidden.java:151` asserts.
 fn confirmed_nest_host<'a>(class: &'a Class, store: &ClassStore) -> &'a str {
     match class.nest_host.as_deref() {
         // A class that names itself as its NestHost is its own host.

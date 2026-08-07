@@ -1520,8 +1520,22 @@ fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, LK_CLASS, LK_FIELD_COUNT);
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(None));
-    ctx.set_field(obj, LK_PREVIOUS_LOOKUP_CLASS, Value::Object(None));
-    ctx.set_field(obj, LK_LOOKUP_MODE, Value::Int(modes));
+    // W6-3: both index writes are the SYNTHETIC layout. On real JDK 25
+    // (`javap -p java.lang.invoke.MethodHandles$Lookup`) slot 2 is
+    // `allowedModes` (int) and slot 3 is `cachedProtectionDomain`, a
+    // `private volatile ProtectionDomain` REFERENCE. `lk_set_modes` below
+    // repairs slot 2 by name; slot 3 was never repaired, so `Int(modes)` sat
+    // in a reference slot the GC scans as an oop. Gate both on the synthetic
+    // layout — a real Lookup declares `prevLookupClass`, a fabricated stub
+    // names its fields `_f0..`. `cachedProtectionDomain` must stay null: it is
+    // a lazy cache `lookupClassProtectionDomain()` fills on first use.
+    let synthetic_layout = ctx
+        .resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "prevLookupClass")
+        .is_none();
+    if synthetic_layout {
+        ctx.set_field(obj, LK_PREVIOUS_LOOKUP_CLASS, Value::Object(None));
+        ctx.set_field(obj, LK_LOOKUP_MODE, Value::Int(modes));
+    }
     // Write `allowedModes` so it lands on the real JDK field (3-field layout
     // puts it at slot 2, not the synthetic slot 1 = prevLookupClass). See
     // `lk_modes_of` and `lang_invoke::lk_write_allowed_modes`.
@@ -2666,7 +2680,10 @@ fn resolve_global_if_visible(
             cratonvm_types::error::VmError::ClassFile(
                 cratonvm_types::error::ClassFileError::ClassNotFound { class_name },
             ),
-        )) if class_name != internal => {
+        )) if class_name != internal
+            && cratonvm_classloading::array_descriptor_element_class(internal)
+                != Some(class_name.as_str()) =>
+        {
             tracing::debug!(
                 requested = internal,
                 missing_dependency = %class_name,

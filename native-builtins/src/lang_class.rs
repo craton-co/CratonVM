@@ -138,7 +138,7 @@ pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> 
     let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
         Arc::from(primitive)
     } else if slashed.contains('/') {
-        Arc::from(slashed.replace('/', "."))
+        Arc::from(dotted_binary_name(slashed))
     } else {
         Arc::from(slashed)
     };
@@ -540,8 +540,19 @@ fn check_access(
     )
 }
 
+/// `read_field_meta` collapses an unreadable `clazz` mirror onto
+/// `ClassId::new(0)`, which is also a perfectly valid id (ids are handed out
+/// from `classes.len()`, so the first class loaded *is* 0). The two cases are
+/// indistinguishable by the time [`check_field_access`] sees the value, so the
+/// caller-entitlement step below refuses to run on it: on the sentinel reading
+/// it as a real declaring class would answer JLS questions about the wrong
+/// class (notably `caller_is_subclass_of(_, java/lang/Object)`, which is true
+/// for every caller). Skipping keeps this degenerate input at exactly today's
+/// behaviour.
+const UNRESOLVED_DECLARING_CLASS_ID: u32 = 0;
+
 /// Check a reflective field access using the caller-sensitive part of the
-/// ordinary Java member-access rules.
+/// ordinary Java member-access rules (JLS §6.6.1, JEP 181).
 ///
 /// `Field.get` is not intrinsically a deep-reflection operation.  In
 /// particular, code may reflectively read a private field it declares itself
@@ -550,10 +561,22 @@ fn check_access(
 /// state.  The old blanket non-public rejection incorrectly treated that
 /// legal same-class read as an access violation.
 ///
-/// Keep the existing conservative rule for callers outside the declaring
-/// class: those still need a public member or the explicit accessible
-/// override.  JPMS/open-package validation remains in the caller after this
-/// check and continues to govern cross-class deep reflection.
+/// L15: the same rule reaches further than the declaring class itself. A
+/// **nestmate** may read a `private` field of its nest sibling, and a
+/// same-runtime-package or subclass caller may read a package-private /
+/// `protected` one — all without `setAccessible(true)`. That is the field
+/// shaped twin of the `Method.invoke` gap L1 fixed (see
+/// `native_method_invoke`, and `docs/known-issues/jdk-only/
+/// L15-nestmate-access-field-and-constructor.md`); it is routed through the
+/// same `lang_reflect::caller_may_access_member` predicate so the two paths
+/// cannot drift.
+///
+/// This is **pure widening**: the step is only consulted after the old rule
+/// has already answered "not public and not overridden", it only ever returns
+/// an *allow*, and when the caller cannot be resolved (`resolve_caller_class_id
+/// == None`) the fallback below is reached unchanged.  JPMS/open-package
+/// validation remains in the caller after this check and continues to govern
+/// cross-module deep reflection.
 fn check_field_access(
     ctx: &mut dyn NativeContext,
     modifiers: i32,
@@ -564,8 +587,28 @@ fn check_field_access(
     if accessible || (modifiers & ACC_PUBLIC) != 0 {
         return Ok(());
     }
-    if resolve_caller_class_id(ctx) == Some(declaring_class_id) {
+    // Resolved once and reused: `resolve_caller_class_id` walks the frame
+    // stack, and both arms below ask the same question of it.
+    let caller_cid = resolve_caller_class_id(ctx);
+    if caller_cid == Some(declaring_class_id) {
         return Ok(());
+    }
+    if declaring_class_id.as_u32() != UNRESOLVED_DECLARING_CLASS_ID {
+        if let Some(caller) = caller_cid {
+            // No `ObjectRef` crosses this call, and every `NativeContext`
+            // method it reaches is a `&self` metadata lookup (`class_name_of_id`
+            // / `loader_id_of_class` / `nest_host_name` / `nest_member_names` /
+            // `class_id_by_name_near` / `superclass_of`) — none of them
+            // re-enters Java, so no moving-GC pin is required here.
+            if crate::lang_reflect::caller_may_access_member(
+                ctx,
+                caller,
+                declaring_class_id,
+                modifiers,
+            ) {
+                return Ok(());
+            }
+        }
     }
     check_access(modifiers, false, member_desc)
 }
@@ -777,6 +820,83 @@ fn check_reflection_module_access_with_target_id(
     ctx.check_deep_reflection_access(accessor_cid, target_cid)
 }
 
+/// The `exports` half of `Reflection.verifyMemberAccess`, for a reflective
+/// operation on a PUBLIC member that has NOT been `setAccessible(true)`.
+///
+/// JEP 261: a public member of a public class is still unreachable from the
+/// class path when its package is not `exports`ed to the caller's module.
+/// HotSpot 25 reaches this through `Constructor.newInstance` / `Method.invoke`
+/// -> `AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
+/// `verifyModuleAccess` -> `memberModule.isExported(pkg, callerModule)`, and
+/// throws `IllegalAccessException`. `verifyMemberAccess` runs that module test
+/// BEFORE its `Modifier.isPublic(modifiers)` shortcut, which is why a public
+/// member does not skip it. `regression-suite/src/RJdkModule.java:172`
+/// is the witness: a public no-arg ctor on the public `EnGreeter`, in the one
+/// package `cratonvm.jdkonly.svc` neither exports nor opens.
+///
+/// Both reflective entry points are the SAME shape here — `Constructor` passes
+/// `clazz` as both `memberClass` and `targetClass`, `Method` passes
+/// `isStatic ? null : obj.getClass()` as `targetClass`, and that argument only
+/// steers the `protected` sub-rule, never the module test. So the two call
+/// sites read identically.
+///
+/// Deliberately NOT folded into [`check_reflection_module_access_with_target_id`]:
+/// that one asks the `opens` question, which over-denies here — every public
+/// `java.util.ArrayList` construction would fail, because java.base exports
+/// java.util without opening it (the kafka `ListDeserializer` regression the
+/// caller's comment records).
+///
+/// Same three bypasses as its `opens` sibling, in the same order, so the two
+/// gates cannot disagree about WHO is asking:
+///   * `accessible_override == true` -> the check was paid at `setAccessible`;
+///   * no resolvable Java caller frame -> the VM itself is driving;
+///   * a Bootstrap/Platform-loader caller in a boot package -> HotSpot exempts
+///     java.base the same way (`checkCanSetAccessible`'s
+///     `callerModule == Object.class.getModule()` arm).
+///
+/// Unlike the `opens` sibling this fails OPEN when the target class cannot be
+/// resolved: this is a NEW refusal on a path that previously had none, so an
+/// unreadable input must not invent one.
+fn check_reflection_export_access_with_target_id(
+    ctx: &mut dyn NativeContext,
+    target_class_name: &str,
+    target_class_id: Option<ClassId>,
+    accessible_override: bool,
+) -> Result<(), String> {
+    if accessible_override {
+        return Ok(());
+    }
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return Ok(());
+    };
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
+        return Ok(());
+    }
+    let Some(target_cid) = target_class_id.or_else(|| ctx.class_id_by_name(target_class_name))
+    else {
+        return Ok(());
+    };
+    if accessor_cid == target_cid {
+        return Ok(());
+    }
+    // `reflective_export_to_accessor` is the `exports` edge;
+    // `check_deep_reflection_access` additionally accepts `opens`, the
+    // same-module case and an unnamed target, so either one passing is enough.
+    if ctx.reflective_export_to_accessor(accessor_cid, target_cid)
+        || ctx
+            .check_deep_reflection_access(accessor_cid, target_cid)
+            .is_ok()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "class {} is in a package its module does not export to the caller",
+        target_class_name.replace('/', ".")
+    ))
+}
+
 /// Read a declaring-class mirror from an AccessibleObject and enforce the
 /// NEW-19 module check. Returns `Err(IllegalAccessException)` on denial.
 ///
@@ -863,6 +983,45 @@ fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option
     let host = ctx.lambda_proxy_host(class_id)?;
     let host_dotted = host.replace('/', ".");
     Some(format!("{host_dotted}$$Lambda/0x{:x}", class_id.as_u32()))
+}
+
+/// Split a hidden class's mangled internal name at its `/0x<hex>` tail.
+///
+/// The class store registers a hidden class under `<this_class>/0x<n>` — both
+/// `lookup_define.rs`'s pre-mangled `override_name` and `class_manager.rs`'s
+/// collision suffix build that shape. HotSpot reports it verbatim from
+/// `Class.getName()`: the `/` is part of the NAME, not a package separator, so
+/// the usual internal->binary `/`->`.` rewrite must not touch it. Measured
+/// before this fix: `getName()` answered `RJdkHidden$Payload.0x0`, failing
+/// `regression-suite/src/RJdkHidden.java:93`'s `getName().contains("/0x")`.
+///
+/// Returns `(base, suffix)` with the suffix still carrying its leading `/`, or
+/// `None` when there is no such tail. No legal Java package or class segment
+/// begins with a digit, so `0x...` after a `/` is unambiguous.
+fn hidden_name_suffix_split(internal: &str) -> Option<(&str, &str)> {
+    let at = internal.rfind("/0x")?;
+    let hex = &internal[at + 3..];
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((&internal[..at], &internal[at..]))
+}
+
+/// Internal (`/`-separated) name -> the binary name `Class.getName()` reports,
+/// preserving a hidden class's `/0x<hex>` suffix verbatim.
+///
+///   `RJdkHidden$Payload/0x3` -> `RJdkHidden$Payload/0x3`
+///   `com/acme/P/0x3`         -> `com.acme.P/0x3`
+///   `com/acme/P`             -> `com.acme.P`
+pub(crate) fn dotted_binary_name(internal: &str) -> String {
+    match hidden_name_suffix_split(internal) {
+        Some((base, suffix)) => {
+            let mut out = base.replace('/', ".");
+            out.push_str(suffix);
+            out
+        }
+        None => internal.replace('/', "."),
+    }
 }
 
 const SPRING_ENHANCED_CONFIGURATION_IFACE: &str =
@@ -972,7 +1131,7 @@ pub(crate) fn native_class_get_name(
                 .unwrap_or(strict_name);
             let dotted = primitive_descriptor_name(&display_name)
                 .map(str::to_string)
-                .unwrap_or_else(|| display_name.replace('/', "."));
+                .unwrap_or_else(|| dotted_binary_name(&display_name));
             if dbg_bb {
                 eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
             }
@@ -1022,7 +1181,7 @@ pub(crate) fn native_class_get_name(
             let dotted_name = if let Some(primitive) = primitive_descriptor_name(&display_name) {
                 primitive.to_string()
             } else if display_name.contains('/') {
-                display_name.replace('/', ".")
+                dotted_binary_name(&display_name)
             } else {
                 display_name
             };
@@ -2704,6 +2863,32 @@ pub(crate) fn native_class_is_instance(
     };
     let target_class_id = ctx.class_id_of_object(target);
 
+    // PERF (webapp-deploy annotation scan): answer the ordinary "the object's
+    // class IS, or extends/implements, this mirror's class" shape from class
+    // ids alone, before anything below materialises a class NAME.
+    //
+    // Every `class_name_of_id` / `mirror_class_name` call takes the class-
+    // manager read lock and clones the name into a fresh `String`, and the
+    // AnnotationProxy and `Proxy$Instance` probes below each do one on EVERY
+    // call just to compare against a fixed literal. Tomcat's BCEL scanner
+    // reaches this through `ConstantPool.getConstant(int, Class)`, which runs
+    // `castTo.isAssignableFrom(...)` + `castTo.cast(...)` once per constant-
+    // pool access of every class in every scanned jar: a `--stack-sample-ms`
+    // profile of `TestHostConfigAutomaticDeploymentCopyXML` put 55% of all
+    // interpreted time in that one method.
+    //
+    // This is the FIRST TWO DISJUNCTS OF THIS FUNCTION'S OWN TAIL, evaluated
+    // earlier. Every branch between here and there returns `1` or falls
+    // through -- none returns `0` -- so hoisting a `true` cannot change an
+    // answer. Arrays are excluded: `class_id_of_object` reports an array's
+    // COMPONENT class id, so the id comparison is not meaningful for them and
+    // they keep taking the descriptor-based path above and the tail below.
+    if !target_is_array
+        && (target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id))
+    {
+        return Ok(Some(Value::Int(1)));
+    }
+
     // Annotation proxy special case: our `create_annotation_proxy` allocates
     // objects of class `java/lang/annotation/AnnotationProxy`, not of the
     // actual annotation interface. JDK reflection and Spring's
@@ -3069,6 +3254,29 @@ pub(crate) fn native_class_is_assignable_from(
         // вЂ” it throws `IllegalArgumentException` from
         // `assignableCheckFailed` when this returns false, masking the
         // underlying type-system gap.
+        // PERF (webapp-deploy annotation scan): same hoist as
+        // `native_class_is_instance` above, and the same reason -- the two
+        // `mirror_class_name` calls immediately below each take the class-
+        // manager read lock and clone the name into a fresh `String`, on a path
+        // Tomcat's BCEL scanner walks once per constant-pool access
+        // (`ConstantPool.getConstant(int, Class)` -> `castTo.isAssignableFrom`).
+        //
+        // These are the first two disjuncts of this function's own tail. Every
+        // branch between here and there returns `1` or falls through, and the
+        // two `mirror_class_id` `None` arms cannot be reached once BOTH ids
+        // have resolved -- so hoisting a `true` cannot change an answer.
+        // Skipped when the ObservationRegistry trace is armed, so that
+        // diagnostic still sees every call.
+        if !crate::vmflags().loader.dbg_obsreg {
+            if let (Some(this_cid), Some(other_cid)) =
+                (mirror_class_id(ctx, this), mirror_class_id(ctx, other))
+            {
+                if this_cid == other_cid || ctx.is_subclass(other_cid, this_cid) {
+                    return Ok(Some(Value::Int(1)));
+                }
+            }
+        }
+
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
         if crate::vmflags().loader.dbg_obsreg
@@ -3223,7 +3431,7 @@ pub(crate) fn native_class_is_primitive(
     // that that's where THIS JDK build's compiled `java/lang/Class` happens
     // to place the `primitive` field — the exact "answering true for a
     // class that is not primitive" hazard flagged in
-    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-FIXED-20260803.md.
+    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md.
     // Resolve it the same way the writer does (`resolve_class_mirror_slots`
     // in `vm/src/vm/vm_object.rs`, i.e. by field name against the loaded
     // `java/lang/Class`), so reader and writer agree by construction instead
@@ -7360,25 +7568,71 @@ pub(crate) fn native_method_invoke(
         }
     }
 
+    // Capture the declaring class's EXACT id from the mirror once, before the
+    // access checks. Both the caller-entitlement step and the JPMS step want
+    // it, and resolving it by binary name instead is ambiguous when two child
+    // loaders define the same name (see
+    // `check_reflection_module_access_with_target_id`'s doc comment and
+    // `regression-suite/src/RFieldSiteCache.java` `twoLoadersOneName`).
+    let declaring_cid = mirror_class_id(ctx, declaring_mirror);
+
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
     let is_public = (modifiers & ACC_PUBLIC) != 0;
     // Most framework reflection invokes public methods. Do not format an
     // exception-only diagnostic string on that successful hot path.
     if !accessible && !is_public {
-        check_access(
-            modifiers,
-            false,
-            &format!("Method.invoke: {}.{}", class_name, method_name),
-        )?;
+        // JLS 6.6.1 / JEP 181: a non-public method is still reachable without
+        // `setAccessible(true)` when the CALLER is entitled to it — the
+        // declaring class itself, a confirmed nestmate (private), or a
+        // same-runtime-package / subclass caller (package-private, protected).
+        // `check_access` takes no `ctx` and so cannot ask that question; it
+        // rejected `RJdkReflect$Subject.secret` invoked from its own nest host
+        // (regression-suite/src/RJdkReflect.java:160), which HotSpot 25 allows.
+        // `check_field_access` is the field-shaped half of the same rule.
+        // Pure widening: the fallback below is unchanged for every input the
+        // caller step does not accept.
+        let caller_cid = resolve_caller_class_id(ctx);
+        let caller_entitled = match (caller_cid, declaring_cid) {
+            (Some(caller), Some(declaring)) => {
+                crate::lang_reflect::caller_may_access_member(ctx, caller, declaring, modifiers)
+            }
+            _ => false,
+        };
+        if !caller_entitled {
+        // NOTE: dev landed a NARROWER fix for the same defect while this was
+        // in flight — a same-class-only carve-out, motivated by HikariConfig's
+        // private-final AtomicReference and measured on Temurin 25 as legal for
+        // both private (0x0002) and package-private (0x0008). This rule SUBSUMES
+        // it: `caller_may_access_member`'s first arm is the declaring class
+        // itself. Kept the wider rule; dev's evidence recorded here.
+            check_access(
+                modifiers,
+                false,
+                &format!("Method.invoke: {}.{}", class_name, method_name),
+            )?;
+        }
     }
-    // NEW-19: module-level opens check (JPMS). When `accessible == true`
-    // the override flag short-circuits the deep check (JEP 403).
+    // NEW-19: module-level JPMS check. When `accessible == true` the override
+    // flag short-circuits it (JEP 403).
     //
-    // JEP 403/261 distinction: PUBLIC methods of EXPORTED packages need
-    // only `exports`, not `opens`. Only enforce the deep check when the
-    // method is non-public (ACC_PUBLIC = 0x0001) вЂ” that's the case where
-    // setAccessible / opens is required.
+    // JEP 403/261 distinction: a PUBLIC method of an EXPORTED package needs
+    // only `exports`, not `opens` — `ArrayList.size()` must invoke without any
+    // --add-opens, because java.base exports java.util WITHOUT opening it.
+    // Only a non-public method requires the opens/deep check.
+    //
+    // But "needs only exports" is not "needs nothing", and the public arm used
+    // to have NO check at all. `Method.invoke` is the exact shape of
+    // `Constructor.newInstance`: both call `AccessibleObject.checkAccess` ->
+    // `Reflection.verifyMemberAccess` -> `verifyModuleAccess` ->
+    // `memberModule.isExported(pkg, callerModule)`, and `verifyMemberAccess`
+    // runs that module test BEFORE the `Modifier.isPublic(modifiers)` shortcut,
+    // so public members do not skip it. Measured on Temurin 25.0.3:
+    // `jdk.internal.misc.VM.isBooted()` is public+static on a public class, and
+    // `Method.invoke` throws IllegalAccessException ("module java.base does not
+    // export jdk.internal.misc to unnamed module"), while
+    // `ArrayList.size()` invokes normally. Without this arm CratonVM
+    // fabricated a success where the spec mandates a failure.
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
             return Err(
@@ -7388,6 +7642,18 @@ pub(crate) fn native_method_invoke(
                 .into(),
             );
         }
+    } else if let Err(msg) = check_reflection_export_access_with_target_id(
+        ctx,
+        &class_name,
+        declaring_cid,
+        accessible,
+    ) {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
+            }
+            .into(),
+        );
     }
 
     // Get descriptor вЂ” stored in CratonVM extra slot (not a real JDK field).
@@ -9715,6 +9981,21 @@ pub(crate) fn native_constructor_new_instance(
                 .into(),
             );
         }
+    } else if let Err(msg) = check_reflection_export_access_with_target_id(
+        ctx,
+        &class_name,
+        declaring_cid,
+        accessible,
+    ) {
+        // JEP 261: `exports`, not `opens`. A public ctor previously got NO
+        // module check at all -- the comment above got the exports/opens
+        // distinction right and the code then implemented "needs nothing".
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Constructor.newInstance: {class_name}: {msg}"),
+            }
+            .into(),
+        );
     }
 
     // Descriptor: extra slot / side table, or rebuild from `parameterTypes`
@@ -21189,6 +21470,126 @@ mod tests {
         assert!(check_field_access(
             &mut ctx,
             0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // L15 - check_field_access consults the caller (JLS 6.6.1 / JEP 181),
+    // the field-shaped twin of the Method.invoke widening.
+    // -----------------------------------------------------------------------
+
+    /// A package-private field is reachable from another class in the SAME
+    /// runtime package with no `setAccessible(true)`. Before L15 this was
+    /// rejected (only the declaring class itself was admitted).
+    #[test]
+    fn field_access_allows_package_private_field_from_same_runtime_package() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/PkgPeer")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            "Field.get(pkgValue)"
+        )
+        .is_ok());
+    }
+
+    /// The widening stops at the package boundary: a foreign-package caller
+    /// still needs the accessible override.
+    #[test]
+    fn field_access_rejects_package_private_field_from_a_foreign_package() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/Foreign")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            "Field.get(pkgValue)"
+        )
+        .is_err());
+    }
+
+    /// A `protected` field is reachable from a subclass in a foreign package
+    /// (JLS 6.6.2).
+    #[test]
+    fn field_access_allows_protected_field_from_a_foreign_package_subclass() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/ProtOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/ProtChild")
+            .expect("caller class");
+        ctx.set_superclass(caller, declaring);
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0004, // protected
+            false,
+            declaring,
+            "Field.get(protValue)"
+        )
+        .is_ok());
+    }
+
+    /// Fail CLOSED when there is no resolvable Java caller frame: the
+    /// entitlement step must never be reached, so the old blanket rule stands.
+    #[test]
+    fn field_access_rejects_private_field_when_no_caller_frame_resolves() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        ctx.set_frame_class_ids(Vec::new());
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    /// A private field of a class in the same package is still NOT reachable
+    /// without a confirmed nest relationship - `private` is nest-scoped, never
+    /// package-scoped (JEP 181). This pins the one arm that must not widen.
+    #[test]
+    fn field_access_rejects_private_field_from_a_same_package_non_nestmate() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/NestlessOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/NestlessPeer")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002, // private
             false,
             declaring,
             "Field.get(privateValue)"

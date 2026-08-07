@@ -606,6 +606,23 @@ pub trait NativeClassAccess {
         0
     }
 
+    /// Record the `LambdaMetafactory.altMetafactory` MARKER INTERFACES of a
+    /// proxy just returned by `register_lambda_proxy`.
+    ///
+    /// `altMetafactory`'s `FLAG_MARKERS` (0x2) block names interfaces the spun
+    /// proxy implements IN ADDITION to its functional interface, so
+    /// `marker.isInstance(lambda)` and a `checkcast` to the marker must both
+    /// succeed. They are not part of the SAM metadata `register_lambda_proxy`
+    /// carries, so they are handed over separately, right after it.
+    ///
+    /// `proxy_class_id` is the raw `u32` that `register_lambda_proxy` returned
+    /// (`0` means it declined — nothing to record). `marker_interfaces` are
+    /// internal names (`java/lang/Cloneable`). No-op by default: a host with no
+    /// lambda-proxy table (test mocks) has nowhere to put them.
+    fn register_lambda_proxy_markers(&mut self, proxy_class_id: u32, marker_interfaces: &[String]) {
+        let _ = (proxy_class_id, marker_interfaces);
+    }
+
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 
@@ -1440,6 +1457,46 @@ pub trait NativeClassAccess {
     fn module_is_open(&self, module_name: &str) -> bool {
         let _ = module_name;
         false
+    }
+
+    /// True if the VM's `ModuleRegistry` holds a descriptor for `module_name`.
+    ///
+    /// The default is `false` ("I know nothing"), so a `NativeContext` that does
+    /// not model modules can never be read as asserting a module's ABSENCE —
+    /// callers must probe a known-present name (`java.base`) before treating a
+    /// `false` here as evidence.
+    fn module_is_registered(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
+    }
+
+    /// `exports` directives declared by `module_name`, as
+    /// `(package, targets)`. Package names are INTERNAL (slash) form; an empty
+    /// `targets` is an unqualified export.
+    fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// `opens` directives declared by `module_name`, same shape as
+    /// [`module_exports`].
+    fn module_opens(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// `requires` directives declared by `module_name`, as
+    /// `(module name, is_transitive, is_static)`.
+    fn module_requires(&self, module_name: &str) -> Vec<(String, bool, bool)> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// `provides` directives declared by `module_name`, as
+    /// `(service, providers)` — binary class names in INTERNAL (slash) form.
+    fn module_provides(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
+        let _ = module_name;
+        vec![]
     }
 
     /// Return all registered module names.
@@ -4525,6 +4582,208 @@ pub struct NativeCensusEntry {
     pub kind_chosen: bool,
 }
 
+// ===========================================================================
+// DUPLICATE-REGISTRATION ANALYSIS  (the shadowed-native gate)
+// ===========================================================================
+
+/// One registration that a LATER `register*` of the identical triple displaced.
+///
+/// # The defect species this exists to make findable
+///
+/// [`NativeMethodRegistry::register`] is last-write-wins and **updates the
+/// existing slot in place**. So a correct, guarded, carefully-written native
+/// silently loses to an unguarded twin registered later, and every symptom then
+/// points at the wrong source file. Four instances cost a full
+/// measure-fix-rebuild cycle each before anyone looked for the pattern:
+///
+/// 1. `MethodHandles$Lookup.defineHiddenClass` — a placeholder registered late
+///    in `lang_invoke.rs` shadowed the real implementation, and returned a
+///    `Lookup` whose slot 0 was never written, so `lookupClass()` answered null.
+/// 2. `Files.copy(Path,Path,CopyOption...)` — the winner never read its options
+///    argument, so a copy onto an existing file overwrote instead of throwing
+///    `FileAlreadyExistsException`.
+/// 3. `Module.getResourceAsStream` — registered twice from inside the SAME
+///    function, ~9k lines apart; the wave-2 `opens` gate was dead code.
+/// 4. `SSLContext.getInstance` — four competing registrations; the live one
+///    threw an `IOException` whose message said `NoSuchAlgorithmException`.
+///
+/// The misdirection that made these expensive is worth stating once: **forcing
+/// "the native" over real bytecode does not help when the slot holds a
+/// DIFFERENT native.** Only provenance distinguishes the two, and only the
+/// census keeps it.
+///
+/// # Why this is mechanical
+///
+/// Nothing here is inferred. `register` is `#[track_caller]`, so every accepted
+/// registration already records its `Location`, and `registrations` is
+/// append-only — the LOSER's row survives, tagged
+/// [`NativeCensusEntry::owns_slot`]`== false`. The pair is therefore recoverable
+/// exactly, with no heuristics and no source scanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShadowedRegistration {
+    /// Class of the shadowed triple.
+    pub class: String,
+    /// Method name of the shadowed triple.
+    pub name: String,
+    /// Descriptor of the shadowed triple.
+    pub descriptor: String,
+    /// `file:line` of the registration that LOST, i.e. the callback that can
+    /// never be dispatched. `None` only if provenance was not recorded.
+    pub shadowed_at: Option<String>,
+    /// [`NativeKind`] the losing registration carried.
+    pub shadowed_kind: NativeKind,
+    /// `file:line` of the registration that currently OWNS the slot — the
+    /// callback a dispatch of this triple actually reaches.
+    pub winner_at: Option<String>,
+    /// [`NativeKind`] of the winning registration.
+    pub winner_kind: NativeKind,
+}
+
+/// Strip the `:line` suffix off a `"file:line"` provenance string and normalise
+/// `\` to `/`.
+///
+/// Both halves matter for a frozen baseline. `Location::file()` is the path as
+/// the compiler saw it, which is backslash-separated on Windows and
+/// forward-slash on Linux — a baseline keyed on the raw string is red on one of
+/// the two hosts. And the LINE must go: a duplicate keyed on a line number goes
+/// stale the moment anyone inserts a comment above the call, which is how fixed
+/// line bands in this repo's source-witness tests have failed before.
+fn provenance_file(site: Option<&str>) -> Option<String> {
+    let site = site?;
+    let file = match site.rfind(':') {
+        Some(i) => &site[..i],
+        None => site,
+    };
+    Some(file.replace('\\', "/"))
+}
+
+impl ShadowedRegistration {
+    /// `class.name descriptor`, the way the rest of this crate spells a triple.
+    pub fn triple(&self) -> String {
+        format!("{}.{}{}", self.class, self.name, self.descriptor)
+    }
+
+    /// Source file of the losing registration, without its line number and with
+    /// separators normalised. See [`provenance_file`].
+    pub fn shadowed_file(&self) -> Option<String> {
+        provenance_file(self.shadowed_at.as_deref())
+    }
+
+    /// Source file of the winning registration. See [`provenance_file`].
+    pub fn winner_file(&self) -> Option<String> {
+        provenance_file(self.winner_at.as_deref())
+    }
+
+    /// Whether the two registrations live in DIFFERENT source files.
+    ///
+    /// This is the shape of instances 1, 2 and 4 above, and the one a reviewer
+    /// has no chance of catching by eye: the two files are never open at the
+    /// same time. Instance 3 was same-file (and same *function*), which is why
+    /// this is a classifier and not the gate's only question.
+    pub fn cross_file(&self) -> bool {
+        match (self.shadowed_file(), self.winner_file()) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
+        }
+    }
+
+    /// Whether the winner and the loser disagree about what this native *is*.
+    ///
+    /// The highest-signal subset. A `SyntheticStub` displacing a `Bridge` is
+    /// instance 1 exactly: a placeholder overwriting a real implementation. It
+    /// also changes behaviour beyond the callback, because `NativeKind` decides
+    /// three separate things — `CompatibilityMode::JdkOnly` refuses a
+    /// `SyntheticStub`, `CRATONVM_NO_STUBS` drops one, and
+    /// `synthetic_stub_kind_should_yield_to_real_bytecode` arbitrates for one.
+    pub fn kind_disagreement(&self) -> bool {
+        self.shadowed_kind != self.winner_kind
+    }
+
+    /// Stable one-line key for a frozen baseline: the triple plus the two
+    /// FILES, tab-separated, with no line numbers.
+    ///
+    /// Deliberately coarser than the full provenance. Moving a registration
+    /// within its file must not turn the gate red, but moving it to a different
+    /// file — or adding a third registrar — must, because that is a new pair a
+    /// human has not looked at. Two different triples shadowed by the same file
+    /// pair stay distinct rows, since the triple leads the key.
+    pub fn key(&self) -> String {
+        format!(
+            "{}\t{} => {}",
+            self.triple(),
+            self.shadowed_file().unwrap_or_else(|| "<unknown>".into()),
+            self.winner_file().unwrap_or_else(|| "<unknown>".into()),
+        )
+    }
+}
+
+/// Every row in `rows` that a later registration of the identical triple
+/// displaced, paired with the registration that won.
+///
+/// Free function over a census rather than a method on the registry, because
+/// the gate that consumes it lives in `native-builtins/tests` (it needs the
+/// registrar crates, which `native-api` cannot depend on) while the logic must
+/// be unit-testable here, where no boot path is available.
+///
+/// One row per LOSER, so a triple registered four times yields three rows, all
+/// naming the same winner. That is the right shape for a ratchet: fixing one of
+/// the four removes exactly one row.
+///
+/// The winner is the row with [`NativeCensusEntry::owns_slot`]`== true`, of
+/// which a triple has exactly one — `register` either pushes a slot or rewrites
+/// the existing slot's `reg_index` to point at the newest registration, so
+/// `census`'s reverse map can only attribute the slot to the last accepted
+/// registration. The `unwrap_or(last)` fallback below is unreachable and exists
+/// so a hypothetical desync under-reports rather than panicking in CI.
+pub fn shadowed_registrations_in(rows: &[NativeCensusEntry]) -> Vec<ShadowedRegistration> {
+    // Group by triple, preserving first-seen order so the output is
+    // deterministic across runs — the property any frozen baseline rests on.
+    let mut order: Vec<(&str, &str, &str)> = Vec::new();
+    let mut groups: FxHashMap<(&str, &str, &str), Vec<usize>> = FxHashMap::default();
+    for (i, row) in rows.iter().enumerate() {
+        let key = (
+            row.class.as_str(),
+            row.name.as_str(),
+            row.descriptor.as_str(),
+        );
+        let bucket = groups.entry(key).or_insert_with(|| {
+            order.push(key);
+            Vec::new()
+        });
+        bucket.push(i);
+    }
+
+    let mut out = Vec::new();
+    for key in order {
+        let idxs = match groups.get(&key) {
+            Some(v) if v.len() > 1 => v,
+            _ => continue,
+        };
+        let winner_idx = idxs
+            .iter()
+            .copied()
+            .find(|i| rows[*i].owns_slot)
+            .unwrap_or_else(|| idxs[idxs.len() - 1]);
+        let winner = &rows[winner_idx];
+        for &i in idxs {
+            if i == winner_idx {
+                continue;
+            }
+            let loser = &rows[i];
+            out.push(ShadowedRegistration {
+                class: loser.class.clone(),
+                name: loser.name.clone(),
+                descriptor: loser.descriptor.clone(),
+                shadowed_at: loser.registered_by.clone(),
+                shadowed_kind: loser.kind,
+                winner_at: winner.registered_by.clone(),
+                winner_kind: winner.kind,
+            });
+        }
+    }
+    out
+}
+
 /// Registry of native method implementations.
 ///
 /// Maps (class, method, descriptor) triples to Rust function callbacks.
@@ -5301,6 +5560,15 @@ impl NativeMethodRegistry {
             .collect()
     }
 
+    /// Every registration in this registry that a LATER `register*` of the
+    /// identical triple displaced — the losers of last-write-wins.
+    ///
+    /// See [`shadowed_registrations_in`] for what this is for and why it is the
+    /// only mechanical way to find this defect species. Cold: it censuses.
+    pub fn shadowed_registrations(&self) -> Vec<ShadowedRegistration> {
+        shadowed_registrations_in(&self.census())
+    }
+
     /// Permit the synthetic `java.net.Socket` / `ServerSocket` natives to be
     /// registered even under `CRATONVM_REAL_NET_SOCKETS`. See
     /// [`Self::allow_synthetic_net_sockets`]. Test-registry use only.
@@ -5565,6 +5833,13 @@ impl NativeMethodRegistry {
                     | ("setRawResult", "(Ljava/lang/Object;)V")
                     | ("isDone", "()Z")
                     | ("isCompletedNormally", "()Z")
+                    // `(status & ABNORMAL) != 0` over the real `status` field,
+                    // which no Bridge here ever writes — completions live in
+                    // the `fjp_state` side table. Real bytecode therefore
+                    // answered `false` for a task that had just raised
+                    // ExecutionException (RJdkForkJoin.java:259). Must stay in
+                    // step with `is_forkjoin_native_override`.
+                    | ("isCompletedAbnormally", "()Z")
                     | ("isCancelled", "()Z")
                     | ("cancel", "(Z)Z")
                     | ("complete", "(Ljava/lang/Object;)V")
@@ -5572,6 +5847,36 @@ impl NativeMethodRegistry {
                     // abnormally completed task, so it cannot disagree with
                     // join()/get() about whether the task failed.
                     | ("getException", "()Ljava/lang/Throwable;")
+                    // W6-9: the WRITER for that record. Unregistered, real
+                    // bytecode CASed the real `aux`/`status`, which nothing
+                    // here reads — the task stayed `done == false` and the next
+                    // `join()` ran its body and returned a value. Must stay in
+                    // step with `is_forkjoin_native_override`.
+                    | ("completeExceptionally", "(Ljava/lang/Throwable;)V")
+                    // L12: the STATIC `invokeAll` overloads. JDK 25's
+                    // `invokeAll(t1, t2)` runs one task inline and then blocks
+                    // in `awaitDone` for the FORKED sibling — which the lazy
+                    // `fork()` above never schedules and no worker thread
+                    // exists to run. RJdkForkJoin hung there forever.
+                    | (
+                        "invokeAll",
+                        "(Ljava/util/concurrent/ForkJoinTask;Ljava/util/concurrent/ForkJoinTask;)V",
+                    )
+                    | ("invokeAll", "([Ljava/util/concurrent/ForkJoinTask;)V")
+                    | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/Collection;")
+                    // W6-7: the `quietly*` family. `quietlyJoin()` is
+                    // `if (status >= 0) awaitDone(false, 0L);` and
+                    // `quietlyInvoke()` is `doExec(); ... awaitDone(...)` over
+                    // the real `status` field, which no Bridge here ever writes
+                    // — completions live in the `fjp_state` side table. With no
+                    // worker threads that is a HANG, not a null. Must stay in
+                    // step with `is_forkjoin_native_override`, entry for entry.
+                    | ("quietlyJoin", "()V")
+                    | ("quietlyInvoke", "()V")
+                    | ("quietlyComplete", "()V")
+                    | ("quietlyJoin", "(JLjava/util/concurrent/TimeUnit;)Z")
+                    | ("quietlyJoinUninterruptibly", "(JLjava/util/concurrent/TimeUnit;)Z")
+                    | ("quietlyJoinPoolInvokeAllTask", "(J)V")
             );
         if real_forkjoinpool_enabled()
             && matches!(
@@ -5754,7 +6059,7 @@ impl NativeMethodRegistry {
         // Real-JDK mode: drop the `Executors` POOL FACTORIES so the real
         // `java.util.concurrent.Executors` bytecode builds every executor.
         //
-        // JDK-ONLY-WAVE2 L10 (`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`,
+        // JDK-ONLY-WAVE2 L10 (`L10-blocker-threadpool-init-DONE-20260806.md`,
         // `docs/jdk-only-runtime-services.md` P1). The scheduled pair has been
         // dropped here since the Tomcat `ContainerBase` fix; the three plain-pool
         // factories were the ones still fabricating. What they did was subtler
@@ -5814,6 +6119,44 @@ impl NativeMethodRegistry {
                     | "newCachedThreadPool"
                     | "newSingleThreadExecutor"
             )
+        {
+            return;
+        }
+        // Real-JDK mode: drop the two `identity()` FACTORIES so `java.base`'s
+        // own bytecode runs and the VM spins a real lambda proxy.
+        //
+        // JDK-ONLY-WAVE2 L18 (`docs/known-issues/jdk-only/L18-function-identity-not-synthetic.md`).
+        // `Function.identity()` and `UnaryOperator.identity()` are each a single
+        // `invokedynamic` returning `t -> t` (verified with `javap -p -c` against
+        // the JDK 25 image), so the class HotSpot answers with is a generated
+        // `$$Lambda` hidden class: `isSynthetic()` true, name containing
+        // `$$Lambda`. CratonVM intercepted both with a native returning a
+        // hand-made `java/util/function/Function$Identity` stand-in — an
+        // ordinary named class that fails all three predicates
+        // (`RJdkLambdas.java:61,62,66`). `--jdk-only` already drops these
+        // (`SyntheticStub`) and passes that block; this makes real-JDK mode
+        // agree. The `invokedynamic` opcode is short-circuited in
+        // `vm/src/runtime/invokedynamic.rs` and never calls the
+        // `LambdaMetafactory` natives, so the proxy-spinning machinery is the
+        // same code in both modes and the strict arm's result transfers.
+        //
+        // Only the FACTORIES. `Function$Identity.{apply,andThen,compose}` keep
+        // their registrations and simply become unreachable — dropping the
+        // instance methods while one of the two factory copies survived is
+        // exactly the 2026-07-14 `d8092acb` regression
+        // (`UnsatisfiedLinkError: Function$Identity.andThen` on WildFly boot).
+        // Dropping by class+method here covers BOTH factory copies
+        // (`native-builtins/src/lib.rs`'s `register_function_identity_natives`
+        // and `native-builtins/src/phases_late/streams.rs`) at once, so that
+        // split cannot recur. And the synthetic-JDK build never sets this flag,
+        // so its stand-in — which has no real bytecode to fall back to — is
+        // untouched.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/util/function/Function" | "java/util/function/UnaryOperator"
+            )
+            && method_name == "identity"
         {
             return;
         }

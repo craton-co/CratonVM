@@ -981,7 +981,10 @@ fn load_class_visible_to(
             cratonvm_types::error::VmError::ClassFile(
                 cratonvm_types::error::ClassFileError::ClassNotFound { class_name },
             ),
-        )) if class_name != internal => {
+        )) if class_name != internal
+            && cratonvm_classloading::array_descriptor_element_class(internal)
+                != Some(class_name.as_str()) =>
+        {
             tracing::debug!(
                 requested = internal,
                 missing_dependency = %class_name,

@@ -589,16 +589,120 @@ pub(crate) fn native_random_next_gaussian(
 /// `sr.getAlgorithm().equals(…)` or logging it got an NPE instead of a name.
 /// Record the same name the `getInstanceStrong()` factory already stamps via
 /// `make_secure_random`, so every construction route agrees.
+///
+/// STUB-REMOVAL (jdk-wave2 L8): `provider` was the *other* field the real
+/// `getDefaultPRNG` stamps, and it stayed null — so `getProvider()` (plain JDK
+/// bytecode reading that field; no native overrides it) answered null on every
+/// instance this module hands out. `regression-suite/src/RJdkSecurity.java:136`
+/// asserts `sr.getProvider() != null` and failed in BOTH `--real-jdk` and
+/// `--jdk-only`. Attach the owning `Provider` here as well.
 fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return;
     };
     // `create_string` can move the heap; pin `this` across it.
     let pin = ctx.pin_native_root(this);
-    let algo = ctx.create_string("OS-CSPRNG");
+    let algo = ctx.create_string(DEFAULT_ALGORITHM);
     let this = ctx.read_native_pin(pin, this);
     ctx.set_field_by_name(this, "algorithm", Value::Object(Some(algo)));
     ctx.unpin_native_roots(pin);
+    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM);
+}
+
+// ---------------------------------------------------------------------------
+// Algorithm names and the owning Provider
+// ---------------------------------------------------------------------------
+
+/// The algorithm name this module stamps on instances built by the plain
+/// constructors and by `getInstanceStrong()` — every draw on those instances
+/// reads the OS CSPRNG (see the module header), which is what the name says.
+const DEFAULT_ALGORITHM: &str = "OS-CSPRNG";
+
+/// The provider a stock JDK 25 registers `algo` under, or `None` when the name
+/// is not one of the platform PRNGs at all.
+///
+/// Normalisation is alphanumeric-only + upper-case, matching
+/// `jca::message_digest::algorithm_supported` and the JCA rule that algorithm
+/// lookup is case-insensitive ("Windows-PRNG" → "WINDOWSPRNG").
+fn secure_random_static_provider(algo: &str) -> Option<&'static str> {
+    let normalised: String = algo
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    match normalised.as_str() {
+        // SUN, JDK 9+: `DRBG` is the default and `SHA1PRNG` the legacy
+        // algorithm — the two seeded into the service table by
+        // `jca::provider_chain::seed_direct_native_engine_services`. The
+        // `NativePRNG` family is registered by SUN on Unix only; accepting it
+        // on every host is strictly closer to HotSpot than refusing a name
+        // that is valid on the platform half the corpus runs on.
+        "DRBG" | "SHA1PRNG" | "NATIVEPRNG" | "NATIVEPRNGBLOCKING"
+        | "NATIVEPRNGNONBLOCKING" => Some("SUN"),
+        // SunMSCAPI — Windows only.
+        "WINDOWSPRNG" => Some("SunMSCAPI"),
+        // Our own name, stamped by the constructors and `getInstanceStrong()`.
+        // A caller that round-trips `getAlgorithm()` back through
+        // `getInstance` must not be refused by the check below.
+        "OSCSPRNG" => Some("SUN"),
+        _ => None,
+    }
+}
+
+/// Whether `SecureRandom.getInstance(algo)` may succeed.
+///
+/// Real JDK resolves the name through the provider service map and throws
+/// `NoSuchAlgorithmException` when nothing owns it. This module deliberately
+/// bypasses that map (see the `getInstance` section below), and the bypass used
+/// to fabricate an instance for *any* string — so
+/// `SecureRandom.getInstance("NO-SUCH-PRNG")` quietly returned a working PRNG
+/// where HotSpot raises (`regression-suite/src/RJdkSecurity.java:161`).
+///
+/// The static table is consulted first so the answer does not depend on the
+/// service table having been seeded yet; a caller-registered provider
+/// (`Security.addProvider` + `Provider.put("SecureRandom.<algo>", …)`) is
+/// picked up by the second arm, which reads the very table `Security.getImpl`
+/// consults.
+fn secure_random_algorithm_supported(algo: &str) -> bool {
+    secure_random_static_provider(algo).is_some()
+        || crate::jca::provider_chain::find_service_provider("SecureRandom", algo).is_some()
+}
+
+/// Name to report from `SecureRandom.getProvider().getName()`. A provider that
+/// actually claims the algorithm in the service table wins (that is what real
+/// JDK's search order yields, including for user-registered providers); the
+/// static table is the fallback.
+fn secure_random_provider_name(algo: &str) -> String {
+    if let Some(owner) = crate::jca::provider_chain::find_service_provider("SecureRandom", algo) {
+        return owner;
+    }
+    secure_random_static_provider(algo)
+        .unwrap_or("SUN")
+        .to_string()
+}
+
+/// Populate the real `provider` field so `SecureRandom.getProvider()` answers a
+/// live `java.security.Provider` rather than null.
+///
+/// Returns the (possibly GC-forwarded) receiver: materialising the Provider
+/// allocates several objects, so the caller's `ObjectRef` can be stale on
+/// return — `make_secure_random` hands its result straight back to Java, which
+/// is exactly the shape that turns a missed re-read into a silent stale-oop.
+fn secure_random_attach_provider(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    algo: &str,
+) -> ObjectRef {
+    let name = secure_random_provider_name(algo);
+    let pin = ctx.pin_native_root(this);
+    // `resolve_or_make_provider` hands back the caller's REAL registered
+    // Provider when there is one, so `getProvider().getInfo()` et al. report
+    // what that provider's own constructor set.
+    let provider = crate::jca::provider_chain::resolve_or_make_provider(ctx, &name);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.set_field_by_name(this, "provider", Value::Object(Some(provider)));
+    ctx.unpin_native_roots(pin);
+    this
 }
 
 // ---------------------------------------------------------------------------
@@ -1288,7 +1392,9 @@ fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef
     // regardless of synthetic vs real-JDK field ordering.
     ctx.set_field_by_name(sr, "algorithm", Value::Object(Some(algo_str)));
     ctx.unpin_native_roots(pin);
-    sr
+    // `provider` is the second field `getDefaultPRNG` / `GetInstance` stamp;
+    // without it `getProvider()` reads back null. Returns the forwarded `sr`.
+    secure_random_attach_provider(ctx, sr, algorithm)
 }
 
 /// `SecureRandom.getInstance(String algorithm)` — static factory.  `algorithm`
@@ -1308,6 +1414,19 @@ pub(crate) fn native_secure_random_get_instance(
             }
             .into(),
         );
+    }
+    // Real JDK dead-ends an unknown name in `GetInstance` with
+    // `NoSuchAlgorithmException("<algo> SecureRandom not available")`. Because
+    // this native bypasses the provider search entirely it used to fabricate a
+    // working PRNG for every string, so ordinary probing code
+    // (`try { getInstance(x) } catch (NoSuchAlgorithmException e) { fallback }`)
+    // never took its fallback and an outright typo went undetected. Mirror the
+    // real contract, including the message wording.
+    if !secure_random_algorithm_supported(&algo) {
+        return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx,
+            &format!("{algo} SecureRandom not available"),
+        ));
     }
     Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)))))
 }
@@ -1355,7 +1474,7 @@ pub(crate) fn native_secure_random_get_instance_strong(
 ) -> MethodCallResult {
     Ok(Some(Value::Object(Some(make_secure_random(
         ctx,
-        "OS-CSPRNG",
+        DEFAULT_ALGORITHM,
     )))))
 }
 
@@ -1656,6 +1775,36 @@ mod tests {
             t.remove(&KEY_A);
             t.remove(&KEY_B);
         });
+    }
+
+    /// The static half of the `getInstance` name check. Deliberately does NOT
+    /// exercise `secure_random_algorithm_supported`, which reaches into the
+    /// process-global JCA service table that `provider_chain`'s own tests
+    /// reset — the static table is what makes the check independent of that.
+    #[test]
+    fn test_secure_random_static_provider_names() {
+        // JCA algorithm lookup is case-insensitive and ignores punctuation.
+        assert_eq!(secure_random_static_provider("SHA1PRNG"), Some("SUN"));
+        assert_eq!(secure_random_static_provider("sha1prng"), Some("SUN"));
+        assert_eq!(secure_random_static_provider("DRBG"), Some("SUN"));
+        assert_eq!(
+            secure_random_static_provider("Windows-PRNG"),
+            Some("SunMSCAPI")
+        );
+        assert_eq!(
+            secure_random_static_provider("NativePRNGNonBlocking"),
+            Some("SUN")
+        );
+        // The name this module stamps must round-trip through getInstance.
+        assert_eq!(
+            secure_random_static_provider(DEFAULT_ALGORITHM),
+            Some("SUN")
+        );
+        // The regression the check exists for: a name no provider owns must
+        // NOT resolve, so `getInstance` can raise NoSuchAlgorithmException
+        // instead of fabricating a PRNG.
+        assert_eq!(secure_random_static_provider("NO-SUCH-PRNG"), None);
+        assert_eq!(secure_random_static_provider(""), None);
     }
 
     #[test]

@@ -1258,7 +1258,7 @@ const PB_FIELD_ENVIRONMENT: usize = 2;
 // four extra slots did not exist, so every write to them was dropped and every
 // read of them returned nothing. The same shape on the `Runtime.exec` route is
 // what emptied Tomcat's CGI response body -- see
-// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
+// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
 // It was unreachable here only because `register_io_natives` registers over
 // these triples later, which is a property of boot ordering, not of this code.
 
@@ -1586,16 +1586,15 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // have returned an fd. Removed rather than re-pointed at the new slots: a
     // second reader of a layout with one writer is how the two drift apart.
 
-    // ProcessHandle stub
+    // ProcessHandle stub. Shares `register_p60_process_handle`'s
+    // implementation: this triple is registered from BOTH registrars and the
+    // two must not answer differently depending on which ran last — the same
+    // contract the `isAlive` registration below already carries.
     r.register(
         "java/lang/ProcessHandle",
         "current",
         "()Ljava/lang/ProcessHandle;",
-        |ctx, _args| {
-            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
-            ctx.set_field(handle, 0, Value::Long(std::process::id() as i64));
-            Ok(Some(Value::Object(Some(handle))))
-        },
+        p60_process_handle_current,
     );
 
     r.register("java/lang/ProcessHandle", "pid", "()J", |ctx, args| {
@@ -2100,6 +2099,143 @@ fn p60_parent_pid() -> i64 {
 /// Every `ProcessHandle` this VM hands out is built by one of the factories in
 /// this file (`current`, `parent`, `Process.toHandle`), all of which stamp the
 /// pid into slot 0, so this is the handle's whole identity.
+/// Per-VM memo of THE `ProcessHandle.current()` object, as a JNI-global-root
+/// handle (`NativeContext::add_global_root`) — never a raw `ObjectRef`, because
+/// this table outlives any number of collections and a global ref is the one
+/// root form the moving GC both keeps alive and remaps.
+///
+/// Keyed by `ctx.vm_identity()`: Rust tests build several `Vm`s in one process,
+/// and a process-global object cache goes stale across VM lifetimes. Same shape
+/// as `jboss_jdkspecific::boot_layer_memo`, for the same reason.
+fn p60_current_handle_memo() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `java/lang/ProcessHandle.current()` — shared by both registrars in this file.
+///
+/// Two defects, one fix.
+///
+/// 1. It allocated a FRESH handle on every call, so
+///    `ProcessHandle.current().equals(ProcessHandle.current())` was false and
+///    the two `hashCode()`s differed. HotSpot's `ProcessHandle.current()` is
+///    `getstatic ProcessHandleImpl.current` — a singleton. Measured:
+///    `regression-suite/src/RJdkProcess.java:103` ("current() must be equal
+///    across calls") fails in `--real-jdk` AND `--jdk-only` while HotSpot 25
+///    runs the vector 26/26 green. Same shape as the `ModuleLayer.boot()` fix
+///    in `jboss_jdkspecific.rs`, and memoised the same way.
+///
+/// 2. The object it minted was a bare 1-field allocation under the
+///    `java/lang/ProcessHandle` INTERFACE, which declares `equals`, `hashCode`,
+///    `onExit`, `children`, `descendants`, `destroy`, `parent` and `info`
+///    abstract — so all of them answered from this file's stubs, and three
+///    answered wrongly in a way no identity memo can repair:
+///      * `ProcessHandle.of(pid).get().equals(current())` — `of` is NOT
+///        registered anywhere, so it runs real bytecode and yields a real
+///        `java.lang.ProcessHandleImpl`, whose `equals` opens with
+///        `obj instanceof ProcessHandleImpl`; a bare-interface allocation fails
+///        that test however stable its identity is (`RJdkProcess.java:106`).
+///      * `current().onExit()` returned a COMPLETED future where the JDK
+///        specifies `IllegalStateException` (`RJdkProcess.java:145-150`).
+///      * `current().children()` / `descendants()` returned an EMPTY stream — a
+///        fabricated "this process has no children", indistinguishable from a
+///        true empty answer (`RJdkProcess.java:188-189`).
+///
+/// So prefer a REAL `java.lang.ProcessHandleImpl(pid, startTime)`, exactly as
+/// `native-io::process::build_process_handle` already does for
+/// `Process.toHandle()`. Everything else on the handle then routes through the
+/// JDK's own bytecode into the `ProcessHandleImpl` natives already registered
+/// in `native-io/src/process.rs` (`isAlive0`, `parent0`, `destroy0`,
+/// `getProcessPids0`, `Info.info0`).
+///
+/// A THIRD defect, found in wave 5 (W5-2): `startTime` was a hardcoded `0`.
+///
+/// That is the JDK's `STARTTIME_ANY` wildcard, and it IS honoured by
+/// `ProcessHandleImpl.equals` and `.isAlive()` — which is why the handle still
+/// compared equal to the one `ProcessHandle.of(pid)` builds with a real start
+/// time, and why this survived four waves unnoticed.
+/// `ProcessHandleImpl$Info.info(long pid, long startTime)` does NOT honour it:
+/// its check is a bare `startTime != info.startTime`, and on a mismatch it
+/// nulls `command`, `arguments`, `startTime`, `totalTime` and `user` on the
+/// record `info0` has just filled in. With `0` on this side and a real start
+/// time from `info0` on the other, the mismatch was permanent and
+/// `ProcessHandle.current().info()` was permanently empty — silently, because
+/// every field of `Info` is an `Optional` and an empty one is a legal answer.
+///
+/// HotSpot's `<clinit>` seeds its own singleton with
+/// `new ProcessHandleImpl(pid, isAlive0(pid))`, so the correct value is
+/// whatever `isAlive0` reports; `current_process_start_time()` IS that function
+/// (`start_time_or_any`), which makes the three answers agree by construction.
+/// Measured: `regression-suite/src/RJdkProcess.java` runs 53 checks on HotSpot
+/// 25 and ran 51 here, because the two `check(...)` calls guarded by
+/// `info.command().isPresent()` (:135) and `info.startInstant().isPresent()`
+/// (:138) never executed. Nothing threw; only the counter moved. See
+/// docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md.
+///
+/// The bare-interface allocation stays as the synthetic-JDK fallback, where
+/// `java/lang/ProcessHandleImpl` does not exist; there the memo alone supplies
+/// `equals`/`hashCode` by identity.
+fn p60_process_handle_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let vm = ctx.vm_identity();
+    // The guard is released before any `ctx` call — a mutex held across a
+    // re-entrant VM call is how this table would deadlock itself.
+    let cached_handle = {
+        let memo = p60_current_handle_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        memo.get(&vm).copied()
+    };
+    if let Some(handle) = cached_handle {
+        if let Some(cached) = ctx.resolve_global_root(handle) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+    }
+
+    let pid = std::process::id() as i64;
+    // NOT the `STARTTIME_ANY` 0 this used to pass. `startTime` is a wildcard for
+    // `equals()`/`isAlive()` only; `ProcessHandleImpl$Info.info(pid, startTime)`
+    // compares it with a bare `!=` and, on a mismatch, WIPES every field
+    // `info0` just wrote. `current_process_start_time` is the same
+    // `start_time_or_any` that `isAlive0` and `info0` answer with, so the three
+    // agree by construction — see its doc comment.
+    let start_time = cratonvm_native_io::process::current_process_start_time();
+    let obj = match ctx.new_object_initialized(
+        "java/lang/ProcessHandleImpl",
+        "(JJ)V",
+        &[Value::Long(pid), Value::Long(start_time)],
+    ) {
+        Ok(Some(Value::Object(Some(real)))) => real,
+        _ => {
+            let synth = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            ctx.set_field(synth, 0, Value::Long(pid));
+            synth
+        }
+    };
+
+    // Publish. `new_object_initialized` runs Java, so a re-entrant `current()`
+    // could have published first; prefer whatever is already there so identity
+    // never changes under a caller that already holds one.
+    let mut memo = p60_current_handle_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = memo.get(&vm).copied() {
+        drop(memo);
+        if let Some(cached) = ctx.resolve_global_root(handle) {
+            return Ok(Some(Value::Object(Some(cached))));
+        }
+        memo = p60_current_handle_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    let root = ctx.add_global_root(obj);
+    if root != 0 {
+        memo.insert(vm, root);
+    }
+    drop(memo);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
 fn p60_handle_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<i64> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2192,7 +2328,14 @@ fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     }
     let parent = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
     ctx.set_field(parent, 0, Value::Long(parent_pid));
+    // GC-SAFETY (native stale-local family): `parent` is not yet reachable
+    // from any Java root, and the `Optional` allocation below is a collection
+    // point that can relocate it. Holding it in a bare local across that call
+    // and then storing it is the use-after-move that corrupts the heap.
+    let parent_pin = ctx.pin_native_root(parent);
     let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let parent = ctx.read_native_pin(parent_pin, parent);
+    ctx.unpin_native_roots(parent_pin);
     ctx.set_field(optional, 0, Value::Object(Some(parent)));
     Ok(Some(Value::Object(Some(optional))))
 }
@@ -2207,11 +2350,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         ph,
         "current",
         "()Ljava/lang/ProcessHandle;",
-        |ctx, _args| {
-            let handle = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
-            ctx.set_field(handle, 0, Value::Long(std::process::id() as i64));
-            Ok(Some(Value::Object(Some(handle))))
-        },
+        p60_process_handle_current,
     );
     r.register(ph, "pid", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2311,8 +2450,15 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         let Ok(exe) = std::env::current_exe() else {
             return p60_empty_optional(ctx, args);
         };
+        // GC-SAFETY (native stale-local family): `text` is freshly allocated
+        // and reachable from no Java root, and the `Optional` allocation below
+        // is a collection point that can relocate it. Pin across the alloc and
+        // re-read the forwarded ref before the (allocation-free) field write.
         let text = ctx.create_string(&exe.to_string_lossy());
+        let text_pin = ctx.pin_native_root(text);
         let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let text = ctx.read_native_pin(text_pin, text);
+        ctx.unpin_native_roots(text_pin);
         ctx.set_field(optional, 0, Value::Object(Some(text)));
         Ok(Some(Value::Object(Some(optional))))
     });

@@ -1458,9 +1458,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
             // Map bare library name to platform-specific filename.
             // resolve_library_path() in NativeContextImpl will search java.library.path.
-            let lib_name = platform_lib_name(&name);
-            let _ = ctx.load_native_library(&lib_name); // best-effort; errors are swallowed
-            Ok(None)
+            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
         },
     );
     registry.register(
@@ -1474,8 +1472,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             };
             let path = ctx.read_string(path_obj).unwrap_or_default();
             crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            let _ = ctx.load_native_library(&path);
-            Ok(None)
+            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
         },
     );
 
@@ -1488,9 +1485,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             let name_obj = obj_arg(args, 0)?;
             let name = ctx.read_string(name_obj).unwrap_or_default();
             crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            let lib_name = platform_lib_name(&name);
-            let _ = ctx.load_native_library(&lib_name);
-            Ok(None)
+            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
         },
     );
     registry.register(
@@ -1501,10 +1496,154 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let path = ctx.read_string(path_obj).unwrap_or_default();
             crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            let _ = ctx.load_native_library(&path);
-            Ok(None)
+            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
         },
     );
+}
+
+/// Which of the two JDK spellings the caller used. `System.loadLibrary("zip")`
+/// passes a BARE name that has to be mapped through `System.mapLibraryName`
+/// before it can be opened; `System.load("/x/libzip.so")` passes a complete
+/// path that must be used verbatim (JLS: "the filename argument must be an
+/// absolute path name").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibrarySpelling {
+    BareName,
+    AbsolutePath,
+}
+
+/// The bare library names whose ENTIRE native surface this VM supplies from
+/// Rust, so a caller that asks for them has genuinely got what it asked for
+/// even though no shared object was opened.
+///
+/// These are the java.base-adjacent JNI libraries that ship inside the JDK
+/// image. CratonVM never successfully dlopen()s them — they are linked against
+/// `libjvm`/`jvm.dll`, which this process does not have, so the real load fails
+/// with `ERROR_MOD_NOT_FOUND` (measured on Windows: `LoadLibraryW` on
+/// `<java.home>/bin/{java,zip,net,nio,jimage,verify,management,management_ext,
+/// instrument,extnet,prefs}.dll` all fail with 126 outside a JVM process) —
+/// while every `Java_java_util_zip_*` / `Java_java_net_*` entry point they
+/// exist to provide is registered in this process as a Rust native. On HotSpot
+/// a *cold* `System.loadLibrary` of them SUCCEEDS, so answering
+/// `UnsatisfiedLinkError` for them would be a fresh divergence in the opposite
+/// direction. Anything NOT on this list is a library this VM has no
+/// implementation of, and the JDK contract for that is an error, not a silent
+/// return.
+///
+/// MEASURED (JDK 25.0.3 Windows x64, `System.loadLibrary` from the app class
+/// loader, nothing pre-loaded). Three names that used to be on this list are
+/// NOT loadable on HotSpot at all, because the file does not exist on
+/// `java.library.path`:
+///
+///   * `sunec`  — deleted from the JDK image; SunEC's native ECC was replaced
+///     by a Java implementation, which is why this crate ships
+///     `sunec_intpoly`/`sunec_point` intrinsics instead of a library.
+///   * `jvm`    — lives in `<java.home>/bin/server` (`lib/server` on Linux),
+///     which is on neither `java.library.path` nor `sun.boot.library.path`.
+///   * `jsig`   — no `jsig.dll` in the Windows image. `libjsig.so` DOES exist
+///     in `<java.home>/lib` on Linux/macOS, so this one is platform-split
+///     rather than deleted (see `PLATFORM_ONLY`).
+///
+/// `zip` is deliberately absent for a different, DYNAMIC reason. HotSpot's real
+/// rule is not "does the file exist" but "has the BOOT loader already loaded
+/// it": `NativeLibraries` rejects a second load of the same file from a
+/// different class loader with `UnsatisfiedLinkError: Native Library
+/// <path> already loaded in another classloader`. Measured, same image:
+///
+///   cold, directory classpath          loadLibrary("zip") -> LOADS
+///   after any java.util.zip native use  ->  THROWS (already loaded)
+///   cold, but classpath is a JAR        ->  THROWS (already loaded)
+///
+/// java.base itself boot-loads it (`ZipUtils.loadLibrary()` ->
+/// `BootLoader.loadLibrary("zip")` from `Inflater.<clinit>`), so ANY program
+/// that has touched `java.util.zip` — or that was merely launched from a jar —
+/// is in the throwing state before its own `loadLibrary("zip")` runs. CratonVM
+/// is permanently in the equivalent state: its zip natives are bound in-process
+/// from VM init and no shared object is ever opened. `RJdkJni` measures exactly
+/// this: `zipNatives()` runs immediately before `libraryLoading()`, so HotSpot's
+/// oracle prints `loadedLibrary=net` — `zip` must FAIL and fall through to the
+/// `net` probe (`RJdkJni.java:189-202`). This is a test-produced state, not a
+/// file-layout fact, so it holds identically on Linux.
+///
+/// KNOWN RESIDUAL: the same dynamic rule applies to `net`/`nio`/`prefs`, and
+/// this list cannot model it — there is no class-loader-scoped
+/// `loadedLibraryNames` bookkeeping anywhere in this VM. A program that uses
+/// `java.net` and then calls `System.loadLibrary("net")` gets a silent success
+/// here where HotSpot throws. `net` stays on the list because the measured
+/// oracle needs it: `RJdkJni` never touches `java.net` before line 195.
+pub(crate) fn is_vm_provided_jdk_library(name: &str) -> bool {
+    // Ships as a real, separately-present shared object in the JDK 25 image on
+    // every platform, and cold-loads on HotSpot.
+    const EVERY_PLATFORM: &[&str] = &[
+        "java",
+        "net",
+        "nio",
+        "jimage",
+        "verify",
+        "management",
+        "management_ext",
+        "instrument",
+        "extnet",
+        "prefs",
+        "j2pkcs11",
+    ];
+    // Present in one platform's image only. `sunmscapi.dll` is the Windows
+    // SunMSCAPI crypto provider and has no Unix counterpart; `libjsig.so` is
+    // the Unix signal-chaining shim and has no Windows counterpart.
+    #[cfg(windows)]
+    const PLATFORM_ONLY: &[&str] = &["sunmscapi"];
+    #[cfg(not(windows))]
+    const PLATFORM_ONLY: &[&str] = &["jsig"];
+
+    EVERY_PLATFORM.contains(&name) || PLATFORM_ONLY.contains(&name)
+}
+
+/// Open a native library, or raise the `UnsatisfiedLinkError` the JDK
+/// specifies.
+///
+/// `System.load`, `System.loadLibrary`, `Runtime.load` and `Runtime.loadLibrary`
+/// are all documented to throw `UnsatisfiedLinkError` when "the library does not
+/// exist, or the library cannot be mapped". All four bodies used to end in
+/// `let _ = ctx.load_native_library(..)` — the error was computed and dropped,
+/// so a request for a library that does not exist RETURNED NORMALLY. That is a
+/// fabricated success where the spec mandates a failure, and it is worse than a
+/// missing feature: a caller like Netty's `NativeLibraryLoader` or Tomcat's
+/// `AprLifecycleListener` is written to catch this error and fall back to a pure
+/// -Java path, so swallowing it left them believing a native backend was armed
+/// and failing much later, far from the cause. Measured:
+/// `regression-suite/src/RJdkFailure.java:261` ("loading an absent library must
+/// raise UnsatisfiedLinkError") failed in BOTH `--real-jdk` and `--jdk-only`
+/// while HotSpot 25 passed.
+///
+/// The load is still attempted first, so a library that really is on
+/// `java.library.path` still loads and `JNI_OnLoad` still runs. Only the failure
+/// path changed, and only for names outside [`is_vm_provided_jdk_library`].
+fn load_library_or_throw(
+    ctx: &mut dyn NativeContext,
+    requested: &str,
+    spelling: LibrarySpelling,
+) -> MethodCallResult {
+    let target = match spelling {
+        LibrarySpelling::BareName => platform_lib_name(requested),
+        LibrarySpelling::AbsolutePath => requested.to_string(),
+    };
+    if ctx.load_native_library(&target).is_ok() {
+        return Ok(None);
+    }
+    // A JDK-image library whose natives this VM already provides is not a
+    // failure — see `is_vm_provided_jdk_library`. Only a bare name can name
+    // one; `System.load("/some/path/libzip.so")` names a FILE, and a file that
+    // is not there is an error however it is spelled.
+    if spelling == LibrarySpelling::BareName && is_vm_provided_jdk_library(requested) {
+        return Ok(None);
+    }
+    // NOT memoised as a failure: the JDK re-attempts the lookup on every call
+    // (`RJdkFailure.java:269` asserts the second attempt throws too), and a
+    // library can legitimately appear on `java.library.path` between calls.
+    Err(RuntimeError::UnsatisfiedLinkError {
+        message: format!("no {requested} in java.library.path"),
+    }
+    .into())
 }
 
 pub(crate) fn native_runtime_get_runtime(
@@ -3548,6 +3687,66 @@ fn read_byte_array_define_class_slice(
     Ok(bytes)
 }
 
+/// Where a `java.nio.ByteBuffer`'s backing array and cursors actually live.
+///
+/// The synthetic stub this crate fabricates puts the backing `byte[]` at slot
+/// 0 and `position`/`limit`/`capacity` at 1/2/3. A **real** JDK heap buffer
+/// does not: `java.nio.HeapByteBuffer` declares no instance fields of its
+/// own, so its layout is its ancestors' —
+/// `java.nio.Buffer{mark,position,limit,capacity,address,segment}` at 0..5 and
+/// `java.nio.ByteBuffer{hb,offset,isReadOnly,bigEndian,nativeByteOrder}` at
+/// 6..10 (`javap -p java.nio.Buffer java.nio.ByteBuffer`). Slot 0 on a real
+/// buffer is therefore `mark`, an `int` — the array branch below was skipped
+/// for every real heap buffer, execution fell into the direct-buffer path,
+/// `address` read back 0, and
+/// `ClassLoader.defineClass(String, ByteBuffer, ProtectionDomain)` threw
+/// "direct ByteBuffer has no native address" for a perfectly valid heap
+/// buffer. (`position`/`limit`/`capacity` at 1/2/3 happen to coincide with
+/// the real layout; `hb` does not, and neither does `offset`.)
+///
+/// `hb` is also the discriminator, and it needs no mode flag: a fabricated
+/// synthetic stub names its fields `_f0.._fN`, so the by-name resolve MISSES
+/// there and the synthetic slots are used unchanged. A real *direct* buffer
+/// still resolves `hb` (it is declared on `ByteBuffer`, not `HeapByteBuffer`)
+/// and simply reads back null, which correctly routes to the address path.
+struct BbDefineLayout {
+    /// Backing `byte[]`, or `None` for a direct buffer.
+    hb: usize,
+    /// `ByteBuffer.offset` — index of the buffer's element 0 inside `hb`.
+    /// Non-zero for anything produced by `slice()`. `None` on the synthetic
+    /// stub, which has no such field and always starts at 0.
+    offset: Option<usize>,
+    position: usize,
+    limit: usize,
+    capacity: usize,
+}
+
+fn bb_define_layout(ctx: &dyn NativeContext, bb: ObjectRef) -> BbDefineLayout {
+    let cid = ctx.class_id_of_object(bb);
+    let named = |n: &str| ctx.resolve_field_index_by_class_id(cid, n);
+    match (
+        named("hb"),
+        named("position"),
+        named("limit"),
+        named("capacity"),
+    ) {
+        (Some(hb), Some(position), Some(limit), Some(capacity)) => BbDefineLayout {
+            hb,
+            offset: named("offset"),
+            position,
+            limit,
+            capacity,
+        },
+        _ => BbDefineLayout {
+            hb: 0,
+            offset: None,
+            position: 1,
+            limit: 2,
+            capacity: 3,
+        },
+    }
+}
+
 fn read_byte_buffer_define_class_slice(
     ctx: &dyn NativeContext,
     bb: ObjectRef,
@@ -3555,28 +3754,41 @@ fn read_byte_buffer_define_class_slice(
     length: usize,
     class_name: &str,
 ) -> Result<Vec<u8>, MethodCallFailed> {
-    let pos_slot = 1;
-    let limit_slot = 2;
-    let capacity_slot = 3;
+    let layout = bb_define_layout(ctx, bb);
+    let pos_slot = layout.position;
+    let limit_slot = layout.limit;
+    let capacity_slot = layout.capacity;
 
-    if let Value::Object(Some(array)) = ctx.get_field(bb, 0) {
+    if let Value::Object(Some(array)) = ctx.get_field(bb, layout.hb) {
+        // `hb` is shared with every other view of the same array; the buffer's
+        // own element 0 sits at `hb_base`. Zero for the synthetic stub and for
+        // a whole-array `ByteBuffer.wrap`, non-zero for a `slice()`.
+        let hb_base = layout
+            .offset
+            .map(|s| ctx.get_field(bb, s).as_int().unwrap_or(0).max(0) as usize)
+            .unwrap_or(0);
+        let arr_len = ctx.array_length(array);
+        let cap = arr_len.saturating_sub(hb_base);
         let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
         let limit = ctx
             .get_field(bb, limit_slot)
             .as_int()
-            .unwrap_or_else(|| ctx.array_length(array) as i32)
+            .unwrap_or(cap as i32)
             .max(0) as usize;
-        let cap = ctx.array_length(array);
-        let absolute_off = pos
+        // Bounds are checked in buffer-relative coordinates, then translated.
+        let relative_off = pos
             .checked_add(offset)
             .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         let upper = limit.min(cap);
-        let end = absolute_off
+        let end = relative_off
             .checked_add(length)
             .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         if end > upper {
             return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32).into());
         }
+        let absolute_off = hb_base
+            .checked_add(relative_off)
+            .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         return read_byte_array_define_class_slice(ctx, array, absolute_off, length);
     }
 
@@ -4076,13 +4288,20 @@ pub(crate) fn native_classloader_define_class0(
 
     // `init` (boolean) at arg 7: run <clinit> after define.
     let initialize = matches!(args.get(7), Some(Value::Int(v)) if *v != 0);
-    // `flags` (int) at arg 8: bit 0 = HIDDEN, bit 1 = STRONG, bit 2 = NESTMATE.
+    // `flags` (int) at arg 8. JDK 25 `MethodHandleNatives.Constants`:
+    //   NESTMATE_CLASS = 0x01, HIDDEN_CLASS = 0x02, STRONG_LOADER_LINK = 0x04,
+    //   ACCESS_VM_ANNOTATIONS = 0x08.
+    // This block previously read bit 0 as HIDDEN (that is NESTMATE) and bit 2
+    // as NESTMATE (that is STRONG), so a non-nestmate `defineHiddenClass`
+    // (flags 0x02) decoded as `hidden = false` and collided on a duplicate
+    // define. `classloader.rs:4048-4057` has carried the correct constants all
+    // along — see DEFINE_CLASS0_FLAG_* there.
     let flags = match args.get(8) {
         Some(Value::Int(f)) => *f,
         _ => 0,
     };
-    let hidden = (flags & 0x1) != 0;
-    let nestmate = (flags & 0x4) != 0;
+    let nestmate = (flags & 0x1) != 0;
+    let hidden = (flags & 0x2) != 0;
 
     // If hidden, mangle the name uniquely.
     let (effective_name, override_name) = if hidden {

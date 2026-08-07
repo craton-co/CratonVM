@@ -878,6 +878,15 @@ fn clear_overlay_entries_for_key(key: usize, owner_addr: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
+    // The `--jdk-only` snapshot iterator's backing collection. Keyed by the
+    // ITERATOR, which is short-lived, so without this sweep every strict-mode
+    // `HashSet.iterator()` would leave a permanent entry AND a rooted backing
+    // set — and a later object recycling the dead iterator's identity hash
+    // would inherit a `remove()` that writes into someone else's collection.
+    snapshot_itr_backing_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     // `lhm_ptr_cache` maps raw pointer -> packed key; drop any entry pointing at
     // the cleared key so a stale pointer can't resolve back to it.
     lhm_ptr_cache()
@@ -1906,7 +1915,11 @@ pub fn make_iterator_from_array(
     // then builds the same shape.
     if ctx.array_length(snapshot_array) != size {
         let cur = ctx.read_native_pin(array_pin, snapshot_array);
-        match real_snapshot_iterator(ctx, cur, size) {
+        // `None`: this entry point is handed a bare array and knows of no
+        // collection behind it, so `remove()` must keep raising
+        // `UnsupportedOperationException` — which is what the real
+        // `Arrays.asList(a).iterator()` does too.
+        match real_snapshot_iterator(ctx, cur, size, None) {
             Ok(v) => {
                 ctx.unpin_native_roots(array_pin);
                 return Ok(v);
@@ -1986,17 +1999,35 @@ fn make_fabricated_iterator_from_array(
 /// [`make_iterator_from_array`], i.e. back to the fabricated class this
 /// function exists to avoid.
 ///
-/// One behaviour genuinely differs, and it is loud rather than silent:
-/// `remove()` on the fabricated iterator writes through to the backing
-/// collection (`native_map_key_itr_remove` / `native_ts_itr_remove`), while a
-/// fixed-size list's iterator raises `UnsupportedOperationException` from real
-/// JDK bytecode. On the strict path the alternative is not a working
-/// `remove()` — it is an iteration that never reaches `next()`.
+/// `remove()` used to be the one behaviour that genuinely differed: it writes
+/// through to the backing collection on the fabricated iterator
+/// (`native_map_key_itr_remove` / `native_ts_itr_remove`), while a real
+/// `Arrays$ArrayItr` declares no `remove()` at all and reaches the
+/// `java.util.Iterator.remove()` DEFAULT method, whose whole body is
+/// `throw new UnsupportedOperationException("remove")`.
+///
+/// That difference was not survivable. `com.sun.jmx.mbeanserver.MXBeanSupport`
+/// reduces a `HashSet` of candidate MXBean interfaces with `it.remove()` inside
+/// `while (candidates.size() > 1)`, so `--jdk-only` died on
+/// `ManagementFactory.getPlatformMBeanServer()` with
+/// `NotCompliantMBeanException: sun.management.GarbageCollectorImpl: remove`
+/// (`regression-suite/src/RJdkJmx.java:133`). `backing` closes it: the caller
+/// names the live collection, it is recorded in
+/// [`snapshot_itr_backing_table`], and `native_itr_remove_noop`'s
+/// `Arrays$ArrayItr` arm deletes from it. A caller with no backing to offer
+/// passes `None` and keeps the JDK-correct `UnsupportedOperationException`.
 fn real_snapshot_iterator(
     ctx: &mut dyn NativeContext,
     elems: ObjectRef,
     count: usize,
+    backing: Option<(ObjectRef, SnapshotItrRoute)>,
 ) -> MethodCallResult {
+    // GC-SAFETY: `backing` is a bare Rust local, and everything below it
+    // allocates (the exact-length copy, the iterator itself). Root it for the
+    // whole function and read it back through the pin before it is stored, or
+    // the table would hold a from-space reference to the collection whose
+    // `remove()` must land.
+    let backing_pin = backing.map(|(b, _)| ctx.pin_native_root(b));
     // `Arrays$ArrayList` derives `size()` from `a.length`, so the array it is
     // handed has to be exactly the logical length. Callers over-allocate:
     // `native_ts_iterator` snapshots into `size.max(1)` slots, which would
@@ -2014,21 +2045,35 @@ fn real_snapshot_iterator(
         exact
     };
     match alloc_real_array_iterator(ctx, arr) {
-        Some(itr) => Ok(Some(Value::Object(Some(itr)))),
+        Some(itr) => {
+            // Nothing allocates between here and the store, and `itr` is the
+            // freshly returned (already post-allocation) reference.
+            if let (Some(pin), Some((b, route))) = (backing_pin, backing) {
+                let b = ctx.read_native_pin(pin, b);
+                record_snapshot_itr_backing(ctx, itr, b, route);
+                ctx.unpin_native_roots(pin);
+            }
+            Ok(Some(Value::Object(Some(itr))))
+        }
         // Nothing is left to fall back TO — returning the fabricated shape
         // here would defeat the whole point — so surface a refusal naming the
         // class that is actually missing, not the synthetic one the caller
         // asked for.
-        None => Err(cratonvm_native_api::refusal_to_java_failure(
-            ctx,
-            cratonvm_native_api::ClassIdentityError::Refused {
-                name: "java/util/Arrays$ArrayItr".to_string(),
-                reason: "--jdk-only: a snapshot iterator needs the real array \
-                         iterator to stand in for the refused \
-                         `java.util.HashMap$KeyItr`, and this image has none"
-                    .to_string(),
-            },
-        )),
+        None => {
+            if let Some(pin) = backing_pin {
+                ctx.unpin_native_roots(pin);
+            }
+            Err(cratonvm_native_api::refusal_to_java_failure(
+                ctx,
+                cratonvm_native_api::ClassIdentityError::Refused {
+                    name: "java/util/Arrays$ArrayItr".to_string(),
+                    reason: "--jdk-only: a snapshot iterator needs the real array \
+                             iterator to stand in for the refused \
+                             `java.util.HashMap$KeyItr`, and this image has none"
+                        .to_string(),
+                },
+            ))
+        }
     }
 }
 
@@ -2046,9 +2091,11 @@ fn real_snapshot_iterator(
 /// So this is construction, not a fabricated layout: both fields are declared
 /// by the real class, both are written by NAME, and both receive a value of the
 /// declared type — the same thing `ArrayItr(E[] a)` does, minus running a
-/// constructor whose entire body is `this.a = a`. Everything the iterator then
-/// does — `hasNext`, `next`, and the inherited `remove` that throws — is real
-/// JDK bytecode reading real fields.
+/// constructor whose entire body is `this.a = a`. `hasNext` and `next` are then
+/// real JDK bytecode reading real fields. `remove` is the one exception, and
+/// only when the creator recorded a backing collection for it: the real class
+/// declares none, so the call would otherwise reach the `Iterator.remove()`
+/// default and throw — see [`snapshot_itr_backing_table`].
 ///
 /// `arr` must ALREADY be exactly the logical length: `hasNext()` is
 /// `cursor < a.length`, so an over-allocated snapshot would iterate trailing
@@ -2111,6 +2158,143 @@ pub fn alloc_real_snapshot_iterator_of(
     Some(itr)
 }
 
+// ---------------------------------------------------------------------------
+// Write-through backing for the `--jdk-only` snapshot iterator
+// ---------------------------------------------------------------------------
+//
+// `real_snapshot_iterator` hands back a REAL `java.util.Arrays$ArrayItr`, whose
+// JDK 25 declaration is exactly
+//
+//     private static class ArrayItr<E> implements Iterator<E> {
+//         private int cursor;
+//         private final E[] a;
+//         ...  hasNext()  next()
+//     }
+//
+// — two fields, no `remove()`, and no third slot a backing pointer could live
+// in. The fabricated `HashMap$KeyItr` it replaces carries that pointer in
+// `MAP_KEY_ITR_FIELD_BACKING` and its position in `MAP_KEY_ITR_FIELD_LAST_RET`;
+// this table is where the same two facts live for the real shape.
+//
+// WHY IT MUST WRITE THROUGH. `MXBeanSupport.findMXBeanInterface` reduces its
+// candidate set with
+//
+//     while (candidates.size() > 1) { ... it.remove(); continue reduce; }
+//
+// so an iterator whose `remove()` mutates only the snapshot leaves `size()`
+// unchanged and turns that loop into a livelock (or, once the outer `for` runs
+// out, `IllegalArgumentException: implements more than one MXBean interface`).
+// Wrapping the snapshot in a mutable `ArrayList` and returning ITS iterator
+// looks like a one-line fix and is exactly this trap.
+
+/// Which `remove(Object)` implementation owns the collection behind a snapshot
+/// iterator. Recorded by the CREATOR, which knows; deriving it at removal time
+/// from the backing's class would have to re-guess what `native_hs_iterator` /
+/// `native_ts_iterator` already knew.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SnapshotItrRoute {
+    /// `HashSet`, a `Map` key-set view, or a `ConcurrentHashMap$KeySetView` —
+    /// the family `native_map_key_itr_remove` already discriminates.
+    SetLike,
+    /// A native `TreeSet` (including the descending snapshot), removed through
+    /// the sorted array + size bookkeeping in [`ts_remove_element`].
+    TreeSet,
+}
+
+/// The live collection a snapshot iterator's `remove()` must delete from.
+#[derive(Clone, Copy)]
+struct SnapshotItrBacking {
+    backing: ObjectRef,
+    route: SnapshotItrRoute,
+    /// The `cursor` value at the last successful `remove()`, or `-1` before the
+    /// first one.
+    ///
+    /// The real `ArrayItr.next()` is real bytecode (`return a[cursor++]`), so
+    /// nothing of ours runs there to maintain a `lastRet`. It does not have to:
+    /// `cursor` alone says which element was last returned (`cursor - 1`), and
+    /// this field supplies the other half of the JDK's `IllegalStateException`
+    /// contract — `remove()` twice with no intervening `next()` finds `cursor`
+    /// unchanged since the previous removal.
+    last_removed_cursor: i32,
+}
+
+/// Iterator `ObjectRef` (as a GC-stable [`widened_obj_key`]) -> backing
+/// collection.
+///
+/// GC CONTRACT — this table holds a heap reference the collector cannot see any
+/// other way, so it is wired into all three overlay hooks, exactly like
+/// [`cslm_comparator_table`]:
+///
+///   * [`for_each_overlay_ref`] — the single funnel behind
+///     `gc_scan_collection_overlay_roots` (root scan) and
+///     `gc_update_collection_overlay_refs` (post-move remap), so the backing is
+///     both kept live and repointed by a moving young collection;
+///   * [`gc_overlay_roots_for_collection_with_keys`] — the per-owner rule the
+///     non-moving marker and the old-gen mark BFS use, so the backing is
+///     retained only while the ITERATOR is itself reachable;
+///   * [`clear_overlay_entries_for_key`] — reached from
+///     `gc_prune_dead_collection_overlays` and from `widened_obj_key`'s
+///     recycled-identity path, so a dead iterator's entry is swept and a later
+///     object that recycles its identity hash cannot inherit it.
+///
+/// The KEY is GC-safe for the same reason every other overlay key is: an
+/// identity hash travels with the object header across a relocation, and
+/// `overlay_owner_keys` is rebuilt onto post-move addresses by the remap.
+fn snapshot_itr_backing_table() -> &'static Mutex<StdHashMap<usize, SnapshotItrBacking>> {
+    static T: std::sync::OnceLock<Mutex<StdHashMap<usize, SnapshotItrBacking>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+/// Record the collection `itr`'s `remove()` must write through to.
+///
+/// `itr` and `backing` must both be POST-allocation references: the caller
+/// allocates the iterator and has to read `backing` back through its pin first.
+fn record_snapshot_itr_backing(
+    ctx: &dyn NativeContext,
+    itr: ObjectRef,
+    backing: ObjectRef,
+    route: SnapshotItrRoute,
+) {
+    let key = widened_obj_key(ctx, itr);
+    snapshot_itr_backing_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            key,
+            SnapshotItrBacking {
+                backing,
+                route,
+                last_removed_cursor: -1,
+            },
+        );
+}
+
+/// The recorded backing for `itr`, or `None` for a genuine snapshot iterator
+/// (no backing collection — `remove()` correctly raises
+/// `UnsupportedOperationException`).
+fn snapshot_itr_backing(ctx: &dyn NativeContext, itr: ObjectRef) -> Option<SnapshotItrBacking> {
+    let key = widened_obj_key(ctx, itr);
+    snapshot_itr_backing_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied()
+}
+
+/// Record that `itr` removed the element it returned at `cursor - 1`, so a
+/// second `remove()` with no intervening `next()` raises `IllegalStateException`
+/// the way the JDK's `lastRet = -1` does.
+fn note_snapshot_itr_removed(ctx: &dyn NativeContext, itr: ObjectRef, cursor: i32) {
+    let key = widened_obj_key(ctx, itr);
+    let mut table = snapshot_itr_backing_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(state) = table.get_mut(&key) {
+        state.last_removed_cursor = cursor;
+    }
+}
+
 fn native_unsorted_set_comparator(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -2131,6 +2315,12 @@ fn native_unsorted_set_comparator(
 // almost everything here is jdk-only-native-review.md's rule 4 — "concrete
 // bytecode + incomplete replacement → delete from the strict path" — with a
 // small number of genuine `Intrinsic` promotions.
+//
+// One such promotion exists as of 2026-08-06 and is the crate's only
+// `register_with_kind`: `("java/util/Iterator", "remove", "()V")`. The counts
+// above are unchanged (1,219 registrations); the ambient `Bridge` now covers
+// 1,194 of them. Its §1.4 justification is written out at the registration
+// site in `register_iterator_protocol_natives`.
 //
 // DO NOT flip this line to `SyntheticStub` as a bulk edit. That is the exact
 // shape of the 2026-07-14 regression, at ~8x the blast radius, and the 214
@@ -2257,19 +2447,46 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // alongside this change). Leaving the call site here, disabled, so the
     // next reader sees why it must not be re-enabled.
     let _ = register_stamped_lock_natives;
-    // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
-    // phase=2) that conflicts with the real JDK field layout (state(0, J),
-    // parent(1, L), root(2, L), evenQ(3, L), oddQ(4, L)). In real-JDK mode the
-    // synthetic `<init>` writes Int(parties) to slot 0 — but the real `state`
-    // field is a `long`, so descriptor-aware coercion turns it into Long and
-    // the Int-matching `getRegisteredParties` reads it back as 0; slot 2 gets
-    // Int(0) coerced to a null `root`, so the un-shadowed `getUnarrivedParties`
-    // runs real bytecode and NPEs in `reconcileState` on `root.state`. Gate
-    // behind synthetic-jdk only so real Phaser bytecode runs in real-JDK mode
-    // (same fix pattern as register_blocking_queue_natives above) —
-    // gaps/gap-phaser-real-bytecode-state.md.
-    #[cfg(feature = "synthetic-jdk")]
-    register_phaser_natives(registry);
+    // Phaser: DISABLED 2026-08-07 — same shape as the StampedLock call above,
+    // and for the same two reasons. It used to be
+    // `#[cfg(feature = "synthetic-jdk")] register_phaser_natives(registry);`
+    // (gaps/gap-phaser-real-bytecode-state.md), which was not enough:
+    //
+    //  1. SPLIT-BRAIN under synthetic-jdk. `native-builtins`
+    //     `phases_early::register_phaser_natives` registers TWELVE triples via
+    //     `register_synthetic_overrides` -> `register_phase51_natives`; this
+    //     copy registers NINE of the same twelve and, running later
+    //     (`register_builtins` then `register_collections_natives` in
+    //     `vm_init`), WON them. The two implementations do not share state:
+    //     this one keeps parties/arrived/phase in object slots 0/1/2, the
+    //     `native-builtins` one keeps an `int[3]` holder in slot 1. So the
+    //     three triples this copy does NOT register (`getUnarrivedParties`,
+    //     `isTerminated`, `forceTermination`) read a holder that `arrive()`
+    //     never updates — and worse, `ph_holder` finds a non-Object in slot 1,
+    //     takes its migration path, and OVERWRITES slot 1 with the new array,
+    //     destroying the `arrived` count this copy's `arrive()` had been
+    //     keeping there. One `getUnarrivedParties()` call corrupts the phaser.
+    //     A partial surface is the failure mode here, exactly as with
+    //     StampedLock; the twelve-triple holder-based implementation is a
+    //     strict superset of these nine and serves the whole surface alone.
+    //  2. The `cfg` gate was a BUILD-time gate standing in for a MODE
+    //     question. `use_synthetic_jdk` is runtime config: a synthetic-jdk
+    //     *feature* build running real-JDK *mode* takes the `vm_init` arm that
+    //     skips `register_builtins` but still calls
+    //     `register_collections_natives` — so the cfg was satisfied, this copy
+    //     registered, and the synthetic 3-int layout shadowed real `Phaser`
+    //     bytecode over the real state(0,J)/parent(1,L)/root(2,L)/evenQ/oddQ
+    //     layout anyway. That is the very regression the cfg was added to fix.
+    //
+    // Dropping the call site fixes both: under synthetic-jdk the
+    // `native-builtins` holder implementation serves all twelve triples
+    // (the fabricated `Phaser` gets 3 `Ljava/lang/Object;` slots, so the
+    // holder reference in slot 1 is type-correct there), and in real-JDK mode
+    // Phaser has no native shadow at all and the real bytecode runs. The
+    // default build (no `synthetic-jdk`) is unchanged: neither copy ran there.
+    // Kept, disabled, per the standing rule against deleting a synthetic
+    // method — and so the next reader sees why it must not be re-enabled.
+    let _ = register_phaser_natives;
     register_priority_blocking_queue_natives(registry);
     // ScheduledThreadPoolExecutor natives use a synthetic 3-field layout
     // (poolSize=0, shutdown=1, taskList=2). On a REAL STPE that maps onto
@@ -12710,13 +12927,19 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Not `?`: `this_pin` is this frame's pin base, and unwinding past the
     // `unpin_native_roots` below would strand it and everything pinned above it.
     // A refusal is not the end of the road: `real_snapshot_iterator` hands back
-    // the same elements through a real `Arrays$ArrayItr`. Only `remove()`
-    // differs, and loudly (see that function).
+    // the same elements through a real `Arrays$ArrayItr`, carrying the same
+    // backing set so `it.remove()` still writes through (see that function).
     let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
         Ok(itr) => itr,
         Err(_refused) => {
             let keys_arr = ctx.read_native_pin(keys_arr_pin, keys_arr);
-            let real = real_snapshot_iterator(ctx, keys_arr, total);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                keys_arr,
+                total,
+                Some((this, SnapshotItrRoute::SetLike)),
+            );
             ctx.unpin_native_roots(this_pin);
             return real;
         }
@@ -16942,6 +17165,9 @@ fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Valu
 /// op-chain while sharing `src`'s SOURCE array (slot 0). Caller must have checked
 /// `src` is a synthetic stream. No `invoke_virtual` here, so no safepoint/GC moves
 /// the locals between allocations.
+///
+/// Answers `Ok(None)` — "not deferred, run your eager body" — when the policy
+/// will not mint the op record. See the guard at the top of the body.
 fn stream_make_lazy_derived(
     ctx: &mut dyn NativeContext,
     src: ObjectRef,
@@ -16949,8 +17175,63 @@ fn stream_make_lazy_derived(
     lambda: Option<ObjectRef>,
     aux: i64,
 ) -> MethodCallResult {
+    // JDK-only wave 2 (lane W2-1). Ask the policy BEFORE minting anything, for
+    // the same reason the three `cratonvm/internal/StreamCollector` sites do
+    // (lane L7, 2026-08-05): a fabrication that happens to run FIRST makes
+    // every other site's refusal order-dependent rather than a policy.
+    //
+    // `cratonvm/stream/LazyOp` is the deferred-op record this function exists
+    // to build. No JDK declares that name, so `--jdk-only` refuses it. The
+    // refusal used to arrive from the `try_alloc_synthetic` further down —
+    // after the new op-chain array was already allocated — and surfaced at the
+    // user's own `filter`/`map`/`flatMap`/`limit`/`skip`/`peek` call site as
+    // `NoClassDefFoundError: cratonvm/stream/LazyOp`. That killed
+    // `RJdkCollections` (`src.stream().filter(...)`, line 169) and `RJdkJmx`
+    // (`ManagementFactory.getPlatformMBeanServer()`, i.e. real JDK bytecode
+    // reaching a stream internally) outright, on a mode where both pass today.
+    //
+    // The refusal is not fatal, because deferring is an OPTIMISATION and not a
+    // requirement. `Ok(None)` here is the exact answer `stream_try_defer`
+    // already gives when `CRATONVM_EAGER_STREAMS=1` is set, and every caller
+    // has a complete eager body behind that answer
+    // (`native_stream_{filter,map,flat_map,limit,skip,peek}`) — the pipeline
+    // that was the shipped default until the lazy one was turned on. Element
+    // RESULTS are identical; what strict mode loses is short-circuiting:
+    // `peek` runs on every element rather than stopping at the first
+    // `findFirst`, and an unbounded source feeding `limit(n)` stops at the
+    // drain's safety cap instead of at `n`.
+    //
+    // Deliberately NOT laundered through `ensure_generated_class`
+    // (`ClassOrigin::VmInternal`, which never refuses in either mode). A
+    // `LazyOp` record is only VM-internal in shape; its REASON for existing is
+    // the synthetic `java.util.stream` model, which is the thing strict mode
+    // is supposed to be retiring. Minting it there would make the pipeline work
+    // under `--jdk-only` and take the gap off the census at the same time. This
+    // spelling keeps the `CompatibilityClassRequested` violation recorded on
+    // every refused call, so the census still reports the gap's size.
+    //
+    // Under the default `Compatible` mode this is not a behaviour change: it is
+    // the same `try_ensure_synthetic_class(name, 3)` call, with the same field
+    // count, that `try_alloc_synthetic`'s `refused_class` arm below already
+    // makes on the first deferred op of the run.
+    //
+    // GC-SAFETY: the guard sits BEHIND the two pins, not in front of them.
+    // Registering a class can allocate (the `java.lang.Class` mirror), and in
+    // `Compatible` mode this is the same call that already ran from inside
+    // `try_alloc_synthetic` — i.e. with `src` and `lambda` already pinned.
+    // Hoisting it above the pins would open a window where a moving young GC
+    // relocates the two bare argument refs. On the refusal arm, unpinning at
+    // `src_pin` (the lower handle) pops `lambda_pin` with it; the CALLER's own
+    // pins were taken first and are below both, so they survive.
     let src_pin = ctx.pin_native_root(src);
     let lambda_pin = lambda.map(|l| ctx.pin_native_root(l)).unwrap_or(usize::MAX);
+    if ctx
+        .try_ensure_synthetic_class("cratonvm/stream/LazyOp", 3)
+        .is_err()
+    {
+        ctx.unpin_native_roots(src_pin);
+        return Ok(None);
+    }
     let src_cur = ctx.read_native_pin(src_pin, src);
     // FIX (stream-eager-drain-20260715): do NOT eagerly materialize `src`
     // here. A `src` that still holds a live, undrained lazy spliterator
@@ -36406,6 +36687,20 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&'static str, &mut 
             f("cslm/comparator", r);
         }
     }
+    // The `--jdk-only` snapshot iterator's backing collection. A real
+    // `Arrays$ArrayItr` has only `cursor` and `a`, so the collection its
+    // `remove()` writes through to is reachable ONLY from this table — root it
+    // and repoint it, exactly like the CSLM comparator above. Walked on both
+    // `for_rooting` settings: a live iterator whose backing was reclaimed would
+    // remove into freed memory.
+    {
+        let mut backings = snapshot_itr_backing_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for st in backings.values_mut() {
+            f("snapshot-itr/backing", &mut st.backing);
+        }
+    }
 }
 
 /// Push every top-level ObjectRef held by the overlay-backed collections onto
@@ -36692,6 +36987,25 @@ fn push_overlay_roots_for_keys(keys: &[usize], roots: &mut Vec<ObjectRef>) {
         for key in keys {
             if let Some(comparator) = table.get(key) {
                 roots.push(*comparator);
+            }
+        }
+    }
+    {
+        // The backing collection of a `--jdk-only` snapshot iterator. The owner
+        // here is the ITERATOR, so this edge is retained exactly while the
+        // iterator is itself reachable — which is the correct lifetime: a dead
+        // iterator can no longer call `remove()`.
+        //
+        // Hoisted like its neighbours: dev took each overlay lock once per minor
+        // GC rather than once per key, and this table is the highest-turnover of
+        // the set (one entry per strict-mode `HashSet.iterator()`), so per-key
+        // locking here would have been the worst offender.
+        let table = snapshot_itr_backing_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(state) = table.get(key) {
+                roots.push(state.backing);
             }
         }
     }
@@ -36993,6 +37307,20 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
             .unwrap_or_else(|e| e.into_inner());
         for (k, _) in &dead_keys {
             cmps.remove(k);
+        }
+    }
+    // The `--jdk-only` snapshot iterator's backing collection, keyed by the same
+    // packed `widened_obj_key` — of the ITERATOR, not of a collection. That
+    // makes this the highest-turnover table of the set (one entry per
+    // `HashSet.iterator()` in strict mode) and the one that would leak fastest
+    // if it were skipped: each entry also ROOTS its backing set, so a missed
+    // sweep pins dead collections, not merely a few words.
+    {
+        let mut backings = snapshot_itr_backing_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (k, _) in &dead_keys {
+            backings.remove(k);
         }
     }
     // `lhm_ptr_cache` is keyed by the *raw* object pointer (not the packed
@@ -40086,7 +40414,16 @@ fn native_ts_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     });
     let itr = match refused {
         Ok(itr) => itr,
-        Err(_) => return real_snapshot_iterator(ctx, snap, size as usize),
+        // Carry the owning set through, so the strict stand-in keeps the
+        // write-through `remove()` field 2 gives the fabricated shape.
+        Err(_) => {
+            return real_snapshot_iterator(
+                ctx,
+                snap,
+                size as usize,
+                Some((this, SnapshotItrRoute::TreeSet)),
+            )
+        }
     };
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
@@ -40133,6 +40470,20 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     };
     let last = ctx.get_array_element(arr, (cursor - 1) as usize);
+    ts_remove_element(ctx, owner, last)
+}
+
+/// Delete `last` from the live TreeSet `owner` — the write-through half of
+/// `TreeSet$Itr.remove()`.
+///
+/// Extracted so the `--jdk-only` stand-in (a real `Arrays$ArrayItr` with its
+/// backing set in [`snapshot_itr_backing_table`]) removes through exactly the
+/// same path as the fabricated iterator, rather than a second copy of it.
+fn ts_remove_element(
+    ctx: &mut dyn NativeContext,
+    owner: ObjectRef,
+    last: Value,
+) -> MethodCallResult {
     // Delete the element from the live set via the existing TreeSet remove
     // path (binary search + side-table size update).
     let (data_opt, size, comparator) = ts_state(ctx, owner);
@@ -40661,8 +41012,11 @@ fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let itr = match refused {
         Ok(itr) => itr,
         // The snapshot is already reversed, so the real iterator walks it in
-        // descending order without further work.
-        Err(_) => return real_snapshot_iterator(ctx, snap, n),
+        // descending order without further work. Removal is by ELEMENT, not by
+        // index, so the reversed order does not change what `remove()` deletes.
+        Err(_) => {
+            return real_snapshot_iterator(ctx, snap, n, Some((this, SnapshotItrRoute::TreeSet)))
+        }
     };
     ctx.set_field(itr, 0, Value::Object(Some(snap)));
     ctx.set_field(itr, 1, Value::Int(0));
@@ -44364,7 +44718,7 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `--jdk-only` refuses the fabricated shape, and the trade was argued as
     // free: "on the strict path the alternative was never a working `remove()`
     // — it was an iteration that did not reach `next()`"
-    // (`docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`).
+    // (`jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`).
     //
     // That argument does NOT hold here, and `RChmKeySetView` is what measured
     // it. HotSpot's `ConcurrentHashMap$KeySetView.iterator()` returns a
@@ -49459,7 +49813,50 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_snapshot_itr_next,
     );
-    r.register(itr, "remove", "()V", native_itr_remove_noop);
+    // §1.4 REVIEWED EXCEPTION — the only `Intrinsic` in this crate.
+    //
+    // WHY IT CANNOT BE A BRIDGE. `resolve_native_dispatch_wave1`
+    // (`vm/src/vm/vm_exec.rs:824`) sends a `Bridge` to the real bytecode
+    // whenever bytecode exists, and the force-native sites pass
+    // `bytecode_available: true` by construction
+    // (`admit_forced_native_id`, `native_override.rs`). The "real bytecode"
+    // for `Iterator.remove()` is the interface DEFAULT method, whose entire
+    // body is `throw new UnsupportedOperationException("remove")`. So under
+    // `--jdk-only` a bridge here is not a choice between our implementation and
+    // the JDK's — it is a choice between our implementation and an
+    // unconditional throw.
+    //
+    // WHY THE THROW IS NOT THE HONEST ANSWER. CratonVM allocates
+    // `java.util.HashSet` in its own compact layout, so `HashSet.iterator()` is
+    // intercepted and the real `HashMap$KeyIterator` — the class whose
+    // `remove()` the JDK would have run — cannot exist. Strict mode refuses our
+    // fabricated `HashMap$KeyItr` and gets a real `Arrays$ArrayItr` instead
+    // (`real_snapshot_iterator`), which declares no `remove()` at all. Every
+    // producer of a working `remove()` on that path has been removed by the
+    // VM's own substitutions; this registration is what puts one back.
+    // `com.sun.jmx.mbeanserver.MXBeanSupport.findMXBeanInterface` reduces a
+    // `HashSet` with `it.remove()` inside `while (candidates.size() > 1)`, so
+    // without it `ManagementFactory.getPlatformMBeanServer()` fails outright
+    // (`regression-suite/src/RJdkJmx.java:133`).
+    //
+    // WHY THE BREADTH IS SAFE. The `Intrinsic` is broad by necessity — the
+    // force-native site keys on the DECLARING class, which is
+    // `java/util/Iterator` for exactly the receivers that have no `remove()` of
+    // their own — but `native_itr_remove_noop` is not: for any receiver it does
+    // not specifically implement it hands the call to that receiver's own real
+    // bytecode via `invoke_virtual_bytecode_only`, and only answers UOE where
+    // the real bytecode would have. See the fall-through there.
+    //
+    // NOT applied to `ListIterator.remove`/`set`/`add` below: those keep the
+    // block's `Bridge` and therefore keep yielding to real bytecode in strict
+    // mode, which is correct for them.
+    r.register_with_kind(
+        itr,
+        "remove",
+        "()V",
+        native_itr_remove_noop,
+        cratonvm_native_api::NativeKind::Intrinsic,
+    );
 
     // ListIterator (extends Iterator)
     let litr = "java/util/ListIterator";
@@ -49610,17 +50007,142 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             // `LinkedList$ListItr` is intentionally NOT routed here: it has no
             // backing list and correctly throws UOE.)
             "java/util/LinkedList$Itr" => return native_ll_itr_remove(ctx, args),
+            // The `--jdk-only` stand-in. `Arrays$ArrayItr` is a REAL JDK class
+            // that declares no `remove()`, so without this arm the call reaches
+            // the `Iterator.remove()` default and throws — the
+            // `MXBeanSupport.findMXBeanInterface` failure this arm exists for.
+            // Answers UOE itself when no backing was recorded, so a genuine
+            // snapshot (`Arrays.asList(a).iterator()`) is unaffected.
+            "java/util/Arrays$ArrayItr" => return native_snapshot_itr_remove(ctx, args),
             _ => {}
         }
     }
+    // Anything else: hand the call to the receiver's OWN real bytecode rather
+    // than answering for it.
+    //
+    // This matters because the `("java/util/Iterator", "remove", "()V")`
+    // registration is `Intrinsic` (see `register_iterator_protocol_natives`),
+    // i.e. it wins under `--jdk-only` too, and the force-native entry in
+    // `native_override.rs` routes EVERY `Iterator.remove()` here regardless of
+    // receiver. A native that swallowed all of them would break every real JDK
+    // iterator whose `remove()` works today — far worse than the bug this file
+    // is fixing. The two guards:
+    //
+    //   * `args.len() == 1` — this same callback is also registered for
+    //     `ListIterator.set(Object)` and `.add(Object)`, and a 2-argument call
+    //     must not be turned into a `remove()`.
+    //   * a concrete `remove()V` on the receiver's CLASS chain, and not a
+    //     compatibility stub. `method_exists` does not walk interfaces, so a
+    //     receiver whose only `remove()` is the throwing `Iterator` default
+    //     answers `false` here and gets the identical UOE below without a
+    //     re-entry; and it answers `true` for a synthetic stub (whose methods
+    //     live in the native registry, not in a class file), where there is no
+    //     bytecode to reach — hence the second half of the test.
+    if args.len() == 1 {
+        if let Some(Value::Object(Some(this))) = args.first().copied() {
+            let cid = ctx.class_id_of_object(this);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if !cn.is_empty()
+                && !ctx.is_class_synthetic_stub(&cn)
+                && ctx.method_exists(&cn, "remove", "()V")
+            {
+                return ctx.invoke_virtual_bytecode_only(this, "remove", "()V", &[]);
+            }
+        }
+    }
     // Snapshot-only iterators (no backing collection) genuinely do not
-    // support remove — throw the spec-mandated UOE.
+    // support remove — throw the spec-mandated UOE. The message matters: the
+    // `Iterator.remove()` default method throws
+    // `UnsupportedOperationException("remove")`, while `Collections`
+    // unmodifiable views and `ImmutableCollections` throw a message-less one,
+    // so this text is what keeps the two distinguishable in a stack trace.
     Err(
         cratonvm_types::error::RuntimeError::UnsupportedOperationException {
             message: "remove".to_string(),
         }
         .into(),
     )
+}
+
+/// `remove()` for the `--jdk-only` snapshot stand-in — a real
+/// `java.util.Arrays$ArrayItr` whose backing collection is recorded in
+/// [`snapshot_itr_backing_table`].
+///
+/// The real class has `cursor` and `a` and nothing else, so:
+///
+///   * the element to delete is `a[cursor - 1]` — `ArrayItr.next()` is real
+///     bytecode (`return a[cursor++]`), so the cursor already points one past
+///     the element it returned;
+///   * `cursor` is deliberately NOT rewound. `a` is a SNAPSHOT: removing from
+///     the backing collection does not shift it, so rewinding would re-visit
+///     an element. This mirrors `native_map_key_itr_remove`, which likewise
+///     leaves its cursor alone and only clears `lastRet`.
+fn native_snapshot_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let state = match snapshot_itr_backing(ctx, this) {
+        Some(s) => s,
+        // A genuine snapshot with no collection behind it — `Arrays.asList`,
+        // `List.of`, an unmodifiable view. UOE is the correct answer, and it
+        // is what the real `Arrays$ArrayItr` would have produced anyway.
+        None => {
+            return Err(
+                cratonvm_types::error::RuntimeError::UnsupportedOperationException {
+                    message: "remove".to_string(),
+                }
+                .into(),
+            )
+        }
+    };
+    let cursor_slot = match ctx.resolve_field_index("java/util/Arrays$ArrayItr", "cursor") {
+        Some(s) => s,
+        None => return Err(unsupported_op()),
+    };
+    let a_slot = match ctx.resolve_field_index("java/util/Arrays$ArrayItr", "a") {
+        Some(s) => s,
+        None => return Err(unsupported_op()),
+    };
+    let cursor = match ctx.get_field(this, cursor_slot) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // `cursor == 0` is "next() was never called"; an unchanged cursor since the
+    // last removal is "remove() twice in a row". The JDK expresses both as
+    // `lastRet < 0` and raises IllegalStateException.
+    if cursor <= 0 || state.last_removed_cursor == cursor {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "remove".to_string(),
+        }
+        .into());
+    }
+    let arr = match ctx.get_field(this, a_slot) {
+        Value::Object(Some(a)) => a,
+        _ => return Err(unsupported_op()),
+    };
+    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
+    // GC-SAFETY: the removal below dispatches `hashCode`/`equals`/`compare` and
+    // allocates, so the iterator can move under us. Root it and read it back
+    // before the bookkeeping write. The backing came out of the side table,
+    // which the collector remaps, so it is already a current address.
+    let this_pin = ctx.pin_native_root(this);
+    let removed = match state.route {
+        SnapshotItrRoute::SetLike => {
+            let backing = state.backing;
+            if is_key_set_view(ctx, backing) {
+                native_ksv_remove(ctx, &[Value::Object(Some(backing)), last])
+            } else {
+                native_hs_remove(ctx, &[Value::Object(Some(backing)), last])
+            }
+        }
+        SnapshotItrRoute::TreeSet => ts_remove_element(ctx, state.backing, last),
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    let _ = removed?;
+    note_snapshot_itr_removed(ctx, this, cursor);
+    Ok(None)
 }
 
 // ListIterator extras (snapshot-based: field 0 = array, field 1 = cursor)
@@ -57703,12 +58225,18 @@ mod tests {
             .expect("Compatible mode never refuses a comparator stand-in");
         for (tag_maker, expected) in [
             (
-                make_min_by_collector as fn(&mut dyn NativeContext, Value) -> ObjectRef,
+                // Both makers became fallible when the collector stand-in
+                // learned to be refused under `--jdk-only`; the cast here still
+                // named the old infallible shape, so this file did not compile
+                // under `--all-targets` at all.
+                make_min_by_collector
+                    as fn(&mut dyn NativeContext, Value) -> Result<ObjectRef, MethodCallFailed>,
                 Value::Int(1),
             ),
             (make_max_by_collector, Value::Int(3)),
         ] {
-            let collector = tag_maker(&mut ctx, Value::Object(Some(natural)));
+            let collector = tag_maker(&mut ctx, Value::Object(Some(natural)))
+                .expect("Compatible mode never refuses a collector stand-in");
             let result = native_stream_collect(
                 &mut ctx,
                 &[Value::Object(Some(stream)), Value::Object(Some(collector))],

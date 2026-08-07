@@ -255,13 +255,45 @@ fn module_packages_evict_if_needed(t: &mut std::collections::HashMap<i32, Vec<St
     }
 }
 
-/// Build a synthetic boot ModuleLayer with the real JDK collection fields
-/// initialized. Older code treated ModuleLayer as a one-slot synthetic object,
-/// but real JDK bytecode reads fields such as `parents` when defining child
-/// layers.
+/// Per-VM memo of THE boot `ModuleLayer` object, as a JNI-global-root handle
+/// (`NativeContext::add_global_root`) — never a raw `ObjectRef`, because this
+/// table outlives any number of collections and a global ref is the one root
+/// form the moving GC both keeps alive and remaps.
+///
+/// Keyed by `ctx.vm_identity()`: Rust tests build several `Vm`s in one process,
+/// and a process-global object cache goes stale across VM lifetimes.
+fn boot_layer_memo() -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Build (or return) the synthetic boot ModuleLayer, with the real JDK
+/// collection fields initialized. Older code treated ModuleLayer as a one-slot
+/// synthetic object, but real JDK bytecode reads fields such as `parents` when
+/// defining child layers.
+///
+/// `ModuleLayer.boot()` is a singleton — `ModuleLayer.boot() ==
+/// ModuleLayer.boot()` and `someModule.getLayer() == ModuleLayer.boot()` are
+/// both spec'd identities, and JDK code compares layers with `==`. This used to
+/// allocate a FRESH layer on every call, so both comparisons were always false
+/// (measured: `regression-suite/src/RJdkModule.java:57` fails with "module must
+/// be in the boot layer" in real-jdk AND jdk-only, while HotSpot 25 passes).
+/// Memoise per VM instead.
 fn build_boot_layer(
     ctx: &mut dyn NativeContext,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let vm = ctx.vm_identity();
+    let mut memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = memo.get(&vm).copied() {
+        drop(memo);
+        if let Some(cached) = ctx.resolve_global_root(handle) {
+            return Ok(cached);
+        }
+        memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    }
+    drop(memo);
+
     let layer = alloc_concurrent_synthetic(ctx, "java/lang/ModuleLayer", MODULE_LAYER_FIELD_COUNT);
     let layer_pin = ctx.pin_native_root(layer);
 
@@ -279,6 +311,22 @@ fn build_boot_layer(
     ctx.set_field_by_name(layer, "modules", Value::Object(Some(modules)));
 
     ctx.unpin_native_roots(layer_pin);
+    // Publish. `new_initialized_object` above runs Java, so a re-entrant
+    // `ModuleLayer.boot()` could have published first; prefer whatever is
+    // already there so identity never changes under a caller that has one.
+    let mut memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = memo.get(&vm).copied() {
+        drop(memo);
+        if let Some(cached) = ctx.resolve_global_root(handle) {
+            return Ok(cached);
+        }
+        memo = boot_layer_memo().lock().unwrap_or_else(|e| e.into_inner());
+    }
+    let handle = ctx.add_global_root(layer);
+    if handle != 0 {
+        memo.insert(vm, handle);
+    }
+    drop(memo);
     Ok(layer)
 }
 
@@ -305,33 +353,81 @@ fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRe
     crate::build_real_layout_string_hashset(ctx, &keys)
 }
 
-/// Build a synthetic Module for `name`, bound to the boot layer.
+/// The package set to record for `name` in `module_packages_table`.
+///
+/// `java.base`/`java.xml` keep their hand-maintained boot lists (the registry
+/// does not enumerate jimage packages). Every other name answers from the VM's
+/// `ModuleRegistry`, which is populated both by the boot `module-info` scan and
+/// by `--module-path` resolution — so a module resolved from a module path now
+/// reports ITS packages instead of an empty list. An unregistered name still
+/// gets the empty vec it got before.
+fn module_package_names(ctx: &mut dyn NativeContext, name: &str) -> Vec<String> {
+    match name {
+        "java.base" => BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect(),
+        "java.xml" => JAVA_XML_PACKAGES.iter().map(|s| s.to_string()).collect(),
+        _ => ctx
+            .module_packages(name)
+            .iter()
+            .map(|p| dotted(p))
+            .collect(),
+    }
+}
+
+/// Record `name`'s package set against `module` for `native_module_get_packages`.
+fn record_module_packages(ctx: &mut dyn NativeContext, module: ObjectRef, name: &str) {
+    let packages = module_package_names(ctx, name);
+    let id = ctx.identity_hash_code(module);
+    let mut t = module_packages_table().lock().unwrap();
+    module_packages_evict_if_needed(&mut t, id);
+    t.insert(id, packages);
+}
+
+/// Build a Module for `name`, bound to the boot layer.
+///
+/// For a module the VM actually has a descriptor for, this returns THE
+/// canonical mirror — the same object `Class.getModule()` publishes through
+/// `NativeContext::{get,cache}_cached_module_mirror`. `java.lang.Module` does
+/// not override `equals`, so every JDK comparison of two Modules is `==`; a
+/// fresh Module per `findModule` call made
+/// `Greeter.class.getModule() == ModuleLayer.boot().findModule(m).get()` false
+/// (measured: `regression-suite/src/RJdkModule.java:129`, HotSpot passes).
+///
+/// Fabricated stand-ins for names the registry does NOT know are deliberately
+/// left out of that cache: they are a permissive fallback, not a fact about the
+/// module graph, and `cache_module_mirror` installs a permanent GC root.
 fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+    let registered = ctx.module_is_registered(name);
+    if registered {
+        if let Some(cached) = ctx.get_cached_module_mirror(Some(name)) {
+            // `Class.getModule()`'s builder never sets `layer`; seed it so
+            // `getLayer() == ModuleLayer.boot()` holds on the shared mirror.
+            if !matches!(ctx.get_field_by_name(cached, "layer"), Value::Object(Some(_))) {
+                ctx.set_field_by_name(cached, "layer", Value::Object(Some(layer)));
+            }
+            record_module_packages(ctx, cached, name);
+            return Ok(cached);
+        }
+    }
     let module = alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT);
     let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
     let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
+    // NB: no raw slot write here. Slot 0 of a REAL `java.lang.Module` is
+    // `layer`, not `name` — see the `MODULE_FIELD_COUNT` doc comment for the
+    // Elasticsearch failure a slot-indexed write on this object already cost.
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
-    let desc = crate::build_synthetic_module_descriptor(ctx, name)?;
+    let desc = build_module_descriptor(ctx, name)?;
     let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "descriptor", Value::Object(Some(desc)));
     ctx.unpin_native_roots(pin);
-    // Known boot modules get their package sets; other synthetic modules get
-    // an empty set (callers check `contains` before acting).
     // Recorded off-object in `module_packages_table` (see its doc comment)
     // instead of a field slot; `native_module_get_packages` reads it back
     // the same way.
-    let packages: Vec<String> = match name {
-        "java.base" => BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect(),
-        "java.xml" => JAVA_XML_PACKAGES.iter().map(|s| s.to_string()).collect(),
-        _ => Vec::new(),
-    };
-    let id = ctx.identity_hash_code(module);
-    let mut t = module_packages_table().lock().unwrap();
-    module_packages_evict_if_needed(&mut t, id);
-    t.insert(id, packages);
-    drop(t);
+    record_module_packages(ctx, module, name);
+    if registered {
+        ctx.cache_module_mirror(Some(name), module);
+    }
     Ok(module)
 }
 
@@ -430,6 +526,28 @@ pub(crate) fn native_module_layer_find_module(
         return Err(e.into());
     }
 
+    // An ABSENT module must answer `Optional.empty()`.
+    //
+    // This used to fabricate a Module for any syntactically valid name, so
+    // `ModuleLayer.boot().findModule(anything).isPresent()` was unconditionally
+    // true. Two costs, both measured: `RJdkFailure.java:274`
+    // (`findModule("cratonvm.no.such.module").isEmpty()`) failed outright, and
+    // `RJdkModule.java:48`'s "was --module-path passed?" check passed
+    // VACUOUSLY — which is why the real module defect only surfaced several
+    // checks downstream.
+    //
+    // Absence is only evidence of absence once the boot `ModuleRegistry` has
+    // actually been populated, and `java.base` is the one name that is always
+    // in a populated registry (`ClassManager`'s boot `module-info` scan, plus
+    // `vm_init`'s explicit real-JDK fallback registration). When it is missing
+    // the registry has told us nothing, so the legacy permissive fabrication
+    // stands — that keeps synthetic-jdk and any unpopulated-registry embedder
+    // on exactly its previous behaviour.
+    let registry_populated = ctx.module_is_registered("java.base");
+    if registry_populated && !ctx.module_is_registered(&name) && name != "java.xml" {
+        return ctx.invoke("java/util/Optional", "empty", "()Ljava/util/Optional;", &[]);
+    }
+
     let layer_ref = match args.first() {
         Some(Value::Object(Some(l))) => *l,
         _ => build_boot_layer(ctx)?,
@@ -437,6 +555,169 @@ pub(crate) fn native_module_layer_find_module(
     let module = build_module(ctx, &name, layer_ref)?;
     let opt = wrap_optional_present(ctx, module);
     Ok(Some(Value::Object(Some(opt))))
+}
+
+/// `Module.getResourceAsStream(String)`.
+///
+/// Registered nowhere before this — `RJdkModule.java:192/198/204/208` are the
+/// four checks that need it, and real JDK bytecode for this method routes
+/// through `BuiltinClassLoader.findResourceAsStream` / a `ModuleReader`, neither
+/// of which CratonVM models. Companion entry required in
+/// `vm/src/runtime/interpreter/native_override.rs::force_native_over_real_jdk_bytecode`
+/// or the real bytecode shadows this in real-JDK mode.
+///
+/// Encapsulation. Transcribed from the JDK 25 source
+/// (`lib/src.zip!java.base/java/lang/Module.java`, method body reproduced here
+/// because it is the whole specification of this native):
+///
+/// ```text
+/// if (name.startsWith("/")) name = name.substring(1);
+/// if (isNamed() && Resources.canEncapsulate(name)) {
+///     Module caller = getCallerModule(Reflection.getCallerClass());
+///     if (caller != this && caller != Object.class.getModule()) {
+///         String pn = Resources.toPackageName(name);
+///         if (getPackages().contains(pn)) {
+///             if (caller == null) { if (!isOpen(pn)) return null; }
+///             else if (!isOpen(pn, caller)) return null;
+///         }
+///     }
+/// }
+/// ```
+///
+/// The load-bearing point, and the reason this is NOT the rule the constructor
+/// gate uses: the test is `isOpen`, never `isExported`. `exports` grants
+/// compile/link access to the package's public API; it grants NOTHING for
+/// resources. `java.base` exports `java.util` without opening it, so a public
+/// `new ArrayList()` must be allowed while `java.base
+/// .getResourceAsStream("java/util/x.properties")` must not — the two gates
+/// answer opposite questions and must stay separate. `jdk.internal.module
+/// .Resources.canEncapsulate` supplies the `.class` carve-out
+/// (`len > 6 && endsWith(".class")` ⇒ never encapsulated) and
+/// `Resources.toPackageName` the package derivation (text before the LAST
+/// `'/'`; `""` when there is no `'/'` or the name ends in one — which is why
+/// `META-INF/MANIFEST.MF` and top-level names are never encapsulated).
+///
+/// Deviations from that source, both deliberate:
+///
+///   * `Checks.isPackageName(pn)` is not re-implemented. The membership test
+///     against the module's own package set is strictly stronger: a string
+///     that is not a legal package name cannot be a registered package.
+///   * `Reflection.getCallerClass()` has no equivalent here, so the caller
+///     module is recovered from the interpreter frame stack
+///     (`resource_caller_module`). When the stack names no caller at all the
+///     UNQUALIFIED `isOpen(pn)` is used as the fallback, matching the JDK's
+///     own `caller == null` arm.
+///
+/// Resolution of a non-encapsulated name is delegated to
+/// `classloader::module_get_resource_as_stream` rather than re-done here: that
+/// is the callback this triple actually dispatched to before this fix (see the
+/// registration note below), and it carries the T19.H10 name validation, the
+/// leading-`/` strip, the dynamically-DEFINED-class `.class` fallback and the
+/// SB-15 kotlin-reflect classpath behaviour. Re-implementing the byte fetch
+/// here would have been a second copy of a rule that already exists — the same
+/// mistake that let the `reads` bug survive three waves.
+pub(crate) fn native_module_get_resource_as_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.getResourceAsStream: receiver must not be null".to_string()),
+            }
+            .into());
+        }
+    };
+    let name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Module.getResourceAsStream: name must not be null".to_string()),
+            }
+            .into());
+        }
+    };
+
+    // `name.startsWith("/") -> substring(1)` happens BEFORE the package is
+    // derived, so a caller spelling the resource `"/com/x/secret.txt"` is
+    // encapsulated exactly like `"com/x/secret.txt"`.
+    let res_name: &str = name.strip_prefix('/').unwrap_or(name.as_str());
+
+    // `isNamed()` — the registry's unnamed-module sentinel is the empty name.
+    let module_name = module_registry_name(ctx, this);
+    if !module_name.is_empty() && resource_can_encapsulate(res_name) {
+        let pkg = resource_package_name(res_name);
+        // `getPackages().contains(pn)`: a name outside the module's own
+        // packages is not encapsulated. `ModuleRegistry` keys packages in
+        // internal (slash) form and so does `pkg`, so this compares like with
+        // like — `module_package_names` is the one that dots them, for Java.
+        if !pkg.is_empty() && ctx.module_packages(&module_name).iter().any(|p| p == pkg) {
+            // Bound to a local first: a `&mut ctx` reborrow inside a match
+            // scrutinee is live for the whole match, and the arms below need
+            // `ctx` again.
+            let caller_module = resource_caller_module(ctx);
+            let encapsulated = match caller_module {
+                // `caller != Object.class.getModule()`: java.base reads
+                // everything, and CratonVM's own JDK-internal resource
+                // plumbing runs there.
+                Some(caller) if caller == "java.base" => false,
+                // `isOpen(pn, caller)`. This also supplies the JDK's
+                // `caller != this` exemption: `is_package_open_to` answers
+                // true whenever the two module names are equal.
+                Some(caller) => !ctx.is_package_open_to(&module_name, pkg, &caller),
+                // The JDK's `caller == null` arm: unqualified `isOpen(pn)`.
+                None => !ctx.is_package_open_unqualified(&module_name, pkg),
+            };
+            if encapsulated {
+                return Ok(Some(Value::Object(None)));
+            }
+        }
+    }
+
+    crate::classloader::module_get_resource_as_stream(ctx, args)
+}
+
+/// `jdk.internal.module.Resources.canEncapsulate` — a name ending in `.class`
+/// (and longer than `".class"` itself) is never encapsulated.
+fn resource_can_encapsulate(name: &str) -> bool {
+    !(name.len() > 6 && name.ends_with(".class"))
+}
+
+/// `jdk.internal.module.Resources.toPackageName`, kept in slash form because
+/// that is how `ModuleRegistry` keys packages. Empty when the name has no
+/// `'/'` or ends with one (a directory), which is the JDK's "not in a package,
+/// therefore not encapsulated" answer.
+fn resource_package_name(name: &str) -> &str {
+    match name.rfind('/') {
+        Some(pos) if pos + 1 < name.len() => &name[..pos],
+        _ => "",
+    }
+}
+
+/// The calling module's registry name, i.e. what the JDK gets from
+/// `getCallerModule(Reflection.getCallerClass())`.
+///
+/// Frame walk copied from `lang_class::class_for_name_one_arg_caller_loader`:
+/// `frame_class_ids` is innermost-first, and the innermost frames can be
+/// `java/lang/Module` itself (this native is force-dispatched from there), which
+/// is not the caller the JDK means.
+///
+/// `None` and `Some(String::new())` are DIFFERENT answers and the caller relies
+/// on it: `None` is "the stack named nobody" (fall back to the unqualified
+/// open test), while an empty string is the unnamed module — a real, ordinary
+/// classpath caller, which is what this vector's `RJdkModule` is.
+fn resource_caller_module(ctx: &mut dyn NativeContext) -> Option<String> {
+    for cid in ctx.frame_class_ids() {
+        if matches!(
+            ctx.class_name_of_id(cid).as_deref(),
+            Some("java/lang/Module")
+        ) {
+            continue;
+        }
+        return Some(ctx.module_name_of_class(cid).unwrap_or_default());
+    }
+    None
 }
 
 /// `Module.getName()` — return the real `name` field (resolved by field
@@ -473,13 +754,28 @@ pub(crate) fn native_module_get_packages(
     };
     let id = ctx.identity_hash_code(this);
     let recorded = module_packages_table().lock().unwrap().get(&id).cloned();
-    let set = match recorded {
-        Some(names) => {
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            build_package_set(ctx, &refs)
+    let names = match recorded {
+        Some(names) => names,
+        None => {
+            // No row: this Module was not built here — e.g. the canonical
+            // mirror `Class.getModule()` publishes. Ask the registry for the
+            // module's real package set before falling back to the permissive
+            // whole-of-java.base default.
+            let module_name = module_registry_name(ctx, this);
+            let from_registry = if module_name.is_empty() {
+                Vec::new()
+            } else {
+                module_package_names(ctx, &module_name)
+            };
+            if from_registry.is_empty() {
+                BOOT_JDK_PACKAGES.iter().map(|s| s.to_string()).collect()
+            } else {
+                from_registry
+            }
         }
-        None => build_package_set(ctx, BOOT_JDK_PACKAGES),
     };
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let set = build_package_set(ctx, &refs);
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -666,17 +962,338 @@ fn build_unqualified_export(
     ctx: &mut dyn NativeContext,
     package_name: &str,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let export = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Exports", 4);
-    let export_pin = ctx.pin_native_root(export);
+    build_export_like(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        package_name,
+        &[],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ModuleDescriptor from the VM's own ModuleRegistry
+// ---------------------------------------------------------------------------
+//
+// Everything below builds the Java-side `java.lang.module.ModuleDescriptor`
+// graph for a module name out of the descriptor CratonVM already parsed from
+// that module's `module-info.class` (`classloading::module::parse_module_info`
+// → `ClassManager::module_registry`).
+//
+// It replaces a fabrication: `build_synthetic_module_descriptor` used to set
+// `requires`/`exports`/`opens`/`provides`/`packages` to EMPTY sets
+// unconditionally, for every module, in every mode — so
+// `ModuleLayer.boot().findModule("m").get().getDescriptor().exports()` answered
+// `[]` no matter what `m` actually declares. Measured against HotSpot 25 with
+// `regression-suite/src/RJdkModule.java` (`--module-path build-modules
+// --add-modules cratonvm.jdkonly.svc`): HotSpot reports
+// `exports=[com.cratonvm.jdkonly.svc, com.cratonvm.jdkonly.svc.open]`, CratonVM
+// reported `[]` and the vector died at `RJdkModule.java:69`.
+//
+// The registry stores names in INTERNAL (slash) form; every `java.lang.module`
+// API speaks BINARY (dot) form, so each name crosses `dotted` on the way out.
+// `requires`' module names are already dot-form module names and must NOT be
+// rewritten.
+
+/// Registry (slash) form → Java (dot) form.
+fn dotted(name: &str) -> String {
+    name.replace('/', ".")
+}
+
+/// Append `value` to a `java.util.List` (the `providers()` list is a List, not
+/// a Set — `ModuleDescriptor.Provides.providers()` is spec'd ordered).
+fn list_add(
+    ctx: &mut dyn NativeContext,
+    list: ObjectRef,
+    value: ObjectRef,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    ctx.invoke(
+        "java/util/ArrayList",
+        "add",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(list)), Value::Object(Some(value))],
+    )?;
+    Ok(())
+}
+
+/// Build a `java.util.HashSet<String>` from `items` through the REAL
+/// constructor + `add`, never through a hand-laid slot triple.
+///
+/// `phases_late::build_string_set` (which `build_synthetic_module_descriptor`
+/// used for `uses`) writes the legacy synthetic `(array, size, capacity)`
+/// HashSet shape; real `java.util.HashSet` has a single `map` field, so real
+/// `size()`/`iterator()`/`stream()` bytecode reads an `Object[]` where it
+/// expects a `HashMap`. Same bug class as the `build_package_set` doc comment
+/// above.
+fn build_string_hash_set(
+    ctx: &mut dyn NativeContext,
+    items: &[String],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "descriptor strings")?;
+    let pin = ctx.pin_native_root(set);
+    for item in items {
+        let s = ctx.create_string(item);
+        let set = ctx.read_native_pin(pin, set);
+        collection_add(ctx, set, s)?;
+    }
+    let set = ctx.read_native_pin(pin, set);
+    ctx.unpin_native_roots(pin);
+    Ok(set)
+}
+
+/// Build one `ModuleDescriptor$Exports` or `$Opens`.
+///
+/// Both classes have the identical private shape `(Set mods, String source,
+/// Set<String> targets)` — verified with
+/// `javap -p java.lang.module.ModuleDescriptor$Exports` on JDK 25 — and their
+/// `source()` / `isQualified()` are plain field reads (`isQualified` is
+/// `!targets.isEmpty()`), so populating `targets` is what makes a QUALIFIED
+/// export report itself as qualified.
+///
+/// `mods` is an empty set: the registry keeps no `ACC_SYNTHETIC`/`ACC_MANDATED`
+/// bit per exports entry (`ModuleExportsEntry` has only package + targets), so
+/// there is no data source for `modifiers()`. Empty is the answer for every
+/// `javac`-emitted export anyway, and it keeps real `Exports.hashCode()`
+/// (`modsHashCode(mods)`) off a null.
+fn build_export_like(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    package_name: &str,
+    targets: &[String],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let obj = alloc_concurrent_synthetic(ctx, class_name, 4);
+    let pin = ctx.pin_native_root(obj);
+
     let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export mods")?;
-    let targets = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "export targets")?;
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "mods", Value::Object(Some(mods)));
+
+    let targets_set = build_string_hash_set(ctx, targets)?;
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "targets", Value::Object(Some(targets_set)));
+
     let source = ctx.create_string(package_name);
-    let export = ctx.read_native_pin(export_pin, export);
-    ctx.set_field_by_name(export, "mods", Value::Object(Some(mods)));
-    ctx.set_field_by_name(export, "source", Value::Object(Some(source)));
-    ctx.set_field_by_name(export, "targets", Value::Object(Some(targets)));
-    ctx.unpin_native_roots(export_pin);
-    Ok(export)
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "source", Value::Object(Some(source)));
+
+    ctx.unpin_native_roots(pin);
+    Ok(obj)
+}
+
+/// Build the `Set<Exports>` / `Set<Opens>` for a whole module.
+///
+/// Each element is created and immediately handed to `HashSet.add` — element
+/// refs are never held in a Rust local across another allocating call, because
+/// `add` re-enters Java (`hashCode`) and can move the heap.
+fn build_export_like_set(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    entries: &[(String, Vec<String>)],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "exports/opens")?;
+    let pin = ctx.pin_native_root(set);
+    for (package_name, targets) in entries {
+        let element = build_export_like(ctx, class_name, package_name, targets)?;
+        let set = ctx.read_native_pin(pin, set);
+        collection_add(ctx, set, element)?;
+    }
+    let set = ctx.read_native_pin(pin, set);
+    ctx.unpin_native_roots(pin);
+    Ok(set)
+}
+
+/// Build one `ModuleDescriptor$Provides` — `(String service, List<String>
+/// providers)`.
+fn build_provides(
+    ctx: &mut dyn NativeContext,
+    service: &str,
+    providers: &[String],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let obj = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Provides", 2);
+    let pin = ctx.pin_native_root(obj);
+
+    let list = new_initialized_object(ctx, "java/util/ArrayList", "()V", &[], "providers")?;
+    let list_pin = ctx.pin_native_root(list);
+    for p in providers {
+        let s = ctx.create_string(p);
+        let list = ctx.read_native_pin(list_pin, list);
+        list_add(ctx, list, s)?;
+    }
+    let list = ctx.read_native_pin(list_pin, list);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "providers", Value::Object(Some(list)));
+    ctx.unpin_native_roots(list_pin);
+
+    let service_str = ctx.create_string(service);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "service", Value::Object(Some(service_str)));
+    ctx.unpin_native_roots(pin);
+    Ok(obj)
+}
+
+/// Build the `Set<Provides>` for a whole module.
+fn build_provides_set(
+    ctx: &mut dyn NativeContext,
+    entries: &[(String, Vec<String>)],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "provides")?;
+    let pin = ctx.pin_native_root(set);
+    for (service, providers) in entries {
+        let element = build_provides(ctx, service, providers)?;
+        let set = ctx.read_native_pin(pin, set);
+        collection_add(ctx, set, element)?;
+    }
+    let set = ctx.read_native_pin(pin, set);
+    ctx.unpin_native_roots(pin);
+    Ok(set)
+}
+
+/// Build the `Set<Requires>` for a whole module.
+///
+/// `Requires` is `(Set mods, String name, Version compiledVersion, String
+/// rawCompiledVersion)`. `name()` is a plain field read, which is the accessor
+/// every caller in the corpus uses. `mods` is left EMPTY even for a
+/// `requires transitive` / `requires static` edge: the modifier set is an
+/// `EnumSet<Requires.Modifier>` and a native cannot mint enum constants here
+/// without reading the enum's statics, so `Requires.modifiers()` remains a
+/// known gap (recorded in the known-issues doc). The transitive/static bits are
+/// NOT lost to the VM — `ModuleRegistry::build_readability_graph` consumes them
+/// on the Rust side; they are only invisible through this Java mirror.
+fn build_requires_set(
+    ctx: &mut dyn NativeContext,
+    entries: &[(String, bool, bool)],
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires")?;
+    let pin = ctx.pin_native_root(set);
+    for (name, _transitive, _is_static) in entries {
+        let element =
+            alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Requires", 4);
+        let element_pin = ctx.pin_native_root(element);
+        let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+        let element = ctx.read_native_pin(element_pin, element);
+        ctx.set_field_by_name(element, "mods", Value::Object(Some(mods)));
+        let name_str = ctx.create_string(name);
+        let element = ctx.read_native_pin(element_pin, element);
+        ctx.set_field_by_name(element, "name", Value::Object(Some(name_str)));
+        ctx.unpin_native_roots(element_pin);
+        let set = ctx.read_native_pin(pin, set);
+        collection_add(ctx, set, element)?;
+    }
+    let set = ctx.read_native_pin(pin, set);
+    ctx.unpin_native_roots(pin);
+    Ok(set)
+}
+
+/// Build a `java.lang.module.ModuleDescriptor` for `module_name`, answering
+/// from the VM's `ModuleRegistry` instead of fabricating empty collections.
+///
+/// This is the single implementation behind
+/// `crate::build_synthetic_module_descriptor`, i.e. behind every
+/// `Module.getDescriptor()` / `Class.getModule().getDescriptor()` /
+/// `ModuleLayer.findModule(..).get().getDescriptor()` path.
+///
+/// A module the registry does not know still gets the old all-empty answer —
+/// that is the correct shape for a fabricated stand-in and keeps every
+/// synthetic-jdk / unpopulated-registry caller on exactly its previous
+/// behaviour. The only thing that changes is that a module the VM DID parse now
+/// reports what it parsed.
+pub(crate) fn build_module_descriptor(
+    ctx: &mut dyn NativeContext,
+    module_name: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    // Snapshot every registry answer BEFORE the first allocation: these are
+    // `&self` reads on the class manager and must not interleave with the Java
+    // re-entry below.
+    let is_open = ctx.module_is_open(module_name);
+    let uses: Vec<String> = ctx.module_uses(module_name).iter().map(|s| dotted(s)).collect();
+    let packages: Vec<String> = ctx
+        .module_packages(module_name)
+        .iter()
+        .map(|s| dotted(s))
+        .collect();
+    let exports: Vec<(String, Vec<String>)> = ctx
+        .module_exports(module_name)
+        .into_iter()
+        .map(|(pkg, targets)| (dotted(&pkg), targets))
+        .collect();
+    let opens: Vec<(String, Vec<String>)> = ctx
+        .module_opens(module_name)
+        .into_iter()
+        .map(|(pkg, targets)| (dotted(&pkg), targets))
+        .collect();
+    let provides: Vec<(String, Vec<String>)> = ctx
+        .module_provides(module_name)
+        .into_iter()
+        .map(|(service, with)| {
+            (
+                dotted(&service),
+                with.iter().map(|s| dotted(s)).collect::<Vec<String>>(),
+            )
+        })
+        .collect();
+    let requires = ctx.module_requires(module_name);
+
+    let desc = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+    let pin = ctx.pin_native_root(desc);
+    let name = ctx.create_string(module_name);
+    let desc = ctx.read_native_pin(pin, desc);
+    let name_val = Value::Object(Some(name));
+    // Slots 0/1 are the LEGACY SYNTHETIC contract (`name`, flags word) that
+    // `native_module_descriptor_is_open`'s fallback reads when the named fields
+    // are absent. Write them only when this really is a fabricated class: on
+    // the real JDK's `ModuleDescriptor`, slot 1 is `version`
+    // (a `ModuleDescriptor$Version` reference), and the unconditional
+    // `set_field(desc, 1, Value::Int(0))` this replaces was parking an int in
+    // an object cell — the same "assumes a private synthetic layout on a class
+    // that is actually real bytecode" shape as the Module/HashSet field bugs
+    // documented above.
+    let has_named_layout = ctx
+        .resolve_field_index("java/lang/module/ModuleDescriptor", "open")
+        .is_some();
+    if !has_named_layout {
+        ctx.set_field(desc, 0, name_val);
+        ctx.set_field(desc, 1, Value::Int(if is_open { 1 } else { 0 }));
+    }
+    ctx.set_field_by_name(desc, "name", name_val);
+    ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
+    ctx.set_field_by_name(desc, "automatic", Value::Int(0));
+
+    // `modifiers` has no registry backing (see `build_requires_set`), so it
+    // stays an empty set — but it must be a non-null one.
+    let modifiers = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "modifiers")?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "modifiers", Value::Object(Some(modifiers)));
+
+    let uses_set = build_string_hash_set(ctx, &uses)?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
+
+    let packages_set = build_string_hash_set(ctx, &packages)?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "packages", Value::Object(Some(packages_set)));
+
+    let exports_set = build_export_like_set(
+        ctx,
+        "java/lang/module/ModuleDescriptor$Exports",
+        &exports,
+    )?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "exports", Value::Object(Some(exports_set)));
+
+    let opens_set =
+        build_export_like_set(ctx, "java/lang/module/ModuleDescriptor$Opens", &opens)?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "opens", Value::Object(Some(opens_set)));
+
+    let provides_set = build_provides_set(ctx, &provides)?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "provides", Value::Object(Some(provides_set)));
+
+    let requires_set = build_requires_set(ctx, &requires)?;
+    let desc = ctx.read_native_pin(pin, desc);
+    ctx.set_field_by_name(desc, "requires", Value::Object(Some(requires_set)));
+
+    ctx.unpin_native_roots(pin);
+    Ok(desc)
 }
 
 fn build_boot_resolved_module(
@@ -1003,6 +1620,30 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/ModuleLayer;",
         native_module_get_layer,
     );
+    // `Module.getResourceAsStream(String)` had NO registration at all: in
+    // real-JDK mode the real bytecode ran and dead-ended in
+    // `BuiltinClassLoader`/`ModuleReader` machinery CratonVM does not model, and
+    // in synthetic mode there was nothing to call. Needs the companion entry in
+    // `force_native_over_real_jdk_bytecode` to win over the real bytecode.
+    //
+    // THIS REGISTRATION LOSES, and must stay anyway. `register()` is
+    // last-registration-wins, and `native-builtins/src/lib.rs` re-registers the
+    // very same triple later in the SAME function
+    // (`register_essential_natives_with_shims` calls
+    // `register_jboss_jdkspecific` at ~:9578 and registers
+    // `java/lang/Module.getResourceAsStream` again at ~:18208). Until that site
+    // was pointed at this callback, the encapsulation check above was DEAD CODE
+    // and every module resource was served unconditionally — `RJdkModule.java:198`
+    // ("a resource in a non-open package must NOT be readable from another
+    // module") failed in both jdk modes while the three permissive checks around
+    // it passed. Keeping this row means the gate is installed even if the lib.rs
+    // registrar is ever reordered or dropped.
+    registry.register(
+        m,
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        native_module_get_resource_as_stream,
+    );
     // `defineModule0(Module, boolean isOpen, String version, String location,
     // Object[] packageNames)` — the VM-sync hook `Module.<init>` calls once the
     // Java-side object is initialized. STUB-REMOVAL (wave 4): the previous
@@ -1316,7 +1957,8 @@ mod tests {
     fn module_get_packages_returns_populated_set_for_java_base() {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1350,7 +1992,8 @@ mod tests {
         // name (module_packages_table) — getPackages() must still return a
         // valid (non-null) Set, not null/panic.
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.sql", layer)?;
+        let module = build_module(&mut ctx, "java.sql", layer)
+            .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1364,7 +2007,8 @@ mod tests {
     fn module_get_name_returns_string() {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1410,7 +2054,8 @@ mod tests {
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("build_module must succeed for a synthetic layer");
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1443,7 +2088,8 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         // Build a fully-populated module (java.base records the full JDK package list).
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("build_module must succeed for a synthetic layer");
         // Sanity: getPackages() reflects the recorded data for this module.
         let pkgs = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()

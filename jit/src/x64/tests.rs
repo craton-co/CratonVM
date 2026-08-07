@@ -11273,7 +11273,7 @@ fn compile_with_direct_call(
 }
 
 // -----------------------------------------------------------------------
-// Regression: docs/internal/fixed-suite-bugs/tomcat/
+// Regression: fixed-suite-bugs/tomcat/
 //             ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md
 // -----------------------------------------------------------------------
 //

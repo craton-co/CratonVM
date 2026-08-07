@@ -671,12 +671,21 @@ fn finish_cipher_bytes(
 /// like Tomcat's `EncryptInterceptor` depend on to refuse the transform
 /// (TestEncryptInterceptorAlgorithms `doTestShouldNotSucceed`). Throw the
 /// catchable checked exception so the real-JDK call site behaves as on HotSpot.
+///
+/// The CCM check alone was not enough: it looked only at the MODE, so the base
+/// ALGORITHM was never questioned and `Cipher.getInstance("CRATONVM-NO-SUCH-
+/// CIPHER")` returned a fully-formed synthetic `Cipher` — a fabricated success
+/// where the JDK mandates `NoSuchAlgorithmException`, which is what
+/// `regression-suite/src/RJdkFailure.java:309` measures (failing in `--real-jdk`
+/// and `--jdk-only`, passing on HotSpot 25). `MessageDigest.getInstance` and
+/// `KeyFactory.getInstance` in the sibling modules already validate this way;
+/// see `message_digest::algorithm_supported`.
 fn check_transformation_supported(
     ctx: &mut dyn NativeContext,
     algo: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let (_cipher, mode, _pad) = parse_transformation(algo);
-    if mode == "CCM" {
+    let (cipher, mode, _pad) = parse_transformation(algo);
+    if mode == "CCM" || !cipher_algorithm_known(&cipher) {
         return Err(crate::phases_early::throw_jca_exc(
             ctx,
             "java/security/NoSuchAlgorithmException",
@@ -684,6 +693,81 @@ fn check_transformation_supported(
         ));
     }
     Ok(())
+}
+
+/// Does `cipher` name a block/stream cipher that ANY provider reachable from
+/// this VM supplies?
+///
+/// Deliberately over-inclusive on the accept side and precise only on the
+/// reject side: this gate exists to stop a *fabricated* name from producing a
+/// working-looking `Cipher`, not to enumerate provider inventories. It spans
+/// SunJCE's whole catalogue plus the BouncyCastle names the corpus reaches
+/// (Keycloak/Elytron/Tomcat), so a legitimate transformation is never refused
+/// on a spelling this list happens not to carry — the failure mode a too-narrow
+/// list would produce is a `NoSuchAlgorithmException` for valid input, which is
+/// strictly worse than the fabrication being fixed.
+///
+/// Names are normalised to alphanumeric-uppercase first, exactly as
+/// `message_digest::algorithm_supported` does, so `AES_128`, `AESWrap_256`,
+/// `ChaCha20-Poly1305` and `DESede` all collapse onto their prefix.
+fn cipher_algorithm_known(cipher: &str) -> bool {
+    let n: String = cipher
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_uppercase();
+    if n.is_empty() {
+        return false;
+    }
+    // Prefix families: AES/AES_128/AESWrap_256, every PBEWith*, DES/DESede/
+    // DESedeWrap, and the RSA transformations (RSA, RSA/ECB/OAEP…).
+    if n.starts_with("AES") || n.starts_with("PBE") || n.starts_with("DES") || n.starts_with("RSA")
+    {
+        return true;
+    }
+    matches!(
+        n.as_str(),
+        "TRIPLEDES"
+            | "BLOWFISH"
+            | "ARCFOUR"
+            | "RC2"
+            | "RC4"
+            | "RC5"
+            | "RC6"
+            | "CHACHA20"
+            | "CHACHA20POLY1305"
+            | "CHACHA7539"
+            | "SALSA20"
+            | "XSALSA20"
+            | "HC128"
+            | "HC256"
+            | "IDEA"
+            | "IES"
+            | "ECIES"
+            | "ELGAMAL"
+            | "SEED"
+            | "SM2"
+            | "SM4"
+            | "CAMELLIA"
+            | "CAST5"
+            | "CAST6"
+            | "SERPENT"
+            | "TWOFISH"
+            | "NOEKEON"
+            | "SKIPJACK"
+            | "SHACAL2"
+            | "TEA"
+            | "XTEA"
+            | "VMPC"
+            | "GOST28147"
+            | "DSTU7624"
+            | "THREEFISH256"
+            | "THREEFISH512"
+            | "THREEFISH1024"
+            | "GRAINV1"
+            | "GRAIN128"
+            | "NULL"
+    )
 }
 
 fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {

@@ -419,7 +419,7 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
-/// `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` — arm §1.4 enforcement at
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW` — arm §1.4 enforcement at
 /// `try_stackless_invoke` step 1 under `--jdk-only`.
 ///
 /// Step 1 always *observes* a `Bridge` standing in front of concrete bytecode
@@ -440,14 +440,14 @@ pub fn intrinsics_disabled() -> bool {
 /// measurement one subsystem at a time instead of arguing about it.
 ///
 /// All five blocker families, with symptoms, are in
-/// `docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`.
+/// `jdk-only-step1-bytecode-available-RESOLVED-20260806.md`.
 ///
 /// No effect outside `--jdk-only`: the caller tests `is_jdk_only()` first.
 #[inline]
 pub fn jdk_only_enforce_shadow() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {
-        match cratonvm_types::flags::runtime_var("CRATONVM_JDK_ONLY_ENFORCE_SHADOW") {
+        match cratonvm_types::flags::runtime_var("CRATONVM_ENFORCE_NATIVE_SHADOW") {
             Ok(v) => !v.is_empty() && v != "0",
             Err(_) => false,
         }
@@ -909,7 +909,7 @@ cached_is_set!(dbg_ccsprobe, "CRATONVM_DBG_CCSPROBE");
 // question. L11 item 7 answered that question by deleting the eight call sites
 // and the predicate: there is no receiver-shape decision left to report, so a
 // flag that can only ever print nothing is worse than no flag. The measurement
-// it took is kept in `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
+// it took is kept in `L10-blocker-threadpool-init-DONE-20260806.md`.
 // `CRATONVM_DBG_HANG_SAMPLE` -- temporary diagnostic for the AOT
 // bean-registration hang investigation (2026-07-13). Periodically samples
 // the method being invoked in `execute_invoke_kind` (every Nth call) so a

@@ -188,7 +188,7 @@ fn run_hotspot(java_home: &str, classes: &Path) -> String {
 /// Run the probe under CratonVM and assert clean exit + stdout == HotSpot,
 /// EXCEPT for the out-of-range exception CLASS, which CratonVM deliberately
 /// reports as the `ArrayIndexOutOfBoundsException` subclass — see
-/// `docs/known-issues/list-out-of-bounds-exception-class-and-message.md`.
+/// `list-out-of-bounds-exception-class-and-message-FIXED-20260806.md`.
 fn run_cratonvm_and_assert(bin: &Path, java_home: &str, classes: &Path, extra: &[&str]) -> String {
     let mut cmd = Command::new(bin);
     cmd.args(["--java-home", java_home, "-c", classes.to_str().unwrap()]);

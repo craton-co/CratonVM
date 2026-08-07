@@ -2251,6 +2251,25 @@ fn invoke_to_string_opt(
         }
     }
 
+    // `java.nio.CharBuffer.toString()` is inherited, not declared by any
+    // concrete subclass, and for a `java.nio.StringCharBuffer` receiver the
+    // virtual dispatch below answers an EMPTY string when it is entered from
+    // here rather than from a bytecode `cb.toString()` call site — so
+    // `String.valueOf(cb)`, `"" + cb` and `sb.append(cb)` all lose text that a
+    // direct `cb.toString()` returns correctly. Read the buffer instead of
+    // asking it. Scoped to the `java/nio` buffer classes so no user class can
+    // take this path; the dispatch defect underneath is
+    // docs/known-issues/stringcharbuffer-tostring-empty-via-native-invoke.md.
+    {
+        let cid = ctx.class_id_of_object(obj);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        if cname.starts_with("java/nio/") && cname.contains("CharBuffer") {
+            if let Some(s) = crate::phases_late::charset_buffers::cb_read_text(ctx, obj) {
+                return Ok(Some(s));
+            }
+        }
+    }
+
     // Call obj.toString() via virtual dispatch. A Java exception from the
     // override is observable and must reach the caller; only an absent or
     // malformed return value uses the historical identity fallback.

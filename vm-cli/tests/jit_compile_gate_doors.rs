@@ -28,6 +28,24 @@
 //!   under the default configuration (`bg-compile` is default-ON and reroutes
 //!   first-call compiles to the background worker), so the default arm proves
 //!   nothing about it. `CRATONVM_JIT=bg-compile=0` is what wakes it.
+//!
+//!   **And a bytecode workload cannot reach it however hot it gets — which is
+//!   what this arm got wrong on 2026-08-06.** The door lives in
+//!   `interpreter::execute()`, and `execute()` is not the interpreter's own
+//!   invoke path: ordinary `invokestatic` / `invokevirtual` go through the
+//!   dispatcher's invoke caches and never call it. `execute()` is the entry
+//!   point from OUTSIDE the interpreter loop — reflection, JNI, a native's
+//!   `ctx.invoke_*`, VM bootstrap. All three of the probe's original methods
+//!   are driven from Java bytecode, so the counter read `admitted=0` in four
+//!   configurations and the door was briefly recorded here as dead code. It is
+//!   not dead; the probe was asking with the wrong workload.
+//!
+//!   `reflectedOnly` is what fixed that: a method nothing calls directly,
+//!   driven through `Method.invoke`, which is precisely the entered-from-
+//!   outside shape. Measured with it, `bg-compile=0` gives
+//!   `eager-first-call: admitted=1`. **If this assertion fails again, check
+//!   that the probe still reaches `execute()` before concluding the door has
+//!   gone** — that was the trap the first time.
 //! * `osr-contract-violations == 0` / `osr-coordinate-mismatches == 0` — the
 //!   two fail-closed OSR metadata checks. Both are compiler-bug detectors that
 //!   silently cost a method its OSR service, so "it never fires" has to be a
@@ -78,16 +96,43 @@ public class CompileGateDoorsProbe {
         return (x * 31) ^ (x >>> 3);
     }
 
-    public static void main(String[] args) {
+    // REFLECTED ONLY, and that is the whole point: nothing in this class calls
+    // it directly, so the only route to it is `Method.invoke` -> the VM's
+    // `execute()` entry point, which is where the eager first-call door lives.
+    // An ordinary bytecode invoke goes through the dispatcher's invoke caches
+    // and never calls `execute()` at all, which is why the three methods above
+    // cannot reach that door however hot they get.
+    //
+    // `public` on purpose. Package-private would be legal for a caller in the
+    // same class on HotSpot, and this VM refuses it
+    // (`IllegalAccessException: cannot access member: modifiers 0x0008`) --
+    // a real defect, but not this probe's subject, and depending on it here
+    // would make the gate fail for an unrelated reason.
+    public static int reflectedOnly(int x) {
+        int acc = x;
+        for (int i = 0; i < 32; i++) {
+            acc = acc * 31 + (i ^ (acc >>> 3));
+        }
+        return acc;
+    }
+
+    public static void main(String[] args) throws Exception {
         long l1 = hotLoop(400000, "seedy");
         long l2 = hotLoop2(400000);
         int acc = 0;
         for (int i = 0; i < 200000; i++) {
             acc += leaf(i);
         }
+        java.lang.reflect.Method reflected =
+            CompileGateDoorsProbe.class.getDeclaredMethod("reflectedOnly", int.class);
+        int racc = 0;
+        for (int i = 0; i < 2000; i++) {
+            racc ^= (Integer) reflected.invoke(null, i);
+        }
         System.out.println("hotLoop=" + l1);
         System.out.println("hotLoop2=" + l2);
         System.out.println("leafAcc=" + acc);
+        System.out.println("reflectedAcc=" + racc);
         System.out.println("OK");
     }
 }
@@ -298,6 +343,7 @@ fn check_probe_arithmetic(stdout: &str, stderr: &str) {
         "hotLoop=12909713221",
         "hotLoop2=11295064",
         "leafAcc=1526967200",
+        "reflectedAcc=-149467323",
         "OK",
     ] {
         assert!(
@@ -370,13 +416,17 @@ fn every_backend_door_goes_through_the_admission_gate() {
          conversion — a plausible integer in the wrong pc space.\nstderr:\n{stderr}"
     );
 
-    // ── Arm 2: the eager first-call door ──────────────────────────────
+    // Arm 2: the eager first-call door.
     //
     // Dormant under the default configuration: `bg-compile` is default-ON and
     // reroutes a first-call compile to the background worker, so arm 1 says
     // nothing about that door at all. Without this arm the gate could be
     // missing from it entirely and both `admitted=0` and
     // `ungated-backend-entries=0` would still hold.
+    //
+    // What makes the assertion below reachable is the probe's `reflectedOnly`,
+    // not this environment alone — see the module doc. A bytecode-driven
+    // workload cannot take this door at any temperature.
     let (stdout, stderr) = run_probe(
         &bin,
         &jdk,
@@ -392,8 +442,8 @@ fn every_backend_door_goes_through_the_admission_gate() {
     );
     assert!(
         nth(&fields, "admitted", DOOR_EAGER_FIRST_CALL) > 0,
-        "[jit_compile_gate_doors] the eager first-call door admitted nothing even with \
-         `bg-compile=0`, so this arm proves nothing about it. If that path has been \
-         removed, delete this arm; if it moved, re-point the gate.\nstderr:\n{stderr}"
+        "[jit_compile_gate_doors] the eager first-call door admitted nothing even with          `bg-compile=0`. Before concluding the path is gone, check that the probe still          reaches `interpreter::execute()` at all: that is the only route to this door,          and it is reflection / JNI / native-invoke only, never a bytecode invoke.          `reflectedOnly` is what supplies it.
+stderr:
+{stderr}"
     );
 }

@@ -40,8 +40,8 @@ below it is the original filing.
 
 | Was | Now |
 |---|---|
-| `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md` | [`../../internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`](../../internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md) |
-| `step1-bytecode-available-attempted-and-reverted.md` | [`../../internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`](../../internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md) |
+| `strict-boot-refuses-five-classes-the-corpus-needs-20260805.md` | `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md` |
+| `step1-bytecode-available-attempted-and-reverted.md` | `jdk-only-step1-bytecode-available-RESOLVED-20260806.md` |
 
 The first was marked CLOSED on 2026-08-05 with four of its five classes fixed
 and a header that said five; its own verification section said otherwise two
@@ -63,7 +63,7 @@ instance of the ABSTRACT `java.nio.charset.Charset`, `System.props` is null,
 `value[]`. §1.4's lever is registration, not dispatch. What landed is the
 observation (step 1 now records every `Bridge` that runs in front of real bytes;
 it recorded nothing before) plus a dial,
-`CRATONVM_JDK_ONLY_ENFORCE_SHADOW=1`, so item 4 can re-take that measurement one
+`CRATONVM_ENFORCE_NATIVE_SHADOW=1`, so item 4 can re-take that measurement one
 subsystem at a time.
 
 **Found on the way, fixed, not filed here:** `vm/src/jit/helpers.rs`'s third

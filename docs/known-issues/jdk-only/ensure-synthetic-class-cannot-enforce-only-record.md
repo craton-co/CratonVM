@@ -154,9 +154,40 @@ reports each as "`?` operator has incompatible types" and the repair is to
 delete that `?` — but a name-based rewriter over a 112-file crate will keep
 generating them.
 
-**If you pick this up:** do it module by module, not crate-wide. The 1,932 sites
-are spread over 112 files and the modules are nearly independent; a per-module
-loop keeps the name collisions inside one file, where they are visible.
+**If you pick this up:** not with a textual rewriter. See the next section —
+that advice was tried and is not sufficient.
+
+### Attempt 3, 2026-08-07 — rustc's own suggestions, and where they stop
+
+The 2026-08-06 note above blamed the name-based `?`-appender and prescribed a
+per-module loop. The appender WAS a real fault, but fixing it is not enough.
+Three strategies, each run to its own stopping point on the same 1,908 sites:
+
+| strategy | from | to | why it stopped |
+|---|---:|---:|---|
+| name-based `?` appender | 277 | 137, rising | matches by NAME across 112 files; stamps `?` on same-named functions it never converted |
+| span-precise regex on rustc's `line:col` | 2,072 | ~1,630, flat | the span often points at a PATTERN (`if let Some(v) = f(..)`); text cannot tell which paren belongs to the failing expression |
+| **rustc's own suggestions** | **2,072** | **775, flat** | best by far — rustc knows the expression tree — but its `?` suggestion is `MaybeIncorrect`, and 494 more are `HasPlaceholders`, i.e. not applicable at all |
+
+Two things the third attempt established that the others could not:
+
+* **Apply rustc's suggestions, not your own regex.** `cargo check
+  --message-format json` carries a byte-exact `suggested_replacement` per span.
+  Accept `MachineApplicable`, plus `MaybeIncorrect` entries whose replacement is
+  the original text with a `?` appended — that is the "use `?` to unwrap"
+  suggestion, and rustc chose the span. One round applied **556**.
+* **The residue is not missing `?`, it is SEMANTICS.** At the stopping point:
+  631 `E0308 mismatched types` and — the signal that matters — **104 `E0382`
+  "use of moved value"**. Mechanically wrapping a tail in `Ok(..)` and threading
+  `?` through changes when values move. No textual tool can see that, and a
+  migration that compiles only after someone silences 104 borrow errors is not
+  a migration anyone should land.
+
+**So the remaining work is a `syn`-based rewriter or hand work, module by
+module, over several sittings — not another loop.** Nothing from these three
+attempts was committed; `dev` has never carried a half-migrated
+`native-builtins`. Start from 775, not from 2,072, and start by deciding how
+ownership is preserved.
 
 ### What making a funnel fallible actually FINDS — the reason to do it at all
 
@@ -231,7 +262,7 @@ error.
 > iterator class, hand back the snapshot through a real `Arrays$ArrayList`'s
 > own iterator, which reads only the `Object[]` it was given. All six sections
 > are fixed; see
-> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
+> `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
 > (retired from this directory 2026-08-06, once its fifth class — the
 > `System.Logger` one, which had taken out every `ObjectInputStream`
 > construction — landed on a real `jdk.internal.logger.SimpleConsoleLogger`).
@@ -310,7 +341,7 @@ Reclassifying them is the dangerous direction in *Blast radius* — it silences
 the violation, keeps fabricating, and makes the zero-stub census green while
 the substitution continues. L7 acted on that verdict: the bootstrap site
 **refuses** them rather than relabelling them. See
-[VM-internal classes are mislabelled `CompatibilityStub`](../../internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md)
+VM-internal classes are mislabelled `CompatibilityStub` (`jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`)
 (RETIRED 2026-08-06).
 
 ## What specifically must change
@@ -330,7 +361,7 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
    That last one was reached from `ObjectInputFilter$Config.<clinit>`, so
    refusing it had been costing every `ObjectInputStream` construction in the
    VM. See
-   `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
+   `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
    **Still open here:** `java/util/Enumeration$Impl` in `classloader.rs`'s
    `getResources` helpers, which has no such landing yet. And the refusals are
    landings, not removals — the natives themselves are still registered, which

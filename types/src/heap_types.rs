@@ -428,7 +428,7 @@ pub struct ObjectHeader {
     /// encoding here since 2026-07-26, and it was the ONLY reclaimable 8 bytes
     /// in the header (folding `identity_hash_code` instead buys zero, because
     /// `AtomicU64` forces 8-byte alignment and the 4 bytes reappear as
-    /// padding). See `docs/internal/arch-2026-07-26/header-shrink.md`.
+    /// padding). See `arch-2026-07-26/header-shrink.md`.
     pub mark_word: AtomicU64,
 }
 
@@ -578,7 +578,7 @@ impl ObjectHeader {
     /// This obligation did not exist while forwarding lived in its own field
     /// (the two words were distinct), and it is the reason the encoding was
     /// landed inert in 2026-07-26 rather than wired up opportunistically. See
-    /// `docs/internal/arch-2026-07-26/header-shrink.md` §4.3.
+    /// `arch-2026-07-26/header-shrink.md` §4.3.
     pub fn set_forwarding_address(&self, target: *mut u8) {
         self.mark_word.store(
             Self::make_forwarded(target as usize),

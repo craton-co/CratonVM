@@ -32,7 +32,7 @@ registrations (`bridge` 10,434 → 10,432, `synthetic-stub` 755 → 757, total
 unchanged). Stub ratchet re-frozen 553 → 555 — no new fake; two registrations
 that were mis-tagged `Bridge` are now counted where they belonged.
 
-See `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+See `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
 
 ### 2026-08-06 `Class::is_synthetic_stub` is deleted; `ClassOrigin` is the only answer
 
@@ -53,7 +53,7 @@ already gave those names.
 `compatibility-stub` 14 → 13, `vm-internal` 1 → 2 — exactly one class moved,
 and under `--jdk-only` that probe now fabricates none at all.
 
-See `docs/internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
+See `jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`.
 
 ### 2026-08-06 `Executors.new*` returns real JDK executors in real-JDK mode
 
@@ -83,7 +83,7 @@ sites (see below). The
 `--features synthetic-jdk` build is unaffected — it has no real `Executors`
 bytecode to fall back to and keeps its own factories.
 
-See `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`.
+See `L10-blocker-threadpool-init-DONE-20260806.md`.
 
 ### 2026-08-05 CPU benchmark table re-measured in a quiet window; Sieve at parity
 

@@ -3,10 +3,157 @@
 | | |
 |---|---|
 | **Status** | OPEN |
-| **Severity** | medium (was high) — as of 2026-08-06 it no longer blocks `TestManagerWebapp.testDeploy` or `.testBug57700`, both of which PASS; it still makes deploy-heavy Tomcat classes several times slower than HotSpot |
+| **Severity** | low (was high, then medium) — no test fails on deploy timing since 2026-08-06, and 2026-08-07 measured the remaining gap and re-scoped the exit criteria: this is a tracked throughput item (~16x on a webapp deploy), not a bug. See the 2026-08-07 update. |
 | **HotSpot** | PASS |
 | **CratonVM** | PASS since 2026-08-06 on the two classes this doc named; still slow (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
+
+> **Update 2026-08-07 — I tried to close this and could not. Here is the
+> measured ceiling, three corrections to what is written below, and a re-scope.**
+>
+> Everything here is on `origin/dev` `e1b6c99a3` (the tip after the 2026-08-06
+> fixes), measured on the **real deploy** — `TestManagerWebapp.testBug57700`
+> driven alone — because § the 2026-08-06 update established that this doc's
+> probe is not a safe profile of record.
+>
+> ### Correction 1 — `--nojit` is now 35% SLOWER, not faster
+>
+> § What this is NOT — measured calls it "the decisive measurement": *"on a
+> quiet host `--nojit` is faster than the default … Compiled code contributes
+> nothing to this workload"*, and § Exit criteria builds "**not reachable by
+> tiering work**" on top of it. **That is stale.** Deploy of `/bug57700`,
+> interleaved, two runs each:
+>
+> | arm | deploy |
+> |---|---|
+> | default | 15 886 / 15 063 ms |
+> | `--nojit` | 21 884 / 20 131 ms |
+>
+> The JIT is now worth **~26%**. The regime changed when the per-two-byte
+> native re-entry was removed: that work was *unreachable* by the compiler (a
+> Rust native calling interpreted `BufferedInputStream.read`), so compilation
+> genuinely had nothing to bite on. What is left is BCEL's own Java, which the
+> compiler can and does compile. **Tiering work is back on the table**; the
+> paragraph below saying otherwise should not be planned against.
+>
+> ### Correction 2 — the native-call funnel is not the wall either (10%)
+>
+> Priced properly this time, not estimated. `--dump-native-registry` over one
+> deploy: **12 689 143 native invocations**, led by
+>
+> | native | calls |
+> |---|---|
+> | `DataInputStream.readByte()B` | 3 161 278 |
+> | `Objects.requireNonNull(Object,String)` | 1 733 844 |
+> | `DataInputStream.readUTF()` | 1 733 792 |
+> | `DataInputStream.skipBytes(I)I` | 1 630 912 |
+> | `DataInputStream.readUnsignedShort()I` | 1 200 604 |
+> | `Class.isAssignableFrom` / `Class.cast` | 442 994 / 442 836 |
+>
+> (the last two are one pair per constant-pool access — BCEL's
+> `ConstantPool.getConstant(int, Class)` does `isAssignableFrom` then `cast`.)
+>
+> The two in-tree profilers price a call end to end
+> (`cargo test --release -p cratonvm-vm --lib -- --ignored --nocapture
+> funnel_cost_breakdown` and `jit_native_dispatch`):
+>
+> | step | ns |
+> |---|---|
+> | `safe_native_call` body, 1 object arg | 48 |
+> | ... of which `2x record_transition` | 15 |
+> | ... of which `load_and_forward` | 10 |
+> | `is_object_address(receiver)` | 15 |
+> | `class_id_of(receiver)` (vs `class_id_of_validated` at 1.1) | 12 |
+> | `forward_jit_reference_args`, 1 recv | 12 |
+> | `note_site_identity()` warm hit | 11 |
+> | `decode_dispatch_values`, 1 recv (vs `decode_..._into` resolved at 5.2) | 16 |
+>
+> ≈ **120 ns** for a compiled-code native call. 12.69 M × 120 ns ≈ **1.5 s of a
+> 15.5 s deploy — 10%.** Driving it to zero leaves ~15x against HotSpot, not 5x.
+>
+> ### Correction 3 — by-name field resolution, falsified as a lever
+>
+> `get_field_by_name` / `set_field_by_name` take the class-manager `RwLock` and
+> walk the superclass chain comparing field *names* on **every** call, and the
+> buffered `DataInputStream` fast path reads `buf`/`pos`/`count` and writes
+> `pos` per typed read — ~32 M walks per deploy. A thread-local, epoch-validated
+> `(ClassId, name) -> slot` memo modelled exactly on `FIELD_DESCRIPTOR_RING`
+> (per-entry epoch, direct-mapped, name compared inline on every hit, 31/31
+> regression green) measured **1.9% over ten interleaved runs per arm** —
+> base 15 703–18 296, memo 15 229–16 881. Inside the noise. **Reverted, not
+> shipped**, on this investigation's own standing rule about levers that do not
+> measure. The `with_class_layout` / `VersionCache::find` / `__memcmp` share I
+> had attributed to name resolution belongs to the *descriptor* path that
+> ordinary `get_field`/`set_field` use, not to this.
+>
+> ### Where the time is now
+>
+> Genuinely flat. `perf record` over the deploy, symbols above 1%:
+> `is_object_address` **7.0**, `__memcmp` 3.1, `_mi_page_malloc_zero` 2.6,
+> `execute_frame_from_index` 2.4, `with_class_layout` 2.2,
+> `safe_native_call_impl` 1.9, `single_thread_guard_enabled` 1.6,
+> `get_field_by_name` 1.6, `record_object_ref_payload_slow` 1.5,
+> `VersionCache::find` 1.3, `jit_invoke_dispatch` 1.3, `execute_instruction` 1.2,
+> `try_jit_site_cached_native_dispatch` 1.2, `forward_jit_reference_args` 1.1,
+> `pin_jit_code_range_owner` 1.1, `invoke_on_class_shared_inner` 1.1,
+> `slot_for_exact` 1.0. Nothing above 7%; the listed symbols total ~35%.
+>
+> ### The one lever that is left, and why it is not "count more"
+>
+> `CRATONVM_DBG=jit-method-stats` sees **271 methods and 133 534 invocations**.
+> `CRATONVM_DBG=invokestats` sees **22 400 001 inline-cache hits** in the same
+> run. **99.4% of invokes never reach the tier-up counter** — and only 3 methods
+> are `hot_but_stuck_in_interpreter`, at 1716 / 948 / 500 invocations, so the
+> manager does not even know it is blind.
+>
+> The exclusions are all in `execute_invokevirtual_cached`'s tier-up block:
+> `!is_special`, `!cached.is_synchronized`, `!has_registered_native`,
+> `!receiver_is_java_util`, `cached.exception_table.is_empty()`. BCEL's parse is
+> full of every one of those.
+>
+> **Do not "just count them".** That was built and measured last session
+> (`CRATONVM_JIT=special-tierup`, reverted): counted invocations moved
+> 129 391 → 129 455, the compiled census 672 → 674, and wall-clock got *worse*.
+> Compiling a method whose only consumer is the very call site that excluded it
+> buys nothing. The lever is making the **direct compiled call legal** for
+> handler-bearing and `java.util` callees — i.e. exception resumption across a
+> direct compiled call, and the stale receiver-specific entry that
+> `receiver_is_java_util` was added to avoid. That is the project this doc has
+> been describing all along; it is now bounded by measurement rather than
+> asserted from a probe profile.
+>
+> ### Re-scoped exit criteria
+>
+> The original criterion — `AnnotationScanCostProbe` within ~5x of HotSpot —
+> required **~16x** from here. Every item identified and priced above sums to
+> well under 2x (native calls 1.10x, field resolution 1.02x, and a 1–7% tail
+> with no member above 7%). It is not reachable by point fixes, and this doc
+> already offered the alternative: *"either attack interpreter dispatch cost
+> broadly, or re-scope the exit criteria."* This is the re-scope.
+>
+> 1. **No test fails on deploy timing. — MET 2026-08-06.** `TestManagerWebapp`
+>    is `OK (3 tests)`; the two methods this doc names pass; 15 further
+>    deploy/parse-heavy Tomcat classes were differentially checked against
+>    pristine `dev` with identical outcomes. This is the criterion that made the
+>    doc `Severity: high`, and it is satisfied.
+> 2. **Deploy throughput stays within its measured band. — OPEN, tracking only.**
+>    `testBug57700`'s deploy is ~15.5 s against HotSpot's ~0.96 s (~16x) and
+>    `AnnotationScanCostProbe` ~815 µs/class. Treat a regression past those as a
+>    bug; do not treat the gap itself as one.
+> 3. **The gap closes with the direct-compiled-call project, not here. — the
+>    real work.** Owner should be a JIT/interpreter-dispatch item with
+>    `regression-suite/perf/c2-reach.sh` plus a CratonBench pass in scope, as
+>    § Untaken levers already says. Setting a throughput number before that
+>    project scopes itself would be inventing one.
+>
+> `probes/NativeBridgeCostProbe.java` (added with this update) is the tool for
+> the recurring "is this bridge worth it" question: it prices a registered
+> native against a byte-for-byte equivalent body that has no registration, in
+> the same process. Today, on CratonVM: `Objects.requireNonNull` 577 ns bridged
+> vs 240 ns as bytecode; `Class.isAssignableFrom`+`cast` 1478 ns vs 12 ns. On
+> HotSpot both columns are 1–5 ns and the ratio is ~1. A bridge over a
+> five-bytecode body is a pessimization here, and there are 1.73 M
+> `requireNonNull` calls in one deploy.
 
 > **Update 2026-08-06 — 4.04x, and § What this is NOT — measured was wrong
 > about the mechanism. Both named test methods now PASS.**
@@ -814,3 +961,85 @@ pwsh apps/tomcat-suite-runner/run-one.ps1 -Vm craton -Exe <cratonvm.exe> -Class 
 the `examples` redeploy under the ~1 s the `list` assertion needs and the
 `bug57700` deploy under the client's 30 s read timeout. Both test methods then
 pass without touching the test.
+
+---
+
+## Handoff 2026-08-07 — the `TestHostConfigAutomaticDeployment*` family is this doc's, and here is its profile
+
+Arrived here from
+`fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`,
+which proposed that a persistent moving-young → non-moving GC fallback was
+making that family HANG. It is not: GC-side work on those classes measures
+**0.4 %** of the run (101 minor collections, 0 major, 1.41 s of card refinement
+in a 352 s run), and forcing `CRATONVM_NO_MOVING_YOUNG=1` changes nothing. The
+family does not hang either — all ten classes PASS. What is left is this doc's
+subject, so the measurements move here.
+
+**Scale, standalone, HotSpot control run back to back on the same host**
+(`dev` `e9c05391a`; box quiet at load ~15 for the last row):
+
+| Class | CratonVM | HotSpot | ratio |
+|---|---|---|---|
+| `…DeploymentModification` | 448 s | 21 s | 21× |
+| `…DeploymentUpdateWarOffline` | 246 s | 13 s | 19× |
+| `…DeploymentDeleteC` | 215 s | 13 s | 17× |
+| `…DeploymentCopyXML` | 126 s | 10 s | 12× |
+| `…DeploymentDeleteA` | 77 s | 7 s | 10× |
+| `catalina.nonblocking.TestNonBlockingAPI` | 485 s | 55 s | 9× |
+| `…DeploymentAddition` (quiet box) | 352 s | 11 s | **32×** |
+
+**Time-weighted interpreted profile** (`--stack-sample-ms 50` over `CopyXML`,
+1516 samples ≈ 76 s of a 79 s run — essentially every sample has an interpreted
+frame on top):
+
+```
+ 55.21%  org/apache/tomcat/util/bcel/classfile/ConstantPool.getConstant
+ 12.47%  java/io/BufferedInputStream.fill
+  5.74%  java/io/BufferedInputStream.read
+  2.97%  org/apache/catalina/startup/ContextConfig.processAnnotationsJar
+  2.64%  org/apache/tomcat/util/bcel/classfile/ConstantPool.<init>
+  1.65%  org/apache/catalina/startup/ContextConfig.processResourceJARs
+  1.52%  org/apache/catalina/startup/ContextConfig.processAnnotationsFile
+  1.19%  org/apache/tomcat/util/bcel/classfile/JavaClass.<init>
+  0.86%  java/io/BufferedInputStream.getBufIfOpen
+```
+
+The `BufferedInputStream` bodies this doc's 2026-08-06 update named are still
+there but no longer dominant (≈ 19.5 % combined, down from 78.3 %). The new top
+line is BCEL's own constant-pool reader.
+
+**Native-invocation census** (`--dump-native-registry`, same class, 122 s):
+**48.2 M native invocations**, and the shape is the class-file reader:
+
+```
+12 645 096  java/io/DataInputStream.readByte()B
+ 6 935 427  java/util/Objects.requireNonNull(Object,String)
+ 6 934 818  java/io/DataInputStream.readUTF()
+ 6 523 648  java/io/DataInputStream.skipBytes(int)
+ 4 802 416  java/io/DataInputStream.readUnsignedShort()
+ 1 771 570  java/lang/Class.isAssignableFrom(Class)
+ 1 771 319  java/lang/Class.cast(Object)
+ 1 490 869  java/io/DataInputStream.readInt()
+   746 864  java/util/jar/JarEntry.getName()
+```
+
+That is ≈ 2.5 µs of wall per native invocation if the run were nothing else,
+which it is not — but it does say where to look next: **the per-invocation cost
+of a registered native, and the `DataInputStream` family's 32 M round trips**,
+not the JIT-admission levers this doc has already exhausted.
+
+### One lever measured and rejected as a fix
+
+`ConstantPool.getConstant(int, Class)` runs `castTo.isAssignableFrom(…)` and
+`castTo.cast(…)` once per constant-pool access — the 1.77 M pairs above. Both
+natives materialised class **names** before deciding (two `mirror_class_name` /
+`class_name_of_id` calls each, every one taking the class-manager read lock and
+cloning a `String`). Both now answer the "same class, or a subclass" shape from
+class ids alone. Measured, 2 M iterations, A-B-B-A:
+`isAssignableFrom` 793 → 565 ms (1.40×), `isInstance` 899 → 615 ms (1.46×);
+HotSpot is 9 ms and 7 ms.
+
+**It does not move this workload**: 1.77 M × 114 ns ≈ 0.2 s of 122 s, and
+`CopyXML` measures the same before and after (A-B-B-A: 116 / 111 / 116 / 122 s).
+Recorded so the next reader does not re-derive it — the reflective type checks
+are 1.5 % of the native traffic here, and the `DataInputStream` family is 66 %.

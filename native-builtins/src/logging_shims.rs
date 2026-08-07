@@ -2688,7 +2688,17 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            // `jul_logger_name_object`, not `get_field(this, 0)`. This is the
+            // LAST registration for the triple, so it owns the slot -- and it
+            // was answering the raw contents of slot 0, which is this file's
+            // own 2/3-field layout but neither of the other two JUL Logger
+            // layouts the VM produces. On the 13-field `logmanager` Logger that
+            // `Logger.getLogger(name)` actually returns, slot 0 is not the name
+            // and in the synthetic-JDK build is not even an object.
+            Ok(Some(match crate::logmanager::jul_logger_name_object(&*ctx, this) {
+                Some(name) => Value::Object(Some(name)),
+                None => Value::Object(Some(ctx.create_string(""))),
+            }))
         },
     );
     registry.register(

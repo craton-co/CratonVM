@@ -75,6 +75,12 @@ pub use class_origin::{ClassOrigin, ClassOriginEntry};
 // the crate root for the same reason as `ClassOrigin`: `vm` is the consumer.
 pub use class_manager::ImageMethodVerdict;
 pub use class_manager::is_bootstrap_appended_class;
+// JVMS §5.3.3: an array class is created FROM its element type, so an absent
+// element is the request itself failing (ClassNotFoundException), not a missing
+// dependency of something found (NoClassDefFoundError). The `ClassLoader.loadClass`
+// boundary in `native-builtins` needs to tell those apart; named at the crate root
+// because that is where the descriptor knowledge lives.
+pub use class_manager::array_descriptor_element_class;
 pub use class_manager::synthetic_stub_instance_field_count;
 // The fabricated slot MODEL itself, not just its size. `shadow_layout` diffs it
 // against the real layout; a build-time gate over the `*_FIELD_*` constants —
