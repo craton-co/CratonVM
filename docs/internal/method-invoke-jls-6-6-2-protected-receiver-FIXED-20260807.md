@@ -1,8 +1,27 @@
 # `Method.invoke` refuses the JLS 6.6.2 protected-receiver allowance
 
-**Status:** OPEN, filed 2026-08-07 from the strict-corpus re-measurement. **Not a
-`--jdk-only` defect** — it reproduces identically in `--real-jdk`, and it is one
-of the two mode-independent failures left in the corpus.
+**Status: FIXED 2026-08-07**, the same day it was filed. **Not a `--jdk-only`
+defect** — it reproduced identically in `--real-jdk`.
+
+**The language-level check was never the problem.** `caller_may_access_member`
+already answered correctly for all four receivers — instrumenting it printed
+`subclass=true recv_ok=true` on the two rows that were nevertheless refused. The
+refusal came from the JPMS gate immediately after it: `Method.invoke` sent
+non-public members to `check_reflection_module_access`, the **opens** /
+deep-reflection question, when the JDK asks the **exports** one.
+`AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
+`verifyModuleAccess` tests `isExported(pkg, callerModule)` and never consults
+`opens`; `opens` is `setAccessible(true)`'s gate. `java.lang` is exported but
+not open, so every protected member of `java.lang` was unreachable by
+reflection.
+
+Both arms now ask the exports question (`native-builtins/src/lang_class.rs`).
+`RJdkFieldModule` passes in both modes, and the strict corpus went 51/3 to 53/1.
+
+**The lesson worth keeping:** a correct check and an incorrect one in series
+read, from the outside, exactly like one incorrect check. Instrument the
+predicate you suspect and confirm its verdict BEFORE editing it — here the
+suspect was innocent and the two-line block after it was guilty.
 
 | | |
 |---|---|

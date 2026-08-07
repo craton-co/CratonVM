@@ -5,7 +5,7 @@
 against the re-landed tree the same day. **Two of the five tier-1 rows (items 5
 and 7) closed 2026-08-06** — see the pass note below the table.
 
-> ## 2026-08-07 — the strict corpus was built and run: 51 passed, 3 failed
+> ## 2026-08-07 — the strict corpus was built, run, and closed: 53 passed, 1 failed
 >
 > Most records in this directory say "FIXED in source ... not yet verified,
 > no binary was built in this session". A binary was built (dev `5d22671e3`,
@@ -13,11 +13,16 @@ and 7) closed 2026-08-06** — see the pass note below the table.
 > was run three times, with the identical result each time. The campaign's 14
 > failures are down to **3**:
 >
-> | vector | strict-only? | record |
+> | vector | was | now |
 > |---|---|---|
-> | `RJdkModule` | **yes** — `rc=0` in Compatible | [`W6-11`](W6-11-strict-mode-module-serviceloader.md); `moduleServices()` reached for the first time, and finds `module service providers: []` |
-> | `RJdkFieldModule` | no — identical in both modes | [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](method-invoke-refuses-the-jls-6-6-2-protected-receiver.md), newly filed |
-> | `RMapGcStress` | no — fails in every mode and every build | dev's own; not this campaign |
+> | `RJdkModule` | strict-only, `module service providers: []` | **FIXED** — [`W6-11`](../../internal/jdk-only-W6-11-module-serviceloader-FIXED-20260807.md); 44 checks, matching HotSpot |
+> | `RJdkFieldModule` | both modes, JLS 6.6.2 over-refusal | **FIXED** — [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](../../internal/method-invoke-jls-6-6-2-protected-receiver-FIXED-20260807.md) |
+> | `RMapGcStress` | fails in every mode and every build | still open; dev's own, not this campaign |
+>
+> Corpus after the two fixes: **53 passed, 1 failed**, ABBA-interleaved.
+> Compatible mode unchanged at 30/1. A `--features synthetic-jdk` binary run
+> `--jdk-only` is still worse (48/6) — a separate, previously unmeasured
+> configuration.
 >
 > **What this does and does not license.** Every record whose corpus vector is
 > in `JDKONLY_CLASSES` and is not one of those three now has its vector passing,
