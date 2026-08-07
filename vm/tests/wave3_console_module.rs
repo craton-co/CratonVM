@@ -117,6 +117,14 @@ fn ensure_console_probe_compiled() -> bool {
     }
     let source = dir.join("ConsoleProbe.java");
     if !source.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave3_console_module",
+            "the Wave 3 console fixture `ConsoleProbe.java`",
+            &[source.clone()],
+        );
         return false;
     }
     let compile = Command::new("javac")

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-419 tokens.
+420 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -307,6 +307,7 @@ export inherited from a parent shell.
 | `moving-young-verify` | `CRATONVM_MOVING_YOUNG_VERIFY` |
 | `msc` | `CRATONVM_DBG_MSC` |
 | `mtroots` | `CRATONVM_DBG_MTROOTS` |
+| `nativelibraries-load-ok` | `CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK` |
 | `ncdfe` | `CRATONVM_DBG_NCDFE` |
 | `needs-exact-trace` | `CRATONVM_NEEDS_EXACT_TRACE` |
 | `net` | `CRATONVM_DBG_NET` |
@@ -795,7 +796,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_SECURITY`
 
-11 tokens.
+12 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -807,13 +808,14 @@ export inherited from a parent shell.
 | `confine-io` | `CRATONVM_CONFINE_IO` |
 | `harden-manifest-classpath` | `CRATONVM_HARDEN_MANIFEST_CLASSPATH` |
 | `noncrypto-sslengine` | `CRATONVM_ALLOW_NONCRYPTO_SSLENGINE` |
+| `reflect-export-gate` | `CRATONVM_REFLECT_NO_EXPORT_GATE` |
 | `require-policy` | `CRATONVM_REQUIRE_POLICY` |
 | `trust-pem` | `CRATONVM_TRUST_PEM` |
 | `untrusted-code` | `CRATONVM_UNTRUSTED_CODE` |
 
 ## `CRATONVM_COMPAT`
 
-12 tokens.
+13 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -829,6 +831,7 @@ export inherited from a parent shell.
 | `mockito-legacy-selectors` | `CRATONVM_MOCKITO_LEGACY_SELECTORS` |
 | `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
 | `tomcat-mapper-natives` | `CRATONVM_TOMCAT_MAPPER_NATIVES` |
+| `vh-strict-reference-return` | `CRATONVM_VH_STRICT_REFERENCE_RETURN` |
 
 ## `CRATONVM_TEST`
 

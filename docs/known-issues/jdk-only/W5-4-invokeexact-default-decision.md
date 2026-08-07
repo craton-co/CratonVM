@@ -148,7 +148,7 @@ of the six by construction — not by testing:
 
 | risk | call-site return | in `F`? | test in THIS tree? |
 |---|---|---|---|
-| Groovy `IndyInterface` | `Object` (every indy call site) | **structurally impossible** | yes — `scripts/smoke/ri14_groovy.sh` (downloads groovy 4.0.21), plus 11 hand-built indy probes under `docs/internal/fixed-suite-bugs/repros/springrepos-indy-3c/` |
+| Groovy `IndyInterface` | `Object` (every indy call site) | **structurally impossible** | yes — `scripts/smoke/ri14_groovy.sh` (downloads groovy 4.0.21), plus 11 hand-built indy probes under the internal repro tree, `fixed-suite-bugs/repros/springrepos-indy-3c/` |
 | JRuby | `Object` | **structurally impossible** | **none** — zero fixtures; the name appears only in Rust comments and docs |
 | Jackson 3 `DirectMethodHandle$Constructor` | the constructed type (reference); also `MH_KIND_CONSTRUCTOR` skips `auto_box_return` entirely | **structurally impossible** | **none for Jackson 3** — `tools.jackson` is absent from the tree; only Jackson **2** exists, via `scripts/smoke/ri5_jackson.sh` |
 | Spring/Hibernate proxying | reference returns | **structurally impossible** | runners exist (`apps/spring-suite-runner/run-suite.sh`, `apps/hib-suite-runner/run-hib.sh`) but the `apps/spring-framework` / `apps/hibernate-orm` checkouts are **absent from this worktree** |

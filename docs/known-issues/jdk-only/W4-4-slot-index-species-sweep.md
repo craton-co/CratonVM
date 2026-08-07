@@ -20,19 +20,77 @@ fields `_f0.._fN`, so a by-name resolve misses there and falls through.
 
 ## The reachability rule (this is what bounds the sweep)
 
-A native in `native-builtins` can only *see* a real JDK receiver through one of
-four doors. `vm/src/vm/vm_exec.rs::resolve_dispatch` decides:
+> **CORRECTED 2026-08-07 — this rule is too restrictive, and door 2 does not
+> exist as stated. The sweep it bounds is therefore too narrow, not too wide.**
+> The full correction is
+> [§1 of *Natives over real JDK classes*](../../architecture/natives-over-real-jdk-classes.md);
+> the short version:
+>
+> * **On the cold interpreter paths, registration itself is the gate** — a
+>   native registered for the triple beats real bytecode with no list consulted.
+>   `native_override.rs`'s module banner says so outright (*"A registered native
+>   wins over real bytecode unconditionally. The predicates decide which methods
+>   are registered as overrides, not whether an override applies once it
+>   exists."*), and `resolve_step1_native` hard-codes `compat_native_wins = true`.
+> * **`resolve_dispatch` is not the live decider.** Its only non-test caller sits
+>   inside an `if is_native {` block, and its step 1 returns unconditionally for
+>   `method.is_native()` — so steps 2–4, including the `Intrinsic` step, execute
+>   only from `vm/tests/jdk_only_dispatch.rs`.
+> * **`NativeKind` only ever subtracts.** On the live adapter the kind is read
+>   after `compat_native_wins` and is discarded entirely in `Compatible` mode.
+>   `Intrinsic` buys exemption from the `--jdk-only` yield
+>   (`policy.is_jdk_only() && bytecode_available && kind != NativeKind::Intrinsic`),
+>   JIT direct-bind approval, and survival of two registration-time drop arms —
+>   never precedence it did not already have.
+> * Doors 1, 3 and 4 survive. Door 3 (`force_native_over_real_jdk_bytecode`) and
+>   `vm_exec.rs`'s `check_override` chain are what **reinstate** the default on
+>   the warm/cached/reflective/JIT paths, which would otherwise prefer bytecode.
+>
+> **RE-VERIFIED 2026-08-07 (lane W8-7), and the correction above needs one more
+> clause: it names the wrong FIRST question.** Before "does a list admit this
+> native" comes *"did the registrar that registers it ever run in this mode"*,
+> and after it comes *"does this mode refuse the registration"*. The full
+> three-gate procedure, the per-path table, and the re-audit of every site this
+> campaign called dead are in
+> [*The true native-vs-bytecode precedence rules*](true-native-precedence-rules-and-the-dead-site-re-audit.md).
+> Two clauses of the correction above are load-bearing and now confirmed against
+> a third path each lane missed:
+>
+> * `invoke_on_class_shared_inner`'s ~302-disjunct `check_override` chain is
+>   **not** that path's gate either. When the chain declines, the bytecode arm
+>   ends at a SECOND, unconditional `native_methods.find(declaring_class, …)`
+>   (`vm/src/vm/vm_exec.rs:24595-24622`, `override_cb`), vetoed only by the
+>   interface-default guard and the synthetic-stub yield. So reflection,
+>   `ctx.invoke_virtual`, lambda method-refs and JNI all get "registration is the
+>   gate" too.
+> * The one path where the force list really is the *only* door is the warm
+>   vtable-cached one (`dispatch_virtual.rs:741-779`): a `CachedBytecodeMethod`
+>   consults the registry solely through `force_native_over_real_jdk_bytecode`.
+>   That asymmetry is a live divergence source, not a theoretical one — see
+>   `invoke.rs:3526-3542`, whose guard exists because an interface bridge ran on
+>   the first, cold call at a site and the bytecode ran on every later one.
+>
+> **What this means for the sweep below:** any site excluded because "the method
+> has `Code` and is neither `Intrinsic` nor force-listed" was excluded on a false
+> premise and needs re-checking. The verdicts in the table are not invalidated —
+> a site marked SAFE for a layout reason is still safe — but the *set of sites
+> considered* is, and four rows below state a **wrong reason for a right
+> verdict**; they are corrected in place and marked *(reason corrected
+> 2026-08-07)*.
+
+~~A native in `native-builtins` can only *see* a real JDK receiver through one of
+four doors. `vm/src/vm/vm_exec.rs::resolve_dispatch` decides:~~
 
 1. **`ACC_NATIVE` JDK method** — no bytecode exists, so the registration always
    answers. (`ClassLoader.defineClass2`, `Module.addExports0`, `Perf.*`, …)
-2. **`NativeKind::Intrinsic`** — the one kind allowed to shadow bytecode.
+2. ~~**`NativeKind::Intrinsic`** — the one kind allowed to shadow bytecode.~~
 3. **`force_native_over_real_jdk_bytecode`** (vm/src/runtime/interpreter/
    native_override.rs) — an explicit per-triple list.
 4. **no `Code` anywhere in the hierarchy** — an interface/abstract declaration
    that nothing overrides.
 
-Everything else loses to real bytecode: *step 3 of `resolve_dispatch` —
-"real class bytes are authoritative"*. And the whole
+~~Everything else loses to real bytecode: *step 3 of `resolve_dispatch` —
+"real class bytes are authoritative"*.~~ And the whole
 `register_phase50..72_natives` family is reached ONLY from
 `register_synthetic_overrides`, which `vm_init.rs:1552` calls **only when
 `config.use_synthetic_jdk` is true at runtime** — not merely when the Cargo
@@ -129,7 +187,7 @@ would reintroduce the bug at five sites at once.
 | `lang_system` `native_thread_get_name` | `java.lang.Thread` | yes | name(2), slot 0 = `eetop` | safe — by-name first, slot 0 is the fallback |
 | `lang_system` `exec_dir_path` | `java.io.File` | yes | path(0) | safe — by-name first; slot 0 happens to match |
 | `lang_system` `install_charset` | `java.nio.charset.Charset` | yes (raw `alloc_object` of the real class) | name(0) aliases(1) aliasSet(2) | safe — slot 0 IS `name` |
-| `lang_system` `native_pb_init`/`_command` | `java.lang.ProcessBuilder` | no (all methods have `Code`, PB not force-listed) | command(0) directory(1) environment(2) | safe, and the indices match anyway |
+| `lang_system` `native_pb_init`/`_command` | `java.lang.ProcessBuilder` | **YES** — *(reason corrected 2026-08-07)* "has `Code`, not force-listed" does not exclude anything; `ProcessBuilder` is concrete, so a registration on that exact name wins on every cold and every reflective dispatch | command(0) directory(1) environment(2) | safe **only** because the indices match the real layout — the reachability half of the old argument was false |
 | `lang_system` PD/CodeSource reads in `defineClass1/2` | `java.security.ProtectionDomain`, `CodeSource` | yes (door 1) | PD codesource(0); CS location(0) | safe — both slot-0 reads hit the intended field |
 | `lang_system` `native_runtime_version*`, `native_thread_get_state` | `Runtime$Version`, `Thread` | yes (force-listed) | — | safe — every read is by name |
 | `lang_system` env-`HashMap` builder, `wrap_system_env_map` | `HashMap`/`HashMap$Node`, `cratonvm/internal/UnmodifiableMap` | — | — | safe — real path resolves every index by name; fallback path uses `ensure_synthetic_class` |
@@ -148,9 +206,9 @@ would reintroduce the bug at five sites at once.
 | `nio_file` `register_real_jdk_files_owner`, `register_p66_file_visitor` | `Files`, `SimpleFileVisitor` | yes / no | — | safe — no receiver slot access in either |
 | `foreign_ffm` `p67_segment_byte_size`/`p67_segment_address` | `jdk.internal.foreign.AbstractMemorySegmentImpl` | yes (force-listed) | `length`, `min` | safe — by-name first, slots are the fallback |
 | `ssl_security` `register_p68_crypto_mac` | `javax.crypto.Mac` | yes | — | safe — no receiver slot access |
-| `ssl_security` `register_p68_security_cert` (slots 0-3) | `java.security.cert.X509Certificate` | no | — | safe — abstract class; a real `sun.security.x509.X509CertImpl` overrides every triple with `Code`, and none is force-listed |
+| `ssl_security` `register_p68_security_cert` (slots 0-3) | `java.security.cert.X509Certificate` | **per-method** — *(reason corrected 2026-08-07)* "none is force-listed" excludes nothing. The real gate is that `X509CertImpl` **declares** each triple, so the dispatch class name misses the registry and step 1's superclass walk is skipped (`has_own_bytecode`). Any triple the impl does *not* declare walks up and hits the abstract-class registration | — | safe for the triples `X509CertImpl` overrides; **unverified** for any it inherits |
 | `net_channels` `register_p67_async_channels` (slots 0-3) | `java.nio.channels.Asynchronous*Channel` | no | — | safe — abstract classes; the static `open()` factories have `Code`, so the receiver is always CratonVM-fabricated |
-| `jdbc` `register_p68_jdbc` (~130 slot sites) | `java.sql.Connection/Statement/PreparedStatement/ResultSet/CallableStatement/DatabaseMetaData` | no | — | safe — all six are **interfaces**; any real driver class (H2's `org.h2.jdbc.*`) declares the method with `Code` and wins at step 3. The natives answer only for CratonVM's own fabricated `java/sql/*` receivers |
+| `jdbc` `register_p68_jdbc` (~130 slot sites) | `java.sql.Connection/Statement/PreparedStatement/ResultSet/CallableStatement/DatabaseMetaData` | no | — | safe — *(reason corrected 2026-08-07)* not "step 3", which never runs. Two real gates: the driver class (`org.h2.jdbc.*`) is the declaring class, so the registry lookup is keyed on a name with no registration; and the interface-default guard (`invoke.rs:3550`, `vm_exec.rs:24595`) drops interface-name natives for instance calls outright |
 | `streams` `register_synthetic_stream_spliterators` | — | — | — | safe — no receiver slot access |
 | `jboss_jdkspecific` `module_registry_name`, `build_module`, `native_module_define_module0` | `java.lang.Module` | yes (door 1) | layer(0) name(1) loader(2) descriptor(3) | safe — already fixed; `build_module` carries an explicit "NB: no raw slot write here" note |
 | `jboss_jdkspecific` `wrap_optional_present` | `java.util.Optional` | possible | value(0) — its only instance field | safe — slot 0 IS `value` |
@@ -197,8 +255,13 @@ change belongs with whoever next touches it.
 
 ## Confidence, and the observation that would falsify this
 
-Reachability is the whole argument, and it rests on `resolve_dispatch`'s step 3
-plus the `use_synthetic_jdk` runtime gate at `vm_init.rs:1552`. **The single
+> **2026-08-07 (W8-7).** The `use_synthetic_jdk` half of this paragraph is
+> correct and is the load-bearing half. The `resolve_dispatch` step-3 half is
+> not: that function's steps 2–4 are unreachable in production. Read the
+> paragraph as resting on the runtime gate at `vm_init.rs:1552` alone.
+
+Reachability is the whole argument, and it rests on ~~`resolve_dispatch`'s step 3
+plus~~ the `use_synthetic_jdk` runtime gate at `vm_init.rs:1552`. **The single
 falsifying observation:** a real `java.util.HashSet`, `java.sql.Connection` or
 `java.security.cert.X509Certificate` instance arriving at one of the natives
 this document calls inert. The cheapest instrument is

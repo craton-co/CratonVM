@@ -87,6 +87,12 @@ Current deep dives include:
 - [JIT cache sharding and code reclamation](architecture/jit-cache-sharding-and-code-reclamation.md)
 - [Register allocation, recursion, and inlining](architecture/register-allocation-recursion-and-inlining.md)
 - [Shared verified-code IR](architecture/shared-verified-code-ir.md)
+- [Natives over real JDK classes](architecture/natives-over-real-jdk-classes.md)
+  — how a registered native comes to run instead of real JDK bytecode, why the
+  Cargo feature is not the runtime mode, `register()`'s last-wins semantics,
+  what a by-name field read cannot tell you, and what the registration censuses
+  can and cannot see. Read this before diagnosing "why did/didn't my native
+  run".
 - [Native target-method metadata](architecture/native-target-method-metadata.md)
 - [Mapped JAR and shared class bytes](architecture/mapped-jar-shared-class-bytes.md)
 - [Runtime flag census](flag-census.md)
@@ -135,6 +141,11 @@ default and is unaffected.**
   confirmed, open work list; a floor, not a ceiling.
 - [Native promotion review](jdk-only-native-review.md) — the checklist a
   `SyntheticStub` must pass to become a reviewed `Bridge` or `Intrinsic`.
+- [Natives over real JDK classes](architecture/natives-over-real-jdk-classes.md)
+  — the mechanism facts every wave-2 lane rediscovered: reachability,
+  feature-vs-mode, last-wins registration, by-name field reads, slot indices,
+  census scope, and measurement discipline. Read it before reading a record in
+  the list below.
 - [Object-layout audit](jdk-only-object-layout-audit.md) — every site that
   reaches a field by assumed synthetic slot index, a prerequisite for
   dropping the corresponding stub.

@@ -307,12 +307,50 @@ fn tcp_listener_is_registered(id: i32) -> bool {
 /// finds no listener and gives up) or after it (which has already returned).
 /// The lock is never held across a blocking syscall — the listener is put in
 /// non-blocking mode first, so `accept()` here always returns immediately.
+///
+/// # The same park has to observe an interrupt
+///
+/// `interrupted` is the probe of the accepting thread's own interrupt flag,
+/// exactly as in [`read_close_aware`] and for the same reason: CratonVM
+/// registers `accept` as a NATIVE, so the JDK's `begin()`/`end()` sandwich —
+/// and with it `AbstractInterruptibleChannel`'s interruptor — never runs. A
+/// `true` here means the caller must close the channel and raise
+/// `ClosedByInterruptException` (see [`close_by_interrupt`]).
+///
+/// Measured on HotSpot 25.0.3 (Microsoft build 25.0.3+9-LTS), 2/2 runs:
+///
+/// | scenario (blocking `ServerSocketChannel`)      | outcome                    |
+/// |------------------------------------------------|----------------------------|
+/// | parked in `accept()`, then `interrupt()`        | `ClosedByInterruptException` on delivery; `isOpen()==false`; a second `accept()` is a plain `ClosedChannelException`; `isInterrupted()` still true |
+/// | interrupt flag set BEFORE `accept()`            | same, in 0 ms              |
+/// | ...and a connection ALREADY PENDING             | same, in 0 ms — the pending connection is **not** accepted |
+/// | parked in `accept()`, then `close()`            | `AsynchronousCloseException`; flag false |
+///
+/// and, decisively for the acceptor-thread risk this gate carries, on a
+/// **non-blocking** `ServerSocketChannel` with the interrupt flag set,
+/// `accept()` answers `null` (or accepts the pending connection normally) and
+/// leaves the listener OPEN. That is why `ssc_accept_impl` passes a probe that
+/// is only live when `blocking` is true — a selector-driven acceptor whose
+/// reactor thread happens to carry an interrupt flag must not lose its
+/// listening socket.
+///
+/// The probe runs at the TOP of each pass, before the accept attempt, so a
+/// connection sitting in the backlog cannot satisfy an interrupted accept —
+/// that is the `A1b` row above, and it is the accept twin of
+/// `an_interrupt_outranks_bytes_that_are_already_readable`.
 fn accept_close_aware(
     id: i32,
     blocking: bool,
+    interrupted: &dyn Fn() -> bool,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
     let mut nonblocking_set = false;
     loop {
+        // Interrupt BEFORE the deregistration check and before the accept
+        // attempt: `AbstractInterruptibleChannel.end()` gives the interrupt
+        // priority when a close and an interrupt are both pending.
+        if interrupted() {
+            return Err(channel_interrupted_err());
+        }
         // Scoped so the guard is dropped before the sleep below — otherwise a
         // parked acceptor would hold the registry read lock process-wide.
         let attempt = {
@@ -360,9 +398,10 @@ fn accept_close_aware(
 fn accept_until_deadline(
     id: i32,
     deadline: std::time::Instant,
+    interrupted: &dyn Fn() -> bool,
 ) -> std::io::Result<Option<(TcpStream, SocketAddr)>> {
     loop {
-        match accept_close_aware(id, false)? {
+        match accept_close_aware(id, false, interrupted)? {
             Some(pair) => return Ok(Some(pair)),
             None => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -493,6 +532,47 @@ fn channel_exception(ctx: &mut dyn NativeContext, simple_name: &str) -> MethodCa
 /// when this operation started.
 fn closed_channel_exception(ctx: &mut dyn NativeContext) -> MethodCallFailed {
     channel_exception(ctx, "ClosedChannelException")
+}
+
+/// Do to the channel what `AbstractInterruptibleChannel`'s interruptor does,
+/// then raise what its `end()` raises: close it **permanently** and throw
+/// `ClosedByInterruptException`.
+///
+/// # The contract, measured rather than recalled
+///
+/// HotSpot 25.0.3 (Microsoft build 25.0.3+9-LTS), 3/3 runs, loopback pair:
+///
+/// | scenario (blocking channel)                | outcome                      |
+/// |--------------------------------------------|------------------------------|
+/// | parked in `read`, then `interrupt()`        | `ClosedByInterruptException` after ~402 ms; `isOpen()==false`; a second read is a plain `ClosedChannelException`; `isInterrupted()` still **true** |
+/// | interrupt flag set BEFORE `read`, no data   | same exception in 0 ms       |
+/// | interrupt flag set BEFORE `read`, data ready| same exception in 0 ms — the pending data is **not** delivered |
+/// | parked in `read`, then `close()`            | `AsynchronousCloseException`; interrupt flag false |
+///
+/// and, decisively for the shape of the fix, on a **non-blocking** channel with
+/// the interrupt flag set the read answers `0`, leaves the channel OPEN and
+/// leaves the flag set. That is why every caller below gates this on
+/// `read_blocking_flag`: `SocketChannelImpl.beginRead` only calls `begin()`
+/// `if (blocking)`, so closing a selector-registered channel because its
+/// reactor thread happens to carry an interrupt flag would be a fabricated
+/// failure, not JDK behaviour.
+///
+/// The interrupt status is deliberately NOT consumed — every probe here calls
+/// `is_interrupted(false)`. A `true` would satisfy the "it woke up" half of the
+/// contract while silently breaking the half every `ExecutorService` shutdown
+/// path depends on.
+///
+/// `this` must be a LIVE channel reference. Callers reach this after a blocking
+/// region in which a moving collector may have relocated the channel, and
+/// `sc_close` keys the synthetic state by object identity — so reload the ref
+/// through its pin (`read_native_pin`) first.
+fn close_by_interrupt(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallFailed {
+    // The full `SocketChannel.close()` teardown: FIN, selector deregistration,
+    // registry removal, synthetic-state wipe. Not a resumable wakeup — the
+    // channel stays closed, which is what makes the follow-up read a plain
+    // `ClosedChannelException` exactly as measured above.
+    let _ = sc_close(ctx, &[Value::Object(Some(this))]);
+    channel_exception(ctx, "ClosedByInterruptException")
 }
 
 /// Map a channel read failure to the exception `java.nio.channels` names for
@@ -1226,10 +1306,27 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(ch_val),
     };
     if let Some(sa) = obj_or_none(args, 0) {
+        // `SocketChannel.open(remote)` is `open()` + a BLOCKING `connect()` in
+        // the real JDK, so it carries the same interrupt contract as
+        // `sc_connect`: refuse before the dial, and re-ask after it (the pin
+        // spans the dial because `close_by_interrupt` tears the channel down
+        // by object IDENTITY). See `sc_connect` for the measured table and for
+        // why the mid-dial wake is deferred.
+        if ctx.is_interrupted(false) {
+            return Err(close_by_interrupt(ctx, ch));
+        }
+        let ch_pin = ctx.pin_native_root(ch);
         // Synchronous-connect overload of SocketChannel.open(SocketAddress)
         // is documented to throw IOException on failure. Surface the error
         // so callers can react instead of getting an unconnected channel.
-        sc_connect_inner(ctx, ch, sa, /* allow_block = */ true)?;
+        let result = sc_connect_inner(ctx, ch, sa, /* allow_block = */ true);
+        let live = ctx.read_native_pin(ch_pin, ch);
+        ctx.unpin_native_roots(ch_pin);
+        if ctx.is_interrupted(false) {
+            return Err(close_by_interrupt(ctx, live));
+        }
+        result?;
+        return Ok(Some(Value::Object(Some(live))));
     }
     Ok(Some(Value::Object(Some(ch))))
 }
@@ -1982,6 +2079,12 @@ fn sc_connect_inner(
     sa: ObjectRef,
     allow_block: bool,
 ) -> Result<bool, MethodCallFailed> {
+    // NOTE: the interrupt gate for connect lives in the CALLERS
+    // (`sc_connect`, `sc_blocking_connect`, `sc_open_connected` — the only
+    // three), not here, so that the before-the-dial check and the
+    // after-the-dial re-ask are one pair per entry point and an interrupted
+    // connect raises exactly one exception. Any new caller of this function
+    // must add the same pair; `allow_block` is the flag to gate it on.
     if let Some(path) = decode_unix_socket_address(ctx, sa)? {
         return sc_connect_unix(ctx, this, &path);
     }
@@ -2014,6 +2117,25 @@ fn sc_connect_inner(
         // pause (JIT takeover or GC) does not count this thread as an
         // expected cooperator and wait on it forever. Same pattern as
         // `socket_accept`/`socket_connect` in `plain_socket.rs`.
+        //
+        // MEASURED GAP (2026-08-07, W8-3). This dial is a single blocking OS
+        // `connect()` inside `policy_connect`, so unlike `read_close_aware` /
+        // `write_close_aware` / `accept_close_aware` it observes NEITHER an
+        // asynchronous `close()` NOR an interrupt while it is parked. HotSpot
+        // 25.0.3 (Microsoft build 25.0.3+9-LTS), measured on this host: a
+        // thread parked in a blocking `SocketChannel.connect()` whose channel
+        // is `close()`d from another thread wakes with
+        // `AsynchronousCloseException`; CratonVM stays parked until the dial
+        // resolves or the configured connect timeout (default 30 s) expires.
+        // The interrupt direction is the same gap and is named in
+        // `RSocketChannelInterrupt`'s part-3 header.
+        //
+        // Closing it means replacing this call with a non-blocking dial plus a
+        // registry/interrupt-aware poll loop (the `nb_connect::start` +
+        // `nb_connect::poll` pair the non-blocking branch below already uses),
+        // while keeping `policy_connect`'s SSRF vetting and timeout. That is a
+        // rewrite of the VM's busiest connect path and belongs behind its own
+        // build + full-vector run, not a drive-by.
         ctx.begin_blocking_region();
         let connect_result = crate::outbound_policy::policy_connect(&target);
         ctx.end_blocking_region();
@@ -2189,7 +2311,47 @@ fn sc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         None => return Err(null_socket_address("connect")),
     };
     let blocking = read_blocking_flag(ctx, this);
-    let ok = sc_connect_inner(ctx, this, sa, blocking)?;
+    // RACE DIRECTION 1 for connect — the interrupt landed before the dial.
+    // `SocketChannelImpl.beginConnect` runs `begin()` ahead of the connect, so
+    // a blocking `connect()` entered with the flag already set throws
+    // `ClosedByInterruptException` in 0 ms and NEVER DIALS — measured on
+    // HotSpot even against a LIVE local listener that would have connected
+    // instantly, leaving the channel closed with `isConnected() == false`.
+    //
+    // Gated on `blocking`: a non-blocking connect is not an interruptible
+    // operation (measured: it returns `false`, stays OPEN, keeps
+    // `isConnectionPending() == true` and keeps the flag set).
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
+    // The pin spans `sc_connect_inner`, whose blocking branch performs a real
+    // OS connect inside a GC-blocking region: a moving collector can relocate
+    // the channel across it, and `close_by_interrupt` below tears the channel
+    // down by object IDENTITY.
+    let this_pin = ctx.pin_native_root(this);
+    let result = sc_connect_inner(ctx, this, sa, blocking);
+    let live = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    // RACE DIRECTION 2 for connect, in the only form this architecture can
+    // express: the interrupt is re-asked AFTER the dial. It is checked BEFORE
+    // `result?` because `AbstractInterruptibleChannel.end()` runs in a
+    // `finally` and its `ClosedByInterruptException` replaces whatever the
+    // connect itself was reporting.
+    //
+    // DEFERRED, deliberately: this does not WAKE a connect that is still
+    // parked. The blocking dial happens inside
+    // `outbound_policy::policy_connect` (a different file, and one this lane
+    // does not own), which issues a single blocking OS `connect()` bounded
+    // only by the configured connect timeout — default 30 s. So an interrupt
+    // delivered to a thread parked on an unreachable host is observed when
+    // that dial returns, not at the moment of delivery. HotSpot wakes in
+    // ~0 ms (measured against an RFC 5737 blackhole). Closing that gap means
+    // turning `policy_connect` into a poll loop over a non-blocking connect,
+    // which is a change to `outbound_policy.rs`.
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, live));
+    }
+    let ok = result?;
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -2208,11 +2370,23 @@ fn sc_blocking_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(o) => o,
         None => return Err(null_socket_address("blockingConnect")),
     };
-    let ok = sc_connect_inner(ctx, this, sa, true)?;
+    // Same before/after pair as `sc_connect`; this entry point is
+    // unconditionally blocking, so both gates are unconditional too.
+    if ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let result = sc_connect_inner(ctx, this, sa, true);
+    let live = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    if ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, live));
+    }
+    let ok = result?;
     if !ok {
         return Err(ioex("blockingConnect: connection refused"));
     }
-    cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+    cf_set(ctx, live, F_CONNECTED, Value::Int(1));
     Ok(None)
 }
 
@@ -2225,6 +2399,17 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
     };
+
+    // `finishConnect()` is an interruptible operation too, on the same terms:
+    // measured on HotSpot, a channel switched BACK to blocking mode after a
+    // non-blocking connect was started throws `ClosedByInterruptException` in
+    // 0 ms when the flag is set, while the ordinary NON-blocking
+    // `finishConnect()` returns `true` and leaves the channel open with the
+    // flag still set. This is the whole of the interrupt story for this
+    // native: there is nothing to wake, since it never parks.
+    if read_blocking_flag(ctx, this) && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
 
     // Probe the current state of the registry entry. For a Connecting socket
     // we poll the **real fd** for write/error readiness + SO_ERROR (no
@@ -2386,6 +2571,21 @@ fn channel_async_closed_err() -> std::io::Error {
     std::io::Error::new(ErrorKind::Interrupted, "channel closed asynchronously")
 }
 
+/// The error a parked read reports once the reading thread is interrupted.
+///
+/// It shares `ErrorKind::Interrupted` with [`channel_async_closed_err`] on
+/// purpose. The two are told apart at the *call site* by re-asking the thread's
+/// own interrupt flag rather than by inspecting the error, because that
+/// re-ask is the check that has to happen anyway: a close and an interrupt can
+/// both be pending, and `AbstractInterruptibleChannel.end()` gives the
+/// interrupt priority (`if (interrupted == this thread) throw new
+/// ClosedByInterruptException()` runs before the `!open` arm). Encoding the
+/// distinction in the error instead would let a close that raced an interrupt
+/// report `AsynchronousCloseException`, which is the wrong one.
+fn channel_interrupted_err() -> std::io::Error {
+    std::io::Error::new(ErrorKind::Interrupted, "channel read interrupted")
+}
+
 /// A blocking channel read that observes an asynchronous `close()`.
 ///
 /// # Why the plain blocking read could not
@@ -2407,11 +2607,27 @@ fn channel_async_closed_err() -> std::io::Error {
 /// [`accept_close_aware`] already uses, and which [`sc_blocking_read`] gets for
 /// free by re-`resolve_stream`ing on every pass.
 ///
+/// # The same park has to observe an interrupt
+///
+/// `Thread.interrupt()` on a thread blocked here must close the channel and
+/// raise `ClosedByInterruptException` (see [`close_by_interrupt`] for the
+/// measured contract). CratonVM registers `SocketChannelImpl.read` as a NATIVE,
+/// so the real `SocketChannelImpl.read` bytecode — and with it the
+/// `beginRead`/`begin()`/`end()` sandwich that installs the JDK's interruptor —
+/// never runs. Seeding `AbstractInterruptibleChannel.interruptor` (which this
+/// file does, see [`seed_channel_interruptor`]) stops that path NPE-ing but
+/// cannot make it fire, because nothing calls `begin()`. So the interrupt has
+/// to be observed here, on the same 25 ms cadence the close already uses:
+/// `interrupt()` in this VM sets a shared `AtomicBool` (`vm_exec.rs`
+/// `thread_interrupt` → `thread_registry.set_interrupted`), and `interrupted`
+/// below is a probe of that flag on the parked thread.
+///
 /// The registry lock is taken per pass and never held across the poll.
 fn read_close_aware(
     id: i32,
     stream: &TcpStream,
     buf: &mut [u8],
+    interrupted: &dyn Fn() -> bool,
 ) -> Result<Option<i32>, std::io::Error> {
     loop {
         let ready = match crate::net::poll_stream_readable(stream, READ_CLOSE_POLL_MS) {
@@ -2420,6 +2636,18 @@ fn read_close_aware(
             // read, which cannot see the close but at least still transfers.
             None => return try_read_nb(stream, buf),
         };
+        // Interrupt BEFORE close, and both before the readiness arm.
+        //
+        //   * before close, because `end()` gives the interrupt priority when
+        //     both are pending;
+        //   * before readiness, because HotSpot does not deliver bytes to an
+        //     interrupted blocking read even when they are already buffered
+        //     (measured: "interrupt flag set BEFORE read, data ready" still
+        //     throws) — answering the read here would leave the channel open
+        //     and the wakeup unobserved.
+        if interrupted() {
+            return Err(channel_interrupted_err());
+        }
         // Asked AFTER the poll so a close landing while we are parked is seen
         // on the next pass, and a close racing a readiness edge still wins —
         // completing a read on a channel Java has closed is precisely what
@@ -2453,6 +2681,160 @@ fn try_write_nb(stream: &TcpStream, data: &[u8]) -> Result<Option<i32>, std::io:
     }
 }
 
+/// Is `stream` writable right now, without parking?
+///
+/// Deliberately NOT a second raw-FFI poll in this file: `nb_connect::poll` is
+/// the crate's existing portable zero-timeout write-readiness probe (Windows
+/// `WSAPoll(POLLWRNORM)`, Unix `poll(2)` with `POLLOUT`, plus an `SO_ERROR`
+/// read), already used by `probe_connect_status` and `sc_finish_connect` a few
+/// hundred lines above. Its `Connected` verdict *is* "the fd reports write
+/// readiness", which is exactly the question here, and its `Failed` verdict is
+/// a pending `SO_ERROR` that the following `send` would report anyway.
+///
+/// `net::poll_stream_readable` has no writable sibling exported today. Adding
+/// a `poll_stream_writable` (tracker task #46) is small and would be the tidier
+/// long-term home — it gets `net_poll_stream`'s real timeout instead of this
+/// sleep cadence, and drops the two `SO_ERROR` reads `nb_connect::poll` does per
+/// pass. It is NOT a like-for-like swap, which is why it has not been made:
+/// `net_poll_raw` answers `Ok(count > 0)` for ANY `revents` — `POLLERR`,
+/// `POLLHUP` and `POLLNVAL` all read as "writable" — whereas `nb_connect::poll`
+/// distinguishes `WSAPOLLWRNORM` (`Connected`) from `POLLERR|POLLHUP`
+/// (`Failed`). Under `write_close_aware` that difference decides whether a
+/// half-dead socket reports the PARTIAL COUNT or an exception, which is exactly
+/// the row `RSocketChannelInterrupt.writeWakesOnAsyncClose` pins. Land it with a
+/// build and that vector, not on inspection.
+///
+/// EINTR is reported as NOT-READY, never as an error, for the reason
+/// `net::net_poll_stream` documents at length: CratonVM's own
+/// `jit::xt_root_scan` SIGUSR2s every thread and `poll(2)` is not restarted by
+/// `SA_RESTART`, so a root scan landing on a parked writer would otherwise
+/// surface as a random `SocketException: Interrupted system call` mid-response.
+fn stream_writable_now(stream: &TcpStream) -> Result<bool, std::io::Error> {
+    match crate::nb_connect::poll(stream) {
+        crate::nb_connect::ConnectPoll::Connected => Ok(true),
+        crate::nb_connect::ConnectPoll::Pending => Ok(false),
+        crate::nb_connect::ConnectPoll::Failed(e) if crate::eintr::is_eintr(&e) => Ok(false),
+        crate::nb_connect::ConnectPoll::Failed(e) => Err(e),
+    }
+}
+
+/// How long a blocking channel write waits between write-readiness probes.
+/// Same role as [`READ_CLOSE_POLL_MS`] and [`ACCEPT_CLOSE_POLL`]: a liveness
+/// bound, not a latency cost — a writable socket is served on the first probe.
+const WRITE_CLOSE_POLL: Duration = Duration::from_millis(10);
+
+/// Largest payload handed to one `send` while a blocking write is being
+/// sliced.
+///
+/// # Why the write has to be sliced at all
+///
+/// A blocking-mode channel leaves its `TcpStream` in genuine OS-blocking mode,
+/// and a blocking `send` of N bytes does not return until all N are queued
+/// (Linux `tcp_sendmsg` loops through `sk_stream_wait_memory`; Winsock
+/// documents the same). So a single `try_write_nb` of the whole payload parks
+/// inside `send` for an unbounded time and observes neither a close nor an
+/// interrupt — measured directly on this host (`SendWake.java`, Windows 11,
+/// JDK 25.0.3): a writer parked in a blocking-mode `send` to a stalled peer is
+/// **still parked** 6 s after another thread issues `shutdown(SHUT_WR)`, which
+/// is precisely what `sc_close`'s `lingering_channel_close` does. Only
+/// `closesocket` woke it (in 775 ms, returning the partial count) — and
+/// `tcp_remove` cannot close the handle while this writer holds an `Arc` clone
+/// of it, exactly as `read_close_aware` explains for the read side.
+///
+/// # What the slice does and does not guarantee
+///
+/// Each pass writes at most this many bytes, and only after a positive
+/// write-readiness probe, so the probe cadence is preserved. The bound is
+/// EXACT wherever write-readiness implies at least this much room: Linux sets
+/// `POLLOUT` only when `sk_stream_is_writeable`, i.e. roughly half the send
+/// buffer is free, so any `SO_SNDBUF >= 16 KiB` (the Linux default is orders
+/// of magnitude larger) can never park here. Windows' `WSAPoll` reports
+/// `POLLWRNORM` whenever the send buffer is merely non-full, so a socket
+/// deliberately configured with a tiny `SO_SNDBUF` can still park for as long
+/// as the peer takes to drain up to one slice. That residual is named rather
+/// than papered over; it costs one slice, once, and only on a socket whose
+/// send buffer is smaller than the slice.
+///
+/// 8 KiB, not 2 KiB: the common blocking write (protocol frame, HTTP header
+/// block, handshake) is smaller than one slice and is therefore issued whole,
+/// paying exactly one extra zero-timeout poll over the previous code.
+const WRITE_SLICE_MAX: usize = 8 * 1024;
+
+/// A blocking channel write that observes an asynchronous `close()` and an
+/// interrupt of the writing thread — the write twin of [`read_close_aware`].
+///
+/// # The contract, measured rather than recalled
+///
+/// HotSpot 25.0.3 (Microsoft build 25.0.3+9-LTS), 2/2 runs, loopback pair with
+/// a stalled peer:
+///
+/// | scenario (blocking `SocketChannel.write`)      | outcome                    |
+/// |------------------------------------------------|----------------------------|
+/// | flag set BEFORE `write`, socket writable        | `ClosedByInterruptException` in 0 ms; `isOpen()==false`; second write is a plain `ClosedChannelException`; `isInterrupted()` still true |
+/// | flag set BEFORE `write`, send buffer full       | same                       |
+/// | parked in `write`, then `interrupt()`, 262 KB already out | `ClosedByInterruptException` — the interrupt outranks the bytes already transferred |
+/// | parked in `write`, then `interrupt()`, 0 bytes out | `ClosedByInterruptException` |
+/// | parked in `write`, then `close()`, 262 KB already out | returns the PARTIAL COUNT `262142`, **no exception**, flag false |
+/// | parked in `write`, then `close()`, 0 bytes out  | `AsynchronousCloseException`, flag false |
+/// | `write` on an already-closed channel            | `ClosedChannelException`, even with the flag set |
+///
+/// The two `close()` rows are not a quirk: `SocketChannelImpl.write` retries
+/// `while (IOStatus.okayToRetry(n) && isOpen())` and then calls `endWrite(bl,
+/// n > 0)`, so `AbstractInterruptibleChannel.end(completed)` sees
+/// `completed == true` once any byte has gone out and its `!completed && !open`
+/// arm never fires. The interrupt arm of `end()` has no such guard, which is
+/// why an interrupt throws even after a partial transfer. This function
+/// reproduces both, and the last row is why the caller checks closed-ness
+/// BEFORE it checks the interrupt flag (`begin()`'s interruptor bails on
+/// `if (!open) return;` without recording `interrupted`, so the
+/// `ClosedChannelException` from `ensureOpen()` survives `end()`).
+///
+/// A non-blocking write is NOT interruptible (measured: it returns its byte
+/// count, or 0 on a full buffer, and leaves the channel open with the flag
+/// still set), so this is only ever reached with `blocking == true`.
+fn write_close_aware(
+    id: i32,
+    stream: &TcpStream,
+    data: &[u8],
+    interrupted: &dyn Fn() -> bool,
+) -> Result<Option<i32>, std::io::Error> {
+    let mut written: usize = 0;
+    loop {
+        // Interrupt first, and before the completion check: `end()` raises
+        // `ClosedByInterruptException` regardless of whether the transfer
+        // finished, which the "262 KB already out" row above measures.
+        if interrupted() {
+            return Err(channel_interrupted_err());
+        }
+        if written == data.len() {
+            return Ok(Some(written as i32));
+        }
+        // Asked AFTER the transfer above so a close landing mid-write is seen
+        // on the next pass. `written > 0` is `end()`'s `completed` flag.
+        if !stream_still_registered(id) {
+            if written > 0 {
+                return Ok(Some(written as i32));
+            }
+            return Err(channel_async_closed_err());
+        }
+        if !stream_writable_now(stream)? {
+            std::thread::sleep(WRITE_CLOSE_POLL);
+            continue;
+        }
+        let end = (written + WRITE_SLICE_MAX).min(data.len());
+        match try_write_nb(stream, &data[written..end]) {
+            Ok(Some(n)) if n > 0 => written += n as usize,
+            // Writable, then not: a concurrent writer on this channel took the
+            // room. Park again — a blocking write must not answer 0.
+            Ok(_) => std::thread::sleep(WRITE_CLOSE_POLL),
+            // Propagate even after a partial transfer, matching HotSpot: an
+            // `IOUtil.write` that throws escapes `SocketChannelImpl.write`'s
+            // try block, and `endWrite`'s `end(false)` cannot suppress it.
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -2478,6 +2860,23 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         };
     };
 
+    // RACE DIRECTION 1 — the interrupt landed BEFORE the read parked (or even
+    // before it was called). `SocketChannelImpl.beginRead` runs `begin()`
+    // ahead of `ensureOpen()` and the transfer itself, and `begin()` closes
+    // the channel the moment it sees the flag; measured on HotSpot, a blocking
+    // read entered with the flag already set throws in 0 ms *even when bytes
+    // are waiting*. Checking only inside the poll loop would lose exactly the
+    // interrupts that arrive while the caller is still on its way in.
+    //
+    // Gated on `blocking`: a non-blocking read is not an interruptible
+    // operation (measured: it answers 0 and leaves the channel open), and
+    // closing a selector's channels because the reactor thread carries an
+    // interrupt flag would be a fabricated failure.
+    let blocking = read_blocking_flag(ctx, this);
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
+
     // Determine the writable region. We materialize into a heap buffer here
     // and copy into the buffer slot afterwards so we don't hold a registry
     // lock across `set_array_element`.
@@ -2494,6 +2893,13 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // The OS read below may enter a GC-blocking region. Keep the Java buffer
     // rooted and reload it before writing the received bytes back.
     let bb_pin = ctx.pin_native_root(bb);
+    // The channel object needs the same protection, because the interrupt arm
+    // below closes it — and `sc_close` finds a channel's synthetic state by
+    // object IDENTITY, so a `this` left stale by a pause inside the blocking
+    // region would tear down nothing and leave `isOpen()` answering true.
+    // Pinned AFTER `bb`, so the existing `unpin_native_roots(bb_pin)` calls
+    // (which release every handle from their base onward) already free it.
+    let this_pin = ctx.pin_native_root(this);
 
     // GC/STW-cooperation: when the channel is in its default *blocking*
     // mode (`configureBlocking(false)` never called — see F_BLOCKING /
@@ -2505,7 +2911,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // for the common non-blocking case, where the call returns immediately)
     // so a concurrent STW pause never waits on a thread parked here. Same
     // pattern as `re1_socket_read_stream` in `net_phase_e.rs`.
-    let blocking = read_blocking_flag(ctx, this);
+    // (`blocking` was read above, for the entry-time interrupt check.)
     ctx.begin_blocking_region();
     let read_result = match resolve_stream(id) {
         StreamTarget::Ready(s) => {
@@ -2513,7 +2919,15 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // `try_read_nb` parks inside `recv`, where no `close()` on another
             // thread can reach it. See `read_close_aware`.
             let r = if blocking {
-                read_close_aware(id, &s, &mut buf)
+                // RACE DIRECTION 2 — the interrupt lands while we are parked.
+                // A shared reborrow of `ctx`: the probe only loads the
+                // thread's interrupt `AtomicBool` (`vm_exec.rs`
+                // `is_interrupted`), which takes no lock and touches no heap,
+                // so it is safe to call from inside the blocking region. The
+                // reborrow ends with the `if` expression, before
+                // `end_blocking_region` takes `&mut` again.
+                let probe: &dyn NativeContext = &*ctx;
+                read_close_aware(id, &s, &mut buf, &|| probe.is_interrupted(false))
             } else {
                 try_read_nb(&s, &mut buf)
             };
@@ -2540,6 +2954,29 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let n_opt = match read_result {
         Ok(v) => v,
         Err(e) => {
+            // Ask the flag rather than the error: a close and an interrupt can
+            // both be pending, and `AbstractInterruptibleChannel.end()` raises
+            // `ClosedByInterruptException` before it considers
+            // `AsynchronousCloseException`. `is_interrupted(false)` does not
+            // clear, so the status survives into the catch block — which the
+            // regression test asserts, because clearing it here is the easy
+            // way to pass "it woke up" while breaking every caller that reads
+            // the flag afterwards.
+            //
+            // `blocking &&` (added by the write/accept/connect lane): this arm
+            // is reachable from the NON-blocking branch too, where the error
+            // came from `try_read_nb` (say ECONNRESET) and has nothing to do
+            // with any interrupt. Without the gate, a reactor thread that
+            // merely CARRIES an interrupt flag would turn every non-blocking
+            // read error into a channel close — the fabricated failure the
+            // entry-time gate above is explicitly written to avoid, arriving
+            // through the back door.
+            if blocking && ctx.is_interrupted(false) {
+                let live = ctx.read_native_pin(this_pin, this);
+                let failure = close_by_interrupt(ctx, live);
+                ctx.unpin_native_roots(bb_pin);
+                return Err(failure);
+            }
             ctx.unpin_native_roots(bb_pin);
             return Err(closed_or_io_error(ctx, "read", e));
         }
@@ -2653,7 +3090,20 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("write: null ByteBuffer")),
     };
-    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("write: channel not connected"))?;
+    // A channel closed BEFORE the call is a plain `ClosedChannelException`,
+    // exactly as in `sc_read` — and it OUTRANKS a pending interrupt (measured:
+    // `begin()`'s interruptor returns early on `if (!open)` without recording
+    // `interrupted`, so `end()` has nothing to convert and the
+    // `ClosedChannelException` from `ensureOpen()` survives). Hence this check
+    // sits ahead of the interrupt gate below, not after it.
+    let reg_id = read_reg_id(ctx, this);
+    let Some(id) = reg_id else {
+        return if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 {
+            Err(closed_channel_exception(ctx))
+        } else {
+            Err(ioex("write: channel not connected"))
+        };
+    };
     let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
     if io_flags().dbg_sc_write {
         let position = ctx.get_field_by_name(bb, "position");
@@ -2668,9 +3118,31 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if data.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
+
+    // RACE DIRECTION 1 — the interrupt landed BEFORE the write started.
+    // `SocketChannelImpl.beginWrite` runs `begin()` ahead of the transfer, and
+    // `begin()` closes the channel the moment it sees the flag; measured on
+    // HotSpot, a blocking write entered with the flag already set throws in
+    // 0 ms whether the send buffer is empty or full. Gated on `blocking`: a
+    // non-blocking write is not an interruptible operation (measured: it
+    // returns its byte count, or 0 on a full buffer, and leaves the channel
+    // open), and closing a selector's channels because the reactor thread
+    // carries an interrupt flag would be a fabricated failure.
+    let blocking = read_blocking_flag(ctx, this);
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
+
     // The OS write below may enter a GC-blocking region. Keep the Java buffer
     // rooted until its position has been advanced after the write completes.
     let bb_pin = ctx.pin_native_root(bb);
+    // The channel object needs the same protection, because the interrupt arm
+    // below closes it — and `sc_close` finds a channel's synthetic state by
+    // object IDENTITY, so a `this` left stale by a pause inside the blocking
+    // region would tear down nothing and leave `isOpen()` answering true.
+    // Pinned AFTER `bb`, so the existing `unpin_native_roots(bb_pin)` calls
+    // (which release every handle from their base onward) already free it.
+    let this_pin = ctx.pin_native_root(this);
     // GC/STW-cooperation: same reasoning as `sc_read` above — a
     // blocking-mode channel's `TcpStream` can genuinely block in
     // `try_write_nb`'s `s.write()` (e.g. a full socket send buffer with a
@@ -2678,7 +3150,21 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     ctx.begin_blocking_region();
     let write_result = match resolve_stream(id) {
         StreamTarget::Ready(s) => {
-            let r = try_write_nb(&s, &data).map_err(|e| map_err("write", e));
+            // A blocking channel leaves the OS socket blocking, so a bare
+            // `try_write_nb` parks inside `send`, where neither a `close()` on
+            // another thread nor an `interrupt()` can reach it — measured, see
+            // `write_close_aware`, which is also RACE DIRECTION 2 (the
+            // interrupt lands while we are parked). The shared reborrow of
+            // `ctx` only loads the thread's interrupt `AtomicBool`, which takes
+            // no lock and touches no heap, so it is safe inside the blocking
+            // region; it ends with the `if` expression, before
+            // `end_blocking_region` takes `&mut` again.
+            let r = if blocking {
+                let probe: &dyn NativeContext = &*ctx;
+                write_close_aware(id, &s, &data, &|| probe.is_interrupted(false))
+            } else {
+                try_write_nb(&s, &data)
+            };
             ctx.end_blocking_region();
             r
         }
@@ -2702,8 +3188,21 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let n_opt = match write_result {
         Ok(v) => v,
         Err(e) => {
+            // Ask the flag rather than the error, exactly as `sc_read` does:
+            // a close and an interrupt can both be pending and
+            // `AbstractInterruptibleChannel.end()` gives the interrupt
+            // priority. `is_interrupted(false)` does not clear, so the status
+            // survives into the catch block. `blocking &&` keeps a
+            // non-blocking write error (ECONNRESET on a reactor thread that
+            // merely carries a flag) from closing the channel.
+            if blocking && ctx.is_interrupted(false) {
+                let live = ctx.read_native_pin(this_pin, this);
+                let failure = close_by_interrupt(ctx, live);
+                ctx.unpin_native_roots(bb_pin);
+                return Err(failure);
+            }
             ctx.unpin_native_roots(bb_pin);
-            return Err(e);
+            return Err(closed_or_io_error(ctx, "write", e));
         }
     };
     let n = match n_opt {
@@ -2773,8 +3272,25 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("write(gathering): null buffer array")),
     };
-    let id =
-        read_reg_id(ctx, this).ok_or_else(|| ioex("write(gathering): channel not connected"))?;
+    // Closed-before-the-call outranks a pending interrupt — see `sc_write`.
+    let reg_id = read_reg_id(ctx, this);
+    let Some(id) = reg_id else {
+        return if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 {
+            Err(closed_channel_exception(ctx))
+        } else {
+            Err(ioex("write(gathering): channel not connected"))
+        };
+    };
+
+    // Race direction 1, same as `sc_write`: an interrupt already pending when a
+    // BLOCKING vectored write is entered closes the channel before any
+    // transfer. Measured on HotSpot: a blocking `write(ByteBuffer[], 0, 2)`
+    // with the flag pre-set throws `ClosedByInterruptException` in 0 ms, while
+    // the NON-blocking form returns its byte count and leaves the channel open.
+    let blocking = read_blocking_flag(ctx, this);
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
 
     // Collect each buffer's readable region (in order), keeping the buffer ref
     // so we can advance its position by the bytes actually consumed.
@@ -2805,6 +3321,13 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         data.extend_from_slice(bytes);
     }
 
+    // The channel object itself, pinned LAST so every `unpin_native_roots` on
+    // a chunk pin above (each of which releases from its base onward) already
+    // frees it. Needed because the interrupt arm below closes the channel and
+    // `sc_close` keys the synthetic state by object IDENTITY — a `this` left
+    // stale by a pause inside the blocking region would tear down nothing.
+    let this_pin = ctx.pin_native_root(this);
+
     // A gathering write can block for exactly the same reason as a scalar
     // SocketChannel.write. The copied payload and every Java source buffer are
     // rooted above, so make this a GC-cooperative blocking region as well.
@@ -2814,7 +3337,15 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     ctx.begin_blocking_region();
     let write_result = match resolve_stream(id) {
         StreamTarget::Ready(s) => {
-            let r = try_write_nb(&s, &data).map_err(|e| map_err("write(gathering)", e));
+            // Race direction 2 — the interrupt (or an asynchronous close)
+            // lands while the gathering write is parked in `send`. Same
+            // sliced-poll shape and same shared-reborrow rule as `sc_write`.
+            let r = if blocking {
+                let probe: &dyn NativeContext = &*ctx;
+                write_close_aware(id, &s, &data, &|| probe.is_interrupted(false))
+            } else {
+                try_write_nb(&s, &data)
+            };
             ctx.end_blocking_region();
             r
         }
@@ -2843,10 +3374,19 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let n_opt = match write_result {
         Ok(v) => v,
         Err(e) => {
+            // Interrupt before asynchronous close — see `sc_write`.
+            if blocking && ctx.is_interrupted(false) {
+                let live = ctx.read_native_pin(this_pin, this);
+                let failure = close_by_interrupt(ctx, live);
+                for (pin, _, _) in &chunks {
+                    ctx.unpin_native_roots(*pin);
+                }
+                return Err(failure);
+            }
             for (pin, _, _) in &chunks {
                 ctx.unpin_native_roots(*pin);
             }
-            return Err(e);
+            return Err(closed_or_io_error(ctx, "write(gathering)", e));
         }
     };
     let n = match n_opt {
@@ -2903,6 +3443,13 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         };
     };
 
+    // Race direction 1, same as `sc_read`: an interrupt already pending when a
+    // BLOCKING vectored read is entered closes the channel before any transfer.
+    let blocking = read_blocking_flag(ctx, this);
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
+
     // Sum the writable capacity across the buffer slice; remember each target
     // so we can scatter the bytes back afterward (in array order).
     let arr_len = ctx.array_length(dsts) as i32;
@@ -2943,15 +3490,22 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // and reloaded through `read_native_pin` (a pause inside the region may
     // relocate them) — same protocol as `sc_write_gathering`.
     let pins: Vec<_> = targets.iter().map(|bb| ctx.pin_native_root(*bb)).collect();
-    let blocking = read_blocking_flag(ctx, this);
+    // The channel itself, pinned AFTER the destinations so the existing
+    // `unpin_native_roots(pins[0])` loops already release it (a handle release
+    // covers everything from its base onward). Needed for the same reason as
+    // in `sc_read`: the interrupt arm closes the channel by object identity.
+    let this_pin = ctx.pin_native_root(this);
+    // (`blocking` was read above, for the entry-time interrupt check.)
     ctx.begin_blocking_region();
     let read_result = match resolve_stream(id) {
         StreamTarget::Ready(s) => {
             // Same asynchronous-close hazard as `sc_read` — see
             // `read_close_aware`. This is the shape Jetty/Netty-style reactors
-            // use for header+body reads, so it parks just as long.
+            // use for header+body reads, so it parks just as long, and is
+            // interruptible on the same terms.
             let r = if blocking {
-                read_close_aware(id, &s, &mut buf)
+                let probe: &dyn NativeContext = &*ctx;
+                read_close_aware(id, &s, &mut buf, &|| probe.is_interrupted(false))
             } else {
                 try_read_nb(&s, &mut buf)
             };
@@ -2983,6 +3537,18 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let n_opt = match read_result {
         Ok(v) => v,
         Err(e) => {
+            // Interrupt before asynchronous close — see `sc_read` for why the
+            // discriminator is the thread's flag and not the error kind, and
+            // for why `blocking &&` gates it (a non-blocking read error must
+            // not close the channel just because the thread carries a flag).
+            if blocking && ctx.is_interrupted(false) {
+                let live = ctx.read_native_pin(this_pin, this);
+                let failure = close_by_interrupt(ctx, live);
+                for pin in pins {
+                    ctx.unpin_native_roots(pin);
+                }
+                return Err(failure);
+            }
             for pin in pins {
                 ctx.unpin_native_roots(pin);
             }
@@ -3513,8 +4079,33 @@ fn ssc_accept_impl(
         Some(o) => o,
         None => return Err(ioex("accept: null channel")),
     };
-    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("accept: server channel not bound"))?;
+    // Closed-before-the-call outranks a pending interrupt, and it is a plain
+    // `ClosedChannelException` — measured: the SECOND accept after a
+    // `ClosedByInterruptException` reports exactly that, because `begin()`'s
+    // interruptor bails on `if (!open) return;` without recording
+    // `interrupted`, leaving `ensureOpen()`'s exception to survive `end()`.
+    // `sc_close` wipes the synthetic state, so no registry id + `F_OPEN == 0`
+    // is precisely "this server channel was closed" (an OPEN but unbound
+    // channel keeps `F_OPEN == 1` and still reports "not bound").
+    let reg_id = read_reg_id(ctx, this);
+    let Some(id) = reg_id else {
+        return if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 {
+            Err(closed_channel_exception(ctx))
+        } else {
+            Err(ioex("accept: server channel not bound"))
+        };
+    };
     let blocking = read_blocking_flag(ctx, this);
+
+    // RACE DIRECTION 1 — the interrupt landed BEFORE the accept parked (or
+    // before it was called at all). Measured on HotSpot: a blocking `accept()`
+    // entered with the flag already set throws `ClosedByInterruptException` in
+    // 0 ms and does NOT accept a connection that is already sitting in the
+    // backlog. Gated on `blocking` for the acceptor-thread reason spelled out
+    // at the wait below.
+    if blocking && ctx.is_interrupted(false) {
+        return Err(close_by_interrupt(ctx, this));
+    }
 
     let is_unix_listener = matches!(
         tcp_registry().read().get(&id),
@@ -3557,23 +4148,53 @@ fn ssc_accept_impl(
         // nonblocking poll loop over the REGISTRY's listener (never a private
         // duplicate — see `accept_close_aware`), so `close()` both wakes this
         // path and closes the OS socket in the same instant.
+        //
+        // The channel object has to survive that wait: the interrupt arm below
+        // closes it through `sc_close`, which finds a channel's synthetic
+        // state by object IDENTITY, so a `this` left stale by a GC pause
+        // inside the blocking region would tear down nothing and leave
+        // `isOpen()` answering true.
+        let this_pin = ctx.pin_native_root(this);
+        // The interrupt probe is LIVE ONLY IN BLOCKING MODE. This is the
+        // acceptor-thread guard: `Acceptor` threads are long-lived and a
+        // listener closed by a spurious probe never comes back, so a
+        // selector-driven (non-blocking) accept must never be able to reach
+        // `close_by_interrupt` no matter what flag its reactor thread carries.
+        // Measured on HotSpot: a non-blocking `accept()` with the flag set
+        // answers null (or accepts the pending connection) and leaves the
+        // listener OPEN, so the gate is also the JDK's own behaviour.
         let res = if let Some(deadline) = deadline {
             // Timed accept (`blockingAccept(nanos)`): the same close-aware poll
             // loop, bounded. Expiry is a `SocketTimeoutException`, NOT a null
             // return — a null would tell `ServerSocketAdaptor.accept()` that a
             // blocking accept produced no socket, which it asserts against.
             ctx.begin_blocking_region();
-            let res = accept_until_deadline(id, deadline);
+            // Shared reborrow of `ctx`, as in `sc_read`: the probe only loads
+            // the thread's interrupt `AtomicBool` (no lock, no heap), and the
+            // borrow ends with this block, before `end_blocking_region` takes
+            // `&mut` again.
+            let res = {
+                let probe: &dyn NativeContext = &*ctx;
+                accept_until_deadline(id, deadline, &|| blocking && probe.is_interrupted(false))
+            };
             ctx.end_blocking_region();
             res
         } else if blocking {
             ctx.begin_blocking_region();
-            let res = accept_close_aware(id, true);
+            let res = {
+                let probe: &dyn NativeContext = &*ctx;
+                accept_close_aware(id, true, &|| probe.is_interrupted(false))
+            };
             ctx.end_blocking_region();
             res
         } else {
-            accept_close_aware(id, false)
+            accept_close_aware(id, false, &|| false)
         };
+        // Reload through the pin before anything can use `this` again. Nothing
+        // between this line and the `sc_close` inside `close_by_interrupt`
+        // allocates, so releasing the pin here cannot leave a stale ref behind.
+        let live = ctx.read_native_pin(this_pin, this);
+        ctx.unpin_native_roots(this_pin);
         match res {
             Ok(Some(pair)) => Some(pair),
             Ok(None) if deadline.is_some() => {
@@ -3583,7 +4204,23 @@ fn ssc_accept_impl(
                 .into());
             }
             Ok(None) => None,
-            Err(e) => return Err(map_err("accept", e)),
+            Err(e) => {
+                // Ask the flag, not the error: `accept_close_aware` reports
+                // BOTH "the listener was deregistered" and "this thread was
+                // interrupted" as `ErrorKind::Interrupted`, deliberately, so
+                // that a close racing an interrupt still gives the interrupt
+                // priority the way `AbstractInterruptibleChannel.end()` does.
+                if blocking && ctx.is_interrupted(false) {
+                    return Err(close_by_interrupt(ctx, live));
+                }
+                // `closed_or_io_error`, not `map_err`: an asynchronous close of
+                // a parked accept is `AsynchronousCloseException` (measured),
+                // and `RSocketChannelInterrupt.acceptWakesOnAsyncClose` already
+                // asserts exactly that. `map_err` answered a bare
+                // `IOException: SocketException: accept: ...`, which no NIO
+                // reactor's `catch (AsynchronousCloseException)` can see.
+                return Err(closed_or_io_error(ctx, "accept", e));
+            }
         }
     };
 
@@ -3656,8 +4293,14 @@ fn ssc_accept_impl(
 fn uds_accept_close_aware(
     id: i32,
     blocking: bool,
+    interrupted: &dyn Fn() -> bool,
 ) -> std::io::Result<Option<(TcpStream, String)>> {
     loop {
+        // Interrupt before the deregistration check and before the accept
+        // attempt — see `accept_close_aware` for the measured contract.
+        if interrupted() {
+            return Err(channel_interrupted_err());
+        }
         let attempt = {
             let map = tcp_registry().read();
             match map.get(&id) {
@@ -3703,19 +4346,34 @@ fn ssc_accept_unix(
     // reaches no interpreter safepoint, so a concurrent stop-the-world pause
     // would otherwise wait on it forever.
     uds_dbg(format_args!("accept enter id={id:#x} blocking={blocking}"));
+    // Same identity hazard as the TCP twin: `close_by_interrupt` tears the
+    // channel down by object identity, so `this` must be reloaded through a
+    // pin taken across the wait.
+    let this_pin = ctx.pin_native_root(this);
     let res = if blocking {
         ctx.begin_blocking_region();
-        let res = uds_accept_close_aware(id, true);
+        let res = {
+            let probe: &dyn NativeContext = &*ctx;
+            uds_accept_close_aware(id, true, &|| probe.is_interrupted(false))
+        };
         ctx.end_blocking_region();
         res
     } else {
-        uds_accept_close_aware(id, false)
+        // Non-blocking: never interruptible, for the acceptor reason in
+        // `accept_close_aware`.
+        uds_accept_close_aware(id, false, &|| false)
     };
+    let live = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    let this = live;
     let accepted = match res {
         Ok(pair) => pair,
         Err(e) => {
             uds_dbg(format_args!("accept id={id:#x} error={e}"));
-            return Err(map_err("accept", e));
+            if blocking && ctx.is_interrupted(false) {
+                return Err(close_by_interrupt(ctx, this));
+            }
+            return Err(closed_or_io_error(ctx, "accept", e));
         }
     };
     uds_dbg(format_args!(
@@ -4936,7 +5594,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let mut buf = [0_u8; 16];
             let start = std::time::Instant::now();
-            let outcome = read_close_aware(id, &client, &mut buf);
+            let outcome = read_close_aware(id, &client, &mut buf, &|| false);
             (outcome.map_err(|e| e.kind()), start.elapsed())
         });
 
@@ -4973,10 +5631,100 @@ mod tests {
         let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let id = tcp_register(TcpHandle::Stream(Arc::new(client.try_clone().unwrap())));
         let mut buf = [0_u8; 16];
-        let n = read_close_aware(id, &client, &mut buf)
+        let n = read_close_aware(id, &client, &mut buf, &|| false)
             .expect("read must succeed")
             .expect("a blocking close-aware read never answers UNAVAILABLE");
         assert_eq!(&buf[..n as usize], b"ping");
+        tcp_remove(id);
+        drop(writer.join().unwrap());
+    }
+
+    /// `RSocketChannelInterrupt.readWakesOnInterrupt` at the Rust layer: a
+    /// reader parked on a blocking channel must break out when the reading
+    /// THREAD is interrupted — the mechanism that is distinct from the
+    /// asynchronous close above, because the channel is never removed from the
+    /// registry by the interrupter.
+    ///
+    /// The probe stands in for the parked thread's interrupt `AtomicBool`; in
+    /// the VM it is `NativeContext::is_interrupted(false)`, which
+    /// `Thread.interrupt()` sets through the thread registry.
+    #[test]
+    fn an_interrupt_breaks_a_parked_blocking_channel_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Held open and silent, exactly as in the async-close sibling: the
+        // reader must park for want of DATA, not for want of a connection.
+        let keeper = std::thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = Arc::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let id = tcp_register(TcpHandle::Stream(Arc::clone(&client)));
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let flag = Arc::clone(&interrupted);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0_u8; 16];
+            let start = std::time::Instant::now();
+            let outcome = read_close_aware(id, &client, &mut buf, &|| {
+                flag.load(Ordering::SeqCst)
+            });
+            (outcome.map_err(|e| e.kind()), start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        // NOT `tcp_remove`: the channel stays registered, so only the interrupt
+        // can end this park. That is what separates this test from the
+        // asynchronous-close one — if the interrupt probe were ignored, the
+        // read would still be parked when the join below times the thread out.
+        interrupted.store(true, Ordering::SeqCst);
+
+        let (outcome, elapsed) = reader.join().unwrap();
+        assert_eq!(
+            outcome.unwrap_err(),
+            ErrorKind::Interrupted,
+            "an interrupt must break the parked read"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the interrupt should wake the parked reader within a poll slice, got {elapsed:?}"
+        );
+        assert!(
+            tcp_registry().read().contains_key(&id),
+            "the interrupt path must not remove the registry entry itself — \
+             closing the channel is the CALLER's job, done through `sc_close` \
+             on the pin-reloaded channel reference so the synthetic state \
+             (`isOpen()`) is torn down with it"
+        );
+        tcp_remove(id);
+        drop(keeper.join().unwrap());
+    }
+
+    /// The interrupt probe outranks a readiness edge. HotSpot does not deliver
+    /// buffered bytes to an interrupted blocking read (measured: the "flag set
+    /// before read, data ready" case still throws `ClosedByInterruptException`),
+    /// so a probe that only ran on the not-ready path would answer the read,
+    /// leave the channel open, and lose the interrupt entirely.
+    #[test]
+    fn an_interrupt_outranks_bytes_that_are_already_readable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.write_all(b"ping").unwrap();
+            peer
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let id = tcp_register(TcpHandle::Stream(Arc::new(client.try_clone().unwrap())));
+        // Let the bytes actually arrive, so the poll below reports READY.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut buf = [0_u8; 16];
+        let outcome = read_close_aware(id, &client, &mut buf, &|| true);
+        assert_eq!(
+            outcome.map(|n| n.unwrap_or(0)).unwrap_err().kind(),
+            ErrorKind::Interrupted,
+            "readable bytes must not satisfy a read whose thread is interrupted"
+        );
         tcp_remove(id);
         drop(writer.join().unwrap());
     }
@@ -5043,7 +5791,7 @@ mod tests {
 
         let waiter = std::thread::spawn(move || {
             let start = std::time::Instant::now();
-            let err = accept_close_aware(id, true).unwrap_err();
+            let err = accept_close_aware(id, true, &|| false).unwrap_err();
             (err.kind(), start.elapsed())
         });
 
@@ -5078,7 +5826,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let id = tcp_register(TcpHandle::Listener(listener));
 
-        let acceptor = std::thread::spawn(move || accept_close_aware(id, true).map(|_| ()));
+        let acceptor =
+            std::thread::spawn(move || accept_close_aware(id, true, &|| false).map(|_| ()));
         // Let the acceptor reach its first poll, so the close lands with a
         // thread actively accepting.
         std::thread::sleep(Duration::from_millis(50));
@@ -5097,6 +5846,213 @@ mod tests {
             "port {port} still accepted a connection after its registry entry \
              was dropped — something outlived the close"
         );
+    }
+
+    /// The accept twin of `an_interrupt_breaks_a_parked_blocking_channel_read`:
+    /// an acceptor parked with the listener still REGISTERED can only be ended
+    /// by the interrupt probe, so if the probe were ignored the join below
+    /// would never return.
+    #[test]
+    fn an_interrupt_breaks_a_parked_blocking_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let id = tcp_register(TcpHandle::Listener(listener));
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let flag = Arc::clone(&interrupted);
+        let acceptor = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let err = accept_close_aware(id, true, &|| flag.load(Ordering::SeqCst)).unwrap_err();
+            (err.kind(), start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        // NOT `tcp_remove`: the listener stays registered, so only the
+        // interrupt can end this park.
+        interrupted.store(true, Ordering::SeqCst);
+
+        let (kind, elapsed) = acceptor.join().unwrap();
+        assert_eq!(
+            kind,
+            ErrorKind::Interrupted,
+            "an interrupt must break the parked accept"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the interrupt should wake the parked acceptor within a poll slice, got {elapsed:?}"
+        );
+        assert!(
+            tcp_registry().read().contains_key(&id),
+            "the interrupt path must not deregister the listener itself — closing \
+             the channel is the CALLER's job, done through `sc_close` on the \
+             pin-reloaded channel reference so `isOpen()` is torn down with it"
+        );
+        tcp_remove(id);
+    }
+
+    /// The interrupt probe outranks a connection already sitting in the
+    /// backlog, exactly as it outranks already-readable bytes on the read side.
+    /// Measured on HotSpot: a blocking `accept()` entered with the flag set
+    /// throws `ClosedByInterruptException` and does NOT hand back the pending
+    /// connection.
+    #[test]
+    fn an_interrupt_outranks_a_connection_already_in_the_backlog() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let id = tcp_register(TcpHandle::Listener(listener));
+        // A real pending connection, so the accept below would succeed at once.
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outcome = accept_close_aware(id, true, &|| true);
+        assert_eq!(
+            outcome.map(|p| p.is_some()).unwrap_err().kind(),
+            ErrorKind::Interrupted,
+            "a pending connection must not satisfy an accept whose thread is \
+             interrupted"
+        );
+        // And the negative half: the connection is still there, so the failure
+        // above was a refusal to serve it, not a lost connection.
+        let served = accept_close_aware(id, true, &|| false).unwrap();
+        assert!(
+            served.is_some(),
+            "the refused accept must have left the pending connection in the \
+             backlog"
+        );
+        tcp_remove(id);
+        drop(client);
+    }
+
+    /// The write twin of `a_close_breaks_a_parked_blocking_channel_read`.
+    ///
+    /// Measured on this host that a raw `shutdown(SHUT_WR)` — which is all
+    /// `sc_close`'s `lingering_channel_close` issues — does NOT wake a writer
+    /// parked in a blocking-mode `send`, so the wakeup has to come from the
+    /// registry check, exactly as on the read side.
+    ///
+    /// HotSpot returns the PARTIAL COUNT (no exception) when a close lands
+    /// after some bytes have gone out, which is what this asserts.
+    #[test]
+    fn a_close_breaks_a_parked_blocking_channel_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and then never read: the peer's receive buffer and our send
+        // buffer both fill, and the write parks.
+        let keeper = std::thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = Arc::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let id = tcp_register(TcpHandle::Stream(Arc::clone(&client)));
+
+        // Far more than any plausible socket buffer pair, so the write is
+        // guaranteed to still be in progress when the close lands.
+        let payload = vec![0x5a_u8; 8 * 1024 * 1024];
+        let writer = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let outcome = write_close_aware(id, &client, &payload, &|| false);
+            (outcome, payload.len(), start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        tcp_remove(id);
+
+        let (outcome, len, elapsed) = writer.join().unwrap();
+        let n = outcome
+            .expect("a close that lands after a partial transfer is not an error")
+            .expect("a blocking write never answers UNAVAILABLE");
+        assert!(
+            n > 0 && (n as usize) < len,
+            "the write must report the PARTIAL count it managed before the \
+             close (got {n} of {len}); equal would mean it never parked"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "close should wake the parked writer promptly, got {elapsed:?}"
+        );
+        drop(keeper.join().unwrap());
+    }
+
+    /// The other race direction for write: the writing THREAD is interrupted
+    /// while parked, with the channel still registered — so only the probe can
+    /// end it. The registry entry must survive: closing the channel is the
+    /// caller's job, through `sc_close` on a pin-reloaded reference.
+    #[test]
+    fn an_interrupt_breaks_a_parked_blocking_channel_write() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let keeper = std::thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = Arc::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let id = tcp_register(TcpHandle::Stream(Arc::clone(&client)));
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let flag = Arc::clone(&interrupted);
+        let payload = vec![0x5a_u8; 8 * 1024 * 1024];
+        let writer = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let outcome = write_close_aware(id, &client, &payload, &|| flag.load(Ordering::SeqCst));
+            (outcome.map_err(|e| e.kind()), start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        interrupted.store(true, Ordering::SeqCst);
+
+        let (outcome, elapsed) = writer.join().unwrap();
+        assert_eq!(
+            outcome.map(|n| n.unwrap_or(0)).unwrap_err(),
+            ErrorKind::Interrupted,
+            "an interrupt must break the parked write — and it outranks the \
+             bytes already transferred, which is why this is an error and not \
+             the partial count the close case returns"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the interrupt should wake the parked writer within a poll slice, \
+             got {elapsed:?}"
+        );
+        assert!(
+            tcp_registry().read().contains_key(&id),
+            "the interrupt path must not remove the registry entry itself"
+        );
+        tcp_remove(id);
+        drop(keeper.join().unwrap());
+    }
+
+    /// The other half of the contract: a close-aware write is still a write.
+    /// A payload that fits must be delivered WHOLE — a blocking write may not
+    /// answer a short count — and the reader must see every byte in order,
+    /// which is the assertion that would catch a slicing bug in
+    /// `WRITE_SLICE_MAX`.
+    #[test]
+    fn a_close_aware_write_delivers_every_byte_in_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Larger than one slice, so the loop really does slice.
+        let len = WRITE_SLICE_MAX * 5 + 17;
+        let reader = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = vec![0_u8; 64 * 1024];
+            while got.len() < len {
+                match peer.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(e) => panic!("peer read failed: {e}"),
+                }
+            }
+            got
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let id = tcp_register(TcpHandle::Stream(Arc::new(
+            client.try_clone().unwrap(),
+        )));
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let n = write_close_aware(id, &client, &payload, &|| false)
+            .expect("write must succeed")
+            .expect("a blocking close-aware write never answers UNAVAILABLE");
+        assert_eq!(n as usize, len, "a blocking write must not return short");
+        let got = reader.join().unwrap();
+        assert_eq!(got, payload, "sliced write must preserve content and order");
+        tcp_remove(id);
     }
 
     #[test]

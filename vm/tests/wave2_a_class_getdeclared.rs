@@ -90,7 +90,14 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("ReflectProbe.class").exists() {
-        eprintln!("[wave2_a] ReflectProbe.class missing — run javac in apps/reflect_probe");
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave2_a",
+            "the Wave 2 Task A fixture `ReflectProbe` (ReflectProbe.class, compiled from \
+             ReflectProbe.java)",
+            &[probe.join("ReflectProbe.class"), probe.join("ReflectProbe.java")],
+        );
         return None;
     }
     let mut cmd = Command::new(&bin);

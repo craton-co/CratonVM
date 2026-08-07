@@ -117,7 +117,13 @@ fn run_xml_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("XmlProbe.class").exists() {
-        eprintln!("[wave1-d] XmlProbe.class missing — run javac in apps/xml_probe");
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave1-d",
+            "the Wave 1 Task D fixture `XmlProbe` (XmlProbe.class, compiled from XmlProbe.java)",
+            &[probe.join("XmlProbe.class"), probe.join("XmlProbe.java")],
+        );
         return None;
     }
     write_fixture()?;

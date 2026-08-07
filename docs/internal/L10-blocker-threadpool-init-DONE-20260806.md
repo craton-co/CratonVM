@@ -16,14 +16,23 @@
 > universal claim, and mistaking it for one is exactly how the eight dispatch
 > sites would get deleted on the wrong grounds.
 >
-> **L11's item 7 is unblocked.** Its step 1 was this lane; steps 2–4 (reclassify
+> ~~**L11's item 7 is unblocked.** Its step 1 was this lane; steps 2–4 (reclassify
 > `native_es_execute`, delete the ninth site, delete the eight) are unchanged
-> and still have to happen together in that order.
+> and still have to happen together in that order.~~
 >
-> **Evidence record:**
-> [`threadpoolexecutor-execute-receiver-shape-special-case-copies.md`](../known-issues/jdk-only/threadpoolexecutor-execute-receiver-shape-special-case-copies.md)
+> ~~**Evidence record:**
+> `threadpoolexecutor-execute-receiver-shape-special-case-copies.md`
 > — still **OPEN**, and stays open: it is item 7's record and item 7 is L11's.
-> Its step 1 is struck through and dated.
+> Its step 1 is struck through and dated.~~
+>
+> **UPDATED 2026-08-07 — item 7 was spent the same day this was written, and
+> both statements above are now false.** Steps 2–4 happened: `native_es_execute`
+> is `NativeKind::SyntheticStub`, `ThreadPoolExecutor` is on the
+> real-protected-stub allow-list, and **all nine sites plus the probe helper are
+> deleted**, with a gate that fails if one grows back. The evidence record is no
+> longer open and no longer at the path above; it moved to
+> [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md).
+> The link as written is broken.
 
 ## The brief was wrong about where the defect was, and that is the finding
 
@@ -166,7 +175,7 @@ build, whose two-slot executor model is what those factories are for.
 | `vm/src/runtime/env_cache.rs` | `CRATONVM_DBG_TPE_SHAPE`. |
 | `vm/src/runtime/interpreter/native_override.rs` | the instrument inside `threadpool_executor_has_real_workers`; the ninth site's comment corrected (it claimed the factories "never run the real `<init>`", which had stopped being true); the census constant's step 1 struck through and dated for L11. |
 | `probes/L10ThreadPoolInitProbe.java` | 62 deterministic lines, the oracle for this lane. |
-| `probes/L10ShapeInstrumentControlProbe.java` | the negative control: a constructor-less executor, so the instrument's `false` branch is shown to fire. Not a correctness probe; diverges from HotSpot by design. |
+| ~~`probes/L10ShapeInstrumentControlProbe.java`~~ | ~~the negative control: a constructor-less executor, so the instrument's `false` branch is shown to fire. Not a correctness probe; diverges from HotSpot by design.~~ **Deleted 2026-08-06 with the predicate it measured** (item 7 removed `threadpool_executor_has_real_workers`). The file is not in the tree; this row is history, not a deliverable. `probes/L10ThreadPoolInitProbe.java` **is** present and tracked. |
 | `apps/executor_probe/ExecProbe.java` | **restored** — `vm/tests/wave1_c_executor.rs`'s missing fixture. See below. |
 
 ## The instrument, and why it prints the successes too
@@ -423,7 +432,28 @@ change's:
   not.
 * **`bridge-ratchet.sh` wants a re-freeze** (four fewer `Bridge` rows). It
   passes as-is — the ratchet is `<=` — and the baseline is keyed `25/linux`, so
-  it can only be re-taken on the Linux CI leg.
+  it can only be re-taken on the Linux CI leg. **Note added 2026-08-07:** this
+  one is sound precisely because the dropped rows were registered on the
+  **real-JDK** arm, which is the arm `bridge-ratchet.sh` boots (`--real-jdk`;
+  the frozen artefact records `"mode": "compatible"`). A later record claimed a
+  `+2` on the same ratchet for rows registered only under
+  `register_synthetic_overrides` — those cannot move it at all. See
+  [`W6-1-varhandle-vartype-coordinatetypes.md`](../known-issues/jdk-only/W6-1-varhandle-vartype-coordinatetypes.md)
+  and [§7 of *Natives over real JDK
+  classes*](../architecture/natives-over-real-jdk-classes.md).
+
+* **Generalised 2026-08-07.** This lane's central argument — *"Registration, not
+  dispatch, and that is the point … A policy expressed at registration is
+  invisible to every dispatch path at once"* — turned out to be the tree's
+  general rule rather than this lane's trick. On the cold interpreter paths
+  registration **is** the dispatch gate; the force list and `check_override`
+  only reinstate that default on the warm, cached, reflective and JIT paths;
+  and `NativeKind` only ever subtracts. Written up with citations as
+  [§1 of *Natives over real JDK
+  classes*](../architecture/natives-over-real-jdk-classes.md), together with
+  §3's corollary that `register()` is last-registration-wins, which is what made
+  the eight-registration `Executors` census in *§3. The registry* readable at
+  all (four duplicate pairs, only the later half of each ever running).
 
 ---
 

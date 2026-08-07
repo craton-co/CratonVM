@@ -8,6 +8,24 @@ written up under *The unjustified one*.
 
 Filed 2026-08-07 (JDK-only wave 2, lane W6-4).
 
+> **2026-08-07 — two qualifications on "the gate ships", both verified against
+> the tree.**
+>
+> 1. **Nothing runs it.** `duplicate_registration_gate` appears nowhere in
+>    `.github/workflows/ci.yml`, which wires `stub_ratchet` and
+>    `regression-suite/bridge-ratchet.sh` but not this. So the seed described
+>    under *Seeding* has not been taken by CI either, and the ratchet is not
+>    guarding anything until someone adds the step and pastes the numbers.
+> 2. **The number, once taken, will be scoped.** The gate's own header says it:
+>    it observes only the registrars `vm_init_real_jdk_boot_path` calls, minus
+>    everything `register` drops before it can push a row. **The whole
+>    synthetic-JDK registration graph is invisible to it** — 154 triples
+>    registered by both `register_essential_natives_with_shims` and
+>    `register_synthetic_overrides` in `native-builtins/src/lib.rs` alone. Read
+>    [§7 of *Natives over real JDK
+>    classes*](../../architecture/natives-over-real-jdk-classes.md) before
+>    quoting `BASELINE_SHADOWED` anywhere.
+
 ## The species
 
 `NativeMethodRegistry::register` is last-write-wins and **updates the existing
@@ -127,9 +145,29 @@ justification being the comment already at each site.
 
 ## The unjustified one
 
-**`java.util.concurrent.locks.StampedLock` is served by two different
+> **REFUTED 2026-08-07 by lane W6-12 — leave this section as the record of how
+> the census misled, not as a defect.** See
+> [`W6-12-stampedlock-split-brain.md`](W6-12-stampedlock-split-brain.md). The
+> losing registrar `native-collections/src/lib.rs::register_stamped_lock_natives`
+> was disabled at its **call site** on 2026-07-28 (`let _ = register_stamped_lock_natives;`,
+> a dead-code silencer) and has since been deleted from the file outright — the
+> tombstone comment is still there. It never registered anything, so nothing
+> below about "the collections version wins those eleven" happened.
+>
+> **The methodological finding is the durable part**, and it generalises past
+> this one case: *a census that counts `r.register(...)` sites inside a registrar
+> function does not ask whether the function is reachable.* That is the same
+> scoping trap as the runtime one in
+> [§7 of *Natives over real JDK
+> classes*](../../architecture/natives-over-real-jdk-classes.md) — a registrar
+> reachable only from `register_synthetic_overrides` cannot register in real-JDK
+> mode at all. W6-12 proposes the missing column: *is the registrar reachable
+> from `vm_init` in the configuration under test*. The live split-brain the
+> brief was really describing turned out to be `Phaser`.
+
+~~**`java.util.concurrent.locks.StampedLock` is served by two different
 implementations with two different state stores, and neither one owns the whole
-surface.**
+surface.**~~
 
 Eleven triples — `<init>`, `readLock`, `writeLock`, `unlockRead`, `unlockWrite`,
 `tryOptimisticRead`, `validate`, `tryReadLock`, `tryWriteLock`, `isReadLocked`,

@@ -99,6 +99,14 @@ fn ensure_probe_compiled() -> bool {
     }
     let source = dir.join("ConstructorProbe.java");
     if !source.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "cluster_c_constructor",
+            "the Cluster C fixture `ConstructorProbe.java` (the test pins its 11/11 PASS output)",
+            &[source.clone()],
+        );
         return false;
     }
     let compile = Command::new("javac")

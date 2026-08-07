@@ -435,7 +435,88 @@ use cratonvm_types::access_flags::{
     ACC_STATIC_I32 as ACC_STATIC, ACC_VOLATILE_I32 as ACC_VOLATILE,
 };
 
+// ---------------------------------------------------------------------------
+// THE PRECEDENCE LATTICE of `java.lang.reflect.Field`
+// ---------------------------------------------------------------------------
+//
+// Measured on Temurin/Microsoft OpenJDK 25.0.3 by running each row with TWO
+// things wrong at once -- the only way precedence is observable at all. Every
+// `RANK n` comment below refers to this table, and every row of it is asserted
+// in `regression-suite/src/RJdkFieldModule.java` section 9.
+//
+// It is NOT the three-level ladder it looks like from a distance.
+// `IllegalAccessException` occurs at two DIFFERENT ranks, and confusing them is
+// exactly what makes a reordering fix one pair while breaking another:
+//
+//     rank 1  NullPointerException       null receiver on an INSTANCE field
+//     rank 2  IllegalAccessException     access denied (JLS 6.6.1/6.6.2.1+JPMS)
+//     rank 3  IllegalArgumentException   TYPED accessor vs field descriptor
+//     rank 4  IllegalArgumentException   receiver is not an instance of the
+//                                        declaring class
+//     rank 5  IllegalAccessException     final write
+//     rank 6  IllegalArgumentException   value type, on the generic
+//                                        set(Object, Object)
+//
+// Ranks 1 and 2 are `Field.checkAccess`, and they are SKIPPED ENTIRELY when the
+// `setAccessible` override is set:
+//
+//     public boolean getBoolean(Object obj) throws ... {
+//         if (!override) { checkAccess(Reflection.getCallerClass(), obj); }
+//         return getFieldAccessor(obj).getBoolean(obj);
+//     }
+//     private void checkAccess(Class<?> caller, Object obj) throws ... {
+//         checkAccess(caller, clazz,
+//                     Modifier.isStatic(modifiers) ? null : obj.getClass(),
+//                     modifiers);
+//     }
+//
+// Rank 1 is therefore not a rule anyone wrote: `obj.getClass()` is dereferenced
+// while the ARGUMENT LIST is built. Two measured consequences a flat ladder
+// cannot express, and the reason the override guard below is load-bearing
+// rather than an optimisation:
+//
+//   * WITHOUT the override, `String.hash.getBoolean(null)` is a
+//     `NullPointerException` -- rank 1 beats rank 3;
+//   * WITH the override, `ownPrivateIntField.getBoolean(null)` is an
+//     `IllegalArgumentException` -- ranks 1-2 are gone, so rank 3 goes first and
+//     the null receiver is not noticed until rank 4.
+//
+// Ranks 1 and 4 do not exist for a `static` field: `reflective_target_class_id`
+// passes `null` and the receiver is ignored outright, so
+// `Integer.MAX_VALUE.get(new Object())` reads fine.
+//
+// Rank 3 is the accessor's own type gate and it is UNCONDITIONAL --
+// `Integer.MAX_VALUE.setBoolean(null, true)` is an `IllegalArgumentException`
+// even though the field is `static final`, because `setBoolean` against an
+// `int` field throws before it looks at anything else. That is the whole reason
+// rank 3 sits ABOVE rank 5 while the generic `set(Object,Object)` value check
+// sits BELOW it:
+//
+//     finalIntField.setInt(obj, 1)                 IllegalAccessException
+//     finalIntField.setLong(obj, 1L)               IllegalArgumentException
+//     finalStringField.set(obj, Integer.valueOf(1))    IllegalAccessException
+//     nonFinalStringField.set(obj, Integer.valueOf(1)) IllegalArgumentException
+//     finalIntField.set(obj, null)                 IllegalAccessException
+//
+// The rank-3 widening matrices, measured field descriptor by field descriptor
+// (`validate_field_descriptor` / `validate_set_descriptor`):
+//
+//     getBoolean Z       getByte B        getChar C      getShort BS
+//     getInt BCSI        getLong BCSIJ    getFloat BCSIJF   getDouble BCSIJFD
+//     setBoolean Z       setByte BSIJFD   setChar CIJFD  setShort SIJFD
+//     setInt IJFD        setLong JFD      setFloat FD    setDouble D
+//
+// The getters and setters are NOT transposes of each other: `getShort` accepts
+// a `byte` field but `setByte` also accepts a `short` field, and `getInt`
+// accepts `char` while `setChar` does not accept `int`. Both matrices are
+// written out rather than derived from one another for that reason.
+// ---------------------------------------------------------------------------
+
 /// WP2.1-field вЂ” final-field write check for `Field.set*`.
+///
+/// RANK 5 of the precedence lattice above: below the typed accessor's descriptor
+/// gate and below the receiver-type check, above the generic
+/// `set(Object,Object)` value-type check.
 ///
 /// Per `java.lang.reflect.Field.set` Javadoc and JLS В§15.26.1:
 ///   * Writing a non-static `final` field via reflection requires
@@ -577,11 +658,20 @@ const UNRESOLVED_DECLARING_CLASS_ID: u32 = 0;
 /// == None`) the fallback below is reached unchanged.  JPMS/open-package
 /// validation remains in the caller after this check and continues to govern
 /// cross-module deep reflection.
+///
+/// ...with ONE exception, and it is the reason `receiver_class_id` exists. The
+/// `protected` arm of the widening was too wide: JLS §6.6.2.1 admits a
+/// foreign-package subclass only through a receiver of the caller's own type.
+/// `receiver_class_id` is HotSpot's `targetClass` — `Field.checkAccess` passes
+/// `Modifier.isStatic(modifiers) ? null : obj.getClass()` — and it is built by
+/// [`reflective_target_class_id`] so the four field entry points cannot compute
+/// it differently. `None` is the no-refinement value.
 fn check_field_access(
     ctx: &mut dyn NativeContext,
     modifiers: i32,
     accessible: bool,
     declaring_class_id: ClassId,
+    receiver_class_id: Option<ClassId>,
     member_desc: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     if accessible || (modifiers & ACC_PUBLIC) != 0 {
@@ -599,18 +689,178 @@ fn check_field_access(
             // method it reaches is a `&self` metadata lookup (`class_name_of_id`
             // / `loader_id_of_class` / `nest_host_name` / `nest_member_names` /
             // `class_id_by_name_near` / `superclass_of`) — none of them
-            // re-enters Java, so no moving-GC pin is required here.
+            // re-enters Java, so no moving-GC pin is required here. The receiver
+            // is pre-resolved to a `ClassId` by the caller for the same reason:
+            // it keeps this whole subtree free of `ObjectRef`s that a GC could
+            // move under it.
             if crate::lang_reflect::caller_may_access_member(
                 ctx,
                 caller,
                 declaring_class_id,
                 modifiers,
+                receiver_class_id,
             ) {
                 return Ok(());
             }
         }
     }
     check_access(modifiers, false, member_desc)
+}
+
+/// HotSpot's `targetClass` argument to `Reflection.verifyMemberAccess`, exactly
+/// as `java.lang.reflect.Field.checkAccess` computes it:
+///
+/// ```java
+/// checkAccess(caller, clazz, Modifier.isStatic(modifiers) ? null : obj.getClass(), modifiers);
+/// ```
+///
+/// The `isStatic` test is deliberately made HERE rather than trusted from the
+/// call site's own `is_static` local: it is the same `modifiers` word the access
+/// decision is taken on, so the two cannot disagree about whether a receiver is
+/// even meaningful. Measured on Temurin 25.0.3, a `protected static` field reads
+/// OK through EVERY receiver — the caller's class, the declaring class, a
+/// sibling subclass, an unrelated class, and `null` — so getting this test
+/// backwards would deny a row the JDK always allows.
+///
+/// A `None` receiver on an INSTANCE field cannot reach this function's FIELD
+/// callers: they raise the `NullPointerException` HotSpot raises first (see
+/// `null_receiver_on_instance_field`, rank 1 of the precedence lattice). It CAN
+/// reach the `Method.invoke` caller, which has no rank-1 test of its own — so
+/// the mapping to `None` is load-bearing there rather than merely tidy: `None`
+/// is the fail-open value downstream, and it leaves a null-receiver
+/// `Method.invoke` at whatever answer it had before the receiver was wired in.
+fn reflective_target_class_id(
+    ctx: &dyn NativeContext,
+    modifiers: i32,
+    receiver: Option<ObjectRef>,
+) -> Option<ClassId> {
+    if (modifiers & ACC_STATIC) != 0 {
+        return None;
+    }
+    receiver.map(|r| ctx.class_id_of_object(r))
+}
+
+/// A null receiver on an INSTANCE field is a `NullPointerException`, and it
+/// wins over every access and module refusal.
+///
+/// That precedence is not a preference, it falls out of where HotSpot evaluates
+/// the receiver: `Field.get` calls
+/// `checkAccess(caller, clazz, Modifier.isStatic(modifiers) ? null : obj.getClass(), modifiers)`,
+/// so `obj.getClass()` is dereferenced while building the ARGUMENT LIST, before
+/// `Reflection.verifyMemberAccess` is entered at all. Measured on Temurin
+/// 25.0.3, every one of these answers `NullPointerException` and not
+/// `IllegalAccessException`:
+///
+///   * `String.hash.get(null)` / `.getInt(null)` / `.setInt(null, 1)` — a
+///     private field of another module, denied on every other ground;
+///   * `ArrayList.elementData.get(null)` — package-private, likewise denied;
+///   * the first instance field of `java.text.CalendarBuilder` — denied because
+///     the CLASS is not public, a refusal raised at a different gate again;
+///   * `ByteArrayOutputStream.count.get(null)` from a subclass that IS entitled
+///     to read it — so the rule does not depend on the access answer at all.
+///
+/// The four field entry points therefore ask this FIRST. Before this, CratonVM
+/// ran `check_field_access` and `enforce_module_check_on_field` ahead of the
+/// null test and answered `IllegalAccessException` for the denied rows; the
+/// `NullPointerException` was raised further down, only for inputs that had
+/// already survived both gates.
+///
+/// The refinement this sits next to makes the ordering load-bearing rather than
+/// cosmetic: `protected_receiver_is_permitted` fails OPEN on a `None` receiver,
+/// so without this test a null receiver would reach the JLS §6.6.2.1 arm as
+/// "no opinion" and the read would proceed to a `NullPointerException` anyway —
+/// but a null receiver on a DENIED field would have answered
+/// `IllegalAccessException`, which is the row HotSpot contradicts.
+///
+/// Note `is_static` comes from `read_field_meta`, which collapses an unreadable
+/// `clazz` mirror to `is_static == false`. Such an input already ended in a
+/// `NullPointerException` on the old path (the `receiver.ok_or_else` below the
+/// access checks); the only thing that moves is which exception wins when more
+/// than one applies.
+fn null_receiver_on_instance_field(
+    is_static: bool,
+    receiver: Option<ObjectRef>,
+    operation: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if is_static || receiver.is_some() {
+        return Ok(());
+    }
+    Err(cratonvm_types::error::RuntimeError::NullPointerException {
+        message: Some(format!("{operation}: null receiver for instance field")),
+    }
+    .into())
+}
+
+/// RANK 4 of the precedence lattice -- HotSpot's `FieldAccessorImpl.ensureObj`:
+/// the receiver of an INSTANCE field must be an instance of the declaring class,
+/// or the call is an `IllegalArgumentException`.
+///
+/// This rank is between the typed accessor's descriptor gate (rank 3) and the
+/// final-write refusal (rank 5), and both neighbours are observable:
+///
+/// ```text
+/// finalIntField.setByte(ownInstance, (byte) 1)   IllegalAccessException  (5)
+/// finalIntField.setByte("wrong type",  (byte) 1) IllegalArgumentException(4)
+/// finalIntField.setLong("wrong type",  1L)       IllegalArgumentException(3)
+/// ```
+///
+/// Access (rank 2) still outranks it, which is what stops this from being
+/// visible on a denied field: `String.hash.get(new Object())` is an
+/// `IllegalAccessException`, not an `IllegalArgumentException`.
+///
+/// Before this existed, CratonVM had no receiver-type test on the field path at
+/// all: a wrong-typed receiver read or wrote whatever the declaring class's slot
+/// index happened to address on it. So this closes an out-of-shape slot access
+/// as well as a precedence row.
+///
+/// Three fail-open cases, each deliberate. This is a NEW refusal on the hottest
+/// reflective path and an input it cannot read must not invent one:
+///
+///   * `static`, or a `None` receiver -- rank 4 does not exist for either (rank
+///     1 already answered the second, and `ensureObj` is not reached for the
+///     first);
+///   * an unresolved declaring class. `read_field_meta` collapses an unreadable
+///     `clazz` mirror onto `ClassId::new(0)`, which is also a real id, exactly
+///     as [`check_field_access`] documents -- so the sentinel is skipped for the
+///     same reason it is skipped there;
+///   * an unreadable hierarchy. TWO independent predicates have to agree before
+///     this refuses, and each of them alone is enough to ALLOW:
+///     `NativeContext::is_subclass` — the same `parent.isAssignableFrom(child)`
+///     that `AccessibleObject.canAccess` and `coerce_arg_strict` already ask of
+///     a receiver — and [`crate::lang_reflect::is_subclass_or_unreadable`],
+///     which additionally answers "yes" for any chain that does not terminate
+///     at a real `java/lang/Object`. A `--synthetic-jdk` stand-in has a
+///     truncated supertype chain and must not earn a spurious
+///     `IllegalArgumentException` on every read; requiring both to say no is
+///     what keeps a model gap in either of them from producing one.
+///
+/// Arrays need no special case: `[I` walks to a real `java/lang/Object` without
+/// meeting the declaring class, so it is refused with the same message
+/// `reject_array_field_receiver` used — and where the array model does not
+/// support the walk, that older check is still below this one and catches it.
+fn reflective_receiver_type_check(
+    ctx: &mut dyn NativeContext,
+    is_static: bool,
+    declaring_class_id: ClassId,
+    receiver: Option<ObjectRef>,
+    operation: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if is_static || declaring_class_id.as_u32() == UNRESOLVED_DECLARING_CLASS_ID {
+        return Ok(());
+    }
+    let Some(recv) = receiver else {
+        return Ok(());
+    };
+    let receiver_cid = ctx.class_id_of_object(recv);
+    if receiver_cid == declaring_class_id || ctx.is_subclass(receiver_cid, declaring_class_id) {
+        return Ok(());
+    }
+    if crate::lang_reflect::is_subclass_or_unreadable(ctx, receiver_cid, declaring_class_id) {
+        return Ok(());
+    }
+    Err(illegal_arg_exc(format!(
+        "{operation}: object is not an instance of declaring class"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +1113,19 @@ fn check_reflection_export_access_with_target_id(
     target_class_id: Option<ClassId>,
     accessible_override: bool,
 ) -> Result<(), String> {
+    // Kill switch for the whole export gate. This helper is the single place
+    // all three reflective arms — `Field.get`/`Field.set` (and the typed
+    // family), `Method.invoke`, `Constructor.newInstance` — ask the `exports`
+    // question, so disabling it here disables it for all of them at once and
+    // there is nothing to scatter. Presence disables (`reflect-export-gate` is
+    // stated positively; `CRATONVM_REFLECT_NO_EXPORT_GATE` is its off_key), so
+    // the gate is ON by default and `.is_ok()` is the right test.
+    //
+    // `runtime_var`, not `std::env::var`: the latched snapshot is what the flag
+    // census reads, and a raw env read is a check-surface violation.
+    if cratonvm_types::flags::runtime_var("CRATONVM_REFLECT_NO_EXPORT_GATE").is_ok() {
+        return Ok(());
+    }
     if accessible_override {
         return Ok(());
     }
@@ -930,37 +1193,158 @@ fn enforce_module_check_from_mirror(
 /// declaring-class mirror from a Field object via `get_field_by_name`,
 /// matching the real JDK layout regardless of hierarchy-dependent slot
 /// offsets.
+///
+/// This is the MODULE half of `Reflection.verifyMemberAccess` for
+/// `Field.get`/`Field.set` and the whole typed `getInt`/`setLong`/... family;
+/// the JLS modifier half is `check_field_access`, which every caller runs
+/// first. The two must not both try to be the whole rule.
+///
+/// The question is `exports`, NOT `opens`, and it is the SAME question for a
+/// public and a non-public field. That is not the shape the two arms had, and
+/// both were wrong in opposite directions. Measured on Temurin 25.0.3
+/// (`FieldOracle`/`Sub` probes, rows quoted per claim):
+///
+///   * `opens` is not the field-read gate at all. Under
+///     `--add-opens java.base/java.lang=ALL-UNNAMED`, `String.hash` STILL
+///     answers `IllegalAccessException` to a plain `Field.get`; all the opens
+///     edge buys is that `setAccessible(true)` stops throwing. So an arm that
+///     asks `opens` is asking a question whose answer never decides this.
+///   * `exports` IS the gate, and it is enough on its own. Under
+///     `--add-exports java.base/jdk.internal.misc=ALL-UNNAMED`,
+///     `Unsafe.INVALID_FIELD_OFFSET` (public static final) reads OK while the
+///     private `Unsafe.theUnsafe` still throws — exports alone flipped the
+///     public field and moved the private one not at all.
+///   * The public arm returning `Ok` unconditionally was an UNDER-denial with
+///     a live witness: with no flags at all, `Unsafe.INVALID_FIELD_OFFSET`
+///     must throw `IllegalAccessException` because jdk.internal.misc is
+///     neither exported nor opened, and a public-means-skip arm fabricates a
+///     success there. This is the same hole `Method.invoke` and
+///     `Constructor.newInstance` closed; the shape below is theirs.
+///   * The non-public arm asking `opens` was an OVER-denial. A cross-module
+///     SUBCLASS reads its superclass's `protected` field with no
+///     `setAccessible` and no `--add-opens`: `ByteArrayOutputStream.buf` read
+///     from a classpath subclass is OK on HotSpot, and java.io is exported and
+///     NOT opened, so the opens question denied a read the JDK performs.
+///     `check_field_access` has already granted that caller (JLS 6.6.2), so
+///     the only thing left to ask is whether the package is exported.
+///
+/// Widening audit for that last bullet: `check_field_access` lets a non-public
+/// field through only for `caller == declaring`, a nestmate, a same-runtime-
+/// package caller, or `protected` + subclass. The first three are same-module
+/// by construction and `check_deep_reflection_access` already accepted them, so
+/// the ONLY behaviour this arm changes is the cross-module protected-subclass
+/// family.
+///
+/// That family is exactly where the refusal this arm dropped was doing
+/// accidental work. `buf.get(new ByteArrayOutputStream())` from a classpath
+/// subclass is an `IllegalAccessException` on HotSpot, and until the arm was
+/// corrected the `opens` question refused it — the right answer for the wrong
+/// reason, since `--add-opens java.base/java.io` does not move that row one
+/// bit. The real rule is JLS 6.6.2.1's receiver refinement, and it now lives
+/// where it belongs, in `check_field_access` ->
+/// `lang_reflect::caller_may_access_member`, fed by
+/// [`reflective_target_class_id`]. This function must NOT try to be that rule
+/// as well: the two gates asking overlapping questions is what produced the
+/// coincidence in the first place.
 fn enforce_module_check_on_field(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     accessible: bool,
     operation: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    // JEP 403/261 distinction (same pattern as Method.invoke /
-    // Constructor.newInstance): a PUBLIC field needs only `exports`,
-    // not `opens` вЂ” only non-public fields require the deep check.
+    // JEP 403: `AccessibleObject.checkAccess` is skipped outright when the
+    // override is set, so nothing below may run for an accessible Field.
+    if accessible {
+        return Ok(());
+    }
     let field_modifiers = match ctx.get_field_by_name(this, "modifiers") {
         Value::Int(v) => v,
         _ => 0,
     };
-    if (field_modifiers & 0x0001) != 0 {
+    let Value::Object(Some(mirror)) = ctx.get_field_by_name(this, "clazz") else {
         return Ok(());
-    }
-    let target_class_name = match ctx.get_field_by_name(this, "clazz") {
-        Value::Object(Some(m)) => mirror_class_name(ctx, m),
-        _ => None,
     };
-    if let Some(name) = target_class_name {
-        if let Err(msg) = check_reflection_module_access(ctx, &name, accessible) {
-            return Err(
-                cratonvm_types::error::RuntimeError::IllegalAccessException {
-                    message: format!("{operation}: {name}: {msg}"),
-                }
-                .into(),
-            );
+    let Some(name) = mirror_class_name(ctx, mirror) else {
+        return Ok(());
+    };
+    // Carry the mirror's own ClassId rather than re-resolving the binary name:
+    // two child loaders may define the same name (`RFieldSiteCache`
+    // `twoLoadersOneName`), and the lookup then answers the wrong one.
+    let declaring_cid = mirror_class_id(ctx, mirror);
+    if let Err(msg) =
+        check_reflection_export_access_with_target_id(ctx, &name, declaring_cid, accessible)
+    {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("{operation}: {name}: {msg}"),
+            }
+            .into(),
+        );
+    }
+    // `verifyMemberAccess` asks one more question that a public field would
+    // otherwise walk straight past: a public member of a NON-public class is
+    // reachable only from the declaring class's own runtime package, however
+    // exported that package is. `check_field_access` returns early on
+    // ACC_PUBLIC and never asks it. Witness: `java.text.CalendarBuilder` is
+    // package-private with a `public static final int WEEK_YEAR`, java.text is
+    // exported, and HotSpot answers `IllegalAccessException`.
+    if (field_modifiers & ACC_PUBLIC) != 0 {
+        if let Some(cid) = declaring_cid {
+            if !public_member_class_is_reachable(ctx, cid) {
+                return Err(
+                    cratonvm_types::error::RuntimeError::IllegalAccessException {
+                        message: format!(
+                            "{operation}: {}: class is not public and the caller is not in \
+                             its runtime package",
+                            name.replace('/', ".")
+                        ),
+                    }
+                    .into(),
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// `Reflection.verifyMemberAccess`'s class-accessibility question, asked only
+/// when the member itself is public (a non-public member is already decided by
+/// the JLS half in `check_field_access`).
+///
+/// Answers `true` — i.e. "no refusal" — for every input it cannot read. This is
+/// a NEW denial on the field hot path, so an unreadable class must not invent
+/// one; in particular `class_access_flags` returns 0 both for "package-private
+/// class" and for "no such class / fabricated stand-in with no flags word", and
+/// only the former is a denial. Since a javac-emitted class always carries at
+/// least `ACC_SUPER`, treating 0 as unknown costs nothing on real class files
+/// and keeps synthetic-JDK stand-ins out of the refusal entirely.
+///
+/// The caller resolution is deliberately behind the flags test: it walks the
+/// frame stack, and the overwhelmingly common answer (`ACC_PUBLIC` is set)
+/// returns before paying for it.
+fn public_member_class_is_reachable(ctx: &mut dyn NativeContext, declaring_cid: ClassId) -> bool {
+    let flags = i32::from(ctx.class_access_flags(declaring_cid));
+    if flags == 0 || (flags & ACC_PUBLIC) != 0 {
+        return true;
+    }
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return true;
+    };
+    if accessor_cid == declaring_cid {
+        return true;
+    }
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
+        return true;
+    }
+    match (
+        package_of_class_id(ctx, accessor_cid),
+        package_of_class_id(ctx, declaring_cid),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4862,7 +5246,8 @@ fn set_accessible_declaring_mirror(
 /// ```text
 /// if (declaringClass is public && declaringModule.isExported(pkg, callerModule)) {
 ///     if (member is public)                        return;   // allowed
-///     if (member is protected && member is static) return;   // allowed
+///     if (member is protected && member is static
+///         && isSubclassOf(caller, declaringClass)) return;   // allowed
 /// }
 /// ```
 ///
@@ -4871,6 +5256,27 @@ fn set_accessible_declaring_mirror(
 /// `java.lang.String.hash` throws. A gate that consults only `opens` gets the
 /// first of those wrong, and it is by far the more common call - which is why
 /// this is a step of its own rather than a footnote.
+///
+/// The `isSubclassOf` conjunct is the JDK's, not an embellishment, and it
+/// applies to the SECOND arm only - a public member needs no relationship to its
+/// declaring class. Measured A/B on the `protected static final int`
+/// `java.io.PipedInputStream.PIPE_SIZE`, java.io being exported and not opened:
+///
+/// ```text
+/// caller extends PipedInputStream            setAccessible(true)  OK
+/// caller extends a subclass of it            setAccessible(true)  OK
+/// caller unrelated to it                     InaccessibleObjectException
+/// caller unrelated, but member public        setAccessible(true)  OK
+/// caller unrelated, protected INSTANCE field InaccessibleObjectException
+/// ```
+///
+/// The subclass walk is [`crate::lang_reflect::is_subclass_or_unreadable`] and
+/// NOT `NativeContext::is_subclass`, deliberately. This conjunct only ever
+/// produces a NEW `InaccessibleObjectException`, and `is_subclass` is
+/// two-valued: a `--synthetic-jdk` fabricated stand-in has no modelled supertype
+/// chain and would answer "not a subclass", earning a refusal HotSpot does not
+/// raise, on a gate whose vm suite is blocking at zero failures. Failing open on
+/// an unreadable chain restores exactly the pre-conjunct answer for those.
 ///
 /// Returns `true` only where the JDK would allow the access. Every unreadable
 /// input (no modifiers slot, unresolvable declaring class) answers `false`, so
@@ -4884,9 +5290,10 @@ fn set_accessible_export_carve_out(
         Value::Int(v) => v,
         _ => return false,
     };
-    let member_ok = (member_mods & SA_ACC_PUBLIC) != 0
-        || ((member_mods & SA_ACC_PROTECTED) != 0 && (member_mods & SA_ACC_STATIC) != 0);
-    if !member_ok {
+    let member_is_public = (member_mods & SA_ACC_PUBLIC) != 0;
+    let member_is_protected_static =
+        (member_mods & SA_ACC_PROTECTED) != 0 && (member_mods & SA_ACC_STATIC) != 0;
+    if !member_is_public && !member_is_protected_static {
         return false;
     }
     if (i32::from(ctx.class_access_flags(target_cid)) & SA_ACC_PUBLIC) == 0 {
@@ -4899,6 +5306,14 @@ fn set_accessible_export_carve_out(
     let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
         return true;
     };
+    // The protected-static arm alone carries the subclass conjunct, and only
+    // when the member is not ALSO public (a public member takes the first arm
+    // and never reaches this test).
+    if !member_is_public
+        && !crate::lang_reflect::is_subclass_or_unreadable(ctx, accessor_cid, target_cid)
+    {
+        return false;
+    }
     ctx.reflective_export_to_accessor(accessor_cid, target_cid)
 }
 
@@ -5020,10 +5435,24 @@ fn package_of_class_id(ctx: &dyn NativeContext, cid: ClassId) -> Option<String> 
 ///
 /// No resolvable caller frame means the VM itself is asking; answer `true`,
 /// matching every other reflection gate here.
+///
+/// `receiver` is the JLS §6.6.2.1 target type, the same third argument
+/// `check_field_access` takes and `reflective_target_class_id` computes:
+/// `Modifier.isStatic(modifiers) ? null : obj.getClass()`. `canAccess` must
+/// answer the same question `get`/`set` will, and without it this returned
+/// `true` for a receiver the read then refused. Measured on Temurin 25.0.3 from
+/// a classpath subclass of `java.io.ByteArrayOutputStream`:
+/// `buf.canAccess(ownInstance)` is `true` while `buf.canAccess(bareBaos)` and
+/// `buf.canAccess(siblingSubclass)` are `false`, matching the three
+/// `Field.get` rows exactly.
+///
+/// `None` is the no-refinement value (a `static` member, or a call site with no
+/// receiver in hand) and reproduces this function's pre-receiver behaviour.
 pub(crate) fn verify_member_access(
     ctx: &mut dyn NativeContext,
     declaring_id: ClassId,
     modifiers: i32,
+    receiver: Option<ClassId>,
 ) -> bool {
     let Some(caller_id) = resolve_caller_class_id(ctx) else {
         return true;
@@ -5058,7 +5487,18 @@ pub(crate) fn verify_member_access(
     if same_package {
         return true;
     }
-    (modifiers & SA_ACC_PROTECTED) != 0 && ctx.is_subclass(caller_id, declaring_id)
+    if (modifiers & SA_ACC_PROTECTED) == 0 || !ctx.is_subclass(caller_id, declaring_id) {
+        return false;
+    }
+    // JLS §6.6.2 admits a foreign-package subclass, and §6.6.2.1 then narrows
+    // WHICH objects it may reach the member on. `is_subclass_or_unreadable` is
+    // the tri-state walk: this conjunct only ever produces a `false`, so a
+    // fabricated stand-in with no modelled supertype chain must not be caught
+    // by it.
+    match receiver {
+        Some(r) => crate::lang_reflect::is_subclass_or_unreadable(ctx, r, caller_id),
+        None => true,
+    }
 }
 
 /// Field.setAccessible(boolean) вЂ” writes the accessible flag.
@@ -5667,15 +6107,23 @@ pub(crate) fn native_field_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_field_access(
+    // RANKS 1-2. `Field.get` has no RANK 3: the generic accessor reads every
+    // descriptor, so the null receiver the override skips past is not noticed
+    // until rank 4 either way, and both spellings answer
+    // `NullPointerException`.
+    field_access_phase(
         ctx,
+        this,
         modifiers,
         accessible,
+        is_static,
         class_id,
+        receiver,
         &format!("Field.get({})", descriptor),
     )?;
-    // NEW-19: module-level opens check (JPMS)
-    enforce_module_check_on_field(ctx, this, accessible, "Field.get")?;
+    // RANK 4.
+    null_receiver_on_instance_field(is_static, receiver, "Field.get")?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field.get")?;
 
     // WP2.1-field вЂ” volatile-aware read fence: matches what the JDK does
     // internally via `Unsafe.getReferenceVolatile`/`getIntVolatile`. No-op
@@ -5774,22 +6222,36 @@ pub(crate) fn native_field_set(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_field_access(
+    // RANKS 1-2.
+    field_access_phase(
         ctx,
+        this,
         modifiers,
         accessible,
+        is_static,
         class_id,
+        receiver,
         &format!("Field.set({})", descriptor),
     )?;
-    // WP2.1-field вЂ” final-field write check (must run AFTER access check
-    // so the more specific error message wins on a public-final field).
+    // RANK 4. `set(Object,Object)` has no RANK 3 — it accepts every descriptor
+    // and decides the value's type at rank 6 instead, which is exactly what
+    // separates it from the typed setters:
+    //   finalIntField.setLong(obj, 1L)                IllegalArgumentException
+    //   finalIntField.set(obj, Integer.valueOf(1))    IllegalAccessException
+    null_receiver_on_instance_field(is_static, receiver, "Field.set")?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field.set")?;
+    // RANK 5 вЂ” WP2.1-field final-field write check. It must run AFTER the
+    // access checks so the more specific error message wins on a public-final
+    // field, and BEFORE the coercion below: measured on Temurin 25.0.3,
+    // `finalIntField.set(obj, null)` and
+    // `finalStringField.set(obj, Integer.valueOf(1))` are both
+    // `IllegalAccessException`, while the same two writes to the same fields
+    // without `final` are `IllegalArgumentException`.
     check_final_for_set(modifiers, accessible, &format!("Field.set({})", descriptor))?;
-    // NEW-19: module-level opens check (JPMS)
-    enforce_module_check_on_field(ctx, this, accessible, "Field.set")?;
 
-    // Strictly coerce the value if the field expects a primitive (including
-    // widening); this raises IllegalArgumentException if the wrapper type
-    // cannot be narrowed/widened to the target primitive per JLS В§5.1.2.
+    // RANK 6 вЂ” strictly coerce the value if the field expects a primitive
+    // (including widening); this raises IllegalArgumentException if the wrapper
+    // type cannot be narrowed/widened to the target primitive per JLS В§5.1.2.
     let coerced = coerce_arg_strict(ctx, new_value, &descriptor, "Field.set", Some(class_id))?;
 
     // WP2.1-field вЂ” volatile-aware write fences (no-op for non-volatile).
@@ -5862,9 +6324,99 @@ fn validate_field_descriptor(
     )))
 }
 
+/// The rank-3 gate for the typed SETTERS, the mirror of
+/// [`validate_field_descriptor`].
+///
+/// It is a separate matrix, not the transpose of the getter one: `setByte`
+/// accepts a `short` field while `getShort` accepts a `byte` field, and
+/// `setChar` refuses an `int` field while `getInt` accepts a `char` one. See the
+/// precedence-lattice banner near the top of this file for both, measured.
+///
+/// Until this existed the typed setters had no descriptor gate at all and leant
+/// on `coerce_arg_strict` at rank 6, which cannot see the difference: a
+/// `boolean` is a `Value::Int(0|1)` on our stack, so `Field.setBoolean` on an
+/// `int` field coerced cleanly and silently wrote 1 where HotSpot throws. The
+/// same blindness let `setInt` truncate into a `byte`/`char`/`short` field.
+///
+/// Nothing this gate refuses can be something a corpus depends on: the corpora
+/// run on HotSpot too, and every row it refuses is already an
+/// `IllegalArgumentException` there.
+fn validate_set_descriptor(
+    descriptor: &str,
+    accepted: &[u8],
+    java_method: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    // Empty descriptor means the meta lookup failed; fall back to the
+    // coercion check downstream rather than inventing a refusal here.
+    if descriptor.is_empty() {
+        return Ok(());
+    }
+    let first = descriptor.as_bytes()[0];
+    if accepted.contains(&first) {
+        return Ok(());
+    }
+    Err(illegal_arg_exc(format!(
+        "Can not set {} field using Field.{}: incompatible descriptor `{}`",
+        descriptor, java_method, descriptor
+    )))
+}
+
+/// A typed accessor's rank-3 descriptor gate, threaded into
+/// [`field_get_raw`]/[`field_set_raw`] rather than run at the call site.
+///
+/// The threading IS the fix. Running it at the call site put it at rank 0, ahead
+/// of the access check, so `String.hash.getBoolean("q")` -- denied AND the wrong
+/// accessor -- answered `IllegalArgumentException` where HotSpot answers
+/// `IllegalAccessException`. Only the raw helpers know where rank 3 falls
+/// relative to the override guard, so only they can apply it.
+#[derive(Clone, Copy)]
+struct TypedAccessorGate {
+    /// Field descriptor first bytes this accessor may widen from / narrow into.
+    accepted: &'static [u8],
+    /// `getInt`, `setLong`, ... -- for the exception message only.
+    java_method: &'static str,
+}
+
+/// Ranks 1 and 2 of the precedence lattice: `Field.checkAccess`, in full,
+/// including the `NullPointerException` that falls out of building its argument
+/// list -- and the `if (!override)` that skips the whole thing.
+///
+/// Skipping is not an optimisation. `check_field_access` and
+/// `enforce_module_check_on_field` both return `Ok` on their own when
+/// `accessible` is set, but `null_receiver_on_instance_field` does NOT, and
+/// HotSpot's rank 1 lives inside `checkAccess`'s call, not before it. Measured:
+/// with the override set, `ownPrivateIntField.getBoolean(null)` is an
+/// `IllegalArgumentException` (rank 3 wins) while `ownPrivateIntField.get(null)`
+/// is still a `NullPointerException` -- raised at rank 4 by `ensureObj`, which
+/// the callers below run after the gate.
+fn field_access_phase(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    modifiers: i32,
+    accessible: bool,
+    is_static: bool,
+    class_id: ClassId,
+    receiver: Option<ObjectRef>,
+    operation: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if accessible {
+        return Ok(());
+    }
+    null_receiver_on_instance_field(is_static, receiver, operation)?;
+    // Bound before the call, not inline: `check_field_access` takes `ctx`
+    // mutably and this takes it shared, and the two cannot be live at once.
+    let target_cid = reflective_target_class_id(ctx, modifiers, receiver);
+    check_field_access(ctx, modifiers, accessible, class_id, target_cid, operation)?;
+    // NEW-19: module half of `Reflection.verifyMemberAccess` — the `exports`
+    // edge, for public and non-public fields alike. `opens` is the
+    // `setAccessible` gate and does not decide a plain read.
+    enforce_module_check_on_field(ctx, this, accessible, operation)
+}
+
 fn field_get_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+    gate: TypedAccessorGate,
 ) -> Result<Value, cratonvm_types::error::MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -5879,7 +6431,7 @@ fn field_get_raw(
         Some(Value::Object(obj_opt)) => *obj_opt,
         _ => None,
     };
-    let (is_static, class_id, slot, _descriptor) = read_field_meta(ctx, this);
+    let (is_static, class_id, slot, descriptor) = read_field_meta(ctx, this);
 
     // Access control
     let modifiers = match ctx.get_field_by_name(this, "modifiers") {
@@ -5887,12 +6439,29 @@ fn field_get_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_field_access(ctx, modifiers, accessible, class_id, "Field typed getter")?;
-    // NEW-19: module-level opens check (JPMS).
-    // `enforce_module_check_from_mirror` takes the slot index of the
-    // declaring-class mirror on the Field object; still 0 historically,
-    // but the real JDK layout puts `clazz` elsewhere. Wrap with a helper.
-    enforce_module_check_on_field(ctx, this, accessible, "Field typed getter")?;
+
+    // RANKS 1-2. The whole typed family — getInt/getLong/getFloat/getDouble/
+    // getBoolean/getByte/getShort/getChar — funnels through here, so the rule
+    // cannot drift between `Field.get` and its primitive twins.
+    field_access_phase(
+        ctx,
+        this,
+        modifiers,
+        accessible,
+        is_static,
+        class_id,
+        receiver,
+        "Field typed getter",
+    )?;
+    // RANK 3. Below the access refusal — `String.hash.getBoolean("q")` is denied
+    // AND the wrong accessor, and HotSpot answers `IllegalAccessException` —
+    // and above the receiver test, so with the override set a null receiver
+    // still loses to it.
+    validate_field_descriptor(&descriptor, gate.accepted, gate.java_method)?;
+    // RANK 4, in its two halves: the null receiver the override skipped past
+    // above, then the receiver-type test.
+    null_receiver_on_instance_field(is_static, receiver, "Field typed getter")?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field typed getter")?;
 
     // WP2.1-field вЂ” volatile-aware read fence (no-op for non-volatile).
     volatile_load_fence(modifiers);
@@ -5904,7 +6473,7 @@ fn field_get_raw(
         is_static,
         class_id,
         slot,
-        _descriptor.as_str(),
+        descriptor.as_str(),
         receiver,
     );
 
@@ -5936,19 +6505,16 @@ pub(crate) fn native_field_get_int(
     //
     // Round-9 native-builtins HIGH-7 fix: also reject boolean (`Z`) fields,
     // which are stored as `Value::Int(0|1)` and previously slipped through
-    // the variant-only check. Validate the field *descriptor* first.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getInt: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"BSCI", "getInt")?;
-    let val = field_get_raw(ctx, args)?;
+    // the variant-only check. The descriptor gate runs at RANK 3, inside
+    // `field_get_raw` — see `TypedAccessorGate`.
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"BSCI",
+            java_method: "getInt",
+        },
+    )?;
     match val {
         Value::Int(_) => Ok(Some(val)),
         _ => Err(illegal_arg_exc(
@@ -5962,18 +6528,14 @@ pub(crate) fn native_field_get_long(
     args: &[Value],
 ) -> MethodCallResult {
     // Accepts byte/short/char/int/long (widening). Rejects boolean/float/double/refs.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getLong: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"BSCIJ", "getLong")?;
-    let val = field_get_raw(ctx, args)?;
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"BSCIJ",
+            java_method: "getLong",
+        },
+    )?;
     match val {
         Value::Long(_) => Ok(Some(val)),
         Value::Int(v) => Ok(Some(Value::Long(v as i64))),
@@ -5988,18 +6550,14 @@ pub(crate) fn native_field_get_float(
     args: &[Value],
 ) -> MethodCallResult {
     // Accepts byte/short/char/int/long/float (widening). Rejects boolean/double/refs.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getFloat: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"BSCIJF", "getFloat")?;
-    let val = field_get_raw(ctx, args)?;
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"BSCIJF",
+            java_method: "getFloat",
+        },
+    )?;
     match val {
         Value::Float(_) => Ok(Some(val)),
         Value::Int(v) => Ok(Some(Value::Float(v as f32))),
@@ -6015,18 +6573,14 @@ pub(crate) fn native_field_get_double(
     args: &[Value],
 ) -> MethodCallResult {
     // Accepts every numeric primitive (widening to double). Rejects boolean/refs.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getDouble: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"BSCIJFD", "getDouble")?;
-    let val = field_get_raw(ctx, args)?;
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"BSCIJFD",
+            java_method: "getDouble",
+        },
+    )?;
     match val {
         Value::Double(_) => Ok(Some(val)),
         Value::Float(v) => Ok(Some(Value::Double(v as f64))),
@@ -6044,22 +6598,20 @@ pub(crate) fn native_field_get_boolean(
 ) -> MethodCallResult {
     // getBoolean only accepts boolean fields (per javadoc вЂ” no widening).
     // We detect non-boolean fields by reading the descriptor alongside.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getBoolean: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    if descriptor != "Z" {
-        return Err(illegal_arg_exc(
-            "Field.getBoolean: field type is not boolean".to_string(),
-        ));
-    }
-    let val = field_get_raw(ctx, args)?;
+    //
+    // This gate used to run HERE, ahead of `field_get_raw` and so ahead of the
+    // access check, which is what made `String.hash.getBoolean("q")` — private,
+    // cross-module, AND read through the wrong accessor — answer
+    // `IllegalArgumentException` where HotSpot answers `IllegalAccessException`.
+    // It is RANK 3 and belongs inside; see `TypedAccessorGate`.
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"Z",
+            java_method: "getBoolean",
+        },
+    )?;
     match val {
         // Round-7 MED-11 fix: validate the underlying int is strictly 0 or 1.
         // Previously any non-zero int was silently coerced to `true`, which
@@ -6083,6 +6635,7 @@ fn field_set_raw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     new_value: Value,
+    gate: TypedAccessorGate,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -6105,16 +6658,38 @@ fn field_set_raw(
         _ => 0,
     };
     let accessible = read_field_accessible(ctx, this);
-    check_field_access(ctx, modifiers, accessible, class_id, "Field typed setter")?;
-    // WP2.1-field вЂ” final-field write check (matches Field.set on the
+
+    // RANKS 1-2. setInt/setLong/setFloat/setDouble/setBoolean/setByte/setShort/
+    // setChar all funnel through here, so the rule cannot drift between
+    // `Field.set` and its primitive twins.
+    field_access_phase(
+        ctx,
+        this,
+        modifiers,
+        accessible,
+        is_static,
+        class_id,
+        receiver,
+        "Field typed setter",
+    )?;
+    // RANK 3, and it is ABOVE the final-write refusal on this path — measured:
+    // `Integer.MAX_VALUE.setInt(null, 1)` is `IllegalAccessException` but
+    // `Integer.MAX_VALUE.setBoolean(null, true)` is `IllegalArgumentException`,
+    // on the same `public static final int`. `coerce_arg_strict` at rank 6
+    // cannot stand in for this: a `boolean` is a `Value::Int(0|1)` here, so it
+    // coerces cleanly into an `int` field and the row silently succeeds.
+    validate_set_descriptor(&descriptor, gate.accepted, gate.java_method)?;
+    // RANK 4, in its two halves: the null receiver the override skipped past
+    // above, then the receiver-type test.
+    null_receiver_on_instance_field(is_static, receiver, "Field typed setter")?;
+    reflective_receiver_type_check(ctx, is_static, class_id, receiver, "Field typed setter")?;
+    // RANK 5 вЂ” WP2.1-field final-field write check (matches Field.set on the
     // generic `set(Object,Object)` path).
     check_final_for_set(modifiers, accessible, "Field typed setter")?;
-    // NEW-19: module-level opens check (JPMS)
-    enforce_module_check_on_field(ctx, this, accessible, "Field typed setter")?;
 
-    // Narrow or widen the incoming primitive into whatever the field
-    // actually holds. This catches `Field.setInt(...)` on a reference field
-    // and the like, producing IllegalArgumentException as per javadoc.
+    // RANK 6, and unreachable as a refusal now that rank 3 exists: whatever the
+    // descriptor gate admitted always fits. Kept because it is what actually
+    // performs the widening/narrowing conversion into the field's storage shape.
     let coerced = coerce_arg_strict(
         ctx,
         new_value,
@@ -6148,7 +6723,15 @@ pub(crate) fn native_field_set_int(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Int(0));
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"IJFD",
+            java_method: "setInt",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6157,7 +6740,15 @@ pub(crate) fn native_field_set_long(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Long(0));
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"JFD",
+            java_method: "setLong",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6166,7 +6757,15 @@ pub(crate) fn native_field_set_float(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Float(0.0));
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"FD",
+            java_method: "setFloat",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6175,7 +6774,15 @@ pub(crate) fn native_field_set_double(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Double(0.0));
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"D",
+            java_method: "setDouble",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6184,7 +6791,18 @@ pub(crate) fn native_field_set_boolean(
     args: &[Value],
 ) -> MethodCallResult {
     let val = args.get(2).copied().unwrap_or(Value::Int(0));
-    field_set_raw(ctx, args, val)?;
+    // `Z` only, and this is the row that most needed a descriptor gate: a
+    // boolean is a `Value::Int(0|1)` on our stack, so before this existed
+    // `setBoolean` on an `int` field coerced cleanly and wrote 1.
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"Z",
+            java_method: "setBoolean",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6195,18 +6813,14 @@ pub(crate) fn native_field_get_byte(
     args: &[Value],
 ) -> MethodCallResult {
     // Field.getByte: only `B` is JLS-legal (no widening from C/S/I вЂ” those throw IAE).
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getByte: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"B", "getByte")?;
-    let val = field_get_raw(ctx, args)?;
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"B",
+            java_method: "getByte",
+        },
+    )?;
     match val {
         Value::Int(v) => Ok(Some(Value::Int((v as i8) as i32))),
         _ => Err(illegal_arg_exc(
@@ -6221,18 +6835,14 @@ pub(crate) fn native_field_get_short(
 ) -> MethodCallResult {
     // Field.getShort: accepts byte (widening) or short. Rejects char (JLS forbids
     // charв†’short narrowing without explicit cast), int, long, boolean, refs.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getShort: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"BS", "getShort")?;
-    let val = field_get_raw(ctx, args)?;
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"BS",
+            java_method: "getShort",
+        },
+    )?;
     match val {
         Value::Int(v) => Ok(Some(Value::Int((v as i16) as i32))),
         _ => Err(illegal_arg_exc(
@@ -6247,18 +6857,14 @@ pub(crate) fn native_field_get_char(
 ) -> MethodCallResult {
     // Field.getChar: only `C` is legal вЂ” char is unsigned 16-bit and JLS does
     // not permit widening into it from byte/short/int.
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                message: Some("Field.getChar: null Field".to_string()),
-            }
-            .into())
-        }
-    };
-    let (_, _, _, descriptor) = read_field_meta(ctx, this);
-    validate_field_descriptor(&descriptor, b"C", "getChar")?;
-    let val = field_get_raw(ctx, args)?;
+    let val = field_get_raw(
+        ctx,
+        args,
+        TypedAccessorGate {
+            accepted: b"C",
+            java_method: "getChar",
+        },
+    )?;
     match val {
         // char is an unsigned 16-bit type stored in an int slot; clamp to u16.
         Value::Int(v) => Ok(Some(Value::Int((v as u16) as i32))),
@@ -6281,7 +6887,15 @@ pub(crate) fn native_field_set_byte(
             ))
         }
     };
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"BSIJFD",
+            java_method: "setByte",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6298,7 +6912,15 @@ pub(crate) fn native_field_set_short(
             ))
         }
     };
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"SIJFD",
+            java_method: "setShort",
+        },
+    )?;
     Ok(None)
 }
 
@@ -6315,7 +6937,15 @@ pub(crate) fn native_field_set_char(
             ))
         }
     };
-    field_set_raw(ctx, args, val)?;
+    field_set_raw(
+        ctx,
+        args,
+        val,
+        TypedAccessorGate {
+            accepted: b"CIJFD",
+            java_method: "setChar",
+        },
+    )?;
     Ok(None)
 }
 
@@ -7592,11 +8222,54 @@ pub(crate) fn native_method_invoke(
         // `check_field_access` is the field-shaped half of the same rule.
         // Pure widening: the fallback below is unchanged for every input the
         // caller step does not accept.
+        // JLS §6.6.2.1's receiver refinement applies here exactly as it does to
+        // the field path — `Method.checkAccess` computes the same third argument
+        // to `Reflection.verifyMemberAccess`:
+        //
+        //     checkAccess(caller, clazz,
+        //                 Modifier.isStatic(modifiers) ? null : obj.getClass(),
+        //                 modifiers);
+        //
+        // Measured on Temurin 25.0.3 with `Object.clone` — protected, in
+        // java.lang, cross-module, and needing no fabricated fixtures — invoked
+        // from a classpath class:
+        //
+        //   receiver = the caller's own instance   InvocationTargetException
+        //                                          (CloneNotSupportedException,
+        //                                          i.e. access GRANTED)
+        //   receiver = new Object()                IllegalAccessException
+        //   receiver = "str"                       IllegalAccessException
+        //   receiver = new int[] {1}               IllegalAccessException
+        //   receiver = another class's instance    IllegalAccessException
+        //   receiver = null                        NullPointerException
+        //
+        // Resolved to a `ClassId` BEFORE the call, never passed as an
+        // `ObjectRef`: `caller_may_access_member`'s whole subtree is kept free
+        // of object references so a moving GC cannot invalidate one under it,
+        // and `check_field_access` pre-resolves its receiver for the same
+        // reason.
+        //
+        // The `null` row above is NOT implemented here. It is rank 1 of the
+        // field precedence lattice — the `NullPointerException` that falls out
+        // of dereferencing `obj.getClass()` while building the argument list —
+        // and `Method.invoke` has no equivalent of
+        // `null_receiver_on_instance_field` yet. `reflective_target_class_id`
+        // maps a null receiver to `None`, the fail-open value, so that row keeps
+        // whatever answer it has today rather than acquiring a new one.
+        let invoke_receiver = match args.get(1) {
+            Some(Value::Object(obj_opt)) => *obj_opt,
+            _ => None,
+        };
+        let receiver_cid = reflective_target_class_id(ctx, modifiers, invoke_receiver);
         let caller_cid = resolve_caller_class_id(ctx);
         let caller_entitled = match (caller_cid, declaring_cid) {
-            (Some(caller), Some(declaring)) => {
-                crate::lang_reflect::caller_may_access_member(ctx, caller, declaring, modifiers)
-            }
+            (Some(caller), Some(declaring)) => crate::lang_reflect::caller_may_access_member(
+                ctx,
+                caller,
+                declaring,
+                modifiers,
+                receiver_cid,
+            ),
             _ => false,
         };
         if !caller_entitled {
@@ -21451,6 +22124,7 @@ mod tests {
             0x0002,
             false,
             declaring,
+            None,
             "Field.get(privateValue)"
         )
         .is_ok());
@@ -21472,6 +22146,7 @@ mod tests {
             0x0002,
             false,
             declaring,
+            None,
             "Field.get(privateValue)"
         )
         .is_err());
@@ -21501,6 +22176,7 @@ mod tests {
             0x0000, // package-private
             false,
             declaring,
+            None,
             "Field.get(pkgValue)"
         )
         .is_ok());
@@ -21524,6 +22200,7 @@ mod tests {
             0x0000, // package-private
             false,
             declaring,
+            None,
             "Field.get(pkgValue)"
         )
         .is_err());
@@ -21548,9 +22225,218 @@ mod tests {
             0x0004, // protected
             false,
             declaring,
+            None,
             "Field.get(protValue)"
         )
         .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // JLS 6.6.2.1 - the RECEIVER refinement of the protected rule.
+    //
+    // Every row below is measured on Temurin 25.0.3 with
+    // `ByteArrayOutputStream.buf` (protected, java.io exported-not-opened) read
+    // from a classpath subclass, no setAccessible and no flags; the shape is
+    // reproduced here on synthetic class ids so the whole matrix is testable
+    // without a JDK. `object` is wired as the root of every chain because
+    // `superclass_of` answering None is what the fail-open arm keys on, and a
+    // test that never reaches a real root would pass for the wrong reason.
+    // -----------------------------------------------------------------------
+
+    /// Build ProtOwner <- ProtChild (the caller) plus a sibling and a
+    /// grandchild, all rooted at a real `java/lang/Object`.
+    fn protected_receiver_fixture(
+        ctx: &mut crate::test_utils::MockNativeContext,
+    ) -> (ClassId, ClassId, ClassId, ClassId) {
+        let object = ctx
+            .ensure_class_initialized("java/lang/Object")
+            .expect("Object");
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/ProtOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/ProtChild")
+            .expect("caller class");
+        let grandchild = ctx
+            .ensure_class_initialized("cratonvm/other/ProtGrandChild")
+            .expect("grandchild class");
+        let sibling = ctx
+            .ensure_class_initialized("cratonvm/other/ProtSibling")
+            .expect("sibling class");
+        ctx.set_superclass(declaring, object);
+        ctx.set_superclass(caller, declaring);
+        ctx.set_superclass(grandchild, caller);
+        ctx.set_superclass(sibling, declaring);
+        (declaring, caller, grandchild, sibling)
+    }
+
+    fn protected_read_with_receiver(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        declaring: ClassId,
+        receiver: Option<ClassId>,
+    ) -> bool {
+        check_field_access(
+            ctx,
+            0x0004, // protected
+            false,
+            declaring,
+            receiver,
+            "Field.get(protValue)",
+        )
+        .is_ok()
+    }
+
+    /// ALLOW: the receiver is the caller's own class. HotSpot row H1.
+    #[test]
+    fn protected_receiver_allows_the_callers_own_class() {
+        let mut ctx = mock_ctx();
+        let (declaring, caller, _grandchild, _sibling) = protected_receiver_fixture(&mut ctx);
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(protected_read_with_receiver(
+            &mut ctx,
+            declaring,
+            Some(caller)
+        ));
+    }
+
+    /// ALLOW: the receiver is a SUBCLASS of the caller. HotSpot row H1b.
+    #[test]
+    fn protected_receiver_allows_a_subclass_of_the_caller() {
+        let mut ctx = mock_ctx();
+        let (declaring, caller, grandchild, _sibling) = protected_receiver_fixture(&mut ctx);
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(protected_read_with_receiver(
+            &mut ctx,
+            declaring,
+            Some(grandchild)
+        ));
+    }
+
+    /// DENY: the receiver is the DECLARING class itself. HotSpot row H2 - the
+    /// row that was accidentally right before the module gate was corrected,
+    /// and became a live divergence when it was.
+    #[test]
+    fn protected_receiver_rejects_the_declaring_class() {
+        let mut ctx = mock_ctx();
+        let (declaring, caller, _grandchild, _sibling) = protected_receiver_fixture(&mut ctx);
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(!protected_read_with_receiver(
+            &mut ctx,
+            declaring,
+            Some(declaring)
+        ));
+    }
+
+    /// DENY: the receiver is a SIBLING subclass - a subclass of the DECLARING
+    /// class that is not under the CALLER. This is the row that reads as
+    /// surprising: being a subclass of the declaring class is not the test.
+    /// HotSpot row H2b.
+    #[test]
+    fn protected_receiver_rejects_a_sibling_subclass() {
+        let mut ctx = mock_ctx();
+        let (declaring, caller, _grandchild, sibling) = protected_receiver_fixture(&mut ctx);
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(!protected_read_with_receiver(
+            &mut ctx,
+            declaring,
+            Some(sibling)
+        ));
+    }
+
+    /// A `protected` STATIC field is exempt: `Field.checkAccess` passes a null
+    /// `targetClass` for it, and HotSpot reads it OK through every receiver
+    /// including a sibling and an unrelated class. `None` is how that reaches
+    /// here, and it must not deny.
+    #[test]
+    fn protected_receiver_refinement_does_not_apply_to_a_static_field() {
+        let mut ctx = mock_ctx();
+        let (declaring, caller, _grandchild, _sibling) = protected_receiver_fixture(&mut ctx);
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(check_field_access(
+            &mut ctx,
+            0x0004 | 0x0008, // protected static
+            false,
+            declaring,
+            None, // `reflective_target_class_id` maps every static receiver here
+            "Field.get(protStaticValue)"
+        )
+        .is_ok());
+    }
+
+    /// FAIL OPEN: a receiver whose superclass chain cannot be walked to
+    /// `java/lang/Object` is an unreadable input, not a denial. A synthetic-JDK
+    /// stand-in is exactly this shape - fabricated, with supertypes modelled
+    /// only where a stub table declares them - and a rule about real class
+    /// hierarchies must not catch it.
+    #[test]
+    fn protected_receiver_fails_open_on_an_unrooted_receiver_chain() {
+        let mut ctx = mock_ctx();
+        let (declaring, caller, _grandchild, _sibling) = protected_receiver_fixture(&mut ctx);
+        // Deliberately NOT given a superclass: `superclass_of` answers None at
+        // the very first step and the class is not `java/lang/Object`.
+        let standin = ctx
+            .ensure_class_initialized("cratonvm/synthetic/FabricatedStandIn")
+            .expect("stand-in class");
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(protected_read_with_receiver(
+            &mut ctx,
+            declaring,
+            Some(standin)
+        ));
+    }
+
+    /// The refinement is confined to `protected`. A package-private field read
+    /// by a same-runtime-package caller stays allowed through a receiver that
+    /// is not under the caller at all - HotSpot rows N1/N2 (public) and Q3
+    /// (package-private, same package) all answer OK.
+    #[test]
+    fn protected_receiver_refinement_does_not_apply_to_a_package_private_field() {
+        let mut ctx = mock_ctx();
+        let object = ctx
+            .ensure_class_initialized("java/lang/Object")
+            .expect("Object");
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/PkgPeer")
+            .expect("caller class");
+        let unrelated = ctx
+            .ensure_class_initialized("cratonvm/test/Unrelated")
+            .expect("unrelated class");
+        ctx.set_superclass(declaring, object);
+        ctx.set_superclass(caller, object);
+        ctx.set_superclass(unrelated, object);
+        ctx.set_frame_class_ids(vec![caller]);
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            Some(unrelated),
+            "Field.get(pkgValue)"
+        )
+        .is_ok());
+    }
+
+    /// A null receiver on an INSTANCE field is a NullPointerException and it
+    /// outranks every access refusal - HotSpot evaluates `obj.getClass()` while
+    /// building `checkAccess`'s argument list. `String.hash.get(null)` from a
+    /// foreign caller answers NullPointerException on Temurin 25.0.3 even
+    /// though the field is denied on three separate grounds.
+    #[test]
+    fn null_receiver_on_an_instance_field_outranks_the_access_refusal() {
+        use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
+        let err = null_receiver_on_instance_field(false, None, "Field.get")
+            .expect_err("a null receiver on an instance field must fail");
+        assert!(matches!(
+            err,
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { .. }
+            ))
+        ));
+        // ...and a STATIC field has no receiver to be null.
+        assert!(null_receiver_on_instance_field(true, None, "Field.get").is_ok());
     }
 
     /// Fail CLOSED when there is no resolvable Java caller frame: the
@@ -21568,6 +22454,7 @@ mod tests {
             0x0002,
             false,
             declaring,
+            None,
             "Field.get(privateValue)"
         )
         .is_err());
@@ -21592,6 +22479,7 @@ mod tests {
             0x0002, // private
             false,
             declaring,
+            None,
             "Field.get(privateValue)"
         )
         .is_err());

@@ -1529,9 +1529,7 @@ fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
     // layout — a real Lookup declares `prevLookupClass`, a fabricated stub
     // names its fields `_f0..`. `cachedProtectionDomain` must stay null: it is
     // a lazy cache `lookupClassProtectionDomain()` fills on first use.
-    let synthetic_layout = ctx
-        .resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "prevLookupClass")
-        .is_none();
+    let synthetic_layout = lk_real_prev_lookup_class_slot(ctx, obj).is_none();
     if synthetic_layout {
         ctx.set_field(obj, LK_PREVIOUS_LOOKUP_CLASS, Value::Object(None));
         ctx.set_field(obj, LK_LOOKUP_MODE, Value::Int(modes));
@@ -1543,26 +1541,194 @@ fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
     obj
 }
 
-/// Write `allowedModes` by name (real layout), falling back to the synthetic
-/// slot if the named field cannot be resolved.
-fn lk_set_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i32) {
-    ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
-    let landed = matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == modes);
-    if !landed {
-        ctx.set_field(obj, LK_ALLOWED_MODES, Value::Int(modes));
-    }
+/// The slot of the DECLARED `allowedModes` field, or `None` when the receiver
+/// does not have the real `java.lang.invoke.MethodHandles$Lookup` layout.
+///
+/// The witness is CLASS-side on purpose, and the reason is stronger than the
+/// one this note used to give. It claimed a by-name read of an ABSENT field
+/// answers `Int(0)`. **It does not.** `vm/src/vm/vm_exec.rs`'s
+/// `get_field_by_name` resolves the name in the hierarchy and, on a miss,
+/// returns `Value::Object(None)` — the trait even documents that
+/// (`native-api/src/registry.rs`: "Returns `Value::Object(None)` if the field
+/// is not found"). `Int(0)` is what `test_utils::MockNativeContext` answers,
+/// and what a PRESENT but never-written `int` slot decodes as. So the value
+/// alone cannot separate any of three states: absent, present-and-null, and
+/// present-and-zero.
+///
+/// That makes the class-side witness the only thing that answers the question
+/// at all, not a hardening of a working test. A fabricated Lookup stub names
+/// its fields `_f0.._f3` (`ensure_synthetic_class`), so `allowedModes` IS
+/// absent there, and the old "by name first, synthetic slot second" reader
+/// returned 0 for every synthetic Lookup and never reached the slot that
+/// actually holds the modes: `lookupModes()` answered 0 and
+/// `enforce_lookup_access` saw a powerless Lookup for the whole of
+/// synthetic-JDK mode.
+///
+/// Asking the CLASS is also descriptor-safe: `resolve_field_index_by_class_id`
+/// resolves the declared `int allowedModes` on `MethodHandles$Lookup`, not
+/// some same-named field of another type further down a hierarchy.
+fn lk_real_allowed_modes_slot(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "allowedModes")
 }
 
-/// Read a Lookup's `allowedModes`, by name first (real layout), then the
-/// synthetic slot.
+/// The slot of the DECLARED `prevLookupClass` field, or `None` when the
+/// receiver does not have the real `MethodHandles$Lookup` layout.
+///
+/// The `prevLookupClass` half of [`lk_real_allowed_modes_slot`] — see that
+/// function for why the witness must be class-side rather than a value-shape
+/// test. `Some` from this one and `Some` from that one are the SAME layout
+/// verdict, which is what lets `alloc_lookup`, `lk_set_modes`, `lk_modes_of`
+/// and `lk_previous_lookup_class` agree about which object they are holding.
+fn lk_real_prev_lookup_class_slot(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "prevLookupClass")
+}
+
+/// Write `allowedModes`: the declared slot on a real Lookup, the synthetic
+/// slot on a fabricated one.
+///
+/// The two arms are mutually exclusive by construction. That is load-bearing:
+/// on the real layout `LK_ALLOWED_MODES` (slot 1) is `prevLookupClass`, a
+/// REFERENCE the GC scans as an oop, so an `Int` written there is heap
+/// corruption rather than merely a wrong answer — the same shape as the W6-3
+/// `cachedProtectionDomain` finding repaired in `alloc_lookup` above.
+fn lk_set_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i32) {
+    if let Some(slot) = lk_real_allowed_modes_slot(ctx, obj) {
+        ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
+        if !matches!(ctx.get_field(obj, slot), Value::Int(m) if m == modes) {
+            // Named write did not land; go through the resolved index. Never
+            // through `LK_ALLOWED_MODES` — see the note above.
+            ctx.set_field(obj, slot, Value::Int(modes));
+        }
+        return;
+    }
+    ctx.set_field(obj, LK_ALLOWED_MODES, Value::Int(modes));
+}
+
+/// Read a Lookup's `allowedModes` from whichever layout the receiver has.
 fn lk_modes_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
-    if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
-        return m;
+    if let Some(slot) = lk_real_allowed_modes_slot(ctx, this) {
+        if let Value::Int(m) = ctx.get_field(this, slot) {
+            return m;
+        }
+        if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
+            return m;
+        }
+        return 0;
     }
     if let Value::Int(m) = ctx.get_field(this, LK_ALLOWED_MODES) {
         return m;
     }
     0
+}
+
+/// The JDK's `FULL_POWER_MODES` == `PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE`
+/// == 0x1F.
+///
+/// NOT the same thing as [`LK_FULL_POWER`] (0x5F), which is this module's name
+/// for the modes of `MethodHandles.lookup()` — that value additionally carries
+/// `ORIGINAL`. `Lookup.in` and `Lookup.dropLookupMode` both mask against the
+/// JDK's 0x1F, so the two must not be confused.
+const LK_FULL_POWER_MODES: i32 =
+    LK_PUBLIC | LK_PRIVATE | LK_PROTECTED | LK_PACKAGE | LK_MODULE;
+
+/// `Lookup.in(requestedLookupClass)` mode arithmetic, JDK 25.
+///
+/// Measured (`java p.LkProbe` / `p.LkProbe2`, OpenJDK 25.0.3; receiver is
+/// `MethodHandles.lookup()` in `p.LkProbe2`, whose `lookupModes()` is 95):
+///
+/// | target                                        | modes |
+/// |-----------------------------------------------|-------|
+/// | `in(LkProbe2.class)` — the lookup class itself | 95    |
+/// | `in(LkProbe2.Nested.class)` — a NESTMATE       | 31    |
+/// | `in(p.Mate.class)` — same package, other file  | **25**|
+/// | `in(String.class)` — other module              | 1     |
+/// | receiver 32 (`publicLookup()`), any target     | 32    |
+/// | receiver 25, same package / nestmate           | 25    |
+/// | receiver 25, other module                      | 1     |
+/// | receiver 1 or 0, any target                    | 1 / 0 |
+///
+/// **The same-package row is 25, not 31.** `Lookup.in` applies FOUR
+/// reductions, not two, and the third is the one a package-name comparison
+/// alone cannot see (`VerifyAccess.isSamePackageMember` — same outermost
+/// enclosing class, i.e. a nestmate):
+///
+/// ```text
+///   if allowedModes == UNCONDITIONAL      -> unchanged (publicLookup stays 32)
+///   if target == lookupClass              -> `this` (ORIGINAL kept)
+///   newModes = prev & FULL_POWER_MODES                     // drops ORIGINAL
+///   if !sameModule    newModes &= ~(MODULE|PACKAGE|PRIVATE|PROTECTED)
+///   if !samePackage   newModes &= ~(PACKAGE|PRIVATE|PROTECTED)
+///   if !sameNest      newModes &= ~(PRIVATE|PROTECTED)
+/// ```
+///
+/// 95 -> 31 (mask) -> same package so PACKAGE survives -> not a nestmate, so
+/// PRIVATE|PROTECTED go -> 31 & !6 == 25. Returning 31 there handed a
+/// package-mate lookup PRIVATE access the real JDK does not grant, which is
+/// the direction that turns a `find*` that SHOULD raise
+/// `IllegalAccessException` into a silent success.
+///
+/// CratonVM does not model modules, so `!sameModule` and `!samePackage`
+/// collapse into one test; both strip down to `PUBLIC` from 95, which is the
+/// measured cross-module answer.
+/// `pub(crate)` so `lang_invoke`'s competing `Lookup.in` registration (which
+/// WINS in real-JDK mode — see the note in `register_classloader_natives`) can
+/// adopt this arithmetic instead of keeping a second, differently-wrong copy.
+pub(crate) fn lk_in_modes(prev: i32, same_class: bool, same_package: bool, same_nest: bool) -> i32 {
+    // `publicLookup()` is UNCONDITIONAL-only (32) and `in()` leaves it alone —
+    // measured for a same-package, a cross-module and an `Object.class` target.
+    // The FULL_POWER_MODES mask below would answer 0 for it.
+    if prev == LK_UNCONDITIONAL {
+        return prev;
+    }
+    if same_class {
+        // `in(lookupClass())` returns `this` in the JDK, ORIGINAL included.
+        return prev;
+    }
+    let mut modes = prev & LK_FULL_POWER_MODES;
+    if !same_package {
+        modes &= !(LK_PACKAGE | LK_PRIVATE | LK_PROTECTED | LK_MODULE);
+    }
+    if !same_nest {
+        // `isSamePackageMember`: a same-package class that is not a member of
+        // the same top-level class is still "a cousin", and loses PRIVATE
+        // (and PROTECTED with it).
+        modes &= !(LK_PRIVATE | LK_PROTECTED);
+    }
+    modes
+}
+
+/// `Lookup.dropLookupMode(int)` mode arithmetic, JDK 25. `None` means the
+/// argument is not a droppable mode and the JDK throws
+/// `IllegalArgumentException`.
+///
+/// Measured (`java LkProbe`, OpenJDK 25.0.3, `old == 95`), against the naive
+/// `old & !drop` the previous implementation used:
+///
+/// | drop           | real | `old & !drop` |
+/// |----------------|------|---------------|
+/// | PUBLIC         | 0    | 94            |
+/// | PRIVATE        | 25   | 93            |
+/// | PROTECTED      | 27   | 91            |
+/// | PACKAGE        | 17   | 87            |
+/// | MODULE         | 1    | 79            |
+/// | UNCONDITIONAL  | 27   | 95            |
+/// | ORIGINAL       | 27   | 31            |
+///
+/// The naive form is wrong for all SEVEN, not just for the ones the old
+/// wrong-slot read reached: `dropLookupMode` also drops `PROTECTED` and
+/// `ORIGINAL` unconditionally, then cascades per the dropped mode. Also
+/// measured: `dropLookupMode(0)` and `dropLookupMode(PRIVATE|PROTECTED)` both
+/// throw `IllegalArgumentException: <n> is not a valid mode to drop`.
+fn lk_drop_modes(old: i32, drop: i32) -> Option<i32> {
+    let mut modes = old & !(drop | LK_PROTECTED | LK_ORIGINAL);
+    match drop {
+        LK_PUBLIC => modes = 0,
+        LK_MODULE => modes &= !(LK_PACKAGE | LK_PRIVATE | LK_PROTECTED),
+        LK_PACKAGE => modes &= !(LK_PRIVATE | LK_PROTECTED),
+        LK_PROTECTED | LK_PRIVATE | LK_ORIGINAL | LK_UNCONDITIONAL => {}
+        _ => return None,
+    }
+    Some(modes)
 }
 
 // ---------------------------------------------------------------------------
@@ -3616,6 +3782,120 @@ pub(crate) fn read_byte_array_slice(
     }
 }
 
+/// `java.net.URL.toString()` for a URL we must not (or cannot) call bytecode
+/// on — the CodeSource-location readers below and in `lookup_define` run on
+/// the class-definition path, where `invoke_virtual("toExternalForm")` is not
+/// available.
+///
+/// Measured (`java UrlProbe`, OpenJDK 25.0.3). `URLStreamHandler.toExternalForm`
+/// is `protocol + ":" + ["//" + authority] + file + ["#" + ref]`, where `file`
+/// is already `path + "?" + query`:
+///
+/// | spec                                   | toString                               | `protocol:file` alone |
+/// |----------------------------------------|----------------------------------------|-----------------------|
+/// | `file:/C:/repo/lib/foo.jar`            | `file:/C:/repo/lib/foo.jar`            | same                  |
+/// | `file:///C:/repo/lib/foo.jar`          | `file:/C:/repo/lib/foo.jar`            | same                  |
+/// | `jar:file:/C:/repo/lib/foo.jar!/`      | `jar:file:/C:/repo/lib/foo.jar!/`      | same                  |
+/// | `jar:file:/o/lib/bar.jar!/com/x/Y.class`| `jar:file:/o/lib/bar.jar!/com/x/Y.class`| same                 |
+/// | `file://server/share/x.jar`            | `file://server/share/x.jar`            | `file:/share/x.jar`   |
+/// | `http://example.com:8080/a/b?q=1#frag` | `http://example.com:8080/a/b?q=1#frag` | `http:/a/b?q=1`       |
+/// | `https://user@host/p`                  | `https://user@host/p`                  | `https:/p`            |
+///
+/// So `protocol + ":" + file` — what this module used to inline — is right for
+/// exactly the classpath shapes and wrong for everything with an authority or
+/// a fragment. The `authority` field, not `host`, is the one that round-trips:
+/// `https://user@host/p` has `host == "host"` but `authority == "user@host"`.
+///
+/// Layout: real `java.net.URL` declares `protocol`(0) `host`(1) `port`(2)
+/// `file`(3) `query`(4) `authority`(5) `path`(6) `userInfo`(7) `ref`(8)
+/// (`javap -p java.net.URL`, JDK 25), and this crate's 13-slot synthetic URL
+/// mirrors those indices — hence the by-name-then-slot reads. The LEGACY
+/// 6-slot synthetic instead cached the whole spec in slots 0 and 5; a
+/// protocol that reads back containing `':'` is that shape, and is returned
+/// verbatim rather than being re-prefixed.
+pub(crate) fn url_to_external_form(ctx: &dyn NativeContext, url: ObjectRef) -> Option<String> {
+    // The location may already be a String rather than a URL.
+    if let Some(s) = ctx.read_string(url) {
+        return Some(s);
+    }
+    let read = |name: &str, slot: usize| -> Option<String> {
+        match ctx.get_field_by_name(url, name) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            // A failed by-name read is never proof the field is null, so the
+            // numeric fallback has to be tried regardless. This comment used
+            // to say the reason was that an ABSENT field answers `Int(0)`;
+            // that is the `MockNativeContext` behaviour, not production's.
+            // Production (`vm_exec.rs::get_field_by_name`, and the trait
+            // contract in `native-api/src/registry.rs`) answers
+            // `Value::Object(None)` for a field it cannot resolve — which is
+            // BYTE-FOR-BYTE the same answer as a present reference field that
+            // happens to be null. The correct rationale is therefore the
+            // stronger one: "by-name miss" and "field is genuinely null" are
+            // indistinguishable from the value, so no `Object(None)` result
+            // may be read as a layout verdict.
+            _ => match ctx.get_field(url, slot) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            },
+        }
+    };
+    // NOT `?`: a legacy 6-slot URL leaves slot 0 null and caches the whole
+    // spec in slot 5 only, so "no protocol" is a shape to handle, not a
+    // failure. (`jboss_module_loader`'s `classpath:/…` resource URLs are
+    // exactly that shape.)
+    let protocol = read("protocol", 0).unwrap_or_default();
+    if protocol.contains(':') {
+        // Legacy 6-slot synthetic URL with the full spec cached in slot 0.
+        return Some(protocol);
+    }
+    if protocol.is_empty() {
+        // Legacy 6-slot synthetic URL with the full spec cached in slot 5.
+        return match ctx.get_field(url, 5) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        };
+    }
+    let mut out = String::with_capacity(protocol.len() + 32);
+    out.push_str(&protocol);
+    out.push(':');
+    // `authority` is only at slot 5 on the real/13-slot layouts; the legacy
+    // shape was already returned above, so the numeric read is safe here.
+    match read("authority", 5) {
+        Some(auth) if !auth.is_empty() => {
+            out.push_str("//");
+            out.push_str(&auth);
+        }
+        _ => {
+            // No `authority` field (older synthetic): rebuild it from
+            // host[:port], the way `net_uri_inet::url_external_form` does.
+            let host = read("host", 1).unwrap_or_default();
+            if !host.is_empty() {
+                out.push_str("//");
+                out.push_str(&host);
+                let port = match ctx.get_field_by_name(url, "port") {
+                    Value::Int(p) => p,
+                    _ => match ctx.get_field(url, 2) {
+                        Value::Int(p) => p,
+                        _ => -1,
+                    },
+                };
+                if port >= 0 {
+                    out.push(':');
+                    out.push_str(&port.to_string());
+                }
+            }
+        }
+    }
+    if let Some(file) = read("file", 3) {
+        out.push_str(&file);
+    }
+    if let Some(r) = read("ref", 8) {
+        out.push('#');
+        out.push_str(&r);
+    }
+    Some(out)
+}
+
 /// Decode an optional `ProtectionDomain` arg into a `code_source_url`
 /// string suitable for `DefineClassFull::code_source_url`.
 ///
@@ -3631,15 +3911,14 @@ pub(crate) fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef)
             return Some(s);
         }
         if let Value::Object(Some(loc)) = ctx.get_field(cs, CS_LOCATION_REF) {
-            if let Some(s) = ctx.read_string(loc) {
+            // W7-7 had to gate a raw slot-5 read here on a class-side
+            // `authority` witness, because slot 5 is the full-spec cache on the
+            // legacy synthetic URL and the `authority` FIELD on a real one —
+            // and `read_string` succeeds on both. `url_to_external_form` makes
+            // that distinction once, for every caller, and additionally returns
+            // the real URL's full external form instead of nothing.
+            if let Some(s) = url_to_external_form(ctx, loc) {
                 return Some(s);
-            }
-            // The URL synthetic stores the full string at field 5
-            // (matches alloc done elsewhere in this module).
-            if let Value::Object(Some(full)) = ctx.get_field(loc, 5) {
-                if let Some(s) = ctx.read_string(full) {
-                    return Some(s);
-                }
             }
         }
     }
@@ -3654,153 +3933,30 @@ pub(crate) fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef)
             // `new CodeSource(url, signers)`, the path
             // `ModifiedClassPathClassLoader`/`@ClassPathOverrides` uses to
             // load an overridden jar's classes — see
-            // `NoSuchMethodFailureAnalyzerTests`). Reconstruct the URL
-            // string from its own real fields the same way HotSpot's
-            // `URL.toString()` does (`protocol + ":" + file`) instead.
-            if let Some(s) = ctx.read_string(loc) {
+            // `NoSuchMethodFailureAnalyzerTests`). Reconstruct the URL string
+            // from its own real fields. This used to inline
+            // `protocol + ":" + file`, which is `toString()` only while the
+            // authority and ref are both absent — see `url_to_external_form`
+            // for the measured table and the two shapes it got wrong.
+            if let Some(s) = url_to_external_form(ctx, loc) {
                 return Some(s);
-            }
-            if let (Value::Object(Some(proto)), Value::Object(Some(file))) = (
-                ctx.get_field_by_name(loc, "protocol"),
-                ctx.get_field_by_name(loc, "file"),
-            ) {
-                if let (Some(proto), Some(file)) = (ctx.read_string(proto), ctx.read_string(file)) {
-                    return Some(format!("{proto}:{file}"));
-                }
             }
         }
     }
     None
 }
 
-/// Decode the bytes for a `defineClass2`-style `ByteBuffer` argument.
-///
-/// Handles both heap and direct buffers:
-///   * Heap buffer  — slot `BUF_FIELD_ARRAY` (= 0) holds a `byte[]`
-///     and slot `BUF_FIELD_POS` (= 1) is the start position. We use
-///     the supplied `off` parameter (added to position) and `len`.
-///   * Direct buffer — slot 0 is a `Long` (native address). Real
-///     direct memory is allocated outside the GC heap and the JDK
-///     would memcpy from the address. We don't pin native memory in
-///     this VM, so we fall back to scanning slot 0 for a heap-array
-///     stand-in (some synthetic direct-buffer constructors elsewhere
-///     in this codebase store the backing array there to ease
-///     interop).
-///
-/// Returns `Err(message)` if the buffer can't be decoded into a
-/// readable byte slice; the caller surfaces that as a
-/// `ClassFormatError`.
-fn read_byte_buffer_slice(
-    ctx: &dyn NativeContext,
-    bb: ObjectRef,
-    off: usize,
-    len: usize,
-) -> Result<Vec<u8>, String> {
-    // ByteBuffer synthetic layout: slot 0 = array (heap) OR long address
-    // (direct). The charset module's BUF_FIELD_* constants apply.
-    let array_slot: usize = 0; // BUF_FIELD_ARRAY
-    let pos_slot: usize = 1; // BUF_FIELD_POS
-    let limit_slot: usize = 2; // BUF_FIELD_LIMIT
-    let capacity_slot: usize = 3; // BUF_FIELD_CAPACITY
-
-    // Heap-buffer case.
-    if let Value::Object(Some(array)) = ctx.get_field(bb, array_slot) {
-        let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
-        let limit = ctx
-            .get_field(bb, limit_slot)
-            .as_int()
-            .unwrap_or_else(|| ctx.array_length(array) as i32)
-            .max(0) as usize;
-        let cap = ctx.array_length(array);
-        let absolute_off = pos.saturating_add(off);
-        if absolute_off > cap || absolute_off > limit {
-            return Err(format!(
-                "ByteBuffer offset+pos ({absolute_off}) exceeds capacity ({cap}) or limit ({limit})"
-            ));
-        }
-        // The caller passes (off, len) in buffer-relative coords; honor
-        // the buffer's `limit` as an upper bound for safety.
-        let max_len = (limit - absolute_off).min(cap - absolute_off);
-        let actual_len = len.min(max_len);
-        // Defensive: wrap the copy loop in `catch_unwind` so a panic
-        // inside `get_array_element` returns Err instead of SIGABRT.
-        let ctx_ref: &dyn NativeContext = ctx;
-        let copy_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut out = Vec::with_capacity(actual_len);
-            for i in 0..actual_len {
-                match ctx_ref.get_array_element(array, absolute_off + i) {
-                    Value::Int(b) => out.push((b & 0xFF) as u8),
-                    _ => out.push(0),
-                }
-            }
-            out
-        }));
-        return match copy_result {
-            Ok(out) => Ok(out),
-            Err(_) => {
-                tracing::error!(
-                    "[define_class] panic while reading ByteBuffer \
-                     (abs_off={absolute_off}, len={actual_len}, cap={cap}) — aborting"
-                );
-                Err("panic while reading ByteBuffer".to_string())
-            }
-        };
-    }
-
-    // Direct-buffer case: a `java.nio.DirectByteBuffer` keeps its native
-    // base in the `Buffer.address` long (the synthetic slot-0 array is
-    // absent). Read the address + capacity and memcpy the bytes through
-    // the context so an `Unsafe.allocateMemory` arena handle is routed to
-    // the off-heap store rather than dereferenced raw (a raw memcpy from a
-    // synthetic handle SIGSEGVs); a real pointer falls through to a raw
-    // copy. This lets `Lookup.defineClass`/`defineClass2` accept direct
-    // buffers, matching the heap path above. (cf. async_socket.rs /
-    // nio_native.rs which use the same address + copy_from_native_memory
-    // pattern.)
-    let addr = match ctx.get_field_by_name(bb, "address") {
-        Value::Long(a) => a,
-        _ => 0,
-    };
-    // Honor the buffer's position/limit window, then add the caller's
-    // (off, len) which are buffer-relative coordinates.
-    let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
-    let cap = ctx
-        .get_field(bb, capacity_slot)
-        .as_int()
-        .unwrap_or(0)
-        .max(0) as usize;
-    let limit = ctx
-        .get_field(bb, limit_slot)
-        .as_int()
-        .unwrap_or(cap as i32)
-        .max(0) as usize;
-    if cap == 0 {
-        return Err("direct ByteBuffer is empty".to_string());
-    }
-    if addr == 0 {
-        return Err(format!(
-            "direct ByteBuffer with capacity {cap} has no native address"
-        ));
-    }
-    let absolute_off = pos.saturating_add(off);
-    let upper = limit.min(cap);
-    if absolute_off > upper {
-        return Err(format!(
-            "direct ByteBuffer offset+pos ({absolute_off}) exceeds limit ({limit}) or capacity ({cap})"
-        ));
-    }
-    let actual_len = len.min(upper - absolute_off);
-    let mut out = vec![0u8; actual_len];
-    if actual_len > 0 {
-        let src = addr.wrapping_add(absolute_off as i64);
-        if !ctx.copy_from_native_memory(src, &mut out) {
-            return Err(format!(
-                "direct ByteBuffer copy failed (addr={src:#x}, len={actual_len})"
-            ));
-        }
-    }
-    Ok(out)
-}
+// W7-13: `read_byte_buffer_slice` lived here — a SECOND `defineClass2`
+// ByteBuffer decoder, and the one that actually ran, because this module's
+// `defineClass2` registration shadows `lang_system`'s in synthetic-JDK mode.
+// It hardcoded slot 0 as the backing `byte[]` (on a real `HeapByteBuffer`
+// slot 0 is `Buffer.mark`, an int, so every real heap buffer fell through to
+// the direct arm and died on "no native address") and it CLAMPED an
+// out-of-range `(off, len)` with `min`/`saturating_add` instead of rejecting
+// it. Both defects were already fixed in
+// `lang_system::read_byte_buffer_define_class_slice`; the fix was inert
+// wherever the shadow won. `cl_define_class2` now calls that decoder, so
+// there is exactly one.
 
 /// Bind the loader-id used to register the new class. We look up the
 /// loader's recorded namespace id if it has one (lazily allocating a fresh
@@ -4007,7 +4163,7 @@ fn cl_define_class1(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 ///     ClassLoader loader, String name, ByteBuffer bb, int off,
 ///     int len, ProtectionDomain pd, String source);`
 fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use cratonvm_types::error::{LinkageError, RuntimeError};
+    use cratonvm_types::error::RuntimeError;
 
     let loader = args.first().copied().unwrap_or(Value::Object(None));
     let name = read_optional_internal_name(ctx, args, 1);
@@ -4032,12 +4188,12 @@ fn cl_define_class2(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             return Err(RuntimeError::aioobe_index_only(-1).into());
         }
     };
-    let bytes = read_byte_buffer_slice(ctx, bb, off, len).map_err(|msg| {
-        cratonvm_types::error::MethodCallFailed::from(LinkageError::ClassFormatError {
-            class_name: name.clone(),
-            message: format!("defineClass2: {msg}"),
-        })
-    })?;
+    // Decoded by `lang_system::read_byte_buffer_define_class_slice` — the SAME
+    // decoder this crate's other `defineClass2` registration uses. See the
+    // comment on that function: this entry point shadows that registration in
+    // synthetic-JDK mode, so a private copy here meant the bounds hardening was
+    // silently inert wherever the shadow won.
+    let bytes = crate::lang_system::read_byte_buffer_define_class_slice(ctx, bb, off, len, &name)?;
 
     // cglib SEGV guard.
     if let Some(v) = cglib_guard_value(ctx, &name, &bytes) {
@@ -6314,6 +6470,58 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
 /// the named `path` ArrayList instead, because raw slot zero aliases that field.
 const UCP_STASHED_URLS: usize = 0;
 
+/// True when `ucp` carries CratonVM's SYNTHETIC `URLClassPath` layout — i.e.
+/// [`UCP_STASHED_URLS`] (slot 0) really is our stash array.
+///
+/// Real `jdk.internal.loader.URLClassPath` declares `path`(0) — an
+/// `ArrayList<URL>`, NOT an array. `array_length` of a non-array answers 0
+/// (`vm_exec.rs` guards the kind), so the unguarded slot-0 read did not crash;
+/// it silently reported "this loader owns no URLs", which is a wrong answer of
+/// exactly the kind a URL-visibility fix is trying to avoid. Reachable
+/// whenever `record_url_on_path` has created the list and `ucp_path_urls` has
+/// still declined it — an empty `path`.
+///
+/// Class-side for the same reason [`cl_has_synthetic_layout`] is: a value-shape
+/// test cannot do this job, because `get_field_by_name` answers
+/// `Value::Object(None)` both for a name it cannot resolve and for a real
+/// reference field that is null (`vm/src/vm/vm_exec.rs`, and the trait contract
+/// in `native-api/src/registry.rs`). `URLClassPath` is not a `ClassLoader`, so
+/// it needs its own witness rather than `cl_has_synthetic_layout`'s three.
+fn ucp_synthetic_layout(ctx: &dyn NativeContext, ucp: ObjectRef) -> bool {
+    ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(ucp), "path")
+        .is_none()
+}
+
+/// Is the value stashed at [`UCP_STASHED_URLS`] genuinely a reference ARRAY?
+///
+/// This is the question `ucl_get_urls`'s stash fallback actually needs, and it
+/// is NOT the same as "does this `ucp` have a synthetic layout". Gating the
+/// stash on [`ucp_synthetic_layout`] looked right but broke a load-bearing
+/// real-JDK path: [`record_ucl_urls`] deliberately stashes a real-mode
+/// `URLClassLoader`'s constructor `URL[]` on its `ucp` PLACEHOLDER precisely
+/// because the loader itself has the real field layout — see that function's
+/// doc comment, and the Tomcat `StandardJarScanner` TLD regression it names.
+/// A real-layout `ucp` with a real stash is therefore an expected shape, not a
+/// contradiction, and the synthetic-layout gate refused it.
+///
+/// Asking about the stashed value answers the actual safety concern directly:
+/// on a REAL `jdk.internal.loader.URLClassPath`, slot 0 is `path`, an
+/// `ArrayList`, and `ObjectHeader::array_length` answers **0** for any
+/// non-array — so a real `path` contributes nothing and is never indexed.
+///
+/// A length test rather than a class-name test, deliberately. Array objects do
+/// not carry a nameable class in every context (`MockNativeContext` assigns
+/// them `ClassId::new(0)`, whose name is `None`), so a `starts_with('[')`
+/// witness silently answers "not an array" for genuine arrays. The length is
+/// the one property both the real heap and the mock agree on.
+///
+/// An EMPTY stash answers `false` here, and that is correct rather than merely
+/// tolerable: reading a zero-length array would contribute no URLs anyway, so
+/// both arms produce the same result.
+fn ucp_stash_is_reference_array(ctx: &dyn NativeContext, stashed: ObjectRef) -> bool {
+    ctx.array_length(stashed) > 0
+}
+
 /// Record a real-JDK-mode `URLClassLoader`'s constructor `URL[]` so that
 /// `getURLs()` returns the URLs the loader was built with.
 ///
@@ -6794,15 +7002,19 @@ fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> V
 
     // Synthetic-JDK URLClassLoader instances store constructor URLs directly on
     // the loader. Real-JDK instances stash the original URL[] on the shimmed ucp
-    // placeholder (see `record_ucl_urls`).
-    if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
-        let count = match ctx.get_field(loader, UCL_URL_COUNT) {
-            Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
-            _ => 0,
-        };
-        for i in 0..count {
-            if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
-                append_url(url);
+    // placeholder (see `record_ucl_urls`). The slot reads are gated because on
+    // the real layout slot 4 is `parallelLockMap` and slot 2 is
+    // `unnamedModule` — see `ucl_get_urls` for the full layout.
+    if cl_has_synthetic_layout(ctx, loader) {
+        if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
+            let count = match ctx.get_field(loader, UCL_URL_COUNT) {
+                Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
+                _ => 0,
+            };
+            for i in 0..count {
+                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                    append_url(url);
+                }
             }
         }
     }
@@ -6828,10 +7040,19 @@ fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> V
                 }
             }
         }
+        // Only when slot 0 really holds a URL ARRAY. On a real `URLClassPath`
+        // slot 0 is `path`, an ArrayList, and `array_length` of that is not a
+        // URL count. Ask about the STASHED VALUE rather than the `ucp`'s
+        // layout: `record_ucl_urls` stashes here precisely for REAL-layout
+        // loaders (see its doc comment and the Tomcat StandardJarScanner
+        // regression it names), so a real `ucp` carrying a real stash is an
+        // expected shape and a synthetic-layout gate wrongly refuses it.
         if let Value::Object(Some(urls)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
-            for i in 0..ctx.array_length(urls) {
-                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
-                    append_url(url);
+            if ucp_stash_is_reference_array(ctx, urls) {
+                for i in 0..ctx.array_length(urls) {
+                    if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                        append_url(url);
+                    }
                 }
             }
         }
@@ -6847,26 +7068,32 @@ fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> V
 fn loader_constructor_http_bases(ctx: &dyn NativeContext, loader: ObjectRef) -> Vec<String> {
     let mut out = Vec::new();
 
-    if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
-        let count = match ctx.get_field(loader, UCL_URL_COUNT) {
-            Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
-            _ => 0,
-        };
-        for i in 0..count {
-            if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
-                if let Some(base) = http_base_from_url(ctx, url) {
-                    out.push(base);
+    // Both raw-slot families are gated on the layout that gives them their
+    // meaning — see `cl_has_synthetic_layout` / `ucp_synthetic_layout`.
+    if cl_has_synthetic_layout(ctx, loader) {
+        if let Value::Object(Some(urls)) = ctx.get_field(loader, UCL_URLS_ARRAY) {
+            let count = match ctx.get_field(loader, UCL_URL_COUNT) {
+                Value::Int(n) if n > 0 => (n as usize).min(ctx.array_length(urls)),
+                _ => 0,
+            };
+            for i in 0..count {
+                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                    if let Some(base) = http_base_from_url(ctx, url) {
+                        out.push(base);
+                    }
                 }
             }
         }
     }
 
     if let Value::Object(Some(ucp)) = ctx.get_field_by_name(loader, "ucp") {
-        if let Value::Object(Some(urls)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
-            for i in 0..ctx.array_length(urls) {
-                if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
-                    if let Some(base) = http_base_from_url(ctx, url) {
-                        out.push(base);
+        if ucp_synthetic_layout(ctx, ucp) {
+            if let Value::Object(Some(urls)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
+                for i in 0..ctx.array_length(urls) {
+                    if let Value::Object(Some(url)) = ctx.get_array_element(urls, i) {
+                        if let Some(base) = http_base_from_url(ctx, url) {
+                            out.push(base);
+                        }
                     }
                 }
             }
@@ -6976,10 +7203,17 @@ fn loader_has_recorded_url_set(ctx: &mut dyn NativeContext, loader: ObjectRef) -
     if !is_url_loader {
         return false;
     }
-    matches!(
-        ctx.get_field(loader, UCL_URLS_ARRAY),
-        Value::Object(Some(_))
-    ) || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
+    // The slot-4 disjunct is the SYNTHETIC signal and only means "URL array"
+    // on the synthetic layout; on a real loader slot 4 is `parallelLockMap`, a
+    // `ConcurrentHashMap` that is never null, so unguarded it answers `true`
+    // for every real receiver without consulting anything about URLs. The
+    // `ucp` disjunct is the real-layout signal and stands on its own.
+    (cl_has_synthetic_layout(ctx, loader)
+        && matches!(
+            ctx.get_field(loader, UCL_URLS_ARRAY),
+            Value::Object(Some(_))
+        ))
+        || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
 }
 
 /// Is a package with class files under `class_glob` (e.g.
@@ -7673,26 +7907,71 @@ pub(crate) fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             return Ok(Some(Value::Object(Some(result))));
         }
     }
+    // Everything below reads the SYNTHETIC slot indices. On a real
+    // `java.net.URLClassLoader` (`javap -p`, superclass fields first:
+    // `java.lang.ClassLoader` declares `parent`(0) `name`(1) `unnamedModule`(2)
+    // `nameAndId`(3) `parallelLockMap`(4) …, then `SecureClassLoader.pdcache`,
+    // then `ucp` and `closeables`) slot 2 is a `Module` and slot 4 a
+    // `ConcurrentHashMap`, where this module means URL-COUNT and URL-ARRAY.
+    //
+    // W7-7 left these raw reads unguarded as benign, and the arithmetic did
+    // hold: slot 2 reads back as a reference, the `Value::Int` arm misses, the
+    // count lands 0, and the slot-4 CHM is never indexed. But "right because
+    // the tag happened not to match" is one layout change away from
+    // `array_length(ConcurrentHashMap)`, and it is not the reason the code is
+    // correct — the layout is. Say so. A real-layout loader's URLs are the
+    // `ucp.path` list read above and nothing else, so the answer here is the
+    // same empty array the count-0 arithmetic already produced.
+    if !cl_has_synthetic_layout(ctx, this) {
+        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+        return Ok(Some(Value::Object(Some(empty))));
+    }
     let count = match ctx.get_field(this, UCL_URL_COUNT) {
         Value::Int(n) => n.max(0) as usize,
         _ => 0,
     };
     // Synthetic-JDK path: URLs live in the per-instance slots (`ucl_setup`/
-    // `ucl_add_url`). Keep the legacy raw-slot fallback for old placeholders.
+    // `ucl_add_url`). Keep the legacy raw-slot fallback for old placeholders —
+    // but only when the `ucp` is itself a fabricated stub, because on a real
+    // `URLClassPath` slot 0 is the `path` ArrayList and `array_length` of an
+    // ArrayList is not a URL count.
     if count == 0 {
         if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
             if let Value::Object(Some(stashed)) = ctx.get_field(ucp, UCP_STASHED_URLS) {
-                let n = ctx.array_length(stashed);
-                let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
-                for i in 0..n {
-                    let url = ctx.get_array_element(stashed, i);
-                    ctx.set_array_element(result, i, url);
+                if ucp_stash_is_reference_array(ctx, stashed) {
+                    let n = ctx.array_length(stashed);
+                    // GC-safety (Family-1 stale ObjectRef): `stashed` is read
+                    // out of the heap, so unlike `this`/`args` it is not rooted
+                    // by the interpreter frame. `new_array` below can trigger a
+                    // moving collection, after which the pre-allocation
+                    // `stashed` would name the old address and the loop would
+                    // copy from a stale object. Pin across the allocation and
+                    // re-read through the pin, exactly as `ucl_add_url` does
+                    // for `urls_arr`/`url_obj`. `n` is a plain length, so it
+                    // survives the move; `result` is freshly allocated and the
+                    // loop below allocates nothing, so neither needs a pin.
+                    let stashed_pin = ctx.pin_native_root(stashed);
+                    let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+                    let stashed = ctx.read_native_pin(stashed_pin, stashed);
+                    ctx.unpin_native_roots(stashed_pin);
+                    for i in 0..n {
+                        let url = ctx.get_array_element(stashed, i);
+                        ctx.set_array_element(result, i, url);
+                    }
+                    return Ok(Some(Value::Object(Some(result))));
                 }
-                return Ok(Some(Value::Object(Some(result))));
             }
         }
     }
-    // Copy stored URLs into a new array of the exact size
+    // Copy stored URLs into a new array of the exact size.
+    //
+    // GC-safety: this block needs no pin, and the ORDER is why. `new_array` is
+    // the only allocation, and `urls_arr` is read out of the heap *after* it,
+    // so there is no pre-allocation ObjectRef left to go stale. The loop
+    // allocates nothing. `this` is an argument, rooted by the interpreter
+    // frame, so it survives the move on its own — the same reason `ucl_add_url`
+    // pins `urls_arr`/`url_obj` but not `this`. Do not reorder the read above
+    // the allocation without adding a pin.
     let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, count);
     if let Value::Object(Some(urls_arr)) = ctx.get_field(this, UCL_URLS_ARRAY) {
         for i in 0..count {
@@ -7810,9 +8089,137 @@ fn lk_lookup(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// `privateLookupIn(targetClass, caller)` — registered here on
+/// `MethodHandles$Lookup`, which is **not the class that declares it**.
+///
+/// Reachability, re-derived rather than inherited. `javap -p
+/// java.lang.invoke.MethodHandles` declares
+/// `public static Lookup privateLookupIn(Class<?>, Lookup)`; `javap -p
+/// java.lang.invoke.MethodHandles$Lookup` does not declare it at all. The
+/// registry keys exactly on `(class, name, descriptor)` and only ever relaxes
+/// the DESCRIPTOR (`find_with_descriptor_quirks`), never the class, and
+/// `MethodHandles$Lookup` is a nested class — not a supertype of
+/// `MethodHandles` — so it never appears on the static-resolution chain for
+/// `MethodHandles.privateLookupIn`. (`synthetic_stub_superclass` puts
+/// `MethodHandles` under `java/lang/Object` in synthetic mode too.) No
+/// bytecode can name this triple and no in-tree caller does, so this
+/// registration is **unreachable** — a stronger verdict than "not force
+/// listed", and one the corrected registration-is-the-gate rule does not
+/// disturb: that rule decides which implementation WINS for a triple, it does
+/// not conjure a triple the language cannot spell.
+///
+/// The live copy is `lang_invoke.rs`'s registration on
+/// `java/lang/invoke/MethodHandles`, whose `pli_enforce` carries the measured
+/// OpenJDK 25.0.3 contract. This body is kept (never removed — standing
+/// constraint) and brought into line with it so that a future registration on
+/// the correct class key, or a force-list entry, cannot silently turn a
+/// full-power grant back on. Two things it was getting wrong independently of
+/// the access question:
+///
+/// * **It granted `LK_FULL_POWER` (0x5F, 95).** Re-measured for this lane on
+///   OpenJDK 25.0.3: `privateLookupIn` answers **31** — `PUBLIC|PRIVATE|
+///   PROTECTED|PACKAGE|MODULE`, i.e. [`LK_FULL_POWER_MODES`]. ORIGINAL is
+///   dropped. Granting 95 hands out a mode bit the JDK never grants here.
+/// * **The `target_class` `ObjectRef` was used after an allocation.**
+///   `alloc_lookup` can run a moving GC, so the ref taken from `args` above it
+///   may be stale by the time it is written into `lookupClass` — the Family-1
+///   defect `lk_ensure_initialized` below already guards against.
+///
+/// The mode gate reproduces `pli_enforce`'s, valve included: refuse only on a
+/// POSITIVELY read, nonzero, weak mode word. `lk_modes_of` answers 0 both for
+/// a genuinely modeless Lookup and for one whose modes it could not read, and
+/// refusing our "cannot tell" 0 would turn every Lookup this VM does not model
+/// into an `IllegalAccessException`. The module `canRead`/`isOpen` gate is
+/// deliberately NOT reproduced, for the reason `pli_enforce` records: CratonVM
+/// has no module graph, so a faithful check would refuse calls the VM's own
+/// machinery makes. Both omissions are one-directional — they can only admit
+/// what HotSpot refuses, never refuse what HotSpot admits.
+///
+/// The two implementations must be collapsed onto `pli_enforce` (one
+/// `pub(crate)` on it) rather than forked again; `lang_invoke.rs` is owned by
+/// another lane. Same standing note as [`lk_in_modes`].
 fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let target_class = args.first().copied().unwrap_or(Value::Object(None));
-    let obj = alloc_lookup(ctx, LK_FULL_POWER);
+    let caller = args.get(1).copied().unwrap_or(Value::Object(None));
+
+    // (1) `caller.allowedModes` is the JDK's FIRST dereference — measured: a
+    //     null caller with a primitive target still raises the caller NPE, not
+    //     the primitive `IllegalArgumentException`.
+    let caller_ref = match caller {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read field \"allowedModes\" because \"caller\" is null".to_string(),
+                ),
+            }
+            .into());
+        }
+    };
+    let modes = lk_modes_of(ctx, caller_ref);
+    // (2) TRUSTED (-1) returns `new Lookup(targetClass)` from the top of the
+    //     JDK method, before any check below.
+    if modes != -1 {
+        // (3) `targetClass.isPrimitive()`.
+        let target_ref = match target_class {
+            Value::Object(Some(o)) => o,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some(
+                        "Cannot invoke \"java.lang.Class.isPrimitive()\" because \"targetClass\" is null"
+                            .to_string(),
+                    ),
+                }
+                .into());
+            }
+        };
+        let target_name = crate::lang_class::mirror_class_name(ctx, target_ref);
+        if matches!(
+            crate::lang_class::native_class_is_primitive(ctx, &[Value::Object(Some(target_ref))]),
+            Ok(Some(Value::Int(1)))
+        ) {
+            // `Class.toString()` of a primitive is bare — "int", "void" — so the
+            // JDK's message has no "class " prefix.
+            let name = target_name.unwrap_or_else(|| "?".to_string());
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("{name} is a primitive class"),
+            }
+            .into());
+        }
+        // (4) `targetClass.isArray()`. Array mirrors are the ones whose name
+        //     starts with '['; `Class.toString()` of an array IS prefixed and
+        //     prints the binary name ("class [I", "class [Lp.Mate;").
+        if let Some(name) = target_name {
+            if name.starts_with('[') {
+                return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("class {} is an array class", name.replace('/', ".")),
+                }
+                .into());
+            }
+        }
+        // (5) the mode gate, with the `modes == 0` valve documented above.
+        if modes != 0 && (modes & (LK_PRIVATE | LK_MODULE)) != (LK_PRIVATE | LK_MODULE) {
+            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: "caller does not have PRIVATE and MODULE lookup mode".to_string(),
+            }
+            .into());
+        }
+    }
+
+    // Root `target_class` across the allocation — `alloc_lookup` can move it.
+    let pinned = match target_class {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let obj = alloc_lookup(ctx, LK_FULL_POWER_MODES);
+    let target_class = match pinned {
+        Some((handle, o)) => {
+            let current = ctx.read_native_pin(handle, o);
+            ctx.unpin_native_roots(handle);
+            Value::Object(Some(current))
+        }
+        None => target_class,
+    };
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, target_class);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -7844,9 +8251,46 @@ fn lk_lookup_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(ctx.get_field(this, LK_LOOKUP_CLASS_REF)))
 }
 
+/// `Lookup.previousLookupClass()` — the lookup class of the Lookup this one
+/// was derived from by a MODULE-CROSSING `in()`, or null.
+///
+/// Measured on OpenJDK 25.0.3: it is null for `MethodHandles.lookup()`,
+/// `publicLookup()`, `dropLookupMode(PRIVATE)`, `in(<the lookup class
+/// itself>)` and `in(<a nestmate>)` — every lookup that never left its
+/// module — and becomes non-null only once `in()` crosses a module boundary
+/// (`lookup().in(String.class)` reports the original lookup class, and its
+/// `toString()` renders as `java.lang.String/PrevLk/public`). CratonVM does
+/// not model modules, and neither `alloc_lookup` nor `lk_in_method` ever
+/// populates the field, so **null is the correct answer for every Lookup this
+/// VM hands out**. What matters here is only that the answer is a REFERENCE.
+///
+/// The slot has to be chosen by layout, not assumed. `LK_PREVIOUS_LOOKUP_CLASS`
+/// is 2, and on the real JDK 25 layout slot 2 is `allowedModes`, an `int`
+/// (`javap -p java.lang.invoke.MethodHandles$Lookup`, instance fields in
+/// declaration order: `lookupClass`(0), `prevLookupClass`(1),
+/// `allowedModes`(2), `cachedProtectionDomain`(3)). Reading it raw therefore
+/// returned an `Int` — the mode word, 95 for a full-power lookup — out of a
+/// native whose descriptor is `()Ljava/lang/Class;`. A caller storing that
+/// into a `Class` local holds a type-confused value, and the reference slot it
+/// lands in is one the GC scans as an oop.
+///
+/// The witness is the same CLASS-side one `lk_real_allowed_modes_slot` uses,
+/// so the two never disagree about which layout the receiver has.
 fn lk_previous_lookup_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, LK_PREVIOUS_LOOKUP_CLASS)))
+    let value = match lk_real_prev_lookup_class_slot(ctx, this) {
+        Some(slot) => ctx.get_field(this, slot),
+        None => ctx.get_field(this, LK_PREVIOUS_LOOKUP_CLASS),
+    };
+    // Whatever the layout turned out to be, a `()Ljava/lang/Class;` native must
+    // not return a primitive. A non-reference here means a layout this VM does
+    // not model, and null is this method's own legal answer for "no previous
+    // lookup class" — the answer the real JDK gives for every non-module-
+    // crossing Lookup, which is all of them here.
+    Ok(Some(match value {
+        Value::Object(_) => value,
+        _ => Value::Object(None),
+    }))
 }
 
 fn lk_lookup_modes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8792,14 +9236,71 @@ fn lk_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     lk_unreflect(ctx, args)
 }
 
+/// Two class mirrors' relationship, for [`lk_in_modes`]: `(same_class,
+/// same_package, same_nest)`.
+///
+/// `same_nest` is the JDK's `VerifyAccess.isSamePackageMember`: same package
+/// AND same outermost enclosing class. The JDK walks `getEnclosingClass()`;
+/// we take the internal name up to the first `$`, which agrees with it for
+/// every nested/inner/anonymous form the compiler emits (`p/Outer$Inner`,
+/// `p/Outer$1`) — the one shape it over-approximates is a top-level class
+/// whose SOURCE name literally contains `$`, which is legal but not a name
+/// anything in this codebase produces.
+///
+/// An unresolvable mirror answers `(false, true, true)` — "a different class,
+/// but do not additionally strip package or private access" — matching
+/// `lang_invoke::lk_same_package`'s permissive default. Guessing "different
+/// package" for a mirror we simply could not name would silently demote a
+/// legitimate lookup to PUBLIC and turn every subsequent non-public
+/// `find*` into a spurious `IllegalAccessException`.
+pub(crate) fn lk_class_relation(
+    ctx: &dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> (bool, bool, bool) {
+    let name_of = |v: Value| match v {
+        Value::Object(Some(m)) => crate::lang_class::mirror_class_name(ctx, m),
+        _ => None,
+    };
+    let (Some(an), Some(bn)) = (name_of(a), name_of(b)) else {
+        return (false, true, true);
+    };
+    if an == bn {
+        return (true, true, true);
+    }
+    let package_of = |n: &str| match n.rfind('/') {
+        Some(i) => n[..i].to_string(),
+        None => String::new(),
+    };
+    let outermost_of = |n: &str| match n.find('$') {
+        Some(i) => n[..i].to_string(),
+        None => n.to_string(),
+    };
+    let same_package = package_of(&an) == package_of(&bn);
+    let same_nest = same_package && outermost_of(&an) == outermost_of(&bn);
+    (false, same_package, same_nest)
+}
+
 fn lk_in_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
-    let modes = match ctx.get_field(this, LK_ALLOWED_MODES) {
-        Value::Int(v) => v,
-        _ => LK_PUBLIC,
+    // Read via `lk_modes_of`, which is correct against BOTH layouts. The old
+    // `get_field(this, LK_ALLOWED_MODES)` here was the synthetic slot only; on
+    // a real Lookup slot 1 is `prevLookupClass`, a reference, so the `Int` arm
+    // missed and the modes silently defaulted.
+    let modes = lk_modes_of(ctx, this);
+    let lookup_class = ctx.get_field(this, LK_LOOKUP_CLASS_REF);
+    let (same_class, same_package, same_nest) = lk_class_relation(ctx, lookup_class, target);
+    // A Lookup reporting 0 has no modes to narrow. Keep it at 0 rather than
+    // inventing PUBLIC: `in()` never GRANTS access the receiver did not have.
+    // Measured: `lookup().dropLookupMode(PUBLIC)` is 0, and `.in(String.class)`
+    // / `.in(<package-mate>)` / `.in(<its own lookup class>)` are all 0.
+    let new_modes = if modes == 0 {
+        0
+    } else {
+        lk_in_modes(modes, same_class, same_package, same_nest)
     };
-    let new_lk = alloc_lookup(ctx, modes);
+    let new_lk = alloc_lookup(ctx, new_modes);
     ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, target);
     Ok(Some(Value::Object(Some(new_lk))))
 }
@@ -8807,11 +9308,21 @@ fn lk_in_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 fn lk_drop_lookup_mode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let drop_mode = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-    let modes = match ctx.get_field(this, LK_ALLOWED_MODES) {
-        Value::Int(v) => v,
-        _ => LK_FULL_POWER,
+    // See `lk_in_method` for why this must not read `LK_ALLOWED_MODES` raw.
+    // A 0 stays 0: dropping a mode never GRANTS one, and the previous code
+    // reached the same answer for a fresh synthetic Lookup (whose slot 1 reads
+    // back `Int(0)`, so its `LK_FULL_POWER` default arm never fired either).
+    let modes = lk_modes_of(ctx, this);
+    let new_modes = match lk_drop_modes(modes, drop_mode) {
+        Some(m) => m,
+        // Measured on JDK 25: the message is exactly this.
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("{drop_mode} is not a valid mode to drop"),
+            }
+            .into());
+        }
     };
-    let new_modes = modes & !drop_mode;
     let new_lk = alloc_lookup(ctx, new_modes);
     let cls = ctx.get_field(this, LK_LOOKUP_CLASS_REF);
     ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, cls);
@@ -9187,6 +9698,23 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // findVarHandle/findStaticVarHandle are all registered in
     // lang_invoke::register_p63_method_handles_lookup — do NOT re-register here
     // as that would overwrite the real implementations with incompatible stubs.
+    //
+    // `in` and `dropLookupMode` are the EXCEPTION this comment used to omit,
+    // and the omission mattered: `lang_invoke::register_p63_method_handles_lookup`
+    // registers `in` too (lang_invoke.rs, "Lookup.in(targetClass)"), so there are
+    // two implementations and which one runs depends on the mode.
+    //   * synthetic-JDK mode: `register_synthetic_overrides` calls
+    //     `register_phase63_natives` (lib.rs) BEFORE
+    //     `classloader::register_classloader_natives`, so THIS registration wins.
+    //   * real-JDK mode: `register_synthetic_overrides` is a no-op and vm_init's
+    //     real arm calls `register_p63_method_handles_lookup` directly, so
+    //     lang_invoke's wins.
+    // Keep this one: measured against OpenJDK 25.0.3 (see `lk_in_modes`),
+    // lang_invoke's copy answers 31 for `in(<the lookup class itself>)` where
+    // the JDK answers 95, and it treats a receiver reporting 0 modes as
+    // FULL_POWER — i.e. `in()` GRANTS access. lang_invoke.rs is owned by another
+    // lane; the two must be collapsed onto `lk_in_modes` there, not forked again
+    // here.
     r.register(
         lk,
         "unreflect",
@@ -11703,6 +12231,115 @@ mod classloader_tests {
         assert_ne!(LK_FULL_POWER & LK_ORIGINAL, 0);
     }
 
+    /// The two "full power" values are DIFFERENT numbers and both are load
+    /// bearing: 95 is what `MethodHandles.lookup().lookupModes()` answers,
+    /// 0x1F is the JDK's own `FULL_POWER_MODES` mask that `in`/`dropLookupMode`
+    /// apply. Measured on OpenJDK 25.0.3.
+    #[test]
+    fn test_full_power_modes_mask_excludes_original() {
+        assert_eq!(LK_FULL_POWER, 95);
+        assert_eq!(LK_FULL_POWER_MODES, 0x1F);
+        assert_eq!(LK_FULL_POWER_MODES & LK_ORIGINAL, 0);
+        assert_eq!(LK_FULL_POWER_MODES & LK_UNCONDITIONAL, 0);
+    }
+
+    /// `Lookup.dropLookupMode` against the real JDK 25 answers.
+    ///
+    /// Every row was read off `java LkProbe` on OpenJDK 25.0.3 with the
+    /// receiver `MethodHandles.lookup()` (modes 95) — not derived from the JDK
+    /// source, and deliberately NOT from `old & !drop`, which this asserts is
+    /// wrong for all seven droppable modes.
+    #[test]
+    fn test_drop_lookup_mode_matches_jdk25() {
+        for (drop, expected) in [
+            (LK_PUBLIC, 0),
+            (LK_PRIVATE, 25),
+            (LK_PROTECTED, 27),
+            (LK_PACKAGE, 17),
+            (LK_MODULE, 1),
+            (LK_UNCONDITIONAL, 27),
+            (LK_ORIGINAL, 27),
+        ] {
+            assert_eq!(
+                lk_drop_modes(LK_FULL_POWER, drop),
+                Some(expected),
+                "dropLookupMode(0x{drop:x}) on modes 95"
+            );
+            assert_ne!(
+                LK_FULL_POWER & !drop,
+                expected,
+                "the naive `old & !drop` must NOT coincide with the JDK answer \
+                 for 0x{drop:x} — if it does, this test has stopped proving anything"
+            );
+        }
+    }
+
+    /// Anything that is not exactly one of the seven mode constants is refused.
+    /// Measured: `dropLookupMode(0)` and `dropLookupMode(PRIVATE|PROTECTED)`
+    /// both raise `IllegalArgumentException` on JDK 25.
+    #[test]
+    fn test_drop_lookup_mode_rejects_non_modes() {
+        assert_eq!(lk_drop_modes(LK_FULL_POWER, 0), None);
+        assert_eq!(lk_drop_modes(LK_FULL_POWER, LK_PRIVATE | LK_PROTECTED), None);
+        assert_eq!(lk_drop_modes(LK_FULL_POWER, 0x80), None);
+    }
+
+    /// `Lookup.in`, measured on OpenJDK 25.0.3 from `MethodHandles.lookup()`
+    /// (modes 95). The lookup class itself keeps 95; a NESTMATE gets 31; a
+    /// same-package class in another file gets **25**, not 31, because
+    /// `isSamePackageMember` strips `PRIVATE|PROTECTED` from a "cousin";
+    /// `String.class` gets 1; and `publicLookup()` (32) is returned unchanged.
+    #[test]
+    fn test_in_modes_matches_jdk25() {
+        // (same_class, same_package, same_nest)
+        assert_eq!(lk_in_modes(LK_FULL_POWER, true, true, true), 95);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, true), 31);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false), 25);
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, false, false), 1);
+        // publicLookup(): UNCONDITIONAL survives `in()` for every target.
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, false, false), 32);
+        assert_eq!(lk_in_modes(LK_UNCONDITIONAL, false, true, true), 32);
+        // An already-reduced lookup never REGAINS a mode.
+        assert_eq!(lk_in_modes(25, false, true, true), 25);
+        assert_eq!(lk_in_modes(25, false, false, false), 1);
+        assert_eq!(lk_in_modes(1, false, true, true), 1);
+    }
+
+    /// The nestmate approximation: `p/Outer` and `p/Outer$Inner` share an
+    /// outermost class; `p/Outer` and `p/Mate` do not.
+    #[test]
+    fn test_in_modes_nestmate_beats_bare_package_match() {
+        // Package-mates that are NOT nestmates lose PRIVATE|PROTECTED …
+        assert_eq!(lk_in_modes(LK_FULL_POWER, false, true, false) & LK_PRIVATE, 0);
+        // … while nestmates keep them.
+        assert_ne!(lk_in_modes(LK_FULL_POWER, false, true, true) & LK_PRIVATE, 0);
+    }
+
+    /// `lk_modes_of` must read the SYNTHETIC slot when the receiver's class
+    /// does not declare `allowedModes`.
+    ///
+    /// The trap this pins: a by-name-first reader returned 0 for every
+    /// fabricated Lookup and never consulted the slot that holds the value, so
+    /// `lookupModes()` reported a powerless Lookup for the whole of
+    /// synthetic-JDK mode.
+    ///
+    /// Note that this test exercises ONE of the two absent-field answers.
+    /// `MockNativeContext` answers `Int(0)` for an unresolvable name;
+    /// production (`vm_exec.rs::get_field_by_name`) answers
+    /// `Value::Object(None)`. `lk_modes_of` survives both only because it asks
+    /// the CLASS first — under production's answer a by-name-first reader
+    /// would fall through the `Value::Int` arm instead of latching a false 0,
+    /// but it still would not know which slot to read. Do not read a green
+    /// result here as evidence about the `Int(0)` convention; there isn't one.
+    #[test]
+    fn test_lk_modes_of_reads_synthetic_slot_when_field_absent() {
+        // The mock declares no fields for a fresh class, so `allowedModes` is
+        // absent and the MOCK's `get_field_by_name` answers `Int(0)` for it.
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let lk = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        assert_eq!(lk_modes_of(&ctx, lk), LK_FULL_POWER);
+    }
+
     // --- Loader type constants ---
 
     #[test]
@@ -11978,8 +12615,10 @@ mod classloader_tests {
     }
 
     // NOTE on positive private-access coverage: the MockNativeContext used
-    // here cannot represent the real-JDK `allowedModes` field *by name*
-    // (`get_field_by_name("allowedModes")` returns 0), so `lk_modes_of`
+    // here cannot represent the real-JDK `allowedModes` field *by name* (the
+    // MOCK's `get_field_by_name("allowedModes")` returns `Int(0)`; production
+    // would return `Value::Object(None)` — either way the mock has no such
+    // field and no declared slot for it), so `lk_modes_of`
     // always reports mode 0 under the mock and the "full-power lookup may
     // see its own private member" path cannot be exercised through these
     // natives in-unit. The same-class / mode-bit branch of
