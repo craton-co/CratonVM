@@ -1315,14 +1315,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             };
             let proto_name = ctx.read_string(proto_ref).unwrap_or_default();
-            match proto_name.as_str() {
-                "TLS" | "TLSv1" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3" | "SSL" | "Default" => {}
-                other => {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: format!("No such algorithm: {}", other),
-                    }
-                    .into());
-                }
+            // W3-7: same pair of defects as the sibling in
+            // `net_phase_e::register_re6_ssl_context`. The refusal was an
+            // `IllegalArgumentException` — a RuntimeException, so *unchecked*,
+            // sailing past `catch (NoSuchAlgorithmException)` even more quietly
+            // than the IOException did. And this list was case-SENSITIVE, so
+            // `getInstance("tls")` was refused although JCA lookup folds case.
+            if !crate::jca::provider_chain::ssl_context_protocol_supported(&proto_name) {
+                return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("{proto_name} SSLContext not available"),
+                ));
             }
             let obj =
                 alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS);

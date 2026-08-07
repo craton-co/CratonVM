@@ -1107,6 +1107,13 @@ pub fn pid_for_handle(handle: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// Read a Java `String[]` into `Vec<String>`.
+///
+/// Currently uncalled: its one caller was `ProcessImpl.create`'s envblock
+/// decoder, which read a `String[]` the JDK 25 image does not pass — see the
+/// descriptor note on [`native_process_impl_create`]. Kept because it is the
+/// generic reader every future `String[]` argument on this surface wants, and
+/// deleting it would only invite a hand-rolled copy.
+#[allow(dead_code)]
 fn read_string_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<String> {
     let len = ctx.array_length(arr);
     let mut out = Vec::with_capacity(len);
@@ -1132,6 +1139,10 @@ fn read_string_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<String>
 ///   * A `""` while already inside a quoted section emits a literal `"`
 ///     (the standard escaping for an embedded double quote).
 /// The surrounding quote characters themselves are not kept in the token.
+///
+/// `allow(dead_code)`: its only non-test caller is the Windows-only
+/// `ProcessImpl.create`, and the unit tests below exercise it on every platform.
+#[allow(dead_code)]
 fn tokenize_command_line(cmd_line: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -3559,6 +3570,9 @@ fn os_snapshot_processes() -> Vec<(i64, i64)> {
     /// after `th32ProcessID` that MSVC also emits — `#[repr(C)]` reproduces that
     /// layout exactly, and `dwSize` must equal it or `Process32FirstW` fails.
     #[repr(C)]
+    // Every field must be declared for the layout to be right; only three are
+    // read.
+    #[allow(dead_code)]
     struct ProcessEntry32W {
         dw_size: u32,
         cnt_usage: u32,
@@ -3830,6 +3844,15 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 //     since JDK 9), `ProcessHandleImpl.destroyProcess0` (superseded by
 //     `destroy0(JJZ)Z`) and `ProcessBuilder.start` — dead or shadowing.
 //
+// AMENDED 2026-08-07 (W3-6). `ProcessImpl.create` was in that last group for a
+// reason the census could not see: it was registered under a descriptor the
+// image does not declare, so of course nothing resolved to it. On the JDK 25
+// Windows image it IS `ACC_NATIVE`, and so are the nine siblings that had no
+// registration at all. All ten are now stated `Bridge` under `cfg(windows)`,
+// which moves the Windows arm from 9 bridges to 19 and leaves the Linux arm
+// unchanged. See docs/known-issues/jdk-only/W3-6-processimpl-missing-natives.md
+// for the per-row `javap` census.
+//
 // Details and the per-row table:
 // docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md
 /// Register every WP1.12-owned subprocess native.  Called from
@@ -3842,12 +3865,95 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // ProcessImpl / UNIXProcess.  Only the Windows one is registered on
     // non-Linux targets, and vice-versa, so we don't override each
     // other's natives on the wrong platform.
-    registry.register(
-        "java/lang/ProcessImpl",
-        "create",
-        "(Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;[JZ)J",
-        native_process_impl_create,
-    );
+    //
+    // The full Windows `ProcessImpl` surface, from
+    // `javap -p -s java.lang.ProcessImpl` on the JDK 25 image. All ten are
+    // `ACC_NATIVE` there, so all ten are §1.5 bridges, and nine of them had no
+    // registration at all — `getStillActive`, which `<clinit>` calls to seed
+    // `STILL_ACTIVE`, is simply the first one the class reaches.
+    //
+    // `create` had one, under a descriptor the image does not declare
+    // (`[Ljava/lang/String;` for what is a single envblock `String`), so it
+    // never bound either; see `native_process_impl_create`.
+    //
+    // Gated on `windows` as a group. The Linux image's `ProcessImpl` is a
+    // different class with a different native set — `forkAndExec` below, plus
+    // `init`/`destroyProcess` — and none of these names exist on it, so
+    // registering them there could only ever add unresolvable rows to the
+    // `--jdk-only` census.
+    #[cfg(windows)]
+    {
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "create",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[JZ)J",
+            native_process_impl_create,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "getStillActive",
+            "()I",
+            native_process_impl_get_still_active,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "getExitCodeProcess",
+            "(J)I",
+            native_process_impl_get_exit_code,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "isProcessAlive",
+            "(J)Z",
+            native_process_impl_is_process_alive,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "terminateProcess",
+            "(J)V",
+            native_process_impl_terminate,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "waitForInterruptibly",
+            "(J)V",
+            native_process_impl_wait_for_interruptibly,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "waitForTimeoutInterruptibly",
+            "(JJ)V",
+            native_process_impl_wait_for_timeout,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "getProcessId0",
+            "(J)I",
+            native_process_impl_get_process_id0,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "closeHandle",
+            "(J)Z",
+            native_process_impl_close_handle,
+            NativeKind::Bridge,
+        );
+        registry.register_with_kind(
+            "java/lang/ProcessImpl",
+            "openForAtomicAppend",
+            "(Ljava/lang/String;)J",
+            native_process_impl_open_for_atomic_append,
+            NativeKind::Bridge,
+        );
+    }
 
     // `java.lang.UNIXProcess` was the pre-JDK-9 name of this class and is not
     // on any supported image, so the registration that used to sit here could
@@ -4468,6 +4574,40 @@ mod tests {
         assert!(split_nul_block(b"", 0).is_empty());
     }
 
+    /// The Windows environment block is one NUL-separated String, not the
+    /// `String[]` the old `create` registration decoded.
+    ///
+    /// The block is NUL-*terminated*, so the last split piece is empty and must
+    /// not become a variable; `=C:=...` entries are Windows' per-drive
+    /// current-directory pseudo-variables and are dropped rather than forwarded
+    /// as a variable literally named `=C:`. An empty VALUE is legal and is kept.
+    #[test]
+    #[cfg(windows)]
+    fn an_environment_block_splits_on_nul_and_drops_the_drive_pseudo_vars() {
+        assert_eq!(
+            parse_env_block("PATH=C:\\bin\0HOME=C:\\me\0"),
+            vec![
+                ("PATH".to_string(), "C:\\bin".to_string()),
+                ("HOME".to_string(), "C:\\me".to_string()),
+            ]
+        );
+        assert_eq!(
+            parse_env_block("=C:=C:\\work\0FOO=bar\0"),
+            vec![("FOO".to_string(), "bar".to_string())],
+            "a per-drive cwd pseudo-variable is not an environment variable"
+        );
+        assert_eq!(
+            parse_env_block("EMPTY=\0"),
+            vec![("EMPTY".to_string(), String::new())],
+            "an empty value is legal and must survive"
+        );
+        assert!(parse_env_block("").is_empty());
+        assert!(
+            parse_env_block("NOEQUALS\0").is_empty(),
+            "an entry with no '=' is not a variable"
+        );
+    }
+
     /// `toCString` output is NUL-terminated; the terminator is not part of the
     /// string, and neither is anything the JDK left in the tail.
     #[test]
@@ -4484,8 +4624,12 @@ mod tests {
     /// ids 0/1/2 are permanently the VM's own standard streams with the
     /// counter starting at 3 — so `fds[1] == 1` can only ever mean "stdout",
     /// whichever way you read it.
+    ///
+    /// Windows reaches the same decoder through `ProcessImpl.create`'s
+    /// `long[] stdHandles` rather than `forkAndExec`'s `int[] fds` — the values
+    /// are `FdTable` ids on both platforms — so the test covers both arms.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn a_requested_fd_maps_to_pipe_inherit_or_an_existing_descriptor() {
         assert!(matches!(
             redirect_from_requested_fd(0, -1),

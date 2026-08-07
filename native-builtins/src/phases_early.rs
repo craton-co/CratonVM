@@ -15825,13 +15825,24 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 ],
                 _ => &[],
             };
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, algos.len());
-            for (i, &algo) in algos.iter().enumerate() {
-                let s = ctx.create_string(algo);
-                ctx.set_array_element(arr, i, Value::Object(Some(s)));
-            }
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
+            // W3-7 (RJdkSecurity.java:311). This is the SYNTHETIC HashSet
+            // layout: a String[] in slot 0. In real-JDK mode
+            // `java.util.HashSet` has exactly one instance field —
+            // `transient HashMap<E,Object> map` (verified with javap) — so
+            // slot 0 IS `map`, and this wrote a String[] into it. The set
+            // answers every question until someone calls a HashSet method:
+            // `contains(Object)` is real JDK bytecode doing
+            // `map.containsKey(o)`, i.e. an invokevirtual of HashMap on a
+            // String[] receiver. `make_hashset_with_elements` builds the real
+            // `HashSet -> HashMap -> Node[]` shape and falls back to the legacy
+            // synthetic layout when the real classes are not loaded, so this
+            // is correct in both modes. Same helper
+            // `jca::provider_chain::provider_get_services_native` already uses.
+            let elems: Vec<Value> = algos
+                .iter()
+                .map(|&algo| Value::Object(Some(ctx.create_string(algo))))
+                .collect();
+            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems)?;
             Ok(Some(Value::Object(Some(set))))
         },
     );

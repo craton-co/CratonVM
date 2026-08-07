@@ -11609,13 +11609,30 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
             let proto = value_or_string(ctx, proto_val, "TLS");
-            if !(proto.eq_ignore_ascii_case("TLS")
-                || proto.eq_ignore_ascii_case("TLSv1.2")
-                || proto.eq_ignore_ascii_case("TLSv1.3")
-                || proto.eq_ignore_ascii_case("Default")
-                || proto.eq_ignore_ascii_case("SSL"))
-            {
-                return Err(ioex(format!("NoSuchAlgorithmException: {proto}")));
+            // W3-7 (RJdkSecurity.tls:291). TWO defects on this line.
+            //
+            // (1) WRONG TYPE. `ioex` builds a `java.io.IOException`, so
+            //     `getInstance("NO-SUCH-TLS")` threw
+            //     `IOException: NoSuchAlgorithmException: NO-SUCH-TLS` — the
+            //     right words in the message, the wrong class on the wire.
+            //     `java.io.IOException` and `java.security.NoSuchAlgorithm-
+            //     Exception` (via GeneralSecurityException) are disjoint below
+            //     `Exception`, so the caller's `catch (NoSuchAlgorithmException)`
+            //     did not match and the refusal escaped to main.
+            //
+            // (2) TOO NARROW. The five-name list refused `TLSv1`, `TLSv1.1`,
+            //     `SSLv3` and all three DTLS protocols — every one of which
+            //     SunJSSE really registers on JDK 25 (measured). A too-narrow
+            //     accept list is the more dangerous half: it turns a valid
+            //     `getInstance` into a refusal and takes every HTTPS-using
+            //     suite with it. The decision now lives in ONE place shared
+            //     with `phases_late::ssl_security::register_p68_ssl` and both
+            //     `tls.rs` registrations, so the four cannot drift again.
+            if !crate::jca::provider_chain::ssl_context_protocol_supported(&proto) {
+                return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("{proto} SSLContext not available"),
+                ));
             }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string(&proto);
