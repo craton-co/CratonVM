@@ -1742,9 +1742,7 @@ pub(crate) fn register_p68_jdbc_driver_manager(r: &mut NativeMethodRegistry) {
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
             }
             // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-            ctx.set_field(en, 0, Value::Object(Some(arr)));
-            ctx.set_field(en, 1, Value::Int(0));
+            let en = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
             Ok(Some(Value::Object(Some(en))))
         },
     );

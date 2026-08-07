@@ -3649,7 +3649,7 @@ fn native_antlr_parser_compute_reach_set(
         let reach_set = antlr_new_atn_config_set(&mut *scope, names, full_ctx)?;
         let reach_set_h = scope.root(reach_set);
         let closure_busy =
-            cratonvm_native_collections::make_hashset_with_elements(&mut *scope, &[]);
+            cratonvm_native_collections::make_hashset_with_elements(&mut *scope, &[])?;
         let closure_busy_h = scope.root(closure_busy);
         let treat_eof_as_epsilon = token == -1;
         let intermediate = scope.get(&intermediate_h);

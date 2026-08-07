@@ -4021,10 +4021,8 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         // neither `hasMoreElements` nor `nextElement`. `Enumeration$Impl` is
         // the pre-registered (array=0, index=1) helper every other enumeration
         // site in this VM uses.
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
         let arr = ctx.read_native_pin(arr_pin, arr);
-        ctx.set_field(itr, 0, Value::Object(Some(arr)));
-        ctx.set_field(itr, 1, Value::Int(0));
+        let itr = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
         ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(itr))))
     });

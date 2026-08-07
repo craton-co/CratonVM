@@ -47,8 +47,9 @@ pub use field_layout::{
     class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
     is_compact_object, layout_generation, layout_replace_guard, object_body_size,
-    foreign_layout_refusals, next_layout_domain, read_compact_field, register_class_layout,
-    set_compact_ref_fields_enabled, FIRST_LAYOUT_DOMAIN,
+    foreign_layout_refusals, next_layout_domain, pack_fields_by_width_enabled,
+    read_compact_field, register_class_layout,
+    set_compact_ref_fields_enabled, set_pack_fields_by_width_enabled, FIRST_LAYOUT_DOMAIN,
     unregister_class_layout, with_class_layout, write_compact_field, CompactLayout,
     FieldStorageKind,
 };

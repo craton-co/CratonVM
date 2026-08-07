@@ -8368,7 +8368,7 @@ pub fn register_essential_natives_with_shims(
                 Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
                 _ => String::new(),
             };
-            let descriptor = build_synthetic_module_descriptor(ctx, &name);
+            let descriptor = build_synthetic_module_descriptor(ctx, &name)?;
             Ok(Some(Value::Object(Some(descriptor))))
         },
     );
@@ -8962,8 +8962,26 @@ pub fn register_essential_natives_with_shims(
         ctx.set_field_by_name(this, "handle", Value::Long(-1));
         Ok(None)
     });
+    // `SyntheticStub`, stated, for the same reason as the `FilterOutputStream`
+    // constructor above: the shim assigns `fd` and stops, while the real
+    // constructor also initializes `private final Object closeLock = new
+    // Object()`, and `FileInputStream.close()` / `FileOutputStream.close()`
+    // open with `synchronized (closeLock)`. Any stream built through this shim
+    // therefore throws NPE — not IOException — on its first close.
+    //
+    // Reached from `ProcessImpl`'s `ProcessPipeInputStream(fd)`, whose
+    // `close()` chains down to `FileInputStream.close`; that was the second
+    // null `closeLock` in the same `Process.destroy()`, and it is the same
+    // defect on the input side.
+    //
+    // Compatible mode keeps the shim, where the receiver may carry the
+    // synthetic 1-slot layout the `set_field(this, 0, ..)` writes through.
+    // Strict mode drops it and runs the real constructor, which additionally
+    // sets `path`/`append` and calls `fd.attach(this)`; the fd-table id still
+    // arrives through the `FileDescriptor`'s own `fd` field, which is where
+    // `fis_get_fd`/`fos_get_fd` look first.
     for stream_class in ["java/io/FileInputStream", "java/io/FileOutputStream"] {
-        registry.register(
+        registry.register_with_kind(
             stream_class,
             "<init>",
             "(Ljava/io/FileDescriptor;)V",
@@ -8977,6 +8995,7 @@ pub fn register_essential_natives_with_shims(
                 ctx.set_field(this, 0, fd);
                 Ok(None)
             },
+            cratonvm_native_api::NativeKind::SyntheticStub,
         );
     }
     registry.register(
@@ -9406,7 +9425,19 @@ pub fn register_essential_natives_with_shims(
         native_mapper_internal_map_wildcard_wrapper,
     );
     } // end mapper_natives_enabled()
-    registry.register(
+    // `SyntheticStub`, stated. This shim sets `out` and nothing else, but the
+    // real constructor also initializes `private final Object closeLock = new
+    // Object()` — and `FilterOutputStream.close()` begins with
+    // `synchronized (closeLock)`. Every subclass built through this shim
+    // therefore throws NPE on its first `close()`; the JDK's own
+    // `ProcessImpl.destroy` is one such caller, and its
+    // `catch (IOException ignored)` does not catch it. See the matching note on
+    // the `BufferedOutputStream` constructors in `native-io`.
+    //
+    // Strict mode drops it and runs the two-line real constructor. Compatible
+    // mode, where the receiver may have the synthetic 1-slot layout this writes
+    // through `set_field(this, 0, ..)`, keeps it.
+    registry.register_with_kind(
         "java/io/FilterOutputStream",
         "<init>",
         "(Ljava/io/OutputStream;)V",
@@ -9420,6 +9451,7 @@ pub fn register_essential_natives_with_shims(
             ctx.set_field(this, 0, output);
             Ok(None)
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
     registry.register(
         "java/io/FilterOutputStream",
@@ -11702,7 +11734,7 @@ pub fn register_essential_natives_with_shims(
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.set_field_by_name(m_obj, "name", module_name_val);
             if let Some(name) = module_name.as_deref() {
-                let desc = build_synthetic_module_descriptor(ctx, name);
+                let desc = build_synthetic_module_descriptor(ctx, name)?;
                 let m_obj = ctx.read_native_pin(pin, m_obj);
                 ctx.set_field_by_name(m_obj, "descriptor", Value::Object(Some(desc)));
             }
@@ -11873,7 +11905,7 @@ pub fn register_essential_natives_with_shims(
                 // Unnamed module: matches real Module.getDescriptor()'s null.
                 return Ok(Some(Value::Object(None)));
             }
-            let desc = build_synthetic_module_descriptor(ctx, &module_name);
+            let desc = build_synthetic_module_descriptor(ctx, &module_name)?;
             ctx.set_field_by_name(this, "descriptor", Value::Object(Some(desc)));
             Ok(Some(Value::Object(Some(desc))))
         },
@@ -30366,7 +30398,7 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 pub(crate) fn build_synthetic_module_descriptor(
     ctx: &mut dyn NativeContext,
     module_name: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let uses: Vec<String> = ctx
         .module_uses(module_name)
         .into_iter()
@@ -30392,7 +30424,7 @@ pub(crate) fn build_synthetic_module_descriptor(
         "provides",
         "packages",
     ] {
-        let empty = module_descriptor_empty_set(ctx);
+        let empty = module_descriptor_empty_set(ctx)?;
         let desc = ctx.read_native_pin(pin, desc);
         ctx.set_field_by_name(desc, field, Value::Object(Some(empty)));
     }
@@ -30400,7 +30432,7 @@ pub(crate) fn build_synthetic_module_descriptor(
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
     ctx.unpin_native_roots(pin);
-    desc
+    Ok(desc)
 }
 
 // ---------------------------------------------------------------------------
@@ -30442,8 +30474,8 @@ pub(crate) fn build_synthetic_module_descriptor(
 /// native-collections helper that uses the correct 1-field-with-
 /// backing-HashMap layout, matching `<init>()` / 0..3-arg `Set.of`
 /// behaviour and unblocking Spring `getConvertibleTypes()` paths.
-fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> ObjectRef {
-    cratonvm_native_collections::make_hashset_with_elements(ctx, args)
+fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, args)?)
 }
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
@@ -30466,7 +30498,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
@@ -30476,7 +30508,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
@@ -30486,7 +30518,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
@@ -30496,44 +30528,44 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
 
     // --- Reflection.registerFieldsToFilter(Class, Set) ---

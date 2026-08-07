@@ -62,7 +62,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -121,14 +121,40 @@ static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
 
 /// The subprocess table: `ProcessHandle` → `std::process::Child`.
 ///
-/// Entries stay until `waitFor` / `destroy` observes termination and
-/// removes them.  We don't reap zombies eagerly — the OS keeps the
-/// child's exit status in the process entry until either `wait()` is
-/// called (POSIX) or the `HANDLE` is closed (Windows).  Both happen
-/// naturally when the `Child` is dropped from the table.
-fn process_table() -> &'static Mutex<HashMap<i64, Child>> {
-    static T: OnceLock<Mutex<HashMap<i64, Child>>> = OnceLock::new();
+/// Entries live for the VM's lifetime, and the `Child` is shared rather than
+/// owned by whoever looks it up. Both properties are load-bearing, and both
+/// replaced an arrangement that was fine until the real JDK's `ProcessImpl`
+/// started driving this table.
+///
+/// `ProcessImpl`'s constructor ends in `ProcessHandleImpl.completion(pid, true)`,
+/// which puts a reaper thread into `Child::wait()` for the whole life of every
+/// child, starting the instant it is spawned. The previous design took the
+/// `Child` *out* of the table to wait on it, so from a subsequent
+/// `Process.destroy()`'s point of view every child was permanently missing:
+/// `destroy` became a no-op, and `new ProcessBuilder("sleep","30").start()`
+/// followed by `destroy()` then `waitFor()` blocked for the full thirty
+/// seconds and reported 0 instead of 143. Measured, on the first build where
+/// the real `ProcessImpl` ran.
+///
+/// So the `Child` stays, behind its own mutex:
+///
+/// * a waiter clones the `Arc`, releases the table lock, and blocks on the
+///   child's own mutex — the table stays usable while a child runs;
+/// * `Child::wait` caches its status internally, so two waiters on one child
+///   both get the real code rather than the second seeing "already reaped";
+/// * a killer takes the child's mutex with `try_lock`. Failing that lock is
+///   not a problem to route around — it is *information*: someone is inside
+///   `Child::wait()`, therefore the child has not been reaped, therefore its
+///   pid is still its own and signalling it directly is safe. See
+///   [`destroy_handle`].
+fn process_table() -> &'static Mutex<HashMap<i64, Arc<Mutex<Child>>>> {
+    static T: OnceLock<Mutex<HashMap<i64, Arc<Mutex<Child>>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Look up the shared child for `handle` without holding the table lock.
+fn child_for(handle: i64) -> Option<Arc<Mutex<Child>>> {
+    process_table().lock().get(&handle).cloned()
 }
 
 /// Extra per-process state that can't live inside `std::process::Child`:
@@ -144,6 +170,7 @@ fn pipe_cache() -> &'static Mutex<HashMap<i64, PipeFds>> {
     static T: OnceLock<Mutex<HashMap<i64, PipeFds>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
 
 #[derive(Clone, Copy, Debug)]
 struct ExitCache {
@@ -204,6 +231,14 @@ const PROC_FIELD_HANDLE: usize = JAVA_PROCESS_FIELD_COUNT + 5;
 /// Sentinel "not yet exited" value stored in the exit-code field.
 const EXIT_NOT_YET: i32 = i32::MIN;
 
+/// `ProcessHandleImpl.NOT_A_CHILD` — what `waitForProcessExit0` answers for a
+/// pid that is not a child of this process.
+///
+/// `@Native`-annotated on the JDK side, which makes it part of the native
+/// contract rather than an implementation detail: `ProcessHandleImpl.completion`
+/// compares against it by name and branches.
+const PROCESS_NOT_A_CHILD: i32 = -2;
+
 /// Total number of fields on the synthetic Process.
 const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 6;
 
@@ -253,6 +288,15 @@ enum StdioRedirect {
     Null,
     ReadFile(String),
     WriteFile { path: String, append: bool },
+    /// A descriptor the caller has already opened, named by its `FdTable` id.
+    ///
+    /// The real JDK's `ProcessImpl` opens file redirects itself and passes the
+    /// resulting descriptor down to `forkAndExec` — it never tells the native
+    /// the path. `Inherit` is deliberately NOT folded in here even though ids
+    /// 0/1/2 are the VM's own standard streams: inheriting is `Stdio::inherit`,
+    /// which hands the child this process's real OS descriptors, whereas this
+    /// variant duplicates a table entry.
+    ExistingFd(i32),
 }
 
 #[derive(Clone, Debug)]
@@ -300,12 +344,45 @@ fn open_redirect_output(path: &str, append: bool) -> Result<File, RuntimeError> 
         .map_err(|e| redirect_io_error("redirectOutput", path, e))
 }
 
-fn stdin_stdio(spec: &StdioRedirect) -> Result<(Stdio, bool), RuntimeError> {
+/// Duplicate a file-backed `FdTable` entry for handing to a child.
+///
+/// `try_clone` is a `dup`, so the child gets an independent descriptor on the
+/// same open file: closing the JDK's own `FileInputStream`/`FileOutputStream`
+/// afterwards — which `ProcessImpl.start` does in a `finally` — cannot pull the
+/// file out from under the child.
+fn stdio_from_existing_fd(
+    fd_table: &cratonvm_native_api::fd_table::FileDescriptorTable,
+    id: i32,
+    op: &str,
+) -> Result<Stdio, RuntimeError> {
+    if id < 0 {
+        return Err(RuntimeError::IOException {
+            message: format!("ProcessBuilder.{op}: negative descriptor {id}"),
+        });
+    }
+    let file = fd_table
+        .clone_file(id as FdId)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!(
+                "ProcessBuilder.{op}: descriptor {id} is not backed by a file: {e}"
+            ),
+        })?;
+    Ok(Stdio::from(file))
+}
+
+fn stdin_stdio(
+    fd_table: &cratonvm_native_api::fd_table::FileDescriptorTable,
+    spec: &StdioRedirect,
+) -> Result<(Stdio, bool), RuntimeError> {
     match spec {
         StdioRedirect::Pipe => Ok((Stdio::piped(), true)),
         StdioRedirect::Inherit => Ok((Stdio::inherit(), false)),
         StdioRedirect::Null => Ok((Stdio::null(), false)),
         StdioRedirect::ReadFile(path) => Ok((Stdio::from(open_redirect_input(path)?), false)),
+        StdioRedirect::ExistingFd(id) => Ok((
+            stdio_from_existing_fd(fd_table, *id, "redirectInput")?,
+            false,
+        )),
         StdioRedirect::WriteFile { path, .. } => Err(RuntimeError::IOException {
             message: format!(
                 "ProcessBuilder.redirectInput cannot read from output redirect: {path}"
@@ -314,7 +391,11 @@ fn stdin_stdio(spec: &StdioRedirect) -> Result<(Stdio, bool), RuntimeError> {
     }
 }
 
-fn output_stdio(spec: &StdioRedirect, op: &str) -> Result<(Stdio, bool), RuntimeError> {
+fn output_stdio(
+    fd_table: &cratonvm_native_api::fd_table::FileDescriptorTable,
+    spec: &StdioRedirect,
+    op: &str,
+) -> Result<(Stdio, bool), RuntimeError> {
     match spec {
         StdioRedirect::Pipe => Ok((Stdio::piped(), true)),
         StdioRedirect::Inherit => Ok((Stdio::inherit(), false)),
@@ -322,6 +403,7 @@ fn output_stdio(spec: &StdioRedirect, op: &str) -> Result<(Stdio, bool), Runtime
         StdioRedirect::WriteFile { path, append } => {
             Ok((Stdio::from(open_redirect_output(path, *append)?), false))
         }
+        StdioRedirect::ExistingFd(id) => Ok((stdio_from_existing_fd(fd_table, *id, op)?, false)),
         StdioRedirect::ReadFile(path) => Err(RuntimeError::IOException {
             message: format!("ProcessBuilder.{op} cannot write to input redirect: {path}"),
         }),
@@ -329,11 +411,12 @@ fn output_stdio(spec: &StdioRedirect, op: &str) -> Result<(Stdio, bool), Runtime
 }
 
 fn configure_stdio(
+    fd_table: &cratonvm_native_api::fd_table::FileDescriptorTable,
     command: &mut Command,
     redirects: &ProcessRedirects,
     redirect_error_stream: bool,
 ) -> Result<(bool, bool, bool, Option<std::io::PipeReader>), RuntimeError> {
-    let (stdin, stdin_piped) = stdin_stdio(&redirects.stdin)?;
+    let (stdin, stdin_piped) = stdin_stdio(fd_table, &redirects.stdin)?;
     command.stdin(stdin);
 
     if redirect_error_stream {
@@ -368,6 +451,13 @@ fn configure_stdio(
                 command.stderr(Stdio::from(file2));
                 Ok((stdin_piped, false, false, None))
             }
+            StdioRedirect::ExistingFd(id) => {
+                let out = stdio_from_existing_fd(fd_table, *id, "redirectOutput")?;
+                let err = stdio_from_existing_fd(fd_table, *id, "redirectError")?;
+                command.stdout(out);
+                command.stderr(err);
+                Ok((stdin_piped, false, false, None))
+            }
             StdioRedirect::ReadFile(path) => Err(RuntimeError::IOException {
                 message: format!(
                     "ProcessBuilder.redirectOutput cannot write to input redirect: {path}"
@@ -375,8 +465,8 @@ fn configure_stdio(
             }),
         }
     } else {
-        let (stdout, stdout_piped) = output_stdio(&redirects.stdout, "redirectOutput")?;
-        let (stderr, stderr_piped) = output_stdio(&redirects.stderr, "redirectError")?;
+        let (stdout, stdout_piped) = output_stdio(fd_table, &redirects.stdout, "redirectOutput")?;
+        let (stderr, stderr_piped) = output_stdio(fd_table, &redirects.stderr, "redirectError")?;
         command.stdout(stdout);
         command.stderr(stderr);
         Ok((stdin_piped, stdout_piped, stderr_piped, None))
@@ -492,6 +582,19 @@ pub fn spawn_and_wrap(
     )
 }
 
+/// One spawned child, as the process tables now know it.
+///
+/// Returned by [`spawn_child`] so that the two callers can diverge on what they
+/// build from it: the VM's own `ProcessBuilder.start` shadow fabricates a
+/// synthetic `Process` around it, while the real JDK's `forkAndExec` writes the
+/// pipe ids back into the caller's `int[]` and lets `ProcessImpl` build its own
+/// streams from them.
+struct SpawnedChild {
+    handle: i64,
+    pid: i64,
+    fds: PipeFds,
+}
+
 fn spawn_and_wrap_with_redirects(
     ctx: &mut dyn NativeContext,
     program: &str,
@@ -502,6 +605,68 @@ fn spawn_and_wrap_with_redirects(
     redirect_error_stream: bool,
     redirects: &ProcessRedirects,
 ) -> MethodCallResult {
+    let spawned = spawn_child(
+        ctx,
+        program,
+        args,
+        work_dir,
+        env_vars,
+        clear_env,
+        redirect_error_stream,
+        redirects,
+    )?;
+
+    // `ensure_synthetic_class` gives `cratonvm/synthetic/Process` a real
+    // `java.lang.Process` superclass, but it resolves it with
+    // `get_loaded_class_id` — which answers only for a class that is ALREADY
+    // loaded. Load it here so the fabrication cannot silently fall back to
+    // `java/lang/Object` and reintroduce the supertype inconsistency
+    // (`isAssignableFrom` true while the `getSuperclass()` chain omits it).
+    //
+    // In practice the caller's own bytecode has already resolved
+    // `java.lang.Process` — it is `start()`'s return type — so this is
+    // ordinarily a no-op lookup. It is not free to rely on that: this native is
+    // also reached from paths that never named the type, and a mode without a
+    // real `java.lang.Process` at all must still get the old behaviour rather
+    // than an error, which is why the result is deliberately discarded.
+    let _ = ctx.load_class("java/lang/Process");
+    // Allocate the synthetic Process under its own named class (see
+    // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
+    // ahead of them belong to java.lang.Process's own reader/writer caches and
+    // are deliberately left null — see JAVA_PROCESS_FIELD_COUNT.
+    let proc_class = ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT);
+    let proc_ref = ctx.alloc_object(proc_class, PROC_FIELD_COUNT);
+    ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
+    ctx.set_field(proc_ref, PROC_FIELD_STDIN_FD, Value::Int(spawned.fds.stdin_fd));
+    ctx.set_field(
+        proc_ref,
+        PROC_FIELD_STDOUT_FD,
+        Value::Int(spawned.fds.stdout_fd),
+    );
+    ctx.set_field(
+        proc_ref,
+        PROC_FIELD_STDERR_FD,
+        Value::Int(spawned.fds.stderr_fd),
+    );
+    ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(spawned.pid));
+    ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(spawned.handle));
+
+    Ok(Some(Value::Object(Some(proc_ref))))
+}
+
+/// Spawn a child and register it in the process tables, without building any
+/// Java-visible object around it.
+#[allow(clippy::too_many_arguments)]
+fn spawn_child(
+    ctx: &mut dyn NativeContext,
+    program: &str,
+    args: &[String],
+    work_dir: Option<&str>,
+    env_vars: Option<&[(String, String)]>,
+    clear_env: bool,
+    redirect_error_stream: bool,
+    redirects: &ProcessRedirects,
+) -> Result<SpawnedChild, MethodCallFailed> {
     if program.is_empty() {
         return Err(RuntimeError::IllegalArgumentException {
             message: "ProcessBuilder: empty program".to_string(),
@@ -584,7 +749,7 @@ fn spawn_and_wrap_with_redirects(
     let mut command = Command::new(program);
     command.args(args);
     let (stdin_piped, stdout_piped, stderr_piped, merged_reader) =
-        configure_stdio(&mut command, redirects, redirect_error_stream)
+        configure_stdio(ctx.fd_table(), &mut command, redirects, redirect_error_stream)
             .map_err(cratonvm_types::error::MethodCallFailed::from)?;
 
     if clear_env {
@@ -687,7 +852,9 @@ fn spawn_and_wrap_with_redirects(
             handle, pid, stdin_fd, stdout_fd, stderr_fd
         );
     }
-    process_table().lock().insert(handle, child);
+    process_table()
+            .lock()
+            .insert(handle, Arc::new(Mutex::new(child)));
     exit_cache().lock().insert(
         handle,
         ExitCache {
@@ -703,35 +870,15 @@ fn spawn_and_wrap_with_redirects(
             stderr_fd,
         },
     );
-
-    // `ensure_synthetic_class` gives `cratonvm/synthetic/Process` a real
-    // `java.lang.Process` superclass, but it resolves it with
-    // `get_loaded_class_id` — which answers only for a class that is ALREADY
-    // loaded. Load it here so the fabrication cannot silently fall back to
-    // `java/lang/Object` and reintroduce the supertype inconsistency
-    // (`isAssignableFrom` true while the `getSuperclass()` chain omits it).
-    //
-    // In practice the caller's own bytecode has already resolved
-    // `java.lang.Process` — it is `start()`'s return type — so this is
-    // ordinarily a no-op lookup. It is not free to rely on that: this native is
-    // also reached from paths that never named the type, and a mode without a
-    // real `java.lang.Process` at all must still get the old behaviour rather
-    // than an error, which is why the result is deliberately discarded.
-    let _ = ctx.load_class("java/lang/Process");
-    // Allocate the synthetic Process under its own named class (see
-    // SYNTHETIC_PROCESS_CLASS) and populate its 6 own fields. The 6 slots
-    // ahead of them belong to java.lang.Process's own reader/writer caches and
-    // are deliberately left null — see JAVA_PROCESS_FIELD_COUNT.
-    let proc_class = ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT);
-    let proc_ref = ctx.alloc_object(proc_class, PROC_FIELD_COUNT);
-    ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
-    ctx.set_field(proc_ref, PROC_FIELD_STDIN_FD, Value::Int(stdin_fd));
-    ctx.set_field(proc_ref, PROC_FIELD_STDOUT_FD, Value::Int(stdout_fd));
-    ctx.set_field(proc_ref, PROC_FIELD_STDERR_FD, Value::Int(stderr_fd));
-    ctx.set_field(proc_ref, PROC_FIELD_PID, Value::Long(pid));
-    ctx.set_field(proc_ref, PROC_FIELD_HANDLE, Value::Long(handle));
-
-    Ok(Some(Value::Object(Some(proc_ref))))
+    Ok(SpawnedChild {
+        handle,
+        pid,
+        fds: PipeFds {
+            stdin_fd,
+            stdout_fd,
+            stderr_fd,
+        },
+    })
 }
 
 /// Wait for the child identified by `handle` to exit.  Blocks the
@@ -747,18 +894,18 @@ pub fn wait_for_handle(handle: i64) -> i32 {
             return code;
         }
     }
-    // Slow path: block on the OS.
-    let child_opt = {
-        let mut table = process_table().lock();
-        table.remove(&handle)
-    };
-    let Some(mut child) = child_opt else {
-        // Handle unknown (double-wait without prior removal, or forged)
+    // Slow path: block on the OS. The child stays in the table — see the note
+    // there — so `destroy_handle` can still reach it while we are blocked here.
+    let Some(child) = child_for(handle) else {
+        // Handle unknown (forged, or from a VM whose tables have been reset).
         return -1;
     };
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(_e) => return -1,
+    let status = {
+        let mut child = child.lock();
+        match child.wait() {
+            Ok(s) => s,
+            Err(_e) => return -1,
+        }
     };
     // On Unix, `ExitStatus::code()` returns None if terminated by
     // signal; map that to 128 + signum pattern as HotSpot does.
@@ -796,8 +943,11 @@ pub fn try_exit_handle(handle: i64) -> Option<i32> {
     }
     // `try_wait` returns Ok(None) while still running, Ok(Some(status))
     // after exit.
-    let mut table = process_table().lock();
-    let entry = table.get_mut(&handle)?;
+    let child = child_for(handle)?;
+    // A failed `try_lock` means a waiter is inside `Child::wait()`, i.e. the
+    // child is running. Report that rather than blocking — this native backs
+    // `isAlive()`, which must not stall behind a `waitFor()` on another thread.
+    let mut entry = child.try_lock()?;
     match entry.try_wait() {
         Ok(Some(status)) => {
             #[cfg(unix)]
@@ -810,8 +960,6 @@ pub fn try_exit_handle(handle: i64) -> Option<i32> {
             };
             #[cfg(not(unix))]
             let code = status.code().unwrap_or(-1);
-            // Remove from the live table so its resources can be reclaimed.
-            table.remove(&handle);
             if let Some(cache) = exit_cache().lock().get_mut(&handle) {
                 cache.exit_code = Some(code);
             }
@@ -828,12 +976,47 @@ pub fn try_exit_handle(handle: i64) -> Option<i32> {
 /// subprocess identified by `handle`.  Best-effort: returns `true` if
 /// the kill signal was accepted, `false` otherwise (usually because the
 /// child has already exited).
-pub fn destroy_handle(handle: i64, _force: bool) -> bool {
-    let mut table = process_table().lock();
-    match table.get_mut(&handle) {
-        Some(child) => child.kill().is_ok(),
-        None => false,
+pub fn destroy_handle(handle: i64, force: bool) -> bool {
+    let Some(child) = child_for(handle) else {
+        return false;
+    };
+    if let Some(mut child) = child.try_lock() {
+        return child.kill().is_ok();
     }
+    // The child's mutex is held, which can only be a thread inside
+    // `Child::wait()` — and with the real JDK's `ProcessImpl` that is the
+    // normal state, not a race: its constructor puts a reaper thread there for
+    // every child it spawns. Blocking for the lock would mean waiting for the
+    // very exit we are trying to cause.
+    //
+    // Signalling by pid is safe *because* the lock is held: an unreturned
+    // `wait()` means the child has not been reaped, so the pid is still the
+    // child's and cannot have been recycled onto some unrelated process.
+    signal_pid(pid_for_handle(handle), force)
+}
+
+/// Send a termination signal straight to a pid.
+///
+/// Only ever called with a pid that is provably un-reaped — see
+/// [`destroy_handle`], which is the only caller. `SIGKILL` for a forcible
+/// destroy, `SIGTERM` otherwise, matching what `Child::kill` and HotSpot's
+/// `ProcessHandleImpl.destroy0` send.
+#[cfg(unix)]
+fn signal_pid(pid: i64, force: bool) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+    // SAFETY: `kill` takes two integers and touches no memory the caller owns.
+    unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
+}
+
+#[cfg(not(unix))]
+fn signal_pid(_pid: i64, _force: bool) -> bool {
+    // No portable equivalent without a Win32 OpenProcess/TerminateProcess pair,
+    // and the case that needs it — the real `ProcessImpl` reaper holding the
+    // child — is Linux-only, since `forkAndExec` is.
+    false
 }
 
 /// Look up the captured pid for a live-or-recently-exited handle.
@@ -1249,91 +1432,247 @@ fn native_process_impl_create(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
 }
 
-/// `java.lang.UNIXProcess.forkAndExec(mode, helperpath, prog, argBlock, argc, envBlock, envc, dir, std_fds, redirectErrorStream) -> int`
+/// `java.lang.ProcessImpl.forkAndExec(int mode, byte[] helperpath, byte[] prog,
+/// byte[] argBlock, int argc, byte[] envBlock, int envc, byte[] dir,
+/// int[] fds, boolean redirectErrorStream) -> int` (the child's pid)
 ///
-/// Linux/macOS equivalent of `ProcessImpl.create`.  Returns a pid.
-/// Same behavior as the Windows variant — we route through `spawn_and_wrap`.
+/// The spawn entry point of the REAL JDK's Linux `ProcessImpl`, and therefore
+/// of every `ProcessBuilder.start()` / `Runtime.exec` on this platform once the
+/// VM stops shadowing `start()`. Three things hang off one call:
+///
+/// * the returned **pid** becomes `ProcessImpl.pid`, and
+///   `ProcessHandleImpl.completion(pid, true)` — started by the constructor
+///   immediately after — blocks the reaper thread in `waitForProcessExit0` with
+///   it. That is the whole reason [`handle_for_pid`] exists.
+/// * the **`int[] fds`** is the only channel by which the child's pipes reach
+///   `initStreams`.
+/// * a thrown `IOException` is how an unspawnable command is reported;
+///   `spawn_child` already raises one.
+///
+/// # The `fds` in/out contract
+///
+/// From the JDK's own javadoc on this method: "On input, a value of -1 means to
+/// create a pipe to connect child and parent processes. On output, a value
+/// which is not -1 is the parent pipe fd corresponding to the pipe which has
+/// been created. An element of this array is -1 on input if and only if it is
+/// *not* -1 on output."
+///
+/// Writing the array back is not bookkeeping — it is load-bearing. A native
+/// that spawns the child correctly and leaves the array alone hands the caller
+/// a live process whose `getInputStream`/`getOutputStream`/`getErrorStream` are
+/// all `ProcessBuilder.Null*Stream`, because `initStreams` reads -1 for every
+/// slot and takes the null branch. That failure looks like a hung or mute
+/// child, not like a missing write-back.
+///
+/// A non-(-1) input is a descriptor the caller already owns, and the values are
+/// **`FdTable` ids, not OS descriptors** — the JDK obtains them with
+/// `fdAccess.get(fis.getFD())`, and in this VM a `FileInputStream`'s `fd.fd`
+/// holds an `FdTable` id (see `fos_get_fd`). Ids 0, 1 and 2 are permanently the
+/// VM's own stdin/stdout/stderr (`FileDescriptorTable::new` seeds them and the
+/// counter starts at 3), and those are precisely the values `Redirect.INHERIT`
+/// writes into slots 0, 1 and 2 — so "inherit" and "this descriptor" name the
+/// same three streams and cannot be confused for one another.
 #[cfg(target_os = "linux")]
-fn native_unix_fork_and_exec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // UNIXProcess encodes the argv as a null-separated byte block.
-    // args[2] = prog (byte[]), args[3] = argBlock (byte[]),
-    // args[5] = envBlock (byte[] — can be null).
-    //
-    // Since we route through `std::process::Command` which uses real
-    // argv arrays, we decode the byte-block form back to strings.
-    fn decode_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
-        // AUDIT 2026-05-24: bulk read via NativeContext intrinsic
-        // instead of per-element `get_array_element`. Single memcpy
-        // from the heap byte[] payload.
-        let len = ctx.array_length(arr);
-        let mut out = vec![0u8; len];
-        let n = ctx.read_byte_array_into(arr, 0, &mut out);
-        out.truncate(n);
-        out
-    }
-    let prog_bytes = match args.get(2) {
-        Some(Value::Object(Some(arr))) => decode_byte_array(ctx, *arr),
-        _ => return Ok(Some(Value::Int(-1))),
+fn native_process_impl_fork_and_exec(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // `forkAndExec` is an INSTANCE method (`private native int forkAndExec`),
+    // so args[0] is the `ProcessImpl` under construction and every declared
+    // parameter sits one slot to the right of its declaration index. The dead
+    // `java.lang.UNIXProcess` registration this replaces decoded from index 0,
+    // i.e. off by one throughout; the class has not existed since JDK 9, so
+    // nothing ever called it and the error had no way to surface.
+    const A_PROG: usize = 3;
+    const A_ARGBLOCK: usize = 4;
+    const A_ARGC: usize = 5;
+    const A_ENVBLOCK: usize = 6;
+    const A_ENVC: usize = 7;
+    const A_DIR: usize = 8;
+    const A_FDS: usize = 9;
+    const A_REDIRECT_ERR: usize = 10;
+
+    let prog_bytes = match args.get(A_PROG) {
+        Some(Value::Object(Some(arr))) => read_byte_array(ctx, *arr),
+        _ => {
+            return Err(RuntimeError::IOException {
+                message: "ProcessImpl.forkAndExec: null program".to_string(),
+            }
+            .into())
+        }
     };
-    let arg_block_bytes = match args.get(3) {
-        Some(Value::Object(Some(arr))) => decode_byte_array(ctx, *arr),
+    let program = decode_c_string(&prog_bytes);
+
+    let argc = int_arg(args, A_ARGC).max(0) as usize;
+    let arg_list = match args.get(A_ARGBLOCK) {
+        Some(Value::Object(Some(arr))) => {
+            let block = read_byte_array(ctx, *arr);
+            split_nul_block(&block, argc)
+        }
         _ => Vec::new(),
     };
-    let env_block_bytes = match args.get(5) {
-        Some(Value::Object(Some(arr))) => Some(decode_byte_array(ctx, *arr)),
+
+    let envc = int_arg(args, A_ENVC).max(0) as usize;
+    let env_vars: Option<Vec<(String, String)>> = match args.get(A_ENVBLOCK) {
+        Some(Value::Object(Some(arr))) => {
+            let block = read_byte_array(ctx, *arr);
+            Some(
+                split_nul_block(&block, envc)
+                    .into_iter()
+                    .filter_map(|entry| {
+                        entry
+                            .split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                    })
+                    .collect(),
+            )
+        }
+        // A null envBlock means "inherit this process's environment", which is
+        // `clear_env = false` and no explicit vars.
         _ => None,
     };
 
-    // Strip trailing null byte from prog name if present.
-    let program = {
-        let trimmed: &[u8] = prog_bytes.strip_suffix(&[0u8]).unwrap_or(&prog_bytes[..]);
-        String::from_utf8_lossy(trimmed).into_owned()
-    };
-    // argBlock is NUL-separated.
-    let args_vec: Vec<String> = arg_block_bytes
-        .split(|&b| b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).into_owned())
-        .collect();
-    let env_vars: Option<Vec<(String, String)>> = env_block_bytes.map(|b| {
-        b.split(|&c| c == 0)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| {
-                let text = String::from_utf8_lossy(s);
-                text.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect()
-    });
-    let work_dir = match args.get(7) {
+    let work_dir = match args.get(A_DIR) {
         Some(Value::Object(Some(arr))) => {
-            let bytes = decode_byte_array(ctx, *arr);
-            let trimmed: &[u8] = bytes.strip_suffix(&[0u8]).unwrap_or(&bytes[..]);
-            Some(String::from_utf8_lossy(trimmed).into_owned())
+            let bytes = read_byte_array(ctx, *arr);
+            Some(decode_c_string(&bytes))
         }
         _ => None,
     };
 
-    // forkAndExec's last arg is redirectErrorStream (boolean).
-    let redirect_err = matches!(args.get(9), Some(Value::Int(v)) if *v != 0);
-    let result = spawn_and_wrap(
+    let redirect_err = int_arg(args, A_REDIRECT_ERR) != 0;
+
+    // --- Decode the requested stdio shape from `fds` -----------------------
+    let fds_array = match args.get(A_FDS) {
+        Some(Value::Object(Some(arr))) => Some(*arr),
+        _ => None,
+    };
+    let mut requested = [-1i32; 3];
+    if let Some(arr) = fds_array {
+        let len = ctx.array_length(arr).min(3);
+        for (slot, want) in requested.iter_mut().enumerate().take(len) {
+            if let Value::Int(v) = ctx.get_array_element(arr, slot) {
+                *want = v;
+            }
+        }
+    }
+    let redirects = ProcessRedirects {
+        stdin: redirect_from_requested_fd(0, requested[0]),
+        stdout: redirect_from_requested_fd(1, requested[1]),
+        stderr: redirect_from_requested_fd(2, requested[2]),
+    };
+
+    let spawned = spawn_child(
         ctx,
         &program,
-        &args_vec,
+        &arg_list,
         work_dir.as_deref(),
         env_vars.as_deref(),
         env_vars.is_some(),
         redirect_err,
+        &redirects,
     )?;
-    match result {
-        Some(Value::Object(Some(proc_ref))) => {
-            let pid = match ctx.get_field(proc_ref, PROC_FIELD_PID) {
-                Value::Long(p) => p as i32,
-                _ => -1,
-            };
-            Ok(Some(Value::Int(pid)))
+
+    // --- Write the parent-side pipe ids back -------------------------------
+    //
+    // `spawn_child` reports -1 for any slot it did not pipe, which is exactly
+    // the value `initStreams` reads as "no pipe, use the null stream". So the
+    // write-back is unconditional per slot: a slot the caller supplied a
+    // descriptor for was not piped, gets -1, and satisfies the "-1 on output
+    // iff not -1 on input" half of the contract for free.
+    //
+    // One documented departure: under `redirectErrorStream` the child's stderr
+    // is merged into the stdout pipe here rather than dup2'd in the child, so
+    // slot 2 is -1 on input AND on output. That breaks the letter of the "iff",
+    // and the observable consequence is the intended one — `getErrorStream()`
+    // returns `NullInputStream`, which is what a merged stream means. HotSpot
+    // reaches the same observable state by creating a stderr pipe nothing ever
+    // writes to.
+    if let Some(arr) = fds_array {
+        let parent_side = [
+            spawned.fds.stdin_fd,
+            spawned.fds.stdout_fd,
+            spawned.fds.stderr_fd,
+        ];
+        let len = ctx.array_length(arr).min(3);
+        for (slot, value) in parent_side.iter().enumerate().take(len) {
+            ctx.set_array_element(arr, slot, Value::Int(*value));
         }
-        _ => Ok(Some(Value::Int(-1))),
+    }
+
+    if pb_debug_enabled() {
+        eprintln!(
+            "[PB-FORKEXEC] pid={} requested={:?} returned={:?}",
+            spawned.pid,
+            requested,
+            [
+                spawned.fds.stdin_fd,
+                spawned.fds.stdout_fd,
+                spawned.fds.stderr_fd
+            ]
+        );
+    }
+
+    Ok(Some(Value::Int(spawned.pid as i32)))
+}
+
+/// Map one `fds[slot]` input value to the redirect it asks for.
+///
+/// See the contract note on [`native_process_impl_fork_and_exec`]: -1 asks for
+/// a pipe, the slot's own index names the VM's corresponding standard stream
+/// (which is what `Redirect.INHERIT` encodes), and anything else is an
+/// `FdTable` id the caller opened.
+#[cfg(target_os = "linux")]
+fn redirect_from_requested_fd(slot: usize, requested: i32) -> StdioRedirect {
+    if requested == -1 {
+        StdioRedirect::Pipe
+    } else if requested == slot as i32 {
+        StdioRedirect::Inherit
+    } else {
+        StdioRedirect::ExistingFd(requested)
+    }
+}
+
+/// Read a Java `byte[]` in one bulk copy.
+///
+/// AUDIT 2026-05-24: bulk read via the `NativeContext` intrinsic rather than
+/// per-element `get_array_element` — a single memcpy from the heap payload.
+fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
+    let len = ctx.array_length(arr);
+    let mut out = vec![0u8; len];
+    let n = ctx.read_byte_array_into(arr, 0, &mut out);
+    out.truncate(n);
+    out
+}
+
+/// Decode one NUL-terminated string from a JDK `toCString` byte array.
+fn decode_c_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Split a JDK arg/env block: exactly `count` NUL-terminated strings, laid end
+/// to end (`ProcessImpl.start` builds them with `arraycopy` and relies on the
+/// array being zero-filled, so there is a NUL after each one including the
+/// last).
+///
+/// `count` comes from the `argc`/`envc` parameter and is not inferred. The
+/// previous decoder split on NUL and dropped every empty piece, which also
+/// drops a legitimately empty argument — `new ProcessBuilder("printf", "[%s]",
+/// "")` would have lost its last argument and printed one field instead of two.
+fn split_nul_block(bytes: &[u8], count: usize) -> Vec<String> {
+    bytes
+        .split(|&b| b == 0)
+        .take(count)
+        .map(|piece| String::from_utf8_lossy(piece).into_owned())
+        .collect()
+}
+
+/// Read an `int`/`boolean` argument, defaulting to 0 when absent or not an int.
+fn int_arg(args: &[Value], index: usize) -> i32 {
+    match args.get(index) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
     }
 }
 
@@ -1391,9 +1730,17 @@ fn native_proc_handle_current_pid0(
 
 /// `java.lang.ProcessHandleImpl.isAlive0(long) -> long`
 ///
-/// Returns the start-time of the process (or 0 if dead) in HotSpot's
-/// spec; our simplified implementation returns 1 if alive, 0 if dead.
-/// JDK code checks `> 0`.
+/// The `long` returned is a start-time, not a boolean: `ProcessHandleImpl`
+/// reads it as `STARTTIME_PROCESS_UNKNOWN` (-1) for "no such process",
+/// `STARTTIME_ANY` (0) for "exists, start time unavailable", and any positive
+/// value as the start time itself. We have no cheap start time, so alive is
+/// reported as the constant 1 — `isAlive()` compares it against the value it
+/// cached at construction, and a constant compares equal to itself.
+///
+/// The distinction between 0 and -1 is load-bearing. Returning 0 for a process
+/// that does not exist reads as "exists, unknown start time"; the reaper's
+/// `NOT_A_CHILD` fallback loop spins `while (startTime >= 0)` and would never
+/// leave it.
 fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let pid = match args.first() {
         Some(Value::Long(p)) => *p,
@@ -1437,6 +1784,11 @@ fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 /// `java.lang.ProcessHandleImpl.waitForProcessExit0(long, boolean) -> int`
+///
+/// This is the native the real JDK's per-process reaper thread blocks in —
+/// `ProcessImpl`'s constructor ends in `ProcessHandleImpl.completion(pid, true)`,
+/// and everything the JDK later reports about the child (`waitFor`,
+/// `exitValue`, `isAlive`, `onExit`) is settled by what this returns.
 fn native_proc_handle_wait_for_process_exit0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1447,9 +1799,38 @@ fn native_proc_handle_wait_for_process_exit0(
         _ => return Ok(Some(Value::Int(-1))),
     };
     // A pid we did not spawn cannot be waited for: `wait(2)` only works on
-    // one's own children. -1 is what the JDK's own native reports there.
+    // one's own children. That is not an error, and it is not an exit status —
+    // it is a specific answer the JDK asks for by name:
+    //
+    //     int exitValue = waitForProcessExit0(pid, shouldReap);
+    //     if (exitValue == NOT_A_CHILD) {
+    //         // pid not alive or not a child of this process
+    //         // If it is alive wait for it to terminate
+    //         long startTime = isAlive0(pid);
+    //         while (startTime >= 0) { Thread.sleep(..); startTime = isAlive0(pid); }
+    //         exitValue = 0;
+    //     }
+    //     newCompletion.complete(exitValue);
+    //
+    // Anything else is taken at face value, so the -1 that used to stand here
+    // completed `ProcessHandle.of(pid).onExit()` IMMEDIATELY, with a fabricated
+    // exit status of -1, for a process that was still running. HotSpot's own
+    // native returns `NOT_A_CHILD` on `ECHILD` for exactly this case.
+    //
+    // Measured with `probes/ForeignHandleProbe.java`, whose subject is a
+    // grandchild (`sh` forks it and exits, so it is reparented and `waitpid`
+    // gives ECHILD). Bounding the wait at 400ms against a process that lives 30s:
+    //
+    //   HotSpot 25   onExitWaitsWhileAlive=still-waiting
+    //   before       onExitWaitsWhileAlive=completed-while-alive
+    //   after        onExitWaitsWhileAlive=still-waiting
+    //
+    // The fallback then depends on `isAlive0` answering for a pid we did not
+    // spawn, which `foreign_pid_is_alive` does; without that this would trade a
+    // wrong answer for a hang, so the probe waits on the future after the
+    // process really dies rather than only checking that it does not complete.
     let Some(handle) = handle_for_pid(pid) else {
-        return Ok(Some(Value::Int(-1)));
+        return Ok(Some(Value::Int(PROCESS_NOT_A_CHILD)));
     };
     ctx.begin_blocking_region();
     let code = wait_for_handle(handle);
@@ -2770,12 +3151,18 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         native_process_impl_create,
     );
 
+    // `java.lang.UNIXProcess` was the pre-JDK-9 name of this class and is not
+    // on any supported image, so the registration that used to sit here could
+    // never resolve. `ProcessImpl.forkAndExec` is the live one, and it is a
+    // genuine §1.5 bridge: `ACC_NATIVE` on the image, and a subprocess cannot
+    // be created from bytecode.
     #[cfg(target_os = "linux")]
-    registry.register(
-        "java/lang/UNIXProcess",
+    registry.register_with_kind(
+        "java/lang/ProcessImpl",
         "forkAndExec",
-        "(I[B[B[BI[BI[BZ)I",
-        native_unix_fork_and_exec,
+        "(I[B[B[BI[BI[B[IZ)I",
+        native_process_impl_fork_and_exec,
+        NativeKind::Bridge,
     );
 
     // ProcessHandleImpl family — ProcessHandle.current() / Process.pid()
@@ -2904,6 +3291,23 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // registration every one of these raised NoSuchMethodError on the
     // objects `spawn_and_wrap` actually creates.
     for proc_cls in ["java/lang/Process", SYNTHETIC_PROCESS_CLASS] {
+        // `cratonvm/synthetic/Process` is a class no image contains and this VM
+        // mints, so by the contract's own definition every registration on it
+        // is a `SyntheticStub`, not a `Bridge` — §1.5 defines a bridge as what
+        // an `ACC_NATIVE` method on the image binds to, and there is no image
+        // method here to bind to. `Bridge` was what kept them alive under
+        // `--jdk-only`, which is the outcome §5 forbids: strict mode must not
+        // reach a fabricated class at all. Restated as stubs, strict mode drops
+        // them at registration and `java.lang.ProcessImpl` answers instead.
+        //
+        // The `java/lang/Process` half of this loop keeps the ambient `Bridge`:
+        // those 13 rows are a different question (§1.4 shadows of real
+        // bytecode, or abstract declarations every real subclass overrides) and
+        // are adjudicated in their own record.
+        let __loop_cat = registry.current_category();
+        if proc_cls == SYNTHETIC_PROCESS_CLASS {
+            registry.set_category(NativeKind::SyntheticStub);
+        }
         registry.register(proc_cls, "waitFor", "()I", native_process_wait_for);
         registry.register(
             proc_cls,
@@ -2968,7 +3372,14 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/util/concurrent/CompletableFuture;",
             native_process_on_exit,
         );
+        registry.set_category(__loop_cat);
     }
+
+    // The remaining fabricated-receiver rows, for the same reason as the loop
+    // above: `ProcessExitWaiter`, `ProcessPipeInputStream` and
+    // `ProcessPipeOutputStream` are all classes this VM mints.
+    let __synthetic_cat = registry.current_category();
+    registry.set_category(NativeKind::SyntheticStub);
     // Runnable body of the reaper thread `onExit()` starts for a live child.
     registry.register(
         SYNTHETIC_PROCESS_EXIT_WAITER,
@@ -3051,14 +3462,30 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "()[B",
         crate::native_is_read_all_bytes,
     );
+    registry.set_category(__synthetic_cat);
 
-    // ProcessBuilder.start — route through the real spawn path.  This
-    // overrides the synthetic stub from phases_late.
-    registry.register(
+    // ProcessBuilder.start — route through the real spawn path. This is the
+    // registration that wins the slot (the census names this line), so it is
+    // the one that decides what `start()` returns in every mode.
+    //
+    // `SyntheticStub`, stated, and the tag is the whole point. `start()` is
+    // ordinary bytecode on the image — `acc_native: false, has_code: true` in
+    // the adjudication — so by §1.4 the real method outranks any bridge, and
+    // calling this a bridge is what let a fabricated `cratonvm/synthetic/Process`
+    // escape into `--jdk-only`. Restated, strict mode drops it, the JDK's own
+    // `start()` runs, and it builds a real `java.lang.ProcessImpl` through
+    // `ProcessImpl.forkAndExec` (this crate, above).
+    //
+    // Default `--real-jdk` (compatible) mode is deliberately unchanged: the
+    // registration survives there and still shadows `start()`. Compatible mode
+    // keeps the VM's own process object, strict mode gets the JDK's — which is
+    // exactly the difference the two modes are for.
+    registry.register_with_kind(
         "java/lang/ProcessBuilder",
         "start",
         "()Ljava/lang/Process;",
         native_process_builder_start,
+        NativeKind::SyntheticStub,
     );
     registry.set_category(__prev_cat);
 }
@@ -3248,7 +3675,9 @@ mod tests {
     fn install_child_for_test(child: Child) -> (i64, i64) {
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         let pid = child.id() as i64;
-        process_table().lock().insert(handle, child);
+        process_table()
+            .lock()
+            .insert(handle, Arc::new(Mutex::new(child)));
         exit_cache().lock().insert(
             handle,
             ExitCache {
@@ -3257,6 +3686,176 @@ mod tests {
             },
         );
         (handle, pid)
+    }
+
+    /// The two ids are different numbers, and a `ProcessHandleImpl` native
+    /// handed the pid must still find the child.
+    #[test]
+    #[cfg(unix)]
+    fn a_real_pid_resolves_to_its_table_handle() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let (handle, pid) = install_child_for_test(child);
+        assert_ne!(
+            handle, pid,
+            "handle is a counter and pid is the OS's; a test where they \
+             coincide would pass for the wrong reason"
+        );
+
+        assert_eq!(handle_for_pid(pid), Some(handle), "by pid");
+
+        // `isAlive0` answers a START TIME, not a boolean: >= 0 is alive and -1
+        // is the only way to say otherwise. 0 is the JDK's "alive, start time
+        // unknown".
+        let alive =
+            native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
+                .unwrap();
+        assert_eq!(alive, Some(Value::Long(0)), "alive, start time unknown");
+
+        destroy_handle(handle, true);
+        let code = wait_for_handle(handle);
+        assert!(code != 0, "killed child should not report success: {code}");
+
+        let dead =
+            native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
+                .unwrap();
+        assert_eq!(dead, Some(Value::Long(-1)), "exited, by pid");
+    }
+
+    /// `argc`/`envc` are passed for a reason: an empty argument is an
+    /// argument.
+    ///
+    /// The block is `count` NUL-terminated strings laid end to end, so the
+    /// split yields a trailing empty piece that is NOT an argument, and an
+    /// empty argument in the middle that IS one. Dropping every empty piece —
+    /// what the decoder did before — gets both wrong in the same direction.
+    #[test]
+    fn a_nul_block_keeps_empty_arguments_and_drops_the_trailer() {
+        // `sh -c 'printf [%s] "$1" "$2"' sh "" z` — argv[2] is deliberately "".
+        let block = b"sh\0\0z\0";
+        assert_eq!(
+            split_nul_block(block, 3),
+            vec!["sh".to_string(), String::new(), "z".to_string()],
+        );
+        // Asking for fewer than the block holds takes a prefix, never a scan
+        // for a terminator that is not there.
+        assert_eq!(split_nul_block(block, 1), vec!["sh".to_string()]);
+        assert!(split_nul_block(b"", 0).is_empty());
+    }
+
+    /// `toCString` output is NUL-terminated; the terminator is not part of the
+    /// string, and neither is anything the JDK left in the tail.
+    #[test]
+    fn a_c_string_stops_at_its_terminator() {
+        assert_eq!(decode_c_string(b"/bin/sh\0"), "/bin/sh");
+        assert_eq!(decode_c_string(b"/bin/sh\0junk"), "/bin/sh");
+        assert_eq!(decode_c_string(b"/bin/sh"), "/bin/sh", "no terminator");
+        assert_eq!(decode_c_string(b"\0"), "");
+    }
+
+    /// The three `fds[i]` input cases, and why the middle one is unambiguous.
+    ///
+    /// `Redirect.INHERIT` puts the slot's own index in the slot, and fd-table
+    /// ids 0/1/2 are permanently the VM's own standard streams with the
+    /// counter starting at 3 — so `fds[1] == 1` can only ever mean "stdout",
+    /// whichever way you read it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_requested_fd_maps_to_pipe_inherit_or_an_existing_descriptor() {
+        assert!(matches!(
+            redirect_from_requested_fd(0, -1),
+            StdioRedirect::Pipe
+        ));
+        assert!(matches!(
+            redirect_from_requested_fd(1, 1),
+            StdioRedirect::Inherit
+        ));
+        assert!(matches!(
+            redirect_from_requested_fd(2, 2),
+            StdioRedirect::Inherit
+        ));
+        // A file redirect: the JDK opened it and handed us its table id.
+        assert!(matches!(
+            redirect_from_requested_fd(1, 7),
+            StdioRedirect::ExistingFd(7)
+        ));
+        // The slot index is compared against ITS OWN slot, so id 0 in the
+        // stdout slot is a descriptor, not an inherit.
+        assert!(matches!(
+            redirect_from_requested_fd(1, 0),
+            StdioRedirect::ExistingFd(0)
+        ));
+    }
+
+    /// `destroy` must still reach a child that a `waitFor` is blocked on.
+    ///
+    /// The real JDK's `ProcessImpl` puts a reaper thread into
+    /// `waitForProcessExit0` for every child it spawns, so this is the normal
+    /// state rather than a race. Before the table held the child behind its own
+    /// mutex, the waiter took it out and `destroy` silently did nothing.
+    #[test]
+    #[cfg(unix)]
+    fn destroy_reaches_a_child_a_waiter_is_blocked_on() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let (handle, _pid) = install_child_for_test(child);
+
+        let waiter = std::thread::spawn(move || wait_for_handle(handle));
+        // Give the waiter time to actually be inside `Child::wait()`. If it is
+        // not yet, `destroy_handle` takes the fast path and the test still
+        // asserts the thing that matters — that the child dies.
+        std::thread::sleep(Duration::from_millis(200));
+
+        assert!(destroy_handle(handle, true), "destroy must report success");
+        let code = waiter.join().expect("waiter thread");
+        assert_eq!(code, 128 + 9, "SIGKILL is reported as 128+signum");
+    }
+
+    /// A pid we never spawned resolves to nothing, and the bridge says so
+    /// rather than reaching into the table with it.
+    ///
+    /// The literal -2 is written out on purpose: it is the value
+    /// `ProcessHandleImpl.completion` compares against, so a test that spelled
+    /// it `PROCESS_NOT_A_CHILD` on both sides would pass no matter what the
+    /// constant was changed to.
+    #[test]
+    fn an_unspawned_pid_resolves_to_no_handle() {
+        let foreign = 0x7fff_0000i64; // far above any pid this host will mint
+        assert_eq!(handle_for_pid(foreign), None);
+        let mut ctx = MockNativeContext::new();
+        let rc =
+            native_proc_handle_wait_for_process_exit0(&mut ctx, &[Value::Long(foreign)]).unwrap();
+        assert_eq!(rc, Some(Value::Int(-2)), "NOT_A_CHILD, not an exit status");
+        assert_eq!(
+            native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(foreign), Value::Int(1)])
+                .unwrap(),
+            Some(Value::Int(0)),
+            "and must not signal it"
+        );
+    }
+
+    /// The VM's own pid must read as alive: `ProcessHandleImpl.<clinit>` seeds
+    /// `current` with `isAlive0(getCurrentPid0())`, and -1 there would make the
+    /// VM report its own process as nonexistent.
+    #[test]
+    fn the_current_process_is_alive_by_its_real_pid() {
+        let mut ctx = MockNativeContext::new();
+        let self_pid = std::process::id() as i64;
+        assert_eq!(
+            native_proc_handle_is_alive0(&mut ctx, &[Value::Long(self_pid)]).unwrap(),
+            Some(Value::Long(0)),
+            "alive, start time unknown"
+        );
     }
 
     /// A receiver shaped AND named like one of the VM's own process objects.
@@ -3498,14 +4097,19 @@ mod tests {
         let (handle, pid) = install_child_for_test(child);
         let mut ctx = MockNativeContext::new();
 
-        // A pid we never spawned cannot be waited for.
+        // A pid we never spawned cannot be waited for, and the way to say so
+        // is `NOT_A_CHILD` (-2), not -1. This assertion read -1 when it was
+        // written; -1 is a value `ProcessHandleImpl.completion` hands the
+        // caller as the process's exit status, so it completed
+        // `ProcessHandle.of(pid).onExit()` immediately for a live process.
+        // See `probes/ForeignHandleProbe.java`.
         let unknown = native_proc_handle_wait_for_process_exit0(
             &mut ctx,
             &[Value::Long(pid + 4_000_000), Value::Int(0)],
         )
         .unwrap()
         .unwrap();
-        assert_eq!(unknown, Value::Int(-1));
+        assert_eq!(unknown, Value::Int(-2));
 
         let killed =
             native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(pid), Value::Int(1)])
@@ -3520,7 +4124,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(
-            matches!(code, Value::Int(c) if c != -1),
+            matches!(code, Value::Int(c) if c != -1 && c != -2),
             "waitForProcessExit0 must find the child by pid, got {code:?}"
         );
 
@@ -3551,7 +4155,9 @@ mod tests {
 
         let handle = 42424242i64;
         let pid = child.id() as i64;
-        process_table().lock().insert(handle, child);
+        process_table()
+            .lock()
+            .insert(handle, Arc::new(Mutex::new(child)));
         exit_cache().lock().insert(
             handle,
             ExitCache {
@@ -3593,7 +4199,9 @@ mod tests {
         };
         let handle = 42424243i64;
         let pid = child.id() as i64;
-        process_table().lock().insert(handle, child);
+        process_table()
+            .lock()
+            .insert(handle, Arc::new(Mutex::new(child)));
         exit_cache().lock().insert(
             handle,
             ExitCache {
@@ -3775,7 +4383,9 @@ mod tests {
 
         let handle = 42424244i64;
         let pid = child.id() as i64;
-        process_table().lock().insert(handle, child);
+        process_table()
+            .lock()
+            .insert(handle, Arc::new(Mutex::new(child)));
         exit_cache().lock().insert(
             handle,
             ExitCache {
