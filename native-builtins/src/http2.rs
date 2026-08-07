@@ -1104,7 +1104,7 @@ fn redirect_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::e
     crate::phases_late::p57_alloc_enum(ctx, "java/net/http/HttpClient$Redirect", name, ordinal)
 }
 
-fn register_http_client(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_http_client(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpClient";
@@ -1413,14 +1413,14 @@ fn register_http_client(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
 // 2. java.net.http.HttpClient$Builder
 // ---------------------------------------------------------------------------
 
-fn register_http_client_builder(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_http_client_builder(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpClient$Builder";
@@ -1614,14 +1614,14 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) -> Result<(), Meth
         Ok(Some(Value::Object(Some(client))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
 // 3. java.net.http.HttpRequest
 // ---------------------------------------------------------------------------
 
-fn register_http_request(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_http_request(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest";
@@ -1757,14 +1757,14 @@ fn register_http_request(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
         Ok(Some(Value::Object(Some(opt))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
 // 4. java.net.http.HttpRequest$Builder
 // ---------------------------------------------------------------------------
 
-fn register_http_request_builder(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_http_request_builder(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest$Builder";
@@ -1992,14 +1992,14 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) -> Result<(), Met
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
 // 5. java.net.http.HttpResponse
 // ---------------------------------------------------------------------------
 
-fn register_http_response(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_http_response(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpResponse";
@@ -2125,7 +2125,7 @@ fn register_http_response(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
         Ok(Some(Value::Object(Some(opt))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2268,7 +2268,7 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
 // 7. java.net.http.HttpRequest$BodyPublisher
 // ---------------------------------------------------------------------------
 
-fn register_body_publisher(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_body_publisher(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest$BodyPublisher";
@@ -2394,7 +2394,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) -> Result<(), MethodCal
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Process-wide map from BodySubscriber identity → downstream Flow.Subscriber.
@@ -2427,7 +2427,7 @@ fn body_subscriber_demand() -> &'static parking_lot::Mutex<std::collections::Has
 // 8. java.net.http.HttpResponse$BodyHandlers
 // ---------------------------------------------------------------------------
 
-fn register_body_handlers(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_body_handlers(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bhs = "java/net/http/HttpResponse$BodyHandlers";
@@ -2498,7 +2498,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------

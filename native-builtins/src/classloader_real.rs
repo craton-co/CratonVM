@@ -341,7 +341,7 @@ pub(crate) fn init_urlclassloader_constructor(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     urls: Value,
-) {
+) -> Result<(), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let urls_pin = match urls {
         Value::Object(Some(urls)) => Some((ctx.pin_native_root(urls), urls)),
@@ -349,7 +349,7 @@ pub(crate) fn init_urlclassloader_constructor(
     };
 
     let this = ctx.read_native_pin(this_pin, this);
-    init_classloader_common_fields(ctx, this);
+    init_classloader_common_fields(ctx, this)?;
     let this = ctx.read_native_pin(this_pin, this);
     init_urlclassloader_fields(ctx, this);
     let this = ctx.read_native_pin(this_pin, this);
@@ -362,6 +362,7 @@ pub(crate) fn init_urlclassloader_constructor(
         ctx.unpin_native_roots(pin);
     }
     ctx.unpin_native_roots(this_pin);
+    Ok(())
 }
 
 pub(crate) fn init_urlclassloader_constructor_with_parent(
@@ -369,9 +370,10 @@ pub(crate) fn init_urlclassloader_constructor_with_parent(
     this: ObjectRef,
     urls: Value,
     parent: Value,
-) {
+) -> Result<(), MethodCallFailed> {
     ctx.set_field_by_name(this, "parent", parent);
-    init_urlclassloader_constructor(ctx, this, urls);
+    init_urlclassloader_constructor(ctx, this, urls)?;
+    Ok(())
 }
 
 pub(crate) fn init_urlclassloader_constructor_with_default_parent(
@@ -382,7 +384,7 @@ pub(crate) fn init_urlclassloader_constructor_with_default_parent(
     let this_pin = ctx.pin_native_root(this);
     let parent = get_or_create_system_cl(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
-    init_urlclassloader_constructor_with_parent(ctx, this, urls, Value::Object(parent));
+    init_urlclassloader_constructor_with_parent(ctx, this, urls, Value::Object(parent))?;
     ctx.unpin_native_roots(this_pin);
     Ok(())
 }
@@ -392,7 +394,7 @@ pub(crate) fn init_urlclassloader_constructor_with_default_parent(
 /// These override the complex real-JDK constructors with minimal versions
 /// that just store the parent reference, and provide getParent() that reads
 /// it back.
-pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cl = "java/lang/ClassLoader";
@@ -410,7 +412,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
         // `init_classloader_common_fields`. Without this a subclass that
         // calls `defineClass` NPEs in `preDefineClass` on a null
         // `defaultDomain`.
-        init_classloader_common_fields(ctx, this);
+        init_classloader_common_fields(ctx, this)?;
         Ok(None)
     });
 
@@ -422,7 +424,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
         };
         let parent = args.get(1).copied().unwrap_or(Value::Object(None));
         ctx.set_field_by_name(this, "parent", parent);
-        init_classloader_common_fields(ctx, this);
+        init_classloader_common_fields(ctx, this)?;
         Ok(None)
     });
 
@@ -440,7 +442,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
-            init_classloader_common_fields(ctx, this);
+            init_classloader_common_fields(ctx, this)?;
             Ok(None)
         },
     );
@@ -647,7 +649,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
         // the jars/dirs are actually loadable — without this a custom
         // URLClassLoader (Tomcat's CommonClassLoader, ActiveMQ's launcher)
         // can never find its classes and throws ClassNotFoundException.
-        init_urlclassloader_constructor(ctx, this, urls);
+        init_urlclassloader_constructor(ctx, this, urls)?;
         Ok(None)
     });
     r.register(
@@ -662,7 +664,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "parent", parent);
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-            init_urlclassloader_constructor(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls)?;
             Ok(None)
         },
     );
@@ -686,7 +688,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             let parent = args.get(3).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
-            init_urlclassloader_constructor(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls)?;
             Ok(None)
         },
     );
@@ -702,7 +704,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
             let parent = args.get(2).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "parent", parent);
-            init_urlclassloader_constructor(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls)?;
             Ok(None)
         },
     );
@@ -720,7 +722,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             let parent = args.get(3).copied().unwrap_or(Value::Object(None));
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
-            init_urlclassloader_constructor(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls)?;
             Ok(None)
         },
     );
@@ -762,7 +764,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             let parent = get_or_create_system_cl(ctx)?;
             ctx.set_field_by_name(this, "parent", Value::Object(parent));
             ctx.set_field_by_name(this, "acc", acc);
-            init_urlclassloader_constructor(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls)?;
             Ok(None)
         },
     );
@@ -784,7 +786,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             ctx.set_field_by_name(this, "name", name);
             ctx.set_field_by_name(this, "parent", parent);
             ctx.set_field_by_name(this, "acc", acc);
-            init_urlclassloader_constructor(ctx, this, urls);
+            init_urlclassloader_constructor(ctx, this, urls)?;
             Ok(None)
         },
     );
@@ -867,7 +869,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// `ClassLoader.loadClass(String)` for real-JDK mode.

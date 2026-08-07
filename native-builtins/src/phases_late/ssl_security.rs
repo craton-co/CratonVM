@@ -1292,7 +1292,7 @@ fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
     f(entry);
 }
 
-pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // NEW-13: SSLContext = 5-field synthetic — see field layout constants.
@@ -1424,10 +1424,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
             };
             let this_now = scope.get(&this_h);
             let tms_now = tms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now);
+            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now)?;
             let this_now = scope.get(&this_h);
             let kms_now = kms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now);
+            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now)?;
             let ctx = &mut scope;
 
             // FIX (es-restclient-https): if the supplied TrustManager[] is
@@ -1507,7 +1507,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
                     kms_array,
                 );
             let this = ctx.get(&this_h);
-            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity);
+            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity)?;
             Ok(None)
         },
     );
@@ -2003,7 +2003,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         // handshakes before it returns the socket, so a listener added
         // afterwards has, correctly, missed it). Stock JSSE signals exactly
         // here; see `new13_fire_handshake_completed`.
-        new13_fire_handshake_completed(ctx, socket);
+        new13_fire_handshake_completed(ctx, socket)?;
         Ok(real_tls_id)
     }
 
@@ -2792,7 +2792,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         // never fire another event. Unconditional (not gated on `tls_id >= 0`
         // below) so a second close(), or a socket closed before it ever
         // handshaked, still releases them.
-        new13_drop_handshake_listeners(ctx, this);
+        new13_drop_handshake_listeners(ctx, this)?;
         let tls_id = new13_resolve_tls_id(ctx, this);
         if crate::nbflags().dbg_tls_sock {
             eprintln!(
@@ -4649,7 +4649,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Allocate a fresh SSLEngine with default field values.
@@ -4902,7 +4902,7 @@ fn x509_check_validity_at(
     Ok(None)
 }
 
-pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // CertificateFactory
@@ -5585,7 +5585,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) -> Result
         Ok(Some(Value::Object(Some(arr))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================

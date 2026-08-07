@@ -12441,7 +12441,7 @@ fn p52_isa_addr_value(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
     }
 }
 
-pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let isa = "java/net/InetSocketAddress";
@@ -12476,7 +12476,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             host,
             Value::Object(Some(addr_cur)),
             port,
-        );
+        )?;
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
@@ -12524,7 +12524,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             Value::Object(Some(host_cur)),
             addr,
             port,
-        );
+        )?;
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
@@ -12564,7 +12564,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             host_val,
             Value::Object(Some(addr_cur)),
             port,
-        );
+        )?;
         Ok(Some(Value::Object(None)))
     });
     r.register(
@@ -12587,7 +12587,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
                 Value::Object(Some(host_cur)),
                 Value::Object(None),
                 port,
-            );
+            )?;
             Ok(Some(Value::Object(Some(scope.get(&obj_h)))))
         },
     );
@@ -12751,7 +12751,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
@@ -12833,7 +12833,7 @@ fn phase52_socket_connect(
     }
 }
 
-pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sf = "javax/net/SocketFactory";
@@ -13024,7 +13024,7 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -17260,7 +17260,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
 /// `java.net` bytecode behind them, so they cannot exercise the real path, and
 /// with the synthetic path unregistered they were asserting against natives
 /// nothing would ever provide.
-pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
     use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
     use std::io::{Read as StdRead, Write as StdWrite};
     use std::net::TcpListener;
@@ -18527,7 +18527,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) -> Result<(
         });
     }
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------

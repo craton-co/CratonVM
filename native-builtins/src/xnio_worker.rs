@@ -1304,7 +1304,7 @@ fn alloc_stream_connection_for_tcp(
     ctx.set_field_by_name(conn, "sinkChannel", Value::Object(Some(sink_obj)));
     ctx.set_field_by_name(conn, "closeListener", Value::Object(Some(close_ref)));
     remember_stream_connection_addresses(ctx, conn, local_addr, peer_addr);
-    ensure_source_poller_started(ctx);
+    ensure_source_poller_started(ctx)?;
     let conn = ctx.read_native_pin(conn_pin, conn);
     ctx.unpin_native_roots(io_thread_pin);
     Ok(conn)
@@ -1843,7 +1843,7 @@ fn native_iot_open_tcp_stream_connection(
     ctx.set_field_by_name(conn, "sinkChannel", Value::Object(Some(sink_obj)));
     ctx.set_field_by_name(conn, "closeListener", Value::Object(Some(close_ref)));
     remember_stream_connection_addresses(ctx, conn, local_addr, peer_addr);
-    ensure_source_poller_started(ctx);
+    ensure_source_poller_started(ctx)?;
 
     // `ensure_source_poller_started` allocates and starts a thread — refresh
     // `conn` and each listener through their pins at dispatch time, and

@@ -6362,7 +6362,7 @@ pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls
 fn ucl_init_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-    crate::classloader_real::init_urlclassloader_constructor_with_default_parent(ctx, this, urls);
+    crate::classloader_real::init_urlclassloader_constructor_with_default_parent(ctx, this, urls)?;
     Ok(None)
 }
 
@@ -6370,7 +6370,7 @@ fn ucl_init_urls_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
     let parent = args.get(2).copied().unwrap_or(Value::Object(None));
-    crate::classloader_real::init_urlclassloader_constructor_with_parent(ctx, this, urls, parent);
+    crate::classloader_real::init_urlclassloader_constructor_with_parent(ctx, this, urls, parent)?;
     Ok(None)
 }
 

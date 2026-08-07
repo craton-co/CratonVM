@@ -1424,7 +1424,7 @@ pub(crate) fn p62_new_number_format(
 // ResourceBundle = 2-field (entries=0 HashMap, parent=1)
 // =============================================================================
 
-pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let rb = "java/util/ResourceBundle";
@@ -1529,7 +1529,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) -> Resu
         Ok(Some(Value::Object(Some(set))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Build a Java String[] from a Rust slice of &str.
@@ -2707,7 +2707,7 @@ pub(crate) mod break_iterator_sentence_boundary_tests {
     }
 }
 
-pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bi = "java/text/BreakIterator";
@@ -2861,7 +2861,7 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) -> Resul
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================

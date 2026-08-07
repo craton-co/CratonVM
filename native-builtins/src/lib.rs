@@ -11371,7 +11371,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(i)) => *i != 0,
                 _ => false,
             };
-            write_bytes(ctx, args, &[if v { 1 } else { 0 }]);
+            write_bytes(ctx, args, &[if v { 1 } else { 0 }])?;
             Ok(None)
         });
         registry.register(ba, "setChar", "([BIC)V", |ctx, args| {
@@ -11379,7 +11379,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(i)) => *i as u16,
                 _ => 0,
             };
-            write_bytes(ctx, args, &[(v >> 8) as u8, v as u8]);
+            write_bytes(ctx, args, &[(v >> 8) as u8, v as u8])?;
             Ok(None)
         });
         registry.register(ba, "setShort", "([BIS)V", |ctx, args| {
@@ -11387,7 +11387,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(i)) => *i as u16,
                 _ => 0,
             };
-            write_bytes(ctx, args, &[(v >> 8) as u8, v as u8]);
+            write_bytes(ctx, args, &[(v >> 8) as u8, v as u8])?;
             Ok(None)
         });
         registry.register(ba, "setUnsignedShort", "([BII)V", |ctx, args| {
@@ -11395,7 +11395,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Int(i)) => *i as u16,
                 _ => 0,
             };
-            write_bytes(ctx, args, &[(v >> 8) as u8, v as u8]);
+            write_bytes(ctx, args, &[(v >> 8) as u8, v as u8])?;
             Ok(None)
         });
         registry.register(ba, "setInt", "([BII)V", |ctx, args| {
@@ -11407,7 +11407,7 @@ pub fn register_essential_natives_with_shims(
                 ctx,
                 args,
                 &[(v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8],
-            );
+            )?;
             Ok(None)
         });
         registry.register(ba, "setFloat", "([BIF)V", |ctx, args| {
@@ -11425,7 +11425,7 @@ pub fn register_essential_natives_with_shims(
                     (bits >> 8) as u8,
                     bits as u8,
                 ],
-            );
+            )?;
             Ok(None)
         });
         registry.register(ba, "setFloatRaw", "([BIF)V", |ctx, args| {
@@ -11443,7 +11443,7 @@ pub fn register_essential_natives_with_shims(
                     (bits >> 8) as u8,
                     bits as u8,
                 ],
-            );
+            )?;
             Ok(None)
         });
         registry.register(ba, "setLong", "([BIJ)V", |ctx, args| {
@@ -11464,7 +11464,7 @@ pub fn register_essential_natives_with_shims(
                     (v >> 8) as u8,
                     v as u8,
                 ],
-            );
+            )?;
             Ok(None)
         });
         registry.register(ba, "setDouble", "([BID)V", |ctx, args| {
@@ -11486,7 +11486,7 @@ pub fn register_essential_natives_with_shims(
                     (bits >> 8) as u8,
                     bits as u8,
                 ],
-            );
+            )?;
             Ok(None)
         });
         registry.register(ba, "setDoubleRaw", "([BID)V", |ctx, args| {
@@ -11508,7 +11508,7 @@ pub fn register_essential_natives_with_shims(
                     (bits >> 8) as u8,
                     bits as u8,
                 ],
-            );
+            )?;
             Ok(None)
         });
     }
@@ -12859,7 +12859,7 @@ pub fn register_essential_natives_with_shims(
                 .ok()
                 .flatten()
                 .unwrap_or(Value::Object(None));
-            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader);
+            lang_class::populate_protection_domain_fields(ctx, pd, codesource, classloader)?;
             Ok(Some(Value::Object(Some(pd))))
         },
     );
@@ -20006,7 +20006,7 @@ pub fn register_essential_natives_with_shims(
     fn register_tzdb_offset_natives_for(
         registry: &mut NativeMethodRegistry,
         class_name: &'static str,
-    ) -> Result<(), MethodCallFailed> {
+    ) {
         registry.register(class_name, "getOffset", "(J)I", |ctx, args| {
             let this = match args.first() {
                 Some(Value::Object(Some(o))) => *o,
@@ -20082,7 +20082,7 @@ pub fn register_essential_natives_with_shims(
             let raw = crate::tzdb::raw_offset_seconds(ctx, &id).unwrap_or(0);
             Ok(Some(Value::Int(raw.saturating_mul(1000))))
         });
-    Ok(())
+    ()
 }
     register_tzdb_offset_natives_for(registry, "sun/util/calendar/ZoneInfo");
     register_tzdb_offset_natives_for(registry, "java/util/SimpleTimeZone");
@@ -32238,7 +32238,7 @@ mod base64_tests {
 
 pub(crate) const CHARSET_FIELD_NAME: usize = 0;
 
-fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_charset_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: Charset encode/decode (UTF-8 etc.) is spec-exact and matches
     // real JDK bytecode → Intrinsic.
     let __prev_cat = registry.current_category();
@@ -32966,7 +32966,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), M
         },
     );
     registry.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
@@ -39829,7 +39829,7 @@ fn parse_param_class_names(descriptor: &str) -> Vec<String> {
 // CompletableFuture, Executors, Formatter
 // ===========================================================================
 
-fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     // --- AtomicBoolean (1-field synthetic: value=0 Int) ---
     register_atomic_boolean_natives(registry);
 
@@ -40069,7 +40069,7 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) -> Res
     // where it used to live in `phases_early.rs`.
 
     // Note: CompletableFuture, Executors, Locale, Charset already registered in earlier phases;
-    Ok(())
+    ()
 }
 
 // ===========================================================================

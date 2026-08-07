@@ -315,7 +315,7 @@ fn native_option_clinit(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 /// Install every StackWalker boot-path native this module owns.
-pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
@@ -404,7 +404,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) -> Result
         NativeKind::Bridge,
     );
     registry.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` —

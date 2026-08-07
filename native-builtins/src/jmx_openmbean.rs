@@ -1557,7 +1557,7 @@ fn carrier_get(ctx: &mut dyn NativeContext, carrier: ObjectRef, key: &str) -> Va
     Value::Object(None)
 }
 
-fn register_open_data_carriers(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
     let cds = "javax/management/openmbean/CompositeDataSupport";
 
     // CompositeData.get(String) -> Object.
@@ -1735,7 +1735,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) -> Result<(), Metho
         };
         Ok(Some(Value::Int(empty as i32)))
     });
-    Ok(())
+    ()
 }
 
 /// Build a `TabularDataSupport`-shaped carrier with the given tabular type

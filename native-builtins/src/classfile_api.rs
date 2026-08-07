@@ -312,7 +312,7 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
 // MethodModel — 4-field synthetic
 // ---------------------------------------------------------------------------
 
-fn register_method_model(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_method_model(r: &mut NativeMethodRegistry) {
     let mm = "java/lang/classfile/MethodModel";
 
     r.register(
@@ -403,14 +403,14 @@ fn register_method_model(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
         let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
 // FieldModel — 3-field synthetic
 // ---------------------------------------------------------------------------
 
-fn register_field_model(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_field_model(r: &mut NativeMethodRegistry) {
     let fm = "java/lang/classfile/FieldModel";
 
     r.register(
@@ -477,14 +477,14 @@ fn register_field_model(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
         let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
 // CodeModel — 4-field synthetic
 // ---------------------------------------------------------------------------
 
-fn register_code_model(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_code_model(r: &mut NativeMethodRegistry) {
     let code = "java/lang/classfile/CodeModel";
 
     r.register(code, "maxStack", "()I", |ctx, args| {
@@ -525,7 +525,7 @@ fn register_code_model(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
         let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------

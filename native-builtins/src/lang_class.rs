@@ -19844,7 +19844,7 @@ pub(crate) fn native_class_get_protection_domain0(
     let pd = ctx.read_native_pin(pd_pin, pd);
     let cs = ctx.read_native_pin(cs_pin, cs);
     ctx.unpin_native_roots(url_pin);
-    populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader);
+    populate_protection_domain_fields(ctx, pd, Value::Object(Some(cs)), classloader)?;
 
     Ok(Some(Value::Object(Some(pd))))
 }

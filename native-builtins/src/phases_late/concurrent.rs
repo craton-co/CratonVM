@@ -24,7 +24,7 @@ use super::*;
 //   3 = task (Object: the original Callable/Runnable for lazy execution)
 // CompletableFuture = 3-field: result=0, done=1, exception=2
 // ---------------------------------------------------------------------------
-pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Callable<V> interface ---
@@ -1064,7 +1064,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) -> Result
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -1073,7 +1073,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) -> Result
 // CompletableFuture = 2-field synthetic (result=0, done=1)
 // =============================================================================
 
-pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cf = "java/util/concurrent/CompletableFuture";
@@ -1333,7 +1333,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) -> R
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> Result<ObjectRef, MethodCallFailed> {
@@ -2612,7 +2612,7 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
             ctx.set_field(subscription, 1, Value::Long(0));
             let this = ctx.read_native_pin(pin, this);
             let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
-            sp_append_subscriber(ctx, this, subscriber);
+            sp_append_subscriber(ctx, this, subscriber)?;
             let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
             let subscription = ctx.read_native_pin(sub_pin, subscription);
             let _ = ctx.invoke_virtual(
@@ -4424,7 +4424,7 @@ fn incubator_fork_subtask(
     Ok((scope, subtask))
 }
 
-pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sts = "jdk/incubator/concurrent/StructuredTaskScope";
@@ -4708,7 +4708,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
     // Also register under Java 25 final package: java.util.concurrent.StructuredTaskScope
     register_p67_structured_task_scope_j25(r);
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -5065,7 +5065,7 @@ pub(crate) fn j25_register_scope_common(
     r.register(cls, "isShutdown", "()Z", j25_sts_is_shutdown);
 }
 
-pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sts = "java/util/concurrent/StructuredTaskScope";
@@ -5213,7 +5213,7 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -7802,7 +7802,7 @@ pub(crate) fn register_new15_continuation_scope(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/util/concurrent/ForkJoinPool";
@@ -7854,7 +7854,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) -
             //   "io.quarkus.bootstrap.forkjoin.QuarkusForkJoinWorkerThreadFactory"
             // before delegating to KeycloakMain.main, so we must populate
             // the field with an instance of that class.
-            populate_common_factory(ctx, obj);
+            populate_common_factory(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -7931,7 +7931,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) -
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// T19_K3 — Whitelist for the

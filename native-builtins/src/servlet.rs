@@ -1655,12 +1655,12 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
 
     // Helper closure: extract filesystem paths from a URL[] array object
     // and register them with the VM classpath.
-    fn register_url_array(ctx: &mut dyn NativeContext, url_arr_val: Value) -> Result<(), MethodCallFailed> {
+    fn register_url_array(ctx: &mut dyn NativeContext, url_arr_val: Value) {
         let paths = s1_url_array_to_fs_paths(ctx, url_arr_val);
         if !paths.is_empty() {
             ctx.register_dynamic_classpath(&paths);
         }
-    Ok(())
+    ()
 }
 
     // URLClassLoader(URL[])
@@ -4507,7 +4507,7 @@ fn s2_bb_new_direct_view(
     Ok(buf)
 }
 
-fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     use cratonvm_types::ArrayElementType;
     let bb = "java/nio/ByteBuffer";
 
@@ -6390,12 +6390,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
         }
         Ok(None)
     });
-    Ok(())
+    ()
 }
 
 // ---- ByteOrder -------------------------------------------------------------
 
-fn register_s2_byteorder(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
     let bo = "java/nio/ByteOrder";
     // The factory/static natives return the CANONICAL objects (real class
     // statics when available) — the previous fresh-synthetic-per-call
@@ -6454,7 +6454,7 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
         let b = s2_byte_order_ord(ctx, other);
         Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
     });
-    Ok(())
+    ()
 }
 
 // ---- SocketChannel (real TcpStream) ----------------------------------------
@@ -6916,7 +6916,7 @@ fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bo
     Ok(Value::Object(Some(set)))
 }
 
-fn register_s2_selector(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_s2_selector(r: &mut NativeMethodRegistry) {
     let sel = "java/nio/channels/Selector";
 
     r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _| {
@@ -7094,7 +7094,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
         "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
         s2_register_channel,
     );
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -7125,7 +7125,7 @@ const HR_METHOD: usize = 1;
 const HR_BODY: usize = 2;
 // field 3 = extra headers map (unused by our impl)
 
-pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) {
     let hc = "java/net/http/HttpClient";
     let hrb = "java/net/http/HttpRequest$Builder";
 
@@ -7175,7 +7175,7 @@ pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) -> Result<()
             Ok(Some(Value::Object(Some(cf))))
         },
     );
-    Ok(())
+    ()
 }
 
 /// Extract a plain Rust String from a Java String field of an object, or return `None`.

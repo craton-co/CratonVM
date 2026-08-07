@@ -1300,7 +1300,7 @@ pub(crate) fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMeth
     registry.set_category(__prev_cat);
 }
 
-pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: BigInteger spec-exact arithmetic/factories → Intrinsic.
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -1790,7 +1790,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
         },
     );
     registry.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 fn native_bi_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2439,7 +2439,7 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> Result<Obje
     Ok(obj)
 }
 
-pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: BigDecimal spec-exact arithmetic/factories → Intrinsic.
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -2548,7 +2548,7 @@ pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) -
         Ok(Some(Value::Object(Some(bd_alloc(ctx, "10", 0)?))))
     });
     registry.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Read a `BigDecimal`'s `(unscaled-digits, scale)` in real-JDK layout, or
@@ -2674,7 +2674,7 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => "0".to_string(),
     };
     let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    bd_write_into(ctx, this, &s, scale);
+    bd_write_into(ctx, this, &s, scale)?;
     Ok(None)
 }
 
@@ -2761,7 +2761,7 @@ fn bd_write_into_bigint(
         return Ok(());
     }
     let value = apply_scale(&unscaled.to_decimal(), scale);
-    bd_write_into(ctx, this, &value, scale);
+    bd_write_into(ctx, this, &value, scale)?;
     Ok(())
 }
 
@@ -2832,7 +2832,7 @@ fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         (mag.mul(&bigint_pow5((-exp) as u32)), -exp)
     };
     let unscaled = if neg { unscaled.neg_value() } else { unscaled };
-    bd_write_into_bigint(ctx, this, &unscaled, scale, 0);
+    bd_write_into_bigint(ctx, this, &unscaled, scale, 0)?;
     Ok(None)
 }
 
@@ -2885,7 +2885,7 @@ fn native_bd_init_bigint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_field(this, pr_i, Value::Int(0));
         return Ok(None);
     }
-    bd_write_into_bigint(ctx, this, &v, 0, 0);
+    bd_write_into_bigint(ctx, this, &v, 0, 0)?;
     Ok(None)
 }
 
@@ -2899,7 +2899,7 @@ fn native_bd_init_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => 0,
     };
     let s = v.to_string();
-    bd_write_into(ctx, this, &s, 0);
+    bd_write_into(ctx, this, &s, 0)?;
     Ok(None)
 }
 
@@ -2913,7 +2913,7 @@ fn native_bd_init_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => 0,
     };
     let s = v.to_string();
-    bd_write_into(ctx, this, &s, 0);
+    bd_write_into(ctx, this, &s, 0)?;
     Ok(None)
 }
 

@@ -360,7 +360,7 @@ fn build_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef 
 // 1. javax.net.ssl.SSLContext  (12-field synthetic)
 // ---------------------------------------------------------------------------
 
-fn register_ssl_context(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_ssl_context(r: &mut NativeMethodRegistry) {
     // SyntheticStub: SSLContext here is a synthetic field-holder; getInstance/
     // getDefault/init merely allocate an object and flip an "initialized" flag.
     // No rustls config is built. The real engine lives in t27_tls.rs.
@@ -583,7 +583,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Protocol name for a `CTX_PROTOCOL_IDX` slot value.
@@ -614,7 +614,7 @@ fn ctx_protocol_name(idx: i32) -> &'static str {
 // 2. javax.net.ssl.SSLEngine  (14-field synthetic)
 // ---------------------------------------------------------------------------
 
-fn register_ssl_engine(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     // SyntheticStub: wrap()/unwrap() do NO real TLS — they emit empty records
     // and advance a fake handshake state machine with no rustls crypto. The
     // genuine rustls-backed SSLEngine is t27_tls.rs::register_sslengine_real.
@@ -970,7 +970,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2085,7 +2085,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
 // 8. javax.net.ssl.SSLSocketFactory  (2-field synthetic)
 // ---------------------------------------------------------------------------
 
-fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
     // SyntheticStub: createSocket() returns an unconnected synthetic
     // java/net/Socket with no TLS wiring; getDefault() yields a placeholder
     // factory. Cipher-suite getters return hardcoded lists.
@@ -2165,7 +2165,7 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) -> Result<(), Metho
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -2530,7 +2530,7 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
 // 10. sun.security.ssl.SSLContextImpl  (alias for SSLContext)
 // ---------------------------------------------------------------------------
 
-fn register_ssl_context_impl(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
     // SyntheticStub: alias of the synthetic SSLContext; createSSLEngine()
     // returns the fake (non-rustls) engine, init just flips a flag.
     let __prev_cat = r.current_category();
@@ -2638,7 +2638,7 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) -> Result<(), MethodC
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------

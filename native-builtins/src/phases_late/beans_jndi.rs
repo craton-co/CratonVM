@@ -334,7 +334,7 @@ pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Res
     }
 }
 
-pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pref = "java/util/prefs/Preferences";
@@ -996,7 +996,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) -> Result<(
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -1209,7 +1209,7 @@ fn vcs_fire(
     result
 }
 
-pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // PropertyChangeEvent = 4-field (source=0, propertyName=1, oldValue=2, newValue=3)
@@ -1988,7 +1988,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) -> Result<(), Met
     // GenericTypeAwarePropertyDescriptor stores read/write in its own fields.
     let _ = pd;
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.

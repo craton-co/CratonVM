@@ -1985,7 +1985,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result
         let obj = try_alloc_concurrent_synthetic(ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
         let name_obj = ctx.create_string("");
         ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
-        attach_minimal_jboss_logger_node(ctx, obj);
+        attach_minimal_jboss_logger_node(ctx, obj)?;
         return Ok(obj);
     }
     {
@@ -2003,7 +2003,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
     ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
     ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
-    attach_minimal_jboss_logger_node(ctx, obj);
+    attach_minimal_jboss_logger_node(ctx, obj)?;
     let mut reg = jboss_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());

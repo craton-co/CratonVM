@@ -1637,7 +1637,7 @@ fn register_access_control_context(r: &mut NativeMethodRegistry) {
 // including the BouncyCastle regression suite — are entirely unaffected.
 // Enforcement only ever DENIES once a policy has been parsed and installed
 // via `set_active_policy` / `load_policy_file`.
-fn register_policy_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_policy_natives(r: &mut NativeMethodRegistry) {
     let p = "java/security/Policy";
 
     // getPolicy()Ljava/security/Policy; — process-wide singleton.
@@ -1776,7 +1776,7 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCal
     // the invokespecial path doesn't fall through to the missing-method
     // branch.
     r.register(p, "<init>", "()V", |_ctx, _args| Ok(None));
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------

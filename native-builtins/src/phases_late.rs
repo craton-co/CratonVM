@@ -2342,7 +2342,7 @@ fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 
 /// Register the native-backed ProcessHandle surface in both synthetic- and
 /// real-JDK modes. SmallRye invokes `current().info()` during class init.
-pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ph = "java/lang/ProcessHandle";
@@ -2482,7 +2482,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) -> Result<(), M
         p60_empty_optional,
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 
@@ -2937,7 +2937,7 @@ pub fn register_p61_file_handler(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cl = "java/lang/ClassLoader";
@@ -3157,7 +3157,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) -> Result<(
         Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 
@@ -6722,7 +6722,7 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 
 
 
-pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bi = "java/math/BigInteger";
@@ -7130,7 +7130,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
     let _ = bi_add_str; // keep import alive in case future ops want it
     let _ = bi_cmp_unsigned;
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Divide an unsigned decimal string by 2^32, returning (quotient, remainder).

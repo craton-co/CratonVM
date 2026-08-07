@@ -3677,7 +3677,7 @@ fn register_platform_managed_object_names(r: &mut NativeMethodRegistry) {
 
 fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10)?;
-    init_runtime_mxbean_fields(ctx, obj);
+    init_runtime_mxbean_fields(ctx, obj)?;
     Ok(obj)
 }
 
@@ -3724,7 +3724,7 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
     // factory does.
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        init_runtime_mxbean_fields(ctx, this);
+        init_runtime_mxbean_fields(ctx, this)?;
         Ok(None)
     });
 

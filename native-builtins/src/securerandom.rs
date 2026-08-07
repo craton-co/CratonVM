@@ -597,9 +597,9 @@ pub(crate) fn native_random_next_gaussian(
 /// instance this module hands out. `regression-suite/src/RJdkSecurity.java:136`
 /// asserts `sr.getProvider() != null` and failed in BOTH `--real-jdk` and
 /// `--jdk-only`. Attach the owning `Provider` here as well.
-fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
+fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<(), MethodCallFailed> {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return;
+        return Ok(());
     };
     // `create_string` can move the heap; pin `this` across it.
     let pin = ctx.pin_native_root(this);
@@ -607,7 +607,8 @@ fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
     let this = ctx.read_native_pin(pin, this);
     ctx.set_field_by_name(this, "algorithm", Value::Object(Some(algo)));
     ctx.unpin_native_roots(pin);
-    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM);
+    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -972,7 +973,7 @@ pub(crate) fn native_secure_random_init(
 ) -> MethodCallResult {
     // Per the JDK SecureRandom contract the no-arg ctor selects a default
     // provider; we always select "OS-CSPRNG", the strongest source available.
-    secure_random_record_algorithm(ctx, args);
+    secure_random_record_algorithm(ctx, args)?;
     Ok(None)
 }
 

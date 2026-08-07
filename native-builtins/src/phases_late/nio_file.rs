@@ -89,7 +89,7 @@ pub fn p57_path_display_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> 
     }
 }
 
-pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let path = "java/nio/file/Path";
@@ -7195,7 +7195,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 pub(crate) fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
@@ -10761,13 +10761,13 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                         Err(_) => crate::capability_gate::open_read_gated(&*ctx, &path),
                     };
                 let fd_id = open_result.map_err(raf_open_failure(&path))?;
-                raf_set_fd(ctx, this, fd_id);
+                raf_set_fd(ctx, this, fd_id)?;
                 ctx.set_field(this, 1, Value::Int(0)); // read-only
             } else {
                 let fd_id =
                     crate::capability_gate::open_read_write_gated(&*ctx, &path, create)
                         .map_err(raf_open_failure(&path))?;
-                raf_set_fd(ctx, this, fd_id);
+                raf_set_fd(ctx, this, fd_id)?;
                 ctx.set_field(this, 1, Value::Int(1)); // read-write
             }
             Ok(None)
@@ -10810,7 +10810,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             // GAP I2 — gated; see `newFileChannel`.
             let fd_id = crate::capability_gate::open_read_write_gated(&*ctx, &path, writable)
                 .map_err(raf_open_failure(&path))?;
-            raf_set_fd(ctx, this, fd_id);
+            raf_set_fd(ctx, this, fd_id)?;
             ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
             Ok(None)
         },
@@ -12609,7 +12609,7 @@ pub(crate) fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> Result<Obje
     Ok(obj)
 }
 
-pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let file = "java/io/File";
@@ -13694,7 +13694,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
         Ok(Some(Value::Int(sep)))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -14220,7 +14220,7 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
 // FileTime = 1-field (millis=0 Long)
 // =============================================================================
 
-pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // FileTreeWalker hands `Files.find` the concrete platform attributes
@@ -14455,7 +14455,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Resu
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Allocate a `java.nio.file.attribute.FileTime` carrying `millis`.
@@ -16632,7 +16632,7 @@ pub(crate) fn p98_walk_file_tree(
         p98_visit_single_file(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks)
     };
     ctx.unpin_native_roots(visitor_pin.0);
-    result;
+    result?;
     Ok(Some(path_val))
 }
 
@@ -17358,7 +17358,7 @@ pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodReg
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // FileTime — millis stored in the real `long value` field (by name) so
@@ -17776,14 +17776,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) -> Resu
     );
     register_posix_file_permission_stub_clinit(r);
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
 // Files stream/IO bridge
 // =============================================================================
 
-pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let f = "java/nio/file/Files";
@@ -18148,5 +18148,5 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }

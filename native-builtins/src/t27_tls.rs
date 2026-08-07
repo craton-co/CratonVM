@@ -1006,8 +1006,8 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
 pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
     let ident = ctx_identity(ctx, ctx_obj)?;
     set_huc_default_client_identity(ident);
-    capture_huc_key_managers_ctx_key(ctx, ctx_obj);
-    capture_huc_trust_managers_ctx_key(ctx, ctx_obj);
+    capture_huc_key_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_trust_managers_ctx_key(ctx, ctx_obj)?;
 
     let ident = huc_default_client_identity();
     let km_ctx_key = huc_default_key_managers_ctx_key();
@@ -1032,14 +1032,14 @@ pub(crate) fn capture_huc_ssl_context_for_connection(
     ctx: &mut dyn NativeContext,
     connection: ObjectRef,
     ctx_obj: ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let default_identity = huc_default_identity_slot().lock().clone();
     let default_roots = huc_default_trust_roots_slot().lock().clone();
     let default_config = huc_default_client_config_slot().lock().clone();
     let default_km = *huc_default_km_ctx_key_slot().lock();
     let default_tm = *huc_default_tm_ctx_key_slot().lock();
 
-    capture_huc_ssl_context(ctx, ctx_obj);
+    capture_huc_ssl_context(ctx, ctx_obj)?;
     if let Some(config) = huc_default_client_config() {
         let key = ctx.identity_hash_code(connection);
         let mut configs = huc_connection_client_configs().lock();
@@ -1054,6 +1054,7 @@ pub(crate) fn capture_huc_ssl_context_for_connection(
     *huc_default_client_config_slot().lock() = default_config;
     *huc_default_km_ctx_key_slot().lock() = default_km;
     *huc_default_tm_ctx_key_slot().lock() = default_tm;
+    Ok(())
 }
 
 /// Returns the shared HttpsURLConnection config selected by its SSLContext.
@@ -5190,15 +5191,16 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         factory: ObjectRef,
         connection: Option<ObjectRef>,
-    ) {
+    ) -> Result<(), MethodCallFailed> {
         if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
-                capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
+                capture_huc_ssl_context_for_connection(ctx, connection, sslctx)?;
             } else {
-                capture_huc_ssl_context(ctx, sslctx);
+                capture_huc_ssl_context(ctx, sslctx)?;
             }
         }
-    }
+            Ok(())
+}
     // FIX (tls-handshake-enforcement-gap, doc 21): this native REPLACES the
     // real `HttpsURLConnection.setDefaultSSLSocketFactory` bytecode, so the
     // real JDK static field `HttpsURLConnection.defaultSSLSocketFactory` was
@@ -5245,8 +5247,8 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
         |ctx, args| {
             if let Some(Value::Object(Some(f))) = args.first() {
-                capture_huc_client_identity(ctx, *f, None);
-                publish_default_ssl_socket_factory(ctx, *f);
+                capture_huc_client_identity(ctx, *f, None)?;
+                publish_default_ssl_socket_factory(ctx, *f)?;
             }
             Ok(None)
         },
@@ -5267,7 +5269,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                     .into());
                 }
             };
-            capture_huc_client_identity(ctx, factory, Some(connection));
+            capture_huc_client_identity(ctx, factory, Some(connection))?;
             // FIX (huc-per-connection-ssf-readback): this setter used to
             // capture the connection's client identity and then DROP the
             // factory object, so `getSSLSocketFactory()` could not read back
@@ -9226,7 +9228,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<O
     Ok(ses)
 }
 
-fn register_engine_impl_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls_impl = "sun/security/ssl/SSLEngineImpl";
@@ -9719,7 +9721,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) -> Result<(), Meth
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // -- wrap/unwrap closures (split out for arity / arg shapes) -----------------
@@ -11143,7 +11145,7 @@ pub(crate) fn record_client_peer_chain(
         .insert(gc_stable_objref_key(ctx, session), chain_der);
 }
 
-fn register_ssl_session_real(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     let cls = "javax/net/ssl/SSLSession";
 
     // getPeerCertificates() — the client certificate chain, for mTLS. Tomcat's
@@ -11423,7 +11425,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) -> Result<(), MethodC
         }
         Ok(Some(Value::Object(Some(out))))
     });
-    Ok(())
+    ()
 }
 
 /// Lazily allocate (and cache in the session's own last field) the

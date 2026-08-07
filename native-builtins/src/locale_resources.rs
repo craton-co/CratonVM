@@ -1654,7 +1654,7 @@ fn en_calendar_field_names(field: i32, style: i32) -> Option<Vec<(&'static str, 
     }
 }
 
-pub fn register(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let rb = "java/util/ResourceBundle";
@@ -2418,7 +2418,7 @@ pub fn register(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
     );
 
     registry.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,

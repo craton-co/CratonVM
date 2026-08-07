@@ -655,7 +655,7 @@ pub(crate) fn sax_walk(ctx: &mut dyn NativeContext, handler: ObjectRef, node: &X
 
             for child in children {
                 let handler_cur = ctx.read_native_pin(handler_pin, handler);
-                sax_walk(ctx, handler_cur, child);
+                sax_walk(ctx, handler_cur, child)?;
             }
 
             let uri2 = ctx.create_string("");
@@ -972,14 +972,14 @@ fn xslt_serialize_node(
             let root =
                 ctx.invoke_virtual(node, "getDocumentElement", "()Lorg/w3c/dom/Element;", &[]);
             if let Ok(Some(Value::Object(Some(root)))) = root {
-                xslt_serialize_node(ctx, root, indent, depth, out);
+                xslt_serialize_node(ctx, root, indent, depth, out)?;
             } else {
                 let node = ctx.read_native_pin(node_pin, node);
                 let children = xslt_child_nodes(ctx, node);
                 let base = children.first().map(|(pin, _)| *pin);
                 for (pin, child) in &children {
                     let child = ctx.read_native_pin(*pin, *child);
-                    xslt_serialize_node(ctx, child, indent, depth, out);
+                    xslt_serialize_node(ctx, child, indent, depth, out)?;
                 }
                 if let Some(base) = base {
                     ctx.unpin_native_roots(base);
@@ -1031,7 +1031,7 @@ fn xslt_serialize_node(
                     out.push('>');
                     for (pin, child) in &children {
                         let child = ctx.read_native_pin(*pin, *child);
-                        xslt_serialize_node(ctx, child, child_indent, depth + 1, out);
+                        xslt_serialize_node(ctx, child, child_indent, depth + 1, out)?;
                     }
                     if let Some(step) = child_indent {
                         out.push('\n');
@@ -1088,7 +1088,7 @@ fn xslt_output_property(
 /// `DOMSource` and `StreamSource` cover essentially every identity-transform
 /// caller; anything else (notably `SAXSource`) returns `None` so `transform`
 /// can report it rather than emit an empty result.
-fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<String> {
+fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Result<Option<String>, MethodCallFailed> {
     let class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(source))
         .unwrap_or_default();
@@ -1097,10 +1097,10 @@ fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<St
             ctx.invoke_virtual(source, "getNode", "()Lorg/w3c/dom/Node;", &[])
         {
             let mut out = String::new();
-            xslt_serialize_node(ctx, node, None, 0, &mut out);
-            return Some(out);
+            xslt_serialize_node(ctx, node, None, 0, &mut out)?;
+            return Ok(Some(out));
         }
-        return None;
+        return Ok(None);
     }
     if class_name.ends_with("StreamSource") {
         let source_pin = ctx.pin_native_root(source);
@@ -1109,7 +1109,7 @@ fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<St
         {
             let text = xml_read_input_stream(ctx, stream);
             ctx.unpin_native_roots(source_pin);
-            return Some(text);
+            return Ok(Some(text));
         }
         let source = ctx.read_native_pin(source_pin, source);
         if let Ok(Some(Value::Object(Some(reader)))) =
@@ -1119,12 +1119,12 @@ fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<St
             // the same shape, so reuse it rather than duplicating the pinning.
             let text = xml_read_input_stream(ctx, reader);
             ctx.unpin_native_roots(source_pin);
-            return Some(text);
+            return Ok(Some(text));
         }
         ctx.unpin_native_roots(source_pin);
-        return None;
+        return Ok(None);
     }
-    None
+    Ok(None)
 }
 
 /// Write `text` into a `javax.xml.transform.Result`. Returns `false` when the
@@ -1363,7 +1363,7 @@ fn dom_node_namespace_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     ))))
 }
 
-pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DocumentBuilderFactory = 3-field (namespaceAware=0, validating=1, features=2 HashMap)
@@ -1690,7 +1690,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) -> Result<(), Metho
             };
             if let Some(root) = xml_parse(&xml_text) {
                 let _ = ctx.invoke_virtual(handler, "startDocument", "()V", &[]);
-                sax_walk(ctx, handler, &root);
+                sax_walk(ctx, handler, &root)?;
                 let _ = ctx.invoke_virtual(handler, "endDocument", "()V", &[]);
             }
             Ok(None)
@@ -1715,7 +1715,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) -> Result<(), Metho
             let xml_text = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(root) = xml_parse(&xml_text) {
                 let _ = ctx.invoke_virtual(handler, "startDocument", "()V", &[]);
-                sax_walk(ctx, handler, &root);
+                sax_walk(ctx, handler, &root)?;
                 let _ = ctx.invoke_virtual(handler, "endDocument", "()V", &[]);
             }
             Ok(None)
@@ -2399,7 +2399,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) -> Result<(), Metho
             let result_pin = ctx.pin_native_root(result);
             let text = xslt_source_text(ctx, source);
             let this = ctx.read_native_pin(this_pin, this);
-            let Some(body) = text else {
+            let Ok(Some(body)) = text else {
                 let source = ctx.read_native_pin(source_pin, source);
                 let class_name = ctx
                     .class_name_of_id(ctx.class_id_of_object(source))
@@ -2488,7 +2488,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) -> Result<(), Metho
         |ctx, _args| Err(xpath_unsupported(ctx, "XPath.compile")),
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================

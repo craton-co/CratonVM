@@ -575,7 +575,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, params);
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -591,7 +591,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             // and the form-builder both see a non-null array.
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(obj, 1, Value::Object(Some(empty)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -607,7 +607,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -636,7 +636,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3567,7 +3567,7 @@ fn lk_same_package(ctx: &dyn NativeContext, a: Value, b: Value) -> bool {
     }
 }
 
-pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
@@ -3885,7 +3885,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) -> Resul
         Ok(Some(Value::Object(Some(s))))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -4679,7 +4679,7 @@ fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> Res
 ///
 /// NOTE: requires the matching `check_override` allow-list entry in
 /// `vm/src/vm/vm_exec.rs` so this native wins over the (broken) JDK bytecode.
-pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
@@ -4696,7 +4696,7 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
         |ctx, args| array_element_accessor_handle(ctx, args, true),
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Shared body of the `arrayElementGetter` / `arrayElementSetter` bridges.
@@ -4776,7 +4776,7 @@ fn array_element_accessor_handle(
 /// This mirrors the existing `register_array_element_accessor_bridges`
 /// pattern (another concrete `MethodHandles` static factory whose JDK
 /// bytecode CratonVM cannot execute).
-pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
@@ -4797,7 +4797,7 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// `MethodHandles.identity(Class type)` — a *functional* shim returning an
@@ -4811,7 +4811,7 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
 /// read — so `identity().invoke()` / `.bindTo()` fail (OOB field reads on
 /// slots 16–19). Groovy's `IndyInterface` and any `SwitchPoint`/dispatch chain
 /// that threads values through `identity` needs this.
-pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
@@ -4829,7 +4829,7 @@ pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegist
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// `CallSite.dynamicInvoker()` (concrete on `MutableCallSite` /
@@ -4844,7 +4844,7 @@ pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegist
 /// `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so without this shim
 /// every `new SwitchPoint()` — and therefore Apache Groovy's
 /// `IndyInterface.<clinit>` at runtime — hangs.
-pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     for cs in [
@@ -4869,7 +4869,7 @@ pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegis
         );
     }
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4950,7 +4950,7 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             ctx.unpin_native_roots(orig_ptypes_pin);
             ctx.set_field(new_mt, 0, ret);
             ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
-            populate_method_type_form(ctx, new_mt);
+            populate_method_type_form(ctx, new_mt)?;
             ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
         }
     }
@@ -4980,7 +4980,7 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 ///   target's `MethodType` to the site's; synthetic `MethodType`s don't
 ///   `equals()` the JDK forms → `WrongMethodTypeException`. Shim it to store
 ///   the target field directly (dispatch ignores types anyway).
-pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
 
@@ -5219,7 +5219,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     }
 
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Read a call site's current target MethodHandle descriptor (real
@@ -5233,7 +5233,7 @@ fn callsite_target_desc(ctx: &mut dyn NativeContext, callsite: ObjectRef) -> Opt
     mh_read_desc(ctx, target)
 }
 
-pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
@@ -5277,7 +5277,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) ->
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -8645,7 +8645,7 @@ fn auto_box_return(
     }
 }
 
-pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandle";
@@ -8997,7 +8997,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
     // Lookup.find* are already registered in register_p63_method_handles_lookup
     // with full descriptor resolution. No duplicate registration needed here.
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Build a MethodType object from a JVM method descriptor string.
@@ -9062,7 +9062,7 @@ pub fn build_method_type_from_descriptor(
     ctx.set_field(mt, 0, Value::Object(Some(ret_mirror)));
     ctx.set_field(mt, 1, Value::Object(Some(arr)));
 
-    populate_method_type_form(ctx, mt);
+    populate_method_type_form(ctx, mt)?;
     Ok(Some(mt))
 }
 
@@ -9258,7 +9258,7 @@ fn parse_descriptor_types(desc: &str) -> Vec<Cow<'static, str>> {
 // T2.8: MethodHandle completeness — unreflect, permuteArguments, guardWithTest
 // =============================================================================
 
-pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // I2 follow-up: register `ClassLoader.{getDefinedPackage,
@@ -9547,7 +9547,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) -> 
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -10394,7 +10394,7 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             ctx.unpin_native_roots(ptypes_pin);
             ctx.set_field(mt, 0, Value::Object(Some(void_mirror)));
             ctx.set_field(mt, 1, Value::Object(Some(ptypes_ref)));
-            populate_method_type_form(ctx, mt);
+            populate_method_type_form(ctx, mt)?;
             let member_name = ctx.read_native_pin(member_name_pin, member_name);
             mn_set(ctx, member_name, "type", MN_TYPE, Value::Object(Some(mt)));
         }

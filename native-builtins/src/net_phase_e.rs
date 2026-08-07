@@ -2918,7 +2918,7 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodC
     Ok(uri_obj)
 }
 
-fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_uri_natives(r: &mut NativeMethodRegistry) {
     let uri = "java/net/URI";
 
     // toString() → raw string
@@ -3618,7 +3618,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
             Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
         },
     );
-    Ok(())
+    ()
 }
 
 // ===========================================================================
@@ -4097,11 +4097,11 @@ fn re1_socket_adaptor_inet(
     Ok(Some(alloc_inet_address_for_input(ctx, ip, ip)?))
 }
 
-fn register_re1_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return Ok(());
+        return ();
     }
     let sock = "java/net/Socket";
 
@@ -4781,7 +4781,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
         }
         re1_close_socket(ctx, owner)
     });
-    Ok(())
+    ()
 }
 
 /// Shut down and forget the TCP stream backing `this`, and mark the socket
@@ -5167,12 +5167,12 @@ fn re2_server_socket_close(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
-fn register_re2_server_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. See
     // register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return Ok(());
+        return ();
     }
     // Install the plain-`ServerSocket` handler set for native-io's winning
     // `ss_wrapper_*` natives to delegate to (BUG-04). Every method native-io
@@ -5509,7 +5509,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) -> Result<(), Method
             Ok(Some(Value::Object(Some(ia))))
         },
     );
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -5584,7 +5584,7 @@ fn re2_server_socket_is_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // RE.3 — java.net.InetAddress
 // ===========================================================================
 
-fn register_re3_inet_address(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
     let ia = "java/net/InetAddress";
 
     r.register(
@@ -5828,7 +5828,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) -> Result<(), MethodC
         });
         register_inet_address_object_methods(r, cls);
     }
-    Ok(())
+    ()
 }
 
 /// Parse the `IA_ADDR` field of an InetAddress mirror and apply `pred`.
@@ -7083,7 +7083,7 @@ fn url_component_ref(
     None
 }
 
-fn register_re4_url_http(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     let url = "java/net/URL";
 
     // ---- java.net.URL(String) ------------------------------------------
@@ -9613,7 +9613,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
     // this to set custom request headers before `exists()`/`getInputStream()`
     // send the request — `ResourceTests.UrlResourceTests
     // .canCustomizeHttpUrlConnectionForExists[Fallback]`).;
-    Ok(())
+    ()
 }
 
 // ===========================================================================
@@ -10728,7 +10728,7 @@ fn re5_uri_string(ctx: &mut dyn NativeContext, uri: ObjectRef) -> ObjectRef {
     ctx.create_string("")
 }
 
-fn register_re5_http_client(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_re5_http_client(r: &mut NativeMethodRegistry) {
     r.register(
         RE5_BODY_COLLECTOR_SUBSCRIBER,
         "onSubscribe",
@@ -11596,7 +11596,7 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) -> Result<(), MethodCa
         ctx.unpin_native_roots(map_pin);
         Ok(Some(Value::Object(Some(map_now))))
     });
-    Ok(())
+    ()
 }
 
 // ===========================================================================
@@ -11774,10 +11774,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             let tms_h = tms_arr.map(|a| scope.root(a));
             let this_now = scope.get(&this_h);
             let tms_now = tms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now);
+            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now)?;
             let this_now = scope.get(&this_h);
             let kms_now = kms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now);
+            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now)?;
             let ctx = &mut scope;
             let kms_arr = kms_h.as_ref().map(|h| ctx.get(h));
             // Per-SSLContext mTLS identity: prefer resolving it DIRECTLY from
@@ -11795,7 +11795,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             // Re-read through the handle rather than reusing the copy from the
             // top of the method: the two attaches above allocate.
             let this = ctx.get(&this_h);
-            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity);
+            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity)?;
             // Stash the actual TrustManager objects passed here (may include a
             // revocation-aware PKIXRevocationChecker attached by
             // Tomcat's SSLUtilBase.getTrustManagers, or a fully custom
@@ -11975,7 +11975,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 // Remember which SSLContext created this engine so the
                 // post-handshake trust check can find its TrustManager[]
                 // (independent of whether a KMF identity was also present).
-                crate::t27_tls::set_engine_trust_ctx_key(ctx, eng, sslctx);
+                crate::t27_tls::set_engine_trust_ctx_key(ctx, eng, sslctx)?;
             }
             // `createSSLEngine(String host, int port)` — record the host the
             // caller intends to reach. Dropping it silently made this engine
@@ -12992,7 +12992,7 @@ fn ws2_get_int(s: usize, level: i32, name: i32) -> Option<i32> {
     (rc == 0).then_some(value)
 }
 
-pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     let ds = "java/net/DatagramSocket";
 
     r.register(ds, "<init>", "()V", |ctx, args| {
@@ -13572,7 +13572,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) -> Resu
             Ok(Some(Value::Object(Some(ia))))
         },
     );
-    Ok(())
+    ()
 }
 
 // ===========================================================================
@@ -16049,7 +16049,7 @@ pub(crate) fn re10_bind_server(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
-fn register_re10_http_server(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     let hs = "com/sun/net/httpserver/HttpServer";
     // The JDK factory contract returns this concrete implementation, not the
     // abstract public API class. Native bridges are aliased to it after all
@@ -16541,7 +16541,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) -> Result<(), MethodC
     // inheritance. Mirror the complete public HttpServer bridge surface onto
     // the concrete class returned by the factory, including set/getExecutor.
     r.alias_class(hs, HS_IMPL_CLASS);
-    Ok(())
+    ()
 }
 
 // ---------------------------------------------------------------------------

@@ -340,7 +340,7 @@ pub(crate) fn drain_input_stream_per_byte(
     ctx.unpin_native_roots(is_pin);
 }
 
-pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // GZIPInputStream / GZIPOutputStream.
@@ -930,7 +930,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(dos, "flush", "()V", dos_flush);
     r.register(dos, "close", "()V", dos_close);
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 /// Register the bulk stream-transfer helper used by Spring's `StreamUtils`.
@@ -3015,7 +3015,7 @@ pub(crate) fn p58_gzip_out_close(ctx: &mut dyn NativeContext, args: &[Value]) ->
 // java.util.zip.ZipEntry = 4-field (name=0, size=1 Long, compressedSize=2 Long, crc=3 Long)
 // =============================================================================
 
-pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ze = "java/util/zip/ZipEntry";
@@ -3066,7 +3066,7 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) -> Result<(),
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================
@@ -3869,7 +3869,7 @@ fn zip_entry_alloc(
     Ok(ze)
 }
 
-pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Adler32 = 1-field (sum=0 Long)
@@ -4194,5 +4194,5 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) -> Result<()
         Ok(None)
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }

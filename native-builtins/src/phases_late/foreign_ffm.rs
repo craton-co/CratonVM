@@ -321,7 +321,7 @@ pub(crate) fn p67_value_layout_clinit(
             1_i64,
         ),
     ] {
-        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment);
+        p67_set_value_layout_static(ctx, field_name, class_name, byte_size, byte_alignment)?;
     }
     Ok(None)
 }
@@ -1546,7 +1546,7 @@ pub(crate) fn lucene_buffered_checksum_index_input_get_checksum(
     }
 }
 
-pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
@@ -2905,5 +2905,5 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
     // `.or()` compose over a lie ("yes, a library IS loaded") instead of a
     // clean unavailable signal.
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }

@@ -383,7 +383,7 @@ fn pe_layout_with_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(cloned))))
 }
 
-fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+fn register_pe_value_layout(r: &mut NativeMethodRegistry) {
     let vl = "java/lang/foreign/ValueLayout";
 
     // Static factory fields — return pre-built layout objects
@@ -486,7 +486,7 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCa
         "(Ljava/lang/String;)Ljava/lang/foreign/MemoryLayout;",
         pe_layout_with_name,
     );
-    Ok(())
+    ()
 }
 
 // --- Arena: lifecycle-scoped memory management ---

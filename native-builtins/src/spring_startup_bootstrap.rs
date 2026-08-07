@@ -2216,7 +2216,7 @@ fn ccpp_process_config_bean_definitions(
             &mut seen_imports,
             &mut registered,
             0,
-        );
+        )?;
     }
 
     if registered > 0 {
@@ -2343,7 +2343,7 @@ fn walk_imports_recursive(
             *registered += 1;
         }
         // Recurse into the import's own @Import tree.
-        walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1);
+        walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1)?;
     }
     Ok(())
 }

@@ -8091,7 +8091,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
 
     r.register(scope, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
+        pd_init_scope(ctx, this)?;
         Ok(None)
     });
     r.register(
@@ -8100,7 +8100,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/util/concurrent/ThreadFactory;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            pd_init_scope(ctx, this);
+            pd_init_scope(ctx, this)?;
             Ok(None)
         },
     );
@@ -8205,7 +8205,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
     let sof = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
     r.register(sof, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
+        pd_init_scope(ctx, this)?;
         Ok(None)
     });
     r.register(
@@ -8263,7 +8263,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
     let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
     r.register(sos, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
+        pd_init_scope(ctx, this)?;
         Ok(None)
     });
     r.register(

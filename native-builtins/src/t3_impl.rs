@@ -1453,7 +1453,7 @@ fn parse_primary(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
 // T3.11 — Internationalization extras
 // =============================================================================
 
-pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // `Locale.getDefault()`.
@@ -1542,7 +1542,7 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) -> Result<(), Met
     // This is registered elsewhere for UTF-8/ISO-8859-1; we add Shift_JIS support
     // The encoding/decoding for exotic charsets is best-effort.
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================

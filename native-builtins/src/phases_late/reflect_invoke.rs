@@ -2919,7 +2919,7 @@ pub(crate) fn native_module_impl_add_opens_to_module(
     module_add_exports_or_opens_void(ctx, args, true, Some(2))
 }
 
-pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // =================================================================
@@ -3249,7 +3249,7 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) -> Result<(), Me
         },
     );
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 // =============================================================================

@@ -1047,7 +1047,7 @@ fn cb_check_from_to_index(from: i32, to: i32, length: i32) -> Result<(), MethodC
     .into())
 }
 
-pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
+pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
     use crate::servlet::s2_byte_order_object;
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1767,7 +1767,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) -> Result<(
         Ok(Some(ctx.get_field(this, 3)))
     });
     r.set_category(__prev_cat);
-    Ok(())
+    ()
 }
 
 pub(crate) fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> Result<ObjectRef, MethodCallFailed> {
