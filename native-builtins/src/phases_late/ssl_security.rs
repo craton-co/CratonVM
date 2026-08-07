@@ -2996,7 +2996,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
             let address =
-                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1");
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1")?;
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -3908,7 +3908,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
             }
             let provider_name = found_provider.unwrap_or_else(|| "SunJSSE".to_string());
             let provider =
-                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name);
+                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name)?;
             ctx.set_field(obj, 0, Value::Object(Some(provider)));
             ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
             ctx.set_field(obj, 2, algorithm); // algorithm

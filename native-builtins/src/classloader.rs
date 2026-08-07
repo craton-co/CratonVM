@@ -780,7 +780,7 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Resu
     let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("platform");
     let name_pin = ctx.pin_native_root(name);
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     let name = ctx.read_native_pin(name_pin, name);
     // L1: only on OUR layout. Slot 2 is `unnamedModule` on the real
     // `java.lang.ClassLoader`, NOT a second copy of `name` — a reference for a
@@ -793,11 +793,11 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Resu
     }
     // Also populate the REAL `name` field by name: the active getName native
     // (classloader_real) reads the real field slot, not CL_NAME_REF.
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     let name = ctx.read_native_pin(name_pin, name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     // Platform's parent is bootstrap (null); already set by alloc_classloader
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     set_platform_loader(vm, Some(obj));
     ctx.unpin_native_roots(obj_pin);
     Ok(obj)
@@ -883,7 +883,7 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
     let name = ctx.create_string("app");
     let name_pin = ctx.pin_native_root(name);
     let mut platform = ctx.read_native_pin(platform_pin, platform?);
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     let mut name = ctx.read_native_pin(name_pin, name);
     // L1: only on OUR layout — see the same guard in
     // `get_or_create_platform_loader`. On the real layout slots 2 and 1 are
@@ -894,7 +894,7 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
     if synthetic_layout {
         ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
     }
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     platform = ctx.read_native_pin(platform_pin, platform);
     if synthetic_layout {
         ctx.set_field(obj, CL_PARENT_REF, Value::Object(Some(platform)));
@@ -905,10 +905,10 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
     // loader's getParent() returned null and Tomcat's
     // WebappClassLoaderBase.<init> javase-loader walk
     // (`while (j.getParent() != null) j = j.getParent()`) misbehaved.
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     name = ctx.read_native_pin(name_pin, name);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     platform = ctx.read_native_pin(platform_pin, platform);
     ctx.set_field_by_name(obj, "parent", Value::Object(Some(platform)));
     // Populate the REAL static `java.lang.ClassLoader.scl` so the real-JDK
@@ -917,9 +917,9 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
     // WebappClassLoaderBase.<init> at pc=174) returns this loader instead of
     // null. A null there made the subsequent `j.getParent()` NPE and aborted
     // every embedded-server webapp deploy ("Error starting the loader").
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     ctx.set_static_field_by_name("java/lang/ClassLoader", "scl", Value::Object(Some(obj)));
-    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    obj = ctx.read_native_pin(obj_pin, obj);
     set_app_loader(vm, Some(obj));
     ctx.unpin_native_roots(platform_pin);
     Ok(obj)
@@ -7281,7 +7281,7 @@ pub(crate) fn ucl_try_define_local_class(
                     "java/lang/ClassNotFoundException",
                     1,
                     internal_name,
-                );
+                )?;
                 return Some(Err(
                     cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception),
                 ));
@@ -7294,7 +7294,7 @@ pub(crate) fn ucl_try_define_local_class(
                 "java/lang/ClassNotFoundException",
                 1,
                 internal_name,
-            );
+            )?;
             return Some(Err(
                 cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
             ));

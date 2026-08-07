@@ -2713,7 +2713,7 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             let fresh_pin = ctx.pin_native_root(fresh);
             let fresh = ctx.read_native_pin(fresh_pin, fresh);
             let value = Value::Object(Some(fresh));
-            set = Ok(ctx.read_native_pin(set_pin, set))?;
+            set = ctx.read_native_pin(set_pin, set);
             let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[value]);
             ctx.unpin_native_roots(fresh_pin);
             continue;
@@ -2721,13 +2721,13 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             let _ = key_obj;
             Value::Object(Some(ctx.read_native_pin(*key_pin, *key_fallback)))
         };
-        set = Ok(ctx.read_native_pin(set_pin, set))?;
+        set = ctx.read_native_pin(set_pin, set);
         let _ = ctx.invoke_virtual(set, "add", "(Ljava/lang/Object;)Z", &[key_value]);
     }
     for (pin, _fallback) in extra_key_pins {
         ctx.unpin_native_roots(pin);
     }
-    set = Ok(ctx.read_native_pin(set_pin, set))?;
+    set = ctx.read_native_pin(set_pin, set);
     // Tag the snapshot so `LinkedHashSet.retainAll`/`remove` can propagate
     // mutations back to `this` (the source `Properties`) — see
     // `tag_properties_keyset_source`'s doc comment.

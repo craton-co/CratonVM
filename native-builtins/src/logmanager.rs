@@ -999,7 +999,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     // instantiates any per-logger handlers. Bypassing this path was why the
     // per-webapp FileHandler and root level disappeared.
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
-    logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+    logger = ctx.read_native_pin(logger_pin, logger);
     if ctx
         .class_name_of_id(ctx.class_id_of_object(manager))
         .as_deref()
@@ -1014,18 +1014,18 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
             "(Ljava/util/logging/Logger;)Z",
             &[Value::Object(Some(logger_arg))],
         );
-        logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+        logger = ctx.read_native_pin(logger_pin, logger);
         ctx.unpin_native_roots(manager_pin);
     }
     if let Ok(Some(root)) = tomcat_juli_root_logger(ctx) {
-        logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+        logger = ctx.read_native_pin(logger_pin, logger);
         if let Some(handlers) = crate::jul_logger_handlers_get(ctx, root) {
             // `publish_to_jul_handlers` is intentionally compact and does not
             // walk a Java parent chain.  Share JULI's already-filtered root
             // handler list with the context-local child so it observes the
             // same per-webapp FileHandler configuration.
             crate::jul_logger_handlers_set(ctx, logger, handlers);
-            logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+            logger = ctx.read_native_pin(logger_pin, logger);
         } else {
             // Older JULI setup paths register a root handler through the
             // name-keyed compatibility table. Snapshot that current root list
@@ -1048,13 +1048,13 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
                         &[Value::Object(Some(list)), Value::Object(Some(handler))],
                     );
                 }
-                logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+                logger = ctx.read_native_pin(logger_pin, logger);
                 crate::jul_logger_handlers_set(ctx, logger, list);
-                logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+                logger = ctx.read_native_pin(logger_pin, logger);
             }
         }
     }
-    logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+    logger = ctx.read_native_pin(logger_pin, logger);
     let mut registry = tomcat_juli_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());

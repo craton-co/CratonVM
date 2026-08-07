@@ -3099,10 +3099,10 @@ pub(crate) fn reflection_deserialize_from_json_depth(
         // Match by field name or by @JsonProperty/@SerializedName alias
         let meta = instance_fields.iter().find(|f| {
             if f.name == *key {
-                return Ok(true)?;
+                return true;
             }
             if let Some(alias) = field_json_name(ctx, class_id, &f.name) {
-                return Ok(alias == *key)?;
+                return alias == *key;
             }
             false
         });
@@ -3902,7 +3902,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             let name_ref = match args.get(1) {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
-                    let missing = alloc_json_node(ctx, -1); // missing node type
+                    let missing = alloc_json_node(ctx, -1)?; // missing node type
                     return Ok(Some(Value::Object(Some(missing))));
                 }
             };

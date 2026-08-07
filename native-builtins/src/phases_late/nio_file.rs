@@ -2345,7 +2345,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         if let Value::Object(Some(data)) = ctx.get_field_by_name(list, "elementData") {
             if index < ctx.array_length(data) {
                 if let Value::Object(Some(o)) = ctx.get_array_element(data, index) {
-                    return Ok(Some(o))?;
+                    return Some(o);
                 }
             }
         }
@@ -2366,7 +2366,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         delta: i32,
     ) -> Vec<PicocliStyledSectionData> {
         let Some(list) = list else {
-            return Ok(Vec::new())?;
+            return Vec::new();
         };
         let count = picocli_list_size(ctx, list).min(100_000);
         let mut out = Vec::with_capacity(count);
@@ -2720,7 +2720,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
     ) -> bool {
         let from_prefix = picocli_string_field(ctx, mapper, "fromPrefix");
         if !from_prefix.is_empty() && key.starts_with(&from_prefix) {
-            return Ok(keycloak_wildcard_value_valid(&key[from_prefix.len()..]))?;
+            return keycloak_wildcard_value_valid(&key[from_prefix.len()..]);
         }
 
         let to_prefix = picocli_string_field(ctx, mapper, "toPrefix");
@@ -2730,7 +2730,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
             || !key.ends_with(&to_suffix)
             || key.len() < to_prefix.len().saturating_add(to_suffix.len())
         {
-            return Ok(false)?;
+            return false;
         }
         let end = key.len().saturating_sub(to_suffix.len());
         keycloak_wildcard_value_valid(&key[to_prefix.len()..end])
@@ -3198,7 +3198,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
     fn keycloak_cli_args(ctx: &mut dyn NativeContext) -> Vec<String> {
         let raw = keycloak_cli_args_property(ctx);
         if raw.is_empty() {
-            return Ok(Vec::new())?;
+            return Vec::new();
         }
         let mut result = Vec::new();
         let mut escaped = false;
@@ -3426,7 +3426,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
 
     fn keycloak_cache_set_to_infinispan(ctx: &mut dyn NativeContext) -> bool {
         if keycloak_cli_value(ctx, "cache-remote-host").is_some() {
-            return Ok(false)?;
+            return false;
         }
         keycloak_cli_value(ctx, "cache")
             .map(|v| v.eq_ignore_ascii_case("ispn"))
@@ -3792,7 +3792,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         let units: Vec<u16> = s.encode_utf16().collect();
         let mut freq = rustc_hash::FxHashMap::default();
         if units.len() < 2 {
-            return Ok(freq)?;
+            return freq;
         }
         for pair in units.windows(2) {
             *freq.entry((pair[0], pair[1])).or_insert(0) += 1;
@@ -4095,7 +4095,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 if crate::nbflags().dbg_picocli_style {
                     eprintln!("[picocli-style] ensure_class_initialized failed");
                 }
-                return Ok(cratonvm_types::Value::Object(None))?;
+                return cratonvm_types::Value::Object(None);
             }
         };
         let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
@@ -4117,7 +4117,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
-                return Ok(v)?;
+                return v;
             }
         } else if dbg {
             eprintln!("[picocli-style] plain {} -> no static field", name);
@@ -4135,7 +4135,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
-                return Ok(v)?;
+                return v;
             }
         } else if dbg {
             eprintln!("[picocli-style] prefixed {} -> no static field", prefixed);
@@ -4151,7 +4151,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     matches!(v, cratonvm_types::Value::Object(None))
                 );
             }
-            return Ok(v)?;
+            return v;
         }
         if dbg {
             eprintln!("[picocli-style] reset static field not found, returning null");
@@ -4214,16 +4214,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         } else if let Some(rest) = input.strip_prefix('-') {
             ("-", rest)
         } else {
-            return Ok(input.to_string())?;
+            return input.to_string();
         };
         let Some(colon) = rest.find(':') else {
-            return Ok(input.to_string())?;
+            return input.to_string();
         };
         if !rest[..colon]
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         {
-            return Ok(input.to_string())?;
+            return input.to_string();
         }
         let after_colon = &rest[colon + 1..];
         let (replacement_sign, value) = if let Some(value) = after_colon.strip_prefix('+') {
@@ -4231,10 +4231,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         } else if let Some(value) = after_colon.strip_prefix('-') {
             ('+', value)
         } else {
-            return Ok(input.to_string())?;
+            return input.to_string();
         };
         if !picocli_regex_word_hyphen(value) {
-            return Ok(input.to_string())?;
+            return input.to_string();
         }
         if synopsis {
             format!("{}{}:(+|-){}", prefix, &rest[..colon], value)
@@ -8758,7 +8758,7 @@ pub(crate) fn p57_create_symbolic_link(
         }
     };
     match result {
-        Ok(())? => Ok(()),
+        () => Ok(()),
         Err(e)? => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
     }
 }

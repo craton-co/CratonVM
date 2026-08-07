@@ -5471,7 +5471,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
                 "()Ljava/lang/Object;",
                 MH_KIND_STATIC,
-            );
+            )?;
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
@@ -5584,7 +5584,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
                 "()Ljava/lang/Object;",
                 MH_KIND_STATIC,
-            );
+            )?;
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }

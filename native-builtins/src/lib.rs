@@ -14044,7 +14044,7 @@ pub fn register_essential_natives_with_shims(
                         crate::lang_system::build_stack_trace_element_array(ctx, &trace)
                     }
                     _ => Ok(ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0)),
-                };
+                }?;
                 ctx.set_array_element(outer, i, Value::Object(Some(inner)));
             }
             Ok(Some(Value::Object(Some(outer))))
@@ -32449,7 +32449,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), M
             let cid = ctx.class_id_of_object(this);
             let cname = ctx.class_name_of_id(cid).unwrap_or_default();
             if cname != "java/nio/StringCharBuffer" {
-                return Ok(None)?;
+                return None;
             }
             let str_obj = match ctx.get_field_by_name(this, "str") {
                 Value::Object(Some(o)) => o,
@@ -32488,7 +32488,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), M
             let (chars, _pos, _lim, off) = string_cb_state(ctx, this)?;
             let real = absolute_index + off;
             if real < 0 || real as usize >= chars.len() {
-                return Ok(None)?;
+                return None;
             }
             Some(Value::Int(chars[real as usize] as i32))
         }
