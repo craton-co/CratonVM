@@ -339,6 +339,57 @@ fn no_new_shadowed_registrations() {
     );
 }
 
+/// Instance 5, and the reason this file gained a per-triple test: an EMPTY
+/// STRING where the text should be.
+///
+/// `java/nio/CharBuffer.toString()Ljava/lang/String;` was registered twice in
+/// `register_p62_char_buffer`, ~340 lines apart. The later one read only the
+/// backing `char[]` through `cb_read_hb` and returned `""` when there was none
+/// — and a real `java.nio.StringCharBuffer` has none: it holds the wrapped
+/// sequence in `str`. Being later, it WON.
+///
+/// The symptom split by CALL ROUTE, which is what made it expensive. A direct
+/// bytecode `cb.toString()` resolves the EXACT class and finds
+/// `StringCharBuffer.toString()` (a separate registration, correct). Anything
+/// that resolves the inherited declaration instead — `Method.invoke`,
+/// `NativeContext::invoke_virtual`, and through them `String.valueOf(Object)`,
+/// string concatenation and `StringBuilder.append` — landed on
+/// `java/nio/CharBuffer.toString()` and got `""`. The investigation that
+/// preceded this test ruled out buffer state, the bytecode chain,
+/// abstract-override dispatch and the force-native gate before reaching the
+/// registry, because nothing pointed at a second registrar.
+///
+/// The whole-workspace ratchet above already counted this row — it went 1207 to
+/// 1206 when the duplicate was deleted — but a baseline that large cannot fail
+/// for one triple coming back. This one can.
+#[test]
+fn char_buffer_to_string_is_not_shadowed() {
+    const TRIPLE: &str = "java/nio/CharBuffer.toString()Ljava/lang/String;";
+    let offenders: Vec<String> = shadowed()
+        .iter()
+        .filter(|row| row.triple() == TRIPLE)
+        .map(|row| {
+            format!(
+                "lost at {} [{}] -> WINS at {} [{}]",
+                row.shadowed_at.as_deref().unwrap_or("<unknown>"),
+                row.shadowed_kind.as_str(),
+                row.winner_at.as_deref().unwrap_or("<unknown>"),
+                row.winner_kind.as_str(),
+            )
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "{TRIPLE} is registered more than once, so one of the callbacks can \
+         never be dispatched:\n  {}\nThe last registration wins. If the winner \
+         cannot read a `StringCharBuffer` (no `hb`, text in `str`), every \
+         declaring-class route answers an empty string while a direct \
+         `cb.toString()` stays correct — see \
+         fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md.",
+        offenders.join("\n  ")
+    );
+}
+
 /// The high-signal subset: the winner and the loser disagree about what the
 /// native IS. Instance 1 was a placeholder stub displacing a real bridge.
 #[test]
