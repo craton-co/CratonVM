@@ -3077,8 +3077,8 @@ pub(crate) fn reflection_deserialize_from_json(
     ctx: &mut dyn NativeContext,
     json: &str,
     class_id: ClassId,
-) -> Option<ObjectRef> {
-    reflection_deserialize_from_json_depth(ctx, json, class_id, 0)?
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
+    Ok(reflection_deserialize_from_json_depth(ctx, json, class_id, 0)?)
 }
 
 pub(crate) fn reflection_deserialize_from_json_depth(
@@ -3359,7 +3359,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
                 Some(id) => id,
                 None => return Ok(Some(Value::Object(None))),
             };
-            match reflection_deserialize_from_json(ctx, &json, class_id) {
+            match reflection_deserialize_from_json(ctx, &json, class_id)? {
                 Some(obj) => Ok(Some(Value::Object(Some(obj)))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -3557,7 +3557,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
                 Some(id) => id,
                 None => return Ok(Some(Value::Object(None))),
             };
-            match reflection_deserialize_from_json(ctx, &json, class_id) {
+            match reflection_deserialize_from_json(ctx, &json, class_id)? {
                 Some(obj) => Ok(Some(Value::Object(Some(obj)))),
                 None => Ok(Some(Value::Object(None))),
             }

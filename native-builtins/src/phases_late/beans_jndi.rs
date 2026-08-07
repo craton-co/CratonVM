@@ -171,7 +171,7 @@ fn p72_prefs_child_or_create(
     this: ObjectRef,
     name_val: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let Some(children) = p72_prefs_children(ctx, this) else {
+    let Ok(Some(children)) = p72_prefs_children(ctx, this) else {
         // Pre-wave-2 layout (no child registry): fall back to the old
         // detached-node behaviour rather than failing.
         let user = p72_prefs_is_user(ctx, this);
@@ -295,12 +295,12 @@ fn p72_prefs_removed_ex() -> MethodCallFailed {
 ///
 /// Mirrors `p72_prefs_map`'s lazy-init shape (including its pinning), so a
 /// `Preferences` built before slots 2/3 existed still works.
-pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if ctx.object_num_fields(this) < 4 {
-        return None;
+        return Ok(None);
     }
     if let Value::Object(Some(m)) = ctx.get_field(this, 3) {
-        return Some(m);
+        return Ok(Some(m));
     }
     // Pin across the map alloc/init below — a moving young GC there would
     // relocate `this` (native stale-local family).
@@ -312,7 +312,7 @@ pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -
     let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field(this, 3, Value::Object(Some(map)));
     ctx.unpin_native_roots(this_pin);
-    Some(map)
+    Ok(Some(map))
 }
 
 pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
@@ -740,7 +740,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) -> Result<(
             let name = ctx.get_field(this, 1);
             let name_pin = pinned_object_value(ctx, name);
             let parent = ctx.read_native_pin(parent_pin, parent);
-            if let Some(children) = p72_prefs_children(ctx, parent) {
+            if let Ok(Some(children)) = p72_prefs_children(ctx, parent) {
                 let name = read_pinned_object_value(ctx, name_pin, name);
                 cratonvm_native_collections::native_map_remove_pub(
                     ctx,
@@ -1190,7 +1190,7 @@ fn vcs_fire(
     let prop_pin = pinned_object_value(ctx, prop_name);
     let old_pin = pinned_object_value(ctx, old_val);
     let new_pin = pinned_object_value(ctx, new_val);
-    let Ok((fired_this, event)) = vcs_event(ctx, this, prop_name, old_val, new_val);
+    let (fired_this, event) = vcs_event(ctx, this, prop_name, old_val, new_val)?;
     let result = match vcs_dispatch(ctx, fired_this, event) {
         Ok(()) => Ok(None),
         Err(failure) => {
@@ -1199,7 +1199,7 @@ fn vcs_fire(
                 let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
                 let old_val = read_pinned_object_value(ctx, old_pin, old_val);
                 let new_val = read_pinned_object_value(ctx, new_pin, new_val);
-                let Ok((revert_this, revert)) = vcs_event(ctx, this, prop_name, new_val, old_val);
+                let (revert_this, revert) = vcs_event(ctx, this, prop_name, new_val, old_val)?;
                 let _ = vcs_dispatch(ctx, revert_this, revert);
             }
             Err(failure)

@@ -1641,7 +1641,7 @@ fn varhandle_access_mode_type_uncached(
         vh_access_mode_descriptor(access_type, &coords, &value_desc)
     };
 
-    match build_method_type_from_descriptor(ctx, &desc) {
+    match build_method_type_from_descriptor(ctx, &desc)? {
         Some(mt) => Ok(Some(Value::Object(Some(mt)))),
         None => Ok(None),
     }
@@ -4519,7 +4519,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(field_type_mirror(ctx, &field_type_slice)?))
     } else {
         let mt = build_method_type_from_descriptor(ctx, &desc)
-            .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+            .or_else(|| build_method_type_from_descriptor(ctx, "()V"))?;
         Value::Object(mt)
     };
     mn_set(ctx, mn, "type", MN_TYPE, type_value);
@@ -5024,7 +5024,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                             params.drain(p..end);
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                             ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -5077,7 +5077,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                         params.push(comp.clone());
                     }
                     let new_desc = format!("({}){}", params.concat(), ret);
-                    if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                    if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                         ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                     }
                 }
@@ -5268,7 +5268,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) ->
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
         |ctx, _args| {
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
+            if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, "()V") {
                 ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
             }
             Ok(Some(Value::Object(Some(obj))))
@@ -6167,7 +6167,7 @@ pub(crate) fn alloc_method_handle(
     // `build_method_type_from_descriptor` allocates too; re-read `mh` once
     // more before its final use, then release the whole pinned batch.
     let mh = ctx.read_native_pin(mh_pin, mh);
-    if let Some(mt) = mt_opt {
+    if let Ok(Some(mt)) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     ctx.unpin_native_roots(mh_pin);
@@ -6295,7 +6295,7 @@ pub(crate) fn alloc_string_concat_method_handle(
     // `mh.type()` walks see a non-null MethodType.
     let mt_opt = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;");
     let mh = ctx.read_native_pin(mh_pin, mh);
-    if let Some(mt) = mt_opt {
+    if let Ok(Some(mt)) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     ctx.unpin_native_roots(mh_pin);
@@ -8852,7 +8852,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
                             params.remove(0); // one value inserted at pos 0
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                             ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -8869,7 +8869,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
             // classes[] of the right length (was AIOOBE: classes longer than the
             // runtime args). STATIC-handle leading-arg drop is a separate path.
             if kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL {
-                if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+                if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &desc) {
                     ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                 }
             } else if kind == MH_KIND_STATIC {
@@ -8887,7 +8887,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
                             params.remove(0);
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &new_desc) {
                             ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -8981,10 +8981,10 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
                 return Ok(Some(Value::Object(Some(mt))));
             }
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
-            if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+            if let Ok(Some(mt)) = build_method_type_from_descriptor(ctx, &desc) {
                 return Ok(Some(Value::Object(Some(mt))));
             }
-            let mt = build_method_type_from_descriptor(ctx, "()V");
+            let mt = build_method_type_from_descriptor(ctx, "()V")?;
             Ok(Some(Value::Object(mt)))
         },
     );
@@ -8999,9 +8999,9 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
 pub fn build_method_type_from_descriptor(
     ctx: &mut dyn NativeContext,
     desc: &str,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if desc.is_empty() || !desc.starts_with('(') {
-        return None;
+        return Ok(None);
     }
 
     let close = desc.find(')')?;
@@ -9056,7 +9056,7 @@ pub fn build_method_type_from_descriptor(
     ctx.set_field(mt, 1, Value::Object(Some(arr)));
 
     populate_method_type_form(ctx, mt);
-    Some(mt)
+    Ok(Some(mt))
 }
 
 /// C21: Build a synthetic MethodTypeForm and link it into `mt.form` so
@@ -10628,7 +10628,7 @@ fn alloc_resolved_member_name(
     // type: MethodType built from desc (fall back to ()V if desc is garbage)
     let mt = build_method_type_from_descriptor(ctx, desc)
         .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
-    if let Some(mt) = mt {
+    if let Ok(Some(mt)) = mt {
         mn_set(ctx, mn, "type", MN_TYPE, Value::Object(Some(mt)));
     }
 

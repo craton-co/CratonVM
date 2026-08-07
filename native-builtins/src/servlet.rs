@@ -2701,7 +2701,7 @@ const S2DC_SOCK_ID: usize = 4;
 
 // ---- ByteBuffer helpers ----------------------------------------------------
 
-fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
+fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectRef>, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
     // and on a full heap the backing `new byte[n]` must raise a *catchable*
@@ -2720,7 +2720,7 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
-    Some(buf)
+    Ok(Some(buf))
 }
 
 /// NEW-17 — synthetic-mode `ByteBuffer.allocateDirect(cap)`.
@@ -4522,8 +4522,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
         }
         let cap = requested as usize;
         match s2_bb_alloc(ctx, cap) {
-            Some(buf) => Ok(Some(Value::Object(Some(buf)))),
-            None => Err(RuntimeError::OutOfMemoryError {
+            Ok(Some(buf)) => Ok(Some(Value::Object(Some(buf)))),
+            Ok(None) => Err(RuntimeError::OutOfMemoryError {
                 message: "Java heap space".to_string(),
             }
             .into()),

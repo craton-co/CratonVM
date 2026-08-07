@@ -2383,7 +2383,7 @@ pub(crate) fn p59_sf_get_method_type(
         }
     }
     Ok(Some(Value::Object(
-        crate::lang_invoke::build_method_type_from_descriptor(ctx, &desc),
+        crate::lang_invoke::build_method_type_from_descriptor(ctx, &desc)?,
     )))
 }
 

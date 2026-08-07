@@ -4455,7 +4455,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let Ok((_, subtask)) = incubator_fork_subtask(ctx, None, callable);
+            let (_, subtask) = incubator_fork_subtask(ctx, None, callable)?;
             Ok(Some(Value::Object(Some(subtask))))
         },
     );
@@ -4573,7 +4573,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let Ok((this, subtask)) = incubator_fork_subtask(ctx, Some(this), callable);
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable)?;
             // ShutdownOnSuccess captures the first successful result.
             if let Some(this) = this {
                 let succeeded =
@@ -4665,7 +4665,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let Ok((this, subtask)) = incubator_fork_subtask(ctx, Some(this), callable);
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable)?;
             if let Some(this) = this {
                 let failed =
                     matches!(ctx.get_field(subtask, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_FAILED);

@@ -3046,7 +3046,7 @@ fn cl_load_class_base_delegation_rooted(
     //    under IMPL-JARS/<module>/<jar_dir>/<classfile> inside the outer
     //    module JAR. When neither the flat classpath nor findClass can locate
     //    the class, try scanning those entries directly.
-    if let Some(mirror) = impl_jars_load_class(ctx, Some(this), &internal) {
+    if let Ok(Some(mirror)) = impl_jars_load_class(ctx, Some(this), &internal) {
         return Ok(Some(Value::Object(Some(mirror))));
     }
 
@@ -3137,7 +3137,7 @@ fn cl_find_class_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // A module-aware lookup can be the first request for an embedded
     // implementation dependency, so share loadClass/findClass(String)'s
     // IMPL-JARS fallback here as well.
-    if let Some(mirror) = impl_jars_load_class(ctx, Some(this), &internal) {
+    if let Ok(Some(mirror)) = impl_jars_load_class(ctx, Some(this), &internal) {
         return Ok(Some(Value::Object(Some(mirror))));
     }
 
@@ -8463,7 +8463,7 @@ fn alloc_method_handle(
     // `()V` MethodType when nothing was supplied (e.g. lk_unreflect, where
     // the Java caller did not pass an explicit MethodType).
     let mt_to_store =
-        method_type.or_else(|| crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V"));
+        method_type.or_else(|| crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V")?);
     let mh = ctx.read_native_pin(mh_pin, mh);
     ctx.unpin_native_roots(mh_pin);
     if let Some(mt) = mt_to_store {

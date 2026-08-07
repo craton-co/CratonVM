@@ -9027,7 +9027,7 @@ pub(crate) fn native_class_get_declared_method(
             // for known WildFly/Keycloak entry-class `main(String[])` lookups so
             // that jboss-modules' bootstrap progresses past the NoSuchMethod
             // wall. Fall through to the existing NSME otherwise.
-            if let Some(method_obj) =
+            if let Ok(Some(method_obj)) =
                 wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
             {
                 return Ok(Some(Value::Object(Some(method_obj))));
@@ -9187,7 +9187,7 @@ pub(crate) fn native_class_get_declared_method(
     // class file's own method table вЂ” which is still empty for the synthetic
     // stub. Synthesise a no-op `main(String[])` Method *here* so the launcher
     // can invoke it (the invoke is intercepted natively elsewhere).
-    if let Some(method_obj) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
+    if let Ok(Some(method_obj)) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -9220,7 +9220,7 @@ fn wf_shim_synth_main_method(
     this: ObjectRef,
     name: &str,
     param_types_arr: Option<ObjectRef>,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     // Real-bytecode audit: this WF6 reflective short-circuit is disabled
     // by default. It synthesized a fake `main(String[])` Method mirror
     // for any class whose name contains a WildFly / Keycloak fragment,
@@ -9229,19 +9229,19 @@ fn wf_shim_synth_main_method(
     // for boot-test (exit-rc-only) diagnostics.
     if !crate::nbflags().use_wildfly_reflect_shim {
         let _ = (this, name, param_types_arr);
-        return None;
+        return Ok(None);
     }
     if name != "main" {
-        return None;
+        return Ok(None);
     }
     let pt_arr = param_types_arr?;
     if ctx.array_length(pt_arr) != 1 {
-        return None;
+        return Ok(None);
     }
     // Parameter element must be String[].class.
     let elem_mirror = match ctx.get_array_element(pt_arr, 0) {
         Value::Object(Some(m)) => m,
-        _ => return None,
+        _ => return Ok(None),
     };
     let elem_name = mirror_class_name(ctx, elem_mirror).unwrap_or_default();
     // Accept JVM-internal form ("[Ljava/lang/String;") and dotted form
@@ -9252,7 +9252,7 @@ fn wf_shim_synth_main_method(
         || elem_name == "java.lang.String[]"
         || elem_name == "java/lang/String[]";
     if !is_string_array {
-        return None;
+        return Ok(None);
     }
 
     let class_name = mirror_class_name(ctx, this).unwrap_or_default();
@@ -9266,7 +9266,7 @@ fn wf_shim_synth_main_method(
         || cn.contains("keycloak")
         || cn.contains("wildfly");
     if !is_known_entry {
-        return None;
+        return Ok(None);
     }
 
     // Synthesise a public-static no-op `main([Ljava/lang/String;)V`. We
@@ -9287,7 +9287,7 @@ fn wf_shim_synth_main_method(
         "synthesising no-op main(String[]) Method for {} (getDeclaredMethod / getMethod)",
         class_name
     );
-    Some(create_method_object(ctx, &meta)?)
+    Ok(Some(create_method_object(ctx, &meta)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -10678,7 +10678,7 @@ pub(crate) fn native_class_get_method(
             // `main(String[])` Method for jboss-modules / WildFly /
             // Keycloak entry-class lookups so the launcher progresses past
             // the NoSuchMethod wall instead of fataling.
-            if let Some(method_obj) =
+            if let Ok(Some(method_obj)) =
                 wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr)
             {
                 return Ok(Some(Value::Object(Some(method_obj))));
@@ -10825,7 +10825,7 @@ pub(crate) fn native_class_get_method(
     // launcher path occasionally hits `getMethod` instead of
     // `getDeclaredMethod`; both must produce a usable Method mirror for the
     // boot to continue.
-    if let Some(method_obj) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
+    if let Ok(Some(method_obj)) = wf_shim_synth_main_method(ctx, this, &target_name, param_types_arr) {
         return Ok(Some(Value::Object(Some(method_obj))));
     }
 
@@ -16204,7 +16204,7 @@ fn package_version_info(
     impl_title: Option<String>,
     impl_version: Option<String>,
     impl_vendor: Option<String>,
-) -> Option<Value> {
+) -> Result<Option<Value>, MethodCallFailed> {
     if spec_title.is_none()
         && spec_version.is_none()
         && spec_vendor.is_none()
@@ -16212,7 +16212,7 @@ fn package_version_info(
         && impl_version.is_none()
         && impl_vendor.is_none()
     {
-        return None;
+        return Ok(None);
     }
 
     // `VersionInfo` has no superclass fields: its six strings are slots 0..5
@@ -16240,7 +16240,7 @@ fn package_version_info(
     }
     let info = ctx.read_native_pin(info_pin, info);
     ctx.unpin_native_roots(info_pin);
-    Some(Value::Object(Some(info)))
+    Ok(Some(Value::Object(Some(info))))
 }
 
 pub(crate) fn native_class_get_package(
@@ -16361,7 +16361,7 @@ pub(crate) fn native_class_get_package(
     // currently no-op for a real-class Package (tracked as a follow-up);
     // what matters here is that they can never clobber `module` /
     // `versionInfo` / `packageInfo` the way the old by-index writes did.
-    if let Some(version_info) = package_version_info(
+    if let Ok(Some(version_info)) = package_version_info(
         ctx,
         spec_title,
         spec_version,
@@ -16920,7 +16920,7 @@ pub(crate) fn i2_classloader_define_package_class(
     // `packageInfo`), so a by-index write here clobbers them exactly like
     // the `native_class_get_package` bug did.
     let pkg_pin = ctx.pin_native_root(pkg?);
-    if let Some(version_info) = package_version_info(
+    if let Ok(Some(version_info)) = package_version_info(
         ctx,
         spec_title,
         spec_version,

@@ -373,9 +373,9 @@ pub fn impl_jars_load_class(
     ctx: &mut dyn NativeContext,
     defining_loader: Option<cratonvm_types::ObjectRef>,
     internal_name: &str,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     let mut visited = std::collections::HashSet::new();
-    impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)?
+    Ok(impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)?)
 }
 
 fn impl_jars_load_class_inner(
@@ -638,7 +638,7 @@ fn load_provider_class(
     ctx: &mut dyn NativeContext,
     fqn: &str,
     loader: Option<cratonvm_types::ObjectRef>,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     if let Some(loader_r) = loader {
         // Both create_string calls can collect, so pin the module or custom
         // loader for the entire loadClass/findClass/fallback sequence.
@@ -653,7 +653,7 @@ fn load_provider_class(
         );
         if let Ok(Some(Value::Object(Some(c)))) = load_result {
             ctx.unpin_native_roots(loader_pin);
-            return Some(c);
+            return Ok(Some(c));
         }
         let find_name = ctx.create_string(fqn);
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
@@ -664,14 +664,14 @@ fn load_provider_class(
             &[Value::Object(Some(find_name))],
         ) {
             ctx.unpin_native_roots(loader_pin);
-            return Some(c);
+            return Ok(Some(c));
         }
         let loader_r = ctx.read_native_pin(loader_pin, loader_r);
         let from_loader_jars =
             load_provider_class_from_loader_jars(ctx, loader_r, &fqn.replace('.', "/"));
         ctx.unpin_native_roots(loader_pin);
         if let Some(c) = from_loader_jars {
-            return Some(c);
+            return Ok(Some(c));
         }
     }
     // No loader, or the loader couldn't resolve it — fall back to the
@@ -683,10 +683,10 @@ fn load_provider_class(
         "(Ljava/lang/String;)Ljava/lang/Class;",
         &[Value::Object(Some(name))],
     ) {
-        return Some(c);
+        return Ok(Some(c));
     }
     // Final fallback: IMPL-JARS nested-JAR scan.
-    impl_jars_load_class(ctx, None, &fqn.replace('.', "/"))
+    Ok(impl_jars_load_class(ctx, None, &fqn.replace('.', "/"))?)
 }
 
 /// Read provider FQNs for `sl.service` from every
@@ -1802,7 +1802,7 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Bound outside the `match` so the shared borrow of `fqn` cannot outlive
         // the call into the arms, where `fqn` is moved into `missing`.
         let resolved = load_provider_class(ctx, &fqn, loader_cur);
-        let class = match resolved {
+        let class = match resolved? {
             Some(c) => c,
             None => {
                 if diag {
@@ -2315,7 +2315,7 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // Class.forName(fqn) uses the flat classpath and won't find the class.
         // Pass the loader so load_provider_class can fall back to loadClass.
         let loader_cur = sl_non_builtin_loader(ctx, sl_cur);
-        let type_class = match load_provider_class(ctx, fqn, loader_cur) {
+        let type_class = match load_provider_class(ctx, fqn, loader_cur)? {
             Some(c) => c,
             None => {
                 if diag {

@@ -14199,17 +14199,17 @@ fn re8_find_interface(
     ctx: &mut dyn NativeContext,
     select: impl Fn(&Re8HostIface) -> bool,
     loopback_fallback: bool,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let hosts = re8_scan_host_ifaces();
     if hosts.is_empty() {
         return if loopback_fallback {
-            re8_make_loopback_interface(ctx)
+            Ok(re8_make_loopback_interface(ctx))
         } else {
-            None
+            Ok(None)
         };
     }
     let host = hosts.into_iter().find(select)?;
-    re8_make_interface(ctx, &host)?
+    Ok(re8_make_interface(ctx, &host)?)
 }
 
 /// Build the single REAL-layout loopback `NetworkInterface` ("lo", index 1,
@@ -14457,7 +14457,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 ctx,
                 move |host| host.name == wanted,
                 name == RE8_LOOPBACK_NAME,
-            );
+            )?;
             Ok(Some(Value::Object(iface)))
         },
         NativeKind::Bridge,
@@ -14475,7 +14475,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(None)));
             };
             let iface =
-                re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback());
+                re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback())?;
             Ok(Some(Value::Object(iface)))
         },
         NativeKind::Bridge,
@@ -14524,7 +14524,7 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
                 ctx,
                 move |host| host.index == index,
                 index == RE8_LOOPBACK_INDEX,
-            );
+            )?;
             Ok(Some(Value::Object(iface)))
         },
         NativeKind::Bridge,

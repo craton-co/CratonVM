@@ -792,7 +792,7 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
 /// scan is the established, well-tested path and answers the same thing.
 /// Because our native IS the `getBundle` frame (no Java frame is pushed for
 /// it), the innermost captured Java frame is the caller.
-fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let frames = ctx.capture_stack_trace(0);
     let cid = frames.last()?.class_id?;
     let mirror = ctx.get_class_mirror(cid);
@@ -801,7 +801,7 @@ fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> 
         &[Value::Object(Some(mirror))],
     ) {
         Ok(Some(Value::Object(Some(loader)))) => loader,
-        _ => return None,
+        _ => return Ok(None),
     };
     // Anything other than the application-loader singleton. NOT
     // `is_user_defined_loader`: that predicate excludes a bare
@@ -812,9 +812,9 @@ fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> 
     // the app singleton, and both keep the established `-cp` path.
     let app = crate::classloader::get_or_create_app_loader(ctx)?;
     if loader.as_ptr() == app.as_ptr() {
-        return None;
+        return Ok(None);
     }
-    Some(loader)
+    Ok(Some(loader))
 }
 
 /// Locate a `.properties` candidate through the loader supplied to
@@ -1045,7 +1045,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
     // An explicit `ClassLoader` argument wins; otherwise honour the JDK's
     // caller-sensitive resolution -- see `caller_bundle_class_loader`.
-    let loader = bundle_class_loader(ctx, args).or_else(|| caller_bundle_class_loader(ctx));
+    let loader = bundle_class_loader(ctx, args).or_else(|| caller_bundle_class_loader(ctx)?);
 
     // cceres5 (WildFly metrics stale-ResourceBundle, live-captured via
     // CRATONVM_DBG_STALE_RECV): `obj`/`map`/`loader` were carried raw across

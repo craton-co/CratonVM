@@ -38383,12 +38383,12 @@ pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> Result<(i32, i32, i32), Method
 /// `1970-01-01T00:00:00.042Z`: the UTC date-time, with the fraction rendered
 /// in whole groups of three digits — milliseconds, microseconds or
 /// nanoseconds — and omitted entirely when zero.
-fn iso_instant_string(sec: i64, nano: i32) -> String {
+fn iso_instant_string(sec: i64, nano: i32) -> Result<String, MethodCallFailed> {
     // Floor division so pre-epoch instants borrow correctly into the previous
     // day rather than truncating toward zero.
     let days = sec.div_euclid(86_400);
     let secs_of_day = sec.rem_euclid(86_400);
-    let Ok((y, m, d)) = epoch_day_to_ymd(days);
+    let (y, m, d) = epoch_day_to_ymd(days)?;
     let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
     // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
     let mut s = if (0..=9999).contains(&y) {
@@ -38407,7 +38407,7 @@ fn iso_instant_string(sec: i64, nano: i32) -> String {
         }
     }
     s.push('Z');
-    s
+    Ok(s)
 }
 
 fn native_synthetic_instant_to_string(
@@ -38417,7 +38417,7 @@ fn native_synthetic_instant_to_string(
     let this = obj_arg(args, 0)?;
     let (sec, nano) = synthetic_instant_parts(ctx, this);
     let s = iso_instant_string(sec, nano);
-    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    Ok(Some(Value::Object(Some(ctx.create_string(&s?)))))
 }
 
 fn native_synthetic_instant_equals(
