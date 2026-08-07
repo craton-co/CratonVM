@@ -204,8 +204,23 @@ run_one_class() {
   safe="$(safe_name "$cls")"
   logf="$logs/$(printf '%05d' "$idx")-$safe.log"
 
+  # Suite runs disable the default watchdog: a class that legitimately takes
+  # the whole $CLASS_TO budget would otherwise abort()+dump, which is noise
+  # here and loses the timeout classification. But disable it ONLY when the
+  # caller has not asked for a watchdog itself: vm-cli's `default_watchdog_env`
+  # (vm-cli/src/main.rs) resolves to None the moment
+  # CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 is present, *whatever*
+  # CRATONVM_DEFAULT_WATCHDOG_SEC says -- so hard-setting it here is what made
+  # `env CRATONVM_DEFAULT_WATCHDOG_SEC=45 ./run-h2-suite.sh run ...` produce a
+  # per-class log with the startup banner and no T19.H1 dump, long past the
+  # deadline (recorded as an unexplained residual in
+  # docs/known-issues/h2/bug-h2-mvstore-insert-loop-perf-hang.md until
+  # 2026-08-07).
+  local -a wd_env=(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1)
+  [ -n "${CRATONVM_DEFAULT_WATCHDOG_SEC:-}" ] && wd_env=()
+
   t0="$(now_ms)"
-  ( cd "$wd" && CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout --kill-after=5 "$CLASS_TO" \
+  ( cd "$wd" && env "${wd_env[@]}" timeout --kill-after=5 "$CLASS_TO" \
       "$javabin" "${extra_args[@]}" "$cls" ) > "$logf" 2>&1
   rc=$?
   t1="$(now_ms)"
@@ -410,6 +425,10 @@ OPTIONS (run / quad / hotspot)
 ENV
   CRATONVM_BIN=...                Override cratonvm executable path.
   CRATONVM_*=...                  Any CratonVM env knob; inherited by child VMs.
+  CRATONVM_DEFAULT_WATCHDOG_SEC=N Arm the in-VM stack-dump watchdog at N seconds.
+                                  Setting it also stops the runner from passing
+                                  CRATONVM_DISABLE_DEFAULT_WATCHDOG=1, which
+                                  would otherwise silently veto it.
   H2_ROOT=...                     H2 checkout (default apps/h2database/h2).
   JDK25=...                       Real JDK25 home (default /home/victor/jdk25).
   CP_FILE=...                     Classpath file (default \$H2_ROOT/craton-testcp.txt).
