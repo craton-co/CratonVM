@@ -7191,44 +7191,6 @@ pub(crate) fn ucl_try_define_local_class(
             let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
             *in_progress = false;
             self.cvar.notify_all();
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
-    Ok(());
     ()
 }
     }
@@ -8462,8 +8424,10 @@ fn alloc_method_handle(
     // mirror from the Lookup.findXxx JVM call); fall back to a synthetic
     // `()V` MethodType when nothing was supplied (e.g. lk_unreflect, where
     // the Java caller did not pass an explicit MethodType).
-    let mt_to_store =
-        method_type.or_else(|| crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V")?);
+    let mt_to_store = match method_type {
+        Some(mt) => Some(mt),
+        None => crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V")?,
+    };
     let mh = ctx.read_native_pin(mh_pin, mh);
     ctx.unpin_native_roots(mh_pin);
     if let Some(mt) = mt_to_store {

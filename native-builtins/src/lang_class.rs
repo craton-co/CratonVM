@@ -16918,14 +16918,14 @@ pub(crate) fn i2_classloader_define_package_class(
         } else {
             (None, None, None, None, None, None)
         };
-    let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
+    let pkg = i2_alloc_synthetic_package(ctx, &pkg_name)?;
     // By-name only вЂ” NOT by raw slot index. See the corruption note on
     // `native_class_get_package` above: real JDK 9+ `Package` has no flat
     // `specTitle`/etc. fields at slots 1-6 (those live inside the nested
     // `versionInfo` object; slots 1-3 are actually `module`/`versionInfo`/
     // `packageInfo`), so a by-index write here clobbers them exactly like
     // the `native_class_get_package` bug did.
-    let pkg_pin = ctx.pin_native_root(pkg?);
+    let pkg_pin = ctx.pin_native_root(pkg);
     if let Ok(Some(version_info)) = package_version_info(
         ctx,
         spec_title,
@@ -16935,7 +16935,7 @@ pub(crate) fn i2_classloader_define_package_class(
         impl_version,
         impl_vendor,
     ) {
-        let pkg = ctx.read_native_pin(pkg_pin, pkg?);
+        let pkg = ctx.read_native_pin(pkg_pin, pkg);
         ctx.set_field(pkg, 2, version_info);
     } else if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
         if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {

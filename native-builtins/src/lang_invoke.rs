@@ -4518,8 +4518,10 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let field_type_slice = field_type_from_desc(&desc, ref_kind);
         Value::Object(Some(field_type_mirror(ctx, &field_type_slice)?))
     } else {
-        let mt = build_method_type_from_descriptor(ctx, &desc)
-            .or_else(|| build_method_type_from_descriptor(ctx, "()V"))?;
+        let mt = match build_method_type_from_descriptor(ctx, &desc)? {
+            Some(mt) => Some(mt),
+            None => build_method_type_from_descriptor(ctx, "()V")?,
+        };
         Value::Object(mt)
     };
     mn_set(ctx, mn, "type", MN_TYPE, type_value);
@@ -6162,8 +6164,11 @@ pub(crate) fn alloc_method_handle(
     } else {
         desc
     };
-    let mt_opt = build_method_type_from_descriptor(ctx, type_desc)
-        .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+    let mt_opt = match build_method_type_from_descriptor(ctx, type_desc) {
+        Ok(Some(mt)) => Ok(Some(mt)),
+        Ok(None) => build_method_type_from_descriptor(ctx, "()V"),
+        Err(e) => Err(e),
+    };
     // `build_method_type_from_descriptor` allocates too; re-read `mh` once
     // more before its final use, then release the whole pinned batch.
     let mh = ctx.read_native_pin(mh_pin, mh);
@@ -10608,13 +10613,12 @@ fn alloc_resolved_member_name(
     // clazz: use the host class mirror (must be a valid Class mirror for
     // downstream `mn.getDeclaringClass()` reads).
     let host_cid = ctx.class_id_by_name(host_class);
-    let clazz_mirror = host_cid
-        .map(|cid| ctx.get_class_mirror(cid))
-        .unwrap_or_else(|| {
-            // Fallback: allocate a synthetic Class stub — should not normally
-            // happen since LambdaForm is always loaded before this path.
-            try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?
-        });
+    let clazz_mirror = match host_cid.map(|cid| ctx.get_class_mirror(cid)) {
+        Some(m) => m,
+        // Fallback: allocate a synthetic Class stub — should not normally
+        // happen since LambdaForm is always loaded before this path.
+        None => try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?,
+    };
     mn_set(
         ctx,
         mn,
@@ -10628,8 +10632,11 @@ fn alloc_resolved_member_name(
     mn_set(ctx, mn, "name", MN_NAME, Value::Object(Some(name_str)));
 
     // type: MethodType built from desc (fall back to ()V if desc is garbage)
-    let mt = build_method_type_from_descriptor(ctx, desc)
-        .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+    let mt = match build_method_type_from_descriptor(ctx, desc) {
+        Ok(Some(mt)) => Ok(Some(mt)),
+        Ok(None) => build_method_type_from_descriptor(ctx, "()V"),
+        Err(e) => Err(e),
+    };
     if let Ok(Some(mt)) = mt {
         mn_set(ctx, mn, "type", MN_TYPE, Value::Object(Some(mt)));
     }

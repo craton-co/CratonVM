@@ -3274,13 +3274,14 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let obj = stpe_new_executor(ctx, cores).unwrap_or_else(|| {
-                try_alloc_concurrent_synthetic(
+            let obj = match stpe_new_executor(ctx, cores) {
+                Some(obj) => obj,
+                None => try_alloc_concurrent_synthetic(
                     ctx,
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     2,
-                )?
-            });
+                )?,
+            };
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -3289,13 +3290,14 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         "newSingleThreadScheduledExecutor",
         "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
-            let obj = stpe_new_executor(ctx, 1).unwrap_or_else(|| {
-                try_alloc_concurrent_synthetic(
+            let obj = match stpe_new_executor(ctx, 1) {
+                Some(obj) => obj,
+                None => try_alloc_concurrent_synthetic(
                     ctx,
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     2,
-                )?
-            });
+                )?,
+            };
             Ok(Some(Value::Object(Some(obj))))
         },
     );

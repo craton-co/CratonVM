@@ -16695,11 +16695,18 @@ pub fn register_essential_natives_with_shims(
         "latestUserDefinedLoader0",
         "()Ljava/lang/ClassLoader;",
         |ctx, _args| {
-            let loader =
-                crate::classloader::latest_user_defined_loader_class(ctx).map(|class_id| {
-                    crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
-                        .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx)?)
-                });
+            let loader = match crate::classloader::latest_user_defined_loader_class(ctx) {
+                Some(class_id) => Some(
+                    match crate::classloader::defining_loader_for(
+                        ctx.vm_identity(),
+                        class_id.as_u32(),
+                    ) {
+                        Some(l) => l,
+                        None => crate::classloader::get_or_create_app_loader(ctx)?,
+                    },
+                ),
+                None => None,
+            };
             Ok(Some(Value::Object(loader)))
         },
         NativeKind::Bridge,

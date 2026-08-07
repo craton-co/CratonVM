@@ -4523,9 +4523,9 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
             .into());
         }
         let cap = requested as usize;
-        match s2_bb_alloc(ctx, cap) {
-            Ok(Some(buf)) => Ok(Some(Value::Object(Some(buf)))),
-            Ok(None) => Err(RuntimeError::OutOfMemoryError {
+        match s2_bb_alloc(ctx, cap)? {
+            Some(buf) => Ok(Some(Value::Object(Some(buf)))),
+            None => Err(RuntimeError::OutOfMemoryError {
                 message: "Java heap space".to_string(),
             }
             .into()),
@@ -5461,7 +5461,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                 Ok(buf)
             }
         };
-        Ok(Some(Value::Object(Some(buf))))
+        Ok(Some(Value::Object(Some(buf?))))
     });
     // JDK 13+ `slice(int index, int length)` — absolute-indexed aliasing
     // view, independent of position/limit. Abstract on the real class, so
@@ -5514,7 +5514,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                 Ok(buf)
             }
         };
-        Ok(Some(Value::Object(Some(buf))))
+        Ok(Some(Value::Object(Some(buf?))))
     });
     r.register(bb, "duplicate", "()Ljava/nio/ByteBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5548,7 +5548,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                 Ok(buf)
             }
         };
-        Ok(Some(Value::Object(Some(buf))))
+        Ok(Some(Value::Object(Some(buf?))))
     });
     r.register(
         bb,
@@ -5584,7 +5584,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                     Ok(buf)
                 }
             };
-            Ok(Some(Value::Object(Some(buf))))
+            Ok(Some(Value::Object(Some(buf?))))
         },
     );
 
