@@ -7444,12 +7444,23 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         _ => None,
                     })
                     .unwrap_or_default();
+                // Same one pass, for the same reason: `create_method_object`
+                // used to re-find this method by name+descriptor to read it.
+                let signature: Option<String> = m.attributes.iter().find_map(|a| {
+                    match a.as_decoded() {
+                        Some(cratonvm_reader::attribute::Attribute::Signature(sig)) => {
+                            Some(sig.to_string())
+                        }
+                        _ => None,
+                    }
+                });
                 MethodMetadata {
                     name: m.name.to_string(),
                     descriptor: m.descriptor.to_string(),
                     access_flags: m.access_flags.bits(),
                     declaring_class_id: class_id,
                     exceptions,
+                    signature,
                 }
             })
             .collect()

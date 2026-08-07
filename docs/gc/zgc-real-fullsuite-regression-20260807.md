@@ -142,8 +142,12 @@ share one cause with each other, or with the HANG group.
 ## 4 classes: HANG (Generational) -> PASS (ZGC)
 
 All four are jOOQ-family classes, the same family already tracked as a
-severe-throughput HANG under Generational
-([`jooqautoconfigurationtests-timeout-regression-20260805.md`](../known-issues/springboot/jooqautoconfigurationtests-timeout-regression-20260805.md)).
+severe-throughput HANG under Generational (the retired
+`jooqautoconfigurationtests-timeout-regression-20260805` write-up). That HANG
+was root-caused and FIXED on 2026-08-07 — `Method.getModifiers()` rebuilt the
+declaring class method table on every call, 39 us per call on jOOQ 1003-method
+`DefaultDSLContext` — so the Generational side of this comparison is stale for
+the jOOQ family and would need re-running to mean anything.
 Plausibly just noise near the 300s timeout boundary (these are exactly the
 kind of borderline-slow classes that flip status run to run), not a genuine
 ZGC advantage — not investigated further.
