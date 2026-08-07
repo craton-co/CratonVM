@@ -7366,11 +7366,30 @@ pub(crate) fn native_method_invoke(
     // Most framework reflection invokes public methods. Do not format an
     // exception-only diagnostic string on that successful hot path.
     if !accessible && !is_public {
-        check_access(
-            modifiers,
-            false,
-            &format!("Method.invoke: {}.{}", class_name, method_name),
-        )?;
+        // Same-class carve-out, the method half of `check_field_access`'s.
+        //
+        // `Method.invoke` is not intrinsically deep reflection: a class may
+        // reflectively invoke a non-public method it DECLARES ITSELF without
+        // `setAccessible(true)` first, exactly as it may read its own private
+        // field. `check_field_access` grew that carve-out for HikariConfig's
+        // private-final `AtomicReference`; the method path kept the blanket
+        // non-public rejection, so `getDeclaredMethod("x").invoke(..)` on your
+        // own class threw `IllegalAccessException: cannot access member` where
+        // HotSpot returns the value. Measured on Temurin 25: legal for both
+        // `private` (0x0002) and package-private (0x0008).
+        //
+        // Callers OUTSIDE the declaring class are unchanged — they still need a
+        // public member or the explicit override, and the JPMS `opens` check
+        // below still governs cross-module deep reflection either way.
+        let same_class = mirror_class_id(ctx, declaring_mirror)
+            .is_some_and(|declaring| resolve_caller_class_id(ctx) == Some(declaring));
+        if !same_class {
+            check_access(
+                modifiers,
+                false,
+                &format!("Method.invoke: {}.{}", class_name, method_name),
+            )?;
+        }
     }
     // NEW-19: module-level opens check (JPMS). When `accessible == true`
     // the override flag short-circuits the deep check (JEP 403).
