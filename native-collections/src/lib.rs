@@ -19912,10 +19912,10 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let arr = alloc_ref_array(ctx, 0);
-            let itr = try_alloc_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
-            ctx.set_field(itr, 0, Value::Object(Some(arr)));
-            ctx.set_field(itr, 1, Value::Int(0));
-            return Ok(Some(Value::Object(Some(itr))));
+            // Same landing as every other snapshot iterator: under --jdk-only
+            // the fabricated shape is refused, and a real Arrays$ArrayItr over
+            // the same Object[] answers instead.
+            return make_iterator_from_array(ctx, arr, 0);
         }
     };
     let elements = stream_elements(ctx, this)?;
@@ -19928,18 +19928,19 @@ fn native_stream_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         ctx.set_array_element(arr, i, val);
     }
     let arr = ctx.read_native_pin(arr_pin, arr);
-    let itr = try_alloc_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
-    let itr_pin = ctx.pin_native_root(itr);
-    let arr = ctx.read_native_pin(arr_pin, arr);
-    let itr = ctx.read_native_pin(itr_pin, itr);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    // `make_iterator_from_array` owns the refusal: under --jdk-only the
+    // fabricated `java/util/ServiceLoader$Itr` — a name no JDK declares — is
+    // refused, and a real `java.util.Arrays$ArrayItr` over this very array
+    // stands in. Refusing it with nowhere to land took out ServiceLoader, and
+    // with it the CLDR locale provider: `ServiceConfigurationError: Locale
+    // provider adapter "CLDR" cannot be instantiated`.
+    let itr = make_iterator_from_array(ctx, arr, elements.len());
     ctx.unpin_native_roots(if elem_base == usize::MAX {
         arr_pin
     } else {
         elem_base
     });
-    Ok(Some(Value::Object(Some(itr))))
+    itr
 }
 
 fn native_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
