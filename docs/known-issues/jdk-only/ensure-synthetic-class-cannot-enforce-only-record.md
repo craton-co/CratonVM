@@ -7,6 +7,16 @@ replaced this record's "52 call sites" with a measured 10. What remains is
 step 3 — deleting the infallible entry point — and the reason it is still open
 is not the call sites. See *What is still open*.
 
+> **2026-08-06.** Item 4's last shape is closed: `java/util/Enumeration$Impl`
+> now has somewhere for its refusal to land (a real
+> `Collections.enumeration(Arrays$ArrayList)`), so every class this record ever
+> listed as "refused with nowhere to go" is answered. Item 5 is **two thirds
+> done**: `native-io` and `native-collections` allocation funnels are fallible,
+> `native-builtins::alloc_concurrent_synthetic` is not, and the reason is
+> measured rather than estimated — see *Why `alloc_concurrent_synthetic` was
+> abandoned rather than finished*. `ensure_synthetic_class` therefore still
+> exists and this record stays here.
+
 The original defect: under `--jdk-only` this API recorded the violation and
 then fabricated the class anyway, so the run reported a violation while
 continuing in the exact state the contract forbids. That is now false for every
