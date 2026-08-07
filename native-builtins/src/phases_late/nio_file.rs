@@ -1887,7 +1887,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 let p = ctx.read_native_pin(p_pin, p);
                 ctx.set_field(p, 0, Value::Object(Some(s)));
                 ctx.unpin_native_roots(p_pin);
-                p
+                Ok(p)
             };
             // "jrt" lets `FileSystems.getFileSystem(URI.create("jrt:/"))` resolve
             // (the real-JDK static iterates installedProviders by scheme) so the
@@ -8722,7 +8722,7 @@ pub(crate) fn p57_create_symbolic_link(
     target: &str,
 ) -> Result<(), MethodCallFailed> {
     #[cfg(unix)]
-    let result = std::os::unix::fs::symlink(target, link)?;
+    let result = std::os::unix::fs::symlink(target, link);
     #[cfg(windows)]
     let result = {
         // Windows needs to know at creation time whether the link is a file or
@@ -8758,8 +8758,8 @@ pub(crate) fn p57_create_symbolic_link(
         }
     };
     match result {
-        () => Ok(()),
-        Err(e)? => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
+        Ok(()) => Ok(()),
+        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
     }
 }
 
@@ -16090,7 +16090,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let name_ref = obj_arg(args, 1)?;
             let name = ctx.read_string(name_ref).unwrap_or_default();
-            let interfaces = p61_build_network_interfaces(ctx);
+            let interfaces = p61_build_network_interfaces(ctx)?;
             for iface in &interfaces {
                 if let Value::Object(Some(s)) = ctx.get_field(*iface, 0) {
                     if ctx.read_string(s).as_deref() == Some(&name) {
@@ -16112,7 +16112,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let interfaces = p61_build_network_interfaces(ctx);
+            let interfaces = p61_build_network_interfaces(ctx)?;
             for iface in &interfaces {
                 if let Value::Object(Some(addrs)) = ctx.get_field(*iface, 2) {
                     let len = ctx.array_length(addrs);
@@ -16337,7 +16337,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
                 Some((base, _)) if !base.is_empty() => base.to_string(),
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let interfaces = p61_build_network_interfaces(ctx);
+            let interfaces = p61_build_network_interfaces(ctx)?;
             for iface in &interfaces {
                 if let Value::Object(Some(s)) = ctx.get_field(*iface, 0) {
                     if ctx.read_string(s).as_deref() == Some(&parent_name) {

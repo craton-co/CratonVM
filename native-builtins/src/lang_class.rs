@@ -11853,10 +11853,14 @@ fn ctx_annotation_array_hash(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Res
     Ok(h)
 }
 
-fn ctx_annotation_member_hash(ctx: &mut dyn NativeContext, name: &str, val: Value) -> i32 {
+fn ctx_annotation_member_hash(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    val: Value,
+) -> Result<i32, MethodCallFailed> {
     let name_hash = ctx_java_string_hash(name);
-    let value_hash = ctx_annotation_value_hash(ctx, val);
-    127i32.wrapping_mul(name_hash) ^ value_hash
+    let value_hash = ctx_annotation_value_hash(ctx, val)?;
+    Ok(127i32.wrapping_mul(name_hash) ^ value_hash)
 }
 
 /// Mirrors `annotation_proxy_hash_code` in vm_exec.rs.
@@ -18519,7 +18523,8 @@ pub(crate) fn native_class_get_record_components(
         let accessor_obj = declared
             .iter()
             .find(|m| m.name == *name && m.descriptor == expected_desc)
-            .map(|m| create_method_object(ctx, m));
+            .map(|m| create_method_object(ctx, m))
+            .transpose()?;
         let accessor_value = match accessor_obj {
             Some(obj) => Value::Object(Some(obj)),
             None => Value::Object(None),
