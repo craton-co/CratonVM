@@ -12306,6 +12306,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
                 return Ok(None);
             }
+            // A connect-path socket has not handshaked yet (its `connect`
+            // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
+            // there is no established connection to tear down and redo. Accept
+            // and discard, which is what this registration already did for an
+            // already-handshaked socket.
+            if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+                && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            {
+                return Ok(None);
+            }
             if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
                 return Ok(None);
             }
@@ -12439,6 +12449,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             {
                 let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
                 crate::t27_tls::set_pending_layered_socket_protocols(pending_id, protocols);
+                return Ok(None);
+            }
+            // A connect-path socket has not handshaked yet (its `connect`
+            // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
+            // there is no established connection to tear down and redo. Accept
+            // and discard, which is what this registration already did for an
+            // already-handshaked socket.
+            if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+                && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            {
                 return Ok(None);
             }
             // Otherwise the socket came from `createSocket(host, port)`, which

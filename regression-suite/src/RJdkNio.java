@@ -129,6 +129,32 @@ public class RJdkNio {
         check(threw, "reading a missing file must throw NoSuchFileException");
         check(!Files.deleteIfExists(dir.resolve("absent.txt")), "deleteIfExists on a miss");
 
+        // Files.createFile is CREATE_NEW. It is the atomic create-if-absent
+        // primitive of java.nio.file, so callers use it AS a lock rather than
+        // merely to make a file, and a second call on the same path must fail
+        // with FileAlreadyExistsException -- and must not touch the bytes that
+        // are already there. CratonVM implemented it with an O_CREAT|O_TRUNC
+        // open, which got both halves wrong at once: it reported success and
+        // emptied the file. H2 FilePathDisk.createFile catches the exception to
+        // answer "another process holds this lock", so two FileLocks both
+        // believed they had taken the database lock (TestFileLock.testSimple
+        // failed with ERROR_OPENING_DATABASE_1 where it asserts
+        // DATABASE_ALREADY_OPEN_1). Runs after the directory listing above on
+        // purpose, and cleans up after itself, so the CK line stays stable.
+        Path fresh = dir.resolve("createnew.txt");
+        Files.createFile(fresh);
+        check(Files.exists(fresh) && Files.size(fresh) == 0, "createFile makes an empty file");
+        Files.write(fresh, new byte[] { 7, 7, 7 });
+        threw = false;
+        try {
+            Files.createFile(fresh);
+        } catch (FileAlreadyExistsException expected) {
+            threw = true;
+        }
+        check(threw, "createFile on an existing path must throw FileAlreadyExistsException");
+        check(Files.size(fresh) == 3, "a refused createFile must not truncate the existing file");
+        Files.delete(fresh);
+
         // Path arithmetic is pure string work and must be exact.
         Path rel = Path.of("a", "b", "c.txt");
         check(rel.getNameCount() == 3, "getNameCount");
