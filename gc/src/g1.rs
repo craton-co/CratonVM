@@ -7337,6 +7337,77 @@ impl G1Collector {
     /// twice. Deliberately NOT gated on `gc_quiescence::is_active()` — a
     /// blocked thread's un-retired tail can be published while no thread is
     /// in JIT at all.
+    /// The [`crate::gc_quiescence::incomplete_reason`] code when this
+    /// collection's JIT root set is known to be INCOMPLETE, or `None` when
+    /// every live compiled frame was enumerated.
+    ///
+    /// # Why G1 needs this and not only [`Self::jit_pinned_region_set`]
+    ///
+    /// `jit_pinned_region_set` is G1's stand-in for the generational
+    /// collector's non-moving-while-in-JIT sweep: the root gatherer publishes
+    /// each conservatively-discovered JIT-frame root, and the region holding
+    /// it is kept out of the collection set so the un-rewritable
+    /// register/spill slot that names it cannot go stale.
+    ///
+    /// That is only sound when the conservative scan actually *saw* the frame.
+    /// Several coverage obligations fail precisely because it did not:
+    /// `UNREGISTERED_JIT_FRAME` (a compiled frame sits above the entry chain's
+    /// cover, so the scan band never reaches it), `FOREIGN_INNERMOST_RBP` (the
+    /// innermost recorded RBP belongs to a deeper callee entered by a direct
+    /// JIT->JIT call, so the entry's map does not describe the frame that is
+    /// actually there), `MISSING_EXACT_RBP` (the frame cannot be bounded at
+    /// all). In each of those the pin set comes back *empty for that frame*,
+    /// G1 sees no reason to exclude anything, and it evacuates an object whose
+    /// only reference lives in a slot nothing will rewrite. The next
+    /// dereference is a native `SIGSEGV`, not a controlled Java error — which
+    /// is what
+    /// `docs/known-issues/hibernate/g1-collector-fullsuite-crashes-hangs-fails-20260806.md`
+    /// and
+    /// `docs/known-issues/springboot/g1-fullsuite-regression-20260807.md`
+    /// both recorded, from three and one crash sites respectively, with the
+    /// collector's own "last incomplete-coverage reason" field already naming
+    /// the obligation in every report.
+    ///
+    /// # The fail-safe
+    ///
+    /// The generational collector answers an incomplete proof by diverting to
+    /// its NON-MOVING young sweep. G1 has no non-moving young path to divert
+    /// to, so the equivalent conservative answer is an **empty collection
+    /// set**: this pause reclaims nothing and every object keeps its address.
+    /// That is strictly weaker than the generational diversion in what it
+    /// reclaims and strictly stronger in what it guarantees — the generational
+    /// sweep still *frees* on mark bits derived from the same incomplete root
+    /// set (the `ClassId(0)` family in `docs/known-issues/h2/`), whereas an
+    /// empty CSet cannot free or move anything.
+    ///
+    /// Reclamation is not starved: the flag is per-collection, cleared by
+    /// `begin_moving_young_coverage_cycle` at every initiator entry, so the
+    /// next pause taken with provable coverage collects normally.
+    ///
+    /// This is the DETECTION only. It deliberately does not consult the
+    /// `CRATONVM_G1_NO_COVERAGE_PIN` opt-out: the caller gates the *refusal*
+    /// on that flag but counts the detection either way, so the arm that
+    /// reinstates the defect still reports how often the gate would have
+    /// fired. A kill switch that also switches off its own measurement cannot
+    /// be used to justify the default.
+    pub(crate) fn root_coverage_incomplete_reason() -> Option<usize> {
+        // `force_non_moving_jit_roots` is the root gatherer's own OSR-shadow
+        // verdict and does not always travel with a reason code; report the
+        // stored reason when there is one, and the OSR code when there is not,
+        // so the record never claims `NONE` while refusing to evacuate.
+        let flagged = crate::gc_quiescence::moving_young_coverage_incomplete();
+        let forced = crate::gc_quiescence::force_non_moving_jit_roots();
+        if !flagged && !forced {
+            return None;
+        }
+        let reason = crate::gc_quiescence::moving_young_incomplete_reason();
+        Some(if reason == crate::gc_quiescence::incomplete_reason::NONE {
+            crate::gc_quiescence::incomplete_reason::OSR_SHADOW
+        } else {
+            reason
+        })
+    }
+
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
         let mut set: std::collections::HashSet<usize> = if crate::gc_quiescence::is_active() {
             crate::gc_quiescence::pinned_jit_roots_snapshot()
@@ -8335,17 +8406,55 @@ impl GarbageCollector for G1Collector {
                 regions.len(), free, eden, survivor, old, pinned
             );
         }
-        // Name the backend in the process-wide decision report. G1 has no
+        // Name the backend in the process-wide decision report, AND whether
+        // this pause was allowed to evacuate at all. G1 normally has no
         // young-moving *choice* to record — its collection set is always
-        // evacuated — but a report that stays silent under `-XX:+UseG1GC` is
-        // exactly how the `docs/GC.md` drift went unnoticed for the
-        // generational path. Recording the constant answer makes "which
-        // collector produced this summary?" a question the runtime answers.
+        // evacuated — but it does have one refusal, and a report that stays
+        // silent under `-XX:+UseG1GC` is exactly how the `docs/GC.md` drift
+        // went unnoticed for the generational path.
+        //
+        // The refusal: this collection's JIT root set may be incomplete, so
+        // no region can be proven free of an object whose only reference the
+        // root scan never saw. See
+        // [`Self::root_coverage_incomplete_reason`] for why
+        // `jit_pinned_region_set` alone does not cover this and what the
+        // empty-CSet fail-safe costs.
+        let coverage_incomplete = Self::root_coverage_incomplete_reason();
+        // Counted in BOTH arms — see `root_coverage_incomplete_reason`.
+        crate::gc_metrics::record_g1_pause_coverage(coverage_incomplete.is_some());
+        // Only the REFUSAL is gated. `CRATONVM_G1_NO_COVERAGE_PIN` reinstates
+        // the pre-fix evacuation for A/B isolation.
+        let refuse = coverage_incomplete.filter(|_| !gc_flags().g1_no_coverage_pin);
         crate::gc_metrics::record_collector_decision(
             "g1",
-            crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
-            crate::gc_quiescence::incomplete_reason::NONE,
+            match refuse {
+                Some(_) => {
+                    crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE
+                }
+                None => crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
+            },
+            coverage_incomplete.unwrap_or(crate::gc_quiescence::incomplete_reason::NONE),
         );
+        if refuse.is_some() {
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::YOUNG,
+                0,
+                0,
+                0,
+                0,
+                crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                    | crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+            );
+            self.native_alloc_pressure.store(false, Ordering::Relaxed);
+            return GcResult {
+                stats: GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+                pointer_map: HashMap::new(),
+            };
+        }
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
@@ -9807,6 +9916,141 @@ mod tests {
         assert_eq!(result.stats.objects_copied, 0);
         // Object should still be at the same address
         assert_eq!(roots[0].as_ptr(), obj.as_ptr());
+    }
+
+    // -- Incomplete JIT root coverage must stop evacuation entirely --
+
+    /// The defect both G1 full-suite crash reports name: G1 evacuated while
+    /// the collection's own root scan had already recorded that it could not
+    /// enumerate every live compiled frame. `jit_pinned_region_set` cannot
+    /// cover that case — the frames in question are exactly the ones the
+    /// conservative scan never reached, so they publish no address to pin.
+    ///
+    /// Asserted from the outside, through `collect_garbage`, because that is
+    /// the single entry to G1's two object-moving paths and therefore the
+    /// only place the guarantee can be stated once.
+    #[test]
+    fn incomplete_root_coverage_evacuates_nothing() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+        let before = obj.as_ptr();
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+        );
+
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "G1 must not evacuate while the JIT root set is known-incomplete"
+        );
+        assert!(
+            result.pointer_map.is_empty(),
+            "an empty collection set cannot have relocated anything"
+        );
+        assert_eq!(
+            roots[0].as_ptr(),
+            before,
+            "the object must keep its address: the reference that names it may \
+             live in a JIT slot nothing will rewrite"
+        );
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// The decision report must NAME the refusal. A collector that silently
+    /// declines to reclaim reads as "there was no garbage" — the exact
+    /// misreading `collector_decision_report` exists to prevent.
+    #[test]
+    fn incomplete_root_coverage_is_recorded_as_the_reason() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+        );
+
+        let mut roots = vec![obj];
+        let _ = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        let d = crate::gc_metrics::last_collector_decision().expect("a decision was recorded");
+        assert_eq!(d.backend, "g1");
+        assert_eq!(
+            d.reason,
+            crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE,
+        );
+        assert_eq!(
+            d.incomplete_reason,
+            crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+        );
+        assert!(!d.young_moving, "the refusal is not a moving cycle");
+
+        let facts = crate::gc_metrics::last_g1_cycle().expect("a G1 cycle was recorded");
+        assert!(
+            facts.degraded & crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE != 0,
+            "the cycle record must distinguish 'not allowed to collect' from \
+             'nothing to collect'"
+        );
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// Complete coverage is the common case and must be untouched: the same
+    /// collection with the flag clear still evacuates.
+    #[test]
+    fn complete_root_coverage_still_evacuates() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert!(G1Collector::root_coverage_incomplete_reason().is_none());
+
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        assert!(result.stats.objects_copied >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+    }
+
+    /// `force_non_moving_jit_roots` is set by the root gatherer's OSR-shadow
+    /// fallback WITHOUT a reason code. It is a second, independent way for the
+    /// root set to be incomplete, and G1 must honour it too — with a reason
+    /// that is not `NONE`, so the record never claims a complete proof while
+    /// refusing to act on one.
+    #[test]
+    fn force_non_moving_jit_roots_alone_blocks_g1_evacuation() {
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        assert!(G1Collector::root_coverage_incomplete_reason().is_none());
+
+        crate::gc_quiescence::set_force_non_moving_jit_roots();
+        assert_eq!(
+            G1Collector::root_coverage_incomplete_reason(),
+            Some(crate::gc_quiescence::incomplete_reason::OSR_SHADOW),
+        );
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
     }
 
     #[test]

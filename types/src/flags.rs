@@ -708,6 +708,19 @@ pub struct GcFlags {
     pub g1_parallel_evac: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
+    /// `CRATONVM_G1_NO_COVERAGE_PIN` — opt **out** of the default-ON refusal to
+    /// evacuate while this collection's JIT root set is known to be
+    /// incomplete. Consumers want `!g1_no_coverage_pin`.
+    ///
+    /// Setting it reinstates the pre-2026-08-07 behaviour, in which G1
+    /// relocated objects whose only reference lived in a JIT frame the root
+    /// scan could not enumerate — a native SIGSEGV rather than a controlled
+    /// error. It stays declared (rather than becoming a bare `getenv`) so the
+    /// A/B that validated the fix remains reproducible; see
+    /// `G1Collector::root_coverage_incomplete_reason`, which is deliberately
+    /// NOT gated on this flag — the opt-out arm still counts every pause the
+    /// gate would have stopped.
+    pub g1_no_coverage_pin: bool,
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].
     pub g1_workers: Option<usize>,
@@ -878,6 +891,7 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
+            g1_no_coverage_pin: present(src, "CRATONVM_G1_NO_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
             gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
                 .filter(|&n| n >= 64)
