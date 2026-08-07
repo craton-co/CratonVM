@@ -1,10 +1,18 @@
-# `@DirtiesUrlFactories` classes fail 100% on the 20260806 Windows full-suite run — the CratonVM launch args never got `--add-opens=java.base/java.net`
+# `@DirtiesUrlFactories`/`java.net` reflection classes fail 100% on the 20260806 Windows full-suite run — the CratonVM launch args never got `--add-opens=java.base/java.net`
 
 **Status: OPEN — harness bug, not a CratonVM correctness bug. Filed 2026-08-07.**
 
+**Consolidation note:** three parallel triage passes independently found this
+exact root cause for disjoint sets of affected classes and each filed its own
+doc (`multipart-and-websocket-missing-add-opens-java-net-runner-gap-20260807.md`,
+`webfluxmanagementchildcontext-add-opens-not-forwarded-to-craton-20260807.md`).
+Folded into this one, the most complete of the three — all 7 known affected
+classes are listed in "Affected classes" below; the other two doc files were
+removed.
+
 ## Symptom
 
-Four classes, all failing **every single test** with the identical stack shape, on
+Seven classes, all failing **every single test** with the identical stack shape, on
 `craton-fullsuite-windows-20260806` (all shards, `all-jit`):
 
 | Module | Class | Seconds | tests / failed |
@@ -13,8 +21,11 @@ Four classes, all failing **every single test** with the identical stack shape, 
 | `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.autoconfigure.TomcatWebServerFactoryCustomizerTests` | 12.757 | 66/66 |
 | `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.servlet.TomcatServletWebServerServletContextListenerTests` | 2.107 | 2/2 |
 | `module/spring-boot-jetty` | `org.springframework.boot.jetty.autoconfigure.servlet.JettyServletWebServerServletContextListenerTests` | 1.435 | 2/2 |
+| `module/spring-boot-servlet` | `org.springframework.boot.servlet.autoconfigure.MultipartAutoConfigurationTests` | 4.122 | 12/12 |
+| `module/spring-boot-websocket` | `org.springframework.boot.websocket.autoconfigure.servlet.WebSocketMessagingAutoConfigurationTests` | 2.270 | 13/13 |
+| `module/spring-boot-webflux` | `org.springframework.boot.webflux.autoconfigure.actuate.web.WebFluxManagementChildContextConfigurationIntegrationTests` | 2.050 | 5/5 |
 
-Every failure, on every test method in every one of these four classes, is byte-identical:
+Every failure, on every test method in every one of these seven classes, is byte-identical:
 
 ```
 => java.lang.IllegalStateException: Unable to reset field. Please run with '--add-opens=java.base/java.net=ALL-UNNAMED'
@@ -33,7 +44,7 @@ Logs (results.tsv rows and hashed log paths):
 `apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-windows-20260806-s4/all-jit/logs/module_spring-boot-tomcat.*` (Ssl/Tomcat factory customizer/context listener),
 `apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-windows-20260806-s3/all-jit/logs/module_spring-boot-jetty.*` (Jetty context listener).
 
-## Why these four classes and not others
+## Why these seven classes and not others
 
 `org.springframework.boot.testsupport.web.servlet.DirtiesUrlFactoriesExtension`
 (`apps/spring-boot/test-support/spring-boot-test-support/src/main/java/org/springframework/boot/testsupport/web/servlet/DirtiesUrlFactoriesExtension.java:48-61`)
@@ -45,17 +56,25 @@ ReflectionTestUtils.setField(URL.class, "factory", null);
 
 — i.e. `java.net.URL.factory` via reflection, catching `InaccessibleObjectException` and
 rethrowing exactly the message quoted above. Two classes carry `@DirtiesUrlFactories`
-directly (`TomcatWebServerFactoryCustomizerTests`, `SslConnectorCustomizerTests`); the other
-two inherit it from `AbstractServletWebServerServletContextListenerTests`
+directly (`TomcatWebServerFactoryCustomizerTests`, `SslConnectorCustomizerTests`); two more
+inherit it from `AbstractServletWebServerServletContextListenerTests`
 (`module/spring-boot-web-server/src/testFixtures/.../AbstractServletWebServerServletContextListenerTests.java:41`),
-their common Tomcat/Jetty base class. Because the extension's `beforeEach`/`afterEach` both
-run it, and both throw, every test method in these four classes fails twice over
+their common Tomcat/Jetty base class; and the remaining three
+(`MultipartAutoConfigurationTests`, `WebSocketMessagingAutoConfigurationTests`,
+`WebFluxManagementChildContextConfigurationIntegrationTests`) pick it up the same way
+through their own web-server test fixtures. `spring-boot-webflux`'s own `build.gradle`
+documents the requirement directly (`jvmArgs += "--add-opens=java.base/java.net=ALL-UNNAMED"`,
+line 68) — independent confirmation this isn't a CratonVM-specific need, Gradle's own test
+task already knew to add it for HotSpot. Because the extension's `beforeEach`/`afterEach` both
+run it, and both throw, every test method in these seven classes fails twice over
 (one exception, one suppressed) — hence 100% failure rate in every one of them, not a
 partial/flaky failure.
 
 Grepped every other Spring Boot module for `@DirtiesUrlFactories`/`DirtiesUrlFactories`
-usage: no other class in the suite carries it (directly or via this base class), which is
-why the blast radius is exactly these four and not wider.
+usage: no other class in the suite carries it (directly, via the Tomcat/Jetty base class, or
+via its own fixture), which is why the confirmed blast radius is exactly these seven. Not
+exhaustively verified beyond grep — a module invoking the same reflection through a
+differently-named fixture wouldn't show up in that search.
 
 ## Root cause: real, deliberate CratonVM fix + a suite-runner gap it exposed
 
@@ -132,7 +151,15 @@ fix above is the *whole* story.
 - `module/spring-boot-tomcat` — `org.springframework.boot.tomcat.autoconfigure.TomcatWebServerFactoryCustomizerTests` (66/66 fail)
 - `module/spring-boot-tomcat` — `org.springframework.boot.tomcat.servlet.TomcatServletWebServerServletContextListenerTests` (2/2 fail)
 - `module/spring-boot-jetty` — `org.springframework.boot.jetty.autoconfigure.servlet.JettyServletWebServerServletContextListenerTests` (2/2 fail)
+- `module/spring-boot-servlet` — `org.springframework.boot.servlet.autoconfigure.MultipartAutoConfigurationTests` (12/12 fail)
+- `module/spring-boot-websocket` — `org.springframework.boot.websocket.autoconfigure.servlet.WebSocketMessagingAutoConfigurationTests` (13/13 fail)
+- `module/spring-boot-webflux` — `org.springframework.boot.webflux.autoconfigure.actuate.web.WebFluxManagementChildContextConfigurationIntegrationTests` (5/5 fail)
 
-All four confirmed via `results.tsv`'s inline HotSpot cross-check to `PASS` on the HotSpot
+All seven confirmed via `results.tsv`'s inline HotSpot cross-check to `PASS` on the HotSpot
 baseline for this same run (`hotspot-baseline: PASS 0/N` appended to each failing row) —
 consistent with the harness giving HotSpot its `--add-opens` and not CratonVM.
+
+**Plausible but unverified:** any other class in `jetty`/`security`/`servlet`/`tomcat`/
+`webflux`/`websocket` whose tests depend on the same reflective `URL.factory` reset through a
+differently-named fixture (not grepped for specifically) could share this same gap without
+having shown up in the three independent triage passes that found the seven above.
