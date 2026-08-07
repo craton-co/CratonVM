@@ -436,6 +436,23 @@ pub fn update_all_roots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &HashMap<usize, usize>,
 ) {
+    let __rp_guard = crate::memory::native_roots::rootprof::on().then(|| {
+        struct G(std::time::Instant, usize);
+        impl Drop for G {
+            fn drop(&mut self) {
+                let ns = self.0.elapsed().as_nanos();
+                if ns >= 20_000_000 {
+                    eprintln!(
+                        "[rootprof] update_all_roots took {}ms pointer_map={}",
+                        ns / 1_000_000,
+                        self.1
+                    );
+                }
+            }
+        }
+        G(std::time::Instant::now(), pointer_map.len())
+    });
+    let _ = &__rp_guard;
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PRECISE").is_some() {
         eprintln!(
             "[PRECISE] update_all_roots called, pointer_map.len()={}",
