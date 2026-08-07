@@ -6,7 +6,37 @@ premise does not survive contact with the logs, and the real defect is one
 level below `ServiceLoader`, in a file this lane does not own. Both findings are
 recorded here.
 
-## 1. `moduleServices()` has never been measured, in either mode
+## MEASURED 2026-08-07 — `moduleServices()` has now been reached, and this lane was right
+
+The `:198` `resources()` blocker named below is fixed: on dev `5d22671e3`
+`RJdkModule` clears `descriptor()`, `readabilityAndExports()`,
+`encapsulation()` and `resources()` in **both** modes, and reaches
+`moduleServices()` for the first time. What it finds there:
+
+| mode | result |
+|---|---|
+| `--real-jdk` (Compatible) | **`rc=0`** — the whole vector passes, 44 checks |
+| `--jdk-only` (strict) | `AssertionError: module service providers: []` |
+
+So this lane's inference is now a measurement, and it holds: strict mode finds
+**no** providers for `com.cratonvm.jdkonly.svc.Greeter`, consistent with the root
+cause named in §2 — an empty boot-layer `nameToModule` means no `ServicesCatalog`
+can be built. It is also the **only strict-only failure left in the whole
+corpus** (51 passed / 3 failed; the other two fail in Compatible too).
+
+Command, and note the `--java-home` — omitting it measures the host's default
+JDK and produces a wrong per-mode verdict:
+
+```sh
+cratonvm --jdk-only --java-home <jdk-25> \
+    --module-path build-modules --add-modules cratonvm.jdkonly.svc \
+    -cp build RJdkModule
+```
+
+Campaign-level context:
+[`STRICT-CORPUS-CAMPAIGN-20260807.md`](../../feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md).
+
+## 1. `moduleServices()` had never been measured, in either mode (as of 2026-08-07 02:42)
 
 `RJdkModule.main` runs `descriptor()`, `readabilityAndExports()`,
 `encapsulation()`, `resources()`, **then** `moduleServices()`. Every log in
