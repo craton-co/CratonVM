@@ -2643,10 +2643,32 @@ pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.set_array_element(arr, i, Value::Object(Some(s)));
     }
 
-    let en = try_alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2)?;
-    ctx.set_field(en, 0, Value::Object(Some(arr)));
-    ctx.set_field(en, 1, Value::Int(0));
-    Ok(Some(Value::Object(Some(en))))
+    // Under `--jdk-only` this fabrication is refused; fall back to an
+    // enumeration the JDK builds itself (`Arrays$ArrayList` +
+    // `Collections.enumeration`), the same landing `Enumeration$Impl` uses.
+    // Without it the refusal surfaces as NoClassDefFoundError out of
+    // `KeyStore.aliases()` and takes the whole `security` section of
+    // `JdkOnlyPlatformProbe` with it. `Compatible` mode is unchanged: the
+    // fallback is only reachable from the refusal arm.
+    let arr_pin = ctx.pin_native_root(arr);
+    let en = match try_alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2) {
+        Ok(en) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            Ok(en)
+        }
+        Err(refusal) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            match crate::classloader::real_snapshot_enumeration(ctx, arr) {
+                Ok(Some(en)) => Ok(en),
+                Ok(None) => Err(refusal),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Object(Some(en?))))
 }
 
 /// Public `KeyStore.aliases()` is intercepted by the early security shim in

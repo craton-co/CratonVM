@@ -5668,7 +5668,7 @@ pub(crate) const ENUMERATION_IMPL_CLASS: &str = "java/util/Enumeration$Impl";
 /// `native-io`'s `zip_real_jar` already drives `Collections.enumeration` this
 /// way for `ZipFile.entries()`, so the invoke is known to reach real bytecode
 /// rather than a native of ours.
-fn real_snapshot_enumeration(
+pub(crate) fn real_snapshot_enumeration(
     ctx: &mut dyn NativeContext,
     array: ObjectRef,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {

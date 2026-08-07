@@ -16365,12 +16365,36 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                             let s = ctx.create_string(k);
                             ctx.set_array_element(arr, i, Value::Object(Some(s)));
                         }
-                        // IteratorEnumeration: 2 fields (elements_arr=0, pos=1)
-                        let en =
-                            try_alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2)?;
-                        ctx.set_field(en, 0, Value::Object(Some(arr)));
-                        ctx.set_field(en, 1, Value::Int(0));
-                        return Ok(Some(Value::Object(Some(en))));
+                        // IteratorEnumeration: 2 fields (elements_arr=0, pos=1).
+                        // Under `--jdk-only` that fabrication is refused, so
+                        // fall back to an enumeration the JDK builds itself —
+                        // the same landing `Enumeration$Impl` uses. Without it
+                        // the refusal reaches `KeyStore.aliases()` as a
+                        // NoClassDefFoundError and takes the whole security
+                        // section of `JdkOnlyPlatformProbe` with it.
+                        let arr_pin = ctx.pin_native_root(arr);
+                        let en = match try_alloc_concurrent_synthetic(
+                            ctx,
+                            "java/util/IteratorEnumeration",
+                            2,
+                        ) {
+                            Ok(en) => {
+                                let arr = ctx.read_native_pin(arr_pin, arr);
+                                ctx.set_field(en, 0, Value::Object(Some(arr)));
+                                ctx.set_field(en, 1, Value::Int(0));
+                                Ok(en)
+                            }
+                            Err(refusal) => {
+                                let arr = ctx.read_native_pin(arr_pin, arr);
+                                match crate::classloader::real_snapshot_enumeration(ctx, arr) {
+                                    Ok(Some(en)) => Ok(en),
+                                    Ok(None) => Err(refusal),
+                                    Err(err) => Err(err),
+                                }
+                            }
+                        };
+                        ctx.unpin_native_roots(arr_pin);
+                        return Ok(Some(Value::Object(Some(en?))));
                     }
                 }
             }
@@ -16379,7 +16403,21 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         {
             let _ = this;
         }
-        let empty = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
+        let empty = match try_alloc_concurrent_synthetic(
+            ctx,
+            "java/util/Collections$EmptyEnumeration",
+            0,
+        ) {
+            Ok(empty) => empty,
+            Err(refusal) => {
+                // Same landing over a zero-length array.
+                let none = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                match crate::classloader::real_snapshot_enumeration(ctx, none)? {
+                    Some(empty) => empty,
+                    None => return Err(refusal),
+                }
+            }
+        };
         Ok(Some(Value::Object(Some(empty))))
     });
     // IteratorEnumeration helpers (used by KeyStore.aliases)
