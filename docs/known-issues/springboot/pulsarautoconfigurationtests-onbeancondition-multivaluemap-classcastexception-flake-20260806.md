@@ -2,6 +2,88 @@
 
 **Status: OPEN — reproduced once; 5 further attempts clean.**
 
+## 2026-08-07 update: a SECOND, unrelated symptom on the same class — a deterministic early HANG, GC-backend-independent
+
+The 2026-08-06/07 Windows full-suite runs (three separate `-Xmx 2g`, 300s/class
+runs on the same box, one per GC backend) all HANG on this class instead of
+producing the ClassCastException above:
+
+| Run | GC | Result |
+|---|---|---:|
+| `craton-fullsuite-windows-20260806-s4` | Generational | TIMEOUT/HANG, 300.071s |
+| `craton-fullsuite-g1-20260807-s4` | G1 | TIMEOUT/HANG, 300.101s |
+| `craton-fullsuite-zgc-20260807-s4` | ZGC (real) | TIMEOUT/HANG, 300.148s |
+
+This is **not** the ClassCastException flake re-manifesting as a hang — it is
+a different symptom on the same class, confirmed independently before
+assuming any connection (per this session's brief). Read on its own merits:
+
+**Zero JUnit output at all** (`.out.log` is 0 bytes in all three runs — not
+even the JUnit Platform launcher's "N containers found" banner) and the
+**identical last `.err.log` line, byte-for-byte, in all three runs**:
+
+```
+WARN cratonvm_jit::x64::driver: JIT compile bailed: code buffer estimate too small; retrying at the measured size method="net/bytebuddy/implementation/bind/annotation/Argument$Binder.bind:(Lnet/bytebuddy/description/annotation/AnnotationDescription$Loadable;Lnet/bytebuddy/description/method/MethodDescription;Lnet/bytebuddy/description/method/ParameterDescription;Lnet/bytebuddy/implementation/Implementation$Target;Lnet/bytebuddy/implementation/bytecode/assign/Assigner;Lnet/bytebuddy/implementation/bytecode/assign/Assigner$Typing;)Lnet/bytebuddy/implementation/bind/MethodDelegationBinder$ParameterBinding;" code_len=244 capacity=62336 wanted=68331
+```
+
+Same method, same `code_len=244 capacity=62336 wanted=68331` numbers, in
+all three runs — this is a deterministic stall point, not a random one. It
+fires early (~70-90s into each run, right after the "Mockito is currently
+self-attaching" banner and the `File fs/separator/pathSeparator` clinit-fixup
+warning, well before any test output would normally appear for a 74-test
+class), and then **total silence** for the remaining ~210-230s until the
+watchdog kills the process — no further JIT warnings, no GC warnings, no
+test progress of any kind. That absence of GC activity is itself informative:
+a process genuinely doing 74 tests' worth of Mockito/ByteBuddy mock-class
+generation for that long would be expected to allocate enough to trigger at
+least one young-gen collection, and none of the other HANGs found in this
+same triage batch (`QuartzEndpointWebIntegrationTests`,
+`WebFluxAutoConfigurationTests`) are this quiet — both of those keep emitting
+GC/JIT warnings most of the way to their own timeouts. This one goes
+completely dark 70-90s in.
+
+**Historical pattern**: this exact class has intermittently HANGed at 300s
+across many independent runs going back to 07-17 (`craton-rerun-20260717`
+shard4, `craton-rerun-20260723` shard7, `craton-fullsuite-20260731`,
+`craton-rerun-20260731`, and now the three 08-06/08-07 runs above), always
+interleaved with clean PASSes (08-02 azure, 07-28 rerun, 08-06
+`pulsar-recheck-r1`) and — once — the ClassCastException FAIL this doc was
+originally filed for. The HotSpot baseline has never hung on this class
+(29.3s clean, 07-17). Isolated single-class reruns (`pulsar-recheck-r1-20260806`,
+182s; `craton-hangverify-20260731`, 369s) always pass, which — per this
+codebase's established "isolation reruns understate cluster bugs 4:1" lesson
+(`docs/internal/fixed-suite-bugs/springboot/mockito-bytebuddy-classfile-metadata-cluster-FIXED-20260805.md`)
+— means this needs to be chased under the suite's own concurrency, not in
+isolation.
+
+**Ruled out**: the already-fixed recycled-`JitInvokeInfo` dispatch-aliasing
+bug (`383e7f5cf`, merged 08-05) that produced a whole cluster of
+Mockito/ByteBuddy symptoms including ones in this exact `Argument$Binder`
+neighborhood — the binary used for all three runs above (built from `dev` as
+of 08-06) contains that fix, and the symptom shape doesn't match anyway (that
+bug produced wrong *values* at specific crash sites; this is silence with no
+crash at all).
+
+**Not root-caused.** The `code_len=244 capacity=62336 wanted=68331` bail is,
+by itself, a normal and handled path (`jit/src/x64/driver.rs:1797-1829`) — it
+bails that one compile to the interpreter and records the shortfall for the
+next compile attempt at this method to size its buffer from
+(`crate::note_code_buffer_shortfall`, `jit/src/lib.rs:12329-12342`); nothing
+in that retry path holds a lock or loops. Whether the total silence
+afterward is this specific method's *interpreted* execution genuinely
+hanging (as opposed to just being slow with nothing else to log), a deadlock
+elsewhere in Mockito/ByteBuddy's mock-class generation that happens to be
+reached right after this bail, or something in the retry bookkeeping itself,
+was not determined this session — no `--stack-dump-on-timeout` capture exists
+for any of the three runs (the suite disables the watchdog by default and
+relies on its own per-class timeout instead, per
+`run-spring-boot-suite.ps1`'s `New-ProcessRecord`). Whoever picks this up
+next should rerun this one class alone with
+`--stack-dump-on-timeout <some-value-under-300>` (or `--stack-sample-ms`) to
+get a real frame at the stall point before guessing further.
+
+## Original entry (2026-08-06), retained below
+
 **2026-08-06 update.** Two things changed, neither of them a fix:
 
 * The `spring-bean-attribute-type-null-flake` cause (recycled-`JitInvokeInfo`
