@@ -896,9 +896,22 @@ sound.
    Unknown `Use*GC` → warn + Generational. Unit-test the parser. (No GC behaviour change; G1 only
    runs if explicitly asked.)
 2. **Doc truth-up.** Reconcile `ARCHITECTURE.md` vs `README.md`/`CONTRIBUTING.md`: describe
-   Generational as default, G1 as opt-in/experimental-but-real, ZGC-real as built-but-undispatched.
+   Generational as default, G1 as opt-in/experimental-but-real, and ZGC-real as built and
+   dispatched but compiled in only behind the default-off `zgc` Cargo feature.
    (Docs-only; full-review docs-governance row.) This is the only step that may touch files outside
    the design doc, and is pure documentation.
+
+   > *Corrected 2026-08-07.* This step used to end "…ZGC-real as built-but-undispatched",
+   > which contradicted this document's own §1 progress notes, §2.1, §2.7 and §7.2.
+   > `ZgcRealHeap` **is** dispatched: `GcAlgorithm::Zgc` (`vm/src/config.rs:24`, `:51`) →
+   > `GcBackend::Zgc` (`vm/src/vm/vm_init.rs`) → `VmHeap::Zgc` (`gc/src/vm_heap.rs:20`), so
+   > `-XX:+UseZGC` really selects it and `PrintFlagsFinal` reports `UseZGC` truthfully. The
+   > half that survives is the gate, not the dispatch: the `zgc` feature is **default-off**,
+   > so a stock build has no `GcAlgorithm::Zgc` variant and no `parse_gc_algorithm` arm for
+   > it, and `-XX:+UseZGC` there warns and falls back to Generational. A ZGC-capable
+   > launcher is `cargo build --release -p cratonvm-cli --features zgc` (the `cratonvm-cli`
+   > pass-through landed 2026-08-07; before it, only `--features cratonvm-vm/zgc` reached
+   > the gated code).
 3. **SATB drain enforcement.** Thread-buffer registry + remark-time global drain + debug-assert +
    multi-mutator integration test (closes finding #18). Build-green regardless of which backend
    runs, since the registry is inert unless SATB is active.

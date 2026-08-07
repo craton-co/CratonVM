@@ -95,10 +95,19 @@ pub mod vm_heap;
 // drain). Crate-internal: only `gen_heap` drives it.
 mod young_mark;
 pub mod zero_forensics;
-// Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
-// feature. No in-workspace consumer references `zgc::*` today, so paying
-// the compile-time + binary-size cost on every build is pure waste. Flip
-// the feature on once a real consumer lands.
+// The Z Garbage Collector backend, gated behind the `zgc` feature.
+//
+// The "1884-LOC stub with no in-workspace consumer" this comment used to
+// claim has been false on both counts since the real collector landed:
+// `vm_heap.rs` does `use crate::zgc::ZgcRealHeap` and carries `VmHeap::Zgc`
+// arms behind the same cfg, and `cratonvm-vm` forwards the feature so
+// `-XX:+UseZGC` really selects it. Two things of different maturity sit
+// behind the one flag — a REAL memory-backed mark-sweep collector
+// (`ZgcRealHeap`) and a metadata-only SIMULATION of OpenJDK's colored-pointer
+// model (`ZgcCollector` / `ColoredPointer` / `LoadBarrier`). See the
+// `[features]` comment in `gc/Cargo.toml` for the full split.
+//
+// Default-OFF is a pass-rate-parity decision, not a "nothing uses it" one.
 #[cfg(feature = "zgc")]
 pub mod zgc;
 // Task #55: ZGC concurrent-mark controller — mirrors the G1

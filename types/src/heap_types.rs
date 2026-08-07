@@ -279,7 +279,7 @@ pub const MAX_SEQUENTIAL_CLASS_ID: u32 = u32::MAX;
 /// which site means which** — and the 24 → 16 shrink needs them to differ. A
 /// 16-byte header cannot hold a 31-bit array length (see
 /// `arch-2026-07-26/header-16-and-field-packing-20260806.md` §2: `class_id`
-/// (32) + length (31) + `kind`/`element_type`/`gc_age`/`gc_flags` (13) is 76
+/// (32) + length (31) + `kind`/`element_type`/`gc_age`/`gc_flags` (14) is 77
 /// bits, while `AtomicU64` alignment leaves only 64 ahead of the mark word), so
 /// the length has to move into an 8-byte prefix at the head of the array's
 /// body: objects 16, array data still at 24.
@@ -318,26 +318,88 @@ const _: () = assert!(
 // the whole reason it is a named constant and not a literal.
 pub const ARRAY_LENGTH_OFFSET: usize = 4;
 pub const NUM_SLOTS_OFFSET: usize = 4;
-// --- The quartet, in mark-word bits 48..61 ---------------------------------
+// --- The quartet, in mark-word bits 48..63 ---------------------------------
 //
 // `kind`, `element_type`, `gc_age` and `gc_flags` were four bytes at offsets
 // 4..8. They had to leave for `HEADER_SIZE` to reach 16: the header is
 // `class_id`(4) + `shape`(4) + an 8-aligned `AtomicU64`, and that is exactly
 // 16 with nothing spare.
 //
-// Bits 48..61 are free in EVERY mark-word state, which is what makes this
-// work rather than merely fit:
-//   * NEUTRAL     -- hash occupies 2..33;
-//   * THIN_LOCKED -- recursion 2..10, owner 10..42;
+// The mark word's TOP TWO BYTES -- bits 48..63 inclusive -- are free in EVERY
+// state, which is what makes this work rather than merely fit:
+//   * NEUTRAL     -- the hash occupies bits 2..32 (`MARK_HASH_MASK`);
+//   * THIN_LOCKED -- recursion bits 2..9, owner bits 10..41;
 //   * INFLATED / FORWARDED -- a pointer, and `plausible_heap_pointer` caps
-//     every one at `2^47 - 1`, so bits 47..64 are unused by construction.
+//     every one at `2^47 - 1`, so bits 47..63 are zero by construction.
 //
 // That last point is the load-bearing one and it is enforced, not assumed:
 // `make_inflated` and `make_forwarded` both assert `plausible_heap_pointer`.
+//
+// # Bit diagram (bit 63 on the left)
+//
+//   63    60 59    56 55  54 53      50 49 48 | 47 .......... 2 | 1  0
+//   +--------+--------+------+----------+-----+----------------+------+
+//   | gc_age |gc_flags| rsvd | elem_typ | knd | state payload  | state|
+//   +--------+--------+------+----------+-----+----------------+------+
+//   \--------------- MARK_QUARTET_MASK -------/
+//
+//     gc_age        bits 60..63 (4)   AGE_SHIFT   = 60, AGE_BITS   = 0xF
+//     gc_flags      bits 56..59 (4)   FLAGS_SHIFT = 56, FLAGS_BITS = 0xF
+//     reserved      bits 54..55 (2)   -- inside the mask, owned by no field
+//     element_type  bits 50..53 (4)   ELEM_SHIFT  = 50, ELEM_BITS  = 0xF
+//     kind          bits 48..49 (2)   KIND_SHIFT  = 48, KIND_BITS  = 0x3
+//
+// 14 field bits over a 16-bit span. The mask deliberately covers the whole
+// SPAN and not the union of the fields: bits 54..55 belong to nothing, and
+// keeping them inside means they are carried through every `quartet_of`
+// rebuild, so a future fifth field can claim them without auditing a single
+// caller. The three numbers that must agree -- the mask's doc, the mask's
+// value and the field layout -- are all "bits 48..63, 16 wide".
+//
+// # 2026-08-07: this mask used to be `0x3FFF << 48`, and that was a bug
+//
+// `0x3FFF << 48` is bits 48..61. It stopped TWO BITS SHORT of the top of
+// `gc_age`, which starts at `AGE_SHIFT = 60` and is 4 bits wide (bits 60..63),
+// so bits 62..63 -- the top half of the age -- fell OUTSIDE the "quartet".
+// Three silent consequences, none of which the suite could see:
+//
+//   1. `quartet_of` dropped them, so `make_thin_locked` / `make_inflated` /
+//      `make_forwarded`, which all rebuild a word from `quartet_of(prev)`,
+//      truncated any `gc_age >= 4` to `age & 3`. `MAX_GC_AGE` is 15, so 12 of
+//      the 16 ages were lossy: thin-locking or inflating an object rewound its
+//      tenuring age and perturbed the next promotion decision. Not an edge
+//      case -- G1's default `promotion_age` is 15 (`gc/src/g1.rs`), so ages
+//      4..14 are its ORDINARY young-survivor range.
+//   2. `!MARK_QUARTET_MASK` consequently did NOT mean "everything that is not
+//      the quartet": it retained bits 62..63. `inflated_monitor` and
+//      `forwarding_target` strip exactly that, so `set_gc_age(n)` with
+//      `n >= 4` on an already-`INFLATED` word yielded
+//      `monitor_ptr | (1 << 62)` -- a non-null WILD pointer handed to
+//      `monitor_ptr_from_mark` (`vm/src/threading/monitor.rs`), which only
+//      null-checks it. The `make_*` helpers emit words with those bits already
+//      clear, which is why round-trip tests looked clean: the corruption needs
+//      the age to be written AFTER the state, which is exactly what every
+//      collector does (`gc/src/g1.rs` `SharedEvac::evacuate` and
+//      `evacuate_object` copy the source mark word to the destination and then
+//      age the copy; `gc/src/gen_heap.rs`'s young non-moving sweep ages
+//      survivors in place with no promotion cap at all).
+//   3. `try_thin_lock` (`vm/src/threading/monitor.rs`) screens an unlocked
+//      word with `cur & !types::MARK_QUARTET_MASK != MARK_NEUTRAL`. With bits
+//      62..63 left in, an object whose age had reached 4 could never satisfy
+//      that test again, so every subsequent lock on it inflated a monitor,
+//      permanently -- the precise failure the mask was introduced to stop for
+//      arrays, reintroduced for aged objects.
+//
+// It went unnoticed because every round-trip test used age 3, the largest
+// value that fits in bits 60..61. Widening to the full 16-bit span collides
+// with nothing: see the state-by-state list above, and the partition and
+// disjointness assertions in the tests below.
 pub const MARK_QUARTET_SHIFT: u32 = 48;
-/// The 13 bits the quartet occupies. Everything outside it belongs to the
-/// state tag and its payload.
-pub const MARK_QUARTET_MASK: u64 = 0x3FFFu64 << MARK_QUARTET_SHIFT;
+/// The mark word's top 16 bits (48..63): the four quartet fields plus the two
+/// reserved bits between `element_type` and `gc_flags`. Everything outside it
+/// belongs to the state tag and its payload, and `!MARK_QUARTET_MASK` is
+/// relied upon to mean exactly that.
+pub const MARK_QUARTET_MASK: u64 = 0xFFFFu64 << MARK_QUARTET_SHIFT;
 
 // The sub-fields are placed for the BENEFIT OF THE JIT, not for tidiness.
 //
@@ -348,12 +410,18 @@ pub const MARK_QUARTET_MASK: u64 = 0x3FFFu64 << MARK_QUARTET_SHIFT;
 // of derived constant that goes stale silently.
 //
 // `kind` and `element_type` share byte 6, so a walker can read both tags with
-// one byte load. `gc_age` takes bits 59..63, the remainder of byte 7.
-const KIND_SHIFT: u32 = MARK_QUARTET_SHIFT; // 48: byte 6, bits 0..2
+// one byte load. `gc_age` takes bits 60..63 -- the remainder of byte 7, i.e.
+// its high nibble. (This read "bits 59..63" until 2026-08-07, which is a
+// five-bit range and disagreed with `AGE_SHIFT = 60` by one; it is the third
+// of the three numbers reconciled with the mask fix above.)
+// Ranges below are INCLUSIVE at both ends, matching the diagram above.
+const KIND_SHIFT: u32 = MARK_QUARTET_SHIFT; // 48: word bits 48..49, byte 6 bits 0..1
 const KIND_BITS: u64 = 0x3;
-const ELEM_SHIFT: u32 = MARK_QUARTET_SHIFT + 2; // 50: byte 6, bits 2..6
+const ELEM_SHIFT: u32 = MARK_QUARTET_SHIFT + 2; // 50: word bits 50..53, byte 6 bits 2..5
 const ELEM_BITS: u64 = 0xF;
-const FLAGS_SHIFT: u32 = MARK_QUARTET_SHIFT + 8; // 56: byte 7, bits 0..4
+// Word bits 54..55 (byte 6, bits 6..7) are RESERVED: inside MARK_QUARTET_MASK,
+// claimed by no field. They are preserved by every quartet rebuild.
+const FLAGS_SHIFT: u32 = MARK_QUARTET_SHIFT + 8; // 56: word bits 56..59, byte 7 bits 0..3
 // FOUR bits for three defined flags. The spare one is not slack -- it is what
 // keeps `header_reserved_fields_plausible` able to fail. That screen rejects a
 // header carrying an undefined flag bit, and if the field were exactly three
@@ -361,8 +429,46 @@ const FLAGS_SHIFT: u32 = MARK_QUARTET_SHIFT + 8; // 56: byte 7, bits 0..4
 // a guard that cannot fail, on the path that decides whether a candidate
 // address is a real object.
 const FLAGS_BITS: u64 = 0xF;
-const AGE_SHIFT: u32 = MARK_QUARTET_SHIFT + 12; // 60: byte 7, bits 4..8
+const AGE_SHIFT: u32 = MARK_QUARTET_SHIFT + 12; // 60: word bits 60..63, byte 7 bits 4..7
 const AGE_BITS: u64 = 0xF;
+
+// The regression guard for the 2026-08-07 mask fix, at COMPILE time: every one
+// of the four fields must lie wholly inside MARK_QUARTET_MASK. The old
+// `0x3FFF << 48` mask failed this on `gc_age` alone, and nothing in the build
+// noticed for a day. Kept as four separate asserts so the message names the
+// field that escaped.
+const _: () = assert!(
+    (KIND_BITS << KIND_SHIFT) & !MARK_QUARTET_MASK == 0,
+    "kind escapes MARK_QUARTET_MASK"
+);
+const _: () = assert!(
+    (ELEM_BITS << ELEM_SHIFT) & !MARK_QUARTET_MASK == 0,
+    "element_type escapes MARK_QUARTET_MASK"
+);
+const _: () = assert!(
+    (FLAGS_BITS << FLAGS_SHIFT) & !MARK_QUARTET_MASK == 0,
+    "gc_flags escapes MARK_QUARTET_MASK"
+);
+const _: () = assert!(
+    (AGE_BITS << AGE_SHIFT) & !MARK_QUARTET_MASK == 0,
+    "gc_age escapes MARK_QUARTET_MASK -- see the 2026-08-07 note above"
+);
+// ...and the mask must not reach down into any state payload. A pointer is
+// capped at `2^47 - 1` by `plausible_heap_pointer`, so bit 46 is the highest a
+// payload can ever occupy; the quartet must start strictly above it (bit 47 is
+// spare between the two).
+const _: () = assert!(
+    MARK_QUARTET_SHIFT >= 48,
+    "the quartet must sit above the 47-bit plausible-pointer range"
+);
+const _: () = assert!(
+    MARK_QUARTET_MASK & (MARK_STATE_MASK | MARK_HASH_MASK) == 0,
+    "MARK_QUARTET_MASK overlaps the state tag or the identity hash"
+);
+const _: () = assert!(
+    MARK_QUARTET_MASK & (THIN_LOCK_RECURSION_MASK | THIN_LOCK_OWNER_MASK) == 0,
+    "MARK_QUARTET_MASK overlaps the thin-lock payload"
+);
 
 /// Byte offset, from the OBJECT BASE, of the byte holding [`GC_FLAG_OLD_GEN`]
 /// / [`GC_FLAG_MARKED`] / [`GC_FLAG_COMPACT`].
@@ -594,7 +700,8 @@ pub struct ObjectHeader {
     /// entirely.
     pub shape: u32,
     /// Mark word -- lock state, identity hash, GC forwarding target, AND the
-    /// `kind` / `element_type` / `gc_age` / `gc_flags` quartet in bits 48..61.
+    /// `kind` / `element_type` / `gc_age` / `gc_flags` quartet in bits 48..63
+    /// (see the diagram at [`MARK_QUARTET_MASK`]).
     ///
     /// State in the low 2 bits; see `MARK_NEUTRAL` / `MARK_THIN_LOCKED` /
     /// `MARK_INFLATED` / `MARK_FORWARDED`. Always at `MARK_WORD_OFFSET` (= 8).
@@ -602,7 +709,9 @@ pub struct ObjectHeader {
     /// This word has absorbed the header three times. `forwarding_ptr` went
     /// first (32 -> 24, 2026-08-06), then `identity_hash_code`, then the
     /// `kind` / `element_type` / `gc_age` / `gc_flags` quartet into bits
-    /// 48..62 (24 -> 16, 2026-08-07).
+    /// 48..63 (24 -> 16, 2026-08-07). (This line, the one above it and
+    /// `MARK_QUARTET_MASK` itself said 48..61, 48..62 and "13 bits" -- three
+    /// different answers for one layout. They agree now: 48..63, 16 bits.)
     ///
     /// The note that used to sit here said folding `identity_hash_code` "buys
     /// zero, because `AtomicU64` forces 8-byte alignment and the 4 bytes
@@ -880,6 +989,19 @@ impl ObjectHeader {
     }
 
     /// Clear flag bits. `fetch_and`, for the same reason.
+    ///
+    /// There is deliberately no `try_clear_gc_flags` twin of
+    /// [`Self::try_add_gc_flags`]. A claim primitive earns its keep only where
+    /// something branches on "I was the one", and no unmark pass does: every
+    /// one of them (the young sweep's post-join survivor loop and its
+    /// sequential arm in `gc/src/gen_heap.rs`, the old-gen sweep there, the
+    /// `gc/src/zgc.rs` pre-clear and sweep) either runs stop-the-world on one
+    /// thread or gets its exclusion from owning a region, and a clear is
+    /// idempotent besides. An unused claim primitive is worse than none: its
+    /// ordering contract cannot be validated by a caller, so the first caller
+    /// to arrive assumes whichever semantics it happens to need. Add it *with*
+    /// that caller -- the case that would justify it is a parallel unmark
+    /// where a per-object action must run exactly once at clear time.
     #[inline(always)]
     pub fn clear_gc_flags(&self, flags: u8) {
         self.mark_word.fetch_and(
@@ -906,6 +1028,198 @@ impl ObjectHeader {
         }
     }
 
+    /// Set flag bits, reporting whether **this** call is the one that set them.
+    ///
+    /// Returns `true` for exactly one caller per object per clear -> set
+    /// transition; every other racing caller gets `false`. This is the
+    /// exactly-once *claim* primitive a **concurrent** marker needs, and it is
+    /// why it exists alongside [`Self::add_gc_flags`], which is a bare
+    /// `fetch_or` and tells its caller nothing.
+    ///
+    /// The pattern it replaces is a check-then-act:
+    ///
+    /// ```text
+    /// if header.gc_flags() & GC_FLAG_MARKED != 0 { return; }  // already seen
+    /// header.add_gc_flags(GC_FLAG_MARKED);                    // ...and race
+    /// ```
+    ///
+    /// which is correct only while marking is stop-the-world with a *single*
+    /// marker thread. With N work-stealing workers plus mutators publishing
+    /// marks from a load barrier, two threads can both read the bit clear and
+    /// both push the object -- or, worse, an object can be claimed by a thread
+    /// that then treats it as already-scanned, so its out-edges are never
+    /// traced and a live object is collected. That is a use-after-free, and it
+    /// presents as heap corruption or a hang rather than as a mark-phase bug.
+    ///
+    /// The intended consumer is `ZMarkContext::try_mark` in
+    /// `gc/src/zgc/mark.rs`, whose contract ("two workers, or a worker and a
+    /// mutator, racing on the same object must see exactly one `true`") this
+    /// is written to satisfy. Wiring it up is a separate change -- see the
+    /// note in `gc/src/zgc_concurrent.rs` -- so until then this has no
+    /// production caller and the STW collectors keep using
+    /// [`Self::add_gc_flags`].
+    ///
+    /// # Multi-bit semantics: ALL-OR-NOTHING, not "any"
+    ///
+    /// `true` means **every** requested bit was clear when this call ran and
+    /// **every** requested bit was set by this call, in one atomic step. If any
+    /// requested bit was already set the call returns `false` and writes
+    /// **nothing** -- it does not top up the remaining bits.
+    ///
+    /// The rejected alternative was "true if *any* requested bit transitioned".
+    /// It stops being exactly-once the moment two callers request overlapping
+    /// but unequal sets: a caller claiming `A` and a caller claiming `A | B`
+    /// would both be told they won. Exactly-once has to survive that, so the
+    /// claim is all-or-nothing and the return value means one thing.
+    ///
+    /// The consequence, which callers must respect: **never mix a sticky flag
+    /// into a claim set.** [`GC_FLAG_COMPACT`] is set at allocation and never
+    /// cleared, and [`GC_FLAG_OLD_GEN`] outlives any one mark cycle, so
+    /// `try_add_gc_flags(GC_FLAG_MARKED | GC_FLAG_OLD_GEN)` on an old-gen
+    /// object returns `false` forever and the object is never marked. Claim
+    /// per-cycle flags only; record a sticky property with
+    /// [`Self::add_gc_flags`].
+    ///
+    /// # Orderings: `AcqRel` on success, `Acquire` on failure and on the load
+    ///
+    /// This is the one flag helper that carries a happens-before edge, which is
+    /// exactly why it does not use `Relaxed` like its neighbours.
+    /// [`Self::add_gc_flags`], [`Self::clear_gc_flags`], [`Self::set_gc_flags`]
+    /// and [`Self::set_gc_age`] run inside a stop-the-world pause with every
+    /// mutator parked: the pause's own thread handshake already supplies the
+    /// ordering, and nothing branches on their result, so a per-object barrier
+    /// would buy nothing on a hot loop. Neither is true here -- this runs with
+    /// mutators running, and its result decides whether an object's reference
+    /// fields are traced at all.
+    ///
+    /// * **Release** on the success path: the winner has usually published
+    ///   something about the object first -- a relocated copy, a healed slot,
+    ///   the field stores a mutator made before it reached the load barrier.
+    ///   Whoever later observes the bit set must see those writes.
+    /// * **Acquire** on the success path: the winner's very next act is to
+    ///   *read* the object's reference fields. Without an acquire that scan is
+    ///   unordered against every release-write that reached this word, and the
+    ///   winner may trace a stale or half-initialised body. That is what makes
+    ///   the success ordering `AcqRel` and not a plain `Release` -- a
+    ///   claim-then-read primitive needs both halves, not just the publishing
+    ///   one.
+    /// * **Acquire** on the failure path: "the loser must not proceed"
+    ///   understates the loser. A load barrier that loses the claim still hands
+    ///   the reference back to the mutator, which dereferences it; a marker
+    ///   that loses still *skips* the object on the strength of the winner's
+    ///   write. Both are decisions taken against the winner's release, so the
+    ///   loser needs the matching acquire. `Relaxed` here would let a loser read
+    ///   a body the winner had not finished publishing.
+    /// * **Acquire** on the initial load, for the same reason and easily
+    ///   missed: a caller that finds the bit already set returns `false`
+    ///   *without ever executing a CAS*, so that one load is its only
+    ///   synchronisation with the winner.
+    ///
+    /// Not `SeqCst`: nothing here needs a single total order across two
+    /// locations -- every participant synchronises through this one word -- and
+    /// `SeqCst` would put an `mfence` / `dmb ish` on the collector's hottest
+    /// path for no extra guarantee. On x86-64 the whole choice is free anyway
+    /// (`lock cmpxchg` is a full barrier); it is written for the memory model
+    /// and for aarch64, where it is not free.
+    ///
+    /// # Why `compare_exchange_weak`, when the ZGC load barrier uses the strong form
+    ///
+    /// `_weak` may fail spuriously on LL/SC targets. That is harmless *in a
+    /// loop*: a spurious failure re-reads the word and re-evaluates the
+    /// already-set test, so it costs one iteration and can never turn a win into
+    /// a loss or a loss into a win. In exchange we drop the hidden retry loop
+    /// the strong form must emit around LL/SC -- cheaper on precisely the
+    /// platform where the two differ.
+    ///
+    /// The contrast is `load_barrier_slow` in `gc/src/zgc/barrier.rs`, which
+    /// deliberately uses the **non-weak** `compare_exchange` to self-heal a
+    /// reference slot: it never retries, it simply accepts the winner's value
+    /// when it loses, because a real loss means somebody else healed the slot.
+    /// A spurious failure there is indistinguishable from a real loss and would
+    /// leave that slot permanently unhealed, so every future load of it
+    /// re-enters the slow path. The rule both sides follow: `_weak` iff you
+    /// loop, strong iff the losing arm gives up. (Its orderings are `AcqRel` /
+    /// `Acquire` for the same reasons as here, and deliberately match.)
+    ///
+    /// # Every other bit survives, and the losing arm is the dangerous part
+    ///
+    /// The replacement word is `cur | bits`, built from the word this call is
+    /// CASing *against*, so the 2-bit state tag, the thin-lock owner and
+    /// recursion count, the inflated `Monitor` pointer, the forwarding target,
+    /// the identity hash, `kind`, `element_type` and `gc_age` are all carried
+    /// over verbatim. If a mutator inflates a monitor between the load and the
+    /// CAS then `cur` no longer matches, the CAS fails, and the retry rebuilds
+    /// against the *new* word -- a pre-inflation word can never be stamped back
+    /// over a live monitor pointer.
+    ///
+    /// "Verbatim" is meant literally, and it used to be strictly stronger than
+    /// what [`Self::quartet_of`] gave. While `MARK_QUARTET_MASK` was
+    /// `0x3FFF << 48` (bits 48..61) it did not cover `gc_age`'s bits 62..63, so
+    /// a word rebuilt through `quartet_of` lost any age >= 4 -- while a claim,
+    /// which never rebuilds and only ORs into the word it observed, kept it.
+    /// This method was therefore immune to that gap and, importantly, was NOT
+    /// a fix for it. The mask was widened to bits 48..63 on 2026-08-07 (see the
+    /// note at [`MARK_QUARTET_MASK`]); the two paths now agree, and this
+    /// paragraph is kept so a future reader does not re-derive the old
+    /// asymmetry from the tests that used to work around it.
+    ///
+    /// The precedent for taking the losing arm this seriously is the fixed
+    /// forwarding CAS in `SharedEvac::evacuate` (`gc/src/g1.rs`, the parallel
+    /// evacuation path): its loser cast the raw mark word straight to a
+    /// pointer instead of decoding the winner's forwarding target out of it, so
+    /// every reference to an already-evacuated object came back as
+    /// `address | MARK_FORWARDED` -- `address + 3`. It surfaced as
+    /// `ObjectRef pointer not 8-byte aligned` in a build with that debug
+    /// assertion, and as a corrupt reference stored into a live object in one
+    /// without; only a two-worker race on the *same* object reaches the arm at
+    /// all, which is why tree-shaped evacuation tests never saw it. Here the
+    /// losing arm returns `false`, writes nothing at all, and re-derives every
+    /// decision from the word the CAS actually observed
+    /// (`Err(observed) => cur = observed`), never from the stale one it
+    /// proposed against.
+    ///
+    /// # Termination
+    ///
+    /// Lock-free. Each iteration either returns, or observes a word different
+    /// from the one it proposed against. A non-spurious difference is another
+    /// thread's *completed* RMW on this word, i.e. system-wide progress;
+    /// spurious failures are bounded by the hardware.
+    #[inline]
+    pub fn try_add_gc_flags(&self, flags: u8) -> bool {
+        debug_assert!(
+            (flags as u64) & !FLAGS_BITS == 0,
+            "a claim set must lie inside the 4-bit gc_flags field"
+        );
+        let bits = ((flags as u64) & FLAGS_BITS) << FLAGS_SHIFT;
+        // An empty claim set has no clear -> set transition to win. Without this
+        // guard the CAS below would propose `cur | 0 == cur`, succeed trivially,
+        // and report a win to *every* caller -- the exact inverse of the
+        // contract. `flags == 0` passes the range `debug_assert` above, so this
+        // branch is the only guard -- and it is a real branch, not an assert,
+        // because release builds are where a concurrent marker actually runs.
+        if bits == 0 {
+            return false;
+        }
+        let mut cur = self.mark_word.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            // All-or-nothing: any requested bit already set means this call did
+            // not perform the transition, so it claims nothing and writes
+            // nothing.
+            if cur & bits != 0 {
+                return false;
+            }
+            match self.mark_word.compare_exchange_weak(
+                cur,
+                cur | bits,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     /// Set `kind` and `element_type`. Allocation-time only: both are immutable
     /// for an object's lifetime, so this takes no care to survive a race.
     pub fn set_shape_tags(&self, kind: ObjectKind, element_type: ArrayElementType) {
@@ -920,6 +1234,12 @@ impl ObjectHeader {
 
     /// The quartet bits of a snapshot, for constructing a replacement word that
     /// keeps them.
+    ///
+    /// This is the whole of bits 48..63, so every one of `kind`,
+    /// `element_type`, `gc_flags` and the FULL 4-bit `gc_age` survives a
+    /// rebuild. Until 2026-08-07 the mask stopped at bit 61 and this silently
+    /// truncated any age >= 4 to `age & 3` on every `make_thin_locked` /
+    /// `make_inflated` / `make_forwarded`; see [`MARK_QUARTET_MASK`].
     #[inline(always)]
     pub fn quartet_of(mark: u64) -> u64 {
         mark & MARK_QUARTET_MASK
@@ -988,6 +1308,15 @@ impl ObjectHeader {
 
     /// Decode the `Monitor` pointer from a `MARK_INFLATED` mark word.
     /// Result is meaningless if the mark word is not in inflated state.
+    ///
+    /// `& !MARK_QUARTET_MASK` is load-bearing, not cosmetic: the quartet is
+    /// written into this word AFTER the state (every collector ages a survivor
+    /// it has just copied), so the bits really are set on words this decodes.
+    /// While the mask stopped at bit 61 this expression left `gc_age`'s bits
+    /// 62..63 in the result and returned `monitor_ptr | (1 << 62)` for any age
+    /// >= 4 -- a non-null wild pointer, which `monitor_ptr_from_mark` in
+    /// `vm/src/threading/monitor.rs` only null-checks. Fixed 2026-08-07 by
+    /// widening the mask; see the note at [`MARK_QUARTET_MASK`].
     #[inline(always)]
     pub fn inflated_monitor(mark: u64) -> *mut () {
         ((mark & INFLATED_PTR_MASK & !MARK_QUARTET_MASK) as usize) as *mut ()
@@ -996,10 +1325,18 @@ impl ObjectHeader {
     /// Construct a `MARK_FORWARDED` mark word pointing at an object's new
     /// location after GC relocation.
     ///
-    /// The target keeps its **full 64-bit** width: the address is OR-ed with
-    /// the tag rather than shifted, so no high bits are lost and no overflow
-    /// side table is required. Heap objects are 8-byte aligned, so the low 3
-    /// bits are already zero and borrowing 2 of them is free.
+    /// The address is OR-ed with the tag rather than *shifted*, so nothing is
+    /// truncated and no overflow side table is required. Heap objects are
+    /// 8-byte aligned, so the low 3 bits are already zero and borrowing 2 of
+    /// them is free.
+    ///
+    /// The usable width is the **47 bits `plausible_heap_pointer` admits**
+    /// (`target <= 2^47 - 1`, asserted below), not 64: bits 48..63 are the
+    /// quartet's, and [`Self::forwarding_target`] masks them off on the way
+    /// out. That has always been true — the doc here used to say "full 64-bit"
+    /// while `quartet_of` was already stamping bits 48..61 of the result — and
+    /// it costs nothing, because the assert makes a target with any bit above
+    /// 46 set a panic rather than a truncation.
     ///
     /// # Ordering contract (read before producing this state)
     ///
@@ -1028,6 +1365,10 @@ impl ObjectHeader {
     /// Decode the relocation target from a `MARK_FORWARDED` mark word.
     /// Result is meaningless if the mark word is not in forwarded state;
     /// check with [`ObjectHeader::is_forwarded_mark`] first.
+    ///
+    /// `& !MARK_QUARTET_MASK` must strip the WHOLE quartet, for the same reason
+    /// spelled out on [`Self::inflated_monitor`]: a high `gc_age` written after
+    /// the state used to survive into the returned address.
     #[inline(always)]
     pub fn forwarding_target(mark: u64) -> *mut u8 {
         ((mark & FORWARDING_PTR_MASK & !MARK_QUARTET_MASK) as usize) as *mut u8
@@ -1148,7 +1489,7 @@ mod tests {
         // Three fields, no padding: `class_id`(4) + `shape`(4) + the 8-aligned
         // mark word is exactly 16, which is why nothing else could stay a
         // field. `kind` / `element_type` / `gc_age` / `gc_flags` are in the
-        // mark word's bits 48..61; the two JIT-facing byte offsets below are
+        // mark word's bits 48..63; the two JIT-facing byte offsets below are
         // what emitted code addresses them through.
         assert_eq!(GC_FLAGS_BYTE_OFFSET, MARK_WORD_OFFSET + 7);
         assert_eq!(KIND_TAGS_BYTE_OFFSET, MARK_WORD_OFFSET + 6);
@@ -1487,6 +1828,303 @@ mod tests {
         assert_eq!(GC_FLAG_OLD_GEN & GC_FLAG_MARKED, 0);
     }
 
+    // -- try_add_gc_flags: the exactly-once claim primitive ----------------
+
+    /// The single-threaded contract: the first claim wins, every later one
+    /// loses, and the bit is set either way.
+    #[test]
+    fn a_second_claim_of_the_same_flag_loses() {
+        let header = make_header();
+        assert!(header.try_add_gc_flags(GC_FLAG_MARKED));
+        assert_eq!(header.gc_flags() & GC_FLAG_MARKED, GC_FLAG_MARKED);
+        assert!(!header.try_add_gc_flags(GC_FLAG_MARKED));
+        assert!(!header.try_add_gc_flags(GC_FLAG_MARKED));
+        assert_eq!(header.gc_flags() & GC_FLAG_MARKED, GC_FLAG_MARKED);
+    }
+
+    /// A flag set through the non-claiming [`ObjectHeader::add_gc_flags`] must
+    /// still make the claim lose. The primitive reports the state of the BIT,
+    /// not whether some earlier caller happened to use the claim API.
+    #[test]
+    fn a_claim_loses_against_a_plain_add() {
+        let header = make_header();
+        header.add_gc_flags(GC_FLAG_MARKED);
+        assert!(!header.try_add_gc_flags(GC_FLAG_MARKED));
+    }
+
+    /// Multi-bit claims are ALL-OR-NOTHING (see the doc comment): one bit
+    /// already set makes the whole claim lose, and -- the half a "true if any
+    /// bit transitioned" implementation would get wrong -- the remaining bits
+    /// are left ALONE rather than topped up.
+    #[test]
+    fn a_multi_bit_claim_is_all_or_nothing() {
+        // Both clear: one atomic claim takes both.
+        let header = make_header();
+        assert!(header.try_add_gc_flags(GC_FLAG_MARKED | GC_FLAG_OLD_GEN));
+        assert_eq!(
+            header.gc_flags() & (GC_FLAG_MARKED | GC_FLAG_OLD_GEN),
+            GC_FLAG_MARKED | GC_FLAG_OLD_GEN
+        );
+
+        // One already set: the claim loses AND writes nothing.
+        let header = make_header();
+        header.add_gc_flags(GC_FLAG_OLD_GEN);
+        assert!(!header.try_add_gc_flags(GC_FLAG_MARKED | GC_FLAG_OLD_GEN));
+        assert_eq!(
+            header.gc_flags() & GC_FLAG_MARKED,
+            0,
+            "a lost all-or-nothing claim must not set the bits it could have won"
+        );
+
+        // Which is exactly the documented footgun: an old-gen object can never
+        // be claimed with a set that carries the sticky flag along...
+        assert!(!header.try_add_gc_flags(GC_FLAG_MARKED | GC_FLAG_OLD_GEN));
+        // ...while the per-cycle flag on its own still claims cleanly.
+        assert!(header.try_add_gc_flags(GC_FLAG_MARKED));
+    }
+
+    /// An empty claim set must LOSE. `cur | 0 == cur` is a CAS that always
+    /// succeeds, so a missing guard would hand a win to every caller.
+    #[test]
+    fn an_empty_claim_set_wins_nothing() {
+        let header = make_header();
+        assert!(!header.try_add_gc_flags(0));
+        assert_eq!(header.gc_flags(), 0);
+    }
+
+    /// A claim must not disturb one other bit of the word. The quartet shares
+    /// the mark word with the thin-lock payload and the monitor pointer, so a
+    /// claim that rebuilt the word instead of OR-ing into the observed one
+    /// would leak a `Monitor`, drop a forwarding target, or reset a tenuring
+    /// age -- none of which the flag assertions alone would notice.
+    #[test]
+    fn a_claim_preserves_the_rest_of_the_mark_word() {
+        let cell: u64 = 0;
+        let payload = &cell as *const u64 as usize;
+
+        let header = ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Array,
+            ArrayElementType::Int,
+            100,
+            0,
+        );
+        header.add_gc_flags(GC_FLAG_COMPACT);
+        let quartet = ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed));
+        let flag_field: u64 = FLAGS_BITS << FLAGS_SHIFT;
+
+        for (name, mark) in [
+            ("NEUTRAL", ObjectHeader::make_neutral_hashed(quartet, 0x0123_4567)),
+            ("THIN_LOCKED", ObjectHeader::make_thin_locked(quartet, 0x0BAD_F00D, 9)),
+            ("INFLATED", ObjectHeader::make_inflated(quartet, payload)),
+            ("FORWARDED", ObjectHeader::make_forwarded(quartet, payload)),
+        ] {
+            header.mark_word.store(mark, Ordering::Release);
+            // The age is installed AFTER the state word rather than folded in
+            // through `quartet_of`, which is also the ordering every collector
+            // uses (copy the mark word, then age the copy). 9 (0b1001) sets
+            // bit 63 -- one of the two the old `0x3FFF << 48` mask could not
+            // carry -- so this doubles as a check that the widened mask and the
+            // OR-into-observed claim agree about the full 4-bit age.
+            header.set_gc_age(9);
+            let before = header.mark_word.load(Ordering::Acquire);
+            assert!(
+                header.try_add_gc_flags(GC_FLAG_MARKED),
+                "{name}: the first claim must win"
+            );
+            let after = header.mark_word.load(Ordering::Acquire);
+
+            assert_eq!(
+                after & !flag_field,
+                before & !flag_field,
+                "{name}: a claim changed a bit outside the flag field"
+            );
+            assert_eq!(
+                ObjectHeader::mark_state(after),
+                ObjectHeader::mark_state(mark),
+                "{name}: the state tag moved"
+            );
+            assert_eq!(header.kind(), ObjectKind::Array, "{name}: kind");
+            assert_eq!(header.element_type(), ArrayElementType::Int, "{name}: element_type");
+            assert_eq!(header.gc_age(), 9, "{name}: gc_age");
+            assert_eq!(
+                header.gc_flags() & GC_FLAG_COMPACT,
+                GC_FLAG_COMPACT,
+                "{name}: the sticky flag was cleared"
+            );
+            assert_eq!(header.gc_flags() & GC_FLAG_MARKED, GC_FLAG_MARKED, "{name}: claimed bit");
+            assert!(
+                !header.try_add_gc_flags(GC_FLAG_MARKED),
+                "{name}: the second claim must lose"
+            );
+        }
+    }
+
+    /// The property the whole primitive exists for: with N threads racing over
+    /// the same objects, EXACTLY ONE call per object returns `true`.
+    ///
+    /// Many objects rather than one, because a single-object race is normally
+    /// won outright by whichever thread arrives first and produces no overlap
+    /// at all. 256 objects, with each thread entering the ring at its own
+    /// offset, is what actually generates contention.
+    #[test]
+    fn a_claim_is_won_exactly_once_across_threads() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 8;
+        const OBJECTS: usize = 256;
+
+        for _round in 0..16 {
+            let headers: Arc<Vec<ObjectHeader>> =
+                Arc::new((0..OBJECTS).map(|_| make_header()).collect());
+            let wins: Arc<Vec<AtomicUsize>> =
+                Arc::new((0..OBJECTS).map(|_| AtomicUsize::new(0)).collect());
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let headers = Arc::clone(&headers);
+                    let wins = Arc::clone(&wins);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for i in 0..OBJECTS {
+                            let idx = (i + t * 31) % OBJECTS;
+                            if headers[idx].try_add_gc_flags(GC_FLAG_MARKED) {
+                                wins[idx].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            for i in 0..OBJECTS {
+                let claims = wins[i].load(Ordering::Relaxed);
+                assert_eq!(claims, 1, "object {i} was claimed {claims} times, not once");
+                assert_eq!(
+                    headers[i].gc_flags() & GC_FLAG_MARKED,
+                    GC_FLAG_MARKED,
+                    "object {i} lost the flag it was claimed with"
+                );
+            }
+        }
+    }
+
+    /// The crux of sharing one word: a mutator taking a thin lock or inflating
+    /// a monitor mid-claim must make the CAS fail and retry, never lose its
+    /// payload -- and must never split one claim into two.
+    ///
+    /// The churn thread rebuilds every word from `quartet_of(observed)` and the
+    /// claim ORs into the word it observed, so a correct implementation has
+    /// both sides surviving; an implementation that rebuilt the word from a
+    /// stale snapshot loses whichever side lost the race.
+    #[test]
+    fn a_claim_survives_a_concurrent_lock_state_change() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Barrier};
+
+        const CLAIMERS: usize = 6;
+        const ATTEMPTS: usize = 512;
+        const ROUNDS: usize = 512;
+
+        for _round in 0..8 {
+            let header = Arc::new(ObjectHeader::new(
+                ClassId::new(11),
+                ObjectKind::Array,
+                ArrayElementType::Long,
+                64,
+                0,
+            ));
+            // Age 13 (0b1101), deliberately NOT 3. The churn thread below
+            // rebuilds every word through `quartet_of`, so the age has to
+            // survive a `make_thin_locked` / `make_inflated` / bare-NEUTRAL
+            // rebuild thousands of times. This used to be 3 -- the largest
+            // value the old `0x3FFF << 48` mask could carry -- with a comment
+            // explaining that anything higher would be truncated by the CHURN.
+            // That "explanation" was the bug's camouflage; with the mask fixed
+            // to bits 48..63 the high age is exactly what this loop should be
+            // hammering, and the final `gc_age()` assertion below is now a live
+            // guard against the mask narrowing again.
+            header.set_gc_age(13);
+            let wins = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(CLAIMERS + 1));
+
+            let churn = {
+                let header = Arc::clone(&header);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    // A stack cell stands in for the `Monitor` allocation --
+                    // `make_inflated` only needs a plausible aligned pointer.
+                    let cell: u64 = 0;
+                    let monitor = &cell as *const u64 as usize;
+                    barrier.wait();
+                    for _ in 0..ROUNDS {
+                        for shape in 0..3u8 {
+                            loop {
+                                let cur = header.mark_word.load(Ordering::Acquire);
+                                let next = match shape {
+                                    0 => ObjectHeader::make_thin_locked(cur, 4242, 3),
+                                    1 => ObjectHeader::make_inflated(cur, monitor),
+                                    _ => ObjectHeader::quartet_of(cur) | MARK_NEUTRAL,
+                                };
+                                if header
+                                    .mark_word
+                                    .compare_exchange(
+                                        cur,
+                                        next,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+            };
+
+            let claimers: Vec<_> = (0..CLAIMERS)
+                .map(|_| {
+                    let header = Arc::clone(&header);
+                    let wins = Arc::clone(&wins);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        for _ in 0..ATTEMPTS {
+                            if header.try_add_gc_flags(GC_FLAG_MARKED) {
+                                wins.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            churn.join().unwrap();
+            for c in claimers {
+                c.join().unwrap();
+            }
+
+            let claims = wins.load(Ordering::Relaxed);
+            assert_eq!(claims, 1, "the lock-state churn split one claim into {claims}");
+            assert_eq!(header.gc_flags() & GC_FLAG_MARKED, GC_FLAG_MARKED);
+            assert_eq!(header.kind(), ObjectKind::Array);
+            assert_eq!(header.element_type(), ArrayElementType::Long);
+            assert_eq!(
+                header.gc_age(),
+                13,
+                "a high gc_age must survive thousands of quartet_of rebuilds; \
+                 truncation here means MARK_QUARTET_MASK no longer covers \
+                 gc_age's top bits"
+            );
+        }
+    }
+
     #[test]
     fn autobox_class_id_constant() {
         // LOW (2026-06-17): moved from the unreserved mid-range 0xAB00_0000
@@ -1517,7 +2155,13 @@ mod tests {
             100,
             0,
         );
-        header.set_gc_age(3);
+        // MAX_GC_AGE, not 3. This assertion is `mark & !MARK_QUARTET_MASK ==
+        // MARK_NEUTRAL` — "nothing outside the quartet is set" — and with age 3
+        // it could not fail: 3 fits in bits 60..61, which the old
+        // `0x3FFF << 48` mask happened to cover. Age 15 lights bits 62..63 too,
+        // so if `MARK_QUARTET_MASK` ever stops covering the whole `gc_age`
+        // field the leftover bits show up here as a non-neutral remainder.
+        header.set_gc_age(MAX_GC_AGE);
         assert_eq!(header.kind(), ObjectKind::Array);
         assert_eq!(header.element_type(), ArrayElementType::Int);
         assert_eq!(header.array_length(), 100);
@@ -1525,9 +2169,11 @@ mod tests {
         // lazily into the mark word on first request.
         assert_eq!(
             header.mark_word.load(Ordering::Relaxed) & !MARK_QUARTET_MASK,
-            MARK_NEUTRAL
+            MARK_NEUTRAL,
+            "a bit outside MARK_QUARTET_MASK is set on an unlocked, unhashed \
+             object — the quartet is leaking past its mask"
         );
-        assert_eq!(header.gc_age(), 3);
+        assert_eq!(header.gc_age(), MAX_GC_AGE);
     }
 
     // ---------------------------------------------------------------------
@@ -2296,7 +2942,7 @@ mod tests {
         );
         // And the header really did lose the bytes: 32 -> 24 when forwarding
         // folded into the mark word, then 24 -> 16 when the identity hash
-        // followed it and the quartet joined them in bits 48..61.
+        // followed it and the quartet joined them in bits 48..63.
         assert_eq!(HEADER_SIZE, 16);
         assert_eq!(std::mem::size_of::<ObjectHeader>(), 16);
     }
@@ -2354,5 +3000,358 @@ mod tests {
         assert_eq!(ARRAY_LENGTH_OFFSET, NUM_SLOTS_OFFSET);
         assert_eq!(std::mem::offset_of!(ObjectHeader, shape), NUM_SLOTS_OFFSET);
         assert!(NUM_SLOTS_OFFSET + 4 <= MARK_WORD_OFFSET);
+    }
+
+    // ---------------------------------------------------------------------
+    //  MARK_QUARTET_MASK partition and payload disjointness (2026-08-07)
+    //
+    //  These exist because the mask was `0x3FFF << 48` -- bits 48..61 -- while
+    //  `gc_age` is `AGE_BITS << AGE_SHIFT` = bits 60..63. The top two age bits
+    //  sat outside the "quartet" mask, so `quartet_of` truncated any age >= 4
+    //  and `!MARK_QUARTET_MASK` did not mean "not the quartet". Nothing failed,
+    //  because every round-trip test used age 3 -- the largest value that fits
+    //  in bits 60..61. See the long note at `MARK_QUARTET_MASK`.
+    // ---------------------------------------------------------------------
+
+    /// The mask/field partition, asserted rather than described.
+    ///
+    /// Three numbers used to disagree about this one layout: the constant's doc
+    /// said "13 bits", its value spanned 14, and the fields span 16. The value
+    /// was the wrong one.
+    #[test]
+    fn the_quartet_fields_lie_inside_the_quartet_mask_and_tile_its_span() {
+        let kind: u64 = KIND_BITS << KIND_SHIFT;
+        let elem: u64 = ELEM_BITS << ELEM_SHIFT;
+        let flags: u64 = FLAGS_BITS << FLAGS_SHIFT;
+        let age: u64 = AGE_BITS << AGE_SHIFT;
+
+        // The mask is exactly the mark word's top 16 bits.
+        assert_eq!(MARK_QUARTET_SHIFT, 48);
+        assert_eq!(MARK_QUARTET_MASK, 0xFFFF_0000_0000_0000u64);
+        assert_eq!(MARK_QUARTET_MASK.count_ones(), 16);
+        assert_eq!(MARK_QUARTET_MASK.trailing_zeros(), MARK_QUARTET_SHIFT);
+        assert_eq!(
+            MARK_QUARTET_MASK.leading_zeros(),
+            0,
+            "the mask must reach bit 63, or gc_age's top bits escape it"
+        );
+
+        let fields: [(&str, u64); 4] = [
+            ("kind", kind),
+            ("element_type", elem),
+            ("gc_flags", flags),
+            ("gc_age", age),
+        ];
+
+        // Every field lies WHOLLY inside the mask. This is the assertion the
+        // old mask failed, and it failed on `gc_age` alone.
+        for (name, field) in fields {
+            assert_eq!(
+                field & !MARK_QUARTET_MASK,
+                0,
+                "{name} has bits outside MARK_QUARTET_MASK, so quartet_of \
+                 truncates it and !MARK_QUARTET_MASK leaks it into the payload"
+            );
+            assert_eq!(field & MARK_QUARTET_MASK, field, "{name}");
+        }
+
+        // ...and no two fields overlap.
+        for (i, (an, a)) in fields.iter().enumerate() {
+            for (bn, b) in fields.iter().skip(i + 1) {
+                assert_eq!(*a & *b, 0, "{an} overlaps {bn}");
+            }
+        }
+
+        // 2 + 4 + 4 + 4 = 14 field bits inside a 16-bit mask. The two left over
+        // are bits 54..55: reserved, owned by no field, and deliberately INSIDE
+        // the mask so every quartet rebuild carries them for a future claimant.
+        let union = kind | elem | flags | age;
+        assert_eq!(union.count_ones(), 14, "the four fields are 14 bits wide");
+        let reserved = MARK_QUARTET_MASK & !union;
+        assert_eq!(
+            reserved,
+            0b11u64 << 54,
+            "the only bits inside the mask that no field owns must be 54..55"
+        );
+
+        // The saturation ceiling must be exactly what the field can hold: a
+        // larger `MAX_GC_AGE` wraps, a smaller one wastes encodings.
+        assert_eq!(u64::from(MAX_GC_AGE), AGE_BITS);
+    }
+
+    /// Widening the quartet upward is only safe if bits 48..63 are unused in
+    /// EVERY mark-word state. That argument is the whole justification for the
+    /// widening, so it is checked against all four states and both payload
+    /// encodings rather than asserted in prose.
+    #[test]
+    fn the_quartet_mask_is_disjoint_from_every_state_payload() {
+        // The statically-known fields.
+        assert_eq!(MARK_QUARTET_MASK & MARK_STATE_MASK, 0, "state tag");
+        assert_eq!(MARK_QUARTET_MASK & MARK_HASH_MASK, 0, "NEUTRAL identity hash");
+        assert_eq!(
+            MARK_QUARTET_MASK & THIN_LOCK_RECURSION_MASK,
+            0,
+            "THIN_LOCKED recursion count"
+        );
+        assert_eq!(
+            MARK_QUARTET_MASK & THIN_LOCK_OWNER_MASK,
+            0,
+            "THIN_LOCKED owner id"
+        );
+
+        // The two pointer states. `INFLATED_PTR_MASK` / `FORWARDING_PTR_MASK`
+        // are both `!MARK_STATE_MASK`, so they nominally reach bit 63 and would
+        // overlap on paper. What actually bounds them is
+        // `plausible_heap_pointer`, which `make_inflated` and `make_forwarded`
+        // ASSERT: its ceiling is `2^47 - 1`, so bit 46 is the highest a payload
+        // can occupy and bit 47 is spare between it and the quartet at 48.
+        const MAX_PLAUSIBLE: u64 = (1u64 << 47) - 1;
+        assert!(crate::plausible_heap_pointer(MAX_PLAUSIBLE & !7));
+        assert!(!crate::plausible_heap_pointer(1u64 << 47));
+        assert!(!crate::plausible_heap_pointer(1u64 << 48));
+        assert!(!crate::plausible_heap_pointer(1u64 << 62));
+        assert_eq!(
+            MARK_QUARTET_MASK & MAX_PLAUSIBLE,
+            0,
+            "the widened quartet would eat the top of a Monitor pointer or a \
+             forwarding target"
+        );
+
+        // The end-to-end form of the same claim: the most extreme legal payload
+        // of each state, carried across a rebuild with the ENTIRE quartet set.
+        let extreme = (MAX_PLAUSIBLE & !7) as usize;
+        let full = MARK_QUARTET_MASK;
+
+        let inflated = ObjectHeader::make_inflated(full, extreme);
+        assert_eq!(ObjectHeader::mark_state(inflated), MARK_INFLATED);
+        assert_eq!(ObjectHeader::inflated_monitor(inflated) as usize, extreme);
+        assert_eq!(ObjectHeader::gc_age_of(inflated), MAX_GC_AGE);
+
+        let forwarded = ObjectHeader::make_forwarded(full, extreme);
+        assert!(ObjectHeader::is_forwarded_mark(forwarded));
+        assert_eq!(ObjectHeader::forwarding_target(forwarded) as usize, extreme);
+        assert_eq!(ObjectHeader::gc_age_of(forwarded), MAX_GC_AGE);
+
+        let thin = ObjectHeader::make_thin_locked(full, u32::MAX, u8::MAX);
+        assert_eq!(ObjectHeader::mark_state(thin), MARK_THIN_LOCKED);
+        assert_eq!(ObjectHeader::thin_lock_owner(thin), u32::MAX);
+        assert_eq!(ObjectHeader::thin_lock_recursion(thin), u8::MAX);
+        assert_eq!(ObjectHeader::gc_age_of(thin), MAX_GC_AGE);
+
+        let hashed = ObjectHeader::make_neutral_hashed(full, i32::MAX);
+        assert_eq!(ObjectHeader::mark_state(hashed), MARK_NEUTRAL);
+        assert_eq!(ObjectHeader::neutral_hash(hashed), i32::MAX);
+        assert_eq!(ObjectHeader::gc_age_of(hashed), MAX_GC_AGE);
+    }
+
+    /// Every `gc_age` in `0..=MAX_GC_AGE` must survive a rebuild through each
+    /// helper that carries the previous word's quartet across.
+    ///
+    /// This is the coverage that did not exist. It stopped at age 3 -- the
+    /// largest value that fitted in the old mask's bits 60..61 -- so 12 of the
+    /// 16 ages were silently truncated to `age & 3`, and
+    /// `MonitorTable::publish_inflated` (`vm/src/threading/monitor.rs`), which
+    /// builds its new word with `make_inflated(expected, ..)`, rewound the
+    /// tenuring age of every object it inflated a monitor for.
+    #[test]
+    fn every_gc_age_survives_every_make_helper() {
+        let cell: u64 = 0;
+        let payload = &cell as *const u64 as usize;
+
+        for age in 0..=MAX_GC_AGE {
+            let header = ObjectHeader::new(
+                ClassId::new(3),
+                ObjectKind::Array,
+                ArrayElementType::Short,
+                8,
+                0,
+            );
+            header.add_gc_flags(GC_FLAG_COMPACT);
+            header.set_gc_age(age);
+            let prev = header.mark_word.load(Ordering::Relaxed);
+            assert_eq!(ObjectHeader::gc_age_of(prev), age, "set_gc_age({age})");
+
+            for (name, rebuilt) in [
+                (
+                    "make_thin_locked",
+                    ObjectHeader::make_thin_locked(prev, 0x0BAD_F00D, 7),
+                ),
+                ("make_inflated", ObjectHeader::make_inflated(prev, payload)),
+                ("make_forwarded", ObjectHeader::make_forwarded(prev, payload)),
+                (
+                    "make_neutral_hashed",
+                    ObjectHeader::make_neutral_hashed(prev, 0x0123_4567),
+                ),
+            ] {
+                assert_eq!(
+                    ObjectHeader::gc_age_of(rebuilt),
+                    age,
+                    "{name} truncated gc_age {age} to {}",
+                    ObjectHeader::gc_age_of(rebuilt)
+                );
+                // The other three quartet fields must ride along too.
+                assert_eq!(
+                    ObjectHeader::kind_of(rebuilt),
+                    ObjectKind::Array,
+                    "{name}: kind lost at age {age}"
+                );
+                assert_eq!(
+                    ObjectHeader::element_type_tag(rebuilt),
+                    ArrayElementType::Short as u8,
+                    "{name}: element_type lost at age {age}"
+                );
+                assert_eq!(
+                    (((rebuilt >> FLAGS_SHIFT) & FLAGS_BITS) as u8) & GC_FLAG_COMPACT,
+                    GC_FLAG_COMPACT,
+                    "{name}: gc_flags lost at age {age}"
+                );
+                // ...and the quartet must be ALL that crossed over: nothing
+                // from the previous word's payload may survive into the new
+                // state's payload region.
+                assert_eq!(
+                    rebuilt & MARK_QUARTET_MASK,
+                    prev & MARK_QUARTET_MASK,
+                    "{name}: the quartet changed at age {age}"
+                );
+            }
+        }
+    }
+
+    /// `inflated_monitor` and `forwarding_target` must round-trip their payload
+    /// with a non-zero, HIGH `gc_age` installed **after** the state.
+    ///
+    /// That order is the one every collector uses -- copy the source mark word
+    /// onto the destination, then bump the copy's age (`SharedEvac::evacuate`
+    /// and `evacuate_object` in `gc/src/g1.rs`, `evacuate` in
+    /// `gc/src/gen_heap.rs`), or age a non-moving survivor in place
+    /// (`gen_heap.rs`'s young sweep, which has no promotion cap at all). It is
+    /// also the order no test used, which is why the mask gap survived: the
+    /// `make_*` helpers emit words whose bits 62..63 are already clear, so a
+    /// construct-then-decode round trip cannot see it. Writing the age second
+    /// is what exposed `monitor_ptr | (1 << 62)` -- a non-null wild pointer,
+    /// and `monitor_ptr_from_mark` in `vm/src/threading/monitor.rs` only
+    /// null-checks what it gets.
+    #[test]
+    fn the_payload_decoders_round_trip_under_every_gc_age() {
+        let cell: u64 = 0;
+        let payload = &cell as *const u64 as usize;
+        const HASH: i32 = 0x5EED_1234 & 0x7FFF_FFFF;
+
+        for age in 0..=MAX_GC_AGE {
+            // INFLATED, then aged -- the collector's order.
+            let header = make_header();
+            header.mark_word.store(
+                ObjectHeader::make_inflated(MARK_NEUTRAL, payload),
+                Ordering::Release,
+            );
+            header.set_gc_age(age);
+            let mark = header.mark_word.load(Ordering::Acquire);
+            assert_eq!(ObjectHeader::mark_state(mark), MARK_INFLATED, "age {age}");
+            assert_eq!(header.gc_age(), age, "age {age}: the age itself was lost");
+            assert_eq!(
+                ObjectHeader::inflated_monitor(mark) as usize,
+                payload,
+                "age {age}: gc_age bits corrupted the Monitor pointer"
+            );
+
+            // FORWARDED, then aged.
+            let header = make_header();
+            header.mark_word.store(
+                ObjectHeader::make_forwarded(MARK_NEUTRAL, payload),
+                Ordering::Release,
+            );
+            header.set_gc_age(age);
+            let mark = header.mark_word.load(Ordering::Acquire);
+            assert!(ObjectHeader::is_forwarded_mark(mark), "age {age}");
+            assert_eq!(header.gc_age(), age, "age {age}");
+            assert_eq!(
+                ObjectHeader::forwarding_target(mark) as usize,
+                payload,
+                "age {age}: gc_age bits corrupted the forwarding target"
+            );
+            assert_eq!(
+                header.forwarding_address() as usize,
+                payload,
+                "age {age}: the accessor disagrees with the raw decode"
+            );
+
+            // THIN_LOCKED, then aged. Its payload lives far below bit 48, but
+            // pin it so a future field placed lower is caught here too.
+            let header = make_header();
+            header.mark_word.store(
+                ObjectHeader::make_thin_locked(MARK_NEUTRAL, 0x0BAD_F00D, 200),
+                Ordering::Release,
+            );
+            header.set_gc_age(age);
+            let mark = header.mark_word.load(Ordering::Acquire);
+            assert_eq!(ObjectHeader::thin_lock_owner(mark), 0x0BAD_F00D, "age {age}");
+            assert_eq!(ObjectHeader::thin_lock_recursion(mark), 200, "age {age}");
+            assert_eq!(header.gc_age(), age, "age {age}");
+
+            // NEUTRAL: the identity hash must survive an age write as well.
+            let header = make_header();
+            header.mark_word.store(
+                ObjectHeader::make_neutral_hashed(MARK_NEUTRAL, HASH),
+                Ordering::Release,
+            );
+            header.set_gc_age(age);
+            let mark = header.mark_word.load(Ordering::Acquire);
+            assert_eq!(
+                ObjectHeader::neutral_hash(mark),
+                HASH,
+                "age {age}: gc_age bits disturbed the identity hash"
+            );
+            assert_eq!(header.gc_age(), age, "age {age}");
+        }
+    }
+
+    /// The screen `try_thin_lock` uses in `vm/src/threading/monitor.rs` --
+    /// `cur & !types::MARK_QUARTET_MASK != MARK_NEUTRAL`, meaning "locked, or
+    /// hashed" -- must read FALSE for an unlocked, unhashed object at EVERY age
+    /// and flag combination.
+    ///
+    /// It did not. With the mask ending at bit 61, an object whose age reached
+    /// 4 left bits 62..63 outside it, the screen classified it as non-neutral,
+    /// and every later `monitorenter` on that object inflated a monitor instead
+    /// of taking the thin lock -- permanently, since this VM never deflates.
+    /// That is the same failure the mask was introduced to stop for arrays,
+    /// reintroduced for aged objects. The consumer lives in another crate, so
+    /// this is the local pin on the property it depends on.
+    #[test]
+    fn an_aged_unlocked_object_still_passes_the_thin_lock_screen() {
+        for age in 0..=MAX_GC_AGE {
+            for flags in [0u8, GC_FLAG_OLD_GEN, GC_FLAG_COMPACT | GC_FLAG_MARKED] {
+                let header = ObjectHeader::new(
+                    ClassId::new(2),
+                    ObjectKind::Array,
+                    ArrayElementType::Reference,
+                    4,
+                    0,
+                );
+                header.set_gc_age(age);
+                header.set_gc_flags(flags);
+                let cur = header.mark_word.load(Ordering::Relaxed);
+                assert_eq!(
+                    cur & !MARK_QUARTET_MASK,
+                    MARK_NEUTRAL,
+                    "age {age}, flags {flags:#x}: an unlocked, unhashed object must \
+                     read neutral outside the quartet, or try_thin_lock inflates a \
+                     monitor for it on every lock, forever"
+                );
+            }
+
+            // ...while a HASHED word must still fail that same screen, which is
+            // what keeps HotSpot's "a hashed object cannot be thin-locked" rule
+            // working. Widening the mask must not have cost that.
+            let header = make_header();
+            header.set_gc_age(age);
+            let quartet = ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed));
+            let hashed = ObjectHeader::make_neutral_hashed(quartet, 0x2A);
+            assert_ne!(
+                hashed & !MARK_QUARTET_MASK,
+                MARK_NEUTRAL,
+                "age {age}: a hashed word must still lose the thin-lock CAS"
+            );
+        }
     }
 }
