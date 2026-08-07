@@ -252,7 +252,7 @@ pub struct ReferenceProcessor {
     /// positions at every mutation site (discover/relocate/remove_collected);
     /// the `(reference_obj -> idx)` invariant mirrors the `soft_ref_lru_index`
     /// `(timestamp, idx) -> idx` invariant the LRU-leak fix already maintains.
-    soft_ref_addr_index: FxHashMap<usize, usize>,
+    soft_ref_addr_index: cratonvm_types::PointerMap,
 
     /// Highest wall-clock millisecond value the *mutator* side has ever handed
     /// this processor through [`Self::touch_soft_reference`].
@@ -937,8 +937,8 @@ impl ReferenceProcessor {
     /// Validates that all target addresses in the pointer map are non-null
     /// and within a plausible heap range (non-zero) to prevent corruption
     /// from a bad relocation map.
-    pub fn update_after_gc(&mut self, pointer_map: &HashMap<usize, usize>) {
-        fn relocate_list(list: &mut [ReferenceEntry], map: &HashMap<usize, usize>) {
+    pub fn update_after_gc(&mut self, pointer_map: &cratonvm_types::PointerMap) {
+        fn relocate_list(list: &mut [ReferenceEntry], map: &cratonvm_types::PointerMap) {
             for e in list.iter_mut() {
                 if let Some(&new_addr) = map.get(&e.reference_obj) {
                     if new_addr != 0 {
@@ -1368,7 +1368,7 @@ impl CleanerThread {
     /// objects they point at can be evacuated by a compacting collector, so
     /// their raw addresses must be remapped on every GC or a later
     /// `drain_actions` would deref freed/moved memory → SEGV.
-    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -1477,7 +1477,7 @@ impl FinalizerThread {
     /// (a `finalize()` invoked while a JIT borrow is live would alias the
     /// `&mut JvmThread`), so a persisted queue entry must track object motion
     /// or `dequeue` would later hand the interpreter a freed/moved address.
-    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -1745,7 +1745,7 @@ mod tests {
     fn update_after_gc_relocates() {
         let mut proc = ReferenceProcessor::new();
         proc.discover_reference(ReferenceType::Weak, 100, 200, Some(300));
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(100, 1100);
         map.insert(200, 1200);
         map.insert(300, 1300);
@@ -1967,7 +1967,7 @@ mod tests {
         // still-pending entry (an object moved by a GC between enqueue and
         // consumption).
         proc.finalization_queue.push_back(100);
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(100, 9999);
         proc.update_after_gc(&map);
         assert_eq!(proc.finalization_queue, vec![9999]);
@@ -2127,7 +2127,7 @@ mod tests {
     fn update_after_gc_skips_null_targets() {
         let mut proc = ReferenceProcessor::new();
         proc.discover_reference(ReferenceType::Weak, 100, 200, Some(300));
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         // Map reference_obj to 0 (invalid) — should be skipped
         map.insert(100usize, 0usize);
         // Map referent to valid address
@@ -2149,7 +2149,7 @@ mod tests {
         // finalization_queue_fifo) — to isolate update_after_gc's null-target
         // skip behaviour.
         proc.finalization_queue.push_back(0xBEEF);
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0xBEEF, 0usize); // null target
         proc.update_after_gc(&map);
         // Should NOT have been relocated to 0
@@ -2166,7 +2166,7 @@ mod tests {
         proc.discover_reference(ReferenceType::Cleaner, 90, 100, None);
         proc.discover_reference(ReferenceType::Finalizer, 110, 120, Some(130));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         for old in (10..=130).step_by(10) {
             map.insert(old, old + 1000);
         }
@@ -2492,7 +2492,7 @@ mod tests {
     fn touch_soft_reference_after_update_after_gc() {
         let mut proc = ReferenceProcessor::new_with_policy(1000);
         proc.discover_reference(ReferenceType::Soft, 0xAA, 0x10, None);
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0xAAusize, 0xCCusize); // reference_obj 0xAA -> 0xCC
         proc.update_after_gc(&map);
         assert_eq!(proc.soft_refs[0].reference_obj, 0xCC);

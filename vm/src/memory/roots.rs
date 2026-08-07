@@ -106,6 +106,8 @@ pub(crate) fn push_off_frame_thread_roots(thread: &JvmThread, roots: &mut Vec<Ob
 /// - Class lock objects (synthetic monitors for static synchronized methods)
 /// - Thread printed values (test harness output)
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
+    let __rp_t0 = crate::memory::native_roots::rootprof::on()
+        .then(std::time::Instant::now);
     let mut roots = Vec::new();
 
     // Stage B (precise oop maps, B-K fix): reset the movable precise-JIT-root
@@ -795,6 +797,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // its matching relocation callback as one entry. The historical notes
     // below document why each registered source is a root.
     crate::memory::native_roots::scan_all_roots(shared, &mut roots);
+    if let Some(t0) = __rp_t0 {
+        let ns = t0.elapsed().as_nanos();
+        if ns >= 20_000_000 {
+            eprintln!(
+                "[rootprof] collect_roots took {}ms roots={}",
+                ns / 1_000_000,
+                roots.len()
+            );
+        }
+    }
 
     // 15. Round-9 CRIT GC-correctness fix: process-global Integer.valueOf
     //     (-128..=127) and Boolean.TRUE/FALSE caches. These live in
@@ -913,6 +925,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     back to reporting "0.0.0.0" (ES
     //     InetAddressRandomBinaryDocValuesRangeQueryTests CONTAINS-query false
     //     negative). Remap companion in `gc.rs` (`gc_update_inet_addr_refs`).
+
+    //     Process-global DatagramSocket side tables (`net_phase_e.rs`):
+    //     `ds_side_table` (fd / closed / timeout / connected / broadcast /
+    //     reuse) and `ds_peer_table` (the connected peer) are both keyed by the
+    //     socket mirror. A relocated mirror makes `ds_get` miss and answer the
+    //     all-defaults `ds_default()` — fd = -1 on a live, connected socket, so
+    //     send() fails as "DatagramSocket: closed" — and a dead mirror's entry
+    //     survives for the allocator to collide with, handing a fresh object a
+    //     dead socket's descriptor. Remap companion in `gc.rs`
+    //     (`gc_update_ds_refs`).
 
     //     NIO SelectionKey table: channel/selector/attachment/key_obj ObjectRefs
     //     live only in `sk_table`; remap was already wired (gc.rs

@@ -917,6 +917,9 @@ fn native_iou_write_max_size(_ctx: &mut dyn NativeContext, _args: &[Value]) -> M
 fn native_iou_fd_limit(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     #[cfg(unix)]
     {
+        // SAFETY: `sysconf` takes an integer name and touches no caller memory;
+        // it reports an unsupported/erroring query as -1, which the check below
+        // treats as "no limit known".
         let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
         if limit > 0 {
             return Ok(Some(Value::Int(limit.min(i32::MAX as i64) as i32)));

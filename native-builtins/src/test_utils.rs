@@ -1560,6 +1560,7 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
                         access_flags: m.access_flags,
                         declaring_class_id: m.declaring_class_id,
                         exceptions: m.exceptions.clone(),
+                        signature: m.signature.clone(),
                     })
                     .collect()
             })

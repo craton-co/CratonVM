@@ -1533,7 +1533,7 @@ pub fn gc_scan_lambda_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRe
 /// every cached singleton for the active VM through the GC's pointer map.
 pub fn gc_update_lambda_singleton_refs(
     vm_identity: usize,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;

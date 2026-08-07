@@ -8355,7 +8355,7 @@ pub(crate) fn fjp_state_get_checked(o: ObjectRef) -> Result<(bool, Value), Metho
     }
 }
 
-fn fjp_remap_value_ref(value: &mut Value, pointer_map: &std::collections::HashMap<usize, usize>) {
+fn fjp_remap_value_ref(value: &mut Value, pointer_map: &cratonvm_types::PointerMap) {
     if let Value::Object(Some(obj)) = value {
         let old_addr = obj.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -8394,7 +8394,7 @@ pub fn gc_scan_forkjoin_roots(out: &mut Vec<ObjectRef>) {
 ///
 /// Remaps cached Object results and rekeys task entries when a moving
 /// collection relocates the rooted task object.
-pub fn gc_update_forkjoin_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_forkjoin_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -9271,7 +9271,7 @@ mod fjp_gc_tests {
         gc_scan_forkjoin_roots(&mut roots);
         assert_eq!(roots, vec![task, result]);
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(task.as_ptr() as usize, task_new.as_ptr() as usize);
         map.insert(result.as_ptr() as usize, result_new.as_ptr() as usize);
         gc_update_forkjoin_refs(&map);

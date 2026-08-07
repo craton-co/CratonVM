@@ -3424,6 +3424,9 @@ mod ext_opt_sys {
     /// AF_UNIX socket (the usual case) or the credentials are unavailable.
     pub(super) fn so_peer_cred(id: i32) -> Option<i64> {
         let fd = raw_fd(id)?;
+        // SAFETY: `libc::ucred` is three integer fields, so the all-zero bit
+        // pattern is a valid value; it is overwritten by the `getsockopt` below
+        // and only read when that call reports success.
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: `cred`/`len` are a valid out-pointer pair sized for the

@@ -6901,7 +6901,7 @@ pub fn gc_scan_lambda_callsite_cache_roots(out: &mut Vec<ObjectRef>) {
 /// remapped so a post-GC lookup with the same logical bootstrap args
 /// still hits the cache. The remap rebuilds the table entry-by-entry
 /// because cache key membership is hash-sensitive to the remapped value.
-pub fn gc_update_lambda_callsite_cache_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_lambda_callsite_cache_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

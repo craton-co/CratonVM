@@ -42,7 +42,7 @@ pub struct ExternalRootProvider {
     /// `None` means "class unknown at this call site" and skips the check.
     pub roots_for_owner: fn(usize, Option<u32>) -> Vec<ObjectRef>,
     pub roots_for_matching_owners: fn(&OwnerPredicate<'_>) -> Vec<ObjectRef>,
-    pub remap: fn(&HashMap<usize, usize>),
+    pub remap: fn(&cratonvm_types::PointerMap),
     pub prune: fn(&OwnerPredicate<'_>),
 }
 
@@ -120,7 +120,7 @@ pub fn external_roots_for_matching_owners(owner_matches: &OwnerPredicate<'_>) ->
     roots
 }
 
-pub fn remap_external_roots(pointer_map: &HashMap<usize, usize>) {
+pub fn remap_external_roots(pointer_map: &cratonvm_types::PointerMap) {
     for provider in snapshot() {
         (provider.remap)(pointer_map);
     }
@@ -158,7 +158,7 @@ mod tests {
     fn matching(predicate: &OwnerPredicate<'_>) -> Vec<ObjectRef> {
         predicate(OWNER).then(|| object(ROOT)).into_iter().collect()
     }
-    fn remap(_map: &HashMap<usize, usize>) {
+    fn remap(_map: &cratonvm_types::PointerMap) {
         REMAPS.fetch_add(1, Ordering::SeqCst);
     }
     fn prune(_is_live: &OwnerPredicate<'_>) {}
@@ -184,7 +184,7 @@ mod tests {
         REMAPS.store(0, Ordering::SeqCst);
         let mut roots = Vec::new();
         scan_external_roots(&mut roots);
-        remap_external_roots(&HashMap::new());
+        remap_external_roots(&cratonvm_types::PointerMap::default());
 
         assert_eq!(SCANS.load(Ordering::SeqCst), 1);
         assert_eq!(REMAPS.load(Ordering::SeqCst), 1);

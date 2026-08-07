@@ -3492,7 +3492,7 @@ mod tests {
         let reused_old_address = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
 
         let first = register_handle(&shared, Some(old));
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old.as_ptr() as usize, moved.as_ptr() as usize);
         shared
             .natives

@@ -40,8 +40,7 @@ use crate::concurrent_mark::ConcurrentGcState;
 use crate::gc::GcResult;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, read_prim_element,
-    write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
-    AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE, OBJECT_KIND_OFFSET,
+    write_prim_element, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
 use crate::old_gen::OldGen;
@@ -1594,6 +1593,88 @@ pub struct GenerationalHeap {
 unsafe impl Send for GenerationalHeap {}
 unsafe impl Sync for GenerationalHeap {}
 
+
+// ---------------------------------------------------------------------------
+// Per-cycle copy tally.
+//
+// Phase H used to derive `bytes_promoted` / `objects_promoted` /
+// `bytes_copied_young` / `objects_copied_young` by walking every
+// `pointer_map` entry after the copy phase and dereferencing each destination
+// header to recompute its size. On a workload with ~756 000 survivors per
+// collection that walk is ~756 000 random header reads, and it measured
+// 29 ms of a 424 ms median stop-the-world pause — to recompute a size
+// `forward_object_impl` already had in hand.
+//
+// A thread-local is sound here and not merely convenient: `forward_object_impl`
+// takes `&mut Arena` for both destinations, so the copy phase is
+// single-threaded by construction and the borrow checker enforces it. (The
+// PARALLEL part of a young cycle is the mark closure, which is read-only and
+// never forwards.)
+//
+// Layout: [bytes_promoted, objects_promoted, bytes_copied_young,
+// objects_copied_young].
+// ---------------------------------------------------------------------------
+thread_local! {
+    static COPY_TALLY: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
+}
+
+/// Record one copied object, classified by the arena it actually landed in
+/// (promotion can fall back to to-space when old gen is full, so the
+/// destination is the truth, not `should_promote`).
+#[inline]
+fn copy_tally_add(promoted: bool, bytes: u64) {
+    COPY_TALLY.with(|t| {
+        let mut a = t.get();
+        let i = if promoted { 0 } else { 2 };
+        a[i] += bytes;
+        a[i + 1] += 1;
+        t.set(a);
+    });
+}
+
+/// Bump one of the two `forward_object` arm counters: slot 4 counts
+/// re-encounters (the object was already forwarded, so this call is a pure
+/// lookup), slot 5 counts actual copies. Their ratio is what says whether
+/// `cheney_drain` is a copying cost or a lookup cost.
+#[inline]
+fn copy_tally_arm(reencounter: bool) {
+    // Diagnostic only, and it fires on the re-encounter path as well -- about
+    // 1.5M calls per collection on a Spring workload -- so it is behind the
+    // same flag that prints the breakdown rather than paid for unconditionally.
+    // (`copy_tally_add` next door is NOT gated: it replaced Phase H's
+    // statistics walk, and those counters are committed to `self.stats` every
+    // cycle.)
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| gc_flags().dbg_gcpause) {
+        return;
+    }
+    COPY_TALLY.with(|t| {
+        let mut a = t.get();
+        a[if reencounter { 4 } else { 5 }] += 1;
+        t.set(a);
+    });
+}
+
+/// Read and clear the tally for this cycle.
+fn copy_tally_take() -> [u64; 6] {
+    COPY_TALLY.with(|t| {
+        let a = t.get();
+        t.set([0; 6]);
+        a
+    })
+}
+
+/// `CRATONVM_DBG_FWDWALK=1` — re-enable the post-copy `pointer_map` walk that
+/// used to produce the counters above. It is now only a BUG-Z diagnostic
+/// (every forward must land inside young to-space or old gen), so it is off by
+/// default rather than paid for on every collection.
+fn fwd_walk_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var("CRATONVM_DBG_FWDWALK").is_ok_and(|v| v != "0"))
+}
+
 impl GenerationalHeap {
     /// Bind this heap to its VM's compact-layout domain.
     pub fn set_layout_domain(&self, domain: u32) {
@@ -1907,11 +1988,10 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots_u32,
             );
-            header.gc_flags |= compact_flag;
+            header.add_gc_flags(compact_flag);
             // SAFETY: `ptr` was just allocated from the young arena with
             // `total_size` bytes and remains protected by the arena lock until
             // this header write completes.
@@ -1970,11 +2050,10 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots_u32,
             );
-            header.gc_flags |= compact_flag;
+            header.add_gc_flags(compact_flag);
             // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
             // zeroed, 8-byte-aligned region of `total_size` bytes; writing the object header at its start is in-bounds.
             unsafe {
@@ -2092,7 +2171,7 @@ impl GenerationalHeap {
     ) -> ObjectRef {
         let data_size = array_data_size(length, element_type)
             .unwrap_or_else(|_| { eprintln!("FATAL: array data size overflow in gen_heap alloc_array (length={}, element_type={:?})", length, element_type); std::process::abort(); });
-        let total_size = HEADER_SIZE.checked_add(data_size).unwrap_or_else(|| {
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size).unwrap_or_else(|| {
             eprintln!(
                 "FATAL: array size overflow in gen_heap alloc_array (length={}, element_type={:?})",
                 length, element_type
@@ -2134,7 +2213,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
                 length_u32,
                 length_u32,
             );
@@ -2192,7 +2270,7 @@ impl GenerationalHeap {
         length: usize,
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let length_u32 = u32::try_from(length).ok()?;
 
         // Humongous path: skip young, allocate straight into old gen.
@@ -2208,7 +2286,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
                 length_u32,
                 length_u32,
             );
@@ -2309,11 +2386,10 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots_u32,
             );
-            header.gc_flags |= compact_flag;
+            header.add_gc_flags(compact_flag);
             // SAFETY: the alloc helper hands `init` a freshly bump-allocated, exclusively-owned,
             // zeroed, 8-byte-aligned region of `total_size` bytes; writing the object header at its start is in-bounds.
             unsafe {
@@ -2354,7 +2430,7 @@ impl GenerationalHeap {
         length: usize,
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let length_u32 = u32::try_from(length).ok()?;
 
         // Humongous path: route straight to old gen so a single array
@@ -2376,7 +2452,6 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
                 length_u32,
                 length_u32,
             );
@@ -2469,13 +2544,12 @@ impl GenerationalHeap {
         // checked arithmetic just in case the validated path is ever
         // narrowed in a future refactor.
         let data_size = array_data_size(length_u32 as usize, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
 
         let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             length_u32,
             length_u32,
         );
@@ -2484,7 +2558,7 @@ impl GenerationalHeap {
         // young from-space arena that gets reset every minor cycle.
         // `OldGen::alloc` zeroed the data region; the header overwrite
         // below initializes the rest of the bookkeeping.
-        header.gc_flags |= GC_FLAG_OLD_GEN;
+        header.add_gc_flags(GC_FLAG_OLD_GEN);
 
         let ptr = {
             let mut og = self.old_gen.lock();
@@ -2530,11 +2604,10 @@ impl GenerationalHeap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             array_len,
             u32::try_from(num_fields).ok()?,
         );
-        header.gc_flags |= GC_FLAG_OLD_GEN | compact_flag;
+        header.add_gc_flags(GC_FLAG_OLD_GEN | compact_flag);
         let ptr = {
             let mut og = self.old_gen.lock();
             let ptr = og.alloc(total_size, 8)?;
@@ -2585,11 +2658,10 @@ impl GenerationalHeap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
                 array_len,
                 num_slots,
             );
-            header.gc_flags |= GC_FLAG_OLD_GEN | compact_flag;
+            header.add_gc_flags(GC_FLAG_OLD_GEN | compact_flag);
             // SAFETY: `OldGen::alloc` returned an exclusive, zeroed span and
             // the old-generation lock remains held until the header is valid.
             unsafe {
@@ -2688,7 +2760,7 @@ impl GenerationalHeap {
                         // Raw byte, not `Debug` — see `warn_non_object_kind_in_object_arm`.
                         (
                             fwd_header.class_id.as_u32(),
-                            format!("0x{:02x}", fwd_header.kind as u8),
+                            format!("0x{:02x}", ObjectHeader::kind_tag(fwd_header.mark_word.load(Ordering::Relaxed))),
                         )
                     }
                     None => (
@@ -2756,7 +2828,7 @@ impl GenerationalHeap {
                                 "\n  OLD holder {:p} class_id={} kind=0x{:02x} slot={} card_dirty_now={}",
                                 optr,
                                 oh.class_id.as_u32(),
-                                oh.kind as u8,
+                                ObjectHeader::kind_tag(oh.mark_word.load(Ordering::Relaxed)),
                                 idx,
                                 self.card_table.is_dirty(cidx),
                             );
@@ -2834,12 +2906,12 @@ impl GenerationalHeap {
 
     /// Get the kind (Object or Array) of a heap allocation.
     pub fn kind_of(&self, obj_ref: ObjectRef) -> ObjectKind {
-        self.get_header(obj_ref).kind
+        self.get_header(obj_ref).kind()
     }
 
     /// Get the element type of an array object.
     pub fn element_type_of(&self, obj_ref: ObjectRef) -> ArrayElementType {
-        self.get_header(obj_ref).element_type
+        self.get_header(obj_ref).element_type()
     }
 
     /// Get the identity hash code of a heap object.
@@ -2859,44 +2931,24 @@ impl GenerationalHeap {
     /// stale the moment a moving GC relocates the object. See
     /// `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        let existing = self.get_header(obj_ref).identity_hash_code;
-        if existing != 0 {
-            return existing;
-        }
-        self.mint_identity_hash_code(obj_ref)
-    }
-
-    /// Lazily mint and durably install a non-zero identity hash for an
-    /// object whose header field is still 0. Safe to call concurrently:
-    /// the header field is written via a CAS from 0, so a losing racer's
-    /// mint is discarded and every caller (including the loser) converges
-    /// on the single value that actually ends up stored.
-    fn mint_identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        let minted = match self.next_hash() {
+        let header = self.get_header(obj_ref);
+        // The hash lives in the upper bits of a NEUTRAL mark word, installed
+        // lazily by one CAS. `Err` means the word is no longer NEUTRAL -- the
+        // object inflated (a hashed object cannot thin-lock, so inflation is
+        // the only way out of NEUTRAL that a hashed object can take), and the
+        // hash was displaced into its Monitor at that moment.
+        match header.mark_word_identity_hash(|| match self.next_hash() {
             0 => i32::MAX,
             h => h,
-        };
-        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code`
-        // is a plain `i32` field at a fixed offset within `ObjectHeader` on
-        // every heap backend (see `types/src/heap_types.rs`). This is the
-        // sole writer that mutates this field post-allocation, and it only
-        // ever moves it 0 -> nonzero via CAS, so treating the field as an
-        // `AtomicI32` for this one operation cannot race with the plain
-        // (non-atomic) reads the rest of the codebase performs elsewhere: a
-        // naturally-aligned 4-byte load/store is already atomic at the ISA
-        // level, and no other writer can observe/produce a torn value. Same
-        // pragmatic accommodation this file already makes for `mark_word`
-        // (see the "Round-2 fix (T2-4)" comment on the GC-copy path above).
-        // SAFETY: `obj_ref` points at a live object header; `identity_hash_code` is a naturally-aligned
-        // 4-byte field (full rationale in the block above), so this one CAS cannot tear or race the plain reads elsewhere.
-        unsafe {
-            let field_ptr = std::ptr::addr_of_mut!(
-                (*(obj_ref.as_ptr() as *mut ObjectHeader)).identity_hash_code
-            );
-            let atomic = &*(field_ptr as *const AtomicI32);
-            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => minted,
-                Err(existing) => existing,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => {
+                let mark = header.mark_word.load(Ordering::Relaxed);
+                // Deliberately no mint on this path. Minting for a non-NEUTRAL
+                // object would return a different value on every call, i.e. an
+                // identity hash that changes under a live object -- which a
+                // test calling it once cannot see.
+                crate::collector::displaced_identity_hash(mark)
             }
         }
     }
@@ -3079,9 +3131,9 @@ impl GenerationalHeap {
         // reached through a typed enum match.
         // SAFETY: `raw` was confirmed inside a mapped heap region above (`in_region`), so the single-byte
         // tag reads at the fixed `OBJECT_KIND`/`ARRAY_ELEMENT_TYPE` header offsets are in-bounds.
-        let kind = unsafe { object_kind_from_tag(*raw.add(OBJECT_KIND_OFFSET)) }?;
+        let kind = unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(raw)) }?;
         let _element_type =
-            unsafe { array_element_type_from_tag(*raw.add(ARRAY_ELEMENT_TYPE_OFFSET)) }?;
+            unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(raw)) }?;
 
         // Object/Array are the only
         // valid kinds; anything else means we landed in the middle of a
@@ -3112,7 +3164,7 @@ impl GenerationalHeap {
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24; // 16M slots -> 256 MB obj
         let is_array = kind == ObjectKind::Array;
         let is_compact = !is_array && is_compact_object(header);
-        if is_array && header.gc_flags & GC_FLAG_COMPACT != 0 {
+        if is_array && header.gc_flags() & GC_FLAG_COMPACT != 0 {
             return None;
         }
         if !is_array && !is_compact && header.array_length() != 0 {
@@ -3157,8 +3209,8 @@ impl GenerationalHeap {
         // not random — it is bits of the flipped mark/age/forwarding write
         // landing inside the victim array's real `array_length` field.
         let claimed_extent = if is_array {
-            match array_data_size(header.array_length() as usize, header.element_type) {
-                Ok(data) => HEADER_SIZE.checked_add(data),
+            match array_data_size(header.array_length() as usize, header.element_type()) {
+                Ok(data) => ARRAY_DATA_OFFSET.checked_add(data),
                 Err(_) => None,
             }
         } else {
@@ -3279,8 +3331,8 @@ impl GenerationalHeap {
                 index,
                 num_slots,
                 class_id = ?header.class_id,
-                kind_byte = header.kind as u8,
-                gc_flags = format!("{:x}", header.gc_flags),
+                kind_byte = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                gc_flags = format!("{:x}", header.gc_flags()),
                 "gen_heap::get_field: suspect header (returning null)",
             );
             // Rate-limited warn — do NOT panic. Returning null lets the
@@ -3586,8 +3638,8 @@ impl GenerationalHeap {
                 index,
                 num_slots,
                 class_id = ?header.class_id,
-                kind_byte = header.kind as u8,
-                gc_flags = format!("{:x}", header.gc_flags),
+                kind_byte = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                gc_flags = format!("{:x}", header.gc_flags()),
                 value = ?value,
                 "gen_heap::set_field: suspect header (returning silently)",
             );
@@ -3865,7 +3917,7 @@ impl GenerationalHeap {
     /// Get the length of an array.
     pub fn array_length(&self, obj_ref: ObjectRef) -> usize {
         let header = self.get_header(obj_ref);
-        if header.kind != ObjectKind::Array {
+        if header.kind() != ObjectKind::Array {
             // Defensive hardening: native/bootstrap code can occasionally pass a
             // plain object into array helpers. Returning 0 keeps startup alive,
             // while diagnostics below pinpoint the exact caller and object shape.
@@ -3916,8 +3968,8 @@ impl GenerationalHeap {
                 // arch-2026-07-26/header-shrink.md).
                 let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
                     let class_id_raw = (obj_ptr as *const u32).read_unaligned();
-                    let kind_byte = *obj_ptr.add(cratonvm_types::OBJECT_KIND_OFFSET);
-                    let elem_byte = *obj_ptr.add(cratonvm_types::ARRAY_ELEMENT_TYPE_OFFSET);
+                    let kind_byte = cratonvm_types::kind_tag_at(obj_ptr);
+                    let elem_byte = cratonvm_types::element_type_tag_at(obj_ptr);
                     let stored_len = (obj_ptr.add(cratonvm_types::ARRAY_LENGTH_OFFSET)
                         as *const u32)
                         .read_unaligned();
@@ -3983,7 +4035,7 @@ impl GenerationalHeap {
                     "[GC-ARRAY-LEN-GUARD] suspect array_length={} (>1<<24) class_id={} elem_byte={} obj={:p} (n={})",
                     raw_len,
                     header.class_id.as_u32(),
-                    header.element_type as u8,
+                    header.element_type() as u8,
                     obj_ref.as_ptr(),
                     n,
                 );
@@ -3999,8 +4051,8 @@ impl GenerationalHeap {
     /// String backing arrays — copies the raw 2-byte-per-element data directly.
     pub fn read_char_array_bulk(&self, obj_ref: ObjectRef) -> Vec<u16> {
         let header = self.get_header(obj_ref);
-        debug_assert_eq!(header.kind, ObjectKind::Array);
-        debug_assert_eq!(header.element_type, ArrayElementType::Char);
+        debug_assert_eq!(header.kind(), ObjectKind::Array);
+        debug_assert_eq!(header.element_type(), ArrayElementType::Char);
         let len = header.array_length() as usize;
         let mut out = vec![0u16; len];
         // SAFETY: `obj_ref` is a valid Char array with `len` elements (verified by
@@ -4009,7 +4061,7 @@ impl GenerationalHeap {
         // buffer `out` is freshly allocated with the same length. The regions do
         // not overlap because `out` is on the Rust heap, not in the GC arena.
         unsafe {
-            let src = obj_ref.as_ptr().add(HEADER_SIZE);
+            let src = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 2);
         }
         out
@@ -4024,7 +4076,7 @@ impl GenerationalHeap {
         // `HEADER_SIZE` plus the data region, so advancing by `HEADER_SIZE`
         // yields a pointer within the allocation. Caller is responsible for
         // bounds and element-type correctness.
-        unsafe { obj_ref.as_ptr().add(HEADER_SIZE) }
+        unsafe { obj_ref.as_ptr().add(ARRAY_DATA_OFFSET) }
     }
 
     /// Get an array element at the given index.
@@ -4032,7 +4084,7 @@ impl GenerationalHeap {
     /// Returns `Err` with the index if out of bounds.
     pub fn get_array_element(&self, obj_ref: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.get_header(obj_ref);
-        debug_assert_eq!(header.kind, ObjectKind::Array);
+        debug_assert_eq!(header.kind(), ObjectKind::Array);
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
@@ -4040,8 +4092,8 @@ impl GenerationalHeap {
         // was allocated with sufficient data space for all elements after the header.
         // `read_prim_element` reads the correctly typed element at the given index.
         unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
-            Ok(read_prim_element(base, index, header.element_type))
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
+            Ok(read_prim_element(base, index, header.element_type()))
         }
     }
 
@@ -4053,17 +4105,17 @@ impl GenerationalHeap {
         index: usize,
     ) -> Result<Value, i32> {
         let header = self.get_header(obj_ref);
-        debug_assert_eq!(header.kind, ObjectKind::Array);
+        debug_assert_eq!(header.kind(), ObjectKind::Array);
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         // SAFETY: Bounds check above guarantees `index < array_length`. The array
         // data region is within the allocation.
         let value = unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
-            read_prim_element(base, index, header.element_type)
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
+            read_prim_element(base, index, header.element_type())
         };
-        if header.element_type == ArrayElementType::Reference {
+        if header.element_type() == ArrayElementType::Reference {
             if let Value::Object(Some(obj)) = value {
                 // The stored word is treated as an `ObjectRef`, but a stale or
                 // garbage non-zero element could point anywhere. Validate it
@@ -4127,7 +4179,7 @@ impl GenerationalHeap {
             }
         }
         let header = self.get_header(obj_ref);
-        debug_assert_eq!(header.kind, ObjectKind::Array);
+        debug_assert_eq!(header.kind(), ObjectKind::Array);
         // gcstress residual face-1 diagnostics (CRATONVM_DBG_CELLCORRUPT) —
         // the debug_assert above is a no-op in release: an array-element
         // write through a STALE array reference whose address is now occupied
@@ -4136,7 +4188,7 @@ impl GenerationalHeap {
         // cells). Trap it with the holder identity + backtrace. The bounds
         // check below usually deflects such writes (a plain object has
         // array_length=0), so this logs the attempt either way.
-        if cell_corrupt_diag_enabled() && header.kind != ObjectKind::Array {
+        if cell_corrupt_diag_enabled() && header.kind() != ObjectKind::Array {
             let class_name = crate::gc::resolve_class_info(header.class_id.as_u32())
                 .map(|(n, _)| n)
                 .unwrap_or_else(|| "<unresolved>".to_string());
@@ -4146,7 +4198,7 @@ impl GenerationalHeap {
                  value={value:?}\n{}",
                 obj_ref.as_ptr() as usize,
                 header.class_id.as_u32(),
-                header.kind as u8,
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                 header.num_slots(),
                 header.array_length(),
                 std::backtrace::Backtrace::force_capture(),
@@ -4160,14 +4212,14 @@ impl GenerationalHeap {
         // correct element offset. For reference arrays, autobox wrappers are
         // allocated on this heap and thus valid.
         unsafe {
-            let base = obj_ref.as_ptr().add(HEADER_SIZE);
+            let base = obj_ref.as_ptr().add(ARRAY_DATA_OFFSET);
             // Compact ref arrays only store 8-byte pointers. If a non-Object
             // value is written (e.g. Value::Int from a native collection),
             // auto-box it into a 1-field wrapper object.
-            if header.element_type == ArrayElementType::Reference {
+            if header.element_type() == ArrayElementType::Reference {
                 match value {
                     Value::Object(_) => {
-                        write_prim_element(base, index, header.element_type, value);
+                        write_prim_element(base, index, header.element_type(), value);
                         // Write barrier: old-gen array storing young-gen ref
                         self.write_barrier(obj_ref, value);
                     }
@@ -4175,13 +4227,13 @@ impl GenerationalHeap {
                         let wrapper = self.alloc_object(AUTOBOX_CLASS_ID, 1);
                         self.set_field(wrapper, 0, value);
                         let wrapper_val = Value::Object(Some(wrapper));
-                        write_prim_element(base, index, header.element_type, wrapper_val);
+                        write_prim_element(base, index, header.element_type(), wrapper_val);
                         // Write barrier: track the wrapper reference for gen GC
                         self.write_barrier(obj_ref, Value::Object(Some(wrapper)));
                     }
                 }
             } else {
-                write_prim_element(base, index, header.element_type, value);
+                write_prim_element(base, index, header.element_type(), value);
             }
         }
         Ok(())
@@ -4837,7 +4889,7 @@ impl GenerationalHeap {
                         // `< a < end_a`, so a full `ObjectHeader` lies within the arena;
                         // fields are read defensively before trusting the contents.
                         let h = unsafe { &*(h_addr as *const ObjectHeader) };
-                        if (h.kind as u8) == 0
+                        if ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                             && h.array_length() == 0
                             && (h.num_slots() as usize) > fld
                             && h.num_slots() <= (1 << 20)
@@ -5161,6 +5213,18 @@ impl GenerationalHeap {
             let on = *G.get_or_init(|| gc_flags().dbg_gcpause);
             PauseTimer(on.then(std::time::Instant::now))
         };
+        let mv_phase_on = gc_flags().dbg_gcpause;
+        #[allow(unused_assignments, unused_variables)]
+        let mut mv_last = std::time::Instant::now();
+        macro_rules! mv_phase {
+            ($name:expr) => {
+                if mv_phase_on {
+                    let now = std::time::Instant::now();
+                    moving_phase_marks_push($name, now.duration_since(mv_last).as_millis());
+                    mv_last = now;
+                }
+            };
+        }
         // Fresh cycle: no old-gen reclamation has happened yet. Phase 5 below
         // sets this when the mark-compact major GC runs, and
         // `run_non_moving_young_cycle` does the same for the in-place old
@@ -5528,7 +5592,7 @@ impl GenerationalHeap {
                         bytes_copied: 0,
                         bytes_freed: 0,
                     },
-                    pointer_map: HashMap::new(),
+                    pointer_map: cratonvm_types::PointerMap::default(),
                 },
                 Vec::new(),
             );
@@ -5698,7 +5762,7 @@ impl GenerationalHeap {
                     // theirs against corrupt headers, then bail the whole
                     // best-effort walk rather than trust a header that fails it.
                     let implausible_slots =
-                        h.kind == ObjectKind::Object && h.num_slots() as usize > 4096;
+                        h.kind() == ObjectKind::Object && h.num_slots() as usize > 4096;
                     if size == 0 || ycur + size > yused || implausible_slots {
                         eprintln!(
                             "[small4] young walk truncated at off={} used={} implausible_slots={}",
@@ -5981,7 +6045,7 @@ impl GenerationalHeap {
                         bytes_copied: 0,
                         bytes_freed: 0,
                     },
-                    pointer_map: HashMap::new(),
+                    pointer_map: cratonvm_types::PointerMap::default(),
                 },
                 Vec::new(),
             );
@@ -5998,7 +6062,7 @@ impl GenerationalHeap {
         // forwarded pointer (N hash ops per GC for N live objects).
         // Converted back to std HashMap at the end for public-API
         // compatibility (`GcResult.pointer_map` and `MonitorCleanup`).
-        let mut pointer_map: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         // CRIT-P2 fix: explicit worklist of promoted (old-gen) objects awaiting
         // a scan. Replaces the O(promoted^2) filter loop that previously
         // rebuilt `Vec<unscanned>` from `pointer_map.values()` per iteration.
@@ -6019,18 +6083,8 @@ impl GenerationalHeap {
         // Marks go to a thread-local that `collect_garbage_inner`'s existing
         // pause timer drains on drop, so the breakdown survives every exit path
         // this function has rather than only the one that falls through.
-        let mv_phase_on = gc_flags().dbg_gcpause;
-        let mut mv_last = std::time::Instant::now();
-        macro_rules! mv_phase {
-            ($name:expr) => {
-                if mv_phase_on {
-                    let now = std::time::Instant::now();
-                    moving_phase_marks_push($name, now.duration_since(mv_last).as_millis());
-                    mv_last = now;
-                }
-            };
-        }
 
+        mv_phase!("pre_evacuate");
         // Collect additional roots from dirty cards in old gen
         let mut extra_roots: Vec<(ObjectRef, usize, usize)> = Vec::new();
         // (old_gen_obj, slot_index, _) for each old→young reference slot
@@ -6129,8 +6183,8 @@ impl GenerationalHeap {
             // SAFETY: `old_obj` is a live old-gen ObjectRef collected from dirty card
             // scanning, so its pointer targets a valid ObjectHeader.
             let header = unsafe { &*(old_obj.as_ptr() as *const ObjectHeader) };
-            let is_ref_array = header.kind == ObjectKind::Array
-                && header.element_type == ArrayElementType::Reference;
+            let is_ref_array = header.kind() == ObjectKind::Array
+                && header.element_type() == ArrayElementType::Reference;
 
             if is_ref_array {
                 // SAFETY: `old_obj` is a valid old-gen object and `slot_idx` was collected
@@ -6139,7 +6193,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * ref_element_size())
+                        .add(ARRAY_DATA_OFFSET + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
@@ -6630,19 +6684,38 @@ impl GenerationalHeap {
             (0, 0)
         };
 
+        mv_phase!("finalizer_resurrect");
         // Phase H (RH.1): compute promotion / young-copy stats from the
         // pointer_map BEFORE major_gc appends its own entries below.
         // Every entry at this point is a minor-GC forward: new_addr is
         // either in old_gen (promoted) or in young_to-space (copied).
         // Walking the map once avoids an expensive counter plumbed
         // through `forward_object`'s 12 call sites.
-        let mut bytes_promoted_cycle: u64 = 0;
-        let mut objects_promoted_cycle: u64 = 0;
-        let mut bytes_copied_young_cycle: u64 = 0;
-        let mut objects_copied_young_cycle: u64 = 0;
+        let [
+            bytes_promoted_cycle,
+            objects_promoted_cycle,
+            bytes_copied_young_cycle,
+            objects_copied_young_cycle,
+            fwd_reencounters_cycle,
+            fwd_copies_cycle,
+        ] = copy_tally_take();
+        if mv_phase_on {
+            // How many `forward_object` calls were pure lookups on an already
+            // forwarded object. Each one is a hash probe of a map with as many
+            // entries as there are survivors, so if this dwarfs the copy count
+            // then `cheney_drain` is a lookup cost, not a copying cost.
+            moving_phase_count_push("fwd_reencounters", fwd_reencounters_cycle as u128);
+            moving_phase_count_push("fwd_copies", fwd_copies_cycle as u128);
+        }
+        // The walk below no longer produces those counters — `copy_tally_add`
+        // does, at the copy site. What is left of it is the BUG-Z forward
+        // validation, which is a diagnostic and does not need to run on every
+        // collection: it cost 29 ms of a 424 ms median pause, ~756 000 random
+        // destination-header dereferences deep inside stop-the-world.
         let mut bad_forward_count: u64 = 0;
         let mut bad_forward_sample: (usize, usize) = (0, 0);
-        for (&old_addr, &new_addr) in pointer_map.iter() {
+        let fwd_walk = if fwd_walk_enabled() { usize::MAX } else { 0 };
+        for (&old_addr, &new_addr) in pointer_map.iter().take(fwd_walk) {
             let new_ptr = new_addr as *const u8;
             let in_old = old_gen.contains(new_ptr);
             let in_young = young_to.contains(new_ptr);
@@ -6664,20 +6737,6 @@ impl GenerationalHeap {
                 }
                 continue;
             }
-            // SAFETY: `new_addr` is confirmed inside young_to or old_gen; both
-            // allocations begin with a valid ObjectHeader.
-            let header = unsafe { &*(new_addr as *const ObjectHeader) };
-            // `gen_object_total_size` is the sum of HEADER_SIZE and the
-            // variable-length object body, computed from the header
-            // exactly as the copy path does.
-            let sz = gen_object_total_size(header) as u64;
-            if in_old {
-                bytes_promoted_cycle += sz;
-                objects_promoted_cycle += 1;
-            } else {
-                bytes_copied_young_cycle += sz;
-                objects_copied_young_cycle += 1;
-            }
         }
         if bad_forward_count > 0 {
             // BUG-Z: surface the corruption once per cycle (not per entry).
@@ -6688,6 +6747,7 @@ impl GenerationalHeap {
             );
         }
 
+        mv_phase!("promotion_stats");
         // Phase 3: Clear card table and reset young from-space
         card_table.clear_all();
         // Re-mark cards for promoted objects that still reference young gen.
@@ -6816,13 +6876,19 @@ impl GenerationalHeap {
             young_from.reset();
         }
 
-        // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
-        // expected by `MonitorCleanup::remap_after_gc` (defined in
-        // `collector.rs`) and `GcResult.pointer_map` (the public-API field
-        // in `gc.rs`). The conversion is a single O(N) walk — cheap
-        // compared to N SipHash operations across the Cheney scan.
-        let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
+        // CRIT-P2 (2026-08-07): the conversion this used to do is gone.
+        // `GcResult.pointer_map` and `MonitorCleanup::remap_after_gc` now name
+        // `cratonvm_types::PointerMap`, i.e. the same `FxHashMap` the Cheney
+        // scan builds, so the map is moved rather than rehashed. The old
+        // comment called the rebuild "a single O(N) walk — cheap compared to N
+        // SipHash operations across the Cheney scan"; it was N SipHash
+        // operations, just moved to the end of the cycle, and it measured
+        // 43 ms median / 98 ms max of a 424 ms pause on the OAuth2 6-lane
+        // repro.
+        mv_phase!("cardclear+young_reset");
+        let mut pointer_map = pointer_map;
 
+        mv_phase!("pointer_map_rebuild");
         // Phase 4: Swap young spaces (monitor remap deferred until after a
         // possible major GC so we can pass the composed pointer_map).
         std::mem::swap(&mut *young_from, &mut *young_to);
@@ -6832,6 +6898,7 @@ impl GenerationalHeap {
         // reliable within the next non-moving epoch, where A2's desync occurs).
         crate::a2dbg::clear();
 
+        mv_phase!("young_swap");
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact).
         //
         // `take_major_gc_request` is ALWAYS evaluated (not short-circuited by
@@ -6983,12 +7050,14 @@ impl GenerationalHeap {
             }
         }
 
+        mv_phase!("major_check");
         // Phase 4b (moved): remap monitors with the FINAL composed pointer_map.
         // Doing this after a possible major GC ensures monitor keys for
         // promoted-then-compacted objects are remapped to their final
         // post-compaction addresses, not the intermediate post-promotion ones.
         monitors.remap_after_gc(&pointer_map);
 
+        mv_phase!("monitor_remap");
         let bytes_freed = bytes_before.saturating_sub(bytes_copied);
 
         // Phase 6: Adaptive heap expansion.
@@ -7082,6 +7151,7 @@ impl GenerationalHeap {
         // `[base, end)` before any mutator resumes. Guards still held.
         self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
 
+        mv_phase!("heap_expand");
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC
         // statistics after the call returns.
@@ -7637,8 +7707,8 @@ impl GenerationalHeap {
             // num_slots = 2^26 > 1<<24 and would be skipped (then swept as
             // garbage, despite being a live root). Gate num_slots on
             // non-arrays; bound array_length at the JVM ceiling.
-            let kind_byte = header.kind as u8;
-            let is_array = header.kind == ObjectKind::Array;
+            let kind_byte = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed));
+            let is_array = header.kind() == ObjectKind::Array;
             if kind_byte > 1
                 || (!is_array && header.num_slots() > (1 << 24))
                 || (is_array && header.array_length() > i32::MAX as u32)
@@ -7866,14 +7936,14 @@ impl GenerationalHeap {
             // SAFETY: `old_obj` is a live old-gen object from dirty-card
             // scanning; its header is valid.
             let header = unsafe { &*(old_obj.as_ptr() as *const ObjectHeader) };
-            if header.kind == ObjectKind::Array
-                && header.element_type == ArrayElementType::Reference
+            if header.kind() == ObjectKind::Array
+                && header.element_type() == ArrayElementType::Reference
             {
                 // SAFETY: `slot_idx` is within array bounds (from card scan).
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * ref_element_size())
+                        .add(ARRAY_DATA_OFFSET + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
@@ -8093,7 +8163,7 @@ impl GenerationalHeap {
         // a non-pointer slot. Objects reachable only via precise heap edges (the
         // tree's interior nodes) are movable and get tenured, draining young
         // while the few pinned objects stay put.
-        let mut evac_map: HashMap<usize, usize> = HashMap::new();
+        let mut evac_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         // Fix A: selective promotion is the proven-correct drain for the
         // JIT-active non-moving sweep (bt18 = 68332206 = HotSpot), so it is now
         // DEFAULT-ON. Opt out with `CRATONVM_NO_SELECTIVE_PROMOTE` to get the pure
@@ -8342,7 +8412,7 @@ impl GenerationalHeap {
                 fn unwind_evac(
                     fwd_installs: &mut Vec<(usize, *mut u8)>,
                     evacuated: &mut Vec<*mut u8>,
-                    evac_map: &mut HashMap<usize, usize>,
+                    evac_map: &mut cratonvm_types::PointerMap,
                     age_bumps: &mut Vec<usize>,
                     fwd_wm: usize,
                     evac_wm: usize,
@@ -8482,8 +8552,8 @@ impl GenerationalHeap {
                     // young then wedged the heap into the old-gen-spill →
                     // abort path that the native-alloc boundary GC exists to
                     // relieve).
-                    let aged = defrag_escalate || header.gc_age + 1 >= PROMOTION_AGE;
-                    let header_marked = header.gc_flags & GC_FLAG_MARKED != 0;
+                    let aged = defrag_escalate || header.gc_age() + 1 >= PROMOTION_AGE;
+                    let header_marked = header.gc_flags() & GC_FLAG_MARKED != 0;
                     let marked = header_marked || side_bits.contains(addr);
                     // Census (see `SP_CENSUS`): classify every marked survivor
                     // the walk reaches, so a `promoted=0` run says WHICH of the
@@ -8546,8 +8616,8 @@ impl GenerationalHeap {
                                 }
                                 // SAFETY: dst is a freshly written object header.
                                 let dhdr = unsafe { &mut *(dst as *mut ObjectHeader) };
-                                dhdr.gc_flags |= GC_FLAG_OLD_GEN;
-                                dhdr.gc_flags &= !GC_FLAG_MARKED;
+                                dhdr.add_gc_flags(GC_FLAG_OLD_GEN);
+                                dhdr.clear_gc_flags(GC_FLAG_MARKED);
                                 // Forwarding-pointer install into the young
                                 // source is deferred until the walk validates.
                                 fwd_installs.push((addr, dst));
@@ -8598,7 +8668,7 @@ impl GenerationalHeap {
                 // the write the walk deferred.
                 unsafe {
                     let h = &mut *(src_addr as *mut ObjectHeader);
-                    h.gc_age = h.gc_age.saturating_add(1);
+                    h.set_gc_age(h.gc_age().saturating_add(1));
                 }
             }
 
@@ -8797,7 +8867,7 @@ impl GenerationalHeap {
                             }
                             side_iter_3a.peek().is_some_and(|&&a| a == abs)
                         };
-                        if (header.gc_flags & GC_FLAG_MARKED != 0 || side_hit)
+                        if (header.gc_flags() & GC_FLAG_MARKED != 0 || side_hit)
                             && !header.is_forwarded()
                         {
                             fixup_object_fields(obj, header, &fwd_of, &is_y, None);
@@ -8889,7 +8959,7 @@ impl GenerationalHeap {
                         if ts < HEADER_SIZE || c + ts > used {
                             break;
                         }
-                        if h.gc_flags & GC_FLAG_MARKED != 0 && !h.is_forwarded() {
+                        if h.gc_flags() & GC_FLAG_MARKED != 0 && !h.is_forwarded() {
                             missed_young += forwarded_ref_count(o, h, &is_y);
                             for_each_ref(o, h, &mut bump);
                         }
@@ -8960,7 +9030,7 @@ impl GenerationalHeap {
                 // SAFETY: `is_young` confirmed an 8-aligned addr inside live
                 // from-space; reading its header is valid.
                 let h = unsafe { &*(a as *const ObjectHeader) };
-                h.gc_flags & GC_FLAG_MARKED == 0
+                h.gc_flags() & GC_FLAG_MARKED == 0
             };
 
             let root_set: HashSet<usize> = roots.iter().map(|r| r.as_ptr() as usize).collect();
@@ -8997,7 +9067,7 @@ impl GenerationalHeap {
                              mark filter rejected a live root?",
                             addr,
                             h.class_id.as_u32(),
-                            h.kind as u8,
+                            ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)),
                             h.num_slots(),
                             h.array_length(),
                         );
@@ -9067,7 +9137,7 @@ impl GenerationalHeap {
                     // Family-A: side-marked objects are live survivors even
                     // though their header GC_FLAG_MARKED bit is never written
                     // (see `is_unmarked_young` above).
-                    if h.gc_flags & GC_FLAG_MARKED != 0 || side_bits.contains(optr as usize) {
+                    if h.gc_flags() & GC_FLAG_MARKED != 0 || side_bits.contains(optr as usize) {
                         marked_total += 1;
                         let cid = h.class_id.as_u32();
                         let oaddr = optr as usize;
@@ -9087,7 +9157,7 @@ impl GenerationalHeap {
                                     ta,
                                     th.class_id.as_u32(),
                                     th.num_slots(),
-                                    th.kind as u8,
+                                    ObjectHeader::kind_tag(th.mark_word.load(Ordering::Relaxed)),
                                     root_set.contains(&ta),
                                 );
                             }
@@ -9301,8 +9371,8 @@ impl GenerationalHeap {
                         // verified inside the live from-space region.
                         let h =
                             unsafe { &mut *((from_base + off) as *mut u8 as *mut ObjectHeader) };
-                        h.gc_flags &= !GC_FLAG_MARKED;
-                        h.gc_age = h.gc_age.saturating_add(1);
+                        h.clear_gc_flags(GC_FLAG_MARKED);
+                        h.set_gc_age(h.gc_age().saturating_add(1));
                     }
                     objects_live += chunk.live;
                     for addr in chunk.watched {
@@ -9475,7 +9545,7 @@ impl GenerationalHeap {
                 // corrupt-header detection into a hard crash (observed: JIT
                 // miscompile of `JUnitCore.main` under real-JCA). Same for the
                 // re-sync probe below.
-                let raw_kind = header.kind as u8;
+                let raw_kind = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed));
                 if SWEEP_CORRUPTION_HITS.fetch_add(1, Ordering::Relaxed) == 0 {
                     eprintln!(
                         "[quiesce] FIRST corruption: quiescence depth={} enter_count={} leave_count={}",
@@ -9552,8 +9622,8 @@ impl GenerationalHeap {
                         eprintln!(
                             "[A2] PRIOR obj @{} size={} class_id={} kind={:?} num_slots={} array_len={} ELEM_TYPE={:?} elem_bytes={} (cursor={} = {}+{})",
                             loff, lsz, lcid, lkind, lns, lal,
-                            lhdr.element_type,
-                            crate::heap::element_byte_size(lhdr.element_type),
+                            lhdr.element_type(),
+                            crate::heap::element_byte_size(lhdr.element_type()),
                             cursor, loff, lsz,
                         );
                     }
@@ -9580,7 +9650,7 @@ impl GenerationalHeap {
                             format!(
                                 "young referent class_id={} kind={} num_slots={}",
                                 rh.class_id.as_u32(),
-                                rh.kind as u8,
+                                ObjectHeader::kind_tag(rh.mark_word.load(Ordering::Relaxed)),
                                 rh.num_slots()
                             )
                         } else if payload >> 40 == (from_base as u64) >> 40 {
@@ -9706,7 +9776,7 @@ impl GenerationalHeap {
                     if gc_flags().dbg_a2 && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30 {
                         eprintln!(
                             "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind=0x{:02x} class_id={}) oversteps free hole at {} — retaining + resyncing",
-                            cursor, total_size, header.kind as u8, header.class_id.as_u32(), foff,
+                            cursor, total_size, ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)), header.class_id.as_u32(), foff,
                         );
                     }
                     A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
@@ -9726,12 +9796,12 @@ impl GenerationalHeap {
                     cursor,
                     total_size,
                     header.class_id.as_u32(),
-                    header.kind,
+                    header.kind(),
                     header.num_slots(),
                     header.array_length(),
                 ));
                 // SAFETY: obj_ptr is the mapped header start; reading 8 bytes is in bounds.
-                walked_ext.push_back((header.element_type as u8, unsafe {
+                walked_ext.push_back((header.element_type() as u8, unsafe {
                     *(obj_ptr as *const u64)
                 }));
             }
@@ -9817,7 +9887,7 @@ impl GenerationalHeap {
                                     cursor,
                                     total_size,
                                     header.class_id.as_u32(),
-                                    header.kind as u8,
+                                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                                     1,
                                 ));
                             }
@@ -9826,7 +9896,7 @@ impl GenerationalHeap {
                                 cursor,
                                 total_size,
                                 header.class_id.as_u32(),
-                                header.kind as u8,
+                                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                                 1,
                             ));
                         }
@@ -9835,7 +9905,7 @@ impl GenerationalHeap {
                             cursor,
                             total_size,
                             header.class_id.as_u32(),
-                            header.kind as u8,
+                            ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                             1,
                         ));
                     }
@@ -9869,13 +9939,13 @@ impl GenerationalHeap {
                     }
                     evac_map.insert(addr, addr);
                 }
-            } else if header.gc_flags & GC_FLAG_MARKED != 0 {
+            } else if header.gc_flags() & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place, and age it so the
                 // next sweep can tenure it once it reaches PROMOTION_AGE
                 // (selective promotion). Saturating so a long-lived pinned
                 // object never wraps its age.
-                header.gc_flags &= !GC_FLAG_MARKED;
-                header.gc_age = header.gc_age.saturating_add(1);
+                header.clear_gc_flags(GC_FLAG_MARKED);
+                header.set_gc_age(header.gc_age().saturating_add(1));
                 objects_live += 1;
                 if gc_flags().dbg_sweep_liveness {
                     young_survivors.push(obj_ptr as usize);
@@ -9919,7 +9989,7 @@ impl GenerationalHeap {
                                 cursor,
                                 total_size,
                                 header.class_id.as_u32(),
-                                header.kind as u8,
+                                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                                 1,
                             ));
                         }
@@ -9928,7 +9998,7 @@ impl GenerationalHeap {
                             cursor,
                             total_size,
                             header.class_id.as_u32(),
-                            header.kind as u8,
+                            ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                             1,
                         ));
                     }
@@ -9937,7 +10007,7 @@ impl GenerationalHeap {
                         cursor,
                         total_size,
                         header.class_id.as_u32(),
-                        header.kind as u8,
+                        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                         1,
                     ));
                 }
@@ -10164,7 +10234,7 @@ impl GenerationalHeap {
                     // candidate `in_young` already bounds-checked).
                     // SAFETY: as above.
                     let bh = unsafe { &*(base as *const ObjectHeader) };
-                    let hdr_marked = bh.gc_flags & GC_FLAG_MARKED != 0;
+                    let hdr_marked = bh.gc_flags() & GC_FLAG_MARKED != 0;
                     let hdr_forwarded = bh.is_forwarded();
                     let hdr_fwd = bh.forwarding_address() as usize;
                     let hdr_cid = bh.class_id.as_u32();
@@ -10475,8 +10545,8 @@ impl GenerationalHeap {
         // millions of entries even though nearly all of them are adjacent.
         // Keep `dead_regions` intact for the per-object diagnostics below, but
         // zero and publish only maximal contiguous spans.
-        let mut reclaimed_regions: Vec<(usize, usize)> = Vec::new();
-        reclaimed_regions.reserve(dead_regions.len().min(1024));
+        let mut reclaimed_regions: Vec<(usize, usize)> =
+            Vec::with_capacity(dead_regions.len().min(1024));
         for &(off, sz, _, _, _) in &dead_regions {
             if let Some(last) = reclaimed_regions.last_mut() {
                 let last_end = last.0 + last.1;
@@ -10823,8 +10893,8 @@ impl GenerationalHeap {
     fn sweep_old_gen_non_moving(
         &self,
         roots: &[ObjectRef],
-        promotions: &HashMap<usize, usize>,
-    ) -> (usize, HashMap<usize, usize>) {
+        promotions: &cratonvm_types::PointerMap,
+    ) -> (usize, cratonvm_types::PointerMap) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
@@ -10936,7 +11006,7 @@ impl GenerationalHeap {
         young_from: &Arena,
         old_gen: &mut OldGen,
         young_skips: &[(usize, usize)],
-    ) -> HashMap<usize, usize> {
+    ) -> cratonvm_types::PointerMap {
         // See `oldgen_compact_enabled`: compaction is disabled by default as
         // of 2026-08-03 pending root-cause attribution of the corruption it
         // was found to cause (fixed-suite-bugs/hibernate/
@@ -10964,7 +11034,7 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         compact: bool,
         young_skips: &[(usize, usize)],
-    ) -> HashMap<usize, usize> {
+    ) -> cratonvm_types::PointerMap {
         // ---- Mark phase ---- BFS from roots + young-gen cross-references ----
 
         let mut worklist: Vec<*mut u8> = Vec::new();
@@ -11171,8 +11241,8 @@ impl GenerationalHeap {
                     // SAFETY: `base` is an object base `walk_objects` yielded,
                     // so its header is valid and mutable.
                     let header = unsafe { &mut *(base as *mut ObjectHeader) };
-                    if header.gc_flags & GC_FLAG_MARKED == 0 {
-                        header.gc_flags |= GC_FLAG_MARKED;
+                    if header.gc_flags() & GC_FLAG_MARKED == 0 {
+                        header.add_gc_flags(GC_FLAG_MARKED);
                         worklist.push(base as *mut u8);
                     }
                 }
@@ -11186,8 +11256,8 @@ impl GenerationalHeap {
                 // rescue path `walk_objects` yielded `ptr` as an object base,
                 // which implies all three.
                 let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-                if header.gc_flags & GC_FLAG_MARKED == 0 {
-                    header.gc_flags |= GC_FLAG_MARKED;
+                if header.gc_flags() & GC_FLAG_MARKED == 0 {
+                    header.add_gc_flags(GC_FLAG_MARKED);
                     worklist.push(ptr);
                 }
             }
@@ -11336,7 +11406,7 @@ impl GenerationalHeap {
             // from "the address is inside old gen". Emit an identity entry for
             // each watched survivor, mirroring what `OldGen::compact` already
             // does for watched objects that happen not to move.
-            let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
+            let mut watched_survivors: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
             // GCAUD-8: the grid derived before the mark. Nothing since then has
             // allocated or freed in old gen, so re-walking would return the
             // same slice; the mark oracle above and the free loop below now
@@ -11379,7 +11449,7 @@ impl GenerationalHeap {
                 for (obj_ptr, _size) in &objects {
                     // SAFETY: `walk_objects` yields valid old-gen object starts.
                     let h = unsafe { &*(*obj_ptr as *const ObjectHeader) };
-                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                    if h.gc_flags() & GC_FLAG_MARKED == 0 {
                         doomed.insert(*obj_ptr as usize);
                     }
                 }
@@ -11391,7 +11461,7 @@ impl GenerationalHeap {
                 for (obj_ptr, _size) in &objects {
                     // SAFETY: as above.
                     let h = unsafe { &*(*obj_ptr as *const ObjectHeader) };
-                    if h.gc_flags & GC_FLAG_MARKED == 0 {
+                    if h.gc_flags() & GC_FLAG_MARKED == 0 {
                         continue; // itself doomed; its refs keep nothing alive
                     }
                     // SAFETY: a marked old-gen object has a valid header and an
@@ -11538,8 +11608,8 @@ impl GenerationalHeap {
                 // object was unreachable from the complete precise +
                 // conservative root set and can be returned to the free list.
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
-                if header.gc_flags & GC_FLAG_MARKED != 0 {
-                    header.gc_flags &= !GC_FLAG_MARKED;
+                if header.gc_flags() & GC_FLAG_MARKED != 0 {
+                    header.clear_gc_flags(GC_FLAG_MARKED);
                     if watched
                         .as_ref()
                         .is_some_and(|w| w.contains(&(obj_ptr as usize)))
@@ -11554,7 +11624,7 @@ impl GenerationalHeap {
                     // an argument. Clear the mark bit like the survivor arm so
                     // the next cycle starts from a clean slate.
                     let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
-                    header.gc_flags &= !GC_FLAG_MARKED;
+                    header.clear_gc_flags(GC_FLAG_MARKED);
                 } else {
                     // A2 forensic breadcrumb (CRATONVM_DBG_A2): preserve the
                     // victim's pre-free identity so a later zero-header /
@@ -11624,7 +11694,7 @@ impl GenerationalHeap {
                         obj_ptr as usize,
                         total_size,
                         header.class_id.as_u32(),
-                        header.kind as u8,
+                        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                         OLD_FREED_SITE_INPLACE_SWEEP,
                         drop_flags_for(obj_ptr as usize),
                     );
@@ -11674,7 +11744,7 @@ impl GenerationalHeap {
             for &(obj_ptr, _size) in &walked_objects {
                 // SAFETY: `walk_objects` yielded this as a valid object start.
                 let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
-                if h.gc_flags & GC_FLAG_MARKED != 0 {
+                if h.gc_flags() & GC_FLAG_MARKED != 0 {
                     continue;
                 }
                 let f = drop_flags_for(obj_ptr as usize);
@@ -11872,8 +11942,8 @@ impl GenerationalHeap {
                         // SAFETY: `candidate` is a verified old-gen object
                         // BASE; its header is valid and mutable for marking.
                         let ref_header = unsafe { &mut *(candidate as *mut ObjectHeader) };
-                        if ref_header.gc_flags & GC_FLAG_MARKED == 0 {
-                            ref_header.gc_flags |= GC_FLAG_MARKED;
+                        if ref_header.gc_flags() & GC_FLAG_MARKED == 0 {
+                            ref_header.add_gc_flags(GC_FLAG_MARKED);
                             worklist.push(candidate as *mut u8);
                         }
                     }
@@ -11943,8 +12013,8 @@ impl GenerationalHeap {
         // SAFETY: every push site range-checked `obj_ptr` against old gen, so
         // offsets 4/5 are mapped; reading a raw `u8` has no validity
         // requirement beyond in-bounds-and-readable.
-        let kind_tag = unsafe { *obj_ptr.add(OBJECT_KIND_OFFSET) };
-        let elem_tag = unsafe { *obj_ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        let kind_tag = unsafe { cratonvm_types::kind_tag_at(obj_ptr) };
+        let elem_tag = unsafe { cratonvm_types::element_type_tag_at(obj_ptr) };
         if object_kind_from_tag(kind_tag).is_none() || array_element_type_from_tag(elem_tag).is_none()
         {
             OLDMARK_BAD_KIND_HITS.fetch_add(1, Ordering::Relaxed);
@@ -11978,7 +12048,7 @@ impl GenerationalHeap {
                      (kind={}, array_len={}, num_slots={}) — corrupt header, not scanned",
                     obj_ptr,
                     total,
-                    header.kind as u8,
+                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                     header.array_length(),
                     header.num_slots(),
                 );
@@ -12005,7 +12075,7 @@ impl GenerationalHeap {
     /// pointed to old-gen objects which have been relocated.
     fn fixup_young_old_refs(
         young_from: &Arena,
-        compact_map: &HashMap<usize, usize>,
+        compact_map: &cratonvm_types::PointerMap,
         young_skips: &[(usize, usize)],
     ) {
         // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
@@ -12570,7 +12640,7 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
         objects_copied: &mut usize,
-        pointer_map: &mut FxHashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         promoted_worklist: &mut Vec<*mut u8>,
         force_promote_all: bool,
     ) -> *mut u8 {
@@ -12606,7 +12676,7 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
         objects_copied: &mut usize,
-        pointer_map: &mut FxHashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         promoted_worklist: &mut Vec<*mut u8>,
         force_promote_all: bool,
     ) -> *mut u8 {
@@ -12639,8 +12709,8 @@ impl GenerationalHeap {
         // `young_object_starts.contains` above, so the two single-byte tag
         // reads at the fixed header offsets are in-bounds; reading a raw `u8`
         // has no validity requirement beyond in-bounds-and-readable.
-        let kind_tag = unsafe { *old_ptr.add(OBJECT_KIND_OFFSET) };
-        let elem_tag = unsafe { *old_ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        let kind_tag = unsafe { cratonvm_types::kind_tag_at(old_ptr) };
+        let elem_tag = unsafe { cratonvm_types::element_type_tag_at(old_ptr) };
         if object_kind_from_tag(kind_tag).is_none() || array_element_type_from_tag(elem_tag).is_none()
         {
             tracing::debug!(
@@ -12677,15 +12747,14 @@ impl GenerationalHeap {
             let h = old_ptr as *const ObjectHeader;
             let mut owned = ObjectHeader::new(
                 std::ptr::addr_of!((*h).class_id).read(),
-                std::ptr::addr_of!((*h).kind).read(),
-                std::ptr::addr_of!((*h).element_type).read(),
-                std::ptr::addr_of!((*h).identity_hash_code).read(),
+                (*h).kind(),
+                (*h).element_type(),
                 0,
                 0,
             );
             owned.shape = std::ptr::addr_of!((*h).shape).read();
-            owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
-            owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
+            owned.set_gc_age((*h).gc_age());
+            owned.set_gc_flags((*h).gc_flags());
             // `mark_word` is an `AtomicU64`: read it through an atomic load so
             // the access is well-defined under the memory model.
             owned.mark_word.store(
@@ -12716,8 +12785,8 @@ impl GenerationalHeap {
         // for non-arrays (where it really is a field count). For arrays,
         // gate on `array_length` against the JVM's i32::MAX ceiling — the
         // same cap as `MAX_REASONABLE_ARRAY_LEN` in `array_length()`.
-        let kind_byte = header.kind as u8;
-        let is_array = header.kind == ObjectKind::Array;
+        let kind_byte = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed));
+        let is_array = header.kind() == ObjectKind::Array;
         let array_length_too_large = is_array && header.array_length() > i32::MAX as u32;
         let num_slots_too_large = !is_array && header.num_slots() > (1 << 24);
         if kind_byte > 1 || num_slots_too_large || array_length_too_large {
@@ -12728,7 +12797,7 @@ impl GenerationalHeap {
                 num_slots = header.num_slots(),
                 array_length = header.array_length(),
                 class_id = ?header.class_id,
-                gc_flags = format!("{:x}", header.gc_flags),
+                gc_flags = format!("{:x}", header.gc_flags()),
                 backtrace = ?std::backtrace::Backtrace::capture(),
                 "gen_heap::forward_object: suspect header",
             );
@@ -12765,8 +12834,8 @@ impl GenerationalHeap {
                     fwd = ?fwd,
                     old_ptr = ?old_ptr,
                     class_id = ?header.class_id,
-                    gc_flags = format!("{:x}", header.gc_flags),
-                    gc_age = header.gc_age,
+                    gc_flags = format!("{:x}", header.gc_flags()),
+                    gc_age = header.gc_age(),
                     backtrace = ?std::backtrace::Backtrace::capture(),
                     "gen_heap::forward_object: bad forwarding_ptr",
                 );
@@ -12775,6 +12844,7 @@ impl GenerationalHeap {
             // Ensure pointer_map has this entry so update_all_roots can update
             // all references to this old address, even if this is a second
             // encounter of the same object (e.g., root + dirty card + Cheney scan).
+            copy_tally_arm(true);
             pointer_map.entry(old_ptr as usize).or_insert(fwd as usize);
             return fwd;
         }
@@ -12802,7 +12872,7 @@ impl GenerationalHeap {
                  kind={:?}, num_slots={}, array_len={})",
                 old_ptr,
                 total_size,
-                header.kind,
+                header.kind(),
                 header.num_slots(),
                 header.array_length(),
             );
@@ -12835,7 +12905,7 @@ impl GenerationalHeap {
                              (kind_byte={} num_slots={} array_len={} total_size={}) — {}",
                             cid,
                             old_ptr as usize,
-                            header.kind as u8,
+                            ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                             header.num_slots(),
                             header.array_length(),
                             total_size,
@@ -12860,7 +12930,7 @@ impl GenerationalHeap {
         //
         // E.g., with PROMOTION_AGE=3: an object at age 2, surviving this GC,
         // would become age 3 → promote instead.
-        let should_promote = force_promote_all || header.gc_age + 1 >= PROMOTION_AGE;
+        let should_promote = force_promote_all || header.gc_age() + 1 >= PROMOTION_AGE;
 
         let new_ptr = if should_promote {
             // Promote to old gen
@@ -12972,6 +13042,12 @@ impl GenerationalHeap {
                 );
             }
         }
+        // Phase H statistics, at the one place that already knows both the
+        // size and the destination arena. Classify by where the object
+        // ACTUALLY landed: the promotion branch falls back to to-space when
+        // old gen is full, so `should_promote` is not the answer.
+        copy_tally_add(old_gen.contains(new_ptr), total_size as u64);
+        copy_tally_arm(false);
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -13040,10 +13116,10 @@ impl GenerationalHeap {
         let landed_in_old_gen = should_promote && old_gen.contains(new_ptr);
         if landed_in_old_gen {
             // Mark as old gen
-            new_header.gc_flags |= GC_FLAG_OLD_GEN;
+            new_header.add_gc_flags(GC_FLAG_OLD_GEN);
         } else {
             // Increment age for young gen survivors
-            new_header.gc_age = new_header.gc_age.saturating_add(1);
+            new_header.set_gc_age(new_header.gc_age().saturating_add(1));
         }
 
         // Install forwarding pointer in the old header.
@@ -13065,11 +13141,13 @@ impl GenerationalHeap {
                     eprintln!(
                         "[desctrace-fwd] {} ihash={} old=0x{:x} new=0x{:x} promoted={} age={} jit_active={} moving_young={}",
                         cname,
-                        header.identity_hash_code,
+                        ObjectHeader::neutral_hash(
+                            header.mark_word.load(Ordering::Relaxed),
+                        ),
                         old_ptr as usize,
                         new_ptr as usize,
                         landed_in_old_gen,
-                        header.gc_age,
+                        header.gc_age(),
                         crate::gc_quiescence::is_active(),
                         crate::gc_quiescence::moving_young_enabled(),
                     );
@@ -13257,7 +13335,7 @@ impl GenerationalHeap {
                      (class_id={} kind=0x{:02x} num_slots={} array_length={} \
                      gen_size={} walker_size={}) — skipping ref-slot scan",
                     header.class_id.as_u32(),
-                    header.kind as u8,
+                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                     header.num_slots(),
                     header.array_length(),
                     safe_size,
@@ -13271,14 +13349,14 @@ impl GenerationalHeap {
 
             // Scan ref slots: ref arrays use compact 8-byte pointers,
             // object fields use 16-byte Value.
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
+            if header.kind() == ObjectKind::Array {
+                if header.element_type() == ArrayElementType::Reference {
                     // Cap element count at what the array's data region holds.
                     let max_elems = body_bytes / ref_element_size();
                     let elems = (header.array_length() as usize).min(max_elems);
                     for i in 0..elems {
                         // SAFETY: `i` < capped element count; offset within array data region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                        let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                         let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
@@ -13433,7 +13511,7 @@ impl GenerationalHeap {
                 // scan if the kind byte is the sentinel value (treating
                 // it as a real object would mis-parse the rest of the
                 // stripe).
-                if header.kind == ObjectKind::HumongousFiller {
+                if header.kind() == ObjectKind::HumongousFiller {
                     break;
                 }
                 // Bug-D fix: stride over a GAP-filler sentinel (a sub-`HEADER_SIZE`
@@ -13578,10 +13656,10 @@ impl GenerationalHeap {
              [CELLCORRUPT]   window cell-1..cell+2: {:016x},{:016x} | {:016x},{:016x} | \
              {:016x},{:016x} | {:016x},{:016x}\n{}",
             header.class_id.as_u32(),
-            header.kind as u8,
+            ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
             header.num_slots(),
             header.array_length(),
-            header.gc_flags,
+            header.gc_flags(),
             raw[0],
             raw[1],
             win[0],
@@ -13639,10 +13717,10 @@ impl GenerationalHeap {
                 "[CELLCORRUPT]   target-header: class_id={} class={tname} kind=0x{:02x} \
                  num_slots={} array_len={} gc_flags=0x{:x}",
                 th.class_id.as_u32(),
-                th.kind as u8,
+                ObjectHeader::kind_tag(th.mark_word.load(Ordering::Relaxed)),
                 th.num_slots(),
                 th.array_length(),
-                th.gc_flags,
+                th.gc_flags(),
             );
         }
     }
@@ -13662,7 +13740,7 @@ fn cell_corrupt_diag_enabled() -> bool {
 /// forming write. Rate-capped; no-op unless the gate is set.
 fn validate_copy_source_cells(obj_ptr: *const u8, header: &ObjectHeader, site: &str) {
     if !cell_corrupt_diag_enabled()
-        || header.kind != ObjectKind::Object
+        || header.kind() != ObjectKind::Object
         || is_compact_object(header)
     {
         return;
@@ -13864,7 +13942,7 @@ fn seedhunt_scan_obj(
     cap: usize,
 ) -> usize {
     let mut count = 0usize;
-    if h.kind == ObjectKind::Object {
+    if h.kind() == ObjectKind::Object {
         for si in 0..h.num_slots() as usize {
             // SAFETY: `si < num_slots`; offset stays within the object.
             let sp = unsafe { optr.add(HEADER_SIZE + si * SLOT_SIZE) };
@@ -13888,10 +13966,10 @@ fn seedhunt_scan_obj(
                 }
             }
         }
-    } else if h.kind == ObjectKind::Array && h.element_type == ArrayElementType::Reference {
+    } else if h.kind() == ObjectKind::Array && h.element_type() == ArrayElementType::Reference {
         for i in 0..h.array_length() as usize {
             // SAFETY: `i < array_length`; offset stays within the array data.
-            let sp = unsafe { optr.add(HEADER_SIZE + i * ref_element_size()) };
+            let sp = unsafe { optr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
             let raw = unsafe { read_ref_slot(sp) } as usize;
             if raw != 0 && raw < 0x1000 {
                 count += 1;
@@ -13991,8 +14069,8 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
     // Compare `kind` as a RAW BYTE: an out-of-range discriminant is exactly the
     // case this screen exists to catch, and the optimiser is entitled to assume
     // the enum is in 0..=2 — which would fold the check away.
-    // SAFETY: as above; `OBJECT_KIND_OFFSET` is inside the header.
-    let kind_byte = unsafe { *ptr.add(OBJECT_KIND_OFFSET) };
+    // SAFETY: as above; `cratonvm_types::KIND_TAGS_BYTE_OFFSET` is inside the header.
+    let kind_byte = unsafe { cratonvm_types::kind_tag_at(ptr) };
     if kind_byte > ObjectKind::Array as u8 {
         return false;
     }
@@ -14006,8 +14084,8 @@ fn old_gen_mark_candidate_plausible(ptr: *mut u8, old_gen: &OldGen, conservative
         // read unvalidated: instant UB the moment it is loaded, which
         // optimized code lowered into a `SIGILL` reached this way against
         // the real `DefaultCatalogAndSchemaTest` workload.
-        // SAFETY: as above; `ARRAY_ELEMENT_TYPE_OFFSET` is inside the header.
-        let elem_tag = unsafe { *ptr.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+        // SAFETY: as above; `cratonvm_types::KIND_TAGS_BYTE_OFFSET` is inside the header.
+        let elem_tag = unsafe { cratonvm_types::element_type_tag_at(ptr) };
         if array_element_type_from_tag(elem_tag).is_none() {
             return false;
         }
@@ -14063,7 +14141,7 @@ fn report_doomed_referrers(
         .iter()
         .filter(|&&(p, _)| {
             // SAFETY: `walk_objects` yielded `p` as a valid object start.
-            unsafe { (*(p as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED == 0 }
+            unsafe { (*(p as *const ObjectHeader)).gc_flags() & GC_FLAG_MARKED == 0 }
         })
         .map(|&(p, _)| p as usize)
         .collect();
@@ -14091,7 +14169,7 @@ fn report_doomed_referrers(
         let (base, size) = (bases[i - 1], walked[i - 1].1);
         (addr < base + size).then(|| {
             // SAFETY: a walked base.
-            let m = unsafe { (*(base as *const ObjectHeader)).gc_flags & GC_FLAG_MARKED != 0 };
+            let m = unsafe { (*(base as *const ObjectHeader)).gc_flags() & GC_FLAG_MARKED != 0 };
             (base, m)
         })
     };
@@ -14142,7 +14220,7 @@ fn report_doomed_referrers(
         format!(
             "class_id={} kind={} num_slots={}",
             vh.class_id.as_u32(),
-            vh.kind as u8,
+            ObjectHeader::kind_tag(vh.mark_word.load(Ordering::Relaxed)),
             vh.num_slots(),
         )
     };
@@ -14350,7 +14428,7 @@ fn note_interior_old_root(root: *mut u8, base: usize, size: usize) {
          docs/gc/old-sweep-liveness.md section 7",
         root as usize - base,
         header.class_id.as_u32(),
-        header.kind as u8,
+        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
     );
 }
 
@@ -14404,9 +14482,9 @@ fn note_rescued_old_mark_candidate(ptr: *mut u8, site: &'static str) {
              marking it. Without this the in-place sweep would free a live object; see \
              docs/gc/old-sweep-liveness.md.",
             header.class_id.as_u32(),
-            header.kind as u8,
+            ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
             header.num_slots(),
-            header.gc_flags,
+            header.gc_flags(),
         );
     }
 }
@@ -14448,6 +14526,45 @@ fn mark_and_push_old_gen(
     if !old_gen.contains(ptr) {
         return;
     }
+    // A plausible-looking header is NECESSARY but not SUFFICIENT.
+    //
+    // The screen decodes bytes, so any interior address whose bytes happen to
+    // read as a well-formed header passes it. That used to be a coincidence one
+    // could not construct on purpose; since `identity_hash_code` left the
+    // header (2026-08-07) it is systematic. `obj + 8` now lands the header's
+    // 4-byte tail padding on `cratonvm_types::KIND_TAGS_BYTE_OFFSET`, and zero is a perfectly
+    // valid `ObjectKind::Object`, while `num_slots` reads the low half of an
+    // unhashed, unlocked mark word -- also zero. So EVERY object's `obj + 8`
+    // decodes as a plausible empty object.
+    //
+    // (The old layout rejected it for an incidental reason: `shape` sat at
+    // +12, so `obj + 8` put the field count on the kind byte, and a count of 2
+    // exceeds `ObjectKind::Array`. A negative control that depended on a field
+    // count not colliding with a kind tag was never testing the invariant it
+    // claimed to.)
+    //
+    // When the caller has a walk, the base list is authoritative for the span
+    // it covers, so an address inside that span that is not a base is interior
+    // by construction -- whatever its bytes say. Marking one writes a mark bit
+    // into a live object's payload, which is the corruption this screen exists
+    // to stop. Outside the walked span, and when there is no walk at all, the
+    // screen remains the only evidence available and still decides.
+    let addr = ptr as usize;
+    let interior_to_the_walk = match walked_bases.first() {
+        // Bounded by the FIRST base only, not by the last: the walk is
+        // contiguous from there to the end of the used region, so every
+        // allocated byte at or above it belongs to some object the walk
+        // returned. Bounding by the last base instead reaches only the final
+        // object's own base address and misses its body entirely -- with a
+        // single walked object the span collapses to one point and catches
+        // nothing, which is exactly how the first attempt at this failed.
+        Some(&lo) => addr > lo && walked_bases.binary_search(&addr).is_err(),
+        None => false,
+    };
+    if interior_to_the_walk {
+        note_rejected_old_mark_candidate(ptr, site);
+        return;
+    }
     if !old_gen_mark_candidate_plausible(ptr, old_gen, false) {
         if !rescue_mark_candidate_by_walk(ptr, old_gen, walked_bases) {
             note_rejected_old_mark_candidate(ptr, site);
@@ -14458,8 +14575,8 @@ fn mark_and_push_old_gen(
     // SAFETY: the screen verified 8-alignment, old-gen containment and a
     // header whose claimed extent fits inside old gen.
     let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-    if header.gc_flags & GC_FLAG_MARKED == 0 {
-        header.gc_flags |= GC_FLAG_MARKED;
+    if header.gc_flags() & GC_FLAG_MARKED == 0 {
+        header.add_gc_flags(GC_FLAG_MARKED);
         worklist.push(ptr);
     }
 }
@@ -14490,7 +14607,7 @@ fn note_rejected_old_mark_candidate(ptr: *mut u8, site: &'static str) {
 
 #[inline]
 fn header_reserved_fields_plausible(header: &ObjectHeader) -> bool {
-    header.gc_flags & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
+    header.gc_flags() & !(GC_FLAG_OLD_GEN | GC_FLAG_MARKED | GC_FLAG_COMPACT) == 0
 }
 
 /// xt-hardening follow-up (2026-07-03): targeted defense against the
@@ -14523,8 +14640,8 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
     // constructing a typed `&ObjectHeader`, mirroring every other fix in
     // `fixed-suite-bugs/hibernate/defaultcatalogandschema-late-phase-instability-20260801-FIXED.md`.
     // SAFETY: bounds-checked by `old_gen.contains(neighbor)` above.
-    let kind_tag = unsafe { *neighbor.add(OBJECT_KIND_OFFSET) };
-    let elem_tag = unsafe { *neighbor.add(ARRAY_ELEMENT_TYPE_OFFSET) };
+    let kind_tag = unsafe { cratonvm_types::kind_tag_at(neighbor) };
+    let elem_tag = unsafe { cratonvm_types::element_type_tag_at(neighbor) };
     let (Some(kind), Some(_)) = (
         object_kind_from_tag(kind_tag),
         array_element_type_from_tag(elem_tag),
@@ -14567,7 +14684,7 @@ fn warn_corrupt_array_header(header: &ObjectHeader) {
         "GC: implausible array_length {} (element_type=0x{:02x}) in heap object \
          header — treating as corrupt; caller will stop/skip the walk",
         header.array_length(),
-        header.element_type as u8,
+        header.element_type() as u8,
     );
 }
 
@@ -14595,7 +14712,7 @@ fn warn_non_object_kind_in_object_arm(header: &ObjectHeader) {
         "GC: header kind=0x{:02x} reached the legacy-object sizing arm (shape={}, \
          class_id={}); a region sentinel is not a sizable object — treating as \
          corrupt so the walker can re-sync.",
-        header.kind as u8,
+        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
         header.num_slots(),
         header.class_id.as_u32(),
     );
@@ -14654,8 +14771,8 @@ fn mark_edge_precise(
     // SAFETY: the test above confirmed an 8-byte-aligned address inside the
     // live from-space region, so reading an `ObjectHeader` there is valid.
     let header = unsafe { &*(addr as *const ObjectHeader) };
-    let kind_byte = header.kind as u8;
-    let is_array = header.kind == ObjectKind::Array;
+    let kind_byte = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed));
+    let is_array = header.kind() == ObjectKind::Array;
     if kind_byte > 1
         || (!is_array && header.num_slots() > (1 << 24))
         || (is_array && header.array_length() > i32::MAX as u32)
@@ -14983,7 +15100,7 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
             if ctx.watched.is_some_and(|w| w.contains(&abs)) {
                 out.watched.push(abs);
             }
-        } else if header.gc_flags & GC_FLAG_MARKED != 0 {
+        } else if header.gc_flags() & GC_FLAG_MARKED != 0 {
             out.live += 1;
             out.survivors.push(cursor);
             if ctx.watched.is_some_and(|w| w.contains(&abs)) {
@@ -15022,7 +15139,7 @@ fn push_dead(
         cursor,
         total_size,
         header.class_id.as_u32(),
-        header.kind as u8,
+        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
         1,
     ));
 }
@@ -15163,14 +15280,14 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
     // the enum: the optimiser is entitled to assume `kind` is a valid `0..=2`
     // discriminant, which is exactly what would let it fold away the
     // out-of-range case this screen exists to catch.
-    let kind_byte = header.kind as u8;
+    let kind_byte = ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed));
     if kind_byte != ObjectKind::Object as u8 && kind_byte != ObjectKind::Array as u8 {
         warn_non_object_kind_in_object_arm(header);
         return 0;
     }
-    let raw_size = if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+    let raw_size = if header.kind() == ObjectKind::Array {
+        match array_data_size(header.array_length() as usize, header.element_type()) {
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 warn_corrupt_array_header(header);
                 0
@@ -15267,7 +15384,7 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // arm that used to bypass it. Retained because it is the one the
         // paragraphs above are written against, and because a future edit that
         // reorders the dispatch should not silently lose it twice.
-        if header.kind as u8 != ObjectKind::Object as u8 {
+        if ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)) != ObjectKind::Object as u8 {
             warn_non_object_kind_in_object_arm(header);
             return 0;
         }
@@ -15383,8 +15500,8 @@ pub(crate) unsafe fn for_each_ref_slot(
     header: &ObjectHeader,
     mut f: impl FnMut(*mut u8, usize),
 ) {
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
+    if header.kind() == ObjectKind::Array {
+        if header.element_type() == ArrayElementType::Reference {
             // HIB-DCAST-LATEPHASE.1: cap by the same `1 << 24` plausibility
             // bound `old_gen_mark_candidate_plausible`/`gen_object_total_size`
             // already apply to a header's own `array_length`/`num_slots` —
@@ -15400,7 +15517,7 @@ pub(crate) unsafe fn for_each_ref_slot(
             // of slots into unmapped memory.
             let elems = (header.array_length() as usize).min(1 << 24);
             for i in 0..elems {
-                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let s = obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size());
                 let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     f(raw as usize as *mut u8, i);
@@ -15471,12 +15588,12 @@ pub(crate) unsafe fn forward_ref_slots(
     header: &ObjectHeader,
     mut forward: impl FnMut(*mut u8) -> Option<*mut u8>,
 ) {
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
+    if header.kind() == ObjectKind::Array {
+        if header.element_type() == ArrayElementType::Reference {
             // HIB-DCAST-LATEPHASE.1: see the matching cap in `for_each_ref_slot`.
             let elems = (header.array_length() as usize).min(1 << 24);
             for i in 0..elems {
-                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let s = obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size());
                 let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {
@@ -15749,7 +15866,7 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
             }
             break;
         }
-        header.gc_flags &= !GC_FLAG_MARKED;
+        header.clear_gc_flags(GC_FLAG_MARKED);
         cursor += total_size;
     }
 }
@@ -15972,7 +16089,7 @@ mod tests {
     /// No-op monitor cleanup for tests in the gc crate.
     struct NoOpMonitors;
     impl crate::collector::MonitorCleanup for NoOpMonitors {
-        fn remap_after_gc(&self, _pointer_map: &std::collections::HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
     }
 
     unsafe fn corrupt_header_byte(obj: ObjectRef, offset: usize, value: u8) {
@@ -15993,7 +16110,6 @@ mod tests {
             ArrayElementType::Reference,
             0,
             0,
-            0,
         );
         assert_eq!(
             gen_object_total_size(&filler),
@@ -16007,7 +16123,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::HumongousFiller,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16041,9 +16156,8 @@ mod tests {
             ArrayElementType::Reference,
             0,
             0,
-            0,
         );
-        compact_filler.gc_flags |= GC_FLAG_COMPACT;
+        compact_filler.add_gc_flags(GC_FLAG_COMPACT);
         assert_eq!(
             gen_object_total_size(&compact_filler),
             0,
@@ -16082,7 +16196,7 @@ mod tests {
         // initialized allocation.
         unsafe {
             let header = &mut *(obj.as_ptr() as *mut ObjectHeader);
-            header.gc_flags |= GC_FLAG_COMPACT;
+            header.add_gc_flags(GC_FLAG_COMPACT);
         }
 
         let mut visited = Vec::new();
@@ -16123,10 +16237,10 @@ mod tests {
         unsafe {
             // A non-zero word0 so only the kind tag is under test. Written
             // FIRST: word0 spans bytes 0..8, which includes the kind byte at
-            // `OBJECT_KIND_OFFSET` (4) — writing it after would clobber the
+            // `cratonvm_types::KIND_TAGS_BYTE_OFFSET` (4) — writing it after would clobber the
             // corrupted tag below.
             std::ptr::write(neighbor as *mut u64, 1u64);
-            std::ptr::write(neighbor.add(OBJECT_KIND_OFFSET), 0xFFu8);
+            std::ptr::write(neighbor.add(cratonvm_types::KIND_TAGS_BYTE_OFFSET), 0xFFu8);
         }
 
         // Must not crash.
@@ -16275,7 +16389,6 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Reference,
             0,
-            0,
             3,
         );
         assert_eq!(gen_object_total_size(&obj), HEADER_SIZE + 3 * SLOT_SIZE);
@@ -16284,18 +16397,16 @@ mod tests {
             ClassId::new(8),
             ObjectKind::Array,
             ArrayElementType::Int,
-            0,
             10,
             0,
         );
-        assert_eq!(gen_object_total_size(&arr), HEADER_SIZE + 10 * 4);
+        assert_eq!(gen_object_total_size(&arr), ARRAY_DATA_OFFSET + 10 * 4);
 
         // The `num_slots` cap still re-syncs the walker.
         let mut huge = ObjectHeader::new(
             ClassId::new(9),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16319,7 +16430,6 @@ mod tests {
             ClassId::new(1),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -16350,7 +16460,7 @@ mod tests {
         let heap = GenerationalHeap::new();
         let invalid_kind = heap.alloc_object(ClassId::new(1), 0);
         unsafe {
-            corrupt_header_byte(invalid_kind, OBJECT_KIND_OFFSET, 0x7f);
+            corrupt_header_byte(invalid_kind, cratonvm_types::KIND_TAGS_BYTE_OFFSET, 0x7f);
         }
         assert!(heap
             .is_object_address(invalid_kind.as_ptr() as usize)
@@ -16358,7 +16468,7 @@ mod tests {
 
         let invalid_element = heap.alloc_array(ClassId::new(2), ArrayElementType::Int, 1);
         unsafe {
-            corrupt_header_byte(invalid_element, ARRAY_ELEMENT_TYPE_OFFSET, 0x7f);
+            corrupt_header_byte(invalid_element, cratonvm_types::KIND_TAGS_BYTE_OFFSET, 0x7f);
         }
         assert!(heap
             .is_object_address(invalid_element.as_ptr() as usize)
@@ -16408,9 +16518,9 @@ mod tests {
             unsafe {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(2);
-                h.kind = ObjectKind::Object;
+                h.set_shape_tags(ObjectKind::Object, ArrayElementType::Reference);
                 h.set_num_slots(1);
-                h.gc_flags = GC_FLAG_OLD_GEN;
+                h.set_gc_flags(GC_FLAG_OLD_GEN);
             }
             p
         };
@@ -16462,7 +16572,7 @@ mod tests {
         // before old gen fills, so the both-gens-full abort is unreachable.
         let mut armed_at = None;
         for i in 0..220 {
-            let _ = heap.alloc_object(ClassId::new(1), 1);
+            let _ = heap.alloc_object(ClassId::new(1), 3);
             if heap.young_spill_pressure() {
                 armed_at = Some(i);
                 break;
@@ -16561,12 +16671,17 @@ mod tests {
                     ClassId::new(7),
                     ObjectKind::Object,
                     ArrayElementType::Reference,
-                    1,
                     0,
                     3,
                 ),
             );
-            *base.add(OBJECT_KIND_OFFSET) = 24;
+            // 0b11 is the ONE unmapped `kind` tag. The old value here was 24,
+            // which worked while `kind` owned a whole byte and 24 was out of
+            // range for a 3-variant enum. The tag is 2 bits now and shares its
+            // byte with `element_type`, so 24 decodes as kind=0 (Object) with
+            // element_type=6 (Float) -- both valid, and the corruption this
+            // test exists to inject would silently stop being injected.
+            *base.add(cratonvm_types::KIND_TAGS_BYTE_OFFSET) = 0b11;
         }
         // SAFETY: the buffer holds a fully written header; the `kind` byte is
         // deliberately out of range, which is precisely the state under test.
@@ -16584,8 +16699,8 @@ mod tests {
         );
         let out = captured.lock().expect("capture mutex").clone();
         assert!(
-            out.contains("kind=0x18"),
-            "the diagnostic must name the raw kind byte (0x18 = 24); got: {out}",
+            out.contains("kind=0x03"),
+            "the diagnostic must name the raw kind tag (0x03, the one unmapped value); got: {out}",
         );
     }
 
@@ -16831,8 +16946,8 @@ mod tests {
         assert!(!heap.is_in_old(obj.as_ptr()));
         assert_eq!(heap.class_id_of(obj), ClassId::new(1));
         assert_eq!(heap.get_header(obj).num_slots(), 2);
-        assert_eq!(heap.get_header(obj).gc_age, 0);
-        assert_eq!(heap.get_header(obj).gc_flags, 0);
+        assert_eq!(heap.get_header(obj).gc_age(), 0);
+        assert_eq!(heap.get_header(obj).gc_flags(), 0);
     }
 
     #[test]
@@ -16855,7 +16970,6 @@ mod tests {
                         ClassId::new(123),
                         ObjectKind::Object,
                         ArrayElementType::Reference,
-                        7,
                         0,
                         0,
                     );
@@ -16883,7 +16997,7 @@ mod tests {
         // SAFETY: the worker finished after writing a valid object header.
         let header = unsafe { &*(ptr as *const ObjectHeader) };
         assert_eq!(header.class_id, ClassId::new(123));
-        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.kind(), ObjectKind::Object);
         assert_eq!(header.array_length(), 0);
         assert_eq!(header.num_slots(), 0);
     }
@@ -17008,7 +17122,7 @@ mod tests {
         // minor GC's `forward_object` does not try to relocate it from
         // (non-existent) young from-space.
         assert_ne!(
-            heap.get_header(big).gc_flags & GC_FLAG_OLD_GEN,
+            heap.get_header(big).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "humongous array header must carry GC_FLAG_OLD_GEN",
         );
@@ -17028,7 +17142,7 @@ mod tests {
             "small array must still allocate in young from-space",
         );
         assert_eq!(
-            heap.get_header(small).gc_flags & GC_FLAG_OLD_GEN,
+            heap.get_header(small).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "small young-gen array must not be flagged as old-gen resident",
         );
@@ -17049,7 +17163,7 @@ mod tests {
             "try_alloc_array humongous must land in old gen",
         );
         assert_ne!(
-            heap.get_header(big).gc_flags & GC_FLAG_OLD_GEN,
+            heap.get_header(big).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "humongous try_alloc_array header must carry GC_FLAG_OLD_GEN",
         );
@@ -17105,7 +17219,7 @@ mod tests {
         assert_eq!(heap.get_field(new_obj, 1).as_long(), Some(100));
 
         // Age should be incremented
-        assert_eq!(heap.get_header(new_obj).gc_age, 1);
+        assert_eq!(heap.get_header(new_obj).gc_age(), 1);
     }
 
     /// `HIB-DCAST-LATEPHASE.1`: `forward_object_impl` used to read
@@ -17128,11 +17242,11 @@ mod tests {
 
         // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
         // 2=HumongousFiller).
-        // SAFETY: `obj.as_ptr() + OBJECT_KIND_OFFSET` is the `kind` byte of a
+        // SAFETY: `obj.as_ptr() + cratonvm_types::KIND_TAGS_BYTE_OFFSET` is the `kind` byte of a
         // live allocation; writing a raw `u8` there does not require the
         // resulting value to be a valid `ObjectKind`.
         unsafe {
-            std::ptr::write(obj.as_ptr().add(OBJECT_KIND_OFFSET), 0xFFu8);
+            std::ptr::write(obj.as_ptr().add(cratonvm_types::KIND_TAGS_BYTE_OFFSET), 0xFFu8);
         }
 
         let mut roots = vec![obj];
@@ -17615,7 +17729,7 @@ mod tests {
         // SAFETY: `live_addr + 32` is inside a live 4-slot object.
         let interior = unsafe { ObjectRef::from_raw((live_addr + 32) as *mut u8) };
         let (reclaimed, _survivors) =
-            heap.sweep_old_gen_non_moving(&[interior], &HashMap::new());
+            heap.sweep_old_gen_non_moving(&[interior], &cratonvm_types::PointerMap::default());
 
         let bases: Vec<usize> = heap
             .old_gen_lock()
@@ -17783,7 +17897,7 @@ mod tests {
         // Keep the first half; the second half's storage is one adjacent run.
         let live: Vec<ObjectRef> = roots[..N / 2].to_vec();
         let blocks_before = heap.old_gen_lock().free_block_count();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
         assert!(reclaimed > 0, "the dropped half must be reclaimed");
 
         let og = heap.old_gen_lock();
@@ -17829,7 +17943,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &cratonvm_types::PointerMap::default());
 
         assert!(
             reclaimed > 0,
@@ -17875,7 +17989,7 @@ mod tests {
         // Both addresses are watched — exactly what the VM publishes for every
         // address the reference processor holds.
         crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
-        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &HashMap::new());
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &cratonvm_types::PointerMap::default());
         crate::gc_quiescence::set_watched_referents(&[]);
 
         assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
@@ -18521,7 +18635,7 @@ mod tests {
                     heap.is_in_young(cur.as_ptr()),
                     "Expected in young gen at iteration {i}"
                 );
-                assert_eq!(heap.get_header(cur).gc_age, i + 1);
+                assert_eq!(heap.get_header(cur).gc_age(), i + 1);
             } else {
                 // Should be promoted to old gen
                 assert!(
@@ -18749,7 +18863,7 @@ mod tests {
         let doomed_addr = roots[1].as_ptr() as usize;
 
         let live = vec![keep];
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
         assert!(
             reclaimed > 0,
             "the sweep must actually have reclaimed the dropped object in place",
@@ -18806,7 +18920,7 @@ mod tests {
         // Only the holder is rooted; the victim must survive via the holder's
         // ref slot, which is precisely the edge the detector inspects.
         let live = vec![holder];
-        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
 
         let vm = crate::vm_heap::VmHeap::Generational(heap);
         assert!(
@@ -18855,7 +18969,7 @@ mod tests {
         // is exactly the state `sweep_young_non_moving` hands over.
         let stale_young = heap.alloc_object(ClassId::new(0), 0);
         let promoted_addr = promoted.as_ptr() as usize;
-        let mut promotions = HashMap::new();
+        let mut promotions = cratonvm_types::PointerMap::default();
         promotions.insert(stale_young.as_ptr() as usize, promoted_addr);
 
         let stale_roots = vec![stale_young];
@@ -18979,11 +19093,11 @@ mod tests {
         }
         // 0xFF is not a declared ObjectKind discriminant (0=Object, 1=Array,
         // 2=HumongousFiller) -- simulating a dangling/corrupt worklist entry.
-        // SAFETY: `ptr + OBJECT_KIND_OFFSET` is the `kind` byte of a live
+        // SAFETY: `ptr + cratonvm_types::KIND_TAGS_BYTE_OFFSET` is the `kind` byte of a live
         // allocation from `og`; writing a raw `u8` there does not require the
         // resulting value to be a valid `ObjectKind`.
         unsafe {
-            std::ptr::write(ptr.add(OBJECT_KIND_OFFSET), 0xFFu8);
+            std::ptr::write(ptr.add(cratonvm_types::KIND_TAGS_BYTE_OFFSET), 0xFFu8);
         }
 
         let before = OLDMARK_BAD_KIND_HITS.load(Ordering::Relaxed);
@@ -19051,15 +19165,15 @@ mod tests {
         // SAFETY: `obj` is a live block of this OldGen.
         unsafe {
             let h = &mut *(obj as *mut ObjectHeader);
-            h.kind = ObjectKind::Array;
+            h.set_shape_tags(ObjectKind::Array, ArrayElementType::Reference);
             h.shape = 4; // array_length
         }
         // 0xFF is not a declared ArrayElementType discriminant.
-        // SAFETY: `obj + ARRAY_ELEMENT_TYPE_OFFSET` is the `element_type`
+        // SAFETY: `obj + cratonvm_types::KIND_TAGS_BYTE_OFFSET` is the `element_type`
         // byte of a live allocation; writing a raw `u8` there does not
         // require the resulting value to be a valid `ArrayElementType`.
         unsafe {
-            std::ptr::write(obj.add(ARRAY_ELEMENT_TYPE_OFFSET), 0xFFu8);
+            std::ptr::write(obj.add(cratonvm_types::KIND_TAGS_BYTE_OFFSET), 0xFFu8);
         }
 
         // Must not crash.
@@ -19093,7 +19207,7 @@ mod tests {
             // `header_reserved_fields_plausible` rejects, and one that leaves
             // every SIZING path (`kind`, `shape`, `GC_FLAG_COMPACT`) untouched,
             // so the object walk still yields this address as a base.
-            h.gc_flags |= 0x08;
+            h.add_gc_flags(0x08);
         }
 
         let bases: Vec<usize> = og.walk_objects().iter().map(|&(p, _)| p as usize).collect();
@@ -19116,7 +19230,7 @@ mod tests {
         );
         // SAFETY: `obj` is a live block; reading its header is in-bounds.
         assert_eq!(
-            unsafe { (*(obj as *const ObjectHeader)).gc_flags } & GC_FLAG_MARKED,
+            unsafe { (*(obj as *const ObjectHeader)).gc_flags() } & GC_FLAG_MARKED,
             0,
         );
 
@@ -19130,7 +19244,7 @@ mod tests {
         );
         // SAFETY: as above.
         assert_ne!(
-            unsafe { (*(obj as *const ObjectHeader)).gc_flags } & GC_FLAG_MARKED,
+            unsafe { (*(obj as *const ObjectHeader)).gc_flags() } & GC_FLAG_MARKED,
             0,
         );
 
@@ -19192,13 +19306,13 @@ mod tests {
         // Induce the mark gap.
         // SAFETY: `b` is a live old-gen object; its header is mapped.
         unsafe {
-            (*(b.as_ptr() as *mut ObjectHeader)).gc_flags |= 0x08;
+            (*(b.as_ptr() as *mut ObjectHeader)).add_gc_flags(0x08);
         }
 
         // Only A is rooted. B is reachable ONLY through A's reference slot —
         // exactly the edge the screen used to drop.
         let (b_addr, c_addr) = (b.as_ptr() as usize, c.as_ptr() as usize);
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[a], &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[a], &cratonvm_types::PointerMap::default());
 
         let bases: Vec<usize> = heap
             .old_gen_lock()
@@ -19279,7 +19393,7 @@ mod tests {
             }
         }
 
-        fn remap(pointer_map: &HashMap<usize, usize>) {
+        fn remap(pointer_map: &cratonvm_types::PointerMap) {
             for slot in [&OWNER, &HELD] {
                 let addr = slot.load(Ordering::Relaxed);
                 if addr != 0 {
@@ -19544,7 +19658,7 @@ mod tests {
 
         // Sweep old gen in place with NO root naming the payload — the young
         // referrer is the only path to it.
-        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &HashMap::new());
+        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &cratonvm_types::PointerMap::default());
 
         assert_eq!(
             heap.get_field(payload, 0).as_int(),
@@ -20162,7 +20276,7 @@ mod tests {
                     "Forwarding pointer should be cleared after compaction"
                 );
                 assert_eq!(
-                    header.gc_flags & GC_FLAG_MARKED,
+                    header.gc_flags() & GC_FLAG_MARKED,
                     0,
                     "Mark bit should be cleared after compaction"
                 );

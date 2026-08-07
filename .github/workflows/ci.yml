@@ -9,6 +9,47 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Formatting is its OWN job, and that placement is the whole point.
+  #
+  # It used to be the FIRST step of `build-and-test`, ahead of `Build`,
+  # `Clippy --workspace --all-targets` and `Test`. GitHub Actions runs a job's
+  # steps in order and skips every later step once one fails, so a red
+  # formatting check took the correctness gates with it — silently, because the
+  # job's failure annotation names the step that failed and nothing else.
+  #
+  # This workspace is not rustfmt-clean and has not been for a long time:
+  # `cargo fmt --all --check` reports 2442 diffs across 2358 sites at
+  # `1ec856c2c` (measured 2026-08-07). So that first step failed on EVERY push,
+  # and `cargo clippy --workspace --all-targets` — the gate that compiles test
+  # targets — had not run on `dev` in that whole window.
+  #
+  # That is exactly how `084098bce` landed with five `#[test]` functions in
+  # `native-builtins/src/jboss_jdkspecific.rs` applying `?` to a `Result` while
+  # declaring `-> ()`. `cargo build --release` was fine, so nothing local
+  # caught it either. It is the third crate in that family after native-io and
+  # native-collections, and the comments further down this file describe the
+  # same failure mode costing this repository 1,522 tests once already — the
+  # gates written in response were correct and simply unreachable.
+  #
+  # Splitting the job does not weaken the formatting signal: a fmt failure
+  # still fails CI, as its own red job. It just stops it from standing in front
+  # of "does the code compile" and "do the tests pass". Making the tree
+  # rustfmt-clean is a separate (and much larger) decision; this change is what
+  # makes the existing gates report until someone takes it.
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
   build-and-test:
     name: Build & Test
     runs-on: ${{ matrix.os }}
@@ -51,9 +92,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
-
-      - name: Check formatting
-        run: cargo fmt --all --check
 
       - name: Build
         run: cargo build --workspace

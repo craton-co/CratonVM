@@ -1,9 +1,10 @@
 # Duplicate registration: the species, the gate, and one live instance
 
-**Status:** the gate ships. The analysis API is in `native-api`, the ratchet is
-in `native-builtins/tests/duplicate_registration_gate.rs`, and its two numeric
-baselines are seeded `0` — they are filled in by the first run, on purpose (see
-*Seeding*). One previously-unrecorded live defect fell out of building it and is
+**Status:** the gate ships, and is now **seeded from its first real run**
+(2026-08-07): 1206 shadowed registrations, 53 of them with a kind disagreement.
+The analysis API is in `native-api`, the ratchet is in
+`native-builtins/tests/duplicate_registration_gate.rs`. See *Seeding* for the
+numbers, and for why the first run took two months to happen. One previously-unrecorded live defect fell out of building it and is
 written up under *The unjustified one*.
 
 Filed 2026-08-07 (JDK-only wave 2, lane W6-4).
@@ -107,8 +108,29 @@ an order inversion with no baseline and ratchets unmodelled registrars at 2.
 
 ### Seeding
 
-`BASELINE_SHADOWED` and `BASELINE_KIND_DISAGREEMENTS` are `0`, so the two
-ratchets are **RED until one run pastes the real numbers in**. This is the
+**Seeded 2026-08-07 at dev `1082eb446`: `BASELINE_SHADOWED = 1206`,
+`BASELINE_KIND_DISAGREEMENTS = 53`.** Both are ratchet ceilings, not
+approvals — every one of the 1206 is a callback that can never be dispatched,
+and each of the 53 is a winner that disagrees with the loser about what the
+native IS. They are the number to drive DOWN; the assert only ever forbids
+going up.
+
+Why it took until now, since the procedure below is one command: the gate is a
+`cargo test` target, and `cargo test --workspace` is the LAST step of ci.yml's
+`build-and-test` job, behind `cargo fmt --all --check` — which fails on every
+push (2442 diffs at that tip), and GitHub Actions skips every later step once
+one fails. So this ratchet had never run in CI at all. The same blindness is
+what let a shadowed `java/nio/CharBuffer.toString()` ship an empty string
+through every reflective route (`fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md`);
+deleting that duplicate is why the count reads 1206 and not 1207. Formatting
+now runs as its own CI job so it can no longer stand in front of the
+correctness gates.
+
+The original seeding note follows, because the reasoning still governs any
+future change to these numbers.
+
+`BASELINE_SHADOWED` and `BASELINE_KIND_DISAGREEMENTS` were `0`, so the two
+ratchets were **RED until one run pasted the real numbers in**. This is the
 procedure `stub_ratchet.rs` documents for its own baseline, and the alternative
 is worse: a baseline seeded above the true count is a gate that silently
 tolerates every duplicate below it — which is the failure this species already

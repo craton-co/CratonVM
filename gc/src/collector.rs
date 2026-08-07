@@ -66,13 +66,48 @@ pub fn volatile_stripe_lock(
     volatile_stripes()[stripe].lock()
 }
 
+/// Resolves the identity hash of an object whose mark word is no longer
+/// `NEUTRAL`, installing one if it has none yet.
+///
+/// An identity hash normally lives in the upper bits of a `MARK_NEUTRAL` mark
+/// word. Inflation overwrites that word, so the hash is displaced into the
+/// object's `Monitor` -- a `vm` type this crate cannot name, hence the hook.
+/// The VM installs it once at start-up; until then, and in gc-only tests, the
+/// displaced case is unreachable because nothing has inflated anything.
+///
+/// Takes the mark-word snapshot rather than the object address on purpose: the
+/// snapshot already carries the `Monitor` pointer, so resolving is a pointer
+/// dereference, not a lookup in an address-keyed table that would then need its
+/// own GC re-keying.
+static DISPLACED_HASH_RESOLVER: std::sync::OnceLock<fn(u64) -> i32> =
+    std::sync::OnceLock::new();
+
+/// Install the displaced-hash resolver. Idempotent; the first install wins.
+pub fn set_displaced_hash_resolver(resolver: fn(u64) -> i32) {
+    let _ = DISPLACED_HASH_RESOLVER.set(resolver);
+}
+
+/// Identity hash for an object whose mark word snapshot is `mark`.
+///
+/// Returns `0` when no resolver is installed. A caller must treat that as "no
+/// answer" and NOT fall back to minting: minting on a non-`NEUTRAL` object
+/// hands out a fresh value on every call, which is a *changing* identity hash --
+/// strictly worse than a missing one, and invisible to any test that calls it
+/// once.
+pub fn displaced_identity_hash(mark: u64) -> i32 {
+    match DISPLACED_HASH_RESOLVER.get() {
+        Some(resolve) => resolve(mark),
+        None => 0,
+    }
+}
+
 /// Trait for monitor table cleanup after GC relocation.
 ///
 /// The VM implements this for its `MonitorTable` so the gc crate does not
 /// need to depend on VM-internal types.
 pub trait MonitorCleanup {
     /// Re-key monitors using the old-address-to-new-address mapping.
-    fn remap_after_gc(&self, pointer_map: &HashMap<usize, usize>);
+    fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap);
 
     /// Prune registry entries keyed by addresses a WHOLE-HEAP collection
     /// just swept (`dead` is exact: every element was a live allocation
@@ -204,7 +239,7 @@ impl std::fmt::Debug for StopTheWorldToken {
 ///
 /// struct NoMonitors;
 /// impl MonitorCleanup for NoMonitors {
-///     fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+///     fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
 /// }
 ///
 /// let heap = Heap::new();
@@ -222,7 +257,7 @@ impl std::fmt::Debug for StopTheWorldToken {
 ///
 /// struct NoMonitors;
 /// impl MonitorCleanup for NoMonitors {
-///     fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+///     fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
 /// }
 ///
 /// let heap = Heap::new();

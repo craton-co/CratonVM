@@ -2,7 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | **FIXED** for CharBuffer (2026-08-05, `0bf9d820d`) and for the ByteBuffer / typed-buffer families (this change). |
+| **Status** | ✅ **FIXED** for CharBuffer (2026-08-05, `0bf9d820d`) and for the ByteBuffer / typed-buffer families (this change). **Re-verified 2026-08-07** on `origin/dev`: `BUFALL` and `CBSLICE` both report `fails=0`, and `NioBufferStampProbe` matches a HotSpot 25 control on every column except the one this record deliberately did not sweep. |
+| **Carried forward** | The abstract-`ByteBuffer` stamp — the "Not swept, deliberately" item below — is now its own record, `known-issues/nio/bytebuffer-allocate-wrap-stamp-the-abstract-class.md`, so it is not lost when this one retires. Nothing else here is open. |
 | **Scope** | `native-io/src/lib.rs` (`BB_FIELD_*`), `native-builtins/src/phases_late/charset_buffers.rs` (`CB_FIELD_*`), `native-builtins/src/charset.rs` (`BUF_FIELD_*`). |
 | **Repro** | `docs/known-issues/repros/charbuffer-address/` — `BUFALL.java` sweeps every family and every mutator; `CB*.java` are the original CharBuffer cases. |
 
@@ -211,7 +212,9 @@ registers the S2 ByteBuffer surface in real-JDK mode precisely so those abstract
 methods have bodies. The exposure is real but conditional: it costs nothing
 until someone reaches a ByteBuffer method nobody has written a native for.
 
-**Not swept, deliberately.** Stamping `HeapByteBuffer` is the right end state,
+**Not swept, deliberately — now tracked separately** in
+`known-issues/nio/bytebuffer-allocate-wrap-stamp-the-abstract-class.md`, with the
+2026-08-07 re-measurement. Stamping `HeapByteBuffer` is the right end state,
 but it hands the whole ByteBuffer surface over to real JDK bodies at once, and
 `ByteBuffer` is reached by nearly everything. The CharBuffer half above is the
 template for doing it: build the concrete class, seed `address` honestly, delete

@@ -23,24 +23,24 @@ impl Compiler {
     /// Inline int element load (compact: 4 bytes/element). RAX=array, RCX=index.
     /// Result in RAX (sign-extended to 64-bit).
     pub(super) fn emit_int_aload_regs(&mut self) {
-        // MOVSXD RAX, DWORD [RAX + RCX*4 + HEADER_SIZE]
+        // MOVSXD RAX, DWORD [RAX + RCX*4 + ARRAY_DATA_OFFSET]
         // Encoding: REX.W + 0x63 + ModRM(mod=01, reg=RAX, r/m=100) + SIB(scale=2, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x63);
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=RAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x88); // SIB: scale=2(10=*4), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // disp8 // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // disp8 // Cast: x86-64 immediate encoding
     }
 
     /// Inline byte element load (compact: 1 byte/element). RAX=array, RCX=index.
     /// Result in RAX (sign-extended to 32-bit, then to 64-bit).
     pub(super) fn emit_byte_aload_regs(&mut self) {
-        // MOVSX EAX, BYTE [RAX + RCX*1 + HEADER_SIZE]
+        // MOVSX EAX, BYTE [RAX + RCX*1 + ARRAY_DATA_OFFSET]
         // Encoding: 0x0F 0xBE + ModRM(mod=01, reg=EAX, r/m=SIB) + SIB(scale=0, idx=RCX, base=RAX) + disp8
         self.buf.emit(&[0x0F, 0xBE]);
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x08); // SIB: scale=0(00=*1), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // disp8 // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // disp8 // Cast: x86-64 immediate encoding
                                                // Sign-extend EAX to RAX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]);
@@ -48,38 +48,38 @@ impl Compiler {
 
     /// Inline int element store (compact: 4 bytes/element). RAX=array, RCX=index, RDX=value.
     pub(super) fn emit_int_astore_regs(&mut self) {
-        // MOV DWORD [RAX + RCX*4 + HEADER_SIZE], EDX
+        // MOV DWORD [RAX + RCX*4 + ARRAY_DATA_OFFSET], EDX
         self.buf.emit_byte(0x89);
         self.buf.emit_byte(0x54); // ModRM: mod=01, reg=EDX(010), r/m=SIB(100)
         self.buf.emit_byte(0x88); // SIB: scale=2(10=*4), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // disp8 // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // disp8 // Cast: x86-64 immediate encoding
     }
 
     /// Inline byte element store (compact: 1 byte/element). RAX=array, RCX=index, RDX=value.
     pub(super) fn emit_byte_astore_regs(&mut self) {
-        // MOV BYTE [RAX + RCX*1 + HEADER_SIZE], DL
+        // MOV BYTE [RAX + RCX*1 + ARRAY_DATA_OFFSET], DL
         self.buf.emit_byte(0x88);
         self.buf.emit_byte(0x54); // ModRM: mod=01, reg=DL(010), r/m=SIB(100)
         self.buf.emit_byte(0x08); // SIB: scale=0(00=*1), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // disp8 // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // disp8 // Cast: x86-64 immediate encoding
     }
 
     /// Inline ref element load from Object[] array (compact 8-byte pointers).
     /// RAX=array, RCX=index. Result in RAX (raw pointer, 0 for null).
     ///
-    /// Emits: MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
+    /// Emits: MOV RAX, QWORD [RAX + RCX*8 + ARRAY_DATA_OFFSET]
     pub(super) fn emit_ref_aload_regs(&mut self) {
         if narrow_oops_enabled() {
             self.emit_narrow_ref_aload_regs();
             return;
         }
-        // MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
+        // MOV RAX, QWORD [RAX + RCX*8 + ARRAY_DATA_OFFSET]
         // REX.W + 0x8B + ModRM(mod=01, reg=RAX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x8B); // MOV r64, r/m64
         self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(RAX), r/m=100(SIB)
         self.buf.emit_byte(0xC8); // SIB: scale=11(*8), index=001(RCX), base=000(RAX)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
     /// Compressed-oops reference element load. RAX=array, RCX=index; result in
@@ -94,11 +94,11 @@ impl Compiler {
     /// R11 is the scratch: it is neither an `ARG_REGS` nor a `SCRATCH_REGS`
     /// member, so the operand-stack register cache never parks a value there.
     fn emit_narrow_ref_aload_regs(&mut self) {
-        // MOV EAX, DWORD [RAX + RCX*4 + HEADER_SIZE]   (32-bit dst zero-extends)
+        // MOV EAX, DWORD [RAX + RCX*4 + ARRAY_DATA_OFFSET]   (32-bit dst zero-extends)
         self.buf.emit_byte(0x8B); // MOV r32, r/m32
         self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(EAX), r/m=100(SIB)
         self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
         self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX, 3
         self.buf.emit(&[0x74, 0x0D]); // JZ +13 (past the rebase: null stays 0)
         self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
@@ -109,7 +109,7 @@ impl Compiler {
     /// Inline ref element store to Object[] array (compact 8-byte pointers).
     /// RAX=array, RCX=index, RDX=value (raw pointer, 0 for null).
     ///
-    /// Emits: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
+    /// Emits: MOV QWORD [RAX + RCX*8 + ARRAY_DATA_OFFSET], RDX
     ///
     /// Wired into the `aastore` opcode arm; the GC write-barrier is emitted
     /// separately as a call to `self.helpers.write_barrier` after the store.
@@ -118,13 +118,13 @@ impl Compiler {
             self.emit_narrow_ref_astore_regs();
             return;
         }
-        // MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
+        // MOV QWORD [RAX + RCX*8 + ARRAY_DATA_OFFSET], RDX
         // REX.W + 0x89 + ModRM(mod=01, reg=RDX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x54); // ModRM: mod=01(disp8), reg=010(RDX), r/m=100(SIB)
         self.buf.emit_byte(0xC8); // SIB: scale=11(*8), index=001(RCX), base=000(RAX)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
     /// Compressed-oops reference element store. RAX=array, RCX=index,
@@ -146,18 +146,18 @@ impl Compiler {
         self.buf.emit_byte(0x89); // MOV r/m32, r32
         self.buf.emit_byte(0x5C); // ModRM: mod=01(disp8), reg=011(R11), r/m=100(SIB)
         self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
     /// Inline short/char element load (compact: 2 bytes/element). RAX=array, RCX=index.
     /// For saload: sign-extends to 32-bit then to 64-bit.
     pub(super) fn emit_short_aload_regs(&mut self) {
-        // MOVSX EAX, WORD [RAX + RCX*2 + HEADER_SIZE]
+        // MOVSX EAX, WORD [RAX + RCX*2 + ARRAY_DATA_OFFSET]
         // Encoding: 0x0F 0xBF + ModRM(mod=01, reg=EAX, r/m=SIB) + SIB(scale=1, idx=RCX, base=RAX) + disp8
         self.buf.emit(&[0x0F, 0xBF]);
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
                                                // Sign-extend EAX to RAX
         self.rex_w();
         self.buf.emit(&[0x63, 0xC0]);
@@ -166,47 +166,47 @@ impl Compiler {
     /// Inline char element load (compact: 2 bytes/element). RAX=array, RCX=index.
     /// Zero-extends to 32-bit then sign-extends to 64-bit.
     pub(super) fn emit_char_aload_regs(&mut self) {
-        // MOVZX EAX, WORD [RAX + RCX*2 + HEADER_SIZE]
+        // MOVZX EAX, WORD [RAX + RCX*2 + ARRAY_DATA_OFFSET]
         // Encoding: 0x0F 0xB7 + ModRM(mod=01, reg=EAX, r/m=SIB) + SIB(scale=1, idx=RCX, base=RAX) + disp8
         self.buf.emit(&[0x0F, 0xB7]);
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=EAX(000), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
                                                // MOVZX already zero-extends to EAX, upper 32 bits of RAX auto-zeroed
     }
 
     /// Inline short/char element store (compact: 2 bytes/element). RAX=array, RCX=index, RDX=value.
     pub(super) fn emit_short_astore_regs(&mut self) {
-        // MOV WORD [RAX + RCX*2 + HEADER_SIZE], DX
+        // MOV WORD [RAX + RCX*2 + ARRAY_DATA_OFFSET], DX
         // Encoding: 0x66 prefix + 0x89 + ModRM + SIB + disp8
         self.buf.emit_byte(0x66); // operand size prefix (16-bit)
         self.buf.emit_byte(0x89);
         self.buf.emit_byte(0x54); // ModRM: mod=01, reg=DX(010), r/m=SIB(100)
         self.buf.emit_byte(0x48); // SIB: scale=1(01=*2), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
     /// Inline long/double element load (compact: 8 bytes/element). RAX=array, RCX=index.
     /// Result in RAX.
     pub(super) fn emit_long_aload_regs(&mut self) {
-        // MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
+        // MOV RAX, QWORD [RAX + RCX*8 + ARRAY_DATA_OFFSET]
         // Encoding: REX.W + 0x8B + ModRM(mod=01, reg=RAX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x8B);
         self.buf.emit_byte(0x44); // ModRM: mod=01, reg=RAX(000), r/m=SIB(100)
         self.buf.emit_byte(0xC8); // SIB: scale=3(11=*8), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
     /// Inline long/double element store (compact: 8 bytes/element). RAX=array, RCX=index, RDX=value.
     pub(super) fn emit_long_astore_regs(&mut self) {
-        // MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
+        // MOV QWORD [RAX + RCX*8 + ARRAY_DATA_OFFSET], RDX
         // Encoding: REX.W + 0x89 + ModRM(mod=01, reg=RDX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x89);
         self.buf.emit_byte(0x54); // ModRM: mod=01, reg=RDX(010), r/m=SIB(100)
         self.buf.emit_byte(0xC8); // SIB: scale=3(11=*8), index=RCX(001), base=RAX(000)
-        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit_byte(ARRAY_DATA_OFFSET as u8); // Cast: x86-64 immediate encoding
     }
 
     /// Inline arraylength. Assumes RAX=array ptr. Result in RAX.

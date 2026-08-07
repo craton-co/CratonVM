@@ -1,8 +1,8 @@
-# A `--features synthetic-jdk` binary run in real-JDK mode fails five suite classes the shipping build passes
+# A `--features synthetic-jdk` binary run in real-JDK mode fails three suite classes the shipping build passes
 
 | | |
 |---|---|
-| **Status** | OPEN — 2 of 7 closed; the remaining 5 are diagnosed below, each with its measured divergence |
+| **Status** | OPEN — 4 of 7 closed; the remaining 3 are diagnosed below, each with its measured divergence |
 | **Severity** | high **for measurement** — this is the configuration the vm test gate and the regression suite are usually run with |
 | **Modes** | built `--features synthetic-jdk`, run `--real-jdk`. The default `cratonvm-cli` build is unaffected |
 | **Opened** | 2026-08-06 |
@@ -17,12 +17,18 @@ Same source tree, same JDK 25 image, same host, same `regression-suite/run.sh`
 | `cargo build --release -p cratonvm-cli` (the shipping default) | **31 passed, 0 failed** |
 | `cargo build --release -p cratonvm-cli --features synthetic-jdk` | 26 passed, **5 failed** |
 
-Remaining: `RStrings`, `RCrypto`, `RChannelInterrupt`, `RFileTimes`,
-`RNioNoFollow`. Every one passes in the default build.
+Remaining: `RChannelInterrupt`, `RFileTimes`, `RNioNoFollow`. Every one passes
+in the default build.
 
 Closed so far: `RExecutorShutdown` (the blocking-queue family — see the retired
-`threadpoolexecutor-drops-queued-tasks-and-never-terminates` write-up) and
-`RSerial` (`java/io/StringWriter`, 2026-08-06).
+`threadpoolexecutor-drops-queued-tasks-and-never-terminates` write-up),
+`RSerial` (`java/io/StringWriter`), and `RStrings` + `RCrypto` together (the
+charset family, 2026-08-07).
+
+**Not part of this family:** `RSocketChannelInterrupt` started failing on `dev`
+on 2026-08-07 and fails in the DEFAULT build too (30 passed / 1 failed), so it
+is a plain `dev` regression rather than a feature-vs-default divergence. Do not
+fold it into this page.
 
 ## The mechanism
 
@@ -103,14 +109,76 @@ exactly this — "a real-JDK HeapCharBuffer/HeapByteBuffer whose field layout do
 not match our synthetic 5-field Buffer overlay used by the encoder native — so
 the encode loop reads zero chars".
 
-**A drop-list entry is NOT the fix here, measured.** Adding
-`CharsetEncoder`/`CharsetDecoder` to `drop_real_layout_synthetic` does not
-restore correct bytes: it makes `getBytes` *throw* inside
-`CharsetEncoder.encode` instead of returning zeros, and the suite stays at five
-failures. Unlike `StringWriter` and the queue family, this surface is
-load-bearing in real-JDK mode — the real encoder path depends on it. The fix has
-to make the coder natives correct for a real receiver (resolve the fields by
-name, or detect a real encoder and defer), not delete them.
+**FIXED 2026-08-07 — and the earlier "a drop-list entry is not the fix here"
+note on this page was WRONG.** It was recorded after dropping only
+`CharsetEncoder`/`CharsetDecoder`, seeing `getBytes` throw, and concluding the
+surface was load-bearing. The throw was not evidence of that; it was the next
+layer of the same defect showing through, and the note was written without ever
+reading the exception text. Whoever hits a partial result like that: capture the
+exception before drawing the conclusion.
+
+The family has to be dropped TOGETHER, and the order it was added in is the
+evidence:
+
+| dropped | `"abc".getBytes()` | `getBytes("UTF-8")` | `getBytes(UTF_8)` |
+|---|---|---|---|
+| nothing | `00 00 00` | `00 00 00` | `00 00 00` |
+| + `CharsetEncoder`/`Decoder` | `AbstractMethodError: CharsetEncoder.encodeLoop has no Code attribute` | same | same |
+| + `Charset` | `61 62 63` | `61 62 63` | `AbstractMethodError: Charset.newEncoder has no Code attribute` |
+| + `StandardCharsets` | `61 62 63` | `61 62 63` | `61 62 63` |
+
+Each step exposes the next fabricated ABSTRACT instance: the coder comes from a
+`Charset`, and the standard charset object comes from its own registrations. All
+four names are now in the `drop_real_layout_synthetic` family, so the real
+`sun.nio.cs` classes get constructed and every overload matches HotSpot.
+
+Measured on one dev tip, four builds:
+
+| build | change | suite |
+|---|---|---|
+| feature | none | 25 passed, 6 failed |
+| feature | charset family dropped | **27 passed, 4 failed** — `RStrings` and `RCrypto` green, nothing new |
+| default | none | 30 passed, 1 failed |
+| default | charset family dropped | 30 passed, 1 failed — **identical**, the shipping build is untouched |
+
+A/B/B/A on the feature build, and `--synthetic-jdk` mode output is
+byte-identical between the arms.
+
+### `RChannelInterrupt`: the receiver is the ABSTRACT class
+
+`AbstractMethodError: java/nio/channels/FileChannel.write(Ljava/nio/ByteBuffer;J)I
+has no Code attribute` is not a missing native. It is a receiver whose runtime
+class IS the abstract class, so every method that has no native to intercept it
+resolves to an abstract declaration:
+
+| | `FileChannel.open(...).getClass()` |
+|---|---|
+| HotSpot 25 | `sun.nio.ch.FileChannelImpl` |
+| default build | `sun.nio.ch.FileChannelImpl` |
+| feature build | **`java.nio.channels.FileChannel`** (superclass `AbstractInterruptibleChannel`) |
+
+Even the one-arg `write(ByteBuffer)` fails on it, not just the positional
+overload the suite happens to report.
+
+Two things ruled out by measurement:
+
+* **Not class resolution.** `Class.forName("sun.nio.ch.FileChannelImpl")`
+  answers identically in both builds — the real class, 65 declared methods,
+  with the 7-arg `open` present. So the concrete class IS available to the
+  feature build.
+* **Not the `newFileChannel` fallback.** `register_phase57_nio_file`'s
+  `FileSystemProvider.newFileChannel` shim already tries to build a real
+  `FileChannelImpl` first (the RECONCILE-WITH-REAL block) and only falls back
+  to `alloc_concurrent_synthetic("java/nio/channels/FileChannel", 1)` if that
+  fails. Instrumenting that closure with `eprintln!` and rebuilding produced
+  **no output at all** — it never runs for `FileChannel.open`. The abstract
+  instance comes from a producer that is still unidentified.
+
+The other `alloc_concurrent_synthetic("java/nio/channels/FileChannel", 1)` site
+is `RandomAccessFile.getChannel`, which this path does not go through. **Next
+step: find the third producer** — instrument `alloc_concurrent_synthetic` itself
+for that class name, or breakpoint on the allocation, rather than auditing
+registration sites by eye (two rounds of that found the wrong two).
 
 `RFileTimes` and `RNioNoFollow` did **not** reproduce from the naive one-liner
 (a plain `JarOutputStream` round-trip and a plain symlink `writeString` both
