@@ -246,11 +246,40 @@ Verified the admitted set does not move: corpus `chain_true` 917 -> 917,
 
 **Cumulative for §11: 217 -> 184 disjuncts, 343 lines.**
 
-**Still open:** the remaining 184 — 138 name a (class, method) pair that IS
-registered, 2 are class-only, and 44 name no class literal. None of those is
-licensed by this method; they need either behavioural evidence (the app-suite
-census) or a per-family judgement about whether the compatibility exception is
-still wanted. Plus §3's Matcher-leaf residual and the `jit_entry_publishable`
+### Seventh pass — §11 third tranche: 184 -> 179, and the static seam runs out
+
+Unreachability is exhausted: every remaining disjunct that names a
+(class, method) pair names one the registry does have. Two *redundancy*
+criteria — the entry adds nothing, rather than the entry cannot fire — find
+five more:
+
+* **Redundant with the chain's own first disjunct (2).** `check_override`
+  begins with `method.is_abstract()`, which §7 permits (step 3b). A name entry
+  whose every registered pair resolves to an image method that is
+  `declared && !has_code && !acc_native` is admitted before the name is
+  consulted: `SSLSocketFactory`/`sun.security.ssl` `createSocket`, and
+  `Iterable`/`Collection` `iterator`.
+* **Subsumed by an earlier entry (3).** Scoring each disjunct by its
+  *registered* coverage only (an unregistered pair cannot pass the `find()`
+  guard), three cover nothing an earlier disjunct already admits —
+  `FilterInputStream.<init>/skip`, Spring's
+  `createDocumentBuilderFactory`, and a **second copy** of
+  `InputStreamReader.close`.
+
+Verified the same way: corpus `chain_true` 926 -> 926, 20 -> 20 triples, diff
+empty, suite 31/31. (926 not 917 because `dev` added corpus classes between
+tranches; both arms of each A/B share a corpus.)
+
+**Cumulative for §11: 217 -> 179 disjuncts, 381 lines.**
+
+**The static seam is now closed.** The remaining 179 break down as 133 naming a
+(class, method) that is registered AND concrete, 2 class-only, and 44 naming no
+class literal. For those the question is no longer "can this fire?" — it can —
+but "is this compatibility exception still wanted?", which is a per-family
+decision needing app-suite evidence, not an analysis. That is the exercise the
+original record described, and it is what remains of §11.
+
+Also still open: §3's Matcher-leaf residual and the `jit_entry_publishable`
 half of §2, which refuses nothing per §1.
 
 ## 2026-08-04 status
