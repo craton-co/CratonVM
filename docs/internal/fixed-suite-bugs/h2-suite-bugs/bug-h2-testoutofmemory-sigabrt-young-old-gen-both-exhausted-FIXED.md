@@ -195,7 +195,7 @@ build aborts on the first one in both modes.
   `create table ... as select x, space(1000000+x) from system_range(1, 10000)`
   insert loop, progressing (frames differ between samples). That is the
   pre-existing, separately-tracked MVStore insert/commit throughput cliff —
-  `bug-h2-mvstore-insert-loop-perf-hang.md` in this directory, which already
+  `bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md` in this directory, which already
   calls itself "likely the dominant cause of the CratonVM-specific silent hangs".
   Not introduced here, and not fixable in this record.
 

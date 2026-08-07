@@ -367,6 +367,36 @@ fn layout_owner_slow(class_id: u32) -> Option<u32> {
         .filter(|&d| d != NO_LAYOUT_OWNER)
 }
 
+/// Whether `domain` may read `class_id`'s registered layout: either nobody has
+/// claimed the slot or `domain` is the claimant.
+///
+/// # why
+///
+/// The one predicate behind every domain screen in this module, so the
+/// allocation side ([`compact_object_body_size`]) and the read side
+/// ([`compact_field_storage_in`], [`compact_field_slot_in`],
+/// [`compact_object_field_storage_in`]) cannot drift apart — they answered
+/// differently for two months, which is the defect recorded as the converse of
+/// `HIB-DCAST-LATEPHASE.1`: allocation refused a foreign domain, the read path
+/// did not check at all, so a same-numbered `class_id` published by a different
+/// `ClassStore` resolved and was decoded as if it described this class. That
+/// failure is silent — the offsets are in range and the value looks plausible
+/// (`Float(3.25)` read back as `Int(1078984704)`), so unlike the un-resolvable
+/// layout it has no `SIGSEGV` and no guard to fire.
+///
+/// `None` (unclaimed) is permissive on purpose. It is also what
+/// [`layout_owner`]'s single-domain fast path answers for every `class_id`
+/// while the process has only ever had one `ClassStore` — which is every
+/// production embedding — so the whole screen costs one relaxed load of a
+/// process-global `AtomicU32` and a comparison there, with no registry lock.
+#[inline]
+fn layout_domain_owns(domain: u32, class_id: u32) -> bool {
+    match layout_owner(class_id) {
+        Some(owner) => owner == domain,
+        None => true,
+    }
+}
+
 /// Sentinel for "no layout registered here". Real domains start at 0, so the
 /// empty marker has to be a value `next_layout_domain` cannot return.
 const NO_LAYOUT_OWNER: u32 = u32::MAX;
@@ -484,14 +514,43 @@ pub fn unregister_class_layout(class_id: u32) {
     let Ok(index) = usize::try_from(class_id) else {
         return;
     };
-    // Release ownership too, or the slot stays reserved to a domain whose class
-    // is gone and no other VM could ever use it.
-    {
-        let mut owners = CLASS_LAYOUT_OWNERS.write().unwrap();
-        if let Some(slot) = owners.get_mut(index) {
-            *slot = NO_LAYOUT_OWNER;
-        }
-    }
+    // OWNERSHIP IS DELIBERATELY *NOT* RELEASED HERE. This used to write
+    // `NO_LAYOUT_OWNER` back, reasoning that "the slot stays reserved to a
+    // domain whose class is gone and no other VM could ever use it". Releasing
+    // it is what makes the READ path unsafe, and the cost of keeping it is
+    // nothing this process was going to get anyway:
+    //
+    //   * Keeping the stamp is what makes ownership MONOTONE per `class_id`.
+    //     `register_class_layout` already refuses a foreign domain, so with a
+    //     stamp that never moves, `CLASS_LAYOUTS[class_id]` can only ever hold
+    //     a layout published by the one domain that first claimed the slot.
+    //     Every object carrying `GC_FLAG_COMPACT` was sized by
+    //     `compact_object_body_size` against a layout its OWN domain owned (or
+    //     against an unclaimed slot its own domain then claimed), so the whole
+    //     flagged read path — `compact_object_field_storage`,
+    //     `class_layout_for_fields`, `with_class_layout`, every collector's
+    //     oop-map walk — resolves its own domain's layout *by construction*,
+    //     with no per-access domain check and no per-access cost.
+    //     `HIB-DCAST-LATEPHASE.1`'s converse (a foreign layout that resolves
+    //     SUCCESSFULLY, so no guard fires and the wrong field is read as a
+    //     right-looking value) needed this window: unload in domain A releases
+    //     the slot, domain B claims it, and A's still-live compact instances —
+    //     which keep their `class_id` in the header — start decoding through
+    //     B's offsets and storage kinds.
+    //
+    //   * Releasing it buys almost nothing. `ClassStore` hands out
+    //     `ClassId::new(self.classes.len())` and never reuses a slot, so every
+    //     store walks the same low ids from 0; by the time domain B could
+    //     claim an id that domain A abandoned, A has already claimed (and B has
+    //     already been refused, see `foreign_layout_refusals`) every id in that
+    //     range. What is given up is a compact layout for one id in one of the
+    //     rare multi-`ClassStore` processes — the class simply allocates with
+    //     tagged slots, which carry their own type and are always correct.
+    //
+    // The layout, the version map and the generation ARE still cleared below:
+    // an unloaded class must stop resolving. Only the domain stamp survives.
+    // `clear_class_layouts` (test/debug-only) still wipes owners, so it remains
+    // a full registry reset.
     {
         // O(this class's versions), not O(every registered version): see
         // `CLASS_LAYOUT_VERSION_KEYS`. Versions lock first, matching
@@ -897,6 +956,15 @@ pub fn with_class_layout<R>(
 /// immutable once registered — redefines replace the Arc and bump the
 /// generation — so a generation-validated hit can never serve a stale
 /// layout.
+///
+/// # DOMAIN-BLIND — prefer [`compact_field_slot_in`] when a domain is in hand
+///
+/// This form is keyed on `class_id` ALONE, and `class_id` is a per-`ClassStore`
+/// index that every `ClassStore` restarts from 0. It therefore answers `Some`
+/// for a class the CALLER'S VM never registered, using whichever VM did claim
+/// that number — with no compact-flag check, no field-count match, and no
+/// domain screen. See `layout_domain_owns` for what that costs and
+/// [`compact_field_slot_in`] for the screened form.
 #[inline]
 pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> {
     compact_field_storage(class_id, index)
@@ -904,6 +972,9 @@ pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> 
 }
 
 /// `(byte_offset, storage_kind)` for a field in a registered compact layout.
+///
+/// DOMAIN-BLIND; see [`compact_field_slot`]'s note and
+/// [`compact_field_storage_in`].
 #[inline]
 pub fn compact_field_storage(
     class_id: u32,
@@ -916,6 +987,56 @@ pub fn compact_field_storage(
         ))
     })
     .flatten()
+}
+
+/// [`compact_field_slot`] screened against the caller's layout domain: `None`
+/// unless `domain` owns `class_id`'s registered layout.
+///
+/// # why
+///
+/// The `class_id`-only accessors are the ONE read path a foreign domain reaches
+/// without any race, class unload, or ownership transfer, because they check
+/// neither `GC_FLAG_COMPACT` nor the object's field count. `register_class_layout`
+/// refuses a slot another domain already owns, so in a multi-`ClassStore`
+/// process the second VM's classes have no layout of their own — and this
+/// lookup then hands that VM the FIRST VM's offsets and storage kinds for the
+/// same number. `jit/src/lib.rs`'s `StringFieldLayout` states the invariant
+/// this breaks in so many words ("Neither condition can produce an instance
+/// carrying `GC_FLAG_COMPACT` ... so the compact arm is unreachable"): under two
+/// domains a `Some` here no longer implies the caller's own instances are
+/// compact, nor that the offsets describe the caller's class.
+///
+/// Callers that hold a heap or a `ClassStore` have the domain already
+/// (`Heap::layout_domain()` / `ClassStore::layout_domain()`); this exists so
+/// they can pass it instead of threading a new parameter through
+/// [`with_class_layout`], whose ~20 collector call sites are covered instead by
+/// the ownership monotonicity that [`unregister_class_layout`] now preserves.
+///
+/// PERF: one relaxed load of a process-global `AtomicU32` plus a comparison on
+/// top of [`compact_field_slot`] — no registry lock — for as long as the process
+/// has had a single `ClassStore`. See `layout_domain_owns`.
+#[inline]
+pub fn compact_field_slot_in(
+    domain: u32,
+    class_id: u32,
+    index: usize,
+) -> Option<(usize, bool)> {
+    compact_field_storage_in(domain, class_id, index)
+        .map(|(offset, storage)| (offset, storage.is_reference()))
+}
+
+/// [`compact_field_storage`] screened against the caller's layout domain.
+/// See [`compact_field_slot_in`] for why, and `layout_domain_owns` for cost.
+#[inline]
+pub fn compact_field_storage_in(
+    domain: u32,
+    class_id: u32,
+    index: usize,
+) -> Option<(usize, FieldStorageKind)> {
+    if !layout_domain_owns(domain, class_id) {
+        return None;
+    }
+    compact_field_storage(class_id, index)
 }
 
 /// Return the compact body size when `class_id` has a complete layout matching
@@ -938,9 +1059,11 @@ pub fn compact_object_body_size(
     // nothing else: the object is allocated with tagged slots, which carry
     // their own type. Answering with the foreign layout corrupts every field
     // access the object will ever see.
-    match layout_owner(class_id) {
-        Some(owner) if owner != domain => return None,
-        _ => {}
+    //
+    // Via `layout_domain_owns` rather than inline, so the read-side screens
+    // (`compact_field_storage_in` and friends) are literally the same test.
+    if !layout_domain_owns(domain, class_id) {
+        return None;
     }
     with_current_class_layout(class_id, |layout| {
         (layout.field_count() == field_count).then_some(layout.body_size as usize)
@@ -949,6 +1072,20 @@ pub fn compact_object_body_size(
 }
 
 /// Resolve a field of an object that is actually marked compact.
+///
+/// # Domain safety
+///
+/// This form takes no domain and does not need one, because an object can only
+/// carry `GC_FLAG_COMPACT` if [`compact_object_body_size`] sized it against a
+/// layout its own domain owned, and ownership of a `class_id` slot is MONOTONE:
+/// [`register_class_layout`] refuses a foreign domain and
+/// [`unregister_class_layout`] no longer releases the stamp. See the latter for
+/// the window that used to exist (unload in domain A, re-claim by domain B,
+/// A's still-live compact instances decoded through B's offsets) and why
+/// closing it there costs nothing per access.
+///
+/// [`compact_object_field_storage_in`] is the belt-and-braces form for callers
+/// that would rather assert the domain than rely on that argument.
 #[inline]
 pub fn compact_object_field_storage(
     header: &ObjectHeader,
@@ -962,6 +1099,35 @@ pub fn compact_object_field_storage(
         layout.field_offset(index)? as usize,
         layout.field_storage(index)?,
     ))
+}
+
+/// [`compact_object_field_storage`] with an explicit domain screen: `None` when
+/// `domain` does not own `header.class_id`'s registered layout.
+///
+/// # why
+///
+/// `HIB-DCAST-LATEPHASE.1` gave the mutator accessors a guard for a compact
+/// receiver whose layout does NOT resolve (`gc/src/gen_heap.rs::get_field`,
+/// `gc/src/g1.rs`): a logged null read instead of striding a compact-sized body
+/// as legacy 16-byte cells. Returning `None` from here routes the converse —
+/// a compact receiver whose layout resolves against a FOREIGN domain — into
+/// that same guard, turning a silent wrong-field read into a
+/// `cratonvm::gc::guard` record. Deliberately `None` and not a panic: those
+/// guards' own comments give the reason (a corrupt receiver must let the Java
+/// side surface an error, not abort the JVM).
+///
+/// PERF: one relaxed load plus a comparison ahead of the existing lookup while
+/// the process has a single `ClassStore`; see `layout_domain_owns`.
+#[inline]
+pub fn compact_object_field_storage_in(
+    domain: u32,
+    header: &ObjectHeader,
+    index: usize,
+) -> Option<(usize, FieldStorageKind)> {
+    if !layout_domain_owns(domain, header.class_id.as_u32()) {
+        return None;
+    }
+    compact_object_field_storage(header, index)
 }
 
 /// Atomically read a tagless compact field and reconstruct its VM `Value`.
@@ -1118,7 +1284,7 @@ pub fn clear_class_layouts() {
 /// Decided per-object via the [`GC_FLAG_COMPACT`] header bit (set at alloc).
 #[inline]
 pub fn is_compact_object(header: &ObjectHeader) -> bool {
-    header.gc_flags & GC_FLAG_COMPACT != 0
+    header.gc_flags() & GC_FLAG_COMPACT != 0
 }
 
 /// The body size [`object_body_size`] returns whenever it cannot establish a
@@ -1238,7 +1404,6 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Reference,
             0,
-            0,
             33_000_000, // far past the 1<<24 (~16.7M) cap
         );
         assert_eq!(object_body_size(&header), IMPLAUSIBLE_BODY_SIZE);
@@ -1256,7 +1421,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::Object,
             ArrayElementType::Reference,
-            0,
             0,
             4,
         );
@@ -1280,10 +1444,9 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Reference,
             0,
-            0,
             4,
         );
-        header.gc_flags |= GC_FLAG_COMPACT;
+        header.add_gc_flags(GC_FLAG_COMPACT);
         assert_eq!(object_body_size(&header), IMPLAUSIBLE_BODY_SIZE);
         assert_ne!(
             HEADER_SIZE + object_body_size(&header),
@@ -1814,6 +1977,137 @@ mod tests {
         register_class_layout(FIRST_LAYOUT_DOMAIN, 0, Arc::clone(&layout));
         assert!(Arc::ptr_eq(&class_layout(0).unwrap(), &layout));
         assert!(class_layout(u32::MAX).is_none());
+        clear_class_layouts();
+    }
+
+    // --- layout domains: the read side of `HIB-DCAST-LATEPHASE.1` ------------
+    //
+    // These two tests are the only ones in this module that need a SECOND
+    // layout domain, and calling `next_layout_domain` permanently advances the
+    // process-global counter, which retires `layout_owner`'s single-domain fast
+    // path for the rest of this test binary. That is deliberate and harmless
+    // here: every other test registers under `FIRST_LAYOUT_DOMAIN` after a
+    // `clear_class_layouts` (which wipes the owners table), so the slow path
+    // they now take answers "unclaimed" or "owner == domain" for each of them
+    // exactly as the fast path did. There is no wall-clock or ordering
+    // assumption in either direction.
+
+    /// A foreign domain must get `None` from the `class_id`-only read
+    /// accessors, not another `ClassStore`'s offsets.
+    ///
+    /// This is the path a second VM reaches with no race and no class unload:
+    /// `register_class_layout` refuses its registration, so its class has no
+    /// layout of its own — and the unscreened lookup then answers with the
+    /// first VM's. Wrong field, right-looking value, no guard.
+    #[test]
+    fn foreign_domain_gets_none_from_the_class_id_keyed_accessors() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        let owner_domain = next_layout_domain();
+        let foreign_domain = next_layout_domain();
+        assert_ne!(owner_domain, foreign_domain);
+
+        register_class_layout(owner_domain, 90, one_ref_layout(8));
+
+        assert_eq!(
+            compact_field_slot_in(owner_domain, 90, 0),
+            Some((0, true)),
+            "the owning domain must still resolve its own layout"
+        );
+        assert!(compact_field_storage_in(owner_domain, 90, 0).is_some());
+
+        assert_eq!(
+            compact_field_slot_in(foreign_domain, 90, 0),
+            None,
+            "a foreign domain must be refused, not served another class's offsets"
+        );
+        assert!(compact_field_storage_in(foreign_domain, 90, 0).is_none());
+
+        // The unscreened forms are the hazard being documented: they answer for
+        // anyone. Pinned so that if they ever grow a screen of their own, this
+        // test fails loudly instead of quietly becoming redundant.
+        assert!(
+            compact_field_storage(90, 0).is_some(),
+            "compact_field_storage is domain-blind by contract"
+        );
+        clear_class_layouts();
+    }
+
+    /// Unloading a class must NOT hand its `class_id` slot to another domain.
+    ///
+    /// The layout itself has to go (an unloaded class must stop resolving), but
+    /// releasing the OWNER stamp is what let domain B claim a slot whose
+    /// still-live compact instances in domain A keep the same `class_id` in
+    /// their headers — after which A decodes them through B's offsets and
+    /// storage kinds, silently. Ownership monotonicity is what lets the whole
+    /// flagged read path stay domain-free and pay nothing per access.
+    #[test]
+    fn unregister_keeps_the_slot_reserved_to_its_original_domain() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        let owner_domain = next_layout_domain();
+        let foreign_domain = next_layout_domain();
+        assert_ne!(owner_domain, foreign_domain);
+
+        register_class_layout(owner_domain, 91, one_ref_layout(8));
+        unregister_class_layout(91);
+        assert!(
+            class_layout(91).is_none(),
+            "unregister must still drop the layout — an unloaded class cannot resolve"
+        );
+
+        let refusals_before = foreign_layout_refusals();
+        register_class_layout(foreign_domain, 91, one_ref_layout(16));
+        assert!(
+            foreign_layout_refusals() > refusals_before,
+            "a foreign domain's registration into an unloaded slot must be refused"
+        );
+        assert!(
+            class_layout(91).is_none(),
+            "the foreign domain must not have claimed the slot"
+        );
+        assert!(
+            compact_field_storage_in(foreign_domain, 91, 0).is_none(),
+            "and must not read through it either"
+        );
+
+        // The original owner may still re-register: this is exactly the
+        // unload-then-redefine flow, and it must not be collateral damage.
+        register_class_layout(owner_domain, 91, one_ref_layout(24));
+        assert_eq!(class_layout(91).map(|l| l.body_size), Some(24));
+        clear_class_layouts();
+    }
+
+    /// The object-carrying accessor's explicit screen: a compact receiver whose
+    /// `class_id` belongs to another domain must read as `None`, which routes it
+    /// into the `HIB-DCAST-LATEPHASE.1` guard in `gc/src/gen_heap.rs::get_field`
+    /// (a logged null read) instead of a wrong-offset field access.
+    #[test]
+    fn compact_object_field_storage_in_screens_a_foreign_domain() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        let owner_domain = next_layout_domain();
+        let foreign_domain = next_layout_domain();
+        assert_ne!(owner_domain, foreign_domain);
+
+        register_class_layout(owner_domain, 92, one_ref_layout(8));
+        let mut header = ObjectHeader::new(
+            ClassId::new(92),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            1, // one field: matches `one_ref_layout`'s field count
+        );
+        header.add_gc_flags(GC_FLAG_COMPACT);
+
+        assert!(
+            compact_object_field_storage_in(owner_domain, &header, 0).is_some(),
+            "the owning domain must still resolve its own compact receiver"
+        );
+        assert!(
+            compact_object_field_storage_in(foreign_domain, &header, 0).is_none(),
+            "a foreign domain must degrade to the guard, not to wrong offsets"
+        );
         clear_class_layouts();
     }
 

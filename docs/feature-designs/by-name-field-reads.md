@@ -323,7 +323,15 @@ family.
 
 *This is a behaviour change for every native in the tree* and must not be
 folded into a call-site fix. Expect fallout in natives that today rely on the
-`Int(0)`-means-absent behaviour; `lang_misc::init_suppressed_sentinel` documents
+`Int(0)`-means-absent behaviour
+(**terminology, 2026-08-07:** read that as *unwritten*, not *absent*. This
+document's own §1 table is the authority — an **absent** field answers
+`Object(None)` from production `get_field_by_name`; `Int(0)` is what a
+present-but-**unwritten** slot decodes to. Several records elsewhere in `docs/`
+took the loose phrasing literally and built layout discriminators on it; see
+[§4 of *Natives over real JDK
+classes*](../architecture/natives-over-real-jdk-classes.md));
+`lang_misc::init_suppressed_sentinel` documents
 relying on it explicitly, and `read_throwable_field`
 (`native-builtins/src/lang_misc.rs:128`) was broken once by not accounting for
 it. Land it on its own, with the synthetic-jdk VM gate green on both platforms.

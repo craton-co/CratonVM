@@ -3777,6 +3777,7 @@ fn constructor_meta_from_constructor_object(
         access_flags,
         declaring_class_id,
         exceptions: Vec::new(),
+        signature: None,
     })
 }
 
@@ -7044,6 +7045,7 @@ mod wp02_tests {
             access_flags: flags,
             declaring_class_id: declaring,
             exceptions: Vec::new(),
+            signature: None,
         }
     }
 

@@ -805,7 +805,7 @@ impl SharedVm {
     /// entries whose Throwable was collected. The registry deliberately does
     /// not keep its key object alive; `is_object_address` is the collector's
     /// stable post-collection liveness probe.
-    pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &cratonvm_types::PointerMap) {
         let mut traces = self.threads.throwable_stacks.write();
         traces.retain(|_, trace| {
             let old_addr = trace.throwable.as_ptr() as usize;
@@ -1431,6 +1431,23 @@ impl SharedVm {
             }
         }
 
+        // --- ZGC relocation --------------------------------------------------
+        //
+        // Beside the compressed-oops gate above because it is the same shape: a
+        // GC capability the JIT has not been taught about, decided once, here,
+        // while the heap is young enough for the answer to be honoured.
+        //
+        // `RELOCATION_REQUESTED` stands in for the eventual relocation switch.
+        // Nothing requests relocation today — see `zgc_relocation_permitted` —
+        // so this is inert, which is the point: the gate is placed AHEAD of the
+        // capability. Whoever wires the switch replaces this constant and
+        // inherits the refusal rather than having to remember it.
+        #[cfg(feature = "zgc")]
+        if gc_backend == GcBackend::Zgc {
+            const RELOCATION_REQUESTED: bool = false;
+            let _zgc_relocation = zgc_relocation_permitted(RELOCATION_REQUESTED);
+        }
+
         // bug-h2-largeblob-direct-memory-oom fix — resolve the process-wide
         // direct-buffer accounting cap (java.nio.Bits.reserveMemory's ceiling)
         // the same way real JDK resolves `-XX:MaxDirectMemorySize`: an
@@ -1932,6 +1949,36 @@ impl SharedVm {
                 // in the real JDK (abstract methods have no Code attribute) and our synthetic
                 // Path objects need native dispatch.
                 cratonvm_native_builtins::phases_late::register_phase57_nio_file(
+                    &mut native_methods,
+                );
+                // 2026-08-07: the jar/zip bridge, which this arm was missing.
+                //
+                // This is a REAL-JDK arm, so it has to register what the shipping
+                // real-JDK arm below registers — the two arms differ only in what
+                // the feature COMPILED IN, never in which class library is loaded.
+                // These three were registered in that arm and not in this one, so
+                // a `--features synthetic-jdk` binary run `--real-jdk` fell back to
+                // `native-io`'s `zip_real_jar` surface for `JarFile`.
+                //
+                // That surface builds its entry objects with `alloc_zip_entry`
+                // unconditionally, so `JarFile.entries()`, `getJarEntry()` and
+                // `getEntry()` all handed back a bare `java.util.zip.ZipEntry`.
+                // `JarFile.entries()` is declared `Enumeration<JarEntry>`, so the
+                // implicit checkcast the compiler emits at the call site threw
+                // `ClassCastException: java.util.zip.ZipEntry cannot be cast to
+                // java.util.jar.JarEntry` — measured by `regression-suite`'s
+                // `RFileTimes`, and it would hit any caller that iterates a jar.
+                // `register_p59_jar` is force-listed in `native_override.rs` for
+                // exactly these methods, so registering it here makes it win, and
+                // it answers `java.util.jar.JarEntry` like the shipping build.
+                //
+                // Kept in the shipping arm's order (nio_file → file → jar → bulk
+                // → zip-output) because this registry is last-write-wins.
+                cratonvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+                cratonvm_native_builtins::phases_late::register_p59_bulk_stream_transfer(
+                    &mut native_methods,
+                );
+                cratonvm_native_builtins::phases_late::register_p59_zip_output_primitives(
                     &mut native_methods,
                 );
                 // KC26: Register URL codec (URLDecoder/URLEncoder) natives — the real JDK
@@ -3659,6 +3706,73 @@ impl SharedVm {
 
         vm
     }
+}
+
+/// Whether ZGC **relocation** may run in this configuration — a refusal, not a
+/// warning.
+///
+/// `requested` is the eventual relocation switch. There is none today: no
+/// `-XX:` option, no `CRATONVM_*` name in `types/src/flag_groups.rs`, no field
+/// on `crate::config::VmConfig`, and `gc/src/zgc/relocate.rs` has no caller —
+/// `ZgcRealHeap` is still the non-moving stop-the-world mark-sweep it has
+/// always been. So the one call site passes a `false` constant and this gate is
+/// a no-op. It exists anyway because a gate added *after* the capability it
+/// guards is a gate that shipped one release too late.
+///
+/// # Why a refusal
+///
+/// Under a relocating ZGC a reference slot holds a *colored* word, not a
+/// machine pointer: a heap offset plus metadata bits plus `Z_COLORED_TAG` at
+/// bit 63 (`gc/src/zgc/vaddr.rs`). The load barrier
+/// (`gc/src/zgc/barrier.rs`) is what turns that word into a live address and
+/// heals the slot, and the interpreter takes it on every read. JIT-compiled
+/// code does not: there are nine raw reference-load emission points across the
+/// baseline and optimizing x64 tiers — `getfield`, `getstatic`, `aaload`, the
+/// `String.value` intrinsic, the LICM hoist, the SIMD row load — and the helper
+/// arms that do reach Rust run the loaded word through `plausible_heap_pointer`
+/// and answer `0` when it fails, which a colored word is designed to do.
+///
+/// So compiled code reads either a stale from-space address into an evacuated
+/// object (use-after-free) or a spurious `null` for a live one (a wrong answer,
+/// silently). Unlike the compressed-oops gate in `SharedVm::new`, whose
+/// degraded mode is "slower but correct", there is no correct degraded mode
+/// here, so this returns `false` rather than logging and continuing.
+///
+/// Refusing *relocation* rather than the *JIT* is deliberate: it degrades ZGC
+/// to the non-moving collector it already is, instead of degrading the whole VM
+/// to the interpreter.
+///
+/// # What lifts the gate
+///
+/// Stage (a) of `docs/feature-designs/zgc-jit-load-barrier.md`: the barrier
+/// inside the `jit_getfield` / `jit_aaload` / `jit_getstatic` helpers, the
+/// inline arms routed to those helpers behind the JIT-side kill switch, and the
+/// seven value-degrading plausibility filters removed from the load path. Until
+/// then the permitted relocating configuration is "JIT off".
+#[cfg(feature = "zgc")]
+pub fn zgc_relocation_permitted(requested: bool) -> bool {
+    if !requested {
+        return false;
+    }
+    if crate::runtime::env_cache::disable_jit() {
+        return true;
+    }
+    // Reported on stderr, not just through `tracing`, for the reason the
+    // compressed-oops gate states: a silent fallback would look identical to a
+    // successful run, and the operator must see which one they got. The stakes
+    // are higher here — the un-refused configuration corrupts the heap rather
+    // than merely using more of it.
+    eprintln!(
+        "[cratonvm] ZGC relocation requested but the JIT is enabled - relocation \
+         REFUSED, running the non-moving mark-sweep instead. JIT-compiled code \
+         loads reference fields without the ZGC load barrier, so a relocating \
+         cycle would hand it stale pointers into evacuated objects \
+         (use-after-free) or a spurious null for a live object, with no error \
+         path. Re-run with --nojit (CRATONVM_DISABLE_JIT=1) to get relocation, \
+         or wait for the JIT-side load barrier - stage (a) of \
+         docs/feature-designs/zgc-jit-load-barrier.md."
+    );
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -8571,8 +8685,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
                 HprofObjectInfo {
                     object_id: ptr as u64,
                     class_id: header.class_id.as_u32(),
-                    is_array: header.kind == ObjectKind::Array,
-                    element_type: header.element_type as u8,
+                    is_array: header.kind() == ObjectKind::Array,
+                    element_type: header.element_type() as u8,
                     array_length: header.array_length(),
                     total_size: size,
                     data_ptr: ptr as *const u8,

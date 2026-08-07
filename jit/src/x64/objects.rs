@@ -202,7 +202,7 @@ impl Compiler {
     ) {
         self.emit_test_mem8_imm8(
             base,
-            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
             cratonvm_types::GC_FLAG_COMPACT,
         );
         let legacy = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear => legacy)
@@ -289,7 +289,7 @@ impl Compiler {
     ) {
         self.emit_test_mem8_imm8(
             base,
-            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
             cratonvm_types::GC_FLAG_COMPACT,
         );
         let legacy = self.emit_jcc_rel32_patch(0x84);
@@ -506,7 +506,7 @@ impl Compiler {
         // synthetic/native allocation used a mismatched slot count.
         self.emit_test_mem8_imm8(
             RAX,
-            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
             cratonvm_types::GC_FLAG_COMPACT,
         );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
@@ -516,7 +516,7 @@ impl Compiler {
         if !self.inline_card_mark_available() {
             self.emit_test_mem8_imm8(
                 RAX,
-                cratonvm_types::GC_FLAGS_OFFSET as i32,
+                cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                 cratonvm_types::GC_FLAG_OLD_GEN,
             );
             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
@@ -603,14 +603,14 @@ impl Compiler {
         bail.extend(self.emit_trusted_oop_receiver_check());
         self.emit_test_mem8_imm8(
             RAX,
-            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
             cratonvm_types::GC_FLAG_COMPACT,
         );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
         if !self.inline_card_mark_available() {
             self.emit_test_mem8_imm8(
                 RAX,
-                cratonvm_types::GC_FLAGS_OFFSET as i32,
+                cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
                 cratonvm_types::GC_FLAG_OLD_GEN,
             );
             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
@@ -886,16 +886,25 @@ impl Compiler {
         // invariant is at the *allocator* — write the four header bytes
         // (and the four array_length bytes) explicitly. Two extra dwords
         // per `new` is negligible vs. the safety guarantee.
-        // `OBJECT_KIND_OFFSET` (4) names the dword that packs
-        // kind/element_type/gc_age/gc_flags; `IDENTITY_HASH_CODE_OFFSET` (8)
-        // names the identity-hash dword. Both were bare literals until the
+        // `KIND_TAGS_BYTE_OFFSET` (4) names the dword that packs
+        // kind/element_type/gc_age/gc_flags. It was a bare literal until the
         // 2026-07-26 header-offset audit — see
         // `arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
-        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
-        if !zero_elision {
-            // identity_hash_code = 0 (lazy-mint contract).
-            self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
-        }
+        let mut compact_flag_pending = false;
+        // NO separate quartet store any more, and removing it is a fix rather
+        // than a tidy-up. `kind` / `element_type` / `gc_age` / `gc_flags` used
+        // to be four bytes at offset 4, zeroed with one dword store. They are
+        // now bits 48..62 of the mark word, and the mechanical offset sweep
+        // pointed that same DWORD store at byte 14 -- which spans 14..18 and
+        // runs two bytes PAST a 16-byte header, into the object body.
+        //
+        // `header_offset_emission_site_inventory_matches_the_doc` and
+        // `inline_tlab_header_writes_stay_inside_the_header` both caught it,
+        // which is exactly what that contract module is for.
+        //
+        // The mark-word zeroing below subsumes it: a plain object wants
+        // kind=Object(0) and element_type=Reference(0), so the quartet bits it
+        // needs are all zero anyway.
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
@@ -910,33 +919,55 @@ impl Compiler {
                     "[compact-inline] new class_id={class_id_raw} body={body} total={total_size}"
                 );
             }
-            // `GC_FLAGS_OFFSET` (7) is byte 3 of the dword at
-            // `OBJECT_KIND_OFFSET` (4), hence the `<< 24`. The shift is only
-            // correct while `GC_FLAGS_OFFSET - OBJECT_KIND_OFFSET == 3`;
-            // `header_offset_contract_gc_flags_is_byte3_of_kind_dword` pins it.
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                cratonvm_types::OBJECT_KIND_OFFSET as i32,
-                (cratonvm_types::GC_FLAG_COMPACT as i32)
-                    << (8 * (cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET)),
-            );
+            // A BYTE store, not a dword. `gc_flags` occupies bits 0..4 of the
+            // mark word's byte 7, so the flag constants are still the right
+            // mask -- but a dword store at that offset would write 15..19 and
+            // run past a 16-byte header into the body.
+            //
+            // Writing the whole byte is safe only because `gc_age` shares it
+            // and is 0 at allocation. Deferred until after the mark-word
+            // zeroing below, which would otherwise erase it.
+            compact_flag_pending = true;
         }
-        // The opt-out also retains the older defensive mark_word stores. The
-        // default path gets their required zero values from the refill
-        // invariant; the field is not subsequently published with a non-zero
-        // initialization value.
+        // UNCONDITIONAL, and `zero_elision` must never gate it again.
         //
-        // The two `forwarding_ptr` stores that used to lead this block are gone
-        // with the field itself (the 32 -> 24 header shrink). Zeroing the mark
-        // word is now doing BOTH jobs — `MARK_NEUTRAL` is 0 and so is
-        // "not forwarded" — which is why this block still covers 8 bytes and
-        // not 16.
-        if !zero_elision {
-            self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
-            self.emit_mov_dword_mem_disp32_imm32(
+        // This was `if !zero_elision` for one release and it broke the Spring
+        // Boot suite outright: 178 of the first 184 classes died in JUnit
+        // discovery with `gen_heap::read_slot: corrupt Value cell`.
+        //
+        // The reason is that the mark word stopped being defensive padding and
+        // became CONTENT. It carries `kind`, `element_type`, `gc_age` and
+        // `gc_flags` in bits 48..62 as of the 24 -> 16 shrink. Skipping the
+        // write leaves an object wearing whatever the TLAB slot happened to
+        // hold: a stale `GC_FLAG_COMPACT` makes every accessor read a legacy
+        // tagged-`Value` object as bare compact pointers -- which is exactly
+        // what that diagnostic reports -- and a stale `kind` turns an object
+        // into an array or a region sentinel mid-walk.
+        //
+        // `zero_elision` is default-ON (opt-out only), so this was not a corner
+        // case; it was every JIT-inline allocation in the process.
+        //
+        // The dword store this replaced -- `kind`/`element_type`/`gc_age`/
+        // `gc_flags` at offset 4 -- was itself unconditional, and for exactly
+        // this reason. The comment above it already said why: "the historical
+        // assumption 'TLAB refill zeroes the region' was empirically violated
+        // on long runs". Moving those four bytes into the mark word did not
+        // move that argument with them; folding the write into the elision
+        // branch silently dropped it. Two dwords per `new` is the same price
+        // that comment already judged negligible.
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            0,
+        );
+
+        // AFTER the mark-word zeroing, which would otherwise erase it.
+        if compact_flag_pending {
+            self.emit_mov_byte_mem_disp32_imm8(
                 R11,
-                cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
-                0,
+                cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32,
+                cratonvm_types::GC_FLAG_COMPACT,
             );
         }
 

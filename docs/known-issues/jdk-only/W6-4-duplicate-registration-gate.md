@@ -1,12 +1,31 @@
 # Duplicate registration: the species, the gate, and one live instance
 
-**Status:** the gate ships. The analysis API is in `native-api`, the ratchet is
-in `native-builtins/tests/duplicate_registration_gate.rs`, and its two numeric
-baselines are seeded `0` — they are filled in by the first run, on purpose (see
-*Seeding*). One previously-unrecorded live defect fell out of building it and is
+**Status:** the gate ships, and is now **seeded from its first real run**
+(2026-08-07): 1206 shadowed registrations, 53 of them with a kind disagreement.
+The analysis API is in `native-api`, the ratchet is in
+`native-builtins/tests/duplicate_registration_gate.rs`. See *Seeding* for the
+numbers, and for why the first run took two months to happen. One previously-unrecorded live defect fell out of building it and is
 written up under *The unjustified one*.
 
 Filed 2026-08-07 (JDK-only wave 2, lane W6-4).
+
+> **2026-08-07 — two qualifications on "the gate ships", both verified against
+> the tree.**
+>
+> 1. **Nothing runs it.** `duplicate_registration_gate` appears nowhere in
+>    `.github/workflows/ci.yml`, which wires `stub_ratchet` and
+>    `regression-suite/bridge-ratchet.sh` but not this. So the seed described
+>    under *Seeding* has not been taken by CI either, and the ratchet is not
+>    guarding anything until someone adds the step and pastes the numbers.
+> 2. **The number, once taken, will be scoped.** The gate's own header says it:
+>    it observes only the registrars `vm_init_real_jdk_boot_path` calls, minus
+>    everything `register` drops before it can push a row. **The whole
+>    synthetic-JDK registration graph is invisible to it** — 154 triples
+>    registered by both `register_essential_natives_with_shims` and
+>    `register_synthetic_overrides` in `native-builtins/src/lib.rs` alone. Read
+>    [§7 of *Natives over real JDK
+>    classes*](../../architecture/natives-over-real-jdk-classes.md) before
+>    quoting `BASELINE_SHADOWED` anywhere.
 
 ## The species
 
@@ -89,8 +108,29 @@ an order inversion with no baseline and ratchets unmodelled registrars at 2.
 
 ### Seeding
 
-`BASELINE_SHADOWED` and `BASELINE_KIND_DISAGREEMENTS` are `0`, so the two
-ratchets are **RED until one run pastes the real numbers in**. This is the
+**Seeded 2026-08-07 at dev `1082eb446`: `BASELINE_SHADOWED = 1206`,
+`BASELINE_KIND_DISAGREEMENTS = 53`.** Both are ratchet ceilings, not
+approvals — every one of the 1206 is a callback that can never be dispatched,
+and each of the 53 is a winner that disagrees with the loser about what the
+native IS. They are the number to drive DOWN; the assert only ever forbids
+going up.
+
+Why it took until now, since the procedure below is one command: the gate is a
+`cargo test` target, and `cargo test --workspace` is the LAST step of ci.yml's
+`build-and-test` job, behind `cargo fmt --all --check` — which fails on every
+push (2442 diffs at that tip), and GitHub Actions skips every later step once
+one fails. So this ratchet had never run in CI at all. The same blindness is
+what let a shadowed `java/nio/CharBuffer.toString()` ship an empty string
+through every reflective route (`fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md`);
+deleting that duplicate is why the count reads 1206 and not 1207. Formatting
+now runs as its own CI job so it can no longer stand in front of the
+correctness gates.
+
+The original seeding note follows, because the reasoning still governs any
+future change to these numbers.
+
+`BASELINE_SHADOWED` and `BASELINE_KIND_DISAGREEMENTS` were `0`, so the two
+ratchets were **RED until one run pasted the real numbers in**. This is the
 procedure `stub_ratchet.rs` documents for its own baseline, and the alternative
 is worse: a baseline seeded above the true count is a gate that silently
 tolerates every duplicate below it — which is the failure this species already
@@ -127,9 +167,29 @@ justification being the comment already at each site.
 
 ## The unjustified one
 
-**`java.util.concurrent.locks.StampedLock` is served by two different
+> **REFUTED 2026-08-07 by lane W6-12 — leave this section as the record of how
+> the census misled, not as a defect.** See
+> [`W6-12-stampedlock-split-brain.md`](W6-12-stampedlock-split-brain.md). The
+> losing registrar `native-collections/src/lib.rs::register_stamped_lock_natives`
+> was disabled at its **call site** on 2026-07-28 (`let _ = register_stamped_lock_natives;`,
+> a dead-code silencer) and has since been deleted from the file outright — the
+> tombstone comment is still there. It never registered anything, so nothing
+> below about "the collections version wins those eleven" happened.
+>
+> **The methodological finding is the durable part**, and it generalises past
+> this one case: *a census that counts `r.register(...)` sites inside a registrar
+> function does not ask whether the function is reachable.* That is the same
+> scoping trap as the runtime one in
+> [§7 of *Natives over real JDK
+> classes*](../../architecture/natives-over-real-jdk-classes.md) — a registrar
+> reachable only from `register_synthetic_overrides` cannot register in real-JDK
+> mode at all. W6-12 proposes the missing column: *is the registrar reachable
+> from `vm_init` in the configuration under test*. The live split-brain the
+> brief was really describing turned out to be `Phaser`.
+
+~~**`java.util.concurrent.locks.StampedLock` is served by two different
 implementations with two different state stores, and neither one owns the whole
-surface.**
+surface.**~~
 
 Eleven triples — `<init>`, `readLock`, `writeLock`, `unlockRead`, `unlockWrite`,
 `tryOptimisticRead`, `validate`, `tryReadLock`, `tryWriteLock`, `isReadLocked`,

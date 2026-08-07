@@ -2062,7 +2062,7 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         timeout_millis.min(i64::from(i32::MAX)) as i32
     };
     ctx.begin_blocking_region();
-    let result = net_poll_stream(&stream, events, timeout)
+    let result = net_poll_stream_close_aware(fd, &stream, events, timeout)
         .map(|ready| Some(Value::Int(if ready { 1 } else { 0 })))
         .map_err(|error| net_err("poll", error));
     ctx.end_blocking_region();
@@ -2076,6 +2076,112 @@ fn net_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 enum PollTarget {
     Listener(Arc<Mutex<TcpListener>>),
     Stream(Arc<TcpStream>),
+}
+
+/// Longest single OS poll a STREAM wait is allowed to sit in before it re-asks
+/// the registry whether its socket was closed under it. Same role, and the same
+/// 25 ms, as [`NET_READ_CLOSE_POLL_MS`] on the blocking-read side.
+const NET_STREAM_POLL_SLICE_MS: i32 = 25;
+
+/// `Net.poll` on a connected stream, made observant of an asynchronous
+/// `Socket.close()`.
+///
+/// # The half of asynchronous close that the `read0` fix could not reach
+///
+/// `net_read_close_aware` (2026-08-07) fixed the reader that parks in
+/// `SocketDispatcher.read0`. But `NioSocketImpl` only parks there when the OS fd
+/// is in BLOCKING mode, and a single call decides that for the whole life of the
+/// socket: `implConnect` runs `configureNonBlockingIfNeeded(fd, millis > 0)`, so
+/// a connect with a timeout latches `nonBlocking = true` permanently
+/// (`endConnect` never restores it). Every later untimed `read()` on that socket
+/// therefore takes the OTHER branch of `implRead`:
+///
+/// ```text
+///   n = tryRead(..)                 // read0 -> WouldBlock -> IOStatus.UNAVAILABLE
+///   while (okayToRetry(n) && isOpen()) {
+///       park(fd, Net.POLLIN);       // <- Net.poll(fd, POLLIN, -1): HERE, not in read0
+///       n = tryRead(..);
+///   }
+/// ```
+///
+/// Measured on HotSpot 25.0.3 by dumping the parked reader's stack: a socket
+/// built with `new Socket(host, port)` parks in `SocketDispatcher.read0`, while
+/// one built with `new Socket()` + `connect(addr, 10000)` parks in `Net.poll`.
+/// That is the entire difference between `RJdkNet` (passing) and
+/// `RChannelInterrupt` (a reader still blocked 15 s after `close()`), and it is
+/// why covering only `read0` looked like a complete fix.
+///
+/// The wakeup mechanism is the registry, not the OS. `close()` on the other
+/// thread reaches `NativeDispatcher.preClose` — NOT `close0`, because
+/// `NioSocketImpl.close` defers the real close while `readerThread != 0` — which
+/// marks this fd `Closed` in [`net_sockets`] but cannot take the OS handle away
+/// while this thread holds an `Arc` clone of the same `TcpStream`. Winsock only
+/// aborts a pending `WSAPoll` on `closesocket`; the `shutdown(Both)` that
+/// `close_net_fd` issues does not. So slice the wait and re-ask the registry,
+/// exactly as [`net_poll_listener`] and [`net_accept_close_aware`] already do.
+///
+/// Answering "ready" on deregistration (rather than "timed out") is the listener
+/// arm's convention and is what makes the outcome faithful: the caller's next
+/// `tryRead` finds the fd is no longer a stream and raises the concrete error,
+/// which `NioSocketImpl.endRead` renders as `SocketException("Socket closed")` —
+/// the exact exception HotSpot produces, measured 3/3 at ~410 ms for a close
+/// issued 400 ms after the read parked.
+///
+/// # Races
+///
+/// The registry check is at the TOP of the loop, before the first poll, so a
+/// close that lands between `tryRead`'s `UNAVAILABLE` and this park is caught
+/// with no wait at all — the pre-park case a check-only-after-the-poll shape
+/// would delay by a full slice. A close that lands while parked is caught on the
+/// next pass, within [`NET_STREAM_POLL_SLICE_MS`]. A close that landed even
+/// earlier never reaches here: `net_poll`'s registry lookup finds `Closed` and
+/// returns immediately, and `implRead` calls `tryRead` again regardless of the
+/// poll's answer, so that path raises the same error rather than spinning.
+///
+/// Cost on a healthy socket is zero: the poll still returns the instant the
+/// stream is readable/writable, so no byte is delayed. Only a wait that would
+/// have blocked anyway pays extra syscalls, at 40/s — the rate a blocking reader
+/// on the same socket already pays inside `net_read_close_aware`.
+fn net_poll_stream_close_aware(
+    fd: i32,
+    stream: &TcpStream,
+    events: i32,
+    timeout: i32,
+) -> std::io::Result<bool> {
+    // A zero timeout is a readiness PROBE, not a wait. Issue it once and answer
+    // what the OS says; running it through the deadline loop below would make
+    // the first `remaining.is_zero()` fire before any poll and report "not
+    // ready" for a socket that is.
+    if timeout == 0 {
+        return net_poll_stream(stream, events, 0);
+    }
+    // poll(2) convention: negative waits forever, positive is a bound.
+    let deadline = (timeout > 0)
+        .then(|| std::time::Instant::now() + Duration::from_millis(timeout as u64));
+    loop {
+        if !net_stream_still_registered(fd) {
+            return Ok(true);
+        }
+        let slice = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                (remaining.as_millis() as i64).min(i64::from(NET_STREAM_POLL_SLICE_MS)) as i32
+            }
+            None => NET_STREAM_POLL_SLICE_MS,
+        };
+        match net_poll_stream(stream, events, slice) {
+            Ok(true) => return Ok(true),
+            // Not ready yet — and on Unix also the EINTR arm of `net_poll_raw`,
+            // which reports "not ready" on purpose so the caller's deadline is
+            // recomputed instead of the whole wait restarting. This loop is that
+            // caller now, and it recomputes from `deadline` on every pass.
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Longest single OS poll a listener wait is allowed to sit in. A
@@ -3318,6 +3424,9 @@ mod ext_opt_sys {
     /// AF_UNIX socket (the usual case) or the credentials are unavailable.
     pub(super) fn so_peer_cred(id: i32) -> Option<i64> {
         let fd = raw_fd(id)?;
+        // SAFETY: `libc::ucred` is three integer fields, so the all-zero bit
+        // pattern is a valid value; it is overwritten by the `getsockopt` below
+        // and only read when that call reports success.
         let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // SAFETY: `cred`/`len` are a valid out-pointer pair sized for the
@@ -4903,6 +5012,146 @@ mod tests {
         assert_eq!(&buf[..n], b"ping");
         remove_fd(fd);
         drop(writer.join().unwrap());
+    }
+
+    /// The OTHER park site of the same contract, and the one
+    /// `RChannelInterrupt` exercises. The reader test above covers a thread
+    /// parked in `read0`; a socket whose
+    /// `connect` carried a timeout is left NON-blocking by `NioSocketImpl`
+    /// forever, so its untimed `read()` never reaches `read0`'s park at all —
+    /// it parks in `Net.poll(fd, POLLIN, -1)` instead. Before this test that
+    /// park was a single infinite `WSAPoll`/`poll` with no registry re-check,
+    /// so `Socket.close()` on another thread never reached it.
+    #[test]
+    fn close_wakes_a_stream_poll_parked_with_no_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold the accepted end open and silent, so the only way the poll can
+        // return is by observing the close.
+        let keeper = thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = Arc::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let fd = register_handle(NetSocketHandle::Stream(Arc::clone(&client)));
+
+        let poller = thread::spawn(move || {
+            let start = std::time::Instant::now();
+            // -1 is what `NioSocketImpl.park(fd, event)` passes for an untimed
+            // read: `nanos == 0` becomes `millis = -1`.
+            let result = net_poll_stream_close_aware(fd, &client, NET_POLLIN, -1);
+            (result.map_err(|e| e.kind()), start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        close_net_fd(fd);
+
+        let (result, elapsed) = poller.join().unwrap();
+        assert!(
+            result.unwrap(),
+            "a deregistered fd must report ready, so the caller's next read \
+             raises the concrete closed-socket error"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "close should wake the parked Net.poll promptly, got {elapsed:?}"
+        );
+        remove_fd(fd);
+        drop(keeper.join().unwrap());
+    }
+
+    /// Slicing the wait must not cost readiness latency: payload that arrives
+    /// while the poll is parked has to be reported on the very next pass.
+    #[test]
+    fn a_close_aware_stream_poll_reports_real_readiness_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            peer.write_all(b"ping").unwrap();
+            peer
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(
+            client.try_clone().unwrap(),
+        )));
+        let start = std::time::Instant::now();
+        let ready = net_poll_stream_close_aware(fd, &client, NET_POLLIN, -1)
+            .expect("poll must succeed");
+        let elapsed = start.elapsed();
+        assert!(ready, "the stream became readable, the poll must say so");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "readiness must not wait out a slice budget, got {elapsed:?}"
+        );
+        remove_fd(fd);
+        drop(writer.join().unwrap());
+    }
+
+    /// A zero timeout is a readiness PROBE, not a wait. The deadline loop must
+    /// not swallow it: `Instant::now() + 0ms` is already expired on the first
+    /// pass, which would report "not ready" without ever asking the OS.
+    #[test]
+    fn a_zero_timeout_stream_poll_probes_instead_of_reporting_not_ready() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.write_all(b"ping").unwrap();
+            peer
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(
+            client.try_clone().unwrap(),
+        )));
+        // Give the peer's bytes time to land, then probe with timeout 0.
+        let mut ready = false;
+        for _ in 0..200 {
+            ready = net_poll_stream_close_aware(fd, &client, NET_POLLIN, 0)
+                .expect("probe must succeed");
+            if ready {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready,
+            "a zero-timeout poll on a readable stream must answer ready"
+        );
+        remove_fd(fd);
+        drop(writer.join().unwrap());
+    }
+
+    /// A BOUNDED wait still honours its own deadline. Slicing recomputes the
+    /// remaining time on every pass, so a timed poll on a silent socket must
+    /// return "not ready" at roughly its timeout — not early (which would break
+    /// `NioSocketImpl.timedRead`'s SO_TIMEOUT accounting) and not forever.
+    #[test]
+    fn a_timed_stream_poll_returns_not_ready_at_its_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let keeper = thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(
+            client.try_clone().unwrap(),
+        )));
+        let start = std::time::Instant::now();
+        let ready = net_poll_stream_close_aware(fd, &client, NET_POLLIN, 300)
+            .expect("poll must succeed");
+        let elapsed = start.elapsed();
+        assert!(!ready, "a silent socket is not readable");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "the slices must not cut the caller's timeout short, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a bounded poll must end at its deadline, got {elapsed:?}"
+        );
+        remove_fd(fd);
+        drop(keeper.join().unwrap());
     }
 
     #[test]

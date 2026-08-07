@@ -1982,7 +1982,7 @@ pub fn gc_scan_unsafe_side_store_roots(out: &mut Vec<cratonvm_types::ObjectRef>)
 /// through the collection's pointer map (a moving GC relocates the ref; a
 /// non-moving sweep's selective promotion may tenure it). Entries absent from
 /// the map did not move and stay as-is.
-pub fn gc_update_unsafe_side_store_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_unsafe_side_store_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

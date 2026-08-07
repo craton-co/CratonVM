@@ -24,7 +24,7 @@ use cratonvm_types::{ClassId, Value};
 /// monitor table.
 struct NoMonitors;
 impl MonitorCleanup for NoMonitors {
-    fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+    fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
 }
 
 /// Test-only `StopTheWorldToken`. Integration tests are single-threaded;
@@ -86,7 +86,7 @@ fn rh1_promoted_objects_survive_further_gcs() {
     let heap = GenerationalHeap::with_capacity(4 * 1024 * 1024);
     let class_id = ClassId::new(7);
     let mut roots = vec![heap.alloc_object(class_id, 2)];
-    let hash_before = heap.get_header(roots[0]).identity_hash_code;
+    let hash_before = heap.identity_hash_code(roots[0]);
     heap.set_field(roots[0], 0, Value::Int(42));
 
     for _ in 0..5 {
@@ -94,7 +94,7 @@ fn rh1_promoted_objects_survive_further_gcs() {
     }
 
     // Still reachable; identity hash unchanged; payload intact.
-    let hash_after = heap.get_header(roots[0]).identity_hash_code;
+    let hash_after = heap.identity_hash_code(roots[0]);
     assert_eq!(hash_before, hash_after);
     match heap.get_field(roots[0], 0) {
         Value::Int(v) => assert_eq!(v, 42),

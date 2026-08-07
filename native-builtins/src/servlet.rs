@@ -2360,6 +2360,26 @@ pub(crate) const RUSTLS_SOCK_ID_BASE: i32 = 0x4000_0000;
 /// collide; see `t27_tls::{stash_pending_layered_socket, drive_pending_layered_handshake}`.
 pub(crate) const PENDING_LAYERED_SOCK_ID_BASE: i32 = 0x2000_0000;
 
+/// Third TLS socket-id range: a socket that `SSLSocket.connect(SocketAddress)`
+/// has TCP-connected but NOT yet handshaked.
+///
+/// JSSE splits those two steps -- `Socket.connect` establishes the TCP
+/// connection and nothing more; the TLS handshake runs on the first read or
+/// write, or on an explicit `startHandshake()`. CratonVM used to do both
+/// inside `connect`, which broke every caller that only wants to know whether
+/// the port answers: H2 `TcpServer.isRunning()` opens a loopback socket and
+/// closes it again WITHOUT any I/O, so on HotSpot it reports "up" while here
+/// it inherited the whole handshake, including its failures and its timeouts
+/// (measured: 60.8 s and then `TLS handshake failed: the handshake process was
+/// interrupted`). `TestTools.testSSL` therefore saw `Server.start()` throw
+/// EXCEPTION_OPENING_PORT_2 -- the suite's `Expected: 0 actual: 1`.
+///
+/// Distinct from, and numerically below, `PENDING_LAYERED_SOCK_ID_BASE`, so
+/// the three ranges never collide and a range test can tell them apart. The
+/// deferred handshake for this range is driven from exactly the four JSSE
+/// trigger points the layered range already uses.
+pub(crate) const PENDING_CONNECT_SOCK_ID_BASE: i32 = 0x1000_0000;
+
 // ---------------------------------------------------------------------------
 // Plaintext readahead for TLS streams
 // ---------------------------------------------------------------------------

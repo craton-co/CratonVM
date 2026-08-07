@@ -1154,6 +1154,90 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- Files.probeContentType, the Windows half ---
+    //
+    // `Files.probeContentType` walks the installed `FileTypeDetector`s and then
+    // the platform default, which on Windows is `sun.nio.fs.RegistryFileTypeDetector`
+    // — a `HKEY_CLASSES_ROOT\<ext>` "Content Type" lookup. Its
+    // `implProbeContentType` is pure JDK bytecode except for two things, and
+    // BOTH of them were missing:
+    //
+    //     at sun.nio.fs.WindowsNativeDispatcher.<clinit>(WindowsNativeDispatcher.java:1100)
+    //     at sun.nio.fs.RegistryFileTypeDetector.implProbeContentType(…:55)
+    //     at sun.nio.fs.AbstractFileTypeDetector.probeContentType(…:75)
+    //     at java.nio.file.Files.probeContentType(Files.java:1594)
+    //
+    // Registering these two rather than shadowing `implProbeContentType` is the
+    // point: the JDK's own detector body then runs, and with it
+    // `AbstractFileTypeDetector.probeContentType`'s fallback to
+    // `URLConnection.getFileNameMap()` and its `parse()` validation — which is
+    // where `.js` comes from (`text/javascript`), because the registry has no
+    // entry for it. Shadowing the detector would have needed a `check_override`
+    // entry, i.e. exactly the "prefer our native over real JDK bytecode"
+    // exception that chain's own banner says must stop growing.
+    //
+    // Measured against HotSpot on the same machine, all 13 lines of
+    // `probes/ProbeContentType.java`: registry for `.txt`/`.html`/`.png`/
+    // `.json`/`.pdf`/`.xml`/`.zip`/`.css`, JDK fallback for `.js`, `null` for
+    // an unknown extension, a name with no dot, and a directory.
+    #[cfg(windows)]
+    {
+        // `initIDs` caches jfieldIDs for the JNI layer. There is no JNI layer
+        // here and nothing to cache, so a no-op is the honest implementation,
+        // not a stub.
+        //
+        // Consequence worth stating: `WindowsNativeDispatcher`'s class
+        // initialiser now SUCCEEDS, so its ~80 other natives stop being
+        // unreachable behind a failing `<clinit>` and start failing
+        // individually. That is strictly more informative — the same
+        // `UnsatisfiedLinkError`, naming the native the caller actually
+        // wanted — but it does move where the error appears.
+        r.register(
+            "sun/nio/fs/WindowsNativeDispatcher",
+            "initIDs",
+            "()V",
+            |_ctx, _args| Ok(None),
+        );
+
+        // `private static native String queryStringValue(long subKey, long name)`.
+        // Both arguments are addresses of NUL-terminated UTF-16 strings in
+        // `NativeBuffer`s that `WindowsNativeDispatcher.asNativeBuffer` filled
+        // through `Unsafe` — so they may be arena handles or real pointers, and
+        // `ctx.copy_from_native_memory` is the bridge that already knows which.
+        //
+        // The JNI original returns NULL for a missing key or value and does not
+        // throw; `AbstractFileTypeDetector` reads that null as "no answer" and
+        // falls back. Do the same.
+        r.register(
+            "sun/nio/fs/RegistryFileTypeDetector",
+            "queryStringValue",
+            "(JJ)Ljava/lang/String;",
+            |ctx, args| {
+                let sub_key = match args.first() {
+                    Some(Value::Long(v)) => *v,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let value_name = match args.get(1) {
+                    Some(Value::Long(v)) => *v,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let (Some(key), Some(name)) = (
+                    read_native_utf16_c_string(ctx, sub_key),
+                    read_native_utf16_c_string(ctx, value_name),
+                ) else {
+                    return Ok(Some(Value::Object(None)));
+                };
+                match hkcr_string_value(&key, &name) {
+                    Some(v) => {
+                        let s = ctx.create_string(&v);
+                        Ok(Some(Value::Object(Some(s))))
+                    }
+                    None => Ok(Some(Value::Object(None))),
+                }
+            },
+        );
+    }
+
     // --- FileSystemProvider minimal methods ---
     let fsp = "java/nio/file/spi/FileSystemProvider";
     r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, args| {
@@ -4827,10 +4911,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `Files.delete` reports failure. It used to discard every error, which
+    // made "the file is still there" indistinguishable from "deleted" — see
+    // `p57_delete_path_checked` for the case H2 depends on.
     r.register(files, "delete", "(Ljava/nio/file/Path;)V", |ctx, args| {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        p57_delete_path(&p);
+        // Virtual filesystems (jarfs/memfs sentinels) are not host paths;
+        // `symlink_metadata` on the encoded string always ENOENTs, so keep them
+        // on the best-effort route rather than inventing a NoSuchFileException.
+        if vfs_classify(&p).is_some() {
+            p57_delete_path(&p);
+            return Ok(None);
+        }
+        // `p57_delete_error` builds the exception object and so can itself be
+        // refused; it cannot sit inside `map_err`, whose closure has to return
+        // the error value directly.
+        if let Err(e) = p57_delete_path_checked(&p) {
+            return Err(p57_delete_error(ctx, &p, &e)?);
+        }
         Ok(None)
     });
 
@@ -4841,14 +4940,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            if vfs_classify(&p).is_some() {
+                p57_delete_path(&p);
+                return Ok(Some(Value::Int(1)));
+            }
             // `Path::exists()` follows links, so a DANGLING symlink read as
             // "does not exist" and was left on disk. The link itself is what
             // `deleteIfExists` is being asked about.
             if std::fs::symlink_metadata(&p).is_err() {
                 return Ok(Some(Value::Int(0)));
             }
-            p57_delete_path(&p);
-            Ok(Some(Value::Int(1)))
+            // Absence is the only failure `deleteIfExists` swallows; every
+            // other one it reports, exactly as `delete` does.
+            match p57_delete_path_checked(&p) {
+                Ok(()) => Ok(Some(Value::Int(1))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(Value::Int(0))),
+                Err(e) => Err(p57_delete_error(ctx, &p, &e)?),
+            }
         },
     );
 
@@ -5330,6 +5438,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| fsp_new_output_stream(ctx, args),
     );
 
+    // `checkAccess` is `Files.isReadable`/`isWritable`/`isExecutable`'s only
+    // implementation — those three have no `Files`-level native, so their real
+    // JDK bytecode calls straight through to here. This used to answer "does
+    // the path exist?" and ignore the `AccessMode` array entirely, so
+    // `Files.isExecutable` said `true` for a plain 0644 file on Linux (HotSpot:
+    // `false`). `fs_check_access` is the same `access(2)` call `File.canWrite`
+    // already routes through — one implementation for both entry points.
     r.register(
         fsp,
         "checkAccess",
@@ -5346,6 +5461,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     message: format!("NoSuchFileException: {}", p),
                 }
                 .into());
+            }
+            // A jar-FS entry has no host permissions to consult; existence is
+            // the whole of what the archive can answer.
+            if vfs_classify(&p).is_some() {
+                return Ok(None);
+            }
+            for mode in access_modes_requested(ctx, args.get(2)) {
+                if !fs_check_access(&p, mode) {
+                    return Err(p57_access_denied(ctx, &p)?);
+                }
             }
             Ok(None)
         },
@@ -5418,6 +5543,110 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             read_named_attributes(ctx, path_obj, &spec, nofollow)
         },
     );
+
+    // `FileSystemProvider.setAttribute(Path, String, Object, LinkOption...)` —
+    // the write-side twin of the reader above, missing for exactly the same
+    // reason and left behind when that one was added.
+    //
+    // `Files.setAttribute` is how everything name-keyed writes: H2's
+    // `FilePathDisk.setReadOnly` takes this branch whenever the FileStore
+    // reports DOS rather than POSIX attributes (i.e. on Windows), which made
+    // `org.h2.test.unit.TestFileSystem` die at `testSetReadOnly` on EVERY
+    // filesystem prefix it exercises. It is not a Windows defect: the Linux
+    // witness fails identically, H2 just reaches
+    // `Files.setPosixFilePermissions` there instead.
+    //
+    // Args: `[this, path, attribute, value, options]`.
+    r.register(
+        fsp,
+        "setAttribute",
+        "(Ljava/nio/file/Path;Ljava/lang/String;Ljava/lang/Object;[Ljava/nio/file/LinkOption;)V",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let spec = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let value = match args.get(3) {
+                Some(Value::Object(v)) => *v,
+                _ => None,
+            };
+            let nofollow =
+                matches!(args.get(4), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
+            write_named_attribute(ctx, path_obj, &spec, value, nofollow)
+        },
+    );
+
+    // The rest of `FileSystemProvider`'s abstract surface. Every one of these
+    // has a working `java/nio/file/Files` native in front of it, which is why
+    // none of them showed up before `setAttribute` did — `Files.delete` never
+    // reaches the provider, so the missing provider method was invisible. It
+    // stops being invisible the moment anything holds a `FileSystemProvider`
+    // and calls it directly (`Files.walkFileTree`'s own internals, NIO code
+    // written against the SPI, and every `AbstractFileSystemProvider` caller
+    // in the JDK do exactly that), and the failure is the same
+    // `AbstractMethodError: ... has no Code attribute`.
+    //
+    // These delegate to the `Files` natives rather than re-implementing them:
+    // one body per operation is what keeps the two entry points from drifting
+    // (the `Files.move` native, for instance, carries a
+    // `FileAlreadyExistsException` contract that H2 depends on by type).
+    r.register(fsp, "delete", "(Ljava/nio/file/Path;)V", |ctx, args| {
+        let path = obj_arg(args, 1)?;
+        ctx.invoke(
+            "java/nio/file/Files",
+            "delete",
+            "(Ljava/nio/file/Path;)V",
+            &[Value::Object(Some(path))],
+        )?;
+        Ok(None)
+    });
+    r.register(
+        fsp,
+        "createDirectory",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V",
+        |ctx, args| {
+            let path = obj_arg(args, 1)?;
+            let attrs = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.invoke(
+                "java/nio/file/Files",
+                "createDirectory",
+                "(Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/file/Path;",
+                &[Value::Object(Some(path)), attrs],
+            )?;
+            Ok(None)
+        },
+    );
+    // `NativeCallback` is a plain `fn` pointer, so these two cannot share one
+    // capturing closure over the method name.
+    r.register(
+        fsp,
+        "copy",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)V",
+        |ctx, args| fsp_delegate_two_path_copy(ctx, args, "copy"),
+    );
+    r.register(
+        fsp,
+        "move",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)V",
+        |ctx, args| fsp_delegate_two_path_copy(ctx, args, "move"),
+    );
+    // `Files.isHidden` has NO `Files`-level native, so this one was reachable
+    // and did fail: `AbstractMethodError: FileSystemProvider.isHidden(Path)Z`.
+    // `dos_attr_flag` is the same rule the DOS view reads and writes — the real
+    // `FILE_ATTRIBUTE_HIDDEN` bit on Windows, the dot-file convention
+    // elsewhere.
+    r.register(fsp, "isHidden", "(Ljava/nio/file/Path;)Z", |ctx, args| {
+        let path_obj = obj_arg(args, 1)?;
+        let path = p57_read_path(ctx, path_obj);
+        if std::fs::symlink_metadata(&path).is_err() && jarfs_decode(&path).is_none() {
+            return Err(p57_no_such_file(ctx, &path)?);
+        }
+        Ok(Some(Value::Int(i32::from(dos_attr_flag(
+            &path,
+            DOS_ATTR_HIDDEN,
+        )))))
+    });
 
     r.register(
         fsp,
@@ -6840,6 +7069,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if let Ok(md) = std::fs::metadata(&path) {
                     let mut perms = md.permissions();
                     if perms.readonly() {
+                        // `set_readonly(false)` is right on Windows, where it
+                        // clears FILE_ATTRIBUTE_READONLY and that IS the whole
+                        // operation `allowDeleteReadOnlyFiles` asks for. On Unix
+                        // the same call writes mode 0o666 — it grants write to
+                        // group and other as well, which is a permission
+                        // widening nobody asked for (clippy::
+                        // permissions_set_readonly_false). Restore the owner
+                        // write bit only; that is the Unix reading of "make it
+                        // writable again", and deletion there depends on the
+                        // DIRECTORY's mode anyway.
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = perms.mode();
+                            perms.set_mode(mode | 0o200);
+                        }
+                        #[cfg(not(unix))]
                         perms.set_readonly(false);
                         let _ = std::fs::set_permissions(&path, perms);
                     }
@@ -8616,11 +8862,54 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Resu
 /// `FileSystemUtils.deleteRecursively` on such a link therefore silently did
 /// nothing, stranding it for every later caller.
 pub(crate) fn p57_delete_path(path: &str) {
-    let is_real_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-    if is_real_dir {
-        let _ = std::fs::remove_dir(path);
+    let _ = p57_delete_path_checked(path);
+}
+
+/// The same removal, but reporting what happened.
+///
+/// `Files.delete` used to discard every error, so a delete that did not happen
+/// returned normally — including the case H2 depends on: on Windows,
+/// `DeleteFileW` refuses a file carrying `FILE_ATTRIBUTE_READONLY`, and
+/// `FilePathDisk.delete` catches that `AccessDeniedException`, clears
+/// `dos:readonly` and retries. Silently deleting the file instead meant that
+/// recovery branch never ran, and a program relying on read-only protection got
+/// no protection at all.
+///
+/// Rust's `std::fs::remove_file` is what made the difference invisible: on
+/// Windows it CLEARS the read-only attribute and retries rather than failing,
+/// deliberately, to give Unix semantics. That is the one case this has to
+/// re-refuse by hand; every other error is just no longer thrown away.
+pub(crate) fn p57_delete_path_checked(path: &str) -> std::io::Result<()> {
+    let md = std::fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        if !md.is_dir() && md.permissions().readonly() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the file is marked read-only",
+            ));
+        }
+    }
+    if md.is_dir() {
+        std::fs::remove_dir(path)
     } else {
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path)
+    }
+}
+
+/// Turn a removal failure into the exception type the JDK raises for it.
+pub(crate) fn p57_delete_error(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    error: &std::io::Error,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => Ok(p57_no_such_file(ctx, path)?),
+        std::io::ErrorKind::PermissionDenied => Ok(p57_access_denied(ctx, path)?),
+        // `DirectoryNotEmpty` is the JDK's `DirectoryNotEmptyException`, which
+        // is a `FileSystemException` subclass; we do not model the subclass, so
+        // the reason string carries the distinction.
+        _ => p57_filesystem_exception(ctx, path, None, &error.to_string()),
     }
 }
 
@@ -10319,6 +10608,183 @@ fn attr_view_flag_arg(args: &[Value]) -> bool {
     args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0
 }
 
+/// Read a NUL-terminated UTF-16 string out of native memory at `addr`.
+///
+/// `addr` comes from a JDK `NativeBuffer`, so it is whatever
+/// `Unsafe.allocateMemory` handed out — an arena handle or a real pointer.
+/// `copy_from_native_memory` is the bridge that classifies the two; going
+/// straight to a raw dereference would SIGSEGV on the handle form.
+///
+/// Two code units at a time rather than one bulk read: the bridge fails a range
+/// that is not wholly inside one live block, and the caller does not know the
+/// string's length in advance. The strings here are a file extension and the
+/// literal `"Content Type"`, so this is a couple of dozen reads.
+#[cfg(windows)]
+fn read_native_utf16_c_string(ctx: &dyn NativeContext, addr: i64) -> Option<String> {
+    // The JDK's own ceiling for a native-buffer string; a missing terminator
+    // must stop somewhere rather than walk the address space.
+    const MAX_CHARS: usize = 32 * 1024;
+    if addr == 0 {
+        return None;
+    }
+    let mut units: Vec<u16> = Vec::new();
+    for i in 0..MAX_CHARS {
+        let mut cell = [0u8; 2];
+        if !ctx.copy_from_native_memory(addr + (i as i64) * 2, &mut cell) {
+            return None;
+        }
+        let unit = u16::from_le_bytes(cell);
+        if unit == 0 {
+            return Some(String::from_utf16_lossy(&units));
+        }
+        units.push(unit);
+    }
+    None
+}
+
+/// `HKEY_CLASSES_ROOT\<sub_key>` → the named `REG_SZ` value, or `None`.
+///
+/// This is what the JDK's `RegistryFileTypeDetector` JNI does, and it has to be
+/// the same registry: the answers differ from the `content-types.properties`
+/// fallback in ways the HotSpot comparison shows — `.zip` is
+/// `application/x-zip-compressed` here and `application/zip` there, `.xml` is
+/// `text/xml` here and `application/xml` there.
+#[cfg(windows)]
+fn hkcr_string_value(sub_key: &str, value_name: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // `((HKEY)(ULONG_PTR)((LONG)0x80000000))` — sign-extended on 64-bit, which
+    // is why this goes through `i32` rather than being written as a `usize`.
+    const HKEY_CLASSES_ROOT: isize = 0x8000_0000u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const ERROR_SUCCESS: i32 = 0;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            value_type: *mut u32,
+            data: *mut u16,
+            data_bytes: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    // A NUL inside either name would truncate the key silently; the registry
+    // has no such names, so refuse rather than query a different key.
+    if sub_key.contains('\0') || value_name.contains('\0') {
+        return None;
+    }
+    let key = wide(sub_key);
+    let name = wide(value_name);
+
+    // Size query first — the value is arbitrary user-writable registry data,
+    // so a fixed buffer would be a guess about someone else's content.
+    let mut bytes: u32 = 0;
+    // SAFETY: both name buffers are NUL-terminated and outlive the call, and
+    // this form asks only for the size (null data pointer), which is what the
+    // API documents for `pvData == NULL`.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CLASSES_ROOT,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if rc != ERROR_SUCCESS || bytes == 0 {
+        return None;
+    }
+    // `bytes` counts BYTES and includes the terminator. Round up so an odd
+    // (malformed) length still gets a whole last code unit to land in.
+    let mut buf: Vec<u16> = vec![0; (bytes as usize).div_ceil(2)];
+    let mut got = bytes;
+    // SAFETY: `buf` is sized from the length the same API just reported, and
+    // `got` tells it that size in bytes.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CLASSES_ROOT,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            &mut got,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let units = ((got as usize) / 2).min(buf.len());
+    let end = buf[..units].iter().position(|&u| u == 0).unwrap_or(units);
+    let value = String::from_utf16_lossy(&buf[..end]);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Set (or clear) a path's read-only bit.
+///
+/// Split out of `dos_view_set_read_only` so `FileSystemProvider.setAttribute`
+/// — which is handed a `Path` and an attribute *name*, never a view object —
+/// changes the file exactly the way the view does. Two spellings of
+/// "`dos:readonly` is now true" that can drift apart is the
+/// `two-caches-one-invalidation-hook` shape.
+pub(crate) fn set_read_only_on_path(path: &str, on: bool) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(on);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_dos_flag_on_path(path: &str, flag: u32, on: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    extern "system" {
+        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
+    }
+    let meta = std::fs::metadata(path)?;
+    let mut attrs = meta.file_attributes();
+    if on {
+        attrs |= flag;
+    } else {
+        attrs &= !flag;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-Windows hosts have no DOS hidden/system/archive bits. Clearing one is
+/// trivially satisfied; SETTING one is refused out loud rather than pretended.
+/// `Ok(false)` means "refuse" — the caller turns that into the
+/// `UnsupportedOperationException` its own surface owes.
+#[cfg(not(windows))]
+pub(crate) fn set_dos_flag_on_path_supported(path: &str, on: bool) -> std::io::Result<bool> {
+    // Validate the file the way the real view does, whichever branch we take.
+    std::fs::metadata(path)?;
+    Ok(!on)
+}
+
 pub(crate) fn dos_view_set_read_only(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10326,40 +10792,18 @@ pub(crate) fn dos_view_set_read_only(
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    let mut perms = meta.permissions();
-    perms.set_readonly(on);
-    std::fs::set_permissions(&path, perms).map_err(|e| p57_io_error(&e))?;
+    set_read_only_on_path(&path, on).map_err(|e| p57_io_error(&e))?;
     Ok(None)
 }
 
 #[cfg(windows)]
 fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], flag: u32) -> MethodCallResult {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::MetadataExt;
-    extern "system" {
-        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
-    }
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    let mut attrs = meta.file_attributes();
-    if on {
-        attrs |= flag;
-    } else {
-        attrs &= !flag;
-    }
-    let wide: Vec<u16> = std::ffi::OsStr::new(&path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
-        return Err(RuntimeError::IOException {
-            message: format!("SetFileAttributes failed for {path}"),
-        }
-        .into());
-    }
+    set_dos_flag_on_path(&path, flag, on).map_err(|e| RuntimeError::IOException {
+        message: format!("SetFileAttributes failed for {path}: {e}"),
+    })?;
     Ok(None)
 }
 
@@ -10368,10 +10812,7 @@ fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], _flag: u32) ->
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    // Validate the file the way the real view does, whichever branch we take.
-    std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    if !on {
-        // Clearing a flag that can never be set here is trivially satisfied.
+    if set_dos_flag_on_path_supported(&path, on).map_err(|e| p57_io_error(&e))? {
         return Ok(None);
     }
     Err(RuntimeError::UnsupportedOperationException {
@@ -10484,6 +10925,46 @@ pub(crate) fn copy_options_replace_existing(
     }
     ctx.unpin_native_roots(pin);
     found
+}
+
+/// The `FS_ACCESS_*` bits named by a `java.nio.file.AccessMode[]` argument.
+///
+/// An empty (or absent) array is the JDK's "existence only" request, which the
+/// caller has already answered — so this returns an empty vector for it rather
+/// than defaulting to some mode the caller never asked about.
+pub(crate) fn access_modes_requested(ctx: &mut dyn NativeContext, modes: Option<&Value>) -> Vec<i32> {
+    let arr = match modes {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Vec::new(),
+    };
+    // Pin: the `toString()` probe re-enters Java and a moving young GC there
+    // would relocate the mode array (native stale-local family) — the same
+    // hazard `copy_options_replace_existing` guards against.
+    let pin = ctx.pin_native_root(arr);
+    let len = ctx.array_length(arr);
+    let mut out = Vec::new();
+    for i in 0..len {
+        let arr_cur = ctx.read_native_pin(pin, arr);
+        let Value::Object(Some(mode)) = ctx.get_array_element(arr_cur, i) else {
+            continue;
+        };
+        let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(mode, "toString", "()Ljava/lang/String;", &[])
+        else {
+            continue;
+        };
+        let text = ctx.read_string(s).unwrap_or_default();
+        // `AccessMode` is an enum, so `toString()` is the constant name.
+        if text.contains("EXECUTE") {
+            out.push(FS_ACCESS_EXECUTE);
+        } else if text.contains("WRITE") {
+            out.push(FS_ACCESS_WRITE);
+        } else if text.contains("READ") {
+            out.push(FS_ACCESS_READ);
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    out
 }
 
 /// Build a REAL `java/nio/file/FileAlreadyExistsException` (same approach as
@@ -12978,11 +13459,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "isHidden", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        // Cross-platform: treat files with leading '.' as hidden
-        let hidden = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().starts_with('.'))
-            .unwrap_or(false);
+        // This used to apply the leading-`.` rule on EVERY platform. On Windows
+        // that is wrong in both directions, measured against HotSpot: a
+        // `.dotfile` is NOT hidden, and a plain name carrying
+        // `FILE_ATTRIBUTE_HIDDEN` IS. `fs_boolean_attributes` is the same
+        // platform split `getBooleanAttributes` already encodes — and, since
+        // `Files.isHidden` and the `dos:hidden` attribute now read the real
+        // Windows bit, sharing it here is what stops two spellings of the same
+        // question from disagreeing.
+        let hidden = fs_boolean_attributes(&path) & FS_BA_HIDDEN != 0;
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
     r.register(file, "canRead", "()Z", |ctx, args| {
@@ -15420,6 +15905,90 @@ struct StatFacts {
     ctime_millis: i64,
     readonly: bool,
     hidden: bool,
+    system: bool,
+    archive: bool,
+}
+
+/// The attribute views a path's filesystem actually has.
+///
+/// A mounted archive is not the host filesystem: its entries have a size and a
+/// timestamp and nothing else, so `basic` is the only view HotSpot's zipfs
+/// offers for them either. Screening the two apart here is what stops
+/// `readAttributes(zipEntry, "unix:mode")` being answered out of the host's
+/// `stat` of a path that does not exist.
+pub(crate) fn attribute_view_names_for_path(path: &str) -> &'static [&'static str] {
+    if vfs_decode(path).is_some() {
+        &["basic"]
+    } else {
+        supported_attribute_view_names()
+    }
+}
+
+/// [`StatFacts`] for an entry inside a mounted archive (jar / jrt), or `None`
+/// when `p` is an ordinary host path and the caller should `stat` it.
+///
+/// TIMESTAMPS ARE THE ARCHIVE'S, NOT THE ENTRY'S. The zip central directory
+/// does carry a per-entry MS-DOS timestamp, but reading it needs the `zip`
+/// crate's `time` feature, which the workspace deliberately does not enable
+/// (see the `zip` pin in the root `Cargo.toml`). The container's own mtime is a
+/// real timestamp rather than a fabricated one, it is already computed for the
+/// index cache key, and it is what every entry of a rebuilt archive would get
+/// anyway. Callers that need per-entry precision should say so and the pin can
+/// be revisited.
+fn vfs_stat_facts(p: &str) -> Option<std::io::Result<StatFacts>> {
+    let (tag, container, entry) = vfs_decode(p)?;
+    let kind = match tag {
+        JARFS_TAG => jarfs_classify(&container, &entry),
+        _ => jrtfs_classify(&container, &entry),
+    };
+    if matches!(kind, JarFsKind::Absent) {
+        return Some(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+    }
+    let is_dir = matches!(kind, JarFsKind::Dir);
+    let size = if is_dir {
+        0
+    } else {
+        let sized = match tag {
+            JARFS_TAG => jarfs_entry_size(&container, &entry),
+            _ => jrtfs_entry_size(&container, &entry),
+        };
+        match sized {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        }
+    };
+    // The jrt filesystem's container is `java.home`; the archive it actually
+    // reads from is the jimage under it.
+    let stamped = match tag {
+        JARFS_TAG => container.clone(),
+        _ => format!("{container}/lib/modules"),
+    };
+    let millis = (crate::net_phase_e::archive_stamp(&stamped).0 / 1_000_000) as i64;
+    Some(Ok(StatFacts {
+        is_dir,
+        is_regular: !is_dir,
+        is_symlink: false,
+        size,
+        modified_millis: millis,
+        access_millis: millis,
+        creation_millis: millis,
+        // r-xr-xr-x for a directory, r--r--r-- for an entry: an archive this VM
+        // has mounted is readable and never writable through these views.
+        mode: if is_dir { 0o040555 } else { 0o100444 },
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        dev: 0,
+        ino: 0,
+        rdev: 0,
+        ctime_millis: millis,
+        readonly: true,
+        // An archive entry has no DOS attribute word of its own; `false` is
+        // what the JDK reports for these on a non-DOS filesystem.
+        hidden: false,
+        system: false,
+        archive: false,
+    }))
 }
 
 fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
@@ -15447,11 +16016,17 @@ fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
         rdev: 0,
         ctime_millis: 0,
         readonly: meta.permissions().readonly(),
-        // `isOther`/`hidden` are the two the JDK derives rather than stats.
-        hidden: std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.')),
+        // The three DOS flags read through the SAME `dos_attr_flag` the
+        // `DosFileAttributeView` setters and `setAttribute` write through: real
+        // `FILE_ATTRIBUTE_*` bits on Windows, the dot-file convention for
+        // `hidden` elsewhere. They used to be derived here from the filename
+        // alone (and `system`/`archive` were hardcoded `false` at the read
+        // site), so on Windows `setAttribute(p, "dos:hidden", true)` followed by
+        // `getAttribute(p, "dos:hidden")` answered `false` — a write that
+        // really happened, reported as if it had not.
+        hidden: dos_attr_flag(path, DOS_ATTR_HIDDEN),
+        system: dos_attr_flag(path, DOS_ATTR_SYSTEM),
+        archive: dos_attr_flag(path, DOS_ATTR_ARCHIVE),
     };
     #[cfg(unix)]
     {
@@ -15516,6 +16091,315 @@ fn posix_permission_set(ctx: &mut dyn NativeContext, mode: i32) -> Option<Object
     Some(set)
 }
 
+/// What `setAttribute` does with one attribute name.
+///
+/// Split out of [`write_named_attribute`] so the classification can be asserted
+/// against [`attribute_names_for_view`] in a unit test: that table is what the
+/// reader answers, and a name added there without a verdict here is exactly how
+/// "`readAttributes` returned it but writing it says it does not exist" appears.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AttributeWrite {
+    /// One of the three `FileTime` fields.
+    Time,
+    /// A DOS boolean flag.
+    DosFlag,
+    /// A POSIX permission set (`posix:permissions`).
+    Permissions,
+    /// A raw `unix:mode` int.
+    Mode,
+    /// Writable in the real JDK; not implemented here, and refused loudly.
+    Unimplemented,
+    /// The reader answers it, but the JDK lets nobody write it.
+    NotWritable,
+}
+
+pub(crate) fn attribute_write_kind(name: &str) -> AttributeWrite {
+    match name {
+        "lastModifiedTime" | "lastAccessTime" | "creationTime" => AttributeWrite::Time,
+        "readonly" | "hidden" | "archive" | "system" => AttributeWrite::DosFlag,
+        "permissions" => AttributeWrite::Permissions,
+        "mode" => AttributeWrite::Mode,
+        "owner" | "group" | "uid" | "gid" => AttributeWrite::Unimplemented,
+        _ => AttributeWrite::NotWritable,
+    }
+}
+
+/// The write side of `Files.setAttribute(path, "view:name", value)`.
+///
+/// Screened against exactly the same view/name tables as
+/// [`read_named_attributes`], so the two can never disagree about what a view
+/// contains — asking for a name the reader answers and being told it does not
+/// exist is the confusing half of that class of bug.
+///
+/// The writes themselves delegate: the DOS flags go through the very
+/// `dos_view_set_*` natives `getFileAttributeView(path, DosFileAttributeView)`
+/// hands out, and the times/permissions go through the same path-level helpers
+/// those views use. Nothing about the filesystem is reimplemented here, so a
+/// later fix to any of them reaches this entry point too.
+///
+/// Names that exist but are read-only (`size`, `isDirectory`, `fileKey`, …)
+/// raise `IllegalArgumentException` with the JDK's own wording. Names that are
+/// writable in the real JDK but not implemented here (`owner`, `group`, `uid`,
+/// `gid`) raise `UnsupportedOperationException` rather than silently doing
+/// nothing — a `setAttribute` that returns normally and changes nothing is the
+/// failure mode that made Gradle believe it had marked a cache directory
+/// read-only.
+pub(crate) fn write_named_attribute(
+    ctx: &mut dyn NativeContext,
+    path_obj: ObjectRef,
+    spec: &str,
+    value: Option<ObjectRef>,
+    nofollow: bool,
+) -> MethodCallResult {
+    let (view, name) = split_attribute_spec(spec);
+    let Some(known) = attribute_names_for_view(view) else {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    };
+    let path = p57_read_path(ctx, path_obj);
+    if !attribute_view_names_for_path(&path).contains(&view) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    }
+    // Writing INTO a mounted archive means rewriting the archive, which this
+    // entry point does not do. Refuse by name rather than fall through to the
+    // host writes below, which would otherwise chmod or re-time whatever the
+    // sentinel-delimited path string happened to resolve to (nothing, today).
+    if vfs_decode(&path).is_some() {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!(
+                "setAttribute('{spec}'): the entries of a mounted archive are read-only"
+            ),
+        }
+        .into());
+    }
+    if name.is_empty() || !known.iter().any(|k| *k == name) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("'{view}:{name}' not recognized"),
+        }
+        .into());
+    }
+
+    // The JDK stats the file before it touches any attribute, so a missing path
+    // is `NoSuchFileException` — not whichever errno the individual setter would
+    // have produced, and not (for the DOS flags, whose view natives only
+    // `std::fs::metadata`) a bare `IOException`. Measured against HotSpot. The
+    // archive-entry case is already refused above, so this only ever sees a
+    // host path.
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(p57_no_such_file(ctx, &path)?);
+    }
+
+    // Every write below follows symlinks. Rather than silently write through a
+    // link the caller asked us not to follow, refuse — the call sites that
+    // matter never pass NOFOLLOW_LINKS, and a wrong target is worse than a
+    // refusal.
+    if nofollow
+        && std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("setAttribute('{spec}'): NOFOLLOW_LINKS on a symbolic link"),
+        }
+        .into());
+    }
+
+    match attribute_write_kind(name) {
+        AttributeWrite::Time => {
+            let Some(ft) = value else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(format!("setAttribute('{spec}'): null FileTime")),
+                }
+                .into());
+            };
+            // Type-check BEFORE reading. `filetime_read_millis` falls back to
+            // slot 0 and then to `0`, so handing it a `String` would have set
+            // the timestamp to the epoch and reported success — a silent wrong
+            // write where the JDK's cast throws.
+            require_value_class(ctx, ft, "java/nio/file/attribute/FileTime", spec)?;
+            let millis = filetime_read_millis(ctx, ft);
+            let (creation, access, modified) = match name {
+                "creationTime" => (Some(millis), None, None),
+                "lastAccessTime" => (None, Some(millis), None),
+                _ => (None, None, Some(millis)),
+            };
+            set_file_attribute_times(&path, creation, access, modified)
+                .map_err(|error| p57_io_error(&error))?;
+            Ok(None)
+        }
+        AttributeWrite::DosFlag => {
+            let on = boolean_attribute_value(ctx, spec, value)?;
+            // Build the one-field synthetic view the `dos_view_set_*` natives
+            // read their path out of — the same shape `getFileAttributeView`
+            // hands to Java callers. Pin the Path across the allocation: a
+            // moving young GC there would relocate it out from under us.
+            let path_pin = ctx.pin_native_root(path_obj);
+            let view_obj =
+                try_alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributeView", 1)?;
+            let path_obj = ctx.read_native_pin(path_pin, path_obj);
+            ctx.set_field(view_obj, 0, Value::Object(Some(path_obj)));
+            ctx.unpin_native_roots(path_pin);
+            let view_args = [
+                Value::Object(Some(view_obj)),
+                Value::Int(if on { 1 } else { 0 }),
+            ];
+            match name {
+                "readonly" => dos_view_set_read_only(ctx, &view_args),
+                "hidden" => dos_view_set_hidden(ctx, &view_args),
+                "archive" => dos_view_set_archive(ctx, &view_args),
+                _ => dos_view_set_system(ctx, &view_args),
+            }
+        }
+        AttributeWrite::Permissions => {
+            let Some(set) = value else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(format!("setAttribute('{spec}'): null permission set")),
+                }
+                .into());
+            };
+            // `posix_permission_bits_from_set` answers `0` for anything it
+            // cannot probe, and `0` is also the legitimate answer for an EMPTY
+            // set — so a non-collection value would `chmod 000` and report
+            // success. `size()` separates the two: a real collection answers it
+            // (with `0` when empty), a `String` does not have the method.
+            if !matches!(
+                ctx.invoke_virtual(set, "size", "()I", &[]),
+                Ok(Some(Value::Int(_)))
+            ) {
+                return Err(value_class_cast_error(ctx, set, "java/util/Set", spec));
+            }
+            let mode = posix_permission_bits_from_set(ctx, set);
+            set_file_mode(&path, mode)
+        }
+        AttributeWrite::Mode => {
+            let mode = int_attribute_value(ctx, spec, value)?;
+            set_file_mode(&path, (mode as u32) & 0o7777)
+        }
+        AttributeWrite::Unimplemented => Err(RuntimeError::UnsupportedOperationException {
+            message: format!("setAttribute('{spec}') is not implemented"),
+        }
+        .into()),
+        // A name the reader answers but the JDK does not let anyone write.
+        // The wording is HotSpot's own, verified against it: `BasicFileAttributeView`
+        // raises `IllegalArgumentException("'" + name() + ":" + attribute + "'
+        // not recognized")`.
+        AttributeWrite::NotWritable => Err(RuntimeError::IllegalArgumentException {
+            message: format!("'{view}:{name}' not recognized"),
+        }
+        .into()),
+    }
+}
+
+/// The `ClassCastException` the JDK's own cast would raise for a `setAttribute`
+/// value of the wrong type.
+///
+/// The `(… are in module java.base of loader 'bootstrap')` clause HotSpot
+/// appends is deliberately NOT reproduced: it would mean asserting module and
+/// loader facts this call site has not looked up.
+fn value_class_cast_error(
+    ctx: &mut dyn NativeContext,
+    value: ObjectRef,
+    want: &str,
+    spec: &str,
+) -> MethodCallFailed {
+    let class_id = ctx.class_id_of_object(value);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    RuntimeError::ClassCastException {
+        message: format!(
+            "class {} cannot be cast to class {} (setting '{spec}')",
+            class_name.replace('/', "."),
+            want.replace('/', ".")
+        ),
+    }
+    .into()
+}
+
+/// Require a `setAttribute` value to be exactly the class the attribute wants.
+///
+/// Not merely cosmetic: the reader on the other side of each write arm has a
+/// benign fallback (`filetime_read_millis` answers `0` for an object with no
+/// `value` field), so without this the mistake becomes a quiet wrong write
+/// instead of the `ClassCastException` the JDK raises.
+fn require_value_class(
+    ctx: &mut dyn NativeContext,
+    value: ObjectRef,
+    want: &str,
+    spec: &str,
+) -> Result<(), MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(value);
+    if ctx.class_name_of_id(class_id).unwrap_or_default() == want {
+        return Ok(());
+    }
+    Err(value_class_cast_error(ctx, value, want, spec))
+}
+
+/// chmod for the POSIX/unix write paths. A no-op refusal on a host without
+/// POSIX modes, rather than a silent success.
+fn set_file_mode(path: &str, mode: u32) -> MethodCallResult {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| p57_io_error(&error))?;
+        Ok(None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Err(RuntimeError::UnsupportedOperationException {
+            message: "POSIX file modes are not supported on this host".to_string(),
+        }
+        .into())
+    }
+}
+
+/// Unbox the `Object` value of a boolean-valued attribute. The JDK casts, so a
+/// wrong type is a `ClassCastException` there and here.
+fn boolean_attribute_value(
+    ctx: &mut dyn NativeContext,
+    spec: &str,
+    value: Option<ObjectRef>,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
+    let Some(value) = value else {
+        return Err(RuntimeError::ClassCastException {
+            message: format!("setAttribute('{spec}'): value is not a Boolean"),
+        }
+        .into());
+    };
+    // Exact class, not "whatever unboxes to an Int". `unbox_value` answers
+    // `Int` for Integer/Byte/Short/Character too, and the JDK's cast to
+    // `Boolean` rejects every one of them.
+    require_value_class(ctx, value, "java/lang/Boolean", spec)?;
+    match crate::lang_class::unbox_value(ctx, value) {
+        Value::Int(i) => Ok(i != 0),
+        _ => Err(RuntimeError::ClassCastException {
+            message: format!("setAttribute('{spec}'): value is not a Boolean"),
+        }
+        .into()),
+    }
+}
+
+/// Unbox the `Object` value of an int-valued attribute (`unix:mode`).
+fn int_attribute_value(
+    ctx: &mut dyn NativeContext,
+    spec: &str,
+    value: Option<ObjectRef>,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    match value.map(|v| crate::lang_class::unbox_value(ctx, v)) {
+        Some(Value::Int(i)) => Ok(i),
+        Some(Value::Long(l)) => Ok(l as i32),
+        Some(_) | None => Err(RuntimeError::ClassCastException {
+            message: format!("setAttribute('{spec}'): value is not an Integer"),
+        }
+        .into()),
+    }
+}
+
 /// Read `path`'s attributes named by `spec` into a `java.util.HashMap`.
 ///
 /// This is the whole of `Files.readAttributes(Path, String, LinkOption...)`,
@@ -15539,7 +16423,7 @@ pub(crate) fn read_named_attributes(
         }
         .into());
     };
-    if !supported_attribute_view_names().contains(&view) {
+    if !attribute_view_names_for_path(&p57_read_path(ctx, path_obj)).contains(&view) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: format!("View '{view}' not available"),
         }
@@ -15570,9 +16454,17 @@ pub(crate) fn read_named_attributes(
     };
 
     let path = p57_read_path(ctx, path_obj);
-    let facts = match stat_facts(&path, nofollow) {
-        Ok(f) => f,
-        Err(_) => return Err(p57_no_such_file(ctx, &path)?),
+    // An entry inside a mounted archive is answered from the archive. Its path
+    // string is the sentinel-delimited `\x01JARFS\x01…` form, which names no
+    // host file at all, so `stat`ing it produced `NoSuchFileException` for every
+    // `Files.readAttributes` / `Files.getAttribute` on a zip or jrt entry.
+    let facts = match vfs_stat_facts(&path) {
+        Some(Ok(f)) => f,
+        Some(Err(_)) => return Err(p57_no_such_file(ctx, &path)?),
+        None => match stat_facts(&path, nofollow) {
+            Ok(f) => f,
+            Err(_) => return Err(p57_no_such_file(ctx, &path)?),
+        },
     };
 
     let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[]) {
@@ -15639,9 +16531,11 @@ pub(crate) fn read_named_attributes(
             "rdev" => box_long(ctx, facts.rdev),
             "readonly" => box_boolean(ctx, facts.readonly),
             "hidden" => box_boolean(ctx, facts.hidden),
-            // DOS-only flags with no Unix counterpart. `false` is what the JDK
+            // On Windows these are the real `FILE_ATTRIBUTE_*` bits; off
+            // Windows `dos_attr_flag` answers `false`, which is what the JDK
             // reports for them on a non-DOS filesystem.
-            "archive" | "system" => box_boolean(ctx, false),
+            "system" => box_boolean(ctx, facts.system),
+            "archive" => box_boolean(ctx, facts.archive),
             "permissions" => match posix_permission_set(ctx, facts.mode) {
                 Some(set) => Value::Object(Some(set)),
                 None => continue,
@@ -15695,9 +16589,148 @@ pub(crate) fn read_named_attributes(
     Ok(Some(Value::Object(Some(map))))
 }
 
+/// Shared body for `FileSystemProvider.copy`/`move`: same argument shape, same
+/// delegation to the `java/nio/file/Files` native, only the method name
+/// differs. The provider overloads return `void`; the `Files` ones return the
+/// target `Path`, which is dropped here.
+fn fsp_delegate_two_path_copy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+) -> MethodCallResult {
+    let src = obj_arg(args, 1)?;
+    let dst = obj_arg(args, 2)?;
+    let options = args.get(3).copied().unwrap_or(Value::Object(None));
+    ctx.invoke(
+        "java/nio/file/Files",
+        method,
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)Ljava/nio/file/Path;",
+        &[Value::Object(Some(src)), Value::Object(Some(dst)), options],
+    )?;
+    Ok(None)
+}
+
+#[cfg(all(test, windows))]
+mod registry_content_type_tests {
+    use super::hkcr_string_value;
+
+    /// A key that is not in the registry answers `None` rather than an empty
+    /// string or an error. `RegistryFileTypeDetector`'s JNI returns NULL here,
+    /// and `AbstractFileTypeDetector` reads that null as "no answer" and falls
+    /// back to `URLConnection.getFileNameMap()` — so turning it into `Some("")`
+    /// would suppress the fallback and make `Files.probeContentType` answer
+    /// null for every extension the registry happens not to carry.
+    ///
+    /// Deliberately not asserting that `.txt` IS `text/plain`: that is a fact
+    /// about the machine's registry, not about this code, and a test that
+    /// depends on it is a latent CI failure on a differently-configured box.
+    #[test]
+    fn an_absent_key_is_none_not_an_empty_string() {
+        assert_eq!(
+            hkcr_string_value(".cratonvm-no-such-extension-zz", "Content Type"),
+            None
+        );
+    }
+
+    /// A value name that is absent from a key that DOES exist is also `None` —
+    /// the two failure modes go through different `RegGetValueW` error codes
+    /// and must not diverge. `.txt` is present on every Windows install; the
+    /// value name is not.
+    #[test]
+    fn an_absent_value_under_a_present_key_is_none() {
+        assert_eq!(hkcr_string_value(".txt", "CratonVM No Such Value"), None);
+    }
+
+    /// An embedded NUL would silently truncate the key inside the Win32 call,
+    /// so the query would run against a DIFFERENT key than the caller named.
+    /// Refuse instead. (These strings arrive from guest-controlled native
+    /// memory via `read_native_utf16_c_string`, so this is reachable.)
+    #[test]
+    fn an_embedded_nul_is_refused_rather_than_truncated() {
+        assert_eq!(hkcr_string_value(".txt\0.exe", "Content Type"), None);
+        assert_eq!(hkcr_string_value(".txt", "Content\0Type"), None);
+    }
+}
+
 #[cfg(test)]
 mod named_attribute_tests {
-    use super::{attribute_names_for_view, split_attribute_spec, supported_attribute_view_names};
+    use super::{
+        attribute_names_for_view, attribute_view_names_for_path, attribute_write_kind,
+        jarfs_encode, split_attribute_spec, supported_attribute_view_names, vfs_stat_facts,
+        AttributeWrite,
+    };
+
+    /// Write a two-entry zip to a unique temp path and return it.
+    fn write_probe_zip(tag: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "cratonvm-vfsattr-{tag}-{}.zip",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        zip.start_file("hello.txt", opts).expect("start_file");
+        zip.write_all(b"hello").expect("write entry");
+        zip.add_directory("dir", opts).expect("add_directory");
+        zip.finish().expect("finish zip");
+        path
+    }
+
+    /// An entry inside a mounted archive must be answered FROM the archive.
+    /// Its path string is the sentinel-delimited jar-FS form, which names no
+    /// host file, so any code that reaches `stat` with it reports the entry as
+    /// missing — which is exactly what `Files.readAttributes` on a zip entry
+    /// did.
+    #[test]
+    fn a_jar_entry_is_stat_ed_out_of_the_archive_not_the_host() {
+        let zip = write_probe_zip("stat");
+        let jar = zip.to_string_lossy().into_owned();
+
+        let file = vfs_stat_facts(&jarfs_encode(&jar, "hello.txt"))
+            .expect("a jar-FS path must be recognised")
+            .expect("hello.txt is present");
+        assert!(file.is_regular, "a zip entry is a regular file");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 5, "size comes from the central directory");
+
+        let dir = vfs_stat_facts(&jarfs_encode(&jar, "dir"))
+            .expect("recognised")
+            .expect("dir is present");
+        assert!(dir.is_dir, "an explicit directory entry is a directory");
+        assert_eq!(dir.size, 0);
+
+        // A name the archive does not hold is NotFound, not a host lookup.
+        assert!(
+            vfs_stat_facts(&jarfs_encode(&jar, "nope.txt"))
+                .expect("recognised")
+                .is_err(),
+            "an absent entry must report NotFound"
+        );
+
+        // A plain host path is not ours to answer.
+        assert!(
+            vfs_stat_facts("/tmp").is_none(),
+            "an ordinary path must fall through to stat"
+        );
+
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    /// A mounted archive offers `basic` and nothing else — HotSpot's zipfs does
+    /// not answer `posix`/`unix`/`dos` for an entry either, and answering them
+    /// here would mean answering them out of a host `stat` of a path string that
+    /// names no file.
+    #[test]
+    fn an_archive_entry_offers_only_the_basic_view() {
+        let jarfs_path = jarfs_encode("/tmp/whatever.jar", "a/b.txt");
+        assert_eq!(attribute_view_names_for_path(&jarfs_path), &["basic"]);
+        assert_eq!(
+            attribute_view_names_for_path("/tmp/whatever.jar"),
+            supported_attribute_view_names(),
+            "an ordinary host path keeps the host's view list"
+        );
+    }
 
     /// `Files` treats a spec with no colon as the `basic` view. Getting this
     /// wrong turns `readAttributes(p, "size")` into a request for a view named
@@ -15745,6 +16778,83 @@ mod named_attribute_tests {
                 assert!(
                     names.contains(b),
                     "view `{view}` is missing basic attribute `{b}`"
+                );
+            }
+        }
+    }
+
+    /// `setAttribute` and `readAttributes` must agree about what a view holds.
+    /// Every name the reader answers gets a verdict from the writer — the
+    /// default arm makes that trivially true, so what this really pins is WHICH
+    /// verdict, i.e. that a name added to the reader's table is not silently
+    /// classified writable (a write that lands somewhere unintended) or
+    /// silently refused (a name `readAttributes` returns that `setAttribute`
+    /// claims does not exist).
+    #[test]
+    fn the_writable_attributes_are_the_ones_the_jdk_lets_you_write() {
+        for name in ["lastModifiedTime", "lastAccessTime", "creationTime"] {
+            assert_eq!(attribute_write_kind(name), AttributeWrite::Time, "{name}");
+        }
+        for name in ["readonly", "hidden", "archive", "system"] {
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::DosFlag,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            attribute_write_kind("permissions"),
+            AttributeWrite::Permissions
+        );
+        assert_eq!(attribute_write_kind("mode"), AttributeWrite::Mode);
+        for name in ["owner", "group", "uid", "gid"] {
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::Unimplemented,
+                "{name}"
+            );
+        }
+        // Read-only in the JDK: the basic attribute view's `setAttribute`
+        // throws for every one of these.
+        for name in [
+            "size",
+            "isRegularFile",
+            "isDirectory",
+            "isSymbolicLink",
+            "isOther",
+            "fileKey",
+            "ino",
+            "dev",
+            "rdev",
+            "nlink",
+            "ctime",
+        ] {
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::NotWritable,
+                "{name} must not be writable"
+            );
+        }
+
+        // And every name any advertised view answers is covered by one of the
+        // arms above — no name reaches the writer unclassified.
+        for view in supported_attribute_view_names() {
+            let Some(names) = attribute_names_for_view(view) else {
+                continue;
+            };
+            for name in names {
+                let kind = attribute_write_kind(name);
+                assert!(
+                    matches!(
+                        kind,
+                        AttributeWrite::Time
+                            | AttributeWrite::DosFlag
+                            | AttributeWrite::Permissions
+                            | AttributeWrite::Mode
+                            | AttributeWrite::Unimplemented
+                            | AttributeWrite::NotWritable
+                    ),
+                    "`{view}:{name}` has no write verdict"
                 );
             }
         }

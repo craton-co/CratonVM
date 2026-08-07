@@ -336,7 +336,7 @@ comment. Item 7 is still blocked on L10.
 
 **Update, 2026-08-06 - L10 and L11 are closed, and item 7 with them.** L10 was
 not a blocker: `Executors.new*ThreadPool()` already returns objects built by the
-real `ThreadPoolExecutor.<init>`, and `probes/ExecProbe.java` shows all six
+real `ThreadPoolExecutor.<init>`, and `apps/executor_probe/ExecProbe.java` (path corrected 2026-08-07; there is no `probes/ExecProbe.java`) shows all six
 factory shapes running asynchronously on a worker thread in both modes, matching
 HotSpot. That made the per-INSTANCE question the eight receiver-shape probes
 existed to answer vacuous, so all eight went, together with the ninth

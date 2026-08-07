@@ -69,7 +69,7 @@
 //! concurrent one.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -79,10 +79,69 @@ use crate::collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 use crate::gc::{GcResult, GcStats};
 use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
-    ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
+    ObjectKind, GC_FLAG_MARKED, ARRAY_DATA_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use cratonvm_types::{ClassId, ObjectRef, Value};
+
+// ---------------------------------------------------------------------------
+// Production-ZGC submodules
+// ---------------------------------------------------------------------------
+//
+// The types above (`ColoredPointer`, `LoadBarrier`, `ZPage`, `ZgcCollector`,
+// `GenerationalZgc`) are the metadata-only SIMULATION described in the module
+// docs. The submodules below are the real, memory-backed replacements being
+// built out under `docs/feature-designs/zgc-production-implementation-plan.md`.
+//
+// They are deliberately decoupled from one another: each depends on a trait it
+// declares itself rather than on a sibling's concrete types, so they can land
+// and be reviewed independently. NONE of them is wired into `ZgcRealHeap` yet —
+// `ZgcRealHeap` is still the stop-the-world non-moving mark-sweep it has always
+// been. Declaring them here compiles and unit-tests them under `--features
+// zgc`; adopting them is a separate, later step.
+
+/// Real colored-pointer encoding and virtual address space.
+pub mod vaddr;
+
+/// Real memory-backed ZPages (small/medium/large tiers) and the O(1) page table.
+pub mod page;
+
+/// Real atomic, self-healing colored-pointer load barrier.
+pub mod barrier;
+
+/// Lock-free per-page forwarding table and relocation-set selection.
+pub mod forwarding;
+
+/// ZGC cycle phase/pause instrumentation and allocation-stall accounting.
+pub mod metrics;
+
+/// Generational remembered set (old -> young) and the store barrier.
+pub mod remembered;
+
+/// Concurrent marking engine: striped work-stealing stacks, the termination
+/// handshake, and the mutator ingress the load barrier publishes into.
+pub mod mark;
+
+/// Generational young/old split (JEP 439) over the real page allocator.
+pub mod generation;
+
+/// Object relocation: the copy/CAS-publish protocol, the from-space page
+/// lifetime state machine, and the stop-the-world compaction path.
+pub mod relocate;
+
+/// Thread-local allocation buffers for the ZGC page allocator.
+pub mod tlab;
+
+/// Reference-slot census: measures the compact/legacy/array/static split that
+/// decides how much of the load barrier's slot-resolution work is critical path.
+pub mod census;
+
+/// The seam layer between the submodules above. These modules were authored
+/// independently and each declares its own decoupling traits, so the glue that
+/// joins them lives here rather than in any one of them. An adapter in this
+/// module is a *symptom*: the long-term fix for several of them is for the two
+/// modules to agree on a shared type.
+pub mod adapters;
 
 // ---------------------------------------------------------------------------
 // Simulation-selected warning
@@ -1403,6 +1462,12 @@ pub struct ZgcRealHeap {
 
     /// Backing storage for all objects.
     arena: Mutex<Arena>,
+    /// Immutable arena envelope, captured at construction — see
+    /// [`Self::conservative_addr_span`]. Plain `usize`, deliberately outside
+    /// the `Mutex`: the conservative-root filter must answer without locking.
+    arena_base: usize,
+    /// Exclusive upper bound of the arena envelope.
+    arena_end: usize,
     /// Base address of every live allocation, in allocation order. Rebuilt
     /// (filtered to survivors) by each sweep.
     /// Hash-set registry (ZGC-5/6 hardening): `is_object_address` is
@@ -1429,8 +1494,44 @@ pub struct ZgcRealHeap {
     /// bytecode) run a full STW mark-sweep per allocation: a livelock-grade
     /// GC storm with no OOME ever surfacing.
     gc_rearm: AtomicUsize,
+    /// "`needs_gc` went true while allocating" latch, read at the native-call
+    /// boundary via `VmHeap::young_spill_pressure`.
+    ///
+    /// Why it exists: this collector's `GarbageCollector::alloc_object` /
+    /// `alloc_array` are INFALLIBLE — they end in
+    /// `eprintln!("FATAL: ZGC(real): out of heap space …"); std::process::abort()`.
+    /// A workload that allocates only from inside native wrappers reaches no
+    /// safepoint of its own, so without a signal the one hook that can collect
+    /// on a native's behalf (`vm/src/vm/vm_exec.rs`) never fires here and the
+    /// process dies by `abort()` on a heap full of garbage, with no Java-visible
+    /// `OutOfMemoryError` ever thrown. G1 closed exactly this defect with
+    /// `G1Collector::native_alloc_pressure`, armed by
+    /// `note_region_consumed_locked` (`g1.rs:1765-1774`); this field is the ZGC
+    /// analogue, armed from [`Self::alloc_raw`].
+    ///
+    /// It CANNOT recreate the `gc_rearm` GC-storm livelock documented on the
+    /// field above, because the arming predicate is `needs_gc`'s predicate
+    /// verbatim — `allocated >= gc_threshold && allocated >= gc_rearm` — so it
+    /// inherits the re-arm floor. A live set parked above the static threshold
+    /// leaves `gc_rearm` above `allocated` after every sweep, so the latch
+    /// simply stays down until genuinely new allocation clears the floor. It
+    /// adds a signal below no gate that `needs_gc` does not already have.
+    ///
+    /// `Relaxed` throughout, matching G1: this is an advisory diagnostic
+    /// feeding a policy decision ("should this native boundary collect?"), not
+    /// a correctness handshake. Nothing is published *through* the bit — the
+    /// consumer re-reads the heap's own counters and re-checks its own gates
+    /// before acting — so no acquire/release pairing is needed, and a read that
+    /// observes the store one boundary late merely defers a collection to the
+    /// next boundary.
+    native_alloc_pressure: AtomicBool,
     /// Lifetime collection counter (observability).
     gc_count: AtomicUsize,
+    /// `--verbose:gc` per-collection logging gate — see
+    /// [`Self::enable_gc_logging`]. Off by default; flipped by
+    /// `VmHeap::enable_gc_logging`. Mirrors G1's `gc_log_enabled`
+    /// (`g1.rs:6770-6777`). `Relaxed`: a logging toggle orders nothing.
+    gc_log_enabled: AtomicBool,
     /// Shared `java.lang.ref` reference processor.
     ///
     /// Weak/soft/phantom/cleaner/finalizer references discovered on this
@@ -1450,6 +1551,99 @@ pub struct ZgcRealHeap {
     /// resurrected (non-moving, so pre == post address). Drained by
     /// [`Self::collect_garbage_with_finalizers`].
     resurrected_finalizers: Mutex<Vec<usize>>,
+
+    /// Reference-slot census — the instrument for the one unmeasured number in
+    /// `docs/feature-designs/zgc-reference-slot-representation.md`.
+    ///
+    /// Why it lives on the heap rather than in a `static`: it is the same
+    /// no-process-global rule [`census`]'s module header states, and the same
+    /// rule this tree learned the hard way from process-global GC caches
+    /// outliving the VM that filled them. One census per heap, reached only
+    /// through `&self`.
+    ///
+    /// **Off by default**, so an untouched heap pays exactly one relaxed
+    /// `AtomicBool` load per collection (the gate on the [`Self::collect_garbage`]
+    /// call site) and nothing at all on any mutator path. Turn it on through
+    /// [`Self::slot_census`].
+    slot_census: census::ZSlotCensus,
+
+    /// The weak-referent skip set for a **concurrent** mark cycle: the
+    /// heap-owned twin of the `ref_skip_objs` local that
+    /// [`Self::collect_garbage`] builds on its own stack.
+    ///
+    /// # Why this is a field and not a parameter
+    ///
+    /// [`mark::ZMarkContext::visit_refs`] takes `&self` and an address and
+    /// nothing else, and it is called from every mark worker and from
+    /// arbitrary mutator threads. The skip set therefore cannot travel on the
+    /// stack the way `collect_garbage`'s does; it has to live somewhere every
+    /// caller can reach. It is also why the set is an [`std::sync::Arc`]: a
+    /// worker clones the handle under a read lock, drops the guard, and walks
+    /// the object with no lock held, which is the same shape the census's
+    /// two-phase contract uses and the same reason — a registry-style guard
+    /// held across a call back into the heap is a lock cycle.
+    ///
+    /// # Why it must be a SNAPSHOT
+    ///
+    /// [`ReferenceProcessor::reference_object_addresses`] is a live view: a
+    /// mutator that constructs a `WeakReference` mid-cycle adds to it. If
+    /// workers read that live view, an object could be traced as a strong
+    /// edge before the `Reference` was discovered and skipped after, so
+    /// whether the referent is immortal would depend on thread timing. Taken
+    /// once at [`Self::begin_concurrent_mark_cycle`] and held for the whole
+    /// cycle, the answer is the same for every worker.
+    ///
+    /// `None` means "no concurrent mark cycle is open" — see
+    /// [`Self::concurrent_mark_skip_set`] for what `visit_refs` then does and
+    /// why that direction was chosen.
+    mark_ref_skip: parking_lot::RwLock<Option<std::sync::Arc<FxHashSet<usize>>>>,
+
+    /// One-shot latch for the "`visit_refs` ran with no skip-set snapshot"
+    /// warning. Without it the warning is one line per object visited, which
+    /// on a real heap is millions of lines and is itself a hang. `Relaxed`: it
+    /// orders nothing and publishes nothing, it only de-duplicates a log line.
+    mark_ref_skip_warned: AtomicBool,
+
+    /// Per-thread allocation buffers carved out of [`Self::arena`] — the
+    /// adoption of `gc::zgc::tlab`'s hook/statistics contract onto this heap.
+    ///
+    /// # Why (the measurement, not a guess)
+    ///
+    /// Every allocation on this backend used to serialise on
+    /// [`Self::arena`]'s single `Mutex<Arena>`, and that mutex is not held for
+    /// a pointer bump: it covers `Arena::alloc`'s free-list tier scans (the
+    /// large tier is a linear scan of every reclaimed span) *and* the
+    /// per-object `write_bytes` zeroing. The generational and G1 backends have
+    /// TLABs; this one had none. The full Spring Boot suite under
+    /// `-XX:+UseZGC` measured 1860 PASS / 49 HANG / 22 FAIL against
+    /// 1902 / 18 / 11 on the default collector — **35 classes PASS -> HANG**,
+    /// concentrated on `*AutoConfigurationTests`, i.e. `ApplicationContext`
+    /// boot/teardown, the most allocation-heavy workload in the suite
+    /// (`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`).
+    ///
+    /// That record does not attribute the hangs to this lock and neither does
+    /// this field: a global lock on every allocation is the wrong answer at
+    /// any heap size, and it is the cheaper of the two suspects to remove.
+    ///
+    /// See [`ZArenaTlabRegistry`] for why the buffers are carved from the
+    /// arena rather than from `zgc::tlab`'s [`crate::zgc::page::ZPageAllocator`].
+    tlabs: ZArenaTlabRegistry,
+
+    /// Kill switch for [`Self::tlabs`], seeded from `CRATONVM_ZGC_TLAB` at
+    /// construction and flippable at runtime through
+    /// [`Self::set_tlab_enabled`]. **Default on.**
+    ///
+    /// Seeded per heap rather than latched in a `OnceLock` (or declared in
+    /// `cratonvm_types::GcFlags`) deliberately: a latched process-global gate
+    /// makes `set_var` invisible to a test that runs after the first read, and
+    /// the point of a kill switch is that a suite run can A/B it. `Relaxed`:
+    /// nothing is published through the bit — a mutator that observes the flip
+    /// one allocation late merely takes the other path for one object.
+    ///
+    /// Turning it OFF does **not** disable [`Self::retire_all_tlabs`]: chunks
+    /// already handed out must still be closed and returned, or their tails
+    /// leak.
+    tlab_enabled: AtomicBool,
 }
 
 // SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
@@ -1473,6 +1667,33 @@ impl ZgcRealHeap {
         self.layout_domain.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// The arena envelope, for conservative root scanning.
+    ///
+    /// `VmHeap::conservative_addr_span`'s ZGC arm answered `None`, justified by
+    /// "ZGC keeps live bases in a registry, not a contiguous arena". That
+    /// premise is false — this heap is one `Arena`, created in
+    /// [`Self::with_capacity`] and never grown — and the consequence was real:
+    /// the sole consumer (`vm/src/jit/conservative_roots.rs`) hoists this span
+    /// out of its scan loop and rejects a word with an inline
+    /// `w < lo || w >= hi`. With `None` it cannot, so EVERY 8-byte stack word
+    /// went through `is_object_address`, which opens with `registry.lock()` —
+    /// one global mutex acquire per candidate qword, per frame, per thread.
+    ///
+    /// **This is a filter, not an answer.** A word inside the span must still
+    /// go through the exact-base registry test. Widening it into an acceptance
+    /// path would readmit interior pointers as object bases — the `is_addr_live`
+    /// unsoundness that was fixed separately, where the sweep's coalescing of
+    /// free spans lets a dead object's base become interior to a live one.
+    ///
+    /// Answers without taking the arena lock; see the fields' note.
+    pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
+        if self.arena_end > self.arena_base {
+            Some((self.arena_base, self.arena_end))
+        } else {
+            None
+        }
+    }
+
     /// Create a heap with the default capacity ([`ZGC_REAL_DEFAULT_HEAP`]).
     pub fn new() -> Self {
         Self::with_capacity(ZGC_REAL_DEFAULT_HEAP)
@@ -1481,20 +1702,44 @@ impl ZgcRealHeap {
     /// Create a heap with the given total capacity in bytes.
     pub fn with_capacity(total_bytes: usize) -> Self {
         let cap = total_bytes.max(4096);
+        let arena = Arena::new(cap);
+        // Capture the arena envelope ONCE, as plain `usize`. This backs
+        // `conservative_addr_span`, and it is deliberately not read through
+        // `self.arena.lock()`: the span's whole purpose is to let a caller
+        // reject a stack word with a range compare and no lock, so taking a
+        // lock to answer it would reintroduce exactly the contention it
+        // exists to delete. Sound because this arena is created here and
+        // NEVER grown — there is no `Arena::grow` call anywhere in this file,
+        // and `alloc_raw` is the single allocation chokepoint.
+        let arena_base = arena.base_ptr() as usize;
+        let arena_end = arena_base.saturating_add(arena.capacity());
         Self {
             layout_domain: std::sync::atomic::AtomicU32::new(
                 cratonvm_types::FIRST_LAYOUT_DOMAIN,
             ),
-            arena: Mutex::new(Arena::new(cap)),
+            arena_base,
+            arena_end,
+            arena: Mutex::new(arena),
             registry: Mutex::new(FxHashSet::default()),
             next_hash_code: AtomicI32::new(1),
             allocated: AtomicUsize::new(0),
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
             gc_rearm: AtomicUsize::new(0),
+            native_alloc_pressure: AtomicBool::new(false),
             gc_count: AtomicUsize::new(0),
+            gc_log_enabled: AtomicBool::new(false),
             ref_processor: Mutex::new(ReferenceProcessor::new()),
             pending_finalizer_roots: Mutex::new(Vec::new()),
             resurrected_finalizers: Mutex::new(Vec::new()),
+            slot_census: census::ZSlotCensus::new(),
+            mark_ref_skip: parking_lot::RwLock::new(None),
+            mark_ref_skip_warned: AtomicBool::new(false),
+            // NOTE (E0063 class of break): this is the ONE struct literal for
+            // `ZgcRealHeap` — `new()` and `Default` both delegate here — so a
+            // new field must be initialised here and nowhere else. Verified by
+            // grepping `ZgcRealHeap {` across the workspace.
+            tlabs: ZArenaTlabRegistry::for_capacity(cap),
+            tlab_enabled: AtomicBool::new(zgc_tlab_enabled_by_default()),
         }
     }
 
@@ -1553,6 +1798,58 @@ impl ZgcRealHeap {
         self.gc_count.load(Ordering::Relaxed)
     }
 
+    /// Native-allocation pressure signal — see the
+    /// [`native_alloc_pressure`](Self::native_alloc_pressure) field doc.
+    /// Consumed at the `safe_native_call` boundary via
+    /// `VmHeap::young_spill_pressure`. Mirrors `G1Collector::native_alloc_pressure`
+    /// (`g1.rs:1779-1781`), including its `Relaxed` ordering: advisory
+    /// diagnostic feeding a policy decision, not a correctness handshake.
+    #[inline]
+    pub fn native_alloc_pressure(&self) -> bool {
+        self.native_alloc_pressure.load(Ordering::Relaxed)
+    }
+
+    /// Clear the native-allocation pressure latch. The consumer clears
+    /// unconditionally after acting (including when its own gates said no), so
+    /// this must be idempotent and cheap. `Relaxed` for the reason on the
+    /// field: nothing is published through the bit. Mirrors `g1.rs:1785-1787`.
+    #[inline]
+    pub fn clear_native_alloc_pressure(&self) {
+        self.native_alloc_pressure.store(false, Ordering::Relaxed);
+    }
+
+    /// Latch the native-allocation pressure signal from OUTSIDE the collector —
+    /// the `VmHeap::note_young_spill_pressure` funnel used by allocation
+    /// wrappers that spilled and cannot collect themselves. Mirrors
+    /// `g1.rs:1793-1795`.
+    ///
+    /// Note this externally-noted edge deliberately bypasses the `gc_threshold`
+    /// / `gc_rearm` predicate that [`Self::alloc_raw`] applies: the caller is
+    /// asserting pressure the heap's own counters cannot see. It still cannot
+    /// storm, because the *consumer* re-checks `needs_gc` and its own overhead
+    /// gate before running a cycle, and each call latches once for one clear.
+    #[inline]
+    pub fn note_native_alloc_pressure(&self) {
+        self.native_alloc_pressure.store(true, Ordering::Relaxed);
+    }
+
+    /// Enable GC event logging (`--verbose:gc`).
+    ///
+    /// Closes the gap recorded on `VmHeap::enable_gc_logging`'s ZGC arm: that
+    /// arm had no toggle to flip and no gated statement to flip it for, so a
+    /// user running `--verbose:gc -XX:+UseZGC` was told logging was on and then
+    /// got nothing for the entire run. Same name/shape as
+    /// `G1Collector::enable_gc_logging` (`g1.rs:6770-6777`) so the `VmHeap` arm
+    /// is a plain delegation.
+    pub fn enable_gc_logging(&self) {
+        self.gc_log_enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// Disable GC event logging. Mirrors `g1.rs:6775-6777`.
+    pub fn disable_gc_logging(&self) {
+        self.gc_log_enabled.store(false, Ordering::Relaxed);
+    }
+
     /// Next identity hash code (never zero; wraps avoiding 0).
     pub fn next_hash(&self) -> i32 {
         let h = self.next_hash_code.fetch_add(1, Ordering::Relaxed);
@@ -1560,31 +1857,6 @@ impl ZgcRealHeap {
             self.next_hash_code.fetch_add(1, Ordering::Relaxed)
         } else {
             h
-        }
-    }
-
-    /// Lazily mint and durably install a non-zero identity hash for an
-    /// object whose header field is still 0 (the JIT inline `new` fast path
-    /// leaves it TLAB-zeroed — see `identity_hash_code`'s doc comment on the
-    /// `GenerationalHeap` backend for the full rationale). Safe under
-    /// concurrency: the header field is written via CAS from 0, so a losing
-    /// racer's mint is discarded and every caller converges on the single
-    /// value that ends up durably stored.
-    fn mint_identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let minted = match self.next_hash() {
-            0 => i32::MAX,
-            h => h,
-        };
-        // SAFETY: see the identical justification in
-        // `gen_heap::GenerationalHeap::mint_identity_hash_code`.
-        unsafe {
-            let field_ptr =
-                std::ptr::addr_of_mut!((*(obj.as_ptr() as *mut ObjectHeader)).identity_hash_code);
-            let atomic = &*(field_ptr as *const AtomicI32);
-            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => minted,
-                Err(existing) => existing,
-            }
         }
     }
 
@@ -1602,7 +1874,28 @@ impl ZgcRealHeap {
             ptr
         };
         self.registry.lock().insert(ptr as usize);
-        self.allocated.fetch_add(size, Ordering::Relaxed);
+        let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
+        // Arm the native-allocation-pressure latch on the crossing edge. This
+        // is the ZGC analogue of G1's `note_region_consumed_locked`
+        // (`g1.rs:1765-1774`): "`needs_gc` went true during allocation".
+        //
+        // `alloc_raw` is the single chokepoint for EVERY object and array on
+        // this backend — `try_alloc_object`, `try_alloc_array` and the
+        // infallible `GarbageCollector::alloc_object` / `alloc_array` all route
+        // here — so one test covers both shapes.
+        //
+        // The predicate is `needs_gc`'s predicate verbatim (inlined rather than
+        // called, to keep this off the trait and out of any import ambiguity;
+        // see `<Self as GarbageCollector>::needs_gc`). Reusing it — rather than
+        // testing `gc_threshold` alone — is what keeps the latch out of the
+        // GC-storm shape the `gc_rearm` field exists to prevent: a live set
+        // parked above the static threshold leaves `gc_rearm` above `allocated`
+        // after every sweep, so the latch stays DOWN until genuinely new
+        // allocation clears the re-arm floor. The latch can therefore never
+        // request a collection that `needs_gc` would refuse.
+        if after >= self.gc_threshold && after >= self.gc_rearm.load(Ordering::Relaxed) {
+            self.native_alloc_pressure.store(true, Ordering::Relaxed);
+        }
         Some(ptr)
     }
 
@@ -1610,12 +1903,11 @@ impl ZgcRealHeap {
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
         let total = HEADER_SIZE.checked_add(fields_size)?;
-        let ptr = self.alloc_raw(total)?;
+        let ptr = self.alloc_raw_tlab(total)?;
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).ok()?,
         );
@@ -1636,14 +1928,13 @@ impl ZgcRealHeap {
             return None;
         }
         let data_size = array_data_size(length, element_type).ok()?;
-        let total = HEADER_SIZE.checked_add(data_size)?;
-        let ptr = self.alloc_raw(total)?;
+        let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
+        let ptr = self.alloc_raw_tlab(total)?;
         let len_u32 = u32::try_from(length).ok()?;
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             len_u32,
             len_u32,
         );
@@ -1691,6 +1982,15 @@ impl ZgcRealHeap {
 
     /// Validate that `addr` is exactly the base of a live object. O(1) — hot
     /// path for conservative-root validation (per candidate qword).
+    ///
+    /// **TLAB audit.** This deliberately does *not* retire TLABs, and does not
+    /// need to: a TLAB-served object is inserted into [`Self::registry`] the
+    /// instant it is handed out, inside the owning cell's lock. This predicate
+    /// is not GC-only — the JIT calls it on the mutator path (`jit_checkcast`
+    /// resolves its receiver through it), and the conservative-root scanner
+    /// calls it *before* `collect_garbage` is entered — which is exactly why
+    /// `gc::zgc::tlab`'s batched registration could not be adopted here. See
+    /// [`ZArenaTlabRegistry`]'s `registry_batch` note.
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         if self.registry.lock().contains(&addr) {
             // SAFETY: the registry contains only live allocation bases.
@@ -1701,6 +2001,13 @@ impl ZgcRealHeap {
     }
 
     /// Loose containment check returning the base object for any address inside it.
+    ///
+    /// **TLAB audit.** No retire here either. The interior-pointer fallback
+    /// below iterates [`Self::registry`] and decodes a header at each
+    /// *registered base* — it never strides raw arena bytes — so an
+    /// un-retired chunk tail is invisible to it rather than fatal. Retiring
+    /// from a mutator query would also be actively wrong: it would close every
+    /// thread's buffer on a conservative-root probe.
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         // Fast path: an exact object base (the overwhelmingly common probe).
         if self.registry.lock().contains(&addr) {
@@ -1728,7 +2035,13 @@ impl ZgcRealHeap {
     }
 
     /// Walk every live object and its allocation size.
+    ///
+    /// Retires every TLAB first — this is a heap-walking entry point and the
+    /// invariant on [`Self::retire_all_tlabs`] applies to it. Idempotent, so
+    /// calling it from inside a collection that has already retired costs a
+    /// pass over an empty set.
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
+        self.retire_all_tlabs();
         self.registry
             .lock()
             .iter()
@@ -1754,16 +2067,35 @@ impl ZgcRealHeap {
         unsafe { &mut *(base as *mut ObjectHeader) }
     }
 
+    /// Shared (`&`) header view — the concurrent twin of [`Self::header_mut`].
+    ///
+    /// Every mutating operation an [`ObjectHeader`] offers goes through the
+    /// atomic mark word, so a `&ObjectHeader` is enough to claim a mark bit.
+    /// [`Self::header_mut`] is nonetheless unusable from the concurrent marker:
+    /// N workers each minting a `&mut ObjectHeader` for the same object are
+    /// aliasing `&mut`s, which is undefined behaviour regardless of what the
+    /// fields underneath happen to be — the compiler is entitled to assume the
+    /// reference is unique. Every method on [`mark::ZMarkContext`] below uses
+    /// this accessor, and none uses `header_mut`.
+    #[inline]
+    fn header_ref(&self, base: *mut u8) -> &ObjectHeader {
+        // SAFETY: `base` is a registered live allocation base (the caller has
+        // passed it through the registry gate); its first HEADER_SIZE bytes
+        // are a valid `ObjectHeader` written at allocation time, and this
+        // reference is shared, so concurrent readers are sound.
+        unsafe { &*(base as *const ObjectHeader) }
+    }
+
     /// Total size in bytes of the allocation rooted at `header`.
     fn alloc_size(header: &ObjectHeader) -> usize {
-        match header.kind {
+        match header.kind() {
             ObjectKind::Object | ObjectKind::HumongousFiller => {
                 HEADER_SIZE + cratonvm_types::object_body_size(header)
             }
             ObjectKind::Array => {
                 let data =
-                    array_data_size(header.array_length() as usize, header.element_type).unwrap_or(0);
-                HEADER_SIZE + data
+                    array_data_size(header.array_length() as usize, header.element_type()).unwrap_or(0);
+                ARRAY_DATA_OFFSET + data
             }
         }
     }
@@ -1787,7 +2119,7 @@ impl ZgcRealHeap {
         skip_index: Option<usize>,
     ) {
         let header = self.header_mut(base);
-        match header.kind {
+        match header.kind() {
             ObjectKind::Object => {
                 if cratonvm_types::is_compact_object(header) {
                     // Borrowing accessor: this walk only reads `field_offsets` /
@@ -1806,8 +2138,41 @@ impl ZgcRealHeap {
                                 if !is_ref || skip_index == Some(index) {
                                     continue;
                                 }
+                                // SAFETY: `offset` comes from this object's own
+                                // registered layout — the layout its body was
+                                // sized with at allocation — so the field lies
+                                // inside the allocation, and `read_ref_slot`
+                                // reads exactly `ref_field_size()` bytes of it.
+                                //
+                                // WHY NOT `std::ptr::read(slot as *const u64)`:
+                                // that is what stood here, and it was wrong
+                                // under compressed oops. `ref_field_size()` is
+                                // 4 when narrow oops are on, so an
+                                // unconditional 8-byte load reads one field
+                                // plus half of the next and calls the result a
+                                // pointer. Every compact reference field then
+                                // traces to garbage — silently refused by the
+                                // registry/`is_in_heap` screen, so nothing
+                                // looks wrong — and the real referent is never
+                                // traced at all: a live object collected.
+                                //
+                                // It was LATENT, never live, and only because
+                                // of a gate in another crate:
+                                // `vm/src/vm/vm_init.rs` (the
+                                // `gc_backend != GcBackend::Generational`
+                                // branch, ~line 1397) refuses compressed oops
+                                // for every backend except `Generational`, so
+                                // ZGC has never seen a narrow slot. THAT GATE
+                                // MUST NOT BE RELAXED PER-BACKEND WITHOUT
+                                // AUDITING EVERY REFERENCE-SLOT READ IN THE
+                                // COLLECTOR BEING ENABLED. `gc/src/g1.rs` was
+                                // audited on 2026-08-07 and still carries the
+                                // same wide-read pattern, held off by the same
+                                // gate; `gen_heap.rs`, the one collector the
+                                // gate admits, is clean.
                                 let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
-                                let raw = unsafe { std::ptr::read(slot as *const u64) };
+                                let raw =
+                                    unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
                                 if raw != 0 {
                                     work.push(raw as usize);
                                 }
@@ -1815,6 +2180,13 @@ impl ZgcRealHeap {
                         },
                     );
                 } else {
+                    // The legacy arm is NOT narrow-oop territory and must not be
+                    // "fixed" to match the compact arm above. A legacy field is a
+                    // whole 16-byte `Value` cell (`SLOT_SIZE`, heap_types.rs:171)
+                    // whose object payload is an 8-byte raw pointer at
+                    // `FIELD_CELL_PAYLOAD64_OFFSET` (heap_types.rs:230). Both are
+                    // plain constants: neither narrows when compressed oops are
+                    // on, so the widths here are already right in both configs.
                     let n = header.num_slots() as usize;
                     for i in 0..n {
                         if skip_index == Some(i) {
@@ -1830,11 +2202,22 @@ impl ZgcRealHeap {
                 }
             }
             ObjectKind::Array => {
-                if header.element_type == ArrayElementType::Reference {
+                if header.element_type() == ArrayElementType::Reference {
                     let len = header.array_length() as usize;
-                    // SAFETY: data area begins at base + HEADER_SIZE; each ref
-                    // element is REF_ELEMENT_SIZE and `i < len`.
-                    let data = unsafe { base.add(HEADER_SIZE) };
+                    // This arm was ALREADY narrow-correct and is deliberately
+                    // left calling `read_prim_element`: its `Reference` case
+                    // (gc/src/heap.rs, `ArrayElementType::Reference`) strides by
+                    // `cratonvm_types::ref_element_size()` and loads through
+                    // `narrow_oop::read_ref_slot`, exactly like the two sibling
+                    // walkers in this file. The SAFETY note here used to cite
+                    // `REF_ELEMENT_SIZE` (heap_types.rs:176) as the stride; that
+                    // is the WIDE 8-byte constant and is the wrong stride under
+                    // narrow oops, so do not reintroduce it — the code was
+                    // right, only the comment was.
+                    //
+                    // SAFETY: data area begins at base + ARRAY_DATA_OFFSET; each
+                    // ref element is `ref_element_size()` bytes and `i < len`.
+                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
                     for i in 0..len {
                         let val =
                             unsafe { read_prim_element(data, i, ArrayElementType::Reference) };
@@ -1880,7 +2263,44 @@ impl ZgcRealHeap {
         // or null (handled above). Reference referents/objects discovered for
         // this heap are always such bases.
         let header = self.header_mut(base as *mut u8);
-        header.gc_flags & GC_FLAG_MARKED != 0
+        header.gc_flags() & GC_FLAG_MARKED != 0
+    }
+
+    /// This heap's [`census::ZSlotCensus`] — the reference-slot instrument.
+    ///
+    /// The handle a driver uses to arm the diagnostic
+    /// (`heap.slot_census().enable()`), label the run, and read the result back
+    /// after a collection. It is disabled until something calls `enable()`, so
+    /// exposing it costs a build nothing.
+    pub fn slot_census(&self) -> &census::ZSlotCensus {
+        &self.slot_census
+    }
+
+    /// Whether the VM's own read path will take its **compact** arm for this
+    /// object — the census's "effectively compact" predicate.
+    ///
+    /// Why this is not `is_compact_object(header)`: `compact_object_field_storage`
+    /// (`types/src/field_layout.rs:953-965`) refuses in *two* steps —
+    /// `is_compact_object`, and then `class_layout_for_fields(class_id,
+    /// num_slots)?`. An object carrying [`cratonvm_types::GC_FLAG_COMPACT`] whose
+    /// class has no layout registered for its exact field count (a redefine that
+    /// changed the count, a foreign layout domain) falls through that `?`, and
+    /// [`Self::get_field`] then reads it as a **16-byte tagged cell**. For an
+    /// instrument whose entire purpose is barrier cost, what the read path does
+    /// is the truth and the header bit is not.
+    ///
+    /// `with_class_layout(.., |_| ())`, not `class_layout_for_fields(..)`: the
+    /// two resolve through the same `registry_layout_for_fields`, and the
+    /// borrowing form does not pay the `Arc` clone/drop for a handle that is
+    /// discarded immediately — the same reason `enumerate_references` uses it.
+    fn effectively_compact_header(header: &ObjectHeader) -> bool {
+        cratonvm_types::is_compact_object(header)
+            && cratonvm_types::with_class_layout(
+                header.class_id.as_u32(),
+                header.num_slots(),
+                |_layout| (),
+            )
+            .is_some()
     }
 
     /// Run the shared [`ReferenceProcessor`] against the just-completed mark.
@@ -1948,12 +2368,1592 @@ impl ZgcRealHeap {
 
         result
     }
+
+    // -- Concurrent-mark seam ---------------------------------------------
+    //
+    // The three methods below exist only to serve the
+    // [`mark::ZMarkContext`] implementation further down this file. Nothing
+    // in `collect_garbage` calls them and nothing in `collect_garbage`
+    // changed to accommodate them; see that impl's header for why adopting
+    // the concurrent engine is a separate step.
+
+    /// Open a concurrent mark cycle: snapshot the weak-referent skip set and
+    /// publish it for [`mark::ZMarkContext::visit_refs`].
+    ///
+    /// Returns the snapshot so a caller can log or assert on its size.
+    ///
+    /// # When to call it
+    ///
+    /// In the mark-start safepoint, **after** every survivor's stale
+    /// [`GC_FLAG_MARKED`] has been cleared and **before** any worker thread is
+    /// started. Both halves of that ordering are load-bearing:
+    ///
+    /// * Clearing after a worker has started loses that worker's claim — the
+    ///   object reads as unmarked again and can be pushed a second time, or
+    ///   worse, the clear lands between another worker's winning
+    ///   [`mark::ZMarkContext::try_mark`] and its scan, so the object is
+    ///   scanned once and then re-claimed by a third worker as if it were
+    ///   fresh. Exactly-once is a property of the whole cycle, not of one CAS.
+    /// * Snapshotting after workers start means some edges were traced under
+    ///   an empty skip set — see the `mark_ref_skip` field docs for why a
+    ///   live view makes referent immortality depend on thread timing.
+    ///
+    /// This method deliberately does **not** clear the mark bits itself. The
+    /// clear is a full walk of the registry that must happen inside the
+    /// safepoint, and folding it in here would hide a stop-the-world pass
+    /// behind a name that reads like bookkeeping.
+    pub fn begin_concurrent_mark_cycle(&self) -> std::sync::Arc<FxHashSet<usize>> {
+        // Take the `ref_processor` guard, build the set, and DROP the guard
+        // before touching `mark_ref_skip`. Holding two collector locks at once
+        // is how a lock cycle is built; there is no reason to here.
+        let snapshot: FxHashSet<usize> = {
+            let rp = self.ref_processor.lock();
+            rp.reference_object_addresses().into_iter().collect()
+        };
+        let shared = std::sync::Arc::new(snapshot);
+        *self.mark_ref_skip.write() = Some(std::sync::Arc::clone(&shared));
+        shared
+    }
+
+    /// Close the concurrent mark cycle opened by
+    /// [`Self::begin_concurrent_mark_cycle`], dropping the skip-set snapshot.
+    ///
+    /// Call it after the last worker has joined and after the non-strong
+    /// reference phase has run — the reference phase asks
+    /// [`mark::ZMarkContext::is_marked`] about referents, which does not
+    /// consult the skip set, but a `keep_alive` re-drain does re-enter
+    /// `visit_refs` and must still see the cycle's snapshot rather than an
+    /// empty set.
+    pub fn end_concurrent_mark_cycle(&self) {
+        *self.mark_ref_skip.write() = None;
+    }
+
+    /// The current cycle's skip-set snapshot, or `None` outside a cycle.
+    ///
+    /// # What `visit_refs` does when this is `None`
+    ///
+    /// It reports **every** reference slot, including a `Reference`'s
+    /// referent, and logs one warning per heap. That is the wrong answer, and
+    /// it is the wrong answer in the survivable direction: an over-reported
+    /// edge makes a weak referent immortal (a leak, and `Cleaner` stops
+    /// firing), while an under-reported edge drops a live object's out-edges
+    /// and is a use-after-free. Faced with a caller that skipped
+    /// [`Self::begin_concurrent_mark_cycle`], leak.
+    ///
+    /// The alternative — take the snapshot lazily on the first `visit_refs` —
+    /// was rejected twice over: it would block a mark worker on
+    /// `ref_processor`'s mutex, which
+    /// [`mark::ZMarkContext`]'s threading contract forbids (a blocking
+    /// implementation turns `pause_for_safepoint` into a hang), and a snapshot
+    /// taken at the first *visit* is not a snapshot taken at mark *start*.
+    pub fn concurrent_mark_skip_set(&self) -> Option<std::sync::Arc<FxHashSet<usize>>> {
+        // Clone the handle under the read lock and return; the guard is gone
+        // by the time the caller walks anything.
+        self.mark_ref_skip.read().as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// Report every **strong** reference out-edge of the object at `base`.
+    ///
+    /// # This is a FORK of [`Self::enumerate_references`], and why
+    ///
+    /// It is not a wrapper for two reasons, one of shape and one historical:
+    ///
+    /// * **Shape.** `enumerate_references` pushes into a `&mut Vec<usize>`;
+    ///   [`mark::ZMarkContext::visit_refs`] hands each child to a
+    ///   `&mut dyn FnMut(u64)` so the engine can push into the *striped*
+    ///   work-stealing stack it owns. Funnelling through a `Vec` first would
+    ///   allocate per object on every mark worker. This reason still stands.
+    /// * **Defect (since FIXED at the source).** `enumerate_references`'s
+    ///   compact arm used to read its field with
+    ///   `std::ptr::read(slot as *const u64)`, an unconditional 8-byte load.
+    ///   The real read path (`read_compact_field`,
+    ///   `types/src/field_layout.rs:978-993`) goes through
+    ///   [`cratonvm_types::narrow_oop::read_ref_slot`], which is a 4-byte
+    ///   narrow load plus base+shift when compressed oops are on. Under narrow
+    ///   oops the raw 8-byte load reads one field and half of the next and
+    ///   calls the result a pointer: every compact reference field is then
+    ///   traced to garbage (refused by `is_in_heap`, so it looks like nothing
+    ///   is wrong) and the real referent is never traced at all — a live
+    ///   object collected, silently, only under compressed oops. It was latent
+    ///   rather than live only because `vm/src/vm/vm_init.rs` refuses
+    ///   compressed oops for any backend but `Generational`.
+    ///   `enumerate_references` now uses the same
+    ///   `narrow_oop::read_ref_slot` load this fork does, so the two arms agree
+    ///   and this bullet records why the fork exists, not a live divergence.
+    ///
+    /// The legacy arm also differs deliberately: it reads the cell's `u32` tag
+    /// and `u64` payload directly instead of `std::ptr::read`ing a whole
+    /// [`Value`]. A concurrent marker races a mutator's field store, and
+    /// materialising a `Value` out of a half-written cell can produce an
+    /// invalid enum discriminant, which is instant undefined behaviour rather
+    /// than a wrong answer. The raw tag/payload read cannot be poisoned that
+    /// way — a torn cell yields an implausible address, which
+    /// [`mark::ZMarkContext::is_in_heap`] then refuses like any other wild
+    /// child. This is the same reason the census reads slots raw.
+    ///
+    /// `skip_index` is the referent-slot hole: `Some(0)` for a registered
+    /// `Weak`/`Soft`/`Phantom`/`Cleaner` `Reference` object, exactly as
+    /// `collect_garbage`'s `skip_for` computes it.
+    fn visit_strong_refs_at(
+        &self,
+        base: *mut u8,
+        skip_index: Option<usize>,
+        f: &mut dyn FnMut(u64),
+    ) {
+        let header = self.header_ref(base);
+        match header.kind() {
+            ObjectKind::Object => {
+                let class_id = header.class_id.as_u32();
+                let num_slots = header.num_slots();
+                // The RAW header bit, following the precedent set by this
+                // file's census impl: the bit decides the object's BODY
+                // LAYOUT (`alloc_object` sizes a flagged object with
+                // `layout.body_size`, not `num_slots * SLOT_SIZE`), while a
+                // successful layout lookup only decides how that body is
+                // *interpreted*. Deciding with `effectively_compact_header`
+                // would send a flagged object whose layout cannot be resolved
+                // down the legacy arm, which strides `num_slots` 16-byte cells
+                // through a compact-sized body and reads past the allocation.
+                if cratonvm_types::is_compact_object(header) {
+                    let laid_out = cratonvm_types::with_class_layout(
+                        class_id,
+                        num_slots,
+                        |layout| {
+                            for (index, (&offset, &is_ref)) in layout
+                                .field_offsets
+                                .iter()
+                                .zip(layout.is_ref.iter())
+                                .enumerate()
+                            {
+                                if !is_ref || skip_index == Some(index) {
+                                    continue;
+                                }
+                                // SAFETY: `offset` comes from this object's own
+                                // registered layout — the layout its body was
+                                // sized with at allocation — so the field lies
+                                // inside the allocation, and `read_ref_slot`
+                                // reads exactly `ref_field_size()` bytes of it.
+                                let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
+                                let raw =
+                                    unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
+                                if raw != 0 {
+                                    f(raw);
+                                }
+                            }
+                        },
+                    )
+                    .is_some();
+                    if !laid_out {
+                        // Compact-flagged with no layout for
+                        // `(class_id, num_slots)`: its cells cannot be walked
+                        // without reading out of bounds, so report NO edges and
+                        // say so. Under-reporting edges is the dangerous
+                        // direction, which is exactly why this is a loud
+                        // warning and not a silent `return`.
+                        tracing::warn!(
+                            target: "zgc",
+                            class_id,
+                            num_slots,
+                            "zgc concurrent mark: compact-flagged object has no registered \
+                             layout; its out-edges cannot be enumerated and are NOT traced"
+                        );
+                    }
+                } else {
+                    let n = num_slots as usize;
+                    // The same "no real class has 1<<24 fields" screen
+                    // `check_field_index` applies: a walk that decoded payload
+                    // bytes as a header would otherwise stride millions of
+                    // cells straight out of the arena.
+                    if n > (1 << 24) {
+                        tracing::debug!(
+                            target: "zgc",
+                            num_slots = n,
+                            "zgc concurrent mark: suspect header, out-edges omitted"
+                        );
+                        return;
+                    }
+                    for i in 0..n {
+                        if skip_index == Some(i) {
+                            continue;
+                        }
+                        // SAFETY: a non-compact object's body is exactly
+                        // `num_slots * SLOT_SIZE` bytes (`alloc_object`'s
+                        // `fields_size` fallback), so cell `i` and both words
+                        // read out of it lie inside the allocation. Both reads
+                        // are naturally aligned because `SLOT_SIZE` is 16 and
+                        // `HEADER_SIZE` is 8-byte aligned.
+                        let cell = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
+                        let tag = unsafe {
+                            std::ptr::read(
+                                cell.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32
+                            )
+                        };
+                        if tag != cratonvm_types::VTAG_OBJECT as u32 {
+                            continue;
+                        }
+                        let raw = unsafe {
+                            std::ptr::read(
+                                cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET)
+                                    as *const u64,
+                            )
+                        };
+                        if raw != 0 {
+                            f(raw);
+                        }
+                    }
+                }
+            }
+            ObjectKind::Array => {
+                if header.element_type() == ArrayElementType::Reference {
+                    let len = header.array_length() as usize;
+                    // `ref_element_size()`, not the wide `REF_ELEMENT_SIZE`
+                    // constant: the stride is 4 under narrow oops. Same reason
+                    // the compact arm above avoids the raw 8-byte load.
+                    let stride = cratonvm_types::ref_element_size();
+                    // SAFETY: the data area begins at `base + ARRAY_DATA_OFFSET`
+                    // and holds `array_length()` elements of `stride` bytes;
+                    // `i < len`.
+                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
+                    for i in 0..len {
+                        let slot = unsafe { data.add(i * stride) };
+                        let raw = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
+                        if raw != 0 {
+                            f(raw);
+                        }
+                    }
+                }
+                // Primitive arrays have no out-edges.
+            }
+            ObjectKind::HumongousFiller => {}
+        }
+    }
 }
 
 impl Default for ZgcRealHeap {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Thread-local allocation buffers for `ZgcRealHeap`
+// ---------------------------------------------------------------------------
+//
+// This section adopts `gc::zgc::tlab`'s contract onto `ZgcRealHeap`. Read the
+// header on [`ZArenaTlabRegistry`] first: it states which parts of that module
+// are reused verbatim, which one part could not be, and why.
+
+use std::sync::Arc;
+
+use crate::tlab::Tlab;
+use crate::zgc::tlab::{current_thread_key, ZTlabConfig, ZTlabHeapHooks, ZTlabStats};
+use crate::zgc::vaddr::ZColor;
+
+/// Alignment of every TLAB-served allocation.
+///
+/// Fixed at 8 rather than taken from the caller: every production allocation
+/// path on this heap already asks [`Arena::alloc`] for 8, and
+/// [`Tlab::reserved_tail`]'s own note records that a cursor which is not
+/// 8-aligned is silently dropped by the consumer of the tail — which turns the
+/// tripwire into a no-op instead of a warning. Pinning the alignment here means
+/// the cursor can never leave the object grid in the first place.
+const ZGC_TLAB_ALIGN: usize = 8;
+
+/// Ceiling on a TLAB chunk carved from the arena.
+///
+/// Deliberately **below** `crate::tlab::default_tlab_size()` (256 KiB). The
+/// shared default is sized for the generational young arena, which is disjoint
+/// from the accounting this heap performs; here every byte sitting in a live
+/// chunk but not yet handed to an object is a byte `ZgcRealHeap::allocated`
+/// does not know about (see [`ZgcRealHeap::alloc_tlab`] on accounting). That
+/// blind spot is bounded by `live_threads * chunk`, so the chunk is the knob
+/// that bounds it. 64 KiB still amortises the arena mutex over ~600 typical
+/// (104-byte) objects, i.e. a ~600x reduction in arena-lock traffic, at a
+/// quarter of the accounting blind spot a 256 KiB chunk would cost.
+const ZGC_TLAB_MAX_CHUNK: usize = 64 * 1024;
+
+/// Runtime kill switch: `CRATONVM_ZGC_TLAB`. **Default on.**
+///
+/// `0` / `off` / `false` / `no` (case-insensitive) disable the TLAB fast path;
+/// anything else — including an unset variable — enables it. Read through
+/// [`cratonvm_types::flags::runtime_var_os`] so it participates in the same
+/// `-XX:` layering every other flag does, but deliberately **not** declared as
+/// a [`cratonvm_types::GcFlags`] field: a declared flag latches on first read,
+/// which makes a mid-run `set_var` invisible, and the whole point of this
+/// switch is that a suite can A/B it. (Declaring it would also mean editing
+/// `types/`, which this change does not touch.)
+///
+/// Read once per heap, in [`ZgcRealHeap::with_capacity`], into
+/// [`ZgcRealHeap::tlab_enabled`].
+fn zgc_tlab_enabled_by_default() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_TLAB") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
+/// The reserved footprint of a `bytes` request at [`ZGC_TLAB_ALIGN`].
+///
+/// Mirrors [`Tlab::alloc_initialized`]'s own `footprint` computation, so the
+/// bytes charged to [`ZgcRealHeap::allocated`] are the bytes the buffer
+/// actually consumed. (There is no *leading* padding to account for: the
+/// cursor never leaves the 8-byte grid because every request uses
+/// [`ZGC_TLAB_ALIGN`].)
+#[inline]
+fn zgc_tlab_footprint(bytes: usize) -> usize {
+    bytes.saturating_add(ZGC_TLAB_ALIGN - 1) & !(ZGC_TLAB_ALIGN - 1)
+}
+
+/// What one [`ZgcRealHeap::retire_all_tlabs`] did.
+///
+/// A distinct type rather than `zgc::tlab::ZTlabRetireSummary` for one honest
+/// reason: that type's `waste_bytes` is documented as "tail bytes made
+/// parseable by a filler" — i.e. *abandoned*. On this arena-backed adapter the
+/// tail is handed straight back to the arena free list, so it is recovered,
+/// not wasted, and reporting it under a field named `waste_bytes` would be a
+/// lie a capacity investigation could act on.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ZArenaTlabRetireSummary {
+    /// Buffers visited.
+    pub tlabs: usize,
+    /// Buffers that actually held a chunk (the rest were already retired).
+    pub live_chunks: usize,
+    /// Chunk-tail bytes returned to the arena free list by this retirement.
+    pub tail_bytes_returned: u64,
+    /// Registered slots dropped because their owning thread has exited.
+    pub slots_pruned: usize,
+    /// Buffers left alone because their cell was locked — see
+    /// [`ZgcRealHeap::retire_all_tlabs`] on why this is a safe skip and not a
+    /// missed obligation. Expected to be zero; a non-zero value means a peer
+    /// was mid-allocation (or forcibly stopped inside one) when the collection
+    /// started.
+    pub skipped_locked: usize,
+}
+
+/// A thread-private bump buffer carved out of [`ZgcRealHeap`]'s arena.
+///
+/// Wraps [`crate::tlab::Tlab`] by value — the same reuse decision
+/// `gc::zgc::tlab::ZTlab` makes, and for the same reason: the bump path, the
+/// "reserve the aligned FOOTPRINT" rule, the two-case tail filler and the
+/// idempotent retire each carry a scar from a real defect, and a second copy
+/// would have to be fixed twice.
+struct ZArenaTlab {
+    /// The shared TLAB doing the bump.
+    inner: Tlab,
+    /// `[start, end)` of the current chunk, or `None` when retired. Recorded
+    /// separately because [`Tlab::retire`] nulls its own pointers and the
+    /// retire path still needs the extent.
+    chunk: Option<(usize, usize)>,
+    /// Accounting, in `zgc::tlab`'s shape so the two allocators' numbers are
+    /// comparable.
+    ///
+    /// [`ZTlabStats::waste_bytes`] stays **zero** here and that is deliberate,
+    /// not an omission: nothing is abandoned on this adapter — see
+    /// [`ZArenaTlabRetireSummary`]. Recovered tail bytes are counted in
+    /// [`Self::tail_returned_bytes`] instead. `pages_taken` likewise stays zero
+    /// (there are no pages), and `direct_*` stays zero (there is no
+    /// keep-the-buffer direct path — see [`ZgcRealHeap::tlab_refill`]).
+    stats: ZTlabStats,
+    /// Cumulative chunk-tail bytes handed back to the arena free list.
+    tail_returned_bytes: u64,
+}
+
+impl ZArenaTlab {
+    fn new() -> Self {
+        Self {
+            inner: Tlab::empty(),
+            chunk: None,
+            stats: ZTlabStats::default(),
+            tail_returned_bytes: 0,
+        }
+    }
+
+    /// **Fast path.** A plain load / add / compare / store on thread-private
+    /// memory: no CAS, no arena lock, no free-list scan, no `write_bytes`.
+    ///
+    /// The `Release` fence inside [`Tlab::alloc_initialized`] stays (it orders
+    /// the caller's header stores ahead of the cursor commit for a cross-thread
+    /// STW reader, and emits no instruction on x86-64).
+    #[inline]
+    fn alloc(&mut self, bytes: usize) -> Option<usize> {
+        let ptr = self.inner.alloc(bytes, ZGC_TLAB_ALIGN)?;
+        let footprint = zgc_tlab_footprint(bytes);
+        self.stats.fast_allocations += 1;
+        self.stats.fast_bytes += footprint as u64;
+        Some(ptr as usize)
+    }
+}
+
+/// Every live [`ZArenaTlab`] on one heap, so a safepoint can retire all of them.
+///
+/// # What is reused from `gc::zgc::tlab`, and the one thing that is not
+///
+/// Reused verbatim: [`ZTlabHeapHooks`] (implemented for [`ZgcRealHeap`] below),
+/// [`ZTlabConfig`] and its `normalized()` clamping, [`ZTlabStats`], and
+/// [`current_thread_key`]. The bump itself is [`crate::tlab::Tlab`], which is
+/// what `ZTlab` wraps too.
+///
+/// **Not reused: `ZTlab` / `ZTlabCell` / `ZTlabRegistry` themselves**, because
+/// their refill source is a [`crate::zgc::page::ZPageAllocator`] and
+/// `ZgcRealHeap` has no pages. That is not a stylistic difference:
+///
+/// * `ZTlab::refill` is private and takes `&ZPageAllocator`; there is no
+///   public entry point that installs a chunk from arbitrary memory.
+/// * `ZgcRealHeap::collect_garbage`'s sweep returns every dead object to the
+///   **arena** free list (`arena.add_free_block(base - arena_base, size)`)
+///   under nothing but a `base >= arena_base` screen. Objects carved from page
+///   storage that happens to sit above the arena would be turned into
+///   free-list offsets far past the arena's `Vec`, and the arena would then
+///   hand out pointers outside its own allocation. Adopting page-backed
+///   chunks therefore *requires* changing the sweep, which this change is
+///   explicitly not doing.
+///
+/// So the chunk source — item 1 of the five ZGC-specific things `zgc::tlab`'s
+/// header lists — is the one part re-derived here, over the arena. Items 2
+/// (page handle) and 3 (allocation colour) do not exist on this heap; items 4
+/// (registry/accounting hooks) and 5 (a registry of live TLABs) are what this
+/// type and the [`ZTlabHeapHooks`] impl provide.
+///
+/// # Scoping
+///
+/// Instance-owned: no `static`, no `OnceLock`. Two heaps in one process (which
+/// the gc unit tests routinely create) get two independent sets of buffers.
+/// The only process-global is a monotonic *id* counter, which is an identity,
+/// not a cache — it exists so a thread-local handle cache cannot alias a
+/// recycled heap address.
+///
+/// # Lock order
+///
+/// `registry.slots -> ZArenaTlab cell -> ZgcRealHeap::arena` and
+/// `ZArenaTlab cell -> ZgcRealHeap::registry`. Every method here snapshots
+/// under `slots` and releases it before locking a cell, and no path takes the
+/// arena or the object registry before a cell, so the reverse edge does not
+/// exist.
+pub struct ZArenaTlabRegistry {
+    /// Process-unique identity, used only to key the thread-local handle cache.
+    id: u64,
+    /// Normalised policy. `initial_chunk == 0` means "this heap is too small
+    /// for a TLAB" — see [`Self::chunk_bytes_for_capacity`].
+    config: ZTlabConfig,
+    slots: Mutex<FxHashMap<u64, Arc<Mutex<ZArenaTlab>>>>,
+}
+
+/// Monotonic registry ids. Never reused, so a stale thread-local entry for a
+/// dropped heap can never be mistaken for a live one that happens to have been
+/// allocated at the same address.
+static NEXT_ZTLAB_REGISTRY_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    /// This thread's [`ZArenaTlab`] handle per registry id.
+    ///
+    /// A *cache*, not a registry: the authoritative map is
+    /// [`ZArenaTlabRegistry::slots`], which is per-heap. Without it every
+    /// allocation would pay a mutex plus a hash lookup to find its own buffer,
+    /// which is most of the cost the TLAB exists to remove.
+    ///
+    /// Keyed by [`ZArenaTlabRegistry::id`] and never by address, so an entry
+    /// left behind by a dropped heap is unreachable rather than aliasable. Such
+    /// an entry keeps an `Arc` alive whose chunk points into freed arena
+    /// memory — that is inert: nothing reads it (the id will never match again)
+    /// and dropping it runs no destructor that touches the chunk.
+    static ZGC_TLAB_HANDLES: std::cell::RefCell<Vec<(u64, Arc<Mutex<ZArenaTlab>>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl ZArenaTlabRegistry {
+    /// Chunk size for an arena of `capacity` bytes, or `0` to disable.
+    ///
+    /// `capacity / 1024`, clamped into `[crate::tlab::min_tlab_size(),
+    /// ZGC_TLAB_MAX_CHUNK]`, and refused outright when one chunk would be more
+    /// than a quarter of the whole heap — at that point the buffer is a second
+    /// heap rather than a buffer, and the honest answer is to allocate the way
+    /// this backend always has. (The 8 KiB unit tests take that branch.)
+    fn chunk_bytes_for_capacity(capacity: usize) -> usize {
+        let want = (capacity / 1024).clamp(crate::tlab::min_tlab_size(), ZGC_TLAB_MAX_CHUNK);
+        if want.saturating_mul(4) > capacity {
+            return 0;
+        }
+        want & !(ZGC_TLAB_ALIGN - 1)
+    }
+
+    /// A registry sized for an arena of `capacity` bytes.
+    fn for_capacity(capacity: usize) -> Self {
+        let chunk = Self::chunk_bytes_for_capacity(capacity);
+        let config = ZTlabConfig {
+            initial_chunk: chunk,
+            min_chunk: chunk,
+            max_chunk: chunk,
+            // An object big enough to eat an eighth of a chunk is not worth
+            // carving one for; it goes to `alloc_raw`, which is exactly where
+            // it went before this change.
+            max_tlab_alloc: (chunk / 8).min(crate::tlab::tlab_max_alloc()),
+            // HotSpot's refill-waste policy exists to avoid ABANDONING a large
+            // chunk remainder. This adapter abandons nothing — the remainder
+            // goes back to the arena free list at retire — so the policy has no
+            // work to do and the ratchet that guards its pathological middle is
+            // likewise unnecessary. Stated as 1/0 rather than left at the
+            // defaults so that "there is no waste policy" is visible here.
+            refill_waste_fraction: 1,
+            waste_increment: 0,
+            // BATCHING IS REVERTED, and this is where that is declared.
+            //
+            // `ZTlabHeapHooks`'s doc argues for per-chunk batched registry
+            // inserts, and states the precondition: "a collection only ever
+            // observes the registry at a safepoint, and `retire_all` — which
+            // every collection must call first — flushes every pending batch
+            // before it returns."
+            //
+            // That precondition does not hold for `ZgcRealHeap`.
+            // `is_object_address` is not a GC-only predicate here: the JIT
+            // calls it on the *mutator* path as its "is this a valid object
+            // pointer" oracle (`vm/src/jit/helpers.rs` — `jit_checkcast`
+            // resolves its receiver through it and turns a miss into a silent
+            // null, and the conservative-root scanner in
+            // `vm/src/jit/conservative_roots.rs` validates every candidate
+            // qword through it *before* `collect_garbage` is entered). An
+            // object sitting in an unflushed batch would answer `false` to both
+            // — a mutator-visible miscompare and a use-after-free respectively,
+            // neither of which any safepoint ordering can fix.
+            //
+            // So a TLAB-served object is inserted into the registry the moment
+            // it is handed out, and `registry_batch: 1` says so. The arena
+            // mutex — which covers free-list tier scans and a per-object
+            // `write_bytes`, not a pointer bump — is what this change removes;
+            // the object registry's single hash insert stays. Sharding
+            // `ZgcRealHeap::registry` is the obvious follow-up and is a
+            // separate change.
+            registry_batch: 1,
+        }
+        .normalized();
+        Self {
+            id: NEXT_ZTLAB_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
+            // `normalized()` clamps a zero chunk up to the object grid, which
+            // would re-enable a TLAB this heap is too small for. Restore the
+            // sentinel.
+            config: if chunk == 0 {
+                ZTlabConfig {
+                    initial_chunk: 0,
+                    max_tlab_alloc: 0,
+                    ..config
+                }
+            } else {
+                config
+            },
+            slots: Mutex::new(FxHashMap::default()),
+        }
+    }
+
+    /// The policy in force.
+    fn config(&self) -> &ZTlabConfig {
+        &self.config
+    }
+
+    /// Is a TLAB available on this heap at all?
+    fn is_active(&self) -> bool {
+        self.config.initial_chunk > 0
+    }
+
+    /// This thread's buffer, creating and registering it on first use.
+    ///
+    /// `try_with` rather than `with`: a thread-local is inaccessible while its
+    /// own destructors run, and an allocation from a TLS destructor must fall
+    /// back to the map rather than panic.
+    fn attach(&self) -> Arc<Mutex<ZArenaTlab>> {
+        let cached = ZGC_TLAB_HANDLES
+            .try_with(|c| {
+                c.borrow()
+                    .iter()
+                    .find(|(id, _)| *id == self.id)
+                    .map(|(_, cell)| Arc::clone(cell))
+            })
+            .ok()
+            .flatten();
+        if let Some(cell) = cached {
+            return cell;
+        }
+        let key = current_thread_key();
+        let cell = {
+            let mut slots = self.slots.lock();
+            match slots.get(&key) {
+                Some(existing) => Arc::clone(existing),
+                None => {
+                    let cell = Arc::new(Mutex::new(ZArenaTlab::new()));
+                    slots.insert(key, Arc::clone(&cell));
+                    cell
+                }
+            }
+        };
+        let _ = ZGC_TLAB_HANDLES.try_with(|c| c.borrow_mut().push((self.id, Arc::clone(&cell))));
+        cell
+    }
+
+    /// Snapshot of every registered buffer. Taken under `slots` and returned
+    /// with the guard released — the caller locks cells, and the reverse edge
+    /// must not exist.
+    fn cells(&self) -> Vec<Arc<Mutex<ZArenaTlab>>> {
+        self.slots.lock().values().map(Arc::clone).collect()
+    }
+}
+
+impl std::fmt::Debug for ZArenaTlabRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZArenaTlabRegistry")
+            .field("id", &self.id)
+            .field("chunk_bytes", &self.config.initial_chunk)
+            .field("max_tlab_alloc", &self.config.max_tlab_alloc)
+            .field("live_tlabs", &self.slots.lock().len())
+            .finish()
+    }
+}
+
+/// The bookkeeping a TLAB-served object still needs, because it never touched
+/// [`ZgcRealHeap::alloc_raw`].
+///
+/// This is `zgc::tlab`'s trait, implemented against the heap it was written
+/// for. It is the whole of the contract: registry membership, the `allocated`
+/// counter, the native-allocation-pressure latch, an identity-hash source and
+/// an allocation colour.
+impl ZTlabHeapHooks for ZgcRealHeap {
+    /// Register freshly allocated object bases and charge their footprint.
+    ///
+    /// `bytes` is the **reserved footprint**, which is what `allocated` has to
+    /// count for `needs_gc` to be right.
+    ///
+    /// The threshold test below is [`GarbageCollector::needs_gc`]'s predicate
+    /// verbatim — `allocated >= gc_threshold && allocated >= gc_rearm` — copied
+    /// from [`ZgcRealHeap::alloc_raw`] rather than re-derived, and that is the
+    /// whole reason this path cannot reopen the GC storm the
+    /// [`gc_rearm`](ZgcRealHeap::gc_rearm) field exists to prevent: a live set
+    /// parked above the static threshold leaves `gc_rearm` above `allocated`
+    /// after every sweep, so the latch stays DOWN until genuinely new
+    /// allocation clears the re-arm floor. Nothing here writes `gc_rearm`;
+    /// only the sweep does.
+    fn register_allocations(&self, addrs: &[usize], bytes: usize) {
+        {
+            let mut registry = self.registry.lock();
+            registry.reserve(addrs.len());
+            for &addr in addrs {
+                registry.insert(addr);
+            }
+        }
+        if bytes == 0 {
+            return;
+        }
+        let after = self.allocated.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if after >= self.gc_threshold && after >= self.gc_rearm.load(Ordering::Relaxed) {
+            self.native_alloc_pressure.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// [`ZColor::Remapped`] — the quiescent good colour, unconditionally.
+    ///
+    /// The same answer, for the same reason, as this file's
+    /// [`mark::ZMarkContext::good_mask`] impl: **`ZgcRealHeap` stores plain
+    /// machine pointers and colours nothing.** Liveness lives in the object
+    /// header's [`GC_FLAG_MARKED`] bit, not in a pointer's metadata bits, and
+    /// no load barrier runs on this backend. Any answer is therefore inert and
+    /// the only question is which one is honest: `Z_REMAPPED` is what
+    /// [`vaddr::ZGoodMask::new`] installs and what `mark::mark_color_for` maps
+    /// to `None`, so a metrics line reads "this cycle has no mark colour"
+    /// rather than claiming a `Marked0`/`Marked1` parity nothing maintains.
+    /// Returning a mark colour would be a lie a future barrier could act on.
+    ///
+    /// When colored pointers land this becomes `self.good_mask.allocation_color()`.
+    fn allocation_color(&self) -> ZColor {
+        ZColor::Remapped
+    }
+
+    /// Identity-hash source.
+    ///
+    /// Provided because the trait requires it, but **nothing on this heap calls
+    /// it**: contrary to the shape the trait's doc assumes,
+    /// [`ZgcRealHeap::alloc_array`] does not stamp a hash at allocation — it
+    /// leaves the mark word zero and lets
+    /// [`GarbageCollector::identity_hash_code`] install one lazily through
+    /// `ObjectHeader::mark_word_identity_hash`. A TLAB-served array therefore
+    /// needs nothing extra, which is why [`ZgcRealHeap::alloc_tlab`] does not
+    /// consult this.
+    ///
+    /// `ZgcRealHeap::next_hash` is the *inherent* method (inherent candidates
+    /// are resolved before trait ones, so this is not a self-call).
+    fn next_hash(&self) -> i32 {
+        ZgcRealHeap::next_hash(self)
+    }
+
+    /// Charge bytes consumed from the arena that will never hold a live object.
+    ///
+    /// Implemented to the contract — and **not called by this adapter**, which
+    /// is the load-bearing half of the note. `zgc::tlab` assumes a retired
+    /// chunk tail is abandoned inside a page whose reclamation is a whole-page
+    /// event; an arena has a free list, so
+    /// [`ZgcRealHeap::tlab_retire_locked`] hands the tail straight back and the
+    /// bytes are *recovered*, not wasted. Charging them here as well would
+    /// double-count the same span and re-arm the collection trigger early.
+    fn note_waste(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.allocated.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl ZgcRealHeap {
+    /// Is the TLAB fast path armed on this heap?
+    ///
+    /// False either because `CRATONVM_ZGC_TLAB` (or
+    /// [`Self::set_tlab_enabled`]) turned it off, or because the heap is too
+    /// small to carve a chunk from — see
+    /// [`ZArenaTlabRegistry::chunk_bytes_for_capacity`].
+    pub fn tlab_enabled(&self) -> bool {
+        self.tlab_enabled.load(Ordering::Relaxed) && self.tlabs.is_active()
+    }
+
+    /// Flip the kill switch at runtime. See [`Self::tlab_enabled`].
+    ///
+    /// Turning it off leaves already-issued chunks in place; they are closed
+    /// and returned by the next [`Self::retire_all_tlabs`], which is *not*
+    /// gated on this flag.
+    pub fn set_tlab_enabled(&self, enabled: bool) {
+        self.tlab_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Aggregate TLAB accounting across every registered buffer.
+    ///
+    /// [`ZTlabStats::waste_bytes`] is always zero here and that is the honest
+    /// answer — this adapter abandons nothing. Recovered tail bytes are
+    /// [`Self::tlab_tail_returned_bytes`].
+    pub fn tlab_stats(&self) -> ZTlabStats {
+        let mut total = ZTlabStats::default();
+        for cell in self.tlabs.cells() {
+            total.add(&cell.lock().stats);
+        }
+        total
+    }
+
+    /// Cumulative chunk-tail bytes handed back to the arena free list by
+    /// retirement, across every registered buffer.
+    ///
+    /// The counterpart of [`ZTlabStats::waste_bytes`] on a page-backed TLAB:
+    /// there the tail is abandoned, here it is recovered. Buffers reaped by
+    /// [`Self::retire_all_tlabs`]'s dead-thread prune drop their contribution,
+    /// so this is a live-buffer figure, not a lifetime total.
+    pub fn tlab_tail_returned_bytes(&self) -> u64 {
+        self.tlabs
+            .cells()
+            .iter()
+            .map(|cell| cell.lock().tail_returned_bytes)
+            .sum()
+    }
+
+    /// **The tripwire.** Reserved `[cursor, end)` tails of every registered
+    /// buffer that still holds a live chunk.
+    ///
+    /// Empty immediately after [`Self::retire_all_tlabs`]. A non-empty result
+    /// at a walk point names exactly the spans that would have been walked as
+    /// objects — far more useful than the SIGSEGV three phases later.
+    pub fn tlab_reserved_tails(&self) -> Vec<(usize, usize)> {
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for cell in self.tlabs.cells() {
+            if let Some(span) = cell.lock().inner.reserved_tail() {
+                out.push(span);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// **Retire every registered TLAB.** The safepoint entry point, and the
+    /// precondition every heap-walking path in this file states.
+    ///
+    /// When this returns: no registered buffer holds a live chunk, every
+    /// chunk tail has been closed with `zgc::tlab`'s filler sentinels and
+    /// returned to the arena free list, and every object a TLAB served is in
+    /// [`Self::registry`] (it was inserted at hand-out time — see
+    /// [`ZArenaTlabRegistry`]'s `registry_batch` note).
+    ///
+    /// Cells are snapshotted under the `slots` lock, which is released before
+    /// any cell is taken, so a thread that is mid-allocation (holding its cell,
+    /// waiting on the arena) can never be the far side of a deadlock with a
+    /// thread that is attaching.
+    ///
+    /// # `try_lock`, and why blocking here would be a hang, not a handshake
+    ///
+    /// `zgc::tlab::ZTlabRegistry::retire_all` blocks on a peer's cell
+    /// deliberately: over a *page*-backed TLAB, retiring is a correctness
+    /// precondition (an un-retired chunk desyncs a `top`-bounded linear page
+    /// walk), so waiting is the only safe answer and blocking substitutes for
+    /// an OS-level suspension handshake.
+    ///
+    /// **On this heap it is not a correctness precondition.** Every walker —
+    /// the mark snapshot, the sweep, the census walk, `walk_objects`,
+    /// `is_heap_addr` — is driven by [`Self::registry`], so a live chunk's
+    /// un-handed-out tail is *invisible* rather than misparsed, and every
+    /// object inside a chunk is already registered. Blocking would therefore
+    /// buy nothing and risk everything: BUG-03 says this VM does forcibly stop
+    /// peers (a frozen in-JIT thread), and one stopped inside its own bump
+    /// would hold its cell for the rest of the process — the collector would
+    /// wait on it forever. That is the exact failure this change exists to
+    /// remove, reintroduced one layer down.
+    ///
+    /// So an uncontended cell is retired and a contended one is **skipped and
+    /// counted** ([`ZArenaTlabRetireSummary::skipped_locked`]). The cost of a
+    /// skip is that one chunk tail is not returned to the arena this cycle; the
+    /// next collection gets it. This is the same "skip list rather than block"
+    /// resolution `zgc::tlab::ZTlabRegistry::reserved_tails` offers for BUG-03.
+    ///
+    /// Not gated on [`Self::tlab_enabled`]: a chunk issued before the kill
+    /// switch was flipped still has to be closed and returned.
+    pub fn retire_all_tlabs(&self) -> ZArenaTlabRetireSummary {
+        let cells = self.tlabs.cells();
+        let mut summary = ZArenaTlabRetireSummary {
+            tlabs: cells.len(),
+            ..ZArenaTlabRetireSummary::default()
+        };
+        for cell in cells.iter() {
+            let Some(mut tlab) = cell.try_lock() else {
+                summary.skipped_locked += 1;
+                continue;
+            };
+            if tlab.chunk.is_some() {
+                summary.live_chunks += 1;
+            }
+            summary.tail_bytes_returned += self.tlab_retire_locked(&mut tlab) as u64;
+        }
+        // Drop our own handles BEFORE the prune below reads `Arc::strong_count`.
+        drop(cells);
+        // Reap buffers whose owning thread has exited. A live thread always
+        // holds a second `Arc` — either in `ZGC_TLAB_HANDLES` for its whole
+        // life, or on its stack while it is inside `attach`/`alloc_tlab` — so
+        // `strong_count == 1` means "only the map still refers to this", i.e.
+        // the owner is gone. Every such buffer was retired one loop above, so
+        // dropping it releases nothing the arena still needs. Without this the
+        // map grows by one entry per thread ever created, and `ThreadId`s are
+        // never reused, so nothing would ever remove them.
+        {
+            let mut slots = self.tlabs.slots.lock();
+            let before = slots.len();
+            slots.retain(|_, cell| Arc::strong_count(cell) > 1);
+            summary.slots_pruned = before - slots.len();
+        }
+        // The per-buffer tripwire is asserted inside `tlab_retire_locked`,
+        // while that buffer's cell lock is still held — race-free, and strictly
+        // stronger than a sweep of `tlab_reserved_tails()` after the fact. A
+        // global assert here would be a false alarm waiting to happen: this
+        // entry point is reachable from `walk_objects` and from the census
+        // driver, neither of which stops the world, so a peer may legitimately
+        // refill between the loop and the check. `tlab_reserved_tails()` stays
+        // available as the tripwire for a caller that IS at a safepoint.
+        if summary.live_chunks > 0 || summary.slots_pruned > 0 || summary.skipped_locked > 0 {
+            tracing::debug!(
+                target: "zgc",
+                tlabs = summary.tlabs,
+                live_chunks = summary.live_chunks,
+                tail_bytes_returned = summary.tail_bytes_returned,
+                slots_pruned = summary.slots_pruned,
+                skipped_locked = summary.skipped_locked,
+                "zgc real: retired TLABs",
+            );
+        }
+        summary
+    }
+
+    /// Close one buffer's chunk and hand its tail back to the arena.
+    ///
+    /// Returns the tail bytes returned. Idempotent: a second call finds no
+    /// chunk and does nothing, which matters because several paths can retire
+    /// the same buffer with no synchronisation between them (a collection, then
+    /// a census walk, then a thread teardown) — exactly as [`Tlab::retire`]'s
+    /// own idempotence note describes.
+    ///
+    /// The caller must hold the cell lock. The arena lock is taken *inside*
+    /// (cell -> arena, never the reverse) and is not held across anything else.
+    fn tlab_retire_locked(&self, tlab: &mut ZArenaTlab) -> usize {
+        let Some((chunk_start, chunk_end)) = tlab.chunk.take() else {
+            return 0;
+        };
+        // Read the tail BEFORE `retire()`, which nulls the cursor.
+        let tail = tlab.inner.reserved_tail();
+        // Installs the `int[]` filler over `[cursor, end)`, or the
+        // `GAP_FILLER_CLASS_ID` sentinel for a sub-header tail. Strictly
+        // speaking this heap has no linear walker to protect — its sweep,
+        // its census walk and `walk_objects` are all driven by
+        // `ZgcRealHeap::registry`, so an un-parsed span is invisible rather
+        // than fatal. It is installed anyway: the span is about to enter the
+        // arena free list shared with every other allocator in this crate, the
+        // write is one header, and "walkable" is the state the rest of the tree
+        // assumes of arena bytes below the cursor.
+        tlab.inner.retire();
+        tlab.stats.retires += 1;
+        debug_assert!(tlab.inner.reserved_tail().is_none());
+        let Some((tail_start, tail_end)) = tail else {
+            return 0;
+        };
+        debug_assert!(tail_start >= chunk_start && tail_end <= chunk_end);
+        let bytes = tail_end - tail_start;
+        if bytes == 0 {
+            return 0;
+        }
+        // Return the tail to the free list rather than abandoning it. This is
+        // the difference between an arena and a page, and it is not an
+        // optimisation: `retire_all_tlabs` runs at EVERY collection, so every
+        // thread abandons a partly-used chunk on every cycle. At 64 KiB and 50
+        // threads that is up to 3 MiB per collection of memory no walker can
+        // ever see again (the filler is not in `registry`, so the sweep never
+        // visits it and never frees it). A few dozen cycles would exhaust the
+        // heap. `note_waste` is therefore deliberately NOT called for these
+        // bytes — they come back.
+        {
+            let mut arena = self.arena.lock();
+            let base = arena.base_ptr() as usize;
+            if tail_start >= base {
+                arena.add_free_block(tail_start - base, bytes);
+            }
+        }
+        // `stats.waste_bytes` stays zero on purpose — nothing was wasted. The
+        // recovered bytes are counted separately.
+        tlab.tail_returned_bytes += bytes as u64;
+        bytes
+    }
+
+    /// Carve a fresh chunk out of the arena for `tlab`.
+    ///
+    /// `Some(())` means the caller's retry is guaranteed to fit: the chunk is
+    /// at least `initial_chunk`, and `max_tlab_alloc <= initial_chunk / 8`, so
+    /// any request that reached here is comfortably smaller than the chunk.
+    /// `None` means the arena could not serve a chunk; the caller falls back to
+    /// [`Self::alloc_raw`], which is the pre-TLAB path unchanged.
+    ///
+    /// There is no keep-the-buffer "direct" path and no HotSpot refill-waste
+    /// ratchet, because the remainder is recovered rather than abandoned — see
+    /// [`ZArenaTlabRegistry::for_capacity`].
+    fn tlab_refill(&self, tlab: &mut ZArenaTlab, need: usize) -> Option<()> {
+        let want = self.tlabs.config().initial_chunk;
+        if want == 0 || need > want {
+            return None;
+        }
+        self.tlab_retire_locked(tlab);
+        // Take the arena lock for the bump ONLY. The zeroing below is the
+        // expensive half and must not be inside it — that is the very
+        // serialisation this whole section exists to remove.
+        let carved = {
+            let mut arena = self.arena.lock();
+            arena.alloc(want, ZGC_TLAB_ALIGN)
+        };
+        let ptr = carved?;
+        // An arena block can carry stale bytes: a split remainder, or the tail
+        // filler header a previous retire left behind. `alloc_raw` zeroes per
+        // object for exactly this reason; the TLAB pays it once per chunk
+        // instead, so `Tlab::alloc` can hand out already-zero memory the way
+        // `zgc::tlab` does over a zeroed page reservation.
+        // SAFETY: `arena.alloc` guarantees `want` valid bytes at `ptr`, and the
+        // span is exclusively ours until retire.
+        unsafe { std::ptr::write_bytes(ptr, 0, want) };
+        // SAFETY: `[ptr, ptr + want)` was just reserved from the arena and is
+        // owned exclusively by this thread until retire; it is zeroed above;
+        // `want` is a multiple of `ZGC_TLAB_ALIGN`, which is what `Tlab::new`'s
+        // tail-filler contract requires of `ptr + want`.
+        tlab.inner = unsafe { Tlab::new(ptr, want) };
+        tlab.chunk = Some((ptr as usize, ptr as usize + want));
+        tlab.stats.refills += 1;
+        tlab.stats.refill_bytes += want as u64;
+        Some(())
+    }
+
+    /// Bump-allocate `size` zeroed bytes from this thread's TLAB.
+    ///
+    /// Returns `None` when the caller must take [`Self::alloc_raw`]: the kill
+    /// switch is off, the heap is too small for a chunk, the object is larger
+    /// than `max_tlab_alloc`, or the arena could not serve a refill.
+    ///
+    /// # Accounting
+    ///
+    /// Each object charges its own **footprint** to `allocated` through
+    /// [`ZTlabHeapHooks::register_allocations`], in the same instant it enters
+    /// [`Self::registry`] — the chunk itself is never charged, so nothing is
+    /// counted twice. The residual is that the not-yet-handed-out part of a
+    /// live chunk is invisible to `allocated`, bounded by
+    /// `live_threads * chunk` and squeezed by [`ZGC_TLAB_MAX_CHUNK`]. That
+    /// errs on the *late* side of the collection trigger, which is the same
+    /// direction `alloc_raw` already errs (it charges the unrounded `size`
+    /// while the arena consumes the rounded footprint plus alignment padding),
+    /// and it collapses to zero at every collection because
+    /// [`Self::retire_all_tlabs`] runs first and hands every remainder back.
+    ///
+    /// Charging the whole chunk at refill instead would make `allocated`
+    /// exact between collections and wrong across one: a sweep republishes
+    /// `allocated` as the surviving *object* bytes, so a threshold crossed by
+    /// chunk reservations would not still be crossed afterwards, and the
+    /// parked-live-set re-arm reasoning (`gc_rearm`) would be reading two
+    /// different quantities on either side of the sweep.
+    fn alloc_tlab(&self, size: usize) -> Option<*mut u8> {
+        if !self.tlab_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let config = self.tlabs.config();
+        if config.initial_chunk == 0 || size == 0 || size > config.max_tlab_alloc {
+            return None;
+        }
+        let cell = self.tlabs.attach();
+        let mut tlab = cell.lock();
+        let addr = match tlab.alloc(size) {
+            Some(addr) => addr,
+            None => {
+                self.tlab_refill(&mut tlab, size)?;
+                tlab.alloc(size)?
+            }
+        };
+        // Registered INSIDE the cell lock, and before the pointer is returned
+        // to anyone: `is_object_address` is a mutator-path oracle on this heap,
+        // not just a GC one, so the window in which a live object is absent
+        // from the registry has to be as narrow as `alloc_raw`'s.
+        <Self as ZTlabHeapHooks>::register_allocations(
+            self,
+            std::slice::from_ref(&addr),
+            zgc_tlab_footprint(size),
+        );
+        Some(addr as *mut u8)
+    }
+
+    /// [`Self::alloc_tlab`] with [`Self::alloc_raw`] as the fallback.
+    ///
+    /// The single funnel every object and array allocation on this backend now
+    /// takes. The fallback is the pre-TLAB path byte-for-byte, so a heap with
+    /// the kill switch off behaves exactly as it did before this change.
+    #[inline]
+    fn alloc_raw_tlab(&self, size: usize) -> Option<*mut u8> {
+        match self.alloc_tlab(size) {
+            Some(ptr) => Some(ptr),
+            None => self.alloc_raw(size),
+        }
+    }
+}
+
+/// Heap-side seam for the reference-slot census.
+///
+/// # Why this exists at all
+///
+/// `docs/feature-designs/zgc-reference-slot-representation.md` ends with exactly
+/// one unresolved number — *what fraction of live reference slots are legacy
+/// 16-byte cells?* — and says in as many words that it is the only guess in the
+/// document and the one that sizes the work. [`census`] is the instrument; this
+/// impl is the only thing that makes it non-inert. Without it the census module
+/// compiles, unit-tests, and measures nothing.
+///
+/// # This is a FORK of [`ZgcRealHeap::enumerate_references`], not a reuse of it
+///
+/// The marker and the census want different things out of the same three arms,
+/// and every difference is load-bearing rather than incidental:
+///
+/// * **Nulls are kept.** The marker discards `raw == 0` because null has no
+///   out-edge. The census must count it: a null slot is a barrier fast-path hit,
+///   so a heap of null legacy fields is *not* a heap of barrier work, and the
+///   two are indistinguishable once the nulls are dropped.
+/// * **Every legacy slot is reported, tagged, whatever its tag.** The marker
+///   only wants `Value::Object(Some(_))`. Filtering here would merge the
+///   never-written population (`tag == 0` from the zero-fill) into "this class
+///   has no reference fields", which is the difference the census's
+///   `legacy_unwritten_slots` column exists to keep.
+/// * **No `skip_index`.** A `java.lang.ref.Reference`'s referent is not a strong
+///   edge, so the marker hides it; but it *is* a reference slot, and the census
+///   counts slots.
+/// * **Raw reads, never `read_prim_element`.** That helper's plausibility
+///   degrade (`gc/src/heap.rs:1687-1714`) turns an implausible word into
+///   `Value::Object(None)`. For a colored pointer that degrade is exactly the
+///   corruption the study names as hazard 2, and a census that inherits it
+///   reports the corrupted population as null instead of as a finding.
+///
+/// # The two-phase contract
+///
+/// [`census::ZSlotCensus::run_walk`] drains
+/// [`census::ZCensusHeapView::for_each_live_object`] into a local `Vec` **before**
+/// it calls [`census::ZCensusHeapView::reference_slots`] for anything, so the
+/// registry lock taken below is never held across a call back into this heap.
+/// That is the whole reason the trait is shaped this way; see this tree's
+/// standing note that a registry guard held across a call-back is a lock cycle.
+impl census::ZCensusHeapView for ZgcRealHeap {
+    /// Visit every **marked** registered allocation.
+    ///
+    /// "Live" here means [`GC_FLAG_MARKED`], so this is only meaningful between
+    /// the end of the mark phase and the sweep that clears those bits — which is
+    /// exactly where [`ZgcRealHeap::collect_garbage`] calls the census from. Run
+    /// outside that window every bit is clear and the walk reports
+    /// `ZCensusVerdict::NoData`, which the census prints as "nothing was
+    /// decided" rather than as a row of zeroes.
+    fn for_each_live_object(
+        &self,
+        f: &mut dyn FnMut(u64, ClassId, census::ZCensusObjectKind),
+    ) {
+        // Heap-walking entry point: retire every TLAB first
+        // ([`ZgcRealHeap::retire_all_tlabs`]). Inside `collect_garbage` — the
+        // only caller today — this is a no-op second retire, because the cycle
+        // retires before its mark snapshot and the world is stopped in between.
+        // It is here for the census driver that calls `run_walk` directly,
+        // which reaches no safepoint of its own.
+        self.retire_all_tlabs();
+
+        // Snapshot under the lock, then DROP the guard before reading a single
+        // header. The trait permits holding it for the whole callback, but this
+        // heap's `header_mut` reads arena bytes and `effectively_compact_header`
+        // reaches the layout cache, so the shorter window is free to take.
+        let bases: Vec<usize> = {
+            let registry = self.registry.lock();
+            registry.iter().copied().collect()
+        };
+
+        for base in bases {
+            let header = self.header_mut(base as *mut u8);
+            if header.gc_flags() & GC_FLAG_MARKED == 0 {
+                continue;
+            }
+            let kind = match header.kind() {
+                ObjectKind::Object => {
+                    // The EFFECTIVE predicate, not the header bit — see
+                    // `effectively_compact_header`. An object the read path
+                    // treats as a 16-byte cell is a legacy instance for census
+                    // purposes no matter what its flags say.
+                    if Self::effectively_compact_header(header) {
+                        census::ZCensusObjectKind::CompactInstance
+                    } else {
+                        census::ZCensusObjectKind::LegacyInstance
+                    }
+                }
+                ObjectKind::Array => {
+                    if header.element_type() == ArrayElementType::Reference {
+                        census::ZCensusObjectKind::ReferenceArray
+                    } else {
+                        census::ZCensusObjectKind::NoReferenceSlots
+                    }
+                }
+                ObjectKind::HumongousFiller => census::ZCensusObjectKind::NoReferenceSlots,
+            };
+            let class_id = header.class_id;
+            f(base as u64, class_id, kind);
+        }
+    }
+
+    /// The second, independent derivation of compactness the census cross-checks
+    /// against the kind reported above.
+    ///
+    /// It must agree with [`census::ZCensusObjectKind::CompactInstance`] for
+    /// every object or the walk is void
+    /// ([`census::ZWalkResult::kind_disagreements`]). Both sides route through
+    /// [`ZgcRealHeap::effectively_compact_header`]; the `kind() == Object` screen
+    /// is what makes them agree for arrays and fillers, which are never compact
+    /// instances regardless of what a stale flag byte might read.
+    fn is_compact(&self, addr: u64) -> bool {
+        if addr == 0 {
+            return false;
+        }
+        let header = self.header_mut(addr as usize as *mut u8);
+        header.kind() == ObjectKind::Object && Self::effectively_compact_header(header)
+    }
+
+    /// Report every slot of the object at `addr` that could hold a reference.
+    ///
+    /// See the impl header for how each arm differs from
+    /// [`ZgcRealHeap::enumerate_references`].
+    fn reference_slots(&self, addr: u64, f: &mut dyn FnMut(census::ZSlotObservation)) {
+        if addr == 0 {
+            return;
+        }
+        let base = addr as usize as *mut u8;
+        let header = self.header_mut(base);
+        match header.kind() {
+            ObjectKind::Object => {
+                let class_id = header.class_id.as_u32();
+                let num_slots = header.num_slots();
+                // The RAW header bit here, deliberately, and it is the one place
+                // in this impl where the effective predicate is the wrong tool:
+                // the bit decides the object's BODY LAYOUT (`alloc_object` sizes
+                // a flagged object with `layout.body_size`, not
+                // `num_slots * SLOT_SIZE`), while the effective predicate decides
+                // how the read path INTERPRETS that body. Striding 16-byte cells
+                // through a compact-sized body because the layout lookup failed
+                // would read past the allocation — `get_field`'s fall-through
+                // does exactly that, and it is a latent bug there that this
+                // instrument must not reproduce.
+                let header_bit_compact = cratonvm_types::is_compact_object(header);
+                if header_bit_compact {
+                    let laid_out = cratonvm_types::with_class_layout(
+                        class_id,
+                        num_slots,
+                        |layout| {
+                            for (&offset, &is_ref) in
+                                layout.field_offsets.iter().zip(layout.is_ref.iter())
+                            {
+                                // No `skip_index` and no `raw == 0` filter; see
+                                // the impl header.
+                                if !is_ref {
+                                    continue;
+                                }
+                                // SAFETY: `offset` comes from this object's own
+                                // registered layout, which is the layout its body
+                                // was sized with at allocation, so the field lies
+                                // inside the allocation. `read_ref_slot` reads
+                                // `ref_field_size()` bytes — the width the layout
+                                // reserved for a reference field — and is used
+                                // rather than a bare `read::<u64>` so the
+                                // observation matches what `read_compact_field`
+                                // (`types/src/field_layout.rs:978-993`) would
+                                // actually load under narrow oops.
+                                let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
+                                let raw =
+                                    unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
+                                f(census::ZSlotObservation::bare(
+                                    census::ZSlotShape::CompactField,
+                                    slot as u64,
+                                    raw,
+                                ));
+                            }
+                        },
+                    )
+                    .is_some();
+                    if !laid_out {
+                        // Flagged compact, no layout for `(class_id, num_slots)`:
+                        // `for_each_live_object` reported this object as a LEGACY
+                        // instance (the read path will treat it as one), but its
+                        // body is compact-sized, so its cells cannot be walked
+                        // without reading out of bounds. Report no slots and say
+                        // so. The object is still counted; only its slots are
+                        // missing, which biases the legacy share DOWN — the
+                        // conservative direction for a decision rule whose
+                        // failure mode is deferring work that is not deferrable.
+                        tracing::warn!(
+                            target: "zgc",
+                            class_id,
+                            num_slots,
+                            "zgc census: compact-flagged object has no registered layout; \
+                             its slots are omitted from the census (cells cannot be walked \
+                             through a compact-sized body)"
+                        );
+                    }
+                } else {
+                    let n = num_slots as usize;
+                    // The same "no real class has 1<<24 fields" screen
+                    // `check_field_index` applies. A desynced walk that decoded
+                    // payload bytes as a header would otherwise stride millions
+                    // of cells straight out of the arena.
+                    if n > (1 << 24) {
+                        tracing::debug!(
+                            target: "zgc",
+                            num_slots = n,
+                            "zgc census: suspect header, slots omitted"
+                        );
+                        return;
+                    }
+                    for i in 0..n {
+                        // SAFETY: a non-compact object's body is exactly
+                        // `num_slots * SLOT_SIZE` bytes (`alloc_object`'s
+                        // `fields_size` fallback), so cell `i` and both words
+                        // read out of it lie inside the allocation. The two
+                        // reads are 4- and 8-byte aligned because `SLOT_SIZE` is
+                        // 16 and `HEADER_SIZE` is 8-byte aligned.
+                        let cell = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
+                        let tag = unsafe {
+                            std::ptr::read(
+                                cell.add(cratonvm_types::FIELD_CELL_TAG_OFFSET) as *const u32
+                            )
+                        };
+                        let word_ptr =
+                            unsafe { cell.add(cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET) };
+                        let word = unsafe { std::ptr::read(word_ptr as *const u64) };
+                        // EVERY slot, tag and all — the census does the tag
+                        // arithmetic itself. Filtering to `Value::Object` here is
+                        // what would merge the never-written population into the
+                        // "no reference fields" one and make the answer wrong.
+                        f(census::ZSlotObservation::tagged(
+                            census::ZSlotShape::LegacyField,
+                            word_ptr as u64,
+                            word,
+                            tag,
+                        ));
+                    }
+                }
+            }
+            ObjectKind::Array => {
+                if header.element_type() == ArrayElementType::Reference {
+                    let len = header.array_length() as usize;
+                    // `ref_element_size()`, not the `REF_ELEMENT_SIZE` constant:
+                    // the constant is the wide (8-byte) width, and the stride is
+                    // 4 under narrow oops. This is the stride
+                    // `read_prim_element`'s own reference arm uses, so the census
+                    // reads the same words the VM does.
+                    let stride = cratonvm_types::ref_element_size();
+                    // SAFETY: the data area begins at `base + ARRAY_DATA_OFFSET`
+                    // and holds `array_length()` elements of `stride` bytes;
+                    // `i < len`.
+                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
+                    for i in 0..len {
+                        let slot = unsafe { data.add(i * stride) };
+                        // A RAW read. `read_prim_element` would apply
+                        // `plausible_heap_pointer` and hand back
+                        // `Value::Object(None)` for a colored or corrupt word —
+                        // the study's hazard 2 — silently reclassifying the exact
+                        // population this census exists to find as null.
+                        let raw = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
+                        f(census::ZSlotObservation::bare(
+                            census::ZSlotShape::ArrayElement,
+                            slot as u64,
+                            raw,
+                        ));
+                    }
+                }
+                // Primitive arrays have no reference slots.
+            }
+            ObjectKind::HumongousFiller => {}
+        }
+    }
+
+    // `static_reference_slots` is left at its default no-op ON PURPOSE. A
+    // `StaticsBlock` is `Box::leak`ed memory owned by
+    // `vm/src/vm/realms/class_realm.rs:43-46`, outside this crate and outside
+    // this collector's registry, so nothing here can reach it. The census
+    // therefore reports the `StaticField` column as NOT WIRED rather than 0 —
+    // see `ZSlotCensus::statics_wired`, which this heap never sets.
+}
+
+/// The concurrent marking engine's view of this heap.
+///
+/// # This makes the engine POSSIBLE; it does not adopt it
+///
+/// `gc/src/zgc/mark.rs` is a complete concurrent marker (striped
+/// work-stealing stacks, a termination handshake, a mutator ingress) and
+/// `gc/src/zgc_concurrent.rs` is a complete driver for it, but until this impl
+/// existed nothing implemented [`mark::ZMarkContext`] for a real heap, so both
+/// were unreachable code that compiled and marked nothing.
+///
+/// [`ZgcRealHeap::collect_garbage`] is deliberately unchanged: it still runs
+/// its own single-threaded stop-the-world mark loop, and this impl is not
+/// wired into it. Switching the production path from that loop to the
+/// concurrent engine is a separate and much riskier change — it needs a
+/// mark-start safepoint, a mutator write barrier feeding
+/// [`mark::ZMarkIngress`], and a decision about what happens to
+/// [`Self::collect_garbage_with_finalizers`]'s resurrection pass — and it is
+/// not this change's call to make. Two consequences follow, and both are
+/// intentional:
+///
+/// * The two markers now enumerate references through *different* code
+///   ([`ZgcRealHeap::visit_strong_refs_at`] here,
+///   [`ZgcRealHeap::enumerate_references`] there). They now agree on the words
+///   they load — the narrow-oop defect that once separated them has been fixed
+///   at the source; see [`ZgcRealHeap::visit_strong_refs_at`]'s doc comment for
+///   what remains a deliberate difference (shape, and the legacy arm's
+///   tear-safe raw tag/payload read).
+/// * Nothing calls [`ZgcRealHeap::begin_concurrent_mark_cycle`] yet, so on
+///   today's execution path this impl is inert.
+///
+/// # Address domain
+///
+/// Every `u64` crossing this trait is an unmasked machine address of an object
+/// base, never a [`vaddr::ZColoredWord`]. This heap stores raw pointers in its
+/// slots and never colors them, so there is nothing to uncolor on the way in;
+/// a colored word that somehow reached a slot would be refused by
+/// [`Self::is_in_heap`] like any other wild child, which is the outcome
+/// `vaddr`'s bit-63 tag exists to produce.
+impl mark::ZMarkContext for ZgcRealHeap {
+    /// [`vaddr::Z_REMAPPED`] — the quiescent good mask, unconditionally.
+    ///
+    /// # Why a constant and not a cycle-flipped mask
+    ///
+    /// Colored pointers are not on this heap's live path. `ZgcRealHeap` keeps
+    /// liveness in the object header's [`GC_FLAG_MARKED`] bit, not in a
+    /// pointer's metadata bits, and the engine states that it does not branch
+    /// on this value: it is surfaced for logging and for the load barrier,
+    /// neither of which this heap drives. Any answer is therefore inert, and
+    /// the only question is which one is *honest*.
+    ///
+    /// `Z_REMAPPED` is what [`vaddr::ZGoodMask::new`] installs and what
+    /// `flip_to_remap` returns — the "no mark parity is good; addresses are
+    /// plain" state. It is also what [`mark::mark_color_for`] maps to `None`,
+    /// so a metrics line reads "this cycle has no mark color" rather than
+    /// claiming a `Marked0`/`Marked1` parity that nothing in this heap
+    /// maintains. Returning a mark color instead would be a lie that a future
+    /// barrier could act on.
+    ///
+    /// When colored pointers do land, this becomes a [`vaddr::ZGoodMask`]
+    /// field on the heap and this method becomes `self.good_mask.good()`; the
+    /// flip belongs to whoever owns the phase machine, not here.
+    fn good_mask(&self) -> u64 {
+        vaddr::Z_REMAPPED
+    }
+
+    /// Atomically claim the object at `addr` for this cycle.
+    ///
+    /// # Why `try_add_gc_flags` and not the STW marker's read-then-set
+    ///
+    /// `collect_garbage`'s loop tests `gc_flags() & GC_FLAG_MARKED` and then
+    /// calls `add_gc_flags`, which is correct only because it is the sole
+    /// thread running. With N workers plus mutators, two threads can both read
+    /// "unmarked" and both proceed: the harmless outcome is a double scan, but
+    /// the caller's contract here is *"`true` means you now own the obligation
+    /// to scan it"*, so two `true`s for one object is only wasteful while a
+    /// lost update is fatal — the object is pushed once, popped once, and its
+    /// out-edges are never traced. Its children are then swept while it is
+    /// alive and pointing at them.
+    ///
+    /// [`ObjectHeader::try_add_gc_flags`] is the exactly-once primitive that
+    /// closes it: a CAS loop with `AcqRel`/`Acquire`, returning `true` iff
+    /// *this* call transitioned the bits. Its sibling `add_gc_flags` returns
+    /// nothing and cannot be used here.
+    ///
+    /// **Only [`GC_FLAG_MARKED`] is claimed**, never a set that also carries
+    /// [`cratonvm_types::GC_FLAG_OLD_GEN`] or
+    /// [`cratonvm_types::GC_FLAG_COMPACT`]. The claim is all-or-nothing
+    /// by design, so a set containing a sticky flag that is already set loses
+    /// forever and the object would never be marked at all.
+    ///
+    /// The engine calls [`Self::is_in_heap`] immediately before every
+    /// `try_mark`; the null screen below is the only extra gate, since a
+    /// header write through an unregistered address is the wild-write cascade
+    /// this collector's `wild_skipped` counter exists to prevent.
+    fn try_mark(&self, addr: u64) -> bool {
+        if addr == 0 {
+            return false;
+        }
+        debug_assert!(
+            self.registry.lock().contains(&(addr as usize)),
+            "try_mark on an address the engine did not gate through is_in_heap"
+        );
+        self.header_ref(addr as usize as *mut u8)
+            .try_add_gc_flags(GC_FLAG_MARKED)
+    }
+
+    /// Is the object at `addr` marked live for this cycle? **Query only.**
+    ///
+    /// The non-strong reference phase asks this about every referent to decide
+    /// whether the `Reference` must be cleared. An implementation that marked
+    /// as a side effect would answer "live, because I just made it live" for
+    /// every referent, and no weak, soft, phantom or cleaner reference would
+    /// ever be cleared again — a leak that no assertion in the reference tests
+    /// would catch, because every one of them is satisfied by "the referent
+    /// survived".
+    ///
+    /// This is [`Self::is_marked_addr`]'s predicate, read through
+    /// [`Self::header_ref`] rather than `header_mut` so that concurrent
+    /// callers do not mint aliasing `&mut`s.
+    fn is_marked(&self, addr: u64) -> bool {
+        if addr == 0 {
+            return false;
+        }
+        self.header_ref(addr as usize as *mut u8).gc_flags() & GC_FLAG_MARKED != 0
+    }
+
+    /// Report the object's **strong** out-edges, plus the three pin edges.
+    ///
+    /// # The referent hole
+    ///
+    /// Slot 0 of a registered `Weak`/`Soft`/`Phantom`/`Cleaner` `Reference` is
+    /// its referent and must not be reported. Report it and the referent is
+    /// reachable through its own `Reference`, so it is always marked, so
+    /// `process_references` never clears it: `WeakReference.get()` never
+    /// returns null and `Cleaner` never runs. Nothing throws, nothing logs —
+    /// the program just leaks. The skip set is the cycle-long snapshot taken
+    /// by [`Self::begin_concurrent_mark_cycle`]; see
+    /// [`Self::concurrent_mark_skip_set`] for the deliberately-leaky fallback
+    /// when no cycle is open.
+    ///
+    /// # The three pin edges
+    ///
+    /// `collect_garbage`'s loop pushes them by hand after every
+    /// `enumerate_references`, and they are edges, not decoration: the class's
+    /// loader ([`cratonvm_types::loader_pin`]), that loader's class mirrors
+    /// ([`cratonvm_types::mirror_pin`]) and its metadata roots
+    /// ([`cratonvm_types::metadata_pin`]). Dropping them lets a loader whose
+    /// only remaining reference is one of its own loaded classes be swept,
+    /// taking every mirror and method structure with it — a class-loader
+    /// unloading bug that presents as a crash in unrelated reflection, not as
+    /// a GC bug. They are reported here for the same reason and in the same
+    /// order.
+    ///
+    /// The Arc handle is cloned and the read guard dropped **before** the walk
+    /// begins, so no lock is held across the `f` callback — the engine calls
+    /// back into its own stripe pusher from inside it, and a lock held across
+    /// that is a cycle.
+    fn visit_refs(&self, addr: u64, f: &mut dyn FnMut(u64)) {
+        if addr == 0 {
+            return;
+        }
+        let base = addr as usize;
+
+        let skip_index = match self.concurrent_mark_skip_set() {
+            Some(skip) => {
+                if skip.contains(&base) {
+                    Some(0usize)
+                } else {
+                    None
+                }
+            }
+            None => {
+                // No cycle open. Trace everything (including referents) and
+                // say so ONCE — see `concurrent_mark_skip_set` for why leaking
+                // beats dropping an edge, and why the latch is not optional.
+                if !self.mark_ref_skip_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "zgc",
+                        "zgc concurrent mark: visit_refs ran with no skip-set snapshot; \
+                         begin_concurrent_mark_cycle was not called, so weak/soft/phantom \
+                         referents are being traced as STRONG edges and cannot be cleared"
+                    );
+                }
+                None
+            }
+        };
+
+        self.visit_strong_refs_at(base as *mut u8, skip_index, f);
+
+        // The pin edges, in `collect_garbage`'s order. `class_id` is read
+        // through the shared header view, like every other read here.
+        let class_id = self.header_ref(base as *mut u8).class_id.as_u32();
+        if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
+            f(loader as u64);
+        }
+        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(base) {
+            for m in mirrors {
+                f(m as u64);
+            }
+        }
+        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(base) {
+            for m in metadata {
+                f(m as u64);
+            }
+        }
+    }
+
+    /// The wild-pointer gate: is `addr` the base of a live allocation?
+    ///
+    /// A reference slot is raw bytes that a racing mutator may be mid-store
+    /// into, so a child address read out of one can be anything at all. This
+    /// is `collect_garbage`'s `registered.contains(&addr)` screen; the engine
+    /// counts refusals in `ZMarkStats::off_heap_children`, which is that
+    /// loop's `wild_skipped`. Interior pointers are refused too — an object
+    /// base is the only thing whose first bytes are a header.
+    fn is_in_heap(&self, addr: u64) -> bool {
+        addr != 0 && self.registry.lock().contains(&(addr as usize))
+    }
+
+    /// Bytes to charge to live-set accounting — [`ZgcRealHeap::alloc_size`],
+    /// the same figure the sweep and [`ZgcRealHeap::walk_objects`] use.
+    ///
+    /// Returning the default `0` would compile and disable liveness
+    /// accounting silently, which is how a relocation-set chooser comes to
+    /// believe every page is empty.
+    fn object_size(&self, addr: u64) -> usize {
+        if addr == 0 {
+            return 0;
+        }
+        Self::alloc_size(self.header_ref(addr as usize as *mut u8))
+    }
+
+    // `on_worker_start` / `on_worker_end` are left at their defaults on
+    // purpose. They exist for per-thread context state (a TLAB-like scratch
+    // buffer, a JFR thread binding); this heap has none — allocation is
+    // serialized through one `Mutex<Arena>` and the marker allocates nothing
+    // — so an override would be an empty function that later reads as a hook
+    // somebody forgot to fill in.
 }
 
 impl GarbageCollector for ZgcRealHeap {
@@ -1972,7 +3972,7 @@ impl GarbageCollector for ZgcRealHeap {
         let total = HEADER_SIZE
             .checked_add(fields_size)
             .expect("object total size overflow");
-        let ptr = self.alloc_raw(total).unwrap_or_else(|| {
+        let ptr = self.alloc_raw_tlab(total).unwrap_or_else(|| {
             eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
             std::process::abort();
         });
@@ -1980,7 +3980,6 @@ impl GarbageCollector for ZgcRealHeap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
@@ -2008,7 +4007,7 @@ impl GarbageCollector for ZgcRealHeap {
         let total = HEADER_SIZE
             .checked_add(data_size)
             .expect("array total size overflow");
-        let ptr = self.alloc_raw(total).unwrap_or_else(|| {
+        let ptr = self.alloc_raw_tlab(total).unwrap_or_else(|| {
             eprintln!("FATAL: ZGC(real): out of heap space for array ({total} bytes)");
             std::process::abort();
         });
@@ -2017,7 +4016,6 @@ impl GarbageCollector for ZgcRealHeap {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             len_u32,
             len_u32, // mirror length into num_slots, like Heap/G1/gen_heap
         );
@@ -2037,19 +4035,24 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
-        self.header(obj).kind
+        self.header(obj).kind()
     }
 
     fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
-        self.header(obj).element_type
+        self.header(obj).element_type()
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let existing = self.header(obj).identity_hash_code;
-        if existing != 0 {
-            return existing;
+        let header = self.header(obj);
+        match header.mark_word_identity_hash(|| match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => crate::collector::displaced_identity_hash(
+                header.mark_word.load(Ordering::Relaxed),
+            ),
         }
-        self.mint_identity_hash_code(obj)
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
@@ -2064,6 +4067,44 @@ impl GarbageCollector for ZgcRealHeap {
             return unsafe {
                 cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed)
             };
+        }
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
+        // answers `None` for TWO reasons and only the first licenses the
+        // fall-through: (1) "this is a legacy object" — its contract, and the
+        // 16-byte `Value` cell read below is correct; (2) "this IS a compact
+        // object (`GC_FLAG_COMPACT`, set at allocation) but its
+        // `(class_id, num_slots)` no longer resolves to a registered layout" —
+        // a redefinition that changed the field count, a foreign layout
+        // domain, or a desynced walk.
+        //
+        // Case (2) must NOT fall through. `alloc_object` sized this body with
+        // `compact_object_body_size`, and `num_slots()` on a compact object is
+        // the FIELD COUNT — so the `index < num_slots` screen above does not
+        // bound `HEADER_SIZE + index * SLOT_SIZE`, and an entirely in-range
+        // index still strides past the allocation. `object_field_size` already
+        // treats this state as "this is not that object at all" and answers
+        // `IMPLAUSIBLE_BODY_SIZE`; the hazard was recognised one layer down but
+        // not at this call site.
+        //
+        // `is_compact_object(header)` — the per-object header bit, independent
+        // of the registry — is what tells the two cases apart. It is the same
+        // discriminator the GC walkers and this file's own
+        // `ZCensusHeapView::reference_slots` already use. The walkers SKIP such
+        // an object; an accessor cannot skip, so it serves nothing and says so.
+        // Deliberately not a panic: the sibling accessors in `gen_heap.rs` /
+        // `g1.rs` document why (a racing redefinition must not abort the JVM).
+        if cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                class_id = ?header.class_id,
+                "zgc::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
         }
         // SAFETY: index validated < num_slots, so the slot is within bounds.
         unsafe {
@@ -2091,6 +4132,24 @@ impl GarbageCollector for ZgcRealHeap {
             };
             return;
         }
+        // HIB-DCAST-LATEPHASE.1, write half — see the matching note in
+        // `get_field` above. This one is strictly worse than the read: striding
+        // a 16-byte `Value` cell through a compact-sized body WRITES past the
+        // allocation, corrupting whatever object the allocator placed next.
+        // Drop the store rather than commit it somewhere unrelated.
+        if cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                class_id = ?header.class_id,
+                "zgc::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the store rather than \
+                 writing a legacy 16-byte cell past its packed compact body \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
         // SAFETY: index validated < num_slots, so the slot is within bounds.
         unsafe {
             let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
@@ -2115,13 +4174,13 @@ impl GarbageCollector for ZgcRealHeap {
 
     fn array_length(&self, obj: ObjectRef) -> usize {
         let header = self.header(obj);
-        debug_assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        debug_assert_eq!(header.kind(), ObjectKind::Array, "not an array");
         header.array_length() as usize
     }
 
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.header(obj);
-        if header.kind != ObjectKind::Array {
+        if header.kind() != ObjectKind::Array {
             return Err(index as i32);
         }
         if index >= header.array_length() as usize {
@@ -2129,24 +4188,24 @@ impl GarbageCollector for ZgcRealHeap {
         }
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         let val = unsafe {
-            let base = obj.as_ptr().add(HEADER_SIZE);
-            read_prim_element(base, index, header.element_type)
+            let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
+            read_prim_element(base, index, header.element_type())
         };
         Ok(val)
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
         let header = self.header(obj);
-        if header.kind != ObjectKind::Array {
+        if header.kind() != ObjectKind::Array {
             return Err(index as i32);
         }
         if index >= header.array_length() as usize {
             return Err(index as i32);
         }
-        let element_type = header.element_type;
+        let element_type = header.element_type();
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         unsafe {
-            let base = obj.as_ptr().add(HEADER_SIZE);
+            let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
             if element_type == ArrayElementType::Reference {
                 match value {
                     Value::Object(_) => {
@@ -2181,6 +4240,39 @@ impl GarbageCollector for ZgcRealHeap {
         roots: &mut [ObjectRef],
         monitors: &dyn MonitorCleanup,
     ) -> GcResult {
+        // Pause clock for the `--verbose:gc` line at the end of this function.
+        // Taken ONLY when logging is armed, so a quiet run pays one relaxed
+        // load per collection and no clock read at all.
+        let gc_started = self
+            .gc_log_enabled
+            .load(Ordering::Relaxed)
+            .then(std::time::Instant::now);
+
+        // ---- RETIRE EVERY TLAB -------------------------------------------
+        // FIRST statement of the cycle, before the registry snapshot below and
+        // therefore before anything reads or walks a heap byte. This is the
+        // module invariant `gc::zgc::tlab` states, honoured here for the three
+        // things it actually buys on THIS heap:
+        //
+        //  1. Chunk tails come back. `retire_all_tlabs` hands every
+        //     `[cursor, chunk_end)` remainder to the arena free list, so the
+        //     coalescer at the end of the sweep sees them and the bytes are
+        //     reusable. Skipping this leaks up to `threads * chunk` per cycle
+        //     into spans the sweep can never visit (a filler is not in
+        //     `registry`), which exhausts the heap in a few dozen cycles.
+        //  2. Every un-handed-out span becomes parseable, so the arena bytes
+        //     below `cursor` satisfy the walkability contract the rest of this
+        //     crate assumes of them.
+        //  3. It is the single point at which "no mutator owns a private slice
+        //     of this heap" is true, which is what makes the mark snapshot on
+        //     the next line a complete picture.
+        //
+        // Registry completeness is NOT one of the three: a TLAB-served object
+        // enters `registry` at hand-out (`ZArenaTlabRegistry`'s
+        // `registry_batch` note explains why batching was reverted), so it is
+        // already there before this call.
+        self.retire_all_tlabs();
+
         // ---- Mark phase --------------------------------------------------
         // Snapshot the registry of all live-or-dead allocations under the
         // lock, then release it: marking reads object bytes in place and
@@ -2197,7 +4289,8 @@ impl GarbageCollector for ZgcRealHeap {
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
         for &base in &all {
-            self.header_mut(base as *mut u8).gc_flags &= !GC_FLAG_MARKED;
+            self.header_mut(base as *mut u8)
+                .clear_gc_flags(GC_FLAG_MARKED);
         }
 
         // INT-8: snapshot the referent-slot skip set — the currently
@@ -2239,11 +4332,11 @@ impl GarbageCollector for ZgcRealHeap {
                 continue;
             }
             let header = self.header_mut(addr as *mut u8);
-            if header.gc_flags & GC_FLAG_MARKED != 0 {
+            if header.gc_flags() & GC_FLAG_MARKED != 0 {
                 continue; // already visited
             }
             let class_id = header.class_id.as_u32();
-            header.gc_flags |= GC_FLAG_MARKED;
+            header.add_gc_flags(GC_FLAG_MARKED);
             self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
             if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
                 work.push(loader);
@@ -2275,7 +4368,7 @@ impl GarbageCollector for ZgcRealHeap {
                     continue; // not a current allocation (already swept earlier)
                 }
                 let header = self.header_mut(addr as *mut u8);
-                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     continue; // survived normally — stays registered, not finalized
                 }
                 resurrected.push(addr); // non-moving: address unchanged
@@ -2285,11 +4378,11 @@ impl GarbageCollector for ZgcRealHeap {
                         continue; // ZGC-4: same wild-child skip as the main loop
                     }
                     let h = self.header_mut(a as *mut u8);
-                    if h.gc_flags & GC_FLAG_MARKED != 0 {
+                    if h.gc_flags() & GC_FLAG_MARKED != 0 {
                         continue;
                     }
                     let class_id = h.class_id.as_u32();
-                    h.gc_flags |= GC_FLAG_MARKED;
+                    h.add_gc_flags(GC_FLAG_MARKED);
                     self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
                     if let Some(loader) =
                         cratonvm_types::loader_pin::loader_pin_addr(class_id)
@@ -2360,12 +4453,36 @@ impl GarbageCollector for ZgcRealHeap {
                     continue; // ZGC-4: same wild-child skip as the main loop
                 }
                 let header = self.header_mut(addr as *mut u8);
-                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     continue;
                 }
-                header.gc_flags |= GC_FLAG_MARKED;
+                header.add_gc_flags(GC_FLAG_MARKED);
                 self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
             }
+        }
+
+        // ---- Reference-slot census (diagnostic, default OFF) -------------
+        // Placed HERE and nowhere else: this is the last point at which the
+        // mark bits are final AND no object has been touched by the sweep. One
+        // statement later the sweep clears every survivor's `GC_FLAG_MARKED`
+        // and zero-fills every dead object, so a census run from inside or
+        // after that loop would see an empty live set and a heap of zeroed
+        // headers. It also holds no lock here — the registry guard was released
+        // at the mark snapshot and the arena guard is not taken until the sweep
+        // block below — which is what lets `for_each_live_object` take the
+        // registry lock itself.
+        //
+        // Cost when disabled: one relaxed `AtomicBool` load and a not-taken
+        // branch. `run_walk` re-checks the same gate and returns `None` before
+        // touching this heap, so the guard is belt-and-braces; it is written
+        // out anyway so the cost is visible at the callsite rather than one
+        // module away.
+        if self.slot_census.is_enabled() {
+            // The result is also logged by `run_walk` itself (target `zgc`,
+            // with `legacy_share` and `verdict`), and folded into the census's
+            // cumulative counters. Callers that want the per-walk gauge read it
+            // back through `slot_census()`.
+            let _ = self.slot_census.run_walk(self);
         }
 
         // ---- Sweep phase -------------------------------------------------
@@ -2379,9 +4496,9 @@ impl GarbageCollector for ZgcRealHeap {
             for &base in &all {
                 let header = self.header_mut(base as *mut u8);
                 let size = Self::alloc_size(header);
-                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     // Survivor: clear the mark bit for next cycle, keep it.
-                    header.gc_flags &= !GC_FLAG_MARKED;
+                    header.clear_gc_flags(GC_FLAG_MARKED);
                     bytes_copied += size;
                     objects_copied += 1;
                 } else {
@@ -2457,11 +4574,46 @@ impl GarbageCollector for ZgcRealHeap {
             bytes_copied.saturating_add((headroom / 4).max(64 * 1024)),
             Ordering::Relaxed,
         );
-        self.gc_count.fetch_add(1, Ordering::Relaxed);
+        // Disarm the native-allocation-pressure latch here, at the same point
+        // `gc_rearm` is recomputed: the collection the latch asked for has now
+        // happened, and the re-arm floor just published above is the only thing
+        // that decides whether the next allocation may raise it again. Mirrors
+        // G1's clear at the end of its cycle (`g1.rs:8392`).
+        self.native_alloc_pressure.store(false, Ordering::Relaxed);
+        let cycle = self.gc_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Per-collection `--verbose:gc` line. One `eprintln!` and no
+        // `tracing` twin on purpose: the defect this closes is that a run with
+        // JUST `--verbose:gc` (no `RUST_LOG`) produced zero output for the
+        // whole run, and stderr is the only sink that is on in that case.
+        //
+        // Format: the `[GC]` prefix and the `zgc-real:` tag match this
+        // backend's existing shutdown line in `vm_heap.rs::print_gc_summary`
+        // (`[GC] zgc-real: collections=… occupancy=…/… bytes`), and the
+        // key names are G1's `[GC-STAT]` keys verbatim (`pause_us=`,
+        // `objects_copied=`, `bytes_copied=`, `bytes_freed=` — `g1.rs:6652`)
+        // so the two backends' per-collection lines extract identically when
+        // compared by hand. `objects_copied`/`bytes_copied` are survivors
+        // retained in place on this non-moving collector, not relocations.
+        //
+        // TODO(zgc): `gc::zgc::metrics::ZgcMetrics::format_cycle_line` already
+        // renders the richer OpenJDK-shaped line (before(%)->after(%),
+        // reclaimed, STW/concurrent split, allocation stalls) for exactly this
+        // callsite. Adopting the metrics module is a larger step — it has to be
+        // fed from every phase, not just here — so this line stays standalone
+        // until then; replace it wholesale at that point.
+        if let Some(started) = gc_started {
+            let pause_us = started.elapsed().as_micros();
+            eprintln!(
+                "[GC] zgc-real: cycle={cycle} pause_us={pause_us} \
+                 objects_copied={objects_copied} bytes_copied={bytes_copied} \
+                 bytes_freed={bytes_freed} occupancy={bytes_copied}/{cap} bytes",
+            );
+        }
 
         // Non-moving: no object changed address, so roots and external
         // references need no fix-up and the pointer map is empty.
-        let pointer_map: HashMap<usize, usize> = HashMap::new();
+        let pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         monitors.remap_after_gc(&pointer_map);
         // ZGC-3: `remap_after_gc` early-returns on the (always-empty) map,
         // so hand the collector's EXACT dead-address list to the registry
@@ -3241,7 +5393,7 @@ mod tests {
 
     struct NoMonitors;
     impl MonitorCleanup for NoMonitors {
-        fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
     }
 
     #[test]
@@ -3285,6 +5437,157 @@ mod tests {
         assert_eq!(heap.get_array_element(arr, 1).unwrap(), Value::Int(7));
         assert!(heap.get_array_element(arr, 4).is_err());
         assert!(heap.set_array_element(arr, 4, Value::Int(0)).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // Native-allocation-pressure latch + `--verbose:gc` gate
+    // ------------------------------------------------------------------
+
+    /// Fill `heap` with fresh objects until `allocated` crosses `gc_threshold`,
+    /// returning them so the caller decides whether they stay live. Bounded so
+    /// a mis-sized heap fails the test rather than hanging (or, worse, driving
+    /// the infallible allocator into its `abort()`).
+    fn alloc_up_to_threshold(heap: &ZgcRealHeap) -> Vec<ObjectRef> {
+        let mut held = Vec::new();
+        let mut guard = 0;
+        while heap.allocated_bytes() < heap.gc_threshold {
+            held.push(heap.alloc_object(ClassId::new(11), 4));
+            guard += 1;
+            assert!(guard < 100_000, "threshold never crossed — heap mis-sized");
+        }
+        // A small deliberate overshoot so a caller that keeps these live is
+        // unambiguously PARKED above the threshold, not sitting on the exact
+        // boundary where a byte of accounting slop decides the test.
+        for _ in 0..8 {
+            held.push(heap.alloc_object(ClassId::new(11), 4));
+        }
+        held
+    }
+
+    #[test]
+    fn real_native_alloc_pressure_arms_on_the_threshold_crossing() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        assert!(
+            !heap.native_alloc_pressure(),
+            "latch must start down on a fresh heap"
+        );
+
+        // A single small object is nowhere near the 75% trigger.
+        let _ = heap.alloc_object(ClassId::new(11), 1);
+        assert!(
+            !heap.native_alloc_pressure(),
+            "latch armed below the gc_threshold"
+        );
+
+        let _held = alloc_up_to_threshold(&heap);
+        assert!(
+            heap.native_alloc_pressure(),
+            "latch must arm once allocation crosses gc_threshold — this is the \
+             signal that lets a native call collect on the mutator's behalf \
+             instead of the infallible allocator reaching abort()"
+        );
+    }
+
+    #[test]
+    fn real_native_alloc_pressure_is_disarmed_by_a_collection() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let held = alloc_up_to_threshold(&heap);
+        assert!(heap.native_alloc_pressure());
+
+        // Drop every root: the whole set is garbage, so the cycle reclaims it.
+        drop(held);
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots: [ObjectRef; 0] = [];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        assert!(
+            !heap.native_alloc_pressure(),
+            "the collection the latch asked for has happened; it must disarm"
+        );
+        assert_eq!(heap.gc_count(), 1);
+    }
+
+    #[test]
+    fn real_native_alloc_pressure_manual_note_and_clear_round_trip() {
+        // The externally-noted edge (`VmHeap::note_young_spill_pressure`):
+        // a wrapper that spilled below the trigger and cannot collect itself.
+        let heap = ZgcRealHeap::new();
+        assert!(!heap.native_alloc_pressure());
+        heap.note_native_alloc_pressure();
+        assert!(heap.native_alloc_pressure());
+        heap.clear_native_alloc_pressure();
+        assert!(!heap.native_alloc_pressure());
+        // Idempotent: the consumer clears unconditionally, including when its
+        // own gates declined to act.
+        heap.clear_native_alloc_pressure();
+        assert!(!heap.native_alloc_pressure());
+    }
+
+    #[test]
+    fn real_gc_logging_is_off_by_default_and_toggles() {
+        let heap = ZgcRealHeap::new();
+        assert!(
+            !heap.gc_log_enabled.load(Ordering::Relaxed),
+            "per-collection logging must stay off unless --verbose:gc asked"
+        );
+        heap.enable_gc_logging();
+        assert!(heap.gc_log_enabled.load(Ordering::Relaxed));
+        heap.disable_gc_logging();
+        assert!(!heap.gc_log_enabled.load(Ordering::Relaxed));
+    }
+
+    /// REGRESSION (GC storm): a live set parked ABOVE the static 75% threshold
+    /// must not make repeated `needs_gc` polling produce back-to-back
+    /// collections. This is the livelock the `gc_rearm` field exists to
+    /// prevent — `needs_gc` once latched permanently true and `maybe_gc`
+    /// (polled after every allocation bytecode) ran a full STW mark-sweep per
+    /// allocation, with no OOME ever surfacing. The `native_alloc_pressure`
+    /// latch reuses the SAME predicate, so it must not reopen it.
+    ///
+    /// Counts only — no wall-clock assertions.
+    #[test]
+    fn real_parked_live_set_does_not_produce_back_to_back_collections() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        // Every object stays reachable through `held`, so the sweep reclaims
+        // nothing and post-GC `allocated` remains above `gc_threshold`.
+        let mut held = alloc_up_to_threshold(&heap);
+        assert!(heap.needs_gc());
+        assert!(heap.native_alloc_pressure());
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut collections = 0usize;
+        for _ in 0..64 {
+            if heap.needs_gc() {
+                heap.collect_garbage(&stw, &mut held, &NoMonitors);
+                collections += 1;
+            }
+        }
+
+        assert_eq!(
+            collections, 1,
+            "64 polls over a parked live set ran {collections} collections; \
+             one is the storm-free answer (the first poll collects, the re-arm \
+             floor published by that sweep silences the other 63)"
+        );
+        assert_eq!(heap.gc_count(), 1);
+        assert!(
+            heap.allocated_bytes() >= heap.gc_threshold,
+            "the live set must still be parked above the static threshold, or \
+             this test is not exercising the storm shape at all"
+        );
+        assert!(
+            !heap.needs_gc(),
+            "needs_gc must stay false above the threshold until NEW allocation \
+             clears gc_rearm"
+        );
+        assert!(
+            !heap.native_alloc_pressure(),
+            "the latch must stay down too — it shares needs_gc's predicate, so \
+             a latch that could re-arm here would reopen the storm through the \
+             native-call boundary instead of through maybe_gc"
+        );
     }
 
     #[test]
@@ -3450,5 +5753,527 @@ mod tests {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
             other => panic!("phantom referent must not be cleared, got {other:?}"),
         }
+    }
+
+    // -- ZMarkContext: the concurrent-mark seam ----------------------------
+    //
+    // These drive the trait methods DIRECTLY, never a worker pool. The engine's
+    // own threading is tested in `gc/src/zgc/mark.rs` against its in-memory
+    // `TestMarkContext`; what is untested until here is whether *this heap*
+    // answers the four contract points correctly, and each of those is a
+    // single-threaded question. Nothing below sleeps, spawns, or times
+    // anything.
+
+    use super::mark::ZMarkContext;
+
+    /// The exactly-once property `try_mark`'s whole contract rests on: the
+    /// first claim wins, every later one loses, and the bit is set either way.
+    /// A second `true` would hand two workers the same scan obligation; the
+    /// dangerous inverse (a lost update, so nobody scans it) is what the
+    /// non-atomic read-then-set in `collect_garbage` would produce under
+    /// concurrency.
+    #[test]
+    fn zmark_try_mark_is_exactly_once() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 0);
+        let addr = obj.as_ptr() as u64;
+
+        assert!(heap.try_mark(addr), "the first claim must win");
+        assert!(!heap.try_mark(addr), "the second claim must lose");
+        assert!(!heap.try_mark(addr), "and so must every one after it");
+        assert!(heap.is_marked(addr), "the bit is set whoever won");
+    }
+
+    /// `is_marked` must be a pure query. If it set the bit, the `try_mark`
+    /// below would lose — and in production every weak referent would be
+    /// immortal, because the reference phase asks `is_marked` about each one.
+    #[test]
+    fn zmark_is_marked_does_not_mark() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 0);
+        let addr = obj.as_ptr() as u64;
+
+        assert!(!heap.is_marked(addr));
+        assert!(!heap.is_marked(addr));
+        assert!(
+            heap.try_mark(addr),
+            "is_marked set the bit; every weak referent would now be immortal"
+        );
+    }
+
+    /// Null and off-heap addresses are refused rather than dereferenced —
+    /// this is the gate that keeps a torn reference slot from becoming a
+    /// header write into arbitrary memory.
+    #[test]
+    fn zmark_is_in_heap_gates_wild_children() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 0);
+
+        assert!(heap.is_in_heap(obj.as_ptr() as u64));
+        assert!(!heap.is_in_heap(0), "null is not an object base");
+        assert!(
+            !heap.is_in_heap(0xDEAD_BEEF),
+            "an unregistered address is not an object base"
+        );
+        // An interior pointer is not a base either: only a base has a header.
+        assert!(!heap.is_in_heap(obj.as_ptr() as u64 + 8));
+    }
+
+    /// `object_size` must report real bytes, not the trait's `0` default —
+    /// which compiles and disables live-set accounting silently.
+    #[test]
+    fn zmark_object_size_is_the_allocation_size() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 3);
+        let size = heap.object_size(obj.as_ptr() as u64);
+
+        assert!(size >= HEADER_SIZE, "size must include the header");
+        assert_eq!(size, heap.walk_objects()[0].1, "must agree with the sweep");
+        assert_eq!(heap.object_size(0), 0, "null has no size");
+    }
+
+    /// The one that breaks `WeakReference` and `Cleaner` silently when it is
+    /// wrong: slot 0 of a registered `Reference` is the referent and is NOT a
+    /// strong edge. The control object proves the hole is specific to the
+    /// registered `Reference` rather than "slot 0 is never reported".
+    #[test]
+    fn zmark_visit_refs_skips_a_registered_references_referent() {
+        let heap = ZgcRealHeap::new();
+        let weak = heap.alloc_object(ClassId::new(1), 1);
+        let referent = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(weak, 0, Value::Object(Some(referent)));
+        heap.discover_reference(ReferenceType::Weak, weak, referent, None);
+
+        // A plain object holding the SAME referent in the same slot.
+        let plain = heap.alloc_object(ClassId::new(3), 1);
+        heap.set_field(plain, 0, Value::Object(Some(referent)));
+
+        heap.begin_concurrent_mark_cycle();
+
+        let referent_addr = referent.as_ptr() as u64;
+
+        let mut from_weak: Vec<u64> = Vec::new();
+        heap.visit_refs(weak.as_ptr() as u64, &mut |c| from_weak.push(c));
+        assert!(
+            !from_weak.contains(&referent_addr),
+            "a Weak reference's referent was reported as a STRONG edge; it could \
+             never be cleared"
+        );
+
+        let mut from_plain: Vec<u64> = Vec::new();
+        heap.visit_refs(plain.as_ptr() as u64, &mut |c| from_plain.push(c));
+        assert!(
+            from_plain.contains(&referent_addr),
+            "an ordinary field holding the same referent must still be traced"
+        );
+
+        heap.end_concurrent_mark_cycle();
+    }
+
+    /// The snapshot is taken ONCE, at cycle start, and held: a `Reference`
+    /// discovered after the snapshot does not retroactively acquire a hole.
+    /// This is what makes referent immortality independent of thread timing
+    /// rather than a race between a worker and a mutator allocating a
+    /// `WeakReference`.
+    #[test]
+    fn zmark_skip_set_is_a_cycle_long_snapshot() {
+        let heap = ZgcRealHeap::new();
+        let weak = heap.alloc_object(ClassId::new(1), 1);
+        let referent = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(weak, 0, Value::Object(Some(referent)));
+
+        // Cycle opens BEFORE discovery, so the snapshot is empty.
+        let snapshot = heap.begin_concurrent_mark_cycle();
+        assert!(snapshot.is_empty());
+        heap.discover_reference(ReferenceType::Weak, weak, referent, None);
+
+        let mut children: Vec<u64> = Vec::new();
+        heap.visit_refs(weak.as_ptr() as u64, &mut |c| children.push(c));
+        assert!(
+            children.contains(&(referent.as_ptr() as u64)),
+            "the held snapshot must not observe a mid-cycle discovery"
+        );
+
+        // Re-open: the next cycle's snapshot does see it.
+        heap.end_concurrent_mark_cycle();
+        let snapshot = heap.begin_concurrent_mark_cycle();
+        assert!(snapshot.contains(&(weak.as_ptr() as usize)));
+
+        let mut children: Vec<u64> = Vec::new();
+        heap.visit_refs(weak.as_ptr() as u64, &mut |c| children.push(c));
+        assert!(!children.contains(&(referent.as_ptr() as u64)));
+        heap.end_concurrent_mark_cycle();
+    }
+
+    /// With no cycle open the fallback leaks (reports the referent) rather
+    /// than dropping edges. Pinned as a test because it is a deliberate
+    /// choice, not an oversight: over-reporting an edge makes a referent
+    /// immortal, under-reporting one frees a live object.
+    #[test]
+    fn zmark_visit_refs_without_a_cycle_leaks_rather_than_drops() {
+        let heap = ZgcRealHeap::new();
+        let weak = heap.alloc_object(ClassId::new(1), 1);
+        let referent = heap.alloc_object(ClassId::new(2), 0);
+        heap.set_field(weak, 0, Value::Object(Some(referent)));
+        heap.discover_reference(ReferenceType::Weak, weak, referent, None);
+
+        assert!(heap.concurrent_mark_skip_set().is_none());
+
+        let mut children: Vec<u64> = Vec::new();
+        heap.visit_refs(weak.as_ptr() as u64, &mut |c| children.push(c));
+        assert!(
+            children.contains(&(referent.as_ptr() as u64)),
+            "no snapshot must mean 'trace everything', never 'skip everything'"
+        );
+    }
+
+    /// A reference array's elements are strong edges, read at the current
+    /// reference width. Reading them at a fixed 8 bytes under narrow oops would
+    /// be a defect — but note this was never the state of
+    /// `enumerate_references`'s ARRAY arm, which has always strided through
+    /// `read_prim_element` (and so through `ref_element_size()`). The fixed
+    /// 8-byte read was in its COMPACT FIELD arm, and is now fixed there too.
+    #[test]
+    fn zmark_visit_refs_walks_a_reference_array() {
+        let heap = ZgcRealHeap::new();
+        let a = heap.alloc_object(ClassId::new(2), 0);
+        let b = heap.alloc_object(ClassId::new(2), 0);
+        let arr = heap.alloc_array(ClassId::new(4), ArrayElementType::Reference, 2);
+        heap.set_array_element(arr, 0, Value::Object(Some(a))).unwrap();
+        heap.set_array_element(arr, 1, Value::Object(Some(b))).unwrap();
+
+        heap.begin_concurrent_mark_cycle();
+        let mut children: Vec<u64> = Vec::new();
+        heap.visit_refs(arr.as_ptr() as u64, &mut |c| children.push(c));
+        heap.end_concurrent_mark_cycle();
+
+        assert!(children.contains(&(a.as_ptr() as u64)));
+        assert!(children.contains(&(b.as_ptr() as u64)));
+    }
+
+    // ------------------------------------------------------------------
+    // TLAB adoption — `ZArenaTlabRegistry` / `ZTlabHeapHooks`
+    // ------------------------------------------------------------------
+    //
+    // Counts and addresses only. No wall-clock assertions: this change is a
+    // contention fix, and a shared build host makes a multi-thread wall-time
+    // measurement worthless as evidence.
+
+    /// Every object's `[base, base + alloc_size)` extent, from the registry.
+    fn extents(heap: &ZgcRealHeap) -> Vec<(usize, usize)> {
+        let mut spans: Vec<(usize, usize)> = heap
+            .registry
+            .lock()
+            .iter()
+            .map(|&base| {
+                let header = unsafe { &*(base as *const ObjectHeader) };
+                (base, base + ZgcRealHeap::alloc_size(header))
+            })
+            .collect();
+        spans.sort_unstable();
+        spans
+    }
+
+    #[test]
+    fn tlab_is_on_by_default_and_serves_the_fast_path() {
+        let heap = ZgcRealHeap::new();
+        assert!(
+            heap.tlab_enabled(),
+            "CRATONVM_ZGC_TLAB defaults ON — a 64 MB heap is far above the \
+             geometry floor"
+        );
+        for _ in 0..64 {
+            heap.alloc_object(ClassId::new(11), 4);
+        }
+        let stats = heap.tlab_stats();
+        assert_eq!(
+            stats.refills, 1,
+            "64 small objects must fit one chunk — more refills means the \
+             chunk geometry regressed"
+        );
+        assert_eq!(stats.fast_allocations, 64);
+        assert!(stats.fast_bytes > 0);
+    }
+
+    /// A heap too small to carve a chunk from disables the TLAB by geometry,
+    /// with no flag involved — and still allocates.
+    #[test]
+    fn tlab_disabled_by_geometry_on_a_tiny_heap() {
+        let heap = ZgcRealHeap::with_capacity(8 * 1024);
+        assert!(
+            !heap.tlab_enabled(),
+            "one chunk would be the whole heap; the buffer must stand down"
+        );
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        assert!(heap.is_object_address(obj.as_ptr() as usize).is_some());
+        assert_eq!(heap.tlab_stats().fast_allocations, 0);
+    }
+
+    /// N threads bumping their own buffers must never hand out overlapping
+    /// memory. This is the property the whole change rests on: the arena mutex
+    /// is gone from the fast path, so nothing but per-thread chunk ownership
+    /// keeps two threads apart.
+    #[test]
+    fn tlab_concurrent_allocation_never_overlaps() {
+        const THREADS: usize = 4;
+        const PER_THREAD: usize = 300;
+
+        let heap = std::sync::Arc::new(ZgcRealHeap::new());
+        assert!(heap.tlab_enabled());
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let heap = std::sync::Arc::clone(&heap);
+            handles.push(std::thread::spawn(move || {
+                let mut mine = Vec::with_capacity(PER_THREAD);
+                for i in 0..PER_THREAD {
+                    // Mixed shapes so the threads do not march in lockstep.
+                    let obj = heap.alloc_object(ClassId::new(20 + t as u32), 1 + (i % 5));
+                    mine.push(obj.as_ptr() as usize);
+                }
+                mine
+            }));
+        }
+        let mut handed_out: Vec<usize> = Vec::new();
+        for h in handles {
+            handed_out.extend(h.join().expect("allocating thread panicked"));
+        }
+        assert_eq!(handed_out.len(), THREADS * PER_THREAD);
+
+        // No address handed out twice...
+        let mut sorted = handed_out.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            handed_out.len(),
+            "two threads were handed the same base address"
+        );
+
+        // ...and no two allocations' FOOTPRINTS overlap either, which is the
+        // stronger statement: distinct bases inside one another's bodies would
+        // still be corruption.
+        let spans = extents(&heap);
+        for w in spans.windows(2) {
+            assert!(
+                w[0].1 <= w[1].0,
+                "overlapping allocations: [{:#x},{:#x}) and [{:#x},{:#x})",
+                w[0].0,
+                w[0].1,
+                w[1].0,
+                w[1].1,
+            );
+        }
+    }
+
+    /// Every TLAB-served object is a registered object base, and after a
+    /// retire no buffer publishes a reserved tail.
+    #[test]
+    fn tlab_objects_are_registered_and_retire_clears_every_tail() {
+        let heap = ZgcRealHeap::new();
+        let mut objs = Vec::new();
+        for i in 0..200 {
+            objs.push(heap.alloc_object(ClassId::new(12), 1 + (i % 3)));
+        }
+        // Registration is at hand-out, not at retire — batching was reverted
+        // because `is_object_address` is a mutator-path oracle here.
+        for o in &objs {
+            assert!(
+                heap.is_object_address(o.as_ptr() as usize).is_some(),
+                "a TLAB-served object was invisible to is_object_address \
+                 BEFORE any retire"
+            );
+        }
+        assert!(
+            !heap.tlab_reserved_tails().is_empty(),
+            "a partly-used chunk must publish a reserved tail, or the tripwire \
+             is measuring nothing"
+        );
+
+        let summary = heap.retire_all_tlabs();
+        assert_eq!(summary.tlabs, 1);
+        assert_eq!(summary.live_chunks, 1);
+        assert!(summary.tail_bytes_returned > 0);
+        assert!(
+            heap.tlab_reserved_tails().is_empty(),
+            "retire_all_tlabs must leave no reserved tail"
+        );
+        for o in &objs {
+            assert!(heap.is_object_address(o.as_ptr() as usize).is_some());
+        }
+        // Idempotent.
+        let again = heap.retire_all_tlabs();
+        assert_eq!(again.live_chunks, 0);
+        assert_eq!(again.tail_bytes_returned, 0);
+    }
+
+    /// A retired chunk's tail goes back to the arena free list rather than
+    /// being abandoned. Without this, `retire_all_tlabs` (which runs at EVERY
+    /// collection) would leak up to one chunk per thread per cycle into spans
+    /// the registry-driven sweep can never visit.
+    #[test]
+    fn tlab_retire_returns_the_chunk_tail_to_the_arena() {
+        let heap = ZgcRealHeap::new();
+        heap.alloc_object(ClassId::new(13), 1);
+        let free_before = heap.arena.lock().free_list_bytes();
+        let summary = heap.retire_all_tlabs();
+        let free_after = heap.arena.lock().free_list_bytes();
+        assert!(summary.tail_bytes_returned > 0);
+        assert_eq!(
+            free_after - free_before,
+            summary.tail_bytes_returned as usize,
+            "every reported tail byte must actually be on the free list",
+        );
+        assert_eq!(
+            heap.tlab_tail_returned_bytes(),
+            summary.tail_bytes_returned,
+            "the per-buffer counter and the summary must agree",
+        );
+        // Nothing was abandoned, so the shared `waste_bytes` field must stay 0.
+        assert_eq!(heap.tlab_stats().waste_bytes, 0);
+    }
+
+    /// A collection after TLAB allocation reclaims exactly the unreachable set
+    /// and leaves the survivor usable — the ordinary contract, unchanged by the
+    /// buffers.
+    #[test]
+    fn tlab_collection_reclaims_correctly() {
+        let heap = ZgcRealHeap::new();
+        let live = heap.alloc_object(ClassId::new(14), 2);
+        let reachable = heap.alloc_object(ClassId::new(14), 1);
+        heap.set_field(live, 0, Value::Object(Some(reachable)));
+        for _ in 0..300 {
+            heap.alloc_object(ClassId::new(14), 2);
+        }
+        let before = heap.allocated_bytes();
+        assert!(before > 0);
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots = [live];
+        let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        assert_eq!(
+            result.stats.objects_copied, 2,
+            "only the root and the object it points at may survive"
+        );
+        assert!(result.stats.bytes_freed > 0);
+        assert!(heap.allocated_bytes() < before);
+        // Non-moving: the survivor did not move and is still readable.
+        assert_eq!(roots[0].as_ptr(), live.as_ptr());
+        heap.set_field(live, 1, Value::Int(99));
+        assert_eq!(heap.get_field(live, 1), Value::Int(99));
+        match heap.get_field(live, 0) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), reachable.as_ptr()),
+            other => panic!("expected the reachable child, got {other:?}"),
+        }
+        // The cycle retired every buffer on its way in.
+        assert!(heap.tlab_reserved_tails().is_empty());
+        // And the heap is still usable afterwards.
+        let fresh = heap.alloc_object(ClassId::new(14), 1);
+        assert!(heap.is_object_address(fresh.as_ptr() as usize).is_some());
+    }
+
+    /// The kill switch disables the fast path cleanly: allocation keeps
+    /// working (it falls back to `alloc_raw`, the pre-TLAB path), objects stay
+    /// registered, and no new chunk is taken.
+    #[test]
+    fn tlab_kill_switch_disables_cleanly() {
+        let heap = ZgcRealHeap::new();
+        heap.alloc_object(ClassId::new(15), 1);
+        let refills_before = heap.tlab_stats().refills;
+        let fast_before = heap.tlab_stats().fast_allocations;
+        assert_eq!(refills_before, 1);
+
+        heap.set_tlab_enabled(false);
+        assert!(!heap.tlab_enabled());
+
+        let mut objs = Vec::new();
+        for _ in 0..64 {
+            objs.push(heap.alloc_object(ClassId::new(15), 2));
+        }
+        let stats = heap.tlab_stats();
+        assert_eq!(stats.refills, refills_before, "no chunk may be taken");
+        assert_eq!(
+            stats.fast_allocations, fast_before,
+            "no allocation may take the bump path"
+        );
+        for o in &objs {
+            assert!(heap.is_object_address(o.as_ptr() as usize).is_some());
+        }
+        assert!(heap.allocated_bytes() > 0);
+
+        // Retiring is NOT gated on the switch: the chunk issued before the
+        // flip still has to be closed and returned.
+        let summary = heap.retire_all_tlabs();
+        assert_eq!(summary.live_chunks, 1);
+        assert!(summary.tail_bytes_returned > 0);
+
+        // Turning it back on resumes the fast path.
+        heap.set_tlab_enabled(true);
+        heap.alloc_object(ClassId::new(15), 2);
+        assert_eq!(heap.tlab_stats().refills, refills_before + 1);
+    }
+
+    /// `ZTlabHeapHooks` is the contract, so it is exercised directly rather
+    /// than only through the allocator.
+    #[test]
+    fn tlab_hooks_register_charge_and_colour() {
+        // `ZTlabHeapHooks` reaches this module through the parent's `use`, via
+        // the `use super::*` at the top of this test module.
+        let heap = ZgcRealHeap::new();
+        // Real allocations, so the addresses are genuine bases (the hook is not
+        // allowed to be told about memory that is not one).
+        let a = heap.alloc_object(ClassId::new(16), 1).as_ptr() as usize;
+        let b = heap.alloc_object(ClassId::new(16), 1).as_ptr() as usize;
+        let charged_before = heap.allocated_bytes();
+
+        // Re-registering is idempotent for the set and additive for the
+        // counter, which is exactly what the trait promises.
+        <ZgcRealHeap as ZTlabHeapHooks>::register_allocations(&heap, &[a, b], 128);
+        assert_eq!(heap.allocated_bytes(), charged_before + 128);
+        assert!(heap.is_object_address(a).is_some());
+        assert!(heap.is_object_address(b).is_some());
+
+        // Zero bytes registers without charging.
+        let charged = heap.allocated_bytes();
+        <ZgcRealHeap as ZTlabHeapHooks>::register_allocations(&heap, &[a], 0);
+        assert_eq!(heap.allocated_bytes(), charged);
+
+        // `note_waste` charges without registering anything.
+        <ZgcRealHeap as ZTlabHeapHooks>::note_waste(&heap, 64);
+        assert_eq!(heap.allocated_bytes(), charged + 64);
+
+        // The honest colour: this heap stores plain machine pointers.
+        assert_eq!(
+            <ZgcRealHeap as ZTlabHeapHooks>::allocation_color(&heap),
+            crate::zgc::vaddr::ZColor::Remapped
+        );
+        assert_eq!(
+            <ZgcRealHeap as ZTlabHeapHooks>::allocation_color_bit(&heap),
+            vaddr::Z_REMAPPED
+        );
+        // The hash source is live (never zero) even though no allocation path
+        // on this heap consults it — arrays get theirs lazily from the mark
+        // word.
+        assert_ne!(<ZgcRealHeap as ZTlabHeapHooks>::next_hash(&heap), 0);
+    }
+
+    /// An object larger than `max_tlab_alloc` bypasses the buffer entirely and
+    /// is served (and registered, and charged) by `alloc_raw`.
+    #[test]
+    fn tlab_large_object_bypasses_the_buffer() {
+        let heap = ZgcRealHeap::new();
+        heap.alloc_object(ClassId::new(17), 1); // install a chunk
+        let fast_before = heap.tlab_stats().fast_allocations;
+        let refills_before = heap.tlab_stats().refills;
+
+        // `max_tlab_alloc` is chunk/8 = 8 KiB on a 64 MB heap; a 64 KiB byte[]
+        // is comfortably past it.
+        let big = heap.alloc_array(ClassId::new(18), ArrayElementType::Byte, 64 * 1024);
+        assert!(heap.is_object_address(big.as_ptr() as usize).is_some());
+        let stats = heap.tlab_stats();
+        assert_eq!(stats.fast_allocations, fast_before, "must not use the bump");
+        assert_eq!(stats.refills, refills_before, "must not take a new chunk");
     }
 }

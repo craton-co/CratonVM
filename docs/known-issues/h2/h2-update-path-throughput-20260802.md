@@ -14,6 +14,60 @@ carry it, and a thread-scaling question this host cannot answer. It is
 deliberately **not** filed as "a bug" — the previous framing ("≈100x. That is
 the bug.") pointed three sessions at a problem no single fix could match.
 
+## UNBLOCKED 2026-08-07 (was: no file-backed H2 database opened on dev tip)
+
+Two defects from the `HEADER_SIZE 24 -> 16` landing blocked this page for most
+of a day. Both are fixed on dev and **re-verified here on the merged tree**
+(`cc86228dd`), so the measurements below can be re-taken in the default
+configuration:
+
+| defect | fix | witness, re-run on the merged tree |
+| --- | --- | --- |
+| `FileChannel.tryLock()` read a corrupt `fileLockTable` cell, so no file-backed database opened | `monitorexit` erased the object header quartet, converting a compact object to "legacy" on the first `synchronized` exit — one line in `vm/src/threading/monitor.rs` | `probes/CompactLayoutFileLockProbe.java` -> `PROBE-OK`; `MergeLockBudgetProbe verify 50` on a real H2 file DB -> `PROBE-OK` |
+| a `WeakReference` whose referent died was cleared but never enqueued, so nothing came out of a `ReferenceQueue` | "young and unmapped" is not a death certificate: after a NON-MOVING sweep nothing moves, so the map is empty and every live young `Reference`/`ReferenceQueue` was condemned — `pre_gc_addr_did_not_survive` now asks `is_live_young_survivor` | `probes/EnqProbe.java` -> `gc enqueued it = true`, 3 of 3 and with `--nojit` |
+
+The second one matters directly to this page: **the non-moving sweep is the only
+young-collection path these workloads take** (`reason=unregistered-jit-frame-on-
+stack`, `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-
+callee` — the same fallback §"Where the CPU goes" already names as a scaling
+target), so GC-driven enqueue never happened at all in any H2 measurement taken
+before this fix.
+
+**The 2026-08-07 profile below still carries its `CRATONVM_COMPACT_REF_FIELDS=0`
+caveat** — it was taken while the first defect was open, so it is valid for the
+dispatch / GC-root / class-resolution questions it is used for and must be
+re-taken with packing on before being compared against anything measured with
+packing on.
+
+### The five-class gap is not closed by either fix
+
+The enqueue fix was recorded as the sibling defect that would recover the five
+H2 classes the quartet fix left short of the pre-landing baseline. Measured on
+the merged tree, `--Xmx 1g`, it does not:
+
+| class | before the enqueue fix | merged tree |
+| --- | --- | --- |
+| `TestLob` | FAIL, `OutOfMemoryError: Java heap space` | **HANG** at the 400 s cap |
+| `TestMemoryUsage` | PASS | PASS |
+| `TestLIRSMemoryConsumption` | PASS | PASS |
+
+`TestLob` moved from OOM to timeout — consistent with the enqueue fix relieving
+real memory pressure — but it still does not pass, and the other two were
+already green. Whatever the remaining five are, they are not this.
+
+### A caution for anyone A/B-ing this suite
+
+A 40-class A/B of the enqueue fix, run 4-way parallel at a 180 s cap, showed
+30 PASS on both arms and three apparent changes: `TestAnalyzeTableTx`
+PASS->FAIL, `TestBigResult` HANG->PASS, `TestLargeBlob` HANG->FAIL. Re-run **in
+isolation**, ABBA-interleaved, 6 runs per arm, every one of the three is flaky on
+*both* arms with overlapping distributions (PASS/FAIL/HANG: 4/2/0 vs 4/1/1,
+3/0/3 vs 4/0/2, 0/5/1 vs 0/4/2). None is a regression and none is a recovery.
+Read on its own, the parallel run would have reported one regression and one fix,
+and it is neither — which is the standing rule in
+[`h2database-suite-runner`](../../../apps/h2database-suite-runner/run-h2-suite.md)
+and is worth restating because it cost a full re-run to establish.
+
 ## Severity
 **MEDIUM.** No incorrect behaviour, but not benign either. The class takes
 20-45 minutes of CPU where HotSpot takes 17 seconds, and H2's internal
@@ -23,6 +77,16 @@ runs came back `rc=1` with `Timeout trying to lock table "TEST"` at
 `TestMultiThread.java:414`, on a host at load 57-156 whose system time exceeded
 its user time. The class is neither deterministically broken nor
 deterministically green, and it will stay that way until the gap closes.
+
+**And 10 s is the roomy case.** `TestAll.lockTimeout` defaults to **50 ms**
+(`TestAll.java:358`) and `TestDb.getURL` appends it to every test URL, so most
+of the suite runs on a budget 200x tighter than `TestMultiThread`'s. At 50 ms
+the gap stops flapping and simply fails: `TestTransaction` is **10 of 10 FAIL**
+and **10 of 10 PASS** at `lockTimeout=500`, nothing else in the class broken.
+That is the subject of the retired
+`bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807` write-up,
+which had been filed as a `MERGE ... USING` correctness bug before it was
+measured.
 
 ## The numbers
 
@@ -71,6 +135,108 @@ host under 10 % load or on a dedicated one. Everything smaller has been tried.
 Until then the honest statement is the first table: **~30x at 4 threads and
 ~60x at 25**, with the growth between them real-looking but unproven.
 
+## Interpreter against interpreter, the factor is ~10x — and it is flat
+
+The headline 30-87x above is measured against HotSpot **with C2**, which folds
+two different things together: what CratonVM's interpreter costs, and what
+CratonVM's JIT fails to recover. Splitting them (2026-08-07, from the
+`testMergeUsing` investigation) says where to aim and where not to.
+
+`apps/h2database-suite-runner/probes/MergeLockBudgetProbe.java bench 500 3`,
+single-threaded so wall clock is defensible, ABBA-interleaved arms (A B B A A B),
+median of 3, load 5-18:
+
+| 500 ops on a 500-row table | HotSpot `-Xint` | cratonvm `--nojit` | ratio |
+| --- | --- | --- | --- |
+| `MERGE ... USING` | 64.6 ms | 693.5 ms | **10.7x** |
+| `UPDATE ... WHERE id=?` | 50.2 ms | 495.6 ms | **9.9x** |
+| `SELECT ... WHERE id=?` | 32.8 ms | 325.1 ms | **9.9x** |
+| `INSERT VALUES (?, ?)` | 24.6 ms | 254.2 ms | **10.3x** |
+
+Two things follow.
+
+**The factor is flat across statement kinds.** MERGE, UPDATE, SELECT and INSERT
+all land within 10 % of each other, so no H2 statement path has its own
+pathology on top of the general one — which is what ruled out a MERGE-specific
+defect in the retired `…merge-using-lock-timeout…` write-up, and is worth
+re-using: a per-statement ratio that stands out from this band is a real lead,
+and one that sits inside it is this page.
+
+**The interpreter is only half the gap.** The same MERGE costs 6.7 ms under
+HotSpot C2, so HotSpot's own JIT is worth ~9.6x on this shape — almost exactly
+the size of CratonVM's interpreter deficit. cratonvm's JIT recovers ~1.3-1.7x of
+it (647 / 435 ms with the JIT against 757 / 706 ms `--nojit`, ABBA, n=2 each),
+not ~10x. That is consistent with the deliberate interpreter-first threshold in
+`vm/src/runtime/interpreter/dispatch_static.rs` ("rather than paying CratonVM's
+currently-slower JIT'd dispatch for code that never amortizes the switch") —
+H2's SQL execution is exactly the call-heavy, shallow, polymorphic code that
+comment is about. **So roughly half of the 30-87x is a JIT that does not reach
+this code, not an interpreter that is slow**, and the two halves want different
+work.
+
+A caution on scale, because it changes which half matters: the JIT needs 500
+invocations per method to warm up (`CRATONVM_JIT_THRESHOLD`), and a real H2 test
+statement runs 50-1000 times. The 500-op probe above is at the optimistic end.
+`testMergeUsing`'s 50 merges never warm up at all, which is why its failure is
+identical with and without the JIT.
+
+## The INSERT loop lands in the same band, and its profile is flat (2026-08-07)
+
+Inherited from the retired
+`bug-h2-mvstore-insert-loop-perf-hang` write-up, which had filed the same
+constant as a separate, larger "cliff". It is not separate and it is not
+larger.
+
+`apps/h2database-suite-runner/probes/H2InsertLoopProbe.java` models
+`TestTempTables.testAnalyzeReuseObjectId` exactly — one connection, one local
+temporary IDENTITY table, one `PreparedStatement`, 10 000 autocommit
+`insert into test default values`, phases timed apart so the ~40 CPU-s
+start-up tax is not folded in. `--Xmx 1g`, real-JDK 25, single-threaded, warm
+rep, load 15-20:
+
+| 10 000-row insert loop | time | µs/row | vs C2 | vs `-Xint` |
+| --- | --- | --- | --- | --- |
+| HotSpot 25, C2 | 15.4 ms | 1.5 | 1x | 0.013x |
+| HotSpot 25, `-Xint` | 1 208 ms | 121 | 78x | 1x |
+| cratonvm, JIT | 8 565 ms | 857 | **556x** | **7.1x** |
+| cratonvm, `--nojit` | 12 649 ms | 1 265 | 821x | **10.5x** |
+
+**10.5x interpreter against interpreter** is dead centre of this page's flat
+9.9-10.7x band, so INSERT has no pathology of its own either. The 556x against
+a default HotSpot is the same two-halves story this page already tells, with
+the halves unusually lopsided: **C2 is worth 78x on this shape** (a tight, hot,
+monomorphic loop around one prepared statement is close to its best case) where
+cratonvm's JIT is worth 1.5x. That single number is why the insert page read
+its ratio as a distinct cliff.
+
+It is also a warning about which ratio to quote. The same four arms taken on
+the same host at load 15-20 instead of 8-16 read 74 / 1 919 / 10 449 / 16 615
+ms — the C2 column moves from 556x to 141x while the `-Xint` column barely
+moves (10.5x to 8.7x). **HotSpot's C2 arm is the load-sensitive one**, because
+it is the only arm short enough for scheduler noise to dominate. Compare
+interpreters.
+
+**The profile is flat, which is the answer to "find the dominant cost".**
+`--stack-sample-ms 20 --nojit`, 887 samples over one 10 000-row loop,
+aggregated by deepest interpreted frame: the heaviest leaf is
+`org.h2.mvstore.RootReference.<init>` at **4.1%**, then
+`tx.CommitDecisionMaker.decide` 3.5%, `Page.getKeyCount` 3.4%,
+`Page$Leaf.getValue` 3.2%, `tx.Transaction.markStatementEnd` 2.6%, and forty
+more entries none of which reaches 1.5%. Every one is H2's own bytecode. The
+insert page's four named suspects come out at:
+`Page.clone` **1.0%**, `MVMap.operate` **1.0%**, `TransactionMap` nowhere in
+the top 25, and boxing under 1%.
+
+**Natives are ~3%, not the wall.** `--dump-native-registry` over 20 000 rows:
+5 812 476 invocations, i.e. 290 per row, which at the in-tree funnel
+profilers' ~120 ns per compiled-code native call is ≈0.70 s of a ≈21 s
+two-rep loop. The top entries are the MVMap CAS loop exactly where H2 puts it
+— `AtomicReference.get` 544 288, `Enum.ordinal` 360 941, `AtomicLong.get`
+346 162, `AtomicReference.compareAndSet` 341 641.
+
+Read the two together, never the sampler alone: a native makes no interpreted
+frame, so `--stack-sample-ms` charges its cost to the calling Java method.
+
 ## Where the CPU goes, and why no symbol on this list is the answer
 
 `perf record -F 199 -g --call-graph=dwarf`, 25 threads × 1000 updates, 27 K
@@ -104,6 +270,87 @@ and so are the next targets:
   falls back to the non-moving sweep — `reason=unregistered-jit-frame-on-stack`,
   `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-callee`
   — which is its own question and has its own pages.
+  **ESCALATED 2026-08-07: this is no longer a throughput tax, it is the OOM.**
+  The fallback rate against this exact workload went from 3 to 361, and with it
+  the run stopped finishing. It is now the top item on this page, not a
+  footnote to it — see the re-measurement above.
+
+## The same profile at 1 thread, on 2026-08-07 code
+
+The table above is 25 threads on 2026-08-02 code. This is **1 thread** on
+`51d68e1b7`, `CRATONVM_COMPACT_REF_FIELDS=0`, `H2UpdateScaleProbe 1 60000
+10000` — 60 000 updates in 279 s against a 37 s setup, so steady state is ~88 %
+of the samples. `sudo perf record -F 99 -g --call-graph=dwarf`, 34 K samples,
+`--sort symbol --no-children`. (`perf_event_paranoid` is 4 on this host, so perf
+needs `sudo -n`; do not change the sysctl, it is shared.)
+
+Single-threaded on purpose: it removes contention from the picture, so the
+difference between this list and the 25-thread one *is* the contention term.
+
+| self | symbol | vs the 25t list |
+| --- | --- | --- |
+| **5.80 %** | `gen_heap::is_object_address` | 1.87 % — now the single largest symbol |
+| 3.75 % | `interpreter::execute_frame_from_index` | 3.0 % |
+| 3.26 % | `__memcmp_evex_movbe` | 2.79 % |
+| 2.62 % | `_mi_page_malloc_zero` | 5.9 % |
+| 2.29 % | `dispatch_virtual::execute_invokevirtual_cached` | 1.83 % |
+| **1.60 %** | `JitCache::invalidate_for_class` | **not on it** |
+| 1.51 % | `jit::helpers::try_jit_site_cached_native_dispatch` | not on it |
+| 1.50 % | `jit::helpers::forward_jit_reference_args` | not on it |
+| 1.49 % | `vm_exec::invoke_on_class_shared_inner` | 2.42 % |
+| 1.38 % | `InvokeCache<JitMethod>::get` | 1.45 % |
+| **1.26 %** | `field_layout::object_body_size` | **not on it** (new code) |
+| **1.26 %** | `value::record_object_ref_payload_slow` | **not on it** |
+| 1.16 % | `NativeMethodRegistry::slot_for_exact` | 2.12 % |
+| 1.12 % | `resolve_field_ref_loader_aware` | not on it |
+| 0.94 / 0.91 / 0.68 / 0.65 % | `validate_code_ptr`, `pin_jit_code_range_owner`, `JitCache::get`, `compute_jit_key_hash` | not on it |
+| **0.64 %** | `SharedVm::load_class_concurrent_for` | **1.4 %** |
+
+### What this changes about the two named next targets
+
+**`load_class_concurrent` is a lock-contention term, not a class-loading one.**
+It is 1.4 % at 25 threads and **0.64 % at 1**, on a workload whose steady state
+resolves no new classes in either shape. A cost that halves when the threads go
+away is contention on the `ClassManager` read lock in the fast path, not work
+being done. The old framing — *"nothing should be resolving classes then; find
+out what is"* — asks the wrong question: the answer is "almost nothing is, and
+the 1.4 % is 25 threads queueing to find that out." The work item is the lock,
+which is the same item the page already closed once (two `read()` guards per
+invoke down to one) and evidently not all the way.
+
+**The conservative root scan is confirmed, and bigger than it looked.**
+`is_object_address` alone is 5.80 % single-threaded, above the whole
+GC-root cluster's 6.6 % at 25 threads. This one does not need contention to be
+expensive, and it is the clearest single target on the list.
+
+**Three clusters on this list are not on the old one at all**, which is what a
+five-day-old profile of a moving codebase is worth:
+
+* **JIT bookkeeping, ~5.4 %** — `invalidate_for_class` 1.60 %,
+  `try_jit_site_cached_native_dispatch` 1.51 %, `forward_jit_reference_args`
+  1.50 %, plus `validate_code_ptr` / `pin_jit_code_range_owner` /
+  `JitCache::get` / `compute_jit_key_hash` at ~3.2 % between them. On a
+  single-threaded run that is already past warm-up, `invalidate_for_class` at
+  1.6 % deserves its own look: something is invalidating compiled code in steady
+  state.
+* **Layout computation, 1.26 %** — `object_body_size` is new code from the
+  header change and is being called on a hot path.
+* **`record_object_ref_payload_slow`, 1.26 %** — a `_slow` suffix at over 1 %
+  is usually a fast path that stopped being taken.
+
+Same caveat as the old list, and it is the whole reason this page exists:
+**that is ~30 % of the profile and removing all of it is under 1.5x, against
+~10x.** These are targets, not a bug list.
+
+### Methodology: do not trust the caller graphs on this binary
+
+`--call-graph=dwarf` unwinds this build badly enough to be misleading, not just
+incomplete. Asking for the callers of `JitCache::invalidate_for_class` returns
+it *underneath* `RawVecInner::finish_grow` underneath `pin_native_root` — an
+incoherent chain, produced by unwinding through deeply inlined Rust. The flat
+self-attribution above needs no unwinding and is sound; every caller-side claim
+from this data set was discarded. If a caller question has to be answered, it
+needs an in-VM counter, not perf.
 
 ## Setup cost
 
@@ -115,16 +362,25 @@ back 29 / 36 / 43 / 50 CPU-s. A flat tax on every H2 run, and the reason a
 
 ## What is ruled out (do not redo)
 
+* **`MERGE ... USING` is not a defect and not a slow path.** Its row state is
+  byte-exact on both branches (9 of 9 checks, with and without the JIT), and its
+  ratio sits inside the flat band above. `TestTransaction`'s
+  `Expected: 100 actual: 50` is this page's constant factor tripping a 50 ms
+  `LOCK_TIMEOUT`; stock HotSpot produces the identical shortfall when its budget
+  is scaled down to 1-3 ms. See the retired
+  `bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807` write-up.
 * **There is no `org/h2/` JIT package ban to lift.** Measured 2026-08-02 with
   `CRATONVM_DBG_JIT_COMPILED=1`: **27** `org/h2/…` methods JIT-compile on the
   default build, **26** with `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/`. The flag is a
   no-op for this workload, so the retired insert page's "lifting the ban made it
   ~9 % worse" was a **null A/B** — two identical configurations — and is
   withdrawn.
-* **Not heap pressure** (`--Xmx` 1g/2g/4g/8g: no trend), **not the young-GC
-  livelock**, **not the STW cross-thread takeover**
-  (`CRATONVM_XT_PEER_DEADLINE_MS` 1/20/200: no effect), **not the JIT-root path**
-  (`--nojit` scales identically).
+* ~~**Not heap pressure** (`--Xmx` 1g/2g/4g/8g: no trend)~~ and ~~**not the
+  JIT-root path** (`--nojit` scales identically)~~ — **BOTH WITHDRAWN
+  2026-08-07**, see the re-measurement at the top of this page. 1g and 2g now
+  OOM, and `--nojit` is the difference between completing and exhausting the
+  heap. Still ruled out: **not the young-GC livelock**, **not the STW
+  cross-thread takeover** (`CRATONVM_XT_PEER_DEADLINE_MS` 1/20/200: no effect).
 * **`jit_activation`'s global `Mutex` is gone** (per-thread tables since
   2026-07-31).
 * **`Math.random()` is not a contention point** — a thread-local `Cell` seed
@@ -155,13 +411,30 @@ to add after the old page's 4-thread arm turned out to be unresolvable.
 6. **Interleave the 0-update baseline as an ordinary arm**, and pair the arms
    within a rep. Taken once up front, the baseline carries that minute's load
    into every number derived from it.
+7. **Trust `perf`'s flat self-attribution here; do not trust its call graphs.**
+   See the methodology note above — dwarf unwinding through this binary's
+   inlining produces chains that are wrong, not merely shallow.
+8. **Measure single-threaded too.** One thread costs nothing extra to run and
+   splits every symbol into a work term and a contention term. That split is
+   what reclassified `load_class_concurrent` on this page.
 
 ## Reproducing
 
 ```bash
-javac -cp <h2>/target/classes -d probe H2UpdateScaleProbe.java
+javac -cp <h2>/target/classes -d probe probes/H2UpdateScaleProbe.java
 <cratonvm> --java-home <jdk25> --Xmx 1g -c "<h2>/target/classes:probe" \
   -Dprobe.dir=./h2updb H2UpdateScaleProbe <threads> <updates> 10000
+```
+
+For the per-statement band, and for the lock-budget question the band exists to
+answer:
+
+```bash
+javac -cp <h2>/target/classes -d probe \
+    apps/h2database-suite-runner/probes/MergeLockBudgetProbe.java
+<cratonvm> --java-home <jdk25> --Xmx 1g -c "probe:<h2>/target/classes" \
+    MergeLockBudgetProbe bench 500 3          # per-statement cost
+<cratonvm> ... MergeLockBudgetProbe contend 50 4 <lockTimeoutMs>
 ```
 
 Run `<threads> 0 10000` for the baseline of the same shape. The full class, when
@@ -183,5 +456,13 @@ cd <fresh writable dir>          # H2 writes ./data
   write-up — the INSERT half. Its flat ~25-30x across 1/2/4/8 threads is this
   page's constant factor, and its 4-thread arm was large enough to establish
   flatness where this page's was not.
+* the retired `bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807`
+  write-up — the same wall at a **50 ms** budget instead of 10 s, where it stops
+  flapping and fails deterministically. Source of this page's
+  interpreter-against-interpreter table and of `MergeLockBudgetProbe`.
 * `bug-h2-classid0-stale-address-family.md` — the memory-safety family
   found in this class. Unrelated to throughput.
+* the retired `bug-h2-mvstore-insert-loop-perf-hang` write-up
+  (`docs/internal/fixed-suite-bugs/h2-suite-bugs/…-RESOLVED-20260807.md`) —
+  source of the INSERT table and the flat profile above, plus the two mark-word
+  quartet defects found while reproducing it.

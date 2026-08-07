@@ -200,7 +200,7 @@ pub(crate) fn scan_transformer_roots(vm: usize, roots: &mut Vec<ObjectRef>) {
 ///
 /// An empty `map` means nothing moved (the non-moving sweep); early-return so a
 /// VM with no transformers never touches the chain lock on that path.
-pub(crate) fn remap_transformer_refs(vm: usize, map: &HashMap<usize, usize>) {
+pub(crate) fn remap_transformer_refs(vm: usize, map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }
@@ -2943,7 +2943,7 @@ mod tests {
         );
         // Relocate only the first entry; the second is absent from the map
         // and must be left untouched.
-        let mut map: HashMap<usize, usize> = HashMap::new();
+        let mut map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         map.insert(0x1000, 0x9000);
         remap_transformer_refs(vm, &map);
         let snap = snapshot_transformer_chain(vm);
@@ -2963,7 +2963,7 @@ mod tests {
                 native_method_prefix: None,
             },
         );
-        remap_transformer_refs(vm, &HashMap::new());
+        remap_transformer_refs(vm, &cratonvm_types::PointerMap::default());
         let snap = snapshot_transformer_chain(vm);
         assert_eq!(snap[0].transformer_ref.as_ptr() as usize, 0x3000);
         forget_vm_transformers(vm);
@@ -3065,7 +3065,7 @@ mod tests {
 
         // B relocates the address A's entry happens to live at. A must be
         // untouched.
-        let mut map: HashMap<usize, usize> = HashMap::new();
+        let mut map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         map.insert(0xA000, 0xDEAD_0000);
         remap_transformer_refs(vm_b, &map);
         assert_eq!(

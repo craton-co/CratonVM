@@ -204,9 +204,17 @@ and needs a reason:
   intercepted, the real `HashMap$KeyIterator` runs, and this registration can go
   back to `Bridge` and then away. That is a lane-scale change, not a patch.
 
-**Why the breadth is safe: the native falls through.** `Intrinsic` means the
-force-native routes *every* `Iterator.remove()` in the VM to
-`native_itr_remove_noop`, in both modes. A native that answered `UnsupportedOperationException`
+**Why the breadth is safe: the native falls through.** ~~`Intrinsic` means the~~
+The registration plus the force-native list route *every* `Iterator.remove()` in
+the VM to
+`native_itr_remove_noop`, in both modes.
+(**Corrected 2026-08-07:** the breadth is not something `NativeKind::Intrinsic`
+causes. On the cold interpreter paths registration alone already routes the
+triple, and `Intrinsic` only exempts the native from the `--jdk-only` yield —
+[§1 of *Natives over real JDK
+classes*](../../architecture/natives-over-real-jdk-classes.md). The breadth
+claim itself, and therefore the fall-through argument, is unchanged.)
+A native that answered `UnsupportedOperationException`
 for all of them would be far worse than the bug. So after the by-class match
 misses, the dispatcher now hands the call to the receiver's own real bytecode
 via `invoke_virtual_bytecode_only`, under two guards:

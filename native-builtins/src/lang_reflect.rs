@@ -197,7 +197,11 @@ fn can_access_member(
         let Some(declaring_id) = declaring_id else {
             return false;
         };
-        return member_is_accessible_here(ctx, member, declaring_id, modifiers);
+        // `None` receiver: a static member has no target type, exactly as
+        // `Field.checkAccess` passes `null` for one. Measured on Temurin 25.0.3,
+        // the protected STATIC `java.io.PipedInputStream.PIPE_SIZE` reads OK
+        // through every receiver, so the refinement must not reach here.
+        return member_is_accessible_here(ctx, member, declaring_id, modifiers, None);
     }
 
     // Instance member: receiver MUST be non-null AND assignable to the
@@ -221,7 +225,15 @@ fn can_access_member(
     if !ctx.is_subclass(receiver_id, declaring_id) {
         return false;
     }
-    member_is_accessible_here(ctx, member, declaring_id, modifiers)
+    // Carry the receiver's class on to the access half. `canAccess` must answer
+    // the question `Field.get` will actually answer, and JLS §6.6.2.1 makes that
+    // question receiver-dependent: measured on Temurin 25.0.3 from a classpath
+    // subclass of `java.io.ByteArrayOutputStream`, `buf.canAccess` is `true` for
+    // the caller's own instance and `false` for a bare superclass instance or a
+    // sibling subclass — the same three answers `Field.get` gives. Passing the
+    // ClassId rather than the ObjectRef keeps the whole subtree free of object
+    // references a moving GC could invalidate.
+    member_is_accessible_here(ctx, member, declaring_id, modifiers, Some(receiver_id))
 }
 
 /// The second half of `canAccess`: the override flag, else the unaided access
@@ -231,11 +243,12 @@ fn member_is_accessible_here(
     member: ObjectRef,
     declaring_id: cratonvm_types::ClassId,
     modifiers: i32,
+    receiver: Option<ClassId>,
 ) -> bool {
     if crate::lang_class::accessible_override_is_set(ctx, member) {
         return true;
     }
-    crate::lang_class::verify_member_access(ctx, declaring_id, modifiers)
+    crate::lang_class::verify_member_access(ctx, declaring_id, modifiers, receiver)
 }
 
 pub(crate) fn native_method_can_access(
@@ -285,7 +298,11 @@ pub(crate) fn native_constructor_can_access(
     };
     let ok = matches!(obj, Value::Object(None))
         && match declaring_id {
-            Some(id) => member_is_accessible_here(ctx, this, id, modifiers),
+            // A constructor is never static and `obj` is required to be null
+            // (asserted just above), so there is no receiver whose type could
+            // narrow JLS 6.6.2.1's protected rule. `None` is the only correct
+            // argument here, not a fallback.
+            Some(id) => member_is_accessible_here(ctx, this, id, modifiers, None),
             None => false,
         };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
@@ -1345,6 +1362,12 @@ fn classes_are_nestmates(ctx: &mut dyn NativeContext, a: ClassId, b: ClassId) ->
 }
 
 /// Is `caller` a subclass of `declaring` (JLS §6.6.2, the `protected` arm)?
+///
+/// FAILS CLOSED, unlike [`is_subclass_or_unreadable`]: this arm only ever
+/// *widens* — its `false` leaves `caller_may_access_member` at the refusal it
+/// would have reached anyway — so an unreadable hierarchy costs nothing here.
+/// Every caller that turns a `false` into a NEW refusal must use the tri-state
+/// walk instead.
 fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring: ClassId) -> bool {
     let mut cursor = caller;
     for _ in 0..MAX_SUPERCLASS_WALK {
@@ -1359,6 +1382,86 @@ fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring
     false
 }
 
+/// Is `subject` `ancestor` or a subclass of it — answering "yes" whenever the
+/// hierarchy cannot be read?
+///
+/// This is the walk every rule needs when a `false` becomes a NEW refusal.
+/// `superclass_of` answering `None` is ambiguous: it is the truth for
+/// `java.lang.Object`, and it is equally what a fabricated synthetic-JDK
+/// stand-in with no modelled supertype answers. Only the first is evidence that
+/// the walk really did visit a whole hierarchy without meeting `ancestor`; the
+/// second is an unreadable input, and an unreadable input must not invent a
+/// denial. Same reasoning for exhausting [`MAX_SUPERCLASS_WALK`]: a chain that
+/// long is a cycle or a corrupt model, not a measured answer.
+///
+/// The synthetic-JDK mode is the concrete reason this matters rather than being
+/// theoretical: `--synthetic-jdk` fabricates stand-ins for real JDK classes and
+/// gives them supertypes only where a stub table declares them, so a class there
+/// routinely has a truncated chain that a real class file would never have. A
+/// rule about real class hierarchies must not catch it, and the synthetic-jdk vm
+/// gate is blocking at zero failures.
+///
+/// Note this is deliberately NOT `NativeContext::is_subclass`: that predicate is
+/// two-valued and reports a fabricated stand-in as "not a subclass", which is
+/// exactly the spurious refusal above.
+///
+/// Interfaces are not walked, and do not need to be: every rule that uses this
+/// asks about an INSTANCE relationship (a receiver's class, a caller's
+/// superclass chain), and instance fields and the `protected` arm of JLS §6.6.2
+/// are both class-only questions.
+pub(crate) fn is_subclass_or_unreadable(
+    ctx: &mut dyn NativeContext,
+    subject: ClassId,
+    ancestor: ClassId,
+) -> bool {
+    let mut cursor = subject;
+    for _ in 0..MAX_SUPERCLASS_WALK {
+        if cursor == ancestor {
+            return true;
+        }
+        match ctx.superclass_of(cursor) {
+            Some(s) => cursor = s,
+            None => {
+                // A chain that ended at a real `java/lang/Object` is a COMPLETE
+                // hierarchy that never met `ancestor` — deny. A chain that ended
+                // anywhere else ended somewhere unreadable — allow.
+                return !matches!(
+                    ctx.class_name_of_id(cursor).as_deref(),
+                    Some("java/lang/Object")
+                );
+            }
+        }
+    }
+    true
+}
+
+/// JLS §6.6.2.1, the receiver refinement of the `protected` rule: once a
+/// foreign-package subclass has been admitted by `caller_is_subclass_of`, it
+/// may still only reach the member through a receiver whose class is `caller`
+/// itself or a subclass of `caller`.
+///
+/// `receiver == None` means the question does not arise — a `static` member has
+/// no receiver (HotSpot passes `null` for `targetClass` and
+/// `verifyMemberAccess` skips the refinement outright), and a call site that
+/// simply does not have the receiver in hand must not manufacture a denial from
+/// its absence.
+///
+/// FAILS OPEN on anything it cannot read, matching
+/// `lang_class::public_member_class_is_reachable` — the walk and its fail-open
+/// rule both live in [`is_subclass_or_unreadable`] so this rule, the
+/// `setAccessible` carve-out and the receiver-type check cannot drift on what
+/// "cannot tell" means.
+fn protected_receiver_is_permitted(
+    ctx: &mut dyn NativeContext,
+    caller: ClassId,
+    receiver: Option<ClassId>,
+) -> bool {
+    let Some(receiver) = receiver else {
+        return true;
+    };
+    is_subclass_or_unreadable(ctx, receiver, caller)
+}
+
 /// Decide whether `caller` is entitled — by the ordinary JLS §6.6.1 rules, with
 /// no `setAccessible(true)` override — to reflectively use a member of
 /// `declaring` whose access flags are `modifiers`.
@@ -1369,11 +1472,40 @@ fn caller_is_subclass_of(ctx: &mut dyn NativeContext, caller: ClassId, declaring
 /// checked after it by `lang_class::check_reflection_module_access`. Answering
 /// `true` here does not bypass the module check — see
 /// `docs/known-issues/jdk-only/L1-reflect-setaccessible-invoke.md`.
+///
+/// `receiver` is the JLS §6.6.2.1 *target type* — HotSpot's
+/// `Reflection.verifyMemberAccess(currentClass, memberClass, targetClass,
+/// modifiers)` third argument, which `Field.checkAccess` fills in as
+/// `Modifier.isStatic(modifiers) ? null : obj.getClass()`. It steers ONLY the
+/// `protected` arm; every other arm ignores it, and passing `None` reproduces
+/// this function's pre-receiver behaviour exactly.
+///
+/// Measured on Temurin 25.0.3 from a classpath subclass of
+/// `java.io.ByteArrayOutputStream`, reading the `protected` `buf`/`count` with
+/// no `setAccessible` and no flags — the four rows the refinement exists for:
+///
+/// | receiver                      | outcome                    |
+/// |-------------------------------|----------------------------|
+/// | the caller's own class        | OK                         |
+/// | a subclass of the caller      | OK                         |
+/// | the superclass (`BAOS` bare)  | `IllegalAccessException`   |
+/// | a SIBLING subclass of `BAOS`  | `IllegalAccessException`   |
+///
+/// The sibling row is the one that reads as surprising and is the point of the
+/// rule: being a subclass of the *declaring* class is not enough, the receiver
+/// must be under the *caller*. Neither `--add-exports java.base/java.io` nor
+/// `--add-opens java.base/java.io` moves any of the four — the refinement is
+/// pure JLS and orthogonal to JPMS. `protected static` is exempt: the same
+/// matrix on the `protected static` `java.io.PipedInputStream.PIPE_SIZE`
+/// answers OK for every receiver, including a sibling, a bare `Object` and
+/// `null`. Both halves are asserted in `regression-suite/src/
+/// RJdkFieldModule.java` sections 7 and 7b.
 pub(crate) fn caller_may_access_member(
     ctx: &mut dyn NativeContext,
     caller: ClassId,
     declaring: ClassId,
     modifiers: i32,
+    receiver: Option<ClassId>,
 ) -> bool {
     // A public member of an accessible class needs no caller analysis. (Call
     // sites short-circuit this already; keep it so the helper is safe alone.)
@@ -1389,6 +1521,13 @@ pub(crate) fn caller_may_access_member(
         return classes_are_nestmates(ctx, caller, declaring);
     }
     // `protected` and package-private both admit a same-runtime-package caller.
+    //
+    // This arm must stay AHEAD of the protected arm below, because the receiver
+    // refinement is skipped entirely when the caller and the declaring class
+    // share a runtime package (`verifyMemberAccess` guards it with
+    // `if (!isSameClassPackage)`). Witness on Temurin 25.0.3: a subclass in the
+    // SAME package as the declaring class reads the protected field through a
+    // bare superclass receiver with no complaint.
     let same_package = match (
         runtime_package_of(ctx, caller),
         runtime_package_of(ctx, declaring),
@@ -1400,8 +1539,12 @@ pub(crate) fn caller_may_access_member(
         return true;
     }
     if (modifiers & ACC_PROTECTED_MEMBER) != 0 {
-        // JLS §6.6.2: a subclass reaches inherited protected members.
-        return caller_is_subclass_of(ctx, caller, declaring);
+        // JLS §6.6.2: a subclass reaches inherited protected members...
+        if !caller_is_subclass_of(ctx, caller, declaring) {
+            return false;
+        }
+        // ...but §6.6.2.1 then narrows WHICH objects it may reach them on.
+        return protected_receiver_is_permitted(ctx, caller, receiver);
     }
     // Package-private with a foreign package: denied.
     false

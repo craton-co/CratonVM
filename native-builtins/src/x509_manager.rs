@@ -2598,7 +2598,7 @@ fn ocsp_http_post(
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let status: i32 = status_line
-        .splitn(3, ' ')
+        .split(' ')
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);

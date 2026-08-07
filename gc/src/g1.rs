@@ -31,8 +31,8 @@ use crate::gc::{GcResult, GcStats};
 use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
-    ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, GC_FLAG_OLD_GEN, HEADER_SIZE,
-    OBJECT_KIND_OFFSET, SLOT_SIZE,
+    ObjectHeader, ObjectKind, GC_FLAG_OLD_GEN, ARRAY_DATA_OFFSET, HEADER_SIZE,
+    SLOT_SIZE,
 };
 use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
@@ -220,6 +220,37 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// TOCTOU at the ref-scan sites.
 fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
+}
+
+/// How many candidate references the evacuation ref-scan refused to
+/// dereference because they did not look like live object headers.
+///
+/// Expected to be ZERO. A non-zero value means some writer put a word into a
+/// reference slot that is inside the heap's address span but is not an object —
+/// which, before the guard, was a SIGSEGV inside `scan_and_evacuate_refs`.
+/// Reported by `G1Collector::print_gc_summary`.
+pub static EVAC_REF_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_REF_REJECTED`].
+pub fn evacuation_refs_rejected() -> usize {
+    EVAC_REF_REJECTED.load(Ordering::Relaxed)
+}
+
+/// How many objects the evacuation ref-scan refused to WALK because their own
+/// header did not look like a live object. Expected to be ZERO.
+pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders' element walks were clamped to their region's extent —
+/// i.e. how many headers claimed more reference slots than could physically be
+/// there. Expected to be ZERO.
+pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
+pub fn evacuation_holder_counts() -> (usize, usize) {
+    (
+        EVAC_HOLDER_REJECTED.load(Ordering::Relaxed),
+        EVAC_HOLDER_CLAMPED.load(Ordering::Relaxed),
+    )
 }
 
 // ===========================================================================
@@ -487,7 +518,7 @@ impl<'a> SharedEvac<'a> {
 
         let promote = {
             let header = &*(old_ptr as *const ObjectHeader);
-            header.gc_age >= self.promotion_age
+            header.gc_age() >= self.promotion_age
         };
         let dest_tlab = if promote {
             &mut tlab.old
@@ -507,7 +538,7 @@ impl<'a> SharedEvac<'a> {
                 let old = old_ptr as usize;
                 return match mark_atomic.compare_exchange(
                     observed,
-                    ObjectHeader::make_forwarded(old),
+                    ObjectHeader::make_forwarded(observed, old),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
@@ -548,9 +579,9 @@ impl<'a> SharedEvac<'a> {
             // G1AUD-1 — same old-generation stamp as the serial
             // `evacuate_object`; see the long note there for why the JIT's
             // inline reference-store fast paths depend on this bit.
-            new_header.gc_flags |= GC_FLAG_OLD_GEN;
+            new_header.add_gc_flags(GC_FLAG_OLD_GEN);
         } else {
-            new_header.gc_age = new_header.gc_age.saturating_add(1);
+            new_header.set_gc_age(new_header.gc_age().saturating_add(1));
         }
         // (No destination forwarding clear: the mark-word store above wrote
         // the known non-forwarded snapshot over whatever the memcpy carried.)
@@ -559,7 +590,7 @@ impl<'a> SharedEvac<'a> {
         // loser abandons its `new_ptr` and adopts the winner's address.
         match mark_atomic.compare_exchange(
             observed,
-            ObjectHeader::make_forwarded(new_addr),
+            ObjectHeader::make_forwarded(observed, new_addr),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
@@ -615,7 +646,7 @@ impl<'a> SharedEvac<'a> {
     ) {
         let (kind, etype, alen, nslots) = {
             let h = &*(obj_ptr as *const ObjectHeader);
-            (h.kind, h.element_type, h.array_length(), h.num_slots())
+            (h.kind(), h.element_type(), h.array_length(), h.num_slots())
         };
         if kind == ObjectKind::Array {
             if etype == ArrayElementType::Reference {
@@ -725,8 +756,8 @@ impl<'a> SharedEvac<'a> {
                     object_total_size(header)
                 };
                 (
-                    header.kind,
-                    header.element_type,
+                    header.kind(),
+                    header.element_type(),
                     header.array_length(),
                     header.num_slots(),
                     is_filler,
@@ -1752,30 +1783,6 @@ impl G1Collector {
         self.next_hash_code.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Lazily mint and durably install a non-zero identity hash for an
-    /// object whose header field is still 0 (the JIT inline `new` fast path
-    /// leaves it TLAB-zeroed — see `identity_hash_code`'s doc comment).
-    /// Safe under concurrency: the header field is written via CAS from 0,
-    /// so a losing racer's mint is discarded and every caller converges on
-    /// the single value that ends up durably stored.
-    fn mint_identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let minted = match self.next_hash() {
-            0 => i32::MAX,
-            h => h,
-        };
-        // SAFETY: see the identical justification in
-        // `gen_heap::GenerationalHeap::mint_identity_hash_code`.
-        unsafe {
-            let field_ptr =
-                std::ptr::addr_of_mut!((*(obj.as_ptr() as *mut ObjectHeader)).identity_hash_code);
-            let atomic = &*(field_ptr as *const AtomicI32);
-            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => minted,
-                Err(existing) => existing,
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Allocation
     // -----------------------------------------------------------------------
@@ -2009,7 +2016,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset: &[usize],
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) -> usize {
         // Regions that hold at least one self-forwarded (in-place) object.
         // `lookup_region_for_addr` consults the immutable region table, so it
@@ -2092,7 +2099,7 @@ impl G1Collector {
             return first;
         }
 
-        let identities = |m: &HashMap<usize, usize>| -> Vec<usize> {
+        let identities = |m: &cratonvm_types::PointerMap| -> Vec<usize> {
             m.iter().filter(|(k, v)| k == v).map(|(&k, _)| k).collect()
         };
 
@@ -2230,8 +2237,8 @@ impl G1Collector {
                 }
             }
         };
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length — inside the allocation.
                     let raw =
@@ -2274,11 +2281,11 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
 
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
         let mut work_list: Vec<*mut u8> = Vec::new();
@@ -2379,7 +2386,7 @@ impl G1Collector {
     /// `acc` key the `acc` entry is the meaningful one (the `next` key is a
     /// pass-1-freed address recycled as later-pass to-space — no frame local
     /// can name it).
-    fn compose_forward_maps(acc: &mut HashMap<usize, usize>, next: &HashMap<usize, usize>) {
+    fn compose_forward_maps(acc: &mut cratonvm_types::PointerMap, next: &cratonvm_types::PointerMap) {
         for v in acc.values_mut() {
             if let Some(&nv) = next.get(v) {
                 *v = nv;
@@ -2427,7 +2434,7 @@ impl G1Collector {
         // invalidated and falls to the Free-gated slow path. `Release`
         // pairs with the `Acquire` load on the fast path.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
@@ -2894,7 +2901,7 @@ impl G1Collector {
         // (Phase 5). Invalidate every mutator's RSet fast-path cache
         // before any reclassification — see `rset_cache_epoch`.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
@@ -3238,7 +3245,7 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         keepalive: &[usize],
         sources: &std::collections::HashSet<usize>,
-    ) -> (HashMap<usize, usize>, usize, usize) {
+    ) -> (cratonvm_types::PointerMap, usize, usize) {
         // One-shot confirmation that the parallel evacuator is genuinely active
         // (the gauntlet lesson: never assume a gated path was taken — verify).
         {
@@ -3442,7 +3449,7 @@ impl G1Collector {
 
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
-        let mut pointer_map: HashMap<usize, usize> = HashMap::with_capacity(main_forwards.len());
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(main_forwards.len(), Default::default());
         for (o, n) in main_forwards {
             pointer_map.insert(o, n);
         }
@@ -3478,13 +3485,21 @@ impl G1Collector {
             // its header is intact and its region is held under the collection's
             // `regions` lock (Phase 5 has not run yet).
             unsafe {
-                // Retire the forward. These are from-space objects the cycle has
-                // abandoned, so NEUTRAL is the right resting state — there is no
-                // lock state left to preserve on a dead copy, and the live one
-                // carries the mark word this evacuation transferred to it.
-                (*(k as *const ObjectHeader))
-                    .mark_word
-                    .store(cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
+                // Retire the forward. These are from-space objects the cycle
+                // has abandoned, so NEUTRAL is the right resting *lock* state —
+                // the live copy carries the mark word this evacuation
+                // transferred to it.
+                //
+                // The QUARTET is not lock state and must survive: `kind` and
+                // `element_type` are what every linear region walker sizes a
+                // from-space object from, and this store runs while Phase 5 has
+                // not yet zeroed the region. Storing a bare `MARK_NEUTRAL` here
+                // left an abandoned copy claiming to be a zero-slot plain
+                // object.
+                let h = &*(k as *const ObjectHeader);
+                let quartet = ObjectHeader::quartet_of(h.mark_word.load(Ordering::Relaxed));
+                h.mark_word
+                    .store(quartet | cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
             }
         }
 
@@ -3528,7 +3543,7 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -3734,7 +3749,7 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -3923,7 +3938,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -3986,7 +4001,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         old_ptr: *mut u8,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         cset: &std::collections::HashSet<usize>,
@@ -4013,7 +4028,7 @@ impl G1Collector {
                  size {} (kind=0x{:02x}, num_slots={}, array_len={}); corrupt header",
                 old_ptr,
                 obj_size,
-                header.kind as u8,
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                 header.num_slots(),
                 header.array_length(),
             );
@@ -4021,7 +4036,7 @@ impl G1Collector {
         }
 
         // Decide destination based on age
-        let promote = header.gc_age >= self.config.promotion_age;
+        let promote = header.gc_age() >= self.config.promotion_age;
         let dest_type = if promote {
             RegionType::Old
         } else {
@@ -4110,9 +4125,9 @@ impl G1Collector {
             // this crate reads the bit on a G1 heap (`grep '\.gc_flags'
             // gc/src/g1.rs`), and `concurrent_mark`'s header validator already
             // lists it as a known flag, so the stamp is invisible to G1 itself.
-            new_header.gc_flags |= GC_FLAG_OLD_GEN;
+            new_header.add_gc_flags(GC_FLAG_OLD_GEN);
         } else {
-            new_header.gc_age = new_header.gc_age.saturating_add(1);
+            new_header.set_gc_age(new_header.gc_age().saturating_add(1));
         }
         pointer_map.insert(old_addr, new_ptr as usize);
         *objects_copied += 1;
@@ -4145,23 +4160,221 @@ impl G1Collector {
     /// no such API), so the invariant is enforced by the type-level
     /// `&mut Vec<G1Region>` parameter (only the lock holder can produce
     /// it) plus this contract comment.
+    /// Reject a candidate reference the evacuator is about to DEREFERENCE
+    /// when it does not look like a live object header, and say so once.
+    ///
+    /// `region_for_ptr` answers "is this word inside the region base table's
+    /// span?" — containment, nothing more. `evacuate_object` then reads the
+    /// candidate's `ObjectHeader`. A word that is in-span but is not an object
+    /// (a region base, an uncommitted page, a stale address whose region has
+    /// been recycled) therefore faults INSIDE THE COLLECTOR, with no
+    /// attribution and no chance for the pause to continue.
+    ///
+    /// `is_object_address` is the validator this collector already trusts for
+    /// conservative JIT roots and for the auto-box read: alignment, live-region
+    /// containment, and both header tag bytes, none of which requires trusting
+    /// the candidate. Using it here is the fail-safe the 2026-08-06 Hibernate
+    /// G1 comparison asked for by name — it observed that the default
+    /// collector's equivalent stale-coverage paths degrade to a controlled Java
+    /// error while G1's take a native SIGSEGV.
+    ///
+    /// Returns `true` when the reference may be evacuated.
+    ///
+    /// This does NOT explain where a rejected word came from. It makes the
+    /// event survivable and attributable; the producer is a separate question.
+    ///
+    /// Takes the caller's ALREADY-BORROWED `regions` slice and must not call
+    /// [`Self::is_object_address`]: that helper's `is_addr_in_live_region` half
+    /// re-acquires `self.regions`, which the evacuator is holding — a deadlock,
+    /// not a slow path.
+    fn evacuation_candidate_is_an_object(
+        &self,
+        regions: &[G1Region],
+        holder: *mut u8,
+        slot: usize,
+        raw: usize,
+    ) -> bool {
+        if self.candidate_header_is_plausible(regions, raw) {
+            return true;
+        }
+        let n = EVAC_REF_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        // Rate-limited like the other GC fail-safes: the first is always
+        // visible, then powers of two, so a pathological cycle cannot flood a
+        // suite log while a single occurrence still cannot hide.
+        if n <= 8 || n.is_power_of_two() {
+            // SAFETY: `holder` is the object currently being scanned; the
+            // evacuator owns it under the `regions` lock.
+            let (holder_class, holder_kind) = unsafe {
+                let h = &*(holder as *const ObjectHeader);
+                (h.class_id.as_u32(), h.kind())
+            };
+            tracing::warn!(
+                "[g1] evacuation ref-scan REJECTED a non-object candidate (#{n}):                  holder=0x{:x} class_id={holder_class} kind={holder_kind:?} slot={slot}                  candidate=0x{raw:x} — the word is inside the region span but is not a live                  object header, so evacuating it would have dereferenced it. The slot is left                  unchanged and the pause continues.",
+                holder as usize,
+            );
+        }
+        false
+    }
+
+    /// How many 8-byte reference slots of `obj_ptr` may safely be walked:
+    /// `declared`, clamped to what remains inside the holder's own region.
+    ///
+    /// Reports (rate-limited) when the clamp actually bites, because that means
+    /// a header claimed more elements than its region can hold — which is the
+    /// corrupt-header case, not a large-object case: a genuinely large array is
+    /// humongous and its continuation slices are physically contiguous, so the
+    /// span below covers them.
+    fn holder_walkable_slots(
+        &self,
+        regions: &[G1Region],
+        obj_ptr: *mut u8,
+        declared: usize,
+    ) -> usize {
+        let addr = obj_ptr as usize;
+        let region_size = self.config.region_size;
+        if region_size == 0 || addr < self.arena_base || addr >= self.arena_end {
+            return declared;
+        }
+        // The holder may be humongous: walk forward across continuation slices
+        // so a legitimately large array is not clamped.
+        let mut idx = (addr - self.arena_base) / region_size;
+        let Some(start) = regions.get(idx) else {
+            return declared;
+        };
+        let base = start.data.as_ptr() as usize;
+        let mut end = base + start.cursor;
+        while let Some(next) = regions.get(idx + 1) {
+            if next.region_type != RegionType::HumongousContinuation {
+                break;
+            }
+            idx += 1;
+            end = next.data.as_ptr() as usize + region_size;
+        }
+        if end <= addr + HEADER_SIZE {
+            return 0;
+        }
+        let room = (end - addr - HEADER_SIZE) / 8;
+        if room >= declared {
+            return declared;
+        }
+        let n = EVAC_HOLDER_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
+            );
+        }
+        room
+    }
+
+    /// [`Self::is_object_address`]'s checks, against a borrowed `regions` slice
+    /// instead of re-locking: alignment, arena bounds, the owning region being
+    /// live and the address being below its allocation cursor, and both header
+    /// tag bytes decoding to defined enum values.
+    ///
+    /// Deliberately does NOT consult `kept_unresolved_*` the way
+    /// `is_addr_in_live_region` does. Those sets are empty outside the rare
+    /// wedged-drain window, they are behind their own mutexes (the same
+    /// deadlock hazard), and erring towards ACCEPTING there is the safe
+    /// direction for this guard: a false accept is only the pre-guard
+    /// behaviour, whereas a false reject would drop a live reference.
+    fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
+        if addr == 0 || addr & 0x7 != 0 {
+            return false;
+        }
+        if addr < self.arena_base || addr >= self.arena_end {
+            return false;
+        }
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return false;
+        }
+        let idx = (addr - self.arena_base) / region_size;
+        let Some(r) = regions.get(idx) else {
+            return false;
+        };
+        match r.region_type {
+            RegionType::Free => return false,
+            // A humongous continuation slice is live in its entirety; only the
+            // start region carries the object's full `cursor`.
+            RegionType::HumongousContinuation => {}
+            _ => {
+                let base = r.data.as_ptr() as usize;
+                if addr < base || addr >= base + r.cursor {
+                    return false;
+                }
+            }
+        }
+        let ptr = addr as *const u8;
+        // SAFETY: the address is 8-aligned and inside a live region's committed
+        // span, so its first two tag bytes are readable. Both are validated as
+        // enum discriminants before any `ObjectHeader` borrow, exactly as
+        // `is_object_address` does — this is the step that rejects a word which
+        // is in-span but is not an object.
+        let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
+            return false;
+        };
+        if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
+        {
+            return false;
+        }
+        if kind == ObjectKind::HumongousFiller {
+            return false;
+        }
+        // SAFETY: tags validated above.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
+        if kind == ObjectKind::Array {
+            header.array_length() <= i32::MAX as u32
+        } else {
+            header.num_slots() <= MAX_PLAUSIBLE_SLOTS
+        }
+    }
+
     fn scan_and_evacuate_refs(
         &self,
         regions: &mut Vec<G1Region>,
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
     ) {
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length() as usize {
+        // The HOLDER has to be an object too. It arrives from the worklist or
+        // from an rset source walk, and a wrong header here is what walks the
+        // loops below out of the region entirely — see
+        // `holder_walkable_slots`.
+        if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
+            let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
+                    obj_ptr as usize,
+                );
+            }
+            return;
+        }
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
+                // Clamp to what the holder's own region actually holds. A
+                // reference array's element count is a u32 bounded only by
+                // `i32::MAX`, and `HEADER_SIZE + len * 8` is never checked
+                // against the region — so one wrong header walks into the next
+                // region's base. The collector knows the bound; use it.
+                let declared = header.array_length() as usize;
+                let len = self.holder_walkable_slots(regions, obj_ptr, declared);
+                for i in 0..len {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                    if raw != 0 {
+                    if raw != 0
+                        && self.evacuation_candidate_is_an_object(
+                            regions,
+                            obj_ptr,
+                            i,
+                            raw as usize,
+                        )
+                    {
                         let ref_ptr = raw as usize as *mut u8;
                         if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&region_idx) {
@@ -4207,6 +4420,9 @@ impl G1Collector {
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                if !self.evacuation_candidate_is_an_object(regions, obj_ptr, raw, raw) {
+                    return;
+                }
                 let ref_ptr = raw as *mut u8;
                 if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                     if cset.contains(&region_idx) {
@@ -4251,7 +4467,7 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         source_idx: usize,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -4308,8 +4524,8 @@ impl G1Collector {
             // concurrent mutator; uses the same plain ptr::write pattern
             // as evacuate_object's mark-word transfer and the existing
             // scan_and_evacuate_refs helper).
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
+            if header.kind() == ObjectKind::Array {
+                if header.element_type() == ArrayElementType::Reference {
                     for i in 0..header.array_length() as usize {
                         let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                         let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
@@ -4371,7 +4587,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         if pointer_map.is_empty() {
             return;
@@ -4491,9 +4707,9 @@ impl G1Collector {
         header: &ObjectHeader,
         out: &mut Vec<(usize, usize)>,
     ) {
-        let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
+        let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
                 for k in 0..header.array_length() as usize {
                     let raw: u64 = unsafe { std::ptr::read(data_start.add(k * 8) as *const u64) };
                     if raw == 0 {
@@ -4545,7 +4761,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let verify = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
         if !verify {
@@ -4599,9 +4815,9 @@ impl G1Collector {
                     break;
                 }
 
-                let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
-                if header.kind == ObjectKind::Array {
-                    if header.element_type == ArrayElementType::Reference {
+                let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                if header.kind() == ObjectKind::Array {
+                    if header.element_type() == ArrayElementType::Reference {
                         for k in 0..header.array_length() as usize {
                             let slot_ptr = unsafe { data_start.add(k * 8) };
                             let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
@@ -4674,7 +4890,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         roots: &[ObjectRef],
     ) {
         if !gc_flags().g1_dbg_headers {
@@ -4684,7 +4900,7 @@ impl G1Collector {
         // SAME destination address = a TLAB allocation race (one copy clobbers
         // the other's header → `java/lang/Object`). Reverse-map the forwards.
         {
-            let mut by_dest: HashMap<usize, usize> = HashMap::with_capacity(pointer_map.len());
+            let mut by_dest: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(pointer_map.len(), Default::default());
             let mut overlaps = 0usize;
             for (&k, &v) in pointer_map.iter() {
                 if k == v {
@@ -4789,9 +5005,9 @@ impl G1Collector {
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
                     break;
                 }
-                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
-                if header.kind == ObjectKind::Array {
-                    if header.element_type == ArrayElementType::Reference {
+                let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                if header.kind() == ObjectKind::Array {
+                    if header.element_type() == ArrayElementType::Reference {
                         for k in 0..header.array_length() as usize {
                             let raw =
                                 unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
@@ -4840,7 +5056,7 @@ impl G1Collector {
             let h = unsafe { &*(addr as *const ObjectHeader) };
             h.class_id.as_u32() == 0
                 && h.num_slots() == 0
-                && (h.kind as u8) == 0
+                && ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                 && h.array_length() == 0
         };
         let mut report = |holder: usize, hreg: Option<usize>, where_: &str, target: usize| {
@@ -4889,9 +5105,9 @@ impl G1Collector {
                 if sz < HEADER_SIZE || off + sz > cursor {
                     break;
                 }
-                let data = unsafe { obj_ptr.add(HEADER_SIZE) };
-                if header.kind == ObjectKind::Array {
-                    if header.element_type == ArrayElementType::Reference {
+                let data = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
+                if header.kind() == ObjectKind::Array {
+                    if header.element_type() == ArrayElementType::Reference {
                         for k in 0..header.array_length() as usize {
                             let raw =
                                 unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
@@ -4934,14 +5150,29 @@ impl G1Collector {
 
         let is_zeroed = |addr: usize| -> bool {
             let h = unsafe { &*(addr as *const ObjectHeader) };
-            // identity_hash_code is stamped non-zero on every allocation, so
-            // requiring it zero here keeps a live bare `new Object()` (which
-            // legitimately has class_id 0 / no slots) from false-positiving.
+            // WEAKER THAN IT WAS, deliberately and visibly.
+            //
+            // This used to end `&& h.identity_hash_code == 0`, justified by
+            // "identity_hash_code is stamped non-zero on every allocation, so
+            // requiring it zero keeps a live bare `new Object()` from
+            // false-positiving". That premise died on 2026-08-07: the identity
+            // hash left the header for the mark word and is now installed
+            // LAZILY, on first request, so a live never-hashed object has a
+            // zero word exactly like reclaimed memory does.
+            //
+            // The mark word is kept in the conjunction because it is the
+            // strictly-better version of the same test (it also excludes
+            // anything locked or forwarded), but it does NOT restore the old
+            // discriminator: a live, never-hashed, never-locked `new Object()`
+            // with class_id 0 is now indistinguishable from zeroed memory here.
+            // This predicate is diagnostic, so the cost is a misleading label
+            // rather than a wrong decision -- but it is a real loss and should
+            // not be read as equivalent to what it replaced.
             h.class_id.as_u32() == 0
                 && h.num_slots() == 0
-                && (h.kind as u8) == 0
+                && ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                 && h.array_length() == 0
-                && h.identity_hash_code == 0
+                && h.mark_word.load(Ordering::Relaxed) == 0
         };
 
         let mut stack: Vec<usize> = Vec::new();
@@ -4965,7 +5196,7 @@ impl G1Collector {
                         let hh = unsafe { &*(holder as *const ObjectHeader) };
                         (
                             hh.class_id.as_u32(),
-                            hh.kind as u8,
+                            ObjectHeader::kind_tag(hh.mark_word.load(Ordering::Relaxed)),
                             hh.num_slots(),
                             hh.array_length(),
                         )
@@ -5008,9 +5239,9 @@ impl G1Collector {
         }
         while let Some(addr) = stack.pop() {
             let header = unsafe { &*(addr as *const ObjectHeader) };
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
-                    let data = unsafe { (addr as *const u8).add(HEADER_SIZE) };
+            if header.kind() == ObjectKind::Array {
+                if header.element_type() == ArrayElementType::Reference {
+                    let data = unsafe { (addr as *const u8).add(ARRAY_DATA_OFFSET) };
                     for k in 0..header.array_length() as usize {
                         let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
                         check_push(raw, addr, "array-elem", k, &mut stack, &mut seen, &mut bad);
@@ -5045,9 +5276,9 @@ impl G1Collector {
                 rseen.insert(addr);
                 while let Some(a) = rstack.pop() {
                     let h = unsafe { &*(a as *const ObjectHeader) };
-                    let data = unsafe { (a as *const u8).add(HEADER_SIZE) };
-                    if h.kind == ObjectKind::Array {
-                        if h.element_type == ArrayElementType::Reference {
+                    let data = unsafe { (a as *const u8).add(ARRAY_DATA_OFFSET) };
+                    if h.kind() == ObjectKind::Array {
+                        if h.element_type() == ArrayElementType::Reference {
                             for k in 0..h.array_length() as usize {
                                 let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) }
                                     as usize;
@@ -5091,7 +5322,7 @@ impl G1Collector {
                         "[g1][ROOTCENSUS] pause={pause} root#{ri} addr={addr:#x} cid={} kind={} \
                          slots={} reach={} slot1={slot1}",
                         h.class_id.as_u32(),
-                        h.kind as u8,
+                        ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)),
                         h.num_slots(),
                         rseen.len()
                     );
@@ -5338,7 +5569,7 @@ impl G1Collector {
     fn remap_reference_skip_set(
         &self,
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let mut skip = self.reference_skip.lock();
         if skip.is_empty() {
@@ -5649,6 +5880,22 @@ impl G1Collector {
                 _ => None,
             }
         };
+        // UNRESOLVED FORK, blocking HEADER_SIZE = 16.
+        //
+        // `read_ref`/`read_value` below are shared between the array walk (which
+        // passes element offsets) and the object walk (which passes compact
+        // field offsets), so at 16 bytes this base has to become
+        // ARRAY_DATA_OFFSET for one caller and HEADER_SIZE for the other. Both
+        // shapes of that change -- `header.payload_offset()` in the closure, and
+        // a `payload_base` hoisted out of it -- were tried on 2026-08-07 and
+        // both left `cargo test -p cratonvm-gc --lib` timing out at 500s.
+        //
+        // That is NOT established as cause: the same suite also hung and also
+        // failed `parallel_matches_serial_no_loss_or_dup` on runs with this code
+        // untouched (6 runs: hang / 979 pass / hang / 978+1 / hang / hang), so
+        // the g1 parallel set is unstable here independently and cannot serve as
+        // the control. Left at HEADER_SIZE -- correct today, since the two
+        // constants are equal -- until that instability is separated out.
         // Read an 8-byte ref word at logical payload offset `payload_off`.
         let read_ref = |payload_off: usize| -> u64 {
             if let Some((start, total_payload)) = humongous_start {
@@ -5673,8 +5920,8 @@ impl G1Collector {
             }
         };
 
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
                 // Reference array: 8-byte compact slot per element.
                 for i in 0..header.array_length() as usize {
                     let raw: u64 = read_ref(i * 8);
@@ -6732,6 +6979,16 @@ impl G1Collector {
     /// no-op when no collection has run. Emitted at VM shutdown when GC stats
     /// are requested — see `VmHeap::print_gc_summary`.
     pub fn print_gc_summary(&self) {
+        // Unconditional, and BEFORE the early return below: a run with no
+        // recorded pause summary can still have rejected a candidate, and a
+        // counter that only prints alongside something else is a counter that
+        // reads as zero when it never ran.
+        let rejected = evacuation_refs_rejected();
+        let (holder_rejected, holder_clamped) = evacuation_holder_counts();
+        eprintln!(
+            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} \
+             evac_holder_clamped={holder_clamped}"
+        );
         let Some(s) = self.pause_summary() else {
             return;
         };
@@ -6899,7 +7156,6 @@ impl G1Collector {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).ok()?,
         );
@@ -6957,7 +7213,7 @@ impl G1Collector {
         length: usize,
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
-        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let total_size = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let (ptr, _region) = self.alloc_in_region(total_size)?;
 
         // Mirror `length` into BOTH `array_length` and `num_slots`, matching
@@ -6970,7 +7226,6 @@ impl G1Collector {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             u32::try_from(length).ok()?,
             u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
         );
@@ -7332,6 +7587,141 @@ impl G1Collector {
     /// twice. Deliberately NOT gated on `gc_quiescence::is_active()` — a
     /// blocked thread's un-retired tail can be published while no thread is
     /// in JIT at all.
+    /// The [`crate::gc_quiescence::incomplete_reason`] code when this
+    /// collection's JIT root set is known to be INCOMPLETE, or `None` when
+    /// every live compiled frame was enumerated.
+    ///
+    /// # Why G1 needs this and not only [`Self::jit_pinned_region_set`]
+    ///
+    /// `jit_pinned_region_set` is G1's stand-in for the generational
+    /// collector's non-moving-while-in-JIT sweep: the root gatherer publishes
+    /// each conservatively-discovered JIT-frame root, and the region holding
+    /// it is kept out of the collection set so the un-rewritable
+    /// register/spill slot that names it cannot go stale.
+    ///
+    /// That is only sound when the conservative scan actually *saw* the frame.
+    /// Several coverage obligations fail precisely because it did not:
+    /// `UNREGISTERED_JIT_FRAME` (a compiled frame sits above the entry chain's
+    /// cover, so the scan band never reaches it), `FOREIGN_INNERMOST_RBP` (the
+    /// innermost recorded RBP belongs to a deeper callee entered by a direct
+    /// JIT->JIT call, so the entry's map does not describe the frame that is
+    /// actually there), `MISSING_EXACT_RBP` (the frame cannot be bounded at
+    /// all). In each of those the pin set comes back *empty for that frame*,
+    /// G1 sees no reason to exclude anything, and it evacuates an object whose
+    /// only reference lives in a slot nothing will rewrite. The next
+    /// dereference would be a native `SIGSEGV`, not a controlled Java error —
+    /// the shape the two retired 2026-08 full-suite G1 comparisons (the
+    /// `g1-collector-fullsuite-crashes-hangs-fails-20260806` and
+    /// `g1-fullsuite-regression-20260807` write-ups) recorded, from three and
+    /// one crash sites respectively, with the collector's own "last
+    /// incomplete-coverage reason" field already naming an obligation in every
+    /// report.
+    ///
+    /// # Why this is a DIAGNOSTIC, not a fail-safe
+    ///
+    /// Each of the reasons above is, on inspection, already backed by a
+    /// conservative scan whose roots G1 pins:
+    ///
+    /// * an unregistered frame is detected and its whole band is scanned by
+    ///   `conservative_roots::scan_active_jit_frames`, which pushes the band's
+    ///   oops into the same `roots` vector `memory::roots::collect_roots`
+    ///   then republishes through `gc_quiescence::add_pinned_jit_root`;
+    /// * a precise entry always ALSO gets a conservative band scan
+    ///   (`scan_compiled_frame_bands`, or the whole-band `scan_one_frame`
+    ///   fallback when its metadata is not trustworthy), so an unresolvable
+    ///   innermost RBP or a missing exact RBP still leaves the frame covered;
+    /// * a parked or blocked peer publishes its own conservative JIT roots via
+    ///   `interpreter::update_root_snapshot`'s `publish_pinned_jit_roots`;
+    /// * a forcibly-frozen peer and its helper window are pinned by
+    ///   `interpreter::pin_frozen_peer_roots_for_g1`, and its un-retired TLAB
+    ///   tail by [`Self::set_jit_tlab_skip_regions`].
+    ///
+    /// So "coverage incomplete" under G1 means *the roots are not REWRITABLE*,
+    /// which is the normal state whenever a thread is in compiled code — not
+    /// *the roots were not ENUMERATED*. Measured: 330263 of 330264 pauses on
+    /// `probes/MovingYoungConcurrentProbe 6 400 2000`. Refusing to evacuate on
+    /// it is therefore both unnecessary and ruinous — the same run needs ONE
+    /// collection with the lever off and takes 330264 no-op pauses with it on,
+    /// because a pause that frees nothing is immediately re-triggered by the
+    /// next allocation.
+    ///
+    /// The refusal is kept as an opt-IN bisection lever
+    /// (`CRATONVM_G1_COVERAGE_PIN`, [`crate::gc_flags`]`().g1_coverage_pin`):
+    /// under it G1 moves nothing, so a G1-only crash that survives it is not
+    /// caused by a relocation the root set failed to cover. That is the
+    /// experiment both 2026-08 full-suite G1 pages asked for and could not run.
+    ///
+    /// This function is the DETECTION only and is deliberately NOT gated on
+    /// that flag, so the counters report the rate in both arms. A lever that
+    /// also switches off its own measurement cannot settle anything.
+    pub(crate) fn root_coverage_incomplete_reason() -> Option<usize> {
+        // `force_non_moving_jit_roots` is the root gatherer's own OSR-shadow
+        // verdict and does not always travel with a reason code; report the
+        // stored reason when there is one, and the OSR code when there is not,
+        // so the record never claims `NONE` while refusing to evacuate.
+        let flagged = crate::gc_quiescence::moving_young_coverage_incomplete();
+        let forced = crate::gc_quiescence::force_non_moving_jit_roots();
+        if !flagged && !forced {
+            return None;
+        }
+        let reason = crate::gc_quiescence::moving_young_incomplete_reason();
+        Some(if reason == crate::gc_quiescence::incomplete_reason::NONE {
+            crate::gc_quiescence::incomplete_reason::OSR_SHADOW
+        } else {
+            reason
+        })
+    }
+
+    /// Box a non-Object `Value` for storage in a REFERENCE array element, or
+    /// return it unchanged when it is already a reference (or the array is not
+    /// a reference array).
+    ///
+    /// The wrapper is a one-field `AUTOBOX_CLASS_ID` object, exactly as
+    /// `GenerationalHeap::set_array_element` and `Heap::set_array_element`
+    /// build it, so [`Self::autobox_payload`] and every other backend's reader
+    /// recognise it. Must be called BEFORE taking the `regions` lock — the
+    /// allocation needs it.
+    fn autobox_for_reference_array(&self, array: ObjectRef, value: Value) -> Value {
+        if matches!(value, Value::Object(_)) {
+            return value;
+        }
+        if self.get_header(array).element_type() != ArrayElementType::Reference {
+            return value;
+        }
+        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+        self.set_field(wrapper, 0, value);
+        Value::Object(Some(wrapper))
+    }
+
+    /// The primitive inside an auto-box wrapper, or `None` when `candidate` is
+    /// an ordinary object.
+    ///
+    /// Validates the address before dereferencing its header: a reference array
+    /// element is a raw word and a stale or garbage one could point anywhere,
+    /// so an unchecked read here would be wild. Mirrors the same guard in
+    /// `GenerationalHeap::get_array_element`.
+    fn autobox_payload(&self, candidate: ObjectRef) -> Option<Value> {
+        self.is_object_address(candidate.as_ptr() as usize)?;
+        // SAFETY: `is_object_address` confirmed `candidate` points at a valid
+        // object header inside one of this collector's regions.
+        let header = unsafe { &*(candidate.as_ptr() as *const ObjectHeader) };
+        if header.class_id != crate::heap::AUTOBOX_CLASS_ID {
+            return None;
+        }
+        Some(self.get_field(candidate, 0))
+    }
+
+    /// Whether this pause must decline to evacuate: the detection from
+    /// [`Self::root_coverage_incomplete_reason`] AND the opt-in
+    /// `CRATONVM_G1_COVERAGE_PIN` lever.
+    ///
+    /// A pure function of its two inputs so both arms are testable —
+    /// `gc_flags()` latches for the process, so a test cannot flip the lever
+    /// from inside one.
+    fn refuse_evacuation(coverage_incomplete: Option<usize>, lever_on: bool) -> Option<usize> {
+        coverage_incomplete.filter(|_| lever_on)
+    }
+
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
         let mut set: std::collections::HashSet<usize> = if crate::gc_quiescence::is_active() {
             crate::gc_quiescence::pinned_jit_roots_snapshot()
@@ -7448,7 +7838,7 @@ impl G1Collector {
         if regions[idx].region_type != RegionType::HumongousStart {
             return None;
         }
-        let payload_bytes = total_object_size.saturating_sub(HEADER_SIZE);
+        let payload_bytes = total_object_size.saturating_sub(ARRAY_DATA_OFFSET);
         Some((idx, payload_bytes))
     }
 
@@ -7515,7 +7905,7 @@ impl G1Collector {
         // region's integer base address (not the `Deref` slice, whose `len` is
         // only `region_size`) so the pointer carries arena provenance across
         // region boundaries.
-        let phys = (regions[start].data.addr() + HEADER_SIZE + payload_off) as *mut u8;
+        let phys = (regions[start].data.addr() + ARRAY_DATA_OFFSET + payload_off) as *mut u8;
         // SAFETY: `payload_off + len <= total_payload`, and the humongous span
         // reserved `ceil(size/region_size)` contiguous arena regions covering
         // `HEADER_SIZE + total_payload` bytes from `start_addr`, so
@@ -7559,9 +7949,9 @@ impl G1Collector {
         // is fed by conservative JIT-frame words and must reject garbage
         // without letting invalid `#[repr(u8)]` values reach a debug enum
         // match.
-        let kind = unsafe { object_kind_from_tag(*raw.add(OBJECT_KIND_OFFSET)) }?;
+        let kind = unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(raw)) }?;
         let _element_type =
-            unsafe { array_element_type_from_tag(*raw.add(ARRAY_ELEMENT_TYPE_OFFSET)) }?;
+            unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(raw)) }?;
         if kind == ObjectKind::HumongousFiller {
             return None;
         }
@@ -7787,7 +8177,6 @@ impl GarbageCollector for G1Collector {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
@@ -7809,7 +8198,7 @@ impl GarbageCollector for G1Collector {
     ) -> ObjectRef {
         let data_size = array_data_size(length, element_type)
             .expect("array data size overflow in g1 alloc_array");
-        let total_size = HEADER_SIZE + data_size;
+        let total_size = ARRAY_DATA_OFFSET + data_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
             eprintln!(
                 "FATAL: G1: out of heap space for array allocation ({} bytes) \
@@ -7830,7 +8219,6 @@ impl GarbageCollector for G1Collector {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             u32::try_from(length).expect("array length exceeds u32::MAX"),
             u32::try_from(length).expect("array length must fit u32 for G1 header num_slots"),
         );
@@ -7850,19 +8238,24 @@ impl GarbageCollector for G1Collector {
     }
 
     fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
-        self.get_header(obj).kind
+        self.get_header(obj).kind()
     }
 
     fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
-        self.get_header(obj).element_type
+        self.get_header(obj).element_type()
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let existing = self.get_header(obj).identity_hash_code;
-        if existing != 0 {
-            return existing;
+        let header = self.get_header(obj);
+        match header.mark_word_identity_hash(|| match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => crate::collector::displaced_identity_hash(
+                header.mark_word.load(Ordering::Relaxed),
+            ),
         }
-        self.mint_identity_hash_code(obj)
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
@@ -7896,6 +8289,48 @@ impl GarbageCollector for G1Collector {
         }
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
+        // returns `None` for TWO different reasons and the `unwrap_or` below
+        // treats them as one: "this is a legacy object" (correct — the uniform
+        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
+        // object (`GC_FLAG_COMPACT`, set at allocation) whose
+        // `(class_id, num_slots)` no longer resolves to a registered layout"
+        // (its `class_layout_for_fields(..)?` early return — e.g. a class
+        // redefinition racing the layout registry).
+        //
+        // For the second, `alloc_object` above sized this object's body with
+        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
+        // `num_slots()` on a compact object is the FIELD COUNT — so the
+        // `index >= num_slots` screen above does not bound the legacy stride,
+        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
+        // the allocation. That is the read half of the `SIGSEGV` observed
+        // against the real `DefaultCatalogAndSchemaTest` workload.
+        //
+        // `is_compact_object(header)` is the per-object header bit, read
+        // independently of the registry, and is exactly how this collector's
+        // own walkers already separate the two cases — see
+        // `for_each_flat_object_reference` and the concurrent mark's object
+        // arm, both of which then simply skip the object when
+        // `with_class_layout` misses. An accessor cannot skip, so it degrades
+        // as this function's neighbouring guards do: benign null read, loud
+        // `cratonvm::gc::guard` record, no panic. Matches
+        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
+        // rationale and the open `TODO` about the unchecked `layout_domain` on
+        // the read path.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
         let (payload_off, payload_size) = compact
             .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
@@ -7944,7 +8379,7 @@ impl GarbageCollector for G1Collector {
         // fixed-suite-bugs/elasticsearch-suite/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
         // which covered g1::scan_object_refs but not this mutator-side path).
-        let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+        let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
         if let Some((_, storage)) = compact {
             unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
         } else {
@@ -8007,6 +8442,32 @@ impl GarbageCollector for G1Collector {
         }
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
+        // on the matching guard in `get_field` above for why this `None` is
+        // two different states and why only the legacy one may reach the
+        // `unwrap_or` below. This half is the more damaging: the legacy stride
+        // does not merely read past a compact-sized body, it *writes* a
+        // 16-byte `Value` cell over whatever follows the object.
+        //
+        // The SATB pre-barrier above has already run, and in this state its
+        // `self.get_field(obj, index)` returned `Value::Object(None)` through
+        // that same guard — so no bogus edge was logged, and the second
+        // `cratonvm::gc::guard` record it emits for this object is expected.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "g1::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the write rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
         let (payload_off, payload_size) = compact
             .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
@@ -8048,7 +8509,7 @@ impl GarbageCollector for G1Collector {
                 // PLAIN-SLOT TEARING FIX (2026-07-06): was a bare
                 // `ptr::write::<Value>` -- see the matching note on
                 // `get_field`'s read side above.
-                let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                let ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                 if let Some((_, storage)) = compact {
                     unsafe {
                         cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
@@ -8123,7 +8584,7 @@ impl GarbageCollector for G1Collector {
         if index >= len {
             return Err(index as i32);
         }
-        let element_type = header.element_type;
+        let element_type = header.element_type();
         let elem_size = crate::heap::element_byte_size(element_type);
         let payload_off = index * elem_size;
 
@@ -8137,7 +8598,7 @@ impl GarbageCollector for G1Collector {
             // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
             // total so the humongous span / payload bound is exact.
             let total_size =
-                HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
                 if !self.humongous_copy(
                     &regions,
@@ -8153,22 +8614,49 @@ impl GarbageCollector for G1Collector {
             } else {
                 // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)`
                 // is inside the array's single-region payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
                 }
             }
         }
-        Ok(array_element_from_bytes(element_type, &raw))
+        let value = array_element_from_bytes(element_type, &raw);
+        // Un-box the auto-box wrapper the store side installs for a non-Object
+        // value — see `set_array_element`, and `GenerationalHeap::
+        // get_array_element` for the same read.
+        if element_type == ArrayElementType::Reference {
+            if let Value::Object(Some(boxed)) = value {
+                if let Some(inner) = self.autobox_payload(boxed) {
+                    return Ok(inner);
+                }
+            }
+        }
+        Ok(value)
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        // A reference array element is a raw 8-byte pointer, so a non-Object
+        // `Value` cannot be stored in one directly. Natives across the tree
+        // nonetheless use a reference array as a generic `Value` store (the
+        // stream pipeline collects `Value::Long`/`Value::Double` into one), and
+        // `GenerationalHeap::set_array_element` has always honoured that by
+        // auto-boxing into a one-field `AUTOBOX_CLASS_ID` wrapper.
+        //
+        // G1 did not: its encoder is `Value::Object(Some(r)) => r.as_ptr(),
+        // _ => 0`, so a `Value::Long(42)` was written as a null reference and
+        // read back as `Value::Object(None)`. `.mapToDouble(...).toArray()`
+        // therefore returned all zeros under `-XX:+UseG1GC` and was correct
+        // under the default collector, with no GC involved at all.
+        //
+        // Boxed BEFORE the `regions` lock below: `alloc_object` takes that same
+        // lock.
+        let value = self.autobox_for_reference_array(obj, value);
         let header = self.get_header(obj);
         let len = header.array_length() as usize;
         if index >= len {
             return Err(index as i32);
         }
-        let element_type = header.element_type;
+        let element_type = header.element_type();
         let elem_size = crate::heap::element_byte_size(element_type);
         let payload_off = index * elem_size;
         let is_ref = element_type == ArrayElementType::Reference;
@@ -8200,7 +8688,7 @@ impl GarbageCollector for G1Collector {
         let stored = {
             let regions = self.regions.lock();
             let total_size =
-                HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+                ARRAY_DATA_OFFSET + crate::heap::array_data_size(len, element_type).unwrap_or(0);
             let span = self.humongous_span(&regions, obj, total_size);
 
             if is_ref && self.satb_pre_barrier_required() && !satb_pre_suppressed() {
@@ -8217,7 +8705,7 @@ impl GarbageCollector for G1Collector {
                     ),
                     None => {
                         // SAFETY: `index < len` so the slot is inside the payload.
-                        let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                        let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 slot_ptr,
@@ -8249,7 +8737,7 @@ impl GarbageCollector for G1Collector {
                 )
             } else {
                 // SAFETY: `index < len` so the slot is inside the array payload.
-                let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                let slot_ptr = unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET + payload_off) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
                 }
@@ -8327,17 +8815,55 @@ impl GarbageCollector for G1Collector {
                 regions.len(), free, eden, survivor, old, pinned
             );
         }
-        // Name the backend in the process-wide decision report. G1 has no
+        // Name the backend in the process-wide decision report, AND whether
+        // this pause was allowed to evacuate at all. G1 normally has no
         // young-moving *choice* to record — its collection set is always
-        // evacuated — but a report that stays silent under `-XX:+UseG1GC` is
-        // exactly how the `docs/GC.md` drift went unnoticed for the
-        // generational path. Recording the constant answer makes "which
-        // collector produced this summary?" a question the runtime answers.
+        // evacuated — but it does have one refusal, and a report that stays
+        // silent under `-XX:+UseG1GC` is exactly how the `docs/GC.md` drift
+        // went unnoticed for the generational path.
+        //
+        // The refusal: this collection's JIT root set may be incomplete, so
+        // no region can be proven free of an object whose only reference the
+        // root scan never saw. See
+        // [`Self::root_coverage_incomplete_reason`] for why
+        // `jit_pinned_region_set` alone does not cover this and what the
+        // empty-CSet fail-safe costs.
+        let coverage_incomplete = Self::root_coverage_incomplete_reason();
+        // Counted in BOTH arms — see `root_coverage_incomplete_reason`.
+        crate::gc_metrics::record_g1_pause_coverage(coverage_incomplete.is_some());
+        // Only the REFUSAL is gated, and it is OFF by default — see
+        // `root_coverage_incomplete_reason` for the measurement that says why.
+        let refuse = Self::refuse_evacuation(coverage_incomplete, gc_flags().g1_coverage_pin);
         crate::gc_metrics::record_collector_decision(
             "g1",
-            crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
-            crate::gc_quiescence::incomplete_reason::NONE,
+            match refuse {
+                Some(_) => {
+                    crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE
+                }
+                None => crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
+            },
+            coverage_incomplete.unwrap_or(crate::gc_quiescence::incomplete_reason::NONE),
         );
+        if refuse.is_some() {
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::YOUNG,
+                0,
+                0,
+                0,
+                0,
+                crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                    | crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+            );
+            self.native_alloc_pressure.store(false, Ordering::Relaxed);
+            return GcResult {
+                stats: GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+                pointer_map: cratonvm_types::PointerMap::default(),
+            };
+        }
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
@@ -8489,7 +9015,7 @@ fn consume_satb_pre_barrier_epoch() -> bool {
 /// than from a separate counter is what stops the report and the reclamation
 /// decision from ever disagreeing.
 fn g1_pause_degraded_flags(
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
     jni_pinned_out: usize,
     jit_pinned_out: usize,
     parallel: bool,
@@ -8587,9 +9113,9 @@ fn find_contiguous_free(regions: &[G1Region], count: usize) -> Option<usize> {
 /// This does not mask genuine bugs silently — the corruption is logged — but it
 /// converts a hard process abort into a recoverable / fail-safe path.
 fn object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+    if header.kind() == ObjectKind::Array {
+        match array_data_size(header.array_length() as usize, header.element_type()) {
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
                 // caller's `total_size < HEADER_SIZE` guard fires (matching the
@@ -8598,7 +9124,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
                     "g1: implausible array_length {} (element_type={:?}) in object header — \
                      treating as corrupt; caller will skip/stop the walk",
                     header.array_length(),
-                    header.element_type,
+                    header.element_type(),
                 );
                 0
             }
@@ -8629,7 +9155,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
 /// regardless of the (synthetic) per-field values stored in the header.
 #[inline]
 fn is_humongous_filler(header: &ObjectHeader) -> bool {
-    matches!(header.kind, ObjectKind::HumongousFiller)
+    matches!(header.kind(), ObjectKind::HumongousFiller)
 }
 
 thread_local! {
@@ -8779,12 +9305,12 @@ fn is_collectable_region_type(region_type: RegionType) -> bool {
 fn update_object_refs(
     obj_ptr: *mut u8,
     header: &ObjectHeader,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
-    let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
+    let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
 
-    if header.kind == ObjectKind::Array {
-        if header.element_type == ArrayElementType::Reference {
+    if header.kind() == ObjectKind::Array {
+        if header.element_type() == ArrayElementType::Reference {
             for i in 0..header.array_length() as usize {
                 let slot_ptr = unsafe { data_start.add(i * 8) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
@@ -8895,7 +9421,7 @@ mod tests {
     /// No-op monitor cleanup for tests.
     struct NoopMonitors;
     impl MonitorCleanup for NoopMonitors {
-        fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
     }
 
     /// Test-only `StopTheWorldToken`. Single-threaded test harness, so the
@@ -8948,6 +9474,50 @@ mod tests {
         );
     }
 
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side. `compact_object_field_storage`
+    /// returns `None` both for a legacy object and for a genuinely compact one
+    /// whose `(class_id, field_count)` no longer resolves to a registered
+    /// layout, and `get_field`/`set_field` collapsed the two into
+    /// `.unwrap_or((index * SLOT_SIZE, SLOT_SIZE))`. On a real instance of the
+    /// second state `alloc_object` sized the body with
+    /// `compact_object_body_size` and `num_slots()` is the FIELD COUNT, so the
+    /// `index >= num_slots` screen does not bound that legacy stride: the read
+    /// escapes the allocation and the write puts a 16-byte `Value` cell past
+    /// it. This collector's own walkers already separate the two cases via the
+    /// `GC_FLAG_COMPACT` header bit; the accessors must too.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let gc = make_collector();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY and the cells written below are real, readable cells. Setting
+        // the bit afterwards reproduces the racing state (header says compact,
+        // registry cannot serve it) without a live redefinition.
+        let obj = gc.alloc_object(ClassId::new(999_997), 4);
+        gc.set_field(obj, 0, Value::Int(1));
+        gc.set_field(obj, 1, Value::Int(2));
+
+        // SAFETY: flips the per-object compact bit on a live, fully
+        // initialized allocation; both flag helpers take `&self` and drive the
+        // atomic mark word.
+        let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(gc.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        gc.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert!(
+            matches!(gc.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
+        );
+    }
+
     fn unaligned_ptr(buf: &mut [u8], align: usize) -> *mut u8 {
         for offset in 0..align {
             let ptr = unsafe { buf.as_mut_ptr().add(offset) };
@@ -8969,7 +9539,7 @@ mod tests {
         let gc = make_collector();
         let invalid_kind = gc.alloc_object(ClassId::new(1), 0);
         unsafe {
-            corrupt_header_byte(invalid_kind, OBJECT_KIND_OFFSET, 0x7f);
+            corrupt_header_byte(invalid_kind, cratonvm_types::KIND_TAGS_BYTE_OFFSET, 0x7f);
         }
         assert!(gc
             .is_object_address(invalid_kind.as_ptr() as usize)
@@ -8977,7 +9547,7 @@ mod tests {
 
         let invalid_element = gc.alloc_array(ClassId::new(2), ArrayElementType::Int, 1);
         unsafe {
-            corrupt_header_byte(invalid_element, ARRAY_ELEMENT_TYPE_OFFSET, 0x7f);
+            corrupt_header_byte(invalid_element, cratonvm_types::KIND_TAGS_BYTE_OFFSET, 0x7f);
         }
         assert!(gc
             .is_object_address(invalid_element.as_ptr() as usize)
@@ -9176,7 +9746,7 @@ mod tests {
         let obj = gc.alloc_object(ClassId::new(1), 2);
         let header = gc.get_header(obj);
         assert_eq!(header.class_id, ClassId::new(1));
-        assert_eq!(header.kind, ObjectKind::Object);
+        assert_eq!(header.kind(), ObjectKind::Object);
         assert_eq!(header.num_slots(), 2);
         assert_eq!(gc.count_regions(RegionType::Eden), 1);
     }
@@ -9324,7 +9894,7 @@ mod tests {
 
         // Raw flat base pointer to element 0 — what the JIT computes from the
         // array oop (`obj + HEADER_SIZE`), with no region-aware translation.
-        let base = unsafe { arr.as_ptr().add(HEADER_SIZE) as *mut i32 };
+        let base = unsafe { arr.as_ptr().add(ARRAY_DATA_OFFSET) as *mut i32 };
 
         // 1) GC accessor writes, flat pointer reads back — including the tail
         //    element, which lives in a continuation region.
@@ -9359,7 +9929,7 @@ mod tests {
         // 3) Contiguity invariant: the byte just past the last element stays
         //    inside the reserved span [start, start + regions_needed*region_size).
         let rs = gc.config.region_size;
-        let total = HEADER_SIZE + n * 4;
+        let total = ARRAY_DATA_OFFSET + n * 4;
         let regions_needed = total.div_ceil(rs);
         let start_base = arr.as_ptr() as usize;
         assert!(
@@ -9508,7 +10078,7 @@ mod tests {
         let header = gc.get_header(roots[0]);
         // With promotion_age=1, objects with gc_age >= 1 go to Old.
         // After first GC, gc_age is incremented to 1.
-        assert!(header.gc_age >= 1);
+        assert!(header.gc_age() >= 1);
     }
 
     #[test]
@@ -9799,6 +10369,239 @@ mod tests {
         assert_eq!(result.stats.objects_copied, 0);
         // Object should still be at the same address
         assert_eq!(roots[0].as_ptr(), obj.as_ptr());
+    }
+
+    // -- Incomplete JIT root coverage must stop evacuation entirely --
+
+    /// The defect both G1 full-suite crash reports name: G1 evacuated while
+    /// the collection's own root scan had already recorded that it could not
+    /// enumerate every live compiled frame. `jit_pinned_region_set` cannot
+    /// cover that case — the frames in question are exactly the ones the
+    /// conservative scan never reached, so they publish no address to pin.
+    ///
+    /// The LEVER's two arms, stated on the pure decision function because
+    /// `gc_flags()` latches process-wide and a test cannot flip it from inside
+    /// one. Off (the shipped default) G1 evacuates regardless; on, it refuses.
+    #[test]
+    fn the_coverage_lever_gates_only_the_refusal() {
+        let reason = Some(crate::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME);
+        assert_eq!(
+            G1Collector::refuse_evacuation(reason, false),
+            None,
+            "default: an incomplete root set is RECORDED, not acted on — the \
+             conservative scan that produced the pins already covered it"
+        );
+        assert_eq!(
+            G1Collector::refuse_evacuation(reason, true),
+            reason,
+            "lever on: this pause must not evacuate"
+        );
+        assert_eq!(
+            G1Collector::refuse_evacuation(None, true),
+            None,
+            "lever on but coverage complete: evacuate normally"
+        );
+    }
+
+    /// The default must still EVACUATE on an incomplete-coverage pause — the
+    /// measured alternative starves reclamation (330263 of 330264 pauses report
+    /// incomplete on `MovingYoungConcurrentProbe`). Stated through
+    /// `collect_garbage` because that is the single entry to G1's two
+    /// object-moving paths.
+    #[test]
+    fn incomplete_root_coverage_still_evacuates_by_default() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+        );
+
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        assert!(result.stats.objects_copied >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// …but the pause must SAY that its root set was incomplete. A collector
+    /// that keeps that to itself is why both 2026-08 full-suite G1 pages had to
+    /// infer the mechanism from a crash dump.
+    #[test]
+    fn incomplete_root_coverage_is_recorded_even_when_it_is_not_acted_on() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+
+        let (pauses_before, incomplete_before) = crate::gc_metrics::g1_pause_coverage_counts();
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+        );
+
+        let mut roots = vec![obj];
+        let _ = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        let d = crate::gc_metrics::last_collector_decision().expect("a decision was recorded");
+        assert_eq!(d.backend, "g1");
+        assert_eq!(
+            d.incomplete_reason,
+            crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+            "the obligation that failed must reach the decision record"
+        );
+
+        let (pauses, incomplete) = crate::gc_metrics::g1_pause_coverage_counts();
+        assert!(pauses > pauses_before, "the pause must be counted");
+        assert!(
+            incomplete > incomplete_before,
+            "and counted as incomplete — the rate is the whole point of the counter"
+        );
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// Complete coverage is the common case and must be untouched: the same
+    /// collection with the flag clear still evacuates.
+    #[test]
+    fn complete_root_coverage_still_evacuates() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert!(G1Collector::root_coverage_incomplete_reason().is_none());
+
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        assert!(result.stats.objects_copied >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+    }
+
+    /// `force_non_moving_jit_roots` is set by the root gatherer's OSR-shadow
+    /// fallback WITHOUT a reason code. It is a second, independent way for the
+    /// root set to be incomplete, and G1 must honour it too — with a reason
+    /// that is not `NONE`, so the record never claims a complete proof while
+    /// refusing to act on one.
+    #[test]
+    fn force_non_moving_jit_roots_alone_blocks_g1_evacuation() {
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        assert!(G1Collector::root_coverage_incomplete_reason().is_none());
+
+        crate::gc_quiescence::set_force_non_moving_jit_roots();
+        assert_eq!(
+            G1Collector::root_coverage_incomplete_reason(),
+            Some(crate::gc_quiescence::incomplete_reason::OSR_SHADOW),
+        );
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+    }
+
+    // -- Reference arrays as a generic Value store --
+
+    /// A REFERENCE array element is a raw 8-byte pointer, but every backend
+    /// must accept an arbitrary `Value` in one: natives across the tree use a
+    /// reference array as a generic `Value` store, and the generational heap
+    /// has always honoured that by auto-boxing into an `AUTOBOX_CLASS_ID`
+    /// wrapper.
+    ///
+    /// G1 had neither half. `Value::Long(42)` was encoded as `0u64` — the
+    /// `_ => 0u64` arm of `array_element_to_unaligned_ptr` — and read back as
+    /// `Value::Object(None)`. In Java that made
+    /// `stream.mapToDouble(Double::doubleValue).toArray()` return all zeros
+    /// under `-XX:+UseG1GC` and the right values under the default collector,
+    /// with no collection involved: deterministic, and identical with `--nojit`
+    /// and at a heap large enough that no GC runs.
+    #[test]
+    fn reference_array_round_trips_every_value_kind() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 6);
+        let obj = gc.alloc_object(ClassId::new(2), 1);
+
+        let cases = [
+            Value::Long(-42),
+            Value::Double(2.5),
+            Value::Int(7),
+            Value::Float(1.5),
+            Value::Object(Some(obj)),
+            Value::Object(None),
+        ];
+        for (i, v) in cases.iter().enumerate() {
+            <G1Collector as crate::collector::GarbageCollector>::set_array_element(&gc, arr, i, *v)
+                .expect("in bounds");
+        }
+        for (i, want) in cases.iter().enumerate() {
+            let got =
+                <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, i)
+                    .expect("in bounds");
+            match (want, got) {
+                (Value::Object(Some(w)), Value::Object(Some(g))) => {
+                    assert_eq!(w.as_ptr(), g.as_ptr(), "element {i}: reference identity")
+                }
+                (w, g) => assert_eq!(*w, g, "element {i} did not round-trip"),
+            }
+        }
+    }
+
+    /// The boxing must not leak into a PRIMITIVE array: those store the value
+    /// directly and a wrapper there would be a wrong-width write.
+    #[test]
+    fn primitive_arrays_are_not_auto_boxed() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Double, 2);
+        <G1Collector as crate::collector::GarbageCollector>::set_array_element(
+            &gc,
+            arr,
+            0,
+            Value::Double(3.25),
+        )
+        .expect("in bounds");
+        assert_eq!(
+            <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, 0),
+            Ok(Value::Double(3.25))
+        );
+    }
+
+    /// An ordinary object stored in a reference array must come back as
+    /// itself, not be mistaken for a wrapper. The un-box keys on
+    /// `AUTOBOX_CLASS_ID`, so this pins that a real object's class id cannot
+    /// collide with it.
+    #[test]
+    fn an_ordinary_object_is_not_mistaken_for_an_auto_box() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 1);
+        let obj = gc.alloc_object(ClassId::new(3), 1);
+        gc.set_field(obj, 0, Value::Int(99));
+        <G1Collector as crate::collector::GarbageCollector>::set_array_element(
+            &gc,
+            arr,
+            0,
+            Value::Object(Some(obj)),
+        )
+        .expect("in bounds");
+        match <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, 0) {
+            Ok(Value::Object(Some(got))) => assert_eq!(got.as_ptr(), obj.as_ptr()),
+            other => panic!("expected the object back, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11162,19 +11965,36 @@ mod tests {
             region_size: 4096,
             ..small_config()
         };
+        let cfg_heap_size = cfg.heap_size;
         let gc = G1Collector::new(cfg);
 
-        // Fill all regions by allocating many objects
+        // Fill all regions by allocating many objects.
+        //
+        // The bound is DERIVED, not the literal 100 it used to be: that number
+        // only exhausted an 8 KB heap while a header was 24 bytes (24 + 4*16 =
+        // 88, so ~93 objects fit). At 16 bytes each object is 80 and ~102 fit,
+        // so a fixed 100 stops proving anything -- the loop ends without the
+        // allocator ever refusing, and the test passes for the wrong reason.
+        let per_object = HEADER_SIZE + 4 * SLOT_SIZE;
+        // Allocate until refusal, with a cap far above any plausible capacity
+        // rather than a count tuned to one header size. The literal 100 here
+        // only exhausted an 8 KB heap while a header was 24 bytes; at 16 the
+        // loop ended before the allocator ever said no, and the test passed
+        // without testing anything.
+        let cap = cfg_heap_size / per_object * 4 + 64;
         let mut allocated = Vec::new();
-        for _i in 0..100 {
+        let mut refused = false;
+        for _i in 0..cap {
             match gc.try_alloc_object(ClassId::new(1), 4) {
                 Some(obj) => allocated.push(obj),
-                None => break,
+                None => {
+                    refused = true;
+                    break;
+                }
             }
         }
-        // Eventually should return None
-        // With 2 regions of 4096 bytes, each object ~72 bytes, we can fit many but not 100
-        assert!(allocated.len() < 100, "should have run out of space");
+        assert!(refused, "should have run out of space");
+        assert!(allocated.len() <= cfg_heap_size / per_object + 8);
         // Final try should fail
         assert!(gc.try_alloc_object(ClassId::new(1), 4).is_none());
     }
@@ -11186,7 +12006,7 @@ mod tests {
         assert!(arr.is_some());
         let arr = arr.unwrap();
         assert_eq!(gc.array_length(arr), 10);
-        assert_eq!(gc.get_header(arr).element_type, ArrayElementType::Int);
+        assert_eq!(gc.get_header(arr).element_type(), ArrayElementType::Int);
     }
 
     #[test]
@@ -12260,7 +13080,7 @@ mod tests {
         let mut roots = vec![obj];
         // First parallel young GC: Survivor, age -> 1.
         gc.young_collection_parallel(&mut roots, &NoopMonitors);
-        assert!(gc.get_header(roots[0]).gc_age >= 1);
+        assert!(gc.get_header(roots[0]).gc_age() >= 1);
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(7));
         // Second: age >= promotion_age -> promote to Old.
         gc.young_collection_parallel(&mut roots, &NoopMonitors);
@@ -12841,10 +13661,10 @@ mod tests {
     /// over a recycled intermediate).
     #[test]
     fn compose_forward_maps_chases_and_keeps_pause_start_keys() {
-        let mut acc: HashMap<usize, usize> = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
+        let mut acc: cratonvm_types::PointerMap = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
             .into_iter()
             .collect();
-        let next: HashMap<usize, usize> = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
+        let next: cratonvm_types::PointerMap = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
             .into_iter()
             .collect();
         G1Collector::compose_forward_maps(&mut acc, &next);
@@ -13401,7 +14221,7 @@ mod tests {
                 bytes_copied: 0,
                 bytes_freed: 0,
             },
-            pointer_map: HashMap::new(),
+            pointer_map: cratonvm_types::PointerMap::default(),
         };
         let mut no_roots: Vec<ObjectRef> = Vec::new();
         let _ = gc.retry_after_evacuation_failure(clean, &mut no_roots, &NoopMonitors);
@@ -13433,7 +14253,7 @@ mod tests {
 
         let obj = gc.alloc_object(ClassId::new(1), 1);
         assert_eq!(
-            gc.get_header(obj).gc_flags & GC_FLAG_OLD_GEN,
+            gc.get_header(obj).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "a freshly allocated Eden object is young"
         );
@@ -13442,7 +14262,7 @@ mod tests {
         let mut roots = vec![obj];
         gc.young_collection(&mut roots, &NoopMonitors);
         assert_eq!(
-            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            gc.get_header(roots[0]).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "a Survivor copy is still young and MUST NOT be stamped — stamping it \
              would send every JIT store on a survivor down the helper for nothing"
@@ -13459,7 +14279,7 @@ mod tests {
             "the object should have been promoted by the second pass"
         );
         assert_ne!(
-            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            gc.get_header(roots[0]).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "a promoted object MUST carry GC_FLAG_OLD_GEN so the JIT's inline \
              reference-store fast paths bail to the full-barrier helper"
@@ -13483,14 +14303,14 @@ mod tests {
         let sentinel = cratonvm_types::GC_FLAG_MARKED;
         unsafe {
             let h = &mut *(obj.as_ptr() as *mut ObjectHeader);
-            h.gc_flags |= sentinel;
+            h.add_gc_flags(sentinel);
         }
 
         let mut roots = vec![obj];
         gc.young_collection(&mut roots, &NoopMonitors);
         gc.young_collection(&mut roots, &NoopMonitors);
 
-        let flags = gc.get_header(roots[0]).gc_flags;
+        let flags = gc.get_header(roots[0]).gc_flags();
         assert_ne!(flags & GC_FLAG_OLD_GEN, 0, "promoted");
         assert_ne!(
             flags & sentinel,
@@ -14068,7 +14888,7 @@ mod tests {
 
         let obj = gc.alloc_object(ClassId::new(1), 1);
         assert_eq!(
-            gc.get_header(obj).gc_flags & GC_FLAG_OLD_GEN,
+            gc.get_header(obj).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "a freshly allocated Eden object is young"
         );
@@ -14076,7 +14896,7 @@ mod tests {
         let mut roots = vec![obj];
         gc.young_collection_parallel(&mut roots, &NoopMonitors);
         assert_eq!(
-            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            gc.get_header(roots[0]).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "a Survivor copy is still young and MUST NOT be stamped"
         );
@@ -14091,7 +14911,7 @@ mod tests {
             "the object should have been promoted by the second parallel pass"
         );
         assert_ne!(
-            gc.get_header(roots[0]).gc_flags & GC_FLAG_OLD_GEN,
+            gc.get_header(roots[0]).gc_flags() & GC_FLAG_OLD_GEN,
             0,
             "a promoted object MUST carry GC_FLAG_OLD_GEN on the parallel path \
              too — the JIT reads the header, not the region table"

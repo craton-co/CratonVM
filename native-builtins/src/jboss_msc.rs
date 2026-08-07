@@ -2544,7 +2544,7 @@ pub fn gc_scan_msc_service_roots(out: &mut Vec<ObjectRef>) {
 /// Post-GC remap for the container-held service objects (companion to
 /// [`gc_scan_msc_service_roots`]). After a moving collection the held objects
 /// relocate; repoint every stored `ObjectRef` to its new address.
-pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_msc_service_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

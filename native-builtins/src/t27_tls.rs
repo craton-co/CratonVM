@@ -10880,7 +10880,7 @@ pub(crate) fn huc_default_ssl_socket_factory() -> Option<ObjectRef> {
 }
 
 /// Post-move remap companion to `gc_scan_tls_ctx_trust_manager_roots`.
-pub fn gc_update_tls_ctx_trust_manager_refs(map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_tls_ctx_trust_manager_refs(map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }
@@ -10924,7 +10924,7 @@ pub fn gc_scan_tls_ctx_key_manager_roots(roots: &mut Vec<ObjectRef>) {
 }
 
 /// Post-move remap companion to `gc_scan_tls_ctx_key_manager_roots`.
-pub fn gc_update_tls_ctx_key_manager_refs(map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_tls_ctx_key_manager_refs(map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }
@@ -11048,7 +11048,7 @@ pub fn gc_scan_default_ssl_context_root(roots: &mut Vec<ObjectRef>) {
 }
 
 /// Post-move remap companion to `gc_scan_default_ssl_context_root`.
-pub fn gc_update_default_ssl_context_ref(map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_default_ssl_context_ref(map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }

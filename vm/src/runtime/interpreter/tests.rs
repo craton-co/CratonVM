@@ -13,6 +13,121 @@ fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
     ) -> bool = jit_method_calls_forced_class_generic_metadata;
 }
 
+/// The `java.lang.Thread`-mirror recovery in `execute_invoke_kind` replaces the
+/// receiver with a live thread mirror when the receiver's address is in
+/// `former_mirror_addrs`. Its gate used to be `class_id_of(recv) == ClassId(0)`,
+/// justified in-comment as "the receiver header is genuinely all-zero".
+///
+/// It is not the same test. **Every primitive array reads `ClassId(0)`** —
+/// `Instruction::Newarray` allocates with `ClassId::new(0)` because an array
+/// header carries its COMPONENT class id (JVMS §4.4.1) and `long[]` has none —
+/// so a perfectly live `long[]` that landed on a recycled young address matched
+/// and was replaced by a `java.lang.Thread`. Measured on
+/// `org.h2.test.db.TestTempTables`: `Arrays.copyOf(long[], int)`'s
+/// `original.clone()` dispatching into the mirror's inherited `Thread.clone`,
+/// i.e. `CloneNotSupportedException`. See
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+///
+/// Restoring the old gate (dropping the header term from
+/// `stale_mirror_recovery_applies`) fails the first assertion below.
+#[test]
+fn stale_mirror_recovery_skips_a_live_primitive_array() {
+    use super::invoke::stale_mirror_recovery_applies;
+    use cratonvm_gc::heap::ObjectHeader;
+    use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+
+    let header_bytes = |h: &ObjectHeader| -> [u8; HEADER_SIZE] {
+        // SAFETY: `ObjectHeader` is `#[repr(C)]` and exactly `HEADER_SIZE`
+        // bytes; this reads it exactly as the interpreter reads a header off a
+        // heap address.
+        unsafe { std::ptr::read(h as *const ObjectHeader as *const [u8; HEADER_SIZE]) }
+    };
+
+    // A live `long[1]` — `bits` in H2's `VersionedBitSet`, the witness shape.
+    let live_long_array = ObjectHeader::new(
+        ClassId::new(0),
+        ObjectKind::Array,
+        ArrayElementType::Long,
+        1,
+        1,
+    );
+    assert_eq!(
+        live_long_array.class_id,
+        ClassId::new(0),
+        "the trap itself: a primitive array's header carries no component class id"
+    );
+    assert!(
+        !stale_mirror_recovery_applies(live_long_array.class_id, &header_bytes(&live_long_array)),
+        "a live long[] must never be mistaken for a reclaimed span and replaced \
+         by a java.lang.Thread mirror"
+    );
+
+    // A live `Object[3]`. Its component class id is `java/lang/Object` =
+    // ClassId(0) too, and `ArrayElementType::Reference` is discriminant 0, so
+    // this one is separated from the wipe by `kind` and `shape` alone.
+    let live_ref_array = ObjectHeader::new(
+        ClassId::new(0),
+        ObjectKind::Array,
+        ArrayElementType::Reference,
+        3,
+        3,
+    );
+    assert!(
+        !stale_mirror_recovery_applies(live_ref_array.class_id, &header_bytes(&live_ref_array)),
+        "a live Object[] must not be mistaken for a reclaimed span either"
+    );
+
+    // What the recovery is actually for: the all-zero header a collector
+    // leaves over a span it reclaimed.
+    assert!(
+        stale_mirror_recovery_applies(ClassId::new(0), &[0u8; HEADER_SIZE]),
+        "the collector's own wipe must still reach the former-mirror lookup"
+    );
+}
+
+/// The header test above cannot close the recovery's last address-collision
+/// window on its own. On the 16-byte header a bare `new Object()` is ALSO
+/// all-zero — `class_id` 0, `shape` 0, `ObjectKind::Object` and
+/// `ArrayElementType::Reference` both discriminant 0, and the identity hash
+/// minted lazily into the mark word rather than stamped at allocation. So the
+/// second half of the gate asks a question the header cannot answer: could this
+/// CALL SITE be holding a thread mirror at all?
+///
+/// Two names can never be evidence of one, whatever the heap says, and
+/// admitting the second is what would leave the `new Object()` window open.
+#[test]
+fn only_a_call_site_that_could_hold_a_thread_mirror_admits_the_recovery() {
+    use super::invoke::call_site_type_can_hold_a_thread_mirror;
+
+    // An array type has no relationship to `java.lang.Thread` in either
+    // direction. This is the `Arrays.copyOf(long[], int)` witness's call site.
+    assert!(
+        !call_site_type_can_hold_a_thread_mirror("[J"),
+        "an array-typed call site can never legitimately hold a thread mirror"
+    );
+    assert!(!call_site_type_can_hold_a_thread_mirror(
+        "[Ljava/lang/Object;"
+    ));
+
+    // Bare `java/lang/Object` admits every mirror, so it is no evidence at all
+    // — and a zero-field `Object` receiver is header-identical to a reclaimed
+    // span, so nothing else could refuse it.
+    assert!(
+        !call_site_type_can_hold_a_thread_mirror("java/lang/Object"),
+        "an Object-typed call site carries no evidence the receiver was a mirror"
+    );
+
+    // The case the recovery exists for — Tomcat's `TaskThreadFactory.<init>`
+    // calling `Thread.currentThread().getThreadGroup()` — and an
+    // interface-typed use, both still admitted (assignability is then checked
+    // against the recovered mirror's real class).
+    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Thread"));
+    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Runnable"));
+    assert!(call_site_type_can_hold_a_thread_mirror(
+        "jdk/internal/misc/InnocuousThread"
+    ));
+}
+
 #[test]
 fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
     // The guard never dereferences these values; aligned sentinel addresses
@@ -4526,24 +4641,25 @@ fn h1_tlab_object_header_has_nonzero_hash_at_allocation() {
                                      // Cast: reinterpret pointer/address to typed pointer
     let ptr = storage.as_mut_ptr() as *mut u8;
 
-    // Path 1: init with a non-zero hash (what the new TLAB path does)
-    let supplied_hash: i32 = 42;
-    super::init_object_header(ptr, ClassId::new(0), 0, supplied_hash);
+    // Path 1: the TLAB fast path no longer mints a hash at allocation.
+    super::init_object_header(ptr, ClassId::new(0), 0);
 
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`.
     let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };
     assert_eq!(header.class_id, ClassId::new(0));
-    assert_eq!(header.identity_hash_code, supplied_hash);
     assert_eq!(header.num_slots(), 0);
 
     // First 16 bytes: must NOT be all-zero, since identity_hash_code
-    // is at byte offset 8..12 and is non-zero. This is the invariant
-    // the stale-pointer detector relies on.
+    // A bare `new Object()` (class_id 0, no fields, unhashed, unlocked) DOES
+    // now read as all-zero. That is a real regression in the stale-pointer
+    // detector's discriminator, recorded here rather than hidden: the hash it
+    // used to key on left the header, and minting one eagerly to restore it
+    // would make every `synchronized` block inflate.
     // SAFETY: we just wrote a valid ObjectHeader into `ptr`, so its first 16 bytes are initialized and readable.
     let first_16: [u8; 16] = unsafe { std::ptr::read(ptr as *const [u8; 16]) };
-    assert_ne!(
+    assert_eq!(
         first_16, [0u8; 16],
-        "fresh-Object header must not read as all-zero when allocated with a non-zero hash"
+        "a bare fresh Object header is all-zero now that the hash is lazy"
     );
 
     // Path 2: verify VmHeap::next_identity_hash never returns 0

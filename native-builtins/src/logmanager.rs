@@ -5348,7 +5348,7 @@ pub fn gc_scan_logmanager_roots(vm: usize, out: &mut Vec<ObjectRef>) {
 /// relocate; repoint every stored address — including BOTH halves of each
 /// `attachments` key — to its new location so later `object_from_u64`
 /// reconstructions resolve to the live object instead of a recycled slot.
-pub fn gc_update_logmanager_refs(vm: usize, pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_logmanager_refs(vm: usize, pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -7263,8 +7263,8 @@ mod tests {
         // non-overlapping synthetic "relocated" address.
         let old_addrs = cached_addrs_snapshot();
         assert!(!old_addrs.is_empty());
-        let mut pointer_map: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap =
+            cratonvm_types::PointerMap::default();
         // Use a high base so the synthetic targets never collide with a
         // real old address (which would make the assertion ambiguous).
         let base: usize = 0x1_0000_0000_0000;
@@ -7310,7 +7310,7 @@ mod tests {
         )
         .unwrap();
         let before = cached_addrs_snapshot();
-        gc_update_logmanager_refs(TEST_VM, &std::collections::HashMap::new());
+        gc_update_logmanager_refs(TEST_VM, &cratonvm_types::PointerMap::default());
         let after = cached_addrs_snapshot();
         assert_eq!(
             before, after,
@@ -7337,7 +7337,7 @@ mod tests {
         .unwrap();
         let before = cached_addrs_snapshot();
         // A pointer map that mentions only some unrelated address.
-        let mut pm: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut pm: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         pm.insert(0xdead_beef, 0xfeed_face);
         gc_update_logmanager_refs(TEST_VM, &pm);
         let after = cached_addrs_snapshot();

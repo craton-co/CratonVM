@@ -58,11 +58,24 @@ Two things W6-3 changed, both about the *negative* half:
 1. **A positive class-side witness.** The discriminator was
    `matches!(get_field_by_name(obj, "prevLookupClass"), Value::Object(_))`. That
    works, but it is a value-shape test on a field that is null in the real
-   layout and absent in the synthetic one — the exact pair the `Int(0)`-for-
-   absent convention exists to separate, and it cannot be checked from the value
-   alone without already knowing the answer. `resolve_field_index_by_class_id`
+   layout and absent in the synthetic one — ~~the exact pair the `Int(0)`-for-
+   absent convention exists to separate~~, and it cannot be checked from the
+   value alone without already knowing the answer. `resolve_field_index_by_class_id`
    asks the CLASS instead. Kept as a disjunct with the old test, so the real arm
    fires whenever it fired before.
+
+   > **CORRECTED 2026-08-07 — there is no `Int(0)`-for-absent convention in
+   > production, and the correction strengthens this item rather than weakening
+   > it.** `vm/src/vm/vm_exec.rs`'s `get_field_by_name` answers
+   > `Value::Object(None)` for an absent field; `Int(0)` is what
+   > `MockNativeContext` (`native-builtins/src/test_utils.rs`) answers, and what
+   > a present-but-**unwritten** reference slot decodes as
+   > (`docs/feature-designs/by-name-field-reads.md` §1). Absent and real-null are
+   > therefore not merely hard to tell apart from the value — they are
+   > **identical**, so the old discriminator took the real-layout arm on the
+   > synthetic layout as well. The class-side witness is not hardening; it is the
+   > only thing that answers the question at all. See
+   > [§4 of *Natives over real JDK classes*](../../architecture/natives-over-real-jdk-classes.md).
 2. **The by-name write is verified.** A `set_field_by_name` that silently did
    not land left a Lookup whose `allowedModes` reads back 0 — "no access at
    all" — and threw nothing. That *is* the original failure mode. If the named

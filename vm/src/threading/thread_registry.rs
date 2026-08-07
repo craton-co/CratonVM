@@ -691,24 +691,94 @@ impl ThreadRegistry {
         }
     }
 
-    /// T19.H1 watchdog — print a one-line summary of every registered thread
-    /// (name, liveness, daemon, deposited-root count) to stderr. Lets the
-    /// watchdog show threads that have NO dumpable interpreter frames — e.g.
-    /// a thread blocked in a Rust-level native lock, or one that never
-    /// started — which the frame-dump path cannot surface. A non-zero
-    /// `roots` on an otherwise-silent thread means it deposited roots before
-    /// blocking (it IS blocked in a native), distinguishing "blocked in
-    /// native" from "never ran".
+    /// Legend printed under the T19.H1 thread-summary header, explaining what
+    /// the `deposit=` column means. See [`Self::deposit_freshness`] for why
+    /// this exists at all.
+    pub(crate) const DEPOSIT_LEGEND: &'static str = concat!(
+        "  legend: deposit=live        — parked in a blocking native; blocked=/roots=/top= ARE its current state.\n",
+        "          deposit=STALE       — RUNNING bytecode right now. top=/roots= are whatever it deposited at its\n",
+        "                                LAST blocking call and can be arbitrarily old — read the live\n",
+        "                                \"T19.H1 stack dump\" above for where this thread actually is.\n",
+        "          deposit=post-mortem — dead. alive=false is authoritative; blocked=/roots=/top= are residue from\n",
+        "                                its termination sequence (nothing clears them), NOT evidence of a wait."
+    );
+
+    /// How current a registry entry's *deposited* state — the `blocked=`,
+    /// `roots=` and frame-chain columns of the T19.H1 summary — actually is.
+    ///
+    /// A thread deposits its root snapshot and frame chain when it is about to
+    /// block, and **nothing clears either afterwards**: not on wake, not on
+    /// death. So the deposit is a faithful readout of the thread's position in
+    /// exactly one case — it is alive AND still inside a blocked region.
+    /// Otherwise it is history:
+    ///
+    /// * `STALE` (alive, not blocked): the thread is executing bytecode. The
+    ///   chain names its last *blocking* call, which may be seconds or minutes
+    ///   old and in a completely different part of the program.
+    /// * `post-mortem` (dead): `blocked=true` here is the terminal
+    ///   `deposit_root_snapshot()` in the thread-exit sequence, which raises
+    ///   `in_blocked_region` and has no counterpart to lower it. Every STW
+    ///   census filters on `alive` before reading that flag
+    ///   (`alive_count_blocked_and_os_tids_inner`, `blocked_os_tids`,
+    ///   `fold_pointer_map_into_blocked`), so the residue is inert to the
+    ///   barrier — it is purely a reporting artifact.
+    ///
+    /// Labelling this is not cosmetic. Three separate investigations have now
+    /// been sent the wrong way by an unmarked stale deposit:
+    /// `onclasscondition-join-never-returns-20260801` (read `alive=false` on
+    /// dead entries as a missed wakeup), the Elasticsearch
+    /// `ES-HANG-20260719-threadjoin` capture (same shape), and
+    /// `bug-h2-teststringcache-thread-join-blocked-on-dead-threads-20260807`,
+    /// where `main` was `alive=true blocked=false` — running
+    /// `TestStringCache.runBenchmark()` — while its unmarked deposit still read
+    /// `java/lang/Thread.join@129` from a join that had returned ~40 s earlier.
+    /// The live stack dump printed directly above said `runBenchmark`; nothing
+    /// flagged the contradiction, and the whole doc was written against the
+    /// stale line.
+    pub(crate) fn deposit_freshness(alive: bool, blocked: bool) -> &'static str {
+        match (alive, blocked) {
+            (false, _) => "post-mortem",
+            (true, true) => "live",
+            (true, false) => "STALE",
+        }
+    }
+
+    /// T19.H1 watchdog — write [`Self::render_thread_summary`] to stderr.
     pub fn dump_thread_summary_to_stderr(&self) {
         use std::io::Write;
-        let threads = self.threads.read();
+        let text = self.render_thread_summary();
         let stderr = std::io::stderr();
         let mut h = stderr.lock();
+        let _ = h.write_all(text.as_bytes());
+        let _ = h.flush();
+    }
+
+    /// T19.H1 watchdog — a one-line summary of every registered thread (name,
+    /// liveness, daemon, deposited-root count), plus the complete deposited
+    /// frame chain of every alive thread. Lets the watchdog show threads that
+    /// have NO dumpable interpreter frames — e.g. a thread blocked in a
+    /// Rust-level native lock, or one that never started — which the frame-dump
+    /// path cannot surface. A non-zero `roots` on an otherwise-silent thread
+    /// means it deposited roots before blocking (it IS blocked in a native),
+    /// distinguishing "blocked in native" from "never ran".
+    ///
+    /// Every row carries a `deposit=` freshness tag; see
+    /// [`Self::deposit_freshness`] for what each value licenses you to
+    /// conclude, and why an untagged chain has repeatedly been misread as a
+    /// live wait site.
+    ///
+    /// Returned as a `String` (rather than written straight out) so the format
+    /// is unit-testable — the tags below are the load-bearing part.
+    pub fn render_thread_summary(&self) -> String {
+        use std::fmt::Write as _;
+        let threads = self.threads.read();
+        let mut h = String::new();
         let _ = writeln!(
             h,
             "--- T19.H1 thread summary: {} registered thread(s) ---",
             threads.len()
         );
+        let _ = writeln!(h, "{}", Self::DEPOSIT_LEGEND);
         struct SummaryRow {
             tid: u64,
             os_tid: u64,
@@ -788,9 +858,12 @@ impl ThreadRegistry {
             .collect();
         rows.sort_by_key(|r| r.tid);
         for row in &rows {
+            // `deposit=` sits immediately before `top=` on purpose: the two are
+            // read together, and the tag is what stops the chain from being
+            // taken for a live wait site.
             let _ = writeln!(
                 h,
-                "  tid={} os_tid={} name={:?} alive={} daemon={} blocked={} roots={} state={:?} top={}",
+                "  tid={} os_tid={} name={:?} alive={} daemon={} blocked={} roots={} state={:?} deposit={} top={}",
                 row.tid,
                 row.os_tid,
                 row.name,
@@ -799,6 +872,7 @@ impl ThreadRegistry {
                 row.blocked,
                 row.roots,
                 row.state,
+                Self::deposit_freshness(row.alive, row.blocked),
                 row.top
             );
         }
@@ -811,26 +885,43 @@ impl ThreadRegistry {
             .iter()
             .filter(|r| r.alive && !r.full_frames.is_empty())
             .collect();
+        // "alive" is NOT the same as "parked here". A running thread keeps the
+        // chain it deposited at its last blocking call, so split the count —
+        // an all-STALE section is a section with no wait sites in it at all.
+        let at_wait_site = live_with_frames.iter().filter(|r| r.blocked).count();
         let _ = writeln!(
             h,
-            "--- T19.H1 full frame chains: {} alive thread(s) with a deposited snapshot ---",
-            live_with_frames.len()
+            "--- T19.H1 full frame chains: {} alive thread(s) with a deposited snapshot ({} at a live wait site, {} STALE) ---",
+            live_with_frames.len(),
+            at_wait_site,
+            live_with_frames.len() - at_wait_site
         );
         for row in live_with_frames {
+            let tag = if row.blocked {
+                "[deposit=live — this IS the thread's current wait site]".to_string()
+            } else {
+                format!(
+                    "[deposit=STALE — thread is RUNNING (blocked=false); chain below is from its LAST \
+                     blocking call and may be arbitrarily old. Its real position is in the \
+                     \"T19.H1 stack dump: tid={}\" section above]",
+                    row.tid
+                )
+            };
             let _ = writeln!(
                 h,
-                "  tid={} os_tid={} name={:?} ({} frame(s), oldest first):",
+                "  tid={} os_tid={} name={:?} ({} frame(s), oldest first) {}:",
                 row.tid,
                 row.os_tid,
                 row.name,
-                row.full_frames.len()
+                row.full_frames.len(),
+                tag
             );
             for (depth, frame) in row.full_frames.iter().enumerate() {
                 let _ = writeln!(h, "    [{depth}] {frame}");
             }
         }
         let _ = writeln!(h, "--- T19.H1 end thread summary ---");
-        let _ = h.flush();
+        h
     }
 
     /// ARCH-2026-07-26 — the calling thread's own async-exception slot,
@@ -1970,10 +2061,23 @@ impl ThreadRegistry {
             if top.is_empty() {
                 top.push_str("<no-frame-trace>");
             }
+            // Same `deposit=` tag as the T19.H1 summary, for the same reason:
+            // this census is alive-only, but "alive" does not mean "parked at
+            // the frames below" — a mutator the barrier is still waiting on is
+            // by definition RUNNING, and its chain is last-block history.
+            // See `ThreadRegistry::deposit_freshness`.
             let _ = write!(
                 out,
-                "\n  t{} os_tid={} name={:?} blocked={} ready={} snapshot={} state={:?} top={}",
-                tid.0, os_tid, entry.name, blocked, stw_ready, snapshot_len, vm_state, top
+                "\n  t{} os_tid={} name={:?} blocked={} ready={} snapshot={} state={:?} deposit={} top={}",
+                tid.0,
+                os_tid,
+                entry.name,
+                blocked,
+                stw_ready,
+                snapshot_len,
+                vm_state,
+                Self::deposit_freshness(true, blocked),
+                top
             );
         }
         out
@@ -2067,7 +2171,7 @@ impl ThreadRegistry {
     /// refs into bytecode (the all-zero-header invokevirtual WARN flood),
     /// and `LockSupport.unpark(Thread)`'s O(1) lookup misses the live
     /// mirror's new address — a silently lost unpark.
-    pub fn update_thread_objs_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_thread_objs_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -2195,7 +2299,7 @@ impl ThreadRegistry {
     /// wake. While it still holds stale frame addresses the only consumers
     /// are this fold (keyed by those addresses) and the wake-side apply,
     /// so the chain stays consistent.
-    pub fn fold_pointer_map_into_blocked(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn fold_pointer_map_into_blocked(&self, pointer_map: &cratonvm_types::PointerMap) {
         self.fold_pointer_map_into_blocked_audited(pointer_map, None)
     }
 
@@ -2231,7 +2335,7 @@ impl ThreadRegistry {
     /// synthetic pointer map.
     pub fn fold_pointer_map_into_blocked_audited(
         &self,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         heap: Option<&crate::memory::VmHeap>,
     ) {
         if pointer_map.is_empty() {
@@ -2907,7 +3011,7 @@ mod tests {
         registry.register(b, "b", None);
 
         registry.set_jmx_owned_synchronizer(Some(a), fake_synchronizer(0x1000));
-        let mut pointer_map = HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0x1000usize, 0x9000usize);
         registry.update_thread_objs_after_gc(&pointer_map);
 
@@ -2950,6 +3054,107 @@ mod tests {
         assert!(!registry.is_alive(tid));
         assert_eq!(registry.count(), 1);
         assert_eq!(registry.alive_count(), 0);
+    }
+
+    /// T19.H1 summary honesty. The deposited frame chain is only a readout of
+    /// where a thread *is* while that thread is inside a blocked region;
+    /// otherwise it is history that nothing clears. An unmarked stale chain
+    /// has now produced three wrong root causes (see
+    /// `ThreadRegistry::deposit_freshness`), the most recent being
+    /// `bug-h2-teststringcache-thread-join-blocked-on-dead-threads-20260807`:
+    /// `main` was running `TestStringCache.runBenchmark()` while its untagged
+    /// deposit still read `java/lang/Thread.join@129`, and the whole doc was
+    /// written against that line. So the tags are asserted, not just the
+    /// columns.
+    #[test]
+    fn t19_summary_tags_a_running_threads_deposit_as_stale() {
+        assert_eq!(ThreadRegistry::deposit_freshness(true, true), "live");
+        assert_eq!(ThreadRegistry::deposit_freshness(true, false), "STALE");
+        assert_eq!(
+            ThreadRegistry::deposit_freshness(false, true),
+            "post-mortem",
+            "a dead thread's raised in_blocked_region is termination residue"
+        );
+        assert_eq!(
+            ThreadRegistry::deposit_freshness(false, false),
+            "post-mortem"
+        );
+
+        let registry = ThreadRegistry::new();
+        let running = ThreadId(1);
+        let parked = ThreadId(2);
+        let dead = ThreadId(3);
+        for (tid, name) in [(running, "running"), (parked, "parked"), (dead, "dead")] {
+            registry.register(tid, name, None);
+            registry.set_frame_trace(
+                tid,
+                Arc::new(Mutex::new(vec![cratonvm_native_api::StackTraceEntry {
+                    class_name: Arc::from("java/lang/Thread"),
+                    method_name: Arc::from("join"),
+                    source_file: Some(Arc::from("Thread.java")),
+                    line_number: crate::runtime::stackwalker::LINE_NUMBER_UNKNOWN,
+                    byte_code_index: 129,
+                    class_id: None,
+                    method_index: None,
+                }])),
+            );
+        }
+        // `parked` is genuinely inside a blocked region. `dead` carries the
+        // flag its exit sequence's final `deposit_root_snapshot()` raised and
+        // that nothing lowers — the exact shape the H2 dump showed for its
+        // three finished workers.
+        for tid in [parked, dead] {
+            registry
+                .gc_block_state_of(tid)
+                .expect("registered")
+                .in_blocked_region
+                .store(true, Ordering::Release);
+        }
+        registry.mark_dead(dead);
+
+        let text = registry.render_thread_summary();
+        let line_for = |name: &str| -> String {
+            text.lines()
+                .find(|l| l.contains(&format!("name={name:?}")))
+                .unwrap_or_else(|| panic!("no summary row for {name}:\n{text}"))
+                .to_string()
+        };
+
+        let running_line = line_for("running");
+        assert!(
+            running_line.contains("alive=true")
+                && running_line.contains("blocked=false")
+                && running_line.contains("deposit=STALE"),
+            "a running thread's deposit must be tagged STALE: {running_line}"
+        );
+        assert!(
+            line_for("parked").contains("deposit=live"),
+            "a thread inside a blocked region IS at its deposited wait site"
+        );
+        let dead_line = line_for("dead");
+        assert!(
+            dead_line.contains("alive=false")
+                && dead_line.contains("blocked=true")
+                && dead_line.contains("deposit=post-mortem"),
+            "a dead entry's raised blocked= must be labelled residue: {dead_line}"
+        );
+
+        assert!(
+            text.contains("(1 at a live wait site, 1 STALE)"),
+            "the chain section must split live wait sites from stale history:\n{text}"
+        );
+        let stale_header = text
+            .lines()
+            .find(|l| l.contains("name=\"running\"") && l.contains("frame(s), oldest first"))
+            .unwrap_or_else(|| panic!("no chain header for the running thread:\n{text}"));
+        assert!(
+            stale_header.contains("deposit=STALE") && stale_header.contains("RUNNING"),
+            "the stale chain's own header must say so: {stale_header}"
+        );
+        assert!(
+            text.contains(ThreadRegistry::DEPOSIT_LEGEND),
+            "the legend explaining deposit= must accompany the table:\n{text}"
+        );
     }
 
     #[test]
@@ -3209,7 +3414,7 @@ mod tests {
         assert!(registry.post_async_exception(tid, old_ref));
 
         // Simulate a moving collection that relocated old → new.
-        let mut pm = HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(old_addr, new_addr);
         registry.update_thread_objs_after_gc(&pm);
 
@@ -3337,7 +3542,7 @@ mod tests {
 
         registry.register(tid, "main", Some(old_ref));
 
-        let mut pm = HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(old_addr, new_addr);
         registry.update_thread_objs_after_gc(&pm);
 
@@ -3376,11 +3581,11 @@ mod tests {
 
         registry.register(tid, "main", Some(first));
 
-        let mut pm1 = HashMap::new();
+        let mut pm1 = cratonvm_types::PointerMap::default();
         pm1.insert(first_addr, second_addr);
         registry.update_thread_objs_after_gc(&pm1);
 
-        let mut pm2 = HashMap::new();
+        let mut pm2 = cratonvm_types::PointerMap::default();
         pm2.insert(second_addr, third_addr);
         registry.update_thread_objs_after_gc(&pm2);
 

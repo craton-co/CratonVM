@@ -521,12 +521,16 @@ pub(crate) fn build_method_mirror(
     if let Some(declaring_class_id) =
         crate::lang_class::mirror_class_id(ctx, declaring_class_mirror)
     {
+        // Real interface method, so resolve its generic signature here —
+        // `create_method_object` now reads the field instead of searching.
+        let signature = ctx.method_signature(declaring_class_id, name, descriptor);
         let meta = cratonvm_native_api::registry::MethodMetadata {
             name: name.to_string(),
             descriptor: descriptor.to_string(),
             access_flags: modifiers,
             declaring_class_id,
             exceptions: Vec::new(),
+            signature,
         };
         return Ok(crate::lang_class::create_method_object(ctx, &meta)?);
     }

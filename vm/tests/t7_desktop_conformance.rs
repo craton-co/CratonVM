@@ -22,8 +22,26 @@
 fn t7_1_1_platform_backend_exists() {
     // Verify the native-awt crate compiles and the platform backend is selectable.
     use cratonvm_native_awt::platform::backend::WindowId;
-    let _id = WindowId(1);
-    eprintln!("[t7] Platform backend type compiled OK");
+
+    // This test used to be `let _id = WindowId(1); eprintln!(...)` — it could
+    // only fail by failing to COMPILE, which is not something a test needs to
+    // exist for. The properties below are the ones the AWT peer layer actually
+    // depends on and that a careless edit to `WindowId` could break:
+    //
+    //  * the wrapped value is public and round-trips (peers hand raw handles
+    //    across the native boundary and rewrap them);
+    //  * it is a u64, not a usize — the handle width must not follow the host
+    //    pointer size, or a 32-bit target would silently truncate;
+    //  * it compares by value (`Eq` + `Hash` are what the peer maps key on).
+    let id = WindowId(1);
+    assert_eq!(id.0, 1u64, "WindowId must round-trip its raw handle");
+    assert_eq!(
+        std::mem::size_of::<WindowId>(),
+        std::mem::size_of::<u64>(),
+        "WindowId must stay a u64 newtype — peer handles are not pointer-width"
+    );
+    assert_eq!(id, WindowId(1), "WindowId must compare by value");
+    assert_ne!(id, WindowId(2), "distinct handles must not compare equal");
 }
 
 #[test]

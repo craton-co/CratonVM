@@ -94,14 +94,14 @@ module/spring-boot-webmvc                                     BasicErrorControll
 
 ## Working hypothesis, not confirmed
 
-`docs/GC.md` already documents ZGC-real as "a memory-backed, non-moving,
+`../../GC.md` already documents ZGC-real as "a memory-backed, non-moving,
 whole-heap stop-the-world mark-sweep over one arena... No colored pointers,
 no load barriers, no concurrency, no compaction." A full **stop-the-world,
 whole-arena** mark-sweep on every collection, with no generational
 short-lived-object fast path, is the textbook shape that turns "many short
 `ApplicationContext` lifecycles" into a throughput cliff — every collection
 scans the *entire* live set instead of just a small young generation.
-`gc_rearm`'s own doc comment in `gc/src/zgc.rs` independently describes a
+`gc_rearm`'s own doc comment in `../../../gc/src/zgc.rs` independently describes a
 previously-fixed livelock mode ("a live set that sits above the static 75%
 threshold... ran a full STW mark-sweep per allocation: a livelock-grade GC
 storm") — plausible that these 35 classes hit a related-but-different
@@ -142,8 +142,12 @@ share one cause with each other, or with the HANG group.
 ## 4 classes: HANG (Generational) -> PASS (ZGC)
 
 All four are jOOQ-family classes, the same family already tracked as a
-severe-throughput HANG under Generational
-([`jooqautoconfigurationtests-timeout-regression-20260805.md`](../known-issues/springboot/jooqautoconfigurationtests-timeout-regression-20260805.md)).
+severe-throughput HANG under Generational (the retired
+`jooqautoconfigurationtests-timeout-regression-20260805` write-up). That HANG
+was root-caused and FIXED on 2026-08-07 — `Method.getModifiers()` rebuilt the
+declaring class method table on every call, 39 us per call on jOOQ 1003-method
+`DefaultDSLContext` — so the Generational side of this comparison is stale for
+the jOOQ family and would need re-running to mean anything.
 Plausibly just noise near the 300s timeout boundary (these are exactly the
 kind of borderline-slow classes that flip status run to run), not a genuine
 ZGC advantage — not investigated further.
@@ -165,7 +169,7 @@ module/spring-boot-jooq-test  JooqTestWithAutoConfigureTestDatabaseIntegrationTe
   above.
 - No re-run for reproducibility on either arm — this is one data point per
   class per collector, not an averaged/repeated measurement. Given
-  `docs/GC.md`'s and `docs/gc-tuning.md`'s own "experimental / research
+  `../../GC.md`'s and `../../gc-tuning.md`'s own "experimental / research
   vehicle, do not depend on in production" framing for this backend, that
   tradeoff (breadth over depth) seemed the right one for a first-ever
   characterization run.

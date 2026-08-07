@@ -176,33 +176,47 @@ pub(crate) const VH_KIND_BYTE_ARRAY_VIEW_BE: i32 = 5;
 // Answering them needs the two `Class` mirrors the factory was handed, and
 // nothing in the 3-slot layout above records a `Class` at all.
 //
-// They are stored at 4 and 5, PAST the real `java.lang.invoke.VarHandle`
-// layout, which declares exactly four instance fields in JDK 25 (`vform`,
-// `exact`, `methodTypeTable`, `methodHandleTable` — `javap -p`). So unlike
-// slots 0-2, these two alias no real-JDK field: `alloc_concurrent_synthetic`
-// sizes the object `num_fields.max(class_num_total_fields)`, and asking for
-// `VH_META_NUM_FIELDS` grows it from 4 to 6 without moving anything.
+// They are stored PAST the real `java.lang.invoke.VarHandle` layout, which
+// declares exactly four instance fields in JDK 25 (`vform`, `exact`,
+// `methodTypeTable`, `methodHandleTable` — `javap -p`), so unlike slots 0-2
+// they alias no real-JDK field: `alloc_concurrent_synthetic` sizes the object
+// `num_fields.max(class_num_total_fields)`, and asking for
+// `VH_META_NUM_FIELDS` grows it without moving anything.
+//
+// WHICH slots is NOT this file's decision. `lang_invoke.rs` imposes its own
+// six-slot meaning on the same `java/lang/invoke/VarHandle` object, and W6-1
+// picked 4 and 5 — which are `VH_FIELD_INDEX` (Int) and `VH_CLASS_ID` (Int)
+// over there, for the same "past the real fields" reason. Two files, two
+// meanings, one object. The map now lives in ONE place; see the SHARED SLOT
+// MAP block in `native-builtins/src/lang_invoke.rs` next to `VH_FIELD_COUNT`,
+// and add nothing here without adding it there.
 //
 // Every read is guarded by `object_num_fields(vh) > VH_COORD0` AND by slot
 // `VH_VAR_TYPE` actually holding an object, so a VarHandle minted by a
 // factory that does NOT stamp them (`phases_late/foreign_ffm.rs`'s
-// memory-segment handles, which are not this lane's files, and the legacy
-// sub-`VH_NUM_FIELDS` array convention) reads as "no metadata" and the
+// memory-segment handles, which are not this lane's files, the legacy
+// sub-`VH_NUM_FIELDS` array convention, and every `lang_invoke.rs` factory,
+// which allocates only `VH_FIELD_COUNT` slots) reads as "no metadata" and the
 // accessors REFUSE rather than invent a plausible `Class`.
+//
+// Defined as ALIASES rather than a `use` re-export so this module's public
+// surface is byte-identical to what it was (`phases_late.rs` does
+// `pub use reflect_invoke::*` and `lib.rs` does `use lang_invoke::*`; two
+// globs exporting one name is an ambiguity waiting for its first user).
+/// Slot [`crate::lang_invoke::VH_META_VAR_TYPE`]: the `Class` mirror of the
+/// variable the handle accesses — exactly the object `varType()` must return.
+pub(crate) const VH_VAR_TYPE: usize = crate::lang_invoke::VH_META_VAR_TYPE;
 
-/// Slot 4: the `Class` mirror of the variable the handle accesses — exactly
-/// the object `varType()` must return. Stamped by the factories below.
-pub(crate) const VH_VAR_TYPE: usize = 4;
-
-/// Slot 5: the `Class` mirror of the handle's LEADING coordinate — the
-/// receiver class for an instance-field handle, the array class for an
-/// array-element handle, and `null` for a static-field handle (which has no
-/// coordinates at all). Trailing coordinates are implied by the kind tag and
-/// are rebuilt in [`vh_coordinate_mirrors`] rather than stored.
-pub(crate) const VH_COORD0: usize = 5;
+/// Slot [`crate::lang_invoke::VH_META_COORD0`]: the `Class` mirror of the
+/// handle's LEADING coordinate — the receiver class for an instance-field
+/// handle, the array class for an array-element handle, and `null` for a
+/// static-field handle (which has no coordinates at all). Trailing coordinates
+/// are implied by the kind tag and are rebuilt in [`vh_coordinate_mirrors`]
+/// rather than stored.
+pub(crate) const VH_COORD0: usize = crate::lang_invoke::VH_META_COORD0;
 
 /// Allocation size for a VarHandle that carries the describe-yourself slots.
-pub(crate) const VH_META_NUM_FIELDS: usize = 6;
+pub(crate) const VH_META_NUM_FIELDS: usize = crate::lang_invoke::VH_META_SLOT_COUNT;
 
 /// Resolve `(declaring class, ABSOLUTE heap slot)` for a named instance field,
 /// walking the inheritance chain. Returns `None` if not found.

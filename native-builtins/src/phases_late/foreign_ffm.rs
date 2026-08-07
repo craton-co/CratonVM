@@ -801,10 +801,7 @@ fn p67_session_push_action(ctx: &mut dyn NativeContext, session: ObjectRef, acti
     // three of these references (native stale-local family).
     let session_pin = ctx.pin_native_root(session);
     let action_pin = ctx.pin_native_root(action);
-    let previous_pin = match previous {
-        Some(actions) => Some(ctx.pin_native_root(actions)),
-        None => None,
-    };
+    let previous_pin = previous.map(|actions| ctx.pin_native_root(actions));
     let grown = ctx.new_array(ArrayElementType::Reference, len + 1);
     let session = ctx.read_native_pin(session_pin, session);
     let action = ctx.read_native_pin(action_pin, action);
@@ -1688,11 +1685,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(owner))) => Some(*owner),
                 _ => None,
             };
-            let owner_pin = match owner {
-                // The allocation below can move the Thread argument.
-                Some(owner) => Some(ctx.pin_native_root(owner)),
-                None => None,
-            };
+            let owner_pin = owner.map(|owner| ctx.pin_native_root(owner));
             let value = p67_memory_session(ctx)?;
             if let (Value::Object(Some(new_session)), Some(owner), Some(pin)) =
                 (value, owner, owner_pin)

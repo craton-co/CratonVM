@@ -1,10 +1,15 @@
 # The strict-corpus campaign — 14 failures, worked in parallel, 2026-08-06/07
 
-**Status: IN FLIGHT. Nothing here has been built or re-measured.** Every fix
-named below is source-level, written by a lane that could not run `cargo` or the
-VM. No arm of the corpus has been re-run since the fixes were written. Read
-every "FIXED" in a lane record as *"fixed in source, unverified by execution"* —
-several of the lane records say exactly that in their own headers.
+**Status: MEASURED 2026-08-07 — 51 passed, 3 failed** (three consecutive
+identical runs; see *MEASURED* below for the binary, the command and the
+remaining three). The campaign's 14 failures are down to 3, and only one of those
+is strict-only.
+
+*The original header, kept because it is what the lane records below still say
+of themselves:* every fix named below was source-level, written by a lane that
+could not run `cargo` or the VM, and no arm of the corpus had been re-run since.
+Read every "FIXED" in a lane record as *"fixed in source, verified only to the
+extent that its corpus vector now passes"*.
 
 This is the record of one campaign: the `--jdk-only` strict regression corpus
 (`regression-suite/run.sh`, `JDKONLY_CLASSES`, 21 vectors) reported **14
@@ -31,7 +36,89 @@ directory, and it stays the guide.
 > worse than the ambiguity. The mapping table below is the reconciliation: cite
 > the **full path** and the `SC-<n>` label together, every time.
 
+> **2026-08-07 — three citation corrections, all of them instances of this
+> document's own "latent flake" theme.**
+>
+> * **This file's `run.sh:<n>` citations are stale as written.** `JDKONLY_MODULE`
+>   is not at `:58`, the scheduling rule is not at `:83-86` (it is in the
+>   `case "${SUITE:-core}"` block near `:154-162`), and the `--module-path`
+>   argument build is in `class_args`, not at `:130`/`:143`. Anchor on the
+>   function or variable name.
+> * **`JDKONLY_CLASSES` holds 23 vectors, not 21.** Every "21" below undercounts;
+>   `regression-suite/src/` holds 57 `.java` files against 31 `CORE_CLASSES`,
+>   23 `JDKONLY_CLASSES` and 3 `UNREGISTERED_CLASSES`. Two of the 23
+>   (`RJdkPhaser`, `RJdkFieldModule`) are **untracked**, so a fresh clone
+>   schedules classes whose sources do not exist.
+> * **`run.sh` prints no per-class SKIP line.** Step 4's parenthetical and
+>   `regression-suite/jdk-only-coverage.txt` both say `RJdkStrict` is skipped in
+>   Compatible mode "with a printed reason". No such code exists in `run.sh`;
+>   the class is simply not in `CORE_CLASSES`. The claim is repeated in
+>   `regression-suite/README.md` and cannot be corrected from `docs/`.
+>
+> The general rule these three are instances of is
+> [§8 of *Natives over real JDK
+> classes*](../../architecture/natives-over-real-jdk-classes.md).
+
 ---
+
+---
+
+## MEASURED 2026-08-07 — the corpus is 51 passed / 3 failed
+
+**This supersedes the "IN FLIGHT / nothing has been built or re-measured" header
+above for the corpus-level numbers.** A `cratonvm-cli` binary was built from dev
+`5d22671e3` (default features, sha256 `4dbf7372…`) and the corpus run three
+times:
+
+```sh
+CV=<binary> JDK=<jdk-25.0.3+9> TIMEOUT=120 \
+  CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh
+```
+
+**51 passed, 3 failed — identical set on all three runs.** The lanes' source-level
+fixes hold up under execution: the campaign's 14 failures are down to 3, and the
+per-lane records that say "FIXED in source, not yet verified" are, at the level
+of *their corpus vector*, now verified by execution. Each record still owns its
+own narrower claims; this is a vector-level result, not a per-assertion audit.
+
+### What still fails
+
+| vector | strict-only? | what it is |
+|---|---|---|
+| `RJdkModule` | **YES** | `AssertionError: module service providers: []` in `moduleServices()`. `rc=0` in Compatible with the identical command line. Owned by [`W6-11`](../../known-issues/jdk-only/W6-11-strict-mode-module-serviceloader.md). |
+| `RJdkFieldModule` | no | `Object.finalize through the caller's own class: expected OK but got IllegalAccessException`. Identical in both modes. Newly filed as [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](../../known-issues/jdk-only/method-invoke-refuses-the-jls-6-6-2-protected-receiver.md). |
+| `RMapGcStress` | no | `rc=124`, the suite's 120 s timeout. Fails in every mode and in both the default and `--features synthetic-jdk` builds. Dev's own, unrelated to this campaign. |
+
+### The headline finding needs one amendment
+
+"Of the 14 strict-corpus failures, 12 fail in `--real-jdk` as well, and ZERO are
+strict-only" was true of the 14. It is **not** true of what is left:
+`RJdkModule` now passes Compatible and fails strict, so there is exactly one
+strict-only failure in the corpus. The claim's *spirit* survives — 2 of the 3
+remaining are mode-independent subsystem bugs, and the strict-only one is a
+missing capability (the boot layer's `nameToModule` is empty) rather than a
+policy over-refusal. But the count is no longer zero, and a reader acting on the
+old sentence would skip the one vector that genuinely needs strict-mode work.
+
+### A measurement trap this re-run walked into, and it is this file's own theme
+
+`regression-suite/run.sh` passes **`--java-home`** to every CratonVM invocation.
+A hand-run that omits it silently measures against whatever JDK the host
+defaults to — here `/usr/lib/jvm/java-21-openjdk-amd64`, not the JDK 25 image the
+suite uses. That produced a wrong per-mode verdict: under JDK 21, `RJdkModule`
+appeared to fail in **both** modes, which would have retired the only strict-only
+failure in the corpus as "mode-independent, not our problem". With
+`--java-home` pointed at the JDK 25 image it passes Compatible cleanly (`rc=0`).
+
+**Reproducing a suite failure by hand means reproducing the suite's command
+line.** Trace it rather than reconstructing it:
+
+```sh
+CV=<binary> JDK=<jdk> ONLY="RJdkModule" bash -x regression-suite/run.sh 2>&1 | grep <binary-name>
+```
+
+This is the same shape as *The two corrections* below — a verdict is only as good
+as the invocation that produced it — and it has now cost this campaign twice.
 
 ## The headline finding
 
@@ -344,9 +431,22 @@ Nothing below has been done. In order:
 7. **Diff the twelve unpaired traces against each other** before staffing
    anything further — SC-3's two vectors were one bug, and no other pair has been
    checked. Thirteen root causes is an upper bound.
-8. **Re-freeze the baselines the lanes named.** They disagree about which move,
-   and each lane says why in its own *Baselines* section: SC-2
-   (`bridge-ratchet`, +2), SC-3 (`kind-map` collapses a duplicate pair to one
+8. **Re-freeze the baselines the lanes named** — but adjudicate each against the
+   mode its census is taken in first. **SC-2's `+2` is wrong and has been
+   retracted in its own record**
+   ([`W6-1-varhandle-vartype-coordinatetypes.md`](../../known-issues/jdk-only/W6-1-varhandle-vartype-coordinatetypes.md)):
+   `varType`/`coordinateTypes` are registered by
+   `register_p59_varhandle`, reachable only through
+   `register_synthetic_overrides`, while `regression-suite/bridge-ratchet.sh`
+   boots `--real-jdk` and its frozen artefact records `"mode": "compatible"` —
+   so those rows never enter the registry the ratchet measures and the counters
+   move by **0**. Before accepting any other row here, ask the same question:
+   *which registrar, reachable in which mode, and is that the mode the census
+   runs in?* — [§7 of *Natives over real JDK
+   classes*](../../architecture/natives-over-real-jdk-classes.md).
+   They disagree about which move,
+   and each lane says why in its own *Baselines* section: ~~SC-2
+   (`bridge-ratchet`, +2)~~, SC-3 (`kind-map` collapses a duplicate pair to one
    row; bridge counts fall by 1), SC-4 (`bridge_without_acc_native` 9528 →
    9536), SC-5/SC-7/SC-8 (none). Re-take the census on a JDK-bearing host; do
    not hand-edit.

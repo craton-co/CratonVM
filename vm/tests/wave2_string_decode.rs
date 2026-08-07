@@ -98,6 +98,14 @@ fn ensure_probe_compiled(name: &str) -> bool {
     }
     let src = dir.join(format!("{name}.java"));
     if !src.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave2_string_decode",
+            &format!("the Wave 2 string-decode fixture `{name}.java`"),
+            &[src.clone()],
+        );
         return false;
     }
     let compile = Command::new("javac").arg("-d").arg(&dir).arg(&src)

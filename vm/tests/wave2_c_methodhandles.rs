@@ -91,7 +91,13 @@ fn run_mh_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("MhProbe.class").exists() {
-        eprintln!("[wave2-c] MhProbe.class missing — run javac in apps/methodhandles_probe");
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave2-c",
+            "the Wave 2 Task C fixture `MhProbe` (MhProbe.class, compiled from MhProbe.java)",
+            &[probe.join("MhProbe.class"), probe.join("MhProbe.java")],
+        );
         return None;
     }
     let mut cmd = Command::new(&bin);

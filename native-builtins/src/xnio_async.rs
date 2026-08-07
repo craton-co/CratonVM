@@ -634,7 +634,7 @@ pub fn gc_scan_xnio_future_roots(roots: &mut Vec<cratonvm_types::ObjectRef>) {
 ///
 /// `map` is keyed by old address (`as_ptr() as usize`) → new address. A ref not
 /// present in `map` did not move and is left untouched. Dead `Weak`s are pruned.
-pub fn gc_update_xnio_future_refs(map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_xnio_future_refs(map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }
@@ -3185,7 +3185,7 @@ mod tests {
         let new_notifier = 0x4000usize;
         let new_attachment = 0x5000usize;
         let new_result = 0x6000usize;
-        let mut map = std::collections::HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(ptr_of(notifier), new_notifier);
         map.insert(ptr_of(attachment), new_attachment);
         map.insert(ptr_of(result), new_result);
@@ -3228,7 +3228,7 @@ mod tests {
         )
         .unwrap();
         // Empty pointer map → no relocation happened → refs unchanged.
-        gc_update_xnio_future_refs(&std::collections::HashMap::new());
+        gc_update_xnio_future_refs(&cratonvm_types::PointerMap::default());
         let mut roots = Vec::new();
         gc_scan_xnio_future_roots(&mut roots);
         let addrs: Vec<usize> = roots.iter().map(|r| ptr_of(*r)).collect();

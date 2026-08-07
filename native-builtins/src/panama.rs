@@ -3079,7 +3079,7 @@ pub fn gc_scan_upcall_target_roots(out: &mut Vec<ObjectRef>) {
 /// [`gc_scan_upcall_target_roots`]). After a moving collection relocates a
 /// target, rewrite each `UpcallUserdata.target` in place so the next trampoline
 /// dispatch reaches the new address. Called from the VM's `update_all_roots`.
-pub fn gc_update_upcall_target_refs(map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_upcall_target_refs(map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }
@@ -5932,7 +5932,7 @@ mod tests {
         );
 
         // Remap 0xABCD_0000 -> 0xABCD_8000; the leaked userdata is rewritten.
-        let mut map = std::collections::HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0xABCD_0000usize, 0xABCD_8000usize);
         gc_update_upcall_target_refs(&map);
         assert_eq!(

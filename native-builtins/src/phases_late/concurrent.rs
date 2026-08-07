@@ -4397,18 +4397,12 @@ fn incubator_fork_subtask(
         return Ok((scope, subtask));
     };
     let base = ctx.pin_native_root(subtask);
-    let scope_pin = match scope {
-        Some(s) => Some((ctx.pin_native_root(s), s)),
-        None => None,
-    };
+    let scope_pin = scope.map(|s| (ctx.pin_native_root(s), s));
     // `invoke_virtual` prepends the receiver itself — passing it again in
     // `args` (as this code used to) duplicates it.
     let outcome = ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[]);
     let subtask = ctx.read_native_pin(base, subtask);
-    let scope = match scope_pin {
-        Some((h, s)) => Some(ctx.read_native_pin(h, s)),
-        None => None,
-    };
+    let scope = scope_pin.map(|(h, s)| ctx.read_native_pin(h, s));
     match outcome {
         Ok(value) => {
             ctx.set_field(subtask, 0, Value::Int(INCUBATOR_SUBTASK_SUCCESS));

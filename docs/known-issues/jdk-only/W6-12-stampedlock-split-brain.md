@@ -169,7 +169,21 @@ phase. If the post-fix run instead shows every accessor answering 0, the
 `native-builtins` holder implementation is not reachable in that configuration
 and the call site must be restored rather than removed.
 
-No regression-suite vector covers `Phaser` — `RJdkAqs` is the only vector that
+> **UPDATED 2026-08-07 — a `Phaser` vector now exists, and it is untracked.**
+> `regression-suite/src/RJdkPhaser.java` is in the working tree,
+> `regression-suite/run.sh` lists `RJdkPhaser` in `JDKONLY_CLASSES`, and
+> `run.sh`'s own coverage comment cites it (*"This is how RJdkPhaser — 240
+> checks — arrived inert"*). But `git ls-files` does not know the file:
+> `git status` reports `?? regression-suite/src/RJdkPhaser.java` (same for
+> `RJdkFieldModule.java`). **On a fresh clone `run.sh` schedules two classes
+> whose sources do not exist**, so the paragraph below is still true of CI even
+> though it is no longer true of this worktree. Track the file before treating
+> the vector as coverage. This is the same untracked-fixture hazard as
+> `probes/BdProbe.java` —
+> [§8 and §9 of *Natives over real JDK
+> classes*](../../architecture/natives-over-real-jdk-classes.md).
+
+~~No regression-suite vector covers `Phaser`~~ — `RJdkAqs` is the only *tracked* vector that
 names anything in this area and it exercises `StampedLock` only (lines 327-341:
 `tryOptimisticRead`/`validate`/`isWriteLocked`/`isReadLocked`), on the
 `native-builtins` path that was never in contention. That absence is why the

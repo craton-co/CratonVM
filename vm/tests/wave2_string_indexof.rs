@@ -87,8 +87,13 @@ fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("SiProbe.class").exists() {
-        eprintln!(
-            "[wave2_string_indexof] SiProbe.class missing — run javac in apps/string_indexof_probe"
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave2_string_indexof",
+            "the Wave 2 String.indexOf fixture `SiProbe` (SiProbe.class, compiled from \
+             SiProbe.java)",
+            &[probe.join("SiProbe.class"), probe.join("SiProbe.java")],
         );
         return None;
     }

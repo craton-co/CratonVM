@@ -278,11 +278,27 @@ fn emit_wait_site_frames(thread_id: ThreadId) {
 /// or inflate.
 #[inline]
 pub fn try_thin_lock(header: &ObjectHeader, thread_id: u32) -> Result<(), u64> {
+    // This used to compare against the literal `types::MARK_NEUTRAL`. It cannot
+    // any more: since the `kind` / `element_type` / `gc_age` / `gc_flags`
+    // quartet moved into bits 48..61, an unlocked object's word is only zero
+    // when it is a plain, never-aged, unflagged object. An `int[]` carries kind
+    // and element_type bits, so a literal compare would fail forever and EVERY
+    // array lock would inflate a monitor.
+    //
+    // Masking the quartet out restores the intended test -- "unlocked, and no
+    // identity hash installed" -- and preserves the property the literal was
+    // silently providing: a hashed word has non-zero bits OUTSIDE the quartet,
+    // so it still loses here and the caller still inflates, which is HotSpot's
+    // rule that a hashed object cannot be thin-locked.
+    let cur = header.mark_word.load(Ordering::Relaxed);
+    if cur & !types::MARK_QUARTET_MASK != types::MARK_NEUTRAL {
+        return Err(cur);
+    }
     header
         .mark_word
         .compare_exchange(
-            types::MARK_NEUTRAL,
-            ObjectHeader::make_thin_locked(thread_id, 0),
+            cur,
+            ObjectHeader::make_thin_locked(cur, thread_id, 0),
             Ordering::Acquire,
             Ordering::Relaxed,
         )
@@ -311,7 +327,7 @@ pub fn try_thin_recursive_lock(header: &ObjectHeader, thread_id: u32) -> Result<
         if recursion == u8::MAX {
             return Err(cur); // overflow → must inflate
         }
-        let new = ObjectHeader::make_thin_locked(thread_id, recursion + 1);
+        let new = ObjectHeader::make_thin_locked(cur, thread_id, recursion + 1);
         if header
             .mark_word
             .compare_exchange(cur, new, Ordering::Acquire, Ordering::Relaxed)
@@ -345,11 +361,40 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
         }
         let recursion = ObjectHeader::thin_lock_recursion(cur);
         let (new, ret) = if recursion == 0 {
-            // Last release → return to NEUTRAL.
-            (types::MARK_NEUTRAL, None)
+            // Last release → return to NEUTRAL, CARRYING THE QUARTET.
+            //
+            // `MARK_NEUTRAL` is a bare state constant (`0b00`). Storing it raw
+            // erases bits 48..61 — the `kind` / `element_type` / `gc_age` /
+            // `gc_flags` quartet that moved into this word when the header
+            // shrank 24 -> 16 (2026-08-07). Every other transition on this word
+            // already rides the quartet across: `make_thin_locked`,
+            // `make_inflated` and `make_neutral_hashed` all derive from the
+            // previous value. This one did not, so the FIRST `synchronized`
+            // block on an object reset its GC flags on exit.
+            //
+            // `GC_FLAG_COMPACT` living in that quartet is what made it fatal: a
+            // compact object silently became "legacy" the moment it was
+            // unlocked, and every later field read then decoded a
+            // compact-packed body as 16-byte cells — reading past the end of
+            // the object. `FileChannelImpl.fileLockTable()` is
+            // double-checked locking over a volatile field, so the assignment
+            // landed inside the lock and the read after `monitorexit` came back
+            // null: `NullPointerException ... because "flt" is null`, and no
+            // file-backed database could open. See the retired
+            // `compact-ref-field-layout-corrupts-filechannel-filelock-20260807`
+            // write-up (cited by name: its tree is not published).
+            //
+            // The second victim, found from the other end the same day: every
+            // Spring Boot test class failed at JUnit discovery, because
+            // `AbstractTestDescriptor.children` is a `Collections.synchronizedSet`
+            // and `EngineDiscoveryResultValidator` walks
+            // `getChildren().iterator()` — the first `synchronized` inside that
+            // wrapper de-compacted it and the backing collection read back
+            // null. `probes/MonitorQuartetProbe.java` is that repro.
+            (ObjectHeader::quartet_of(cur) | types::MARK_NEUTRAL, None)
         } else {
             (
-                ObjectHeader::make_thin_locked(thread_id, recursion - 1),
+                ObjectHeader::make_thin_locked(cur, thread_id, recursion - 1),
                 Some(recursion - 1),
             )
         };
@@ -402,6 +447,21 @@ fn monitor_ptr_from_mark(mark: u64) -> Option<*const Monitor> {
 /// no possible mark-word reader. The returned lifetime is unconstrained, so
 /// callers must keep it within the scope in which they hold `obj_ref`.
 #[inline(always)]
+/// Resolve the identity hash of an object whose mark word is no longer
+/// NEUTRAL, by reading the hash displaced into its `Monitor` at inflation.
+///
+/// Installed into the `gc` crate at VM start-up (`set_displaced_hash_resolver`)
+/// because `gc` owns the `identity_hash_code` accessors but cannot name
+/// `Monitor`. Reaching the hash is a pointer dereference through the mark word,
+/// so this costs the same as any other inflated fast path -- no registry probe.
+///
+/// Answers `0` for a word that is not INFLATED (a THIN_LOCKED object that has
+/// never been hashed can reach here; it has no displaced hash because a hashed
+/// object cannot thin-lock in the first place).
+pub fn displaced_hash_from_mark(mark: u64) -> i32 {
+    monitor_from_mark(mark).map_or(0, |m| m.displaced_hash())
+}
+
 fn monitor_from_mark<'a>(mark: u64) -> Option<&'a Monitor> {
     // SAFETY: as argued above, the pointee is kept alive by the strong
     // reference the mark word itself owns.
@@ -511,6 +571,24 @@ pub struct Monitor {
     /// with a `swap`, so a monitor that is reached by both `prune_dead` and
     /// `remap_after_gc` releases exactly once.
     mark_ref: std::sync::atomic::AtomicBool,
+    /// This object's identity hash, displaced here when the object inflated.
+    ///
+    /// The hash normally lives in the upper bits of a `MARK_NEUTRAL` mark word
+    /// (`ObjectHeader::make_neutral_hashed`). Inflation overwrites the whole
+    /// word with `INFLATED | monitor_ptr`, so it is the one transition that
+    /// would destroy a hash -- `publish_inflated` moves it here first.
+    ///
+    /// A monitor is the right home for it rather than a separate address-keyed
+    /// table: a displaced hash exists only for an inflated object, every
+    /// inflated object has exactly one monitor, and this table is ALREADY
+    /// re-keyed on relocation and pruned on death by `MonitorCleanup` -- which
+    /// carries the "a new object at a recycled address inherits the dead one's
+    /// entry" analysis that a fresh side table would have to repeat. Reaching
+    /// it is a pointer dereference through the mark word, not a hash probe.
+    ///
+    /// `0` means "none displaced": either the object was never hashed before it
+    /// inflated, or it has not been hashed at all yet.
+    displaced_hash: std::sync::atomic::AtomicI32,
 }
 
 /// The mutable state protected by a monitor's mutex.
@@ -557,6 +635,33 @@ impl Monitor {
             entry_condvar: Condvar::new(),
             wait_condvar: Condvar::new(),
             mark_ref: std::sync::atomic::AtomicBool::new(false),
+            displaced_hash: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+
+    /// The identity hash displaced into this monitor, or `0` if none.
+    #[inline]
+    pub fn displaced_hash(&self) -> i32 {
+        self.displaced_hash.load(Ordering::Acquire)
+    }
+
+    /// Install `hash` as this object's identity hash if none is recorded yet,
+    /// and return the hash that is now in force.
+    ///
+    /// Idempotent and racy-safe: the first writer wins and every caller --
+    /// including the losers -- converges on that one value. An object's
+    /// identity hash may never change once observed, so a plain store would be
+    /// wrong even though it looks equivalent.
+    #[inline]
+    pub fn displace_hash(&self, hash: i32) -> i32 {
+        match self.displaced_hash.compare_exchange(
+            0,
+            hash,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => hash,
+            Err(existing) => existing,
         }
     }
 
@@ -1137,6 +1242,11 @@ pub struct MonitorTable {
 impl MonitorTable {
     /// Create an empty monitor table.
     pub fn new() -> Self {
+        // Registered here rather than at a VM init site because this is the
+        // earliest point that provably precedes any inflation: an object cannot
+        // inflate without a monitor table, so no displaced hash can exist
+        // before this runs. Idempotent -- the `OnceLock` keeps the first.
+        cratonvm_gc::collector::set_displaced_hash_resolver(displaced_hash_from_mark);
         Self {
             // Every shard of both registries lives at L6 (`monitors`).
             monitors: (0..MONITOR_SHARDS)
@@ -1190,7 +1300,18 @@ impl MonitorTable {
         // the count is already correct the instant another thread can observe
         // the pointer.
         let mark_owned = Arc::clone(monitor);
-        let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(monitor) as usize);
+        // Carry any identity hash out of the word being overwritten, BEFORE the
+        // CAS publishes the monitor. Any thread that can observe the INFLATED
+        // pointer can already reach the hash through it; doing this after the
+        // CAS would leave a window where the object's hash is simply gone, and
+        // a reader in that window would mint a second, different one.
+        let displaced = ObjectHeader::neutral_hash(expected);
+        if displaced != 0 {
+            monitor.displace_hash(displaced);
+        }
+        // `expected` is the word being replaced, so the quartet rides across
+        // inflation the same way the displaced hash does.
+        let new_mark = ObjectHeader::make_inflated(expected, Arc::as_ptr(monitor) as usize);
         if header
             .mark_word
             .compare_exchange(expected, new_mark, Ordering::Release, Ordering::Relaxed)
@@ -2048,7 +2169,7 @@ impl MonitorTable {
     ///   `gc/src/gen_heap.rs` — left to the owner of those files. Until then a
     ///   dead object's monitor is retained by the moving collectors, which is a
     ///   bounded leak and strictly preferable to a dangling mark word.
-    pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    pub fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -2152,7 +2273,7 @@ impl Default for MonitorTable {
 }
 
 impl cratonvm_gc::MonitorCleanup for MonitorTable {
-    fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         self.remap_after_gc(pointer_map);
     }
 
@@ -2244,6 +2365,69 @@ mod tests {
     fn test_object() -> ObjectRef {
         let heap: &'static Heap = Box::leak(Box::new(Heap::with_capacity(4096)));
         heap.alloc_object(ClassId::new(0), 0)
+    }
+
+    /// A thin lock/unlock round trip must leave the mark word's quartet
+    /// (`kind` / `element_type` / `gc_age` / `gc_flags`) exactly as it found
+    /// it.
+    ///
+    /// Those bits live in the mark word since the header shrank 24 -> 16, and
+    /// the last release used to store the bare `MARK_NEUTRAL` constant over
+    /// them. `GC_FLAG_COMPACT` is one of them, so the first `synchronized`
+    /// block on a compact object converted it to "legacy" and every later field
+    /// read decoded a compact-packed body with 16-byte cells.
+    #[test]
+    fn a_thin_lock_round_trip_preserves_the_mark_word_quartet() {
+        use cratonvm_types::{GC_FLAG_COMPACT, GC_FLAG_OLD_GEN};
+
+        let obj = test_object();
+        let header = header_of(obj);
+        header.set_gc_flags(GC_FLAG_COMPACT | GC_FLAG_OLD_GEN);
+        let before = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(
+            header.gc_flags(),
+            GC_FLAG_COMPACT | GC_FLAG_OLD_GEN,
+            "precondition: the flags are in the mark word"
+        );
+
+        try_thin_lock(header, 7).expect("an unlocked, unhashed object thin-locks");
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed)),
+            ObjectHeader::quartet_of(before),
+            "locking must carry the quartet"
+        );
+
+        // Recursive acquire/release must carry it too — that arm derives from
+        // `cur`, but pin it so a future rewrite cannot regress silently.
+        try_thin_recursive_lock(header, 7).expect("recursive acquire");
+        try_thin_unlock(header, 7).expect("recursive release");
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed)),
+            ObjectHeader::quartet_of(before),
+            "recursive release must carry the quartet"
+        );
+
+        assert_eq!(
+            try_thin_unlock(header, 7),
+            Ok(None),
+            "the last release returns the lock to NEUTRAL"
+        );
+        let after = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(
+            ObjectHeader::mark_state(after),
+            types::MARK_NEUTRAL,
+            "and the state really is NEUTRAL"
+        );
+        assert_eq!(
+            header.gc_flags(),
+            GC_FLAG_COMPACT | GC_FLAG_OLD_GEN,
+            "the LAST release is the one that used to erase the flags"
+        );
+        assert_eq!(
+            ObjectHeader::quartet_of(after),
+            ObjectHeader::quartet_of(before),
+            "kind / element_type / gc_age must survive the unlock too"
+        );
     }
 
     #[test]
@@ -2424,7 +2608,7 @@ mod tests {
             .mark_word
             .store(old_mark, Ordering::Release);
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         table.remap_after_gc(&pointer_map);
 
@@ -2451,7 +2635,7 @@ mod tests {
             .mark_word
             .store(old_mark, Ordering::Release);
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         table.remap_after_gc(&pointer_map);
 
@@ -2478,7 +2662,7 @@ mod tests {
         // whole-heap collection in which `obj` was not forwarded (= dead).
         // (An empty map early-returns; use a dummy unrelated remap so the body
         // actually runs.)
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0xdead_0000usize, 0xbeef_0000usize);
         table.remap_after_gc(&pointer_map);
 
@@ -2513,7 +2697,7 @@ mod tests {
 
         // Partial GC: pointer_map mentions some *other* object, not `obj`
         // (which survived in place). Default flag is off → must NOT reclaim.
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0xfeed_0000usize, 0xface_0000usize);
         table.remap_after_gc(&pointer_map);
 
@@ -2936,7 +3120,7 @@ mod tests {
         // Populate this OS thread's raw-pointer cache, then simulate the
         // stop-the-world re-key that a moving collection performs.
         table.with_cas_lock(old_obj, || {});
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_obj.as_ptr() as usize, new_obj.as_ptr() as usize);
         table.remap_after_gc(&pointer_map);
 
@@ -2952,7 +3136,7 @@ mod tests {
         let tid = ThreadId(1);
 
         table.enter(obj, tid);
-        let empty_map = std::collections::HashMap::new();
+        let empty_map = cratonvm_types::PointerMap::default();
         table.remap_after_gc(&empty_map);
         // Monitor should still be accessible with original address
         assert!(table.exit(obj, tid).is_ok());
@@ -2976,6 +3160,117 @@ mod tests {
     /// (summed across shards).
     fn monitor_registry_len(table: &MonitorTable) -> usize {
         table.indexed_monitor_count()
+    }
+
+    /// The whole point of the displacement: a hash installed while the object
+    /// was NEUTRAL must still be its hash after inflation destroys the word.
+    ///
+    /// This is also the test that shows the free half of the design working
+    /// end to end -- nothing here asks for inflation. `enter` takes the thin
+    /// lock fast path, whose CAS is against the literal `MARK_NEUTRAL`; the
+    /// hashed word is non-zero, so that CAS loses and the object inflates on
+    /// its own.
+    #[test]
+    fn an_identity_hash_survives_the_inflation_that_overwrites_its_word() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let header = header_of(obj);
+
+        let hash = header
+            .mark_word_identity_hash(|| 0x0051_1EEF)
+            .expect("a fresh object is NEUTRAL");
+        assert_ne!(hash, 0);
+        assert!(!is_inflated(obj));
+
+        // No explicit inflation: a hashed word cannot win the thin-lock CAS.
+        table.enter(obj, ThreadId(3));
+        assert!(
+            is_inflated(obj),
+            "a hashed object must inflate rather than thin-lock"
+        );
+
+        let mark = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(
+            ObjectHeader::neutral_hash(mark),
+            0,
+            "the word no longer carries the hash -- that is what makes the              displacement necessary, not optional"
+        );
+        let monitor = monitor_arc_from_mark(mark).expect("inflated => monitor");
+        assert_eq!(
+            monitor.displaced_hash(),
+            hash,
+            "the hash must have moved into the monitor, not vanished"
+        );
+
+        assert!(table.exit(obj, ThreadId(3)).is_ok());
+        // Releasing an inflated monitor leaves it inflated, so the hash stays
+        // reachable. This is why there is no path back to a bare NEUTRAL word
+        // that would let a second, different hash be minted.
+        assert!(is_inflated(obj));
+        let monitor = monitor_arc_from_mark(header.mark_word.load(Ordering::Acquire))
+            .expect("still inflated after exit");
+        assert_eq!(monitor.displaced_hash(), hash);
+    }
+
+    /// End to end, through the accessor the VM actually calls: an object's
+    /// identity hash must not change when it inflates.
+    ///
+    /// This is the property the whole two-sided design exists for, and the one
+    /// a single call can never catch. The hash is read BEFORE inflation (from
+    /// the mark word) and AFTER (resolved from the Monitor via the hook), and
+    /// the two must agree.
+    #[test]
+    fn the_identity_hash_does_not_change_when_the_object_inflates() {
+        let heap = leaked_heap();
+        let table = MonitorTable::new();
+        let obj = heap.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let tid = ThreadId(11);
+
+        let before = heap.identity_hash_code(obj);
+        assert_ne!(before, 0, "a fresh object must get a hash");
+        assert!(!is_inflated(obj));
+
+        // Not an explicit inflation: the hashed word loses the thin-lock CAS.
+        table.enter(obj, tid);
+        assert!(is_inflated(obj));
+        table.exit(obj, tid).unwrap();
+
+        let after = heap.identity_hash_code(obj);
+        assert_eq!(
+            before, after,
+            "identity hash changed across inflation: {before} -> {after}"
+        );
+        // ...and it is stable on repeat, i.e. the displaced path reads rather
+        // than mints.
+        assert_eq!(heap.identity_hash_code(obj), before);
+        assert_eq!(heap.identity_hash_code(obj), before);
+    }
+
+    /// An object that inflates *without* ever having been hashed displaces
+    /// nothing -- `0` has to stay "none", or the first hash request after
+    /// inflation would read a phantom.
+    #[test]
+    fn an_unhashed_object_displaces_nothing_on_inflation() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(4);
+        table.enter(obj, tid);
+        table.wait(obj, tid, Some(1), None).unwrap();
+        table.exit(obj, tid).unwrap();
+        assert!(is_inflated(obj));
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        let monitor = monitor_arc_from_mark(mark).expect("inflated => monitor");
+        assert_eq!(monitor.displaced_hash(), 0);
+    }
+
+    /// A displaced hash is write-once. Two racers must converge, because an
+    /// identity hash may never change once observed.
+    #[test]
+    fn displacing_a_hash_twice_keeps_the_first() {
+        let m = Monitor::new();
+        assert_eq!(m.displace_hash(111), 111);
+        assert_eq!(m.displace_hash(222), 111);
+        assert_eq!(m.displaced_hash(), 111);
     }
 
     #[test]

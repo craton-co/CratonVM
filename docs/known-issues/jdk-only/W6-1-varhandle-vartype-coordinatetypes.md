@@ -202,9 +202,37 @@ reaching the line at all proves defects 1, 4 and 6.
 
 ## Baselines
 
-* `scripts/baselines/jdk-only-bridge-ratchet.json` — **must be re-frozen.**
+* `scripts/baselines/jdk-only-bridge-ratchet.json` — ~~**must be re-frozen.**
   `varType` and `coordinateTypes` are two new `Bridge` rows that shadow real
   bytecode and are not `ACC_NATIVE`, so `bridge_shadows_bytecode` and
-  `bridge_without_acc_native` each rise by 2 and the gate runs with `slack: 0`.
+  `bridge_without_acc_native` each rise by 2 and the gate runs with `slack: 0`.~~
+  **CORRECTED 2026-08-07 — the counters do not move at all, and no re-freeze is
+  warranted.** The two rows are registered in
+  `native-builtins/src/phases_late/reflect_invoke.rs::register_p59_varhandle`,
+  which is reached only through `register_phase59_natives` →
+  `register_synthetic_overrides` — and `vm_init` calls that only under
+  `#[cfg(feature = "synthetic-jdk")]` **and** `config.use_synthetic_jdk` at
+  runtime. `regression-suite/bridge-ratchet.sh` boots the VM with `--real-jdk`,
+  and the frozen artefact records `"mode": "compatible"`. So the registration
+  never enters the registry in the mode the ratchet measures: both counters move
+  by **0**. Corroborating: `scripts/baselines/jdk-only-kind-map-25-linux.tsv`
+  carries 50 `java/lang/invoke/VarHandle` rows and **no** `varType` /
+  `coordinateTypes` row.
+
+  This becomes a real +2 only if the registration is moved onto the real-JDK arm
+  (`lang_invoke.rs::register_phase54_method_handle` /
+  `register_p63_method_handles_lookup`), which is what a live surface for these
+  two methods requires — see the comment in `native-builtins/src/lang_invoke.rs`
+  beginning *"REGISTERED HERE, not in `phases_late/reflect_invoke.rs`"*.
+  Re-freeze **after** that move, not before it.
+
+  The general rule is [§7 of *Natives over real JDK
+  classes*](../../architecture/natives-over-real-jdk-classes.md): before quoting
+  a census number, ask which registrars it called and **which mode it was taken
+  in**. The sibling `+2` in
+  [`L2-methodtypeform-lambdaforms-null.md`](L2-methodtypeform-lambdaforms-null.md)
+  (`asVarargsCollector` / `asFixedArity`) **does** hold — its registrar is
+  reached from `register_essential_natives_with_shims`, the real-JDK arm. Do not
+  "fix" that one by analogy.
 * `native-builtins/tests/stub_ratchet.rs` — unchanged; both rows are `Bridge`,
   not `SyntheticStub`.

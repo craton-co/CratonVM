@@ -2011,7 +2011,7 @@ fn native_properties_put_if_absent(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if args.first().is_none() {
+    if args.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
     if let Some(Value::Object(Some(existing))) = native_properties_get(ctx, args)? {

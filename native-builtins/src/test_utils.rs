@@ -740,6 +740,12 @@ pub(crate) struct MockNativeContext {
     /// to simulate a class with a specific declared field list for
     /// `ObjectStreamClass` / reflection-driven code.
     pub(crate) declared_fields_override: UnsafeCell<HashMap<u32, Vec<FieldMetadata>>>,
+    /// Opt-in: make `get_field_by_name` answer an unresolvable name the way
+    /// production does — `Value::Object(None)` — instead of this mock's
+    /// legacy `Value::Int(0)`. See
+    /// [`MockNativeContext::set_absent_field_answers_null`] for why the
+    /// default is still the divergent answer and what it costs.
+    pub(crate) absent_field_answers_null: std::cell::Cell<bool>,
     /// Next id handed out by `allocate_loader_id`. Starts at
     /// `ClassLoaderId::NATIVE_FIRST_USER_DEFINED` like the real VM's counter.
     pub(crate) next_loader_id: u32,
@@ -920,6 +926,7 @@ impl MockNativeContext {
             blocking_begin_count: 0,
             blocking_end_count: 0,
             declared_fields_override: UnsafeCell::new(HashMap::new()),
+            absent_field_answers_null: std::cell::Cell::new(false),
             next_loader_id: cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED,
             inner_classes_override: UnsafeCell::new(HashMap::new()),
             declared_methods_override: UnsafeCell::new(HashMap::new()),
@@ -1214,6 +1221,39 @@ impl MockNativeContext {
     pub(crate) fn set_declared_fields(&self, class_id: ClassId, fields: Vec<FieldMetadata>) {
         // SAFETY: single-threaded test code.
         unsafe { (*self.declared_fields_override.get()).insert(class_id.as_u32(), fields) };
+    }
+
+    /// Make `get_field_by_name` answer an unresolvable name the way the
+    /// production `NativeContextImpl` does.
+    ///
+    /// Production (`vm/src/vm/vm_exec.rs:10613-10623`) resolves the name in the
+    /// receiver's class hierarchy and returns **`Value::Object(None)`** when it
+    /// cannot; that is also the documented trait contract
+    /// (`native-api/src/registry.rs:2351-2354`, "Returns `Value::Object(None)`
+    /// if the field is not found"). This mock's default answer is
+    /// `Value::Int(0)` — see the DIVERGENCE note on
+    /// [`NativeHeapAccess::get_field_by_name`]'s impl below for why the default
+    /// has not been flipped.
+    ///
+    /// Turn this on in any test whose subject distinguishes "absent" from
+    /// "null" — `field_read::declares_field`, or any dual-layout discriminator
+    /// that reads a witness field's VALUE. Without it the test is measuring the
+    /// mock, not the VM.
+    ///
+    /// Both arms of a dual-layout discriminator are reachable with this on:
+    ///
+    /// * REAL-layout receiver: `ensure_class_initialized("p/RealShaped")`, then
+    ///   `set_declared_fields(cid, ..)` naming the real JDK class's own private
+    ///   fields. `resolve_field_index_by_class_id` finds them (that is the
+    ///   class-side witness) and `get_field_by_name` reads their slots.
+    /// * FABRICATED receiver: a class name that
+    ///   `cratonvm_classloading::synthetic_stub_field_model` does not model and
+    ///   no `mock_*_field_slot` table names, with no `set_declared_fields`
+    ///   call. The witness answers `None` and the by-name read answers
+    ///   `Object(None)` — exactly what the VM would answer.
+    #[allow(dead_code)]
+    pub(crate) fn set_absent_field_answers_null(&self, faithful: bool) {
+        self.absent_field_answers_null.set(faithful);
     }
 
     /// Register `class_id`'s own `InnerClasses` attribute entries. Overrides
@@ -1520,6 +1560,7 @@ impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
                         access_flags: m.access_flags,
                         declaring_class_id: m.declaring_class_id,
                         exceptions: m.exceptions.clone(),
+                        signature: m.signature.clone(),
                     })
                     .collect()
             })
@@ -1940,14 +1981,53 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         }
     }
 
+    /// # DIVERGENCE FROM PRODUCTION — read this before reasoning from a result
+    ///
+    /// **Production answers `Value::Object(None)` for a name it cannot
+    /// resolve.** `NativeContextImpl::get_field_by_name`
+    /// (`vm/src/vm/vm_exec.rs:10613-10623`) calls
+    /// `resolve_field_index_in_hierarchy` and, on `None`, returns
+    /// `Value::Object(None)`. The trait says so too
+    /// (`native-api/src/registry.rs:2351-2354`). `native-api/src/test_mock.rs`
+    /// agrees with production.
+    ///
+    /// **This mock answers `Value::Int(0)` instead**, unless a test opts in via
+    /// [`MockNativeContext::set_absent_field_answers_null`].
+    ///
+    /// The consequence: a discriminator that reads a witness field's VALUE and
+    /// treats `Object(None)` as "no such field" takes the OPPOSITE arm here
+    /// from the arm it takes in the VM, so a unit test of it can be green while
+    /// production is wrong. Two instances have already been paid for on this
+    /// campaign — `lookup_define.rs`'s
+    /// `alloc_lookup_for_still_writes_the_synthetic_indices` (green while
+    /// production took the other arm; see its doc comment) and the corrected
+    /// rationale on `classloader.rs`'s `url_field_read` fallback, which used to
+    /// cite this mock's `Int(0)` as production behaviour. The remedy the campaign settled on is
+    /// the CLASS-SIDE witness (`resolve_field_index_by_class_id(..).is_none()`,
+    /// e.g. `classloader::cl_has_synthetic_layout`), which this mock answers
+    /// faithfully; prefer it, and where you must test the value side, set the
+    /// flag.
+    ///
+    /// Do NOT quote `Int(0)` as production behaviour. The tag production really
+    /// does produce here is a different thing: an unwritten REFERENCE slot of a
+    /// name that DOES resolve reads back as `Int(0)` because the zeroed 16-byte
+    /// slot decodes to the niche-0 discriminant (`native-builtins/src/field_read.rs`
+    /// module docs). That hazard is about a resolvable field, not an absent one.
+    ///
+    /// Why the default is still `Int(0)`: flipping it changes the answer under
+    /// ~3 900 `native-builtins` tests reached from ~1 700 `get_field_by_name`
+    /// call sites, and at least `field_read.rs`'s
+    /// `by_name_read_of_an_unresolvable_name_is_int_zero_not_null` and
+    /// `int_field_strict_refuses_an_unresolvable_field` assert the current
+    /// answer directly. The flip is worth doing, but it has to be done by
+    /// someone who can run `cargo test -p cratonvm-native-builtins` and fix the
+    /// fallout in the same change.
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
         // Mock: no class hierarchy parse. Tests that use
         // `make_field_mirror` write the synthetic 7-slot Field layout
         // directly; map the JDK Field field names to the corresponding
         // synthetic slot so the production code's `get_field_by_name`
-        // path still reads the right value. Unknown names are treated as
-        // absent (returning `Int(0)` rather than silently shadowing slot
-        // 0, which would corrupt slot-0 test state).
+        // path still reads the right value.
         let class_name = self.class_name_of_id(self.class_id_of_object(obj));
         // A field the test declared outranks every table; everything after it
         // is `mock_field_slot`, the single chain all four entry points share.
@@ -1956,6 +2036,9 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
             .or_else(|| mock_field_slot(class_name.as_deref(), field_name));
         match slot {
             Some(slot) => self.get_field(obj, slot),
+            // See the DIVERGENCE note above: production returns
+            // `Value::Object(None)` here (`vm/src/vm/vm_exec.rs:10621`).
+            None if self.absent_field_answers_null.get() => Value::Object(None),
             None => Value::Int(0),
         }
     }

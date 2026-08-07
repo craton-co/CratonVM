@@ -5631,8 +5631,31 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // raises NoSuchMethodError. The synthetic streams use the legacy slot-0
     // `FdId` layout that these `<init>` natives and the `write`/`flush`/`close`
     // natives above all agree on, so they are safe here and only here.
+    //
+    // 2026-08-07: "here and only here" was enforced by the WRONG GUARD, and it
+    // silently un-did the FOS-FIX above for anyone building with the feature.
+    // `#[cfg(feature = "synthetic-jdk")]` asks what was COMPILED; what decides
+    // whether a real `FileOutputStream` is on the other end is which CLASS
+    // LIBRARY was LOADED, i.e. the launcher flag. A feature build run
+    // `--real-jdk` satisfies the cfg and registered these over the real class,
+    // reproducing the exact 2026-05-20 defect the comment above describes:
+    // `<init>` skipped the real constructor, so no `FileDescriptor` was
+    // allocated (`getFD()` threw), the fd went to instance slot 0 — the
+    // reference-typed `fd` field, where an `Value::Int` write is dropped — and
+    // every `write`/`flush`/`close` became a silent no-op.
+    //
+    // Measured on `regression-suite`'s `RFileTimes`: `new FileOutputStream(f)`
+    // + `write(5 bytes)` + `close()` left a ZERO-LENGTH file, and the
+    // `JarOutputStream` built on one produced an archive with no EOCD record.
+    // `Files.write`, `Files.newOutputStream` and `RandomAccessFile` were all
+    // unaffected, which is what kept it hidden.
+    //
+    // The runtime flag is the correct guard and is already set in exactly the
+    // arms that matter — both real-JDK arms of `vm_init`, and neither
+    // synthetic arm. The cfg stays as well: in a default build these natives
+    // should not even be compiled in.
     #[cfg(feature = "synthetic-jdk")]
-    {
+    if !registry.drops_real_layout_synthetic() {
         registry.register(
             "java/io/FileOutputStream",
             "<init>",
@@ -12160,8 +12183,30 @@ fn native_files_delete_if_exists(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_files_create_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = validated_path(&files_path_str(ctx, args))?;
-    if let Err(e) = std::fs::File::create(&s) {
-        return Err(io_err(e));
+    // `Files.createFile` is specified as `CREATE_NEW`: it must FAIL with
+    // `FileAlreadyExistsException` when the path already exists. It is the
+    // atomic create-if-absent primitive of `java.nio.file`, so callers use it
+    // AS a lock rather than merely to make a file. `std::fs::File::create` is
+    // `O_CREAT|O_WRONLY|O_TRUNC`, which did the opposite twice over: it
+    // reported success on an existing path AND truncated whatever was in it.
+    //
+    // H2 `FilePathDisk.createFile` catches `FileAlreadyExistsException` to
+    // return `false` (meaning: another process already holds this lock file),
+    // so a silent success let two `FileLock` instances both believe they had
+    // taken the database lock. `TestFileLock.testSimple` then saw
+    // ERROR_OPENING_DATABASE_1 ("Concurrent update") from the second locker
+    // where it asserts DATABASE_ALREADY_OPEN_1 — and, worse, the truncation
+    // had already destroyed the first lock file holder id on disk.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&s)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(nio_native::file_already_exists(ctx, &s));
+        }
+        Err(e) => return Err(io_err_nio(e, &s)),
     }
     let path = match args.first() {
         Some(v) => *v,
@@ -15209,6 +15254,9 @@ fn os_acquire_lock(
     } else {
         libc::F_SETLK
     };
+    // SAFETY: `raw_fd` is borrowed from the still-live `file`, and
+    // `&flock` points at a fully initialised `libc::flock` local that
+    // outlives the call. `fcntl` reads it and writes nothing back.
     let r = unsafe { libc::fcntl(raw_fd, cmd, &flock) };
     if r < 0 {
         Err(io::Error::last_os_error())
@@ -15231,6 +15279,9 @@ fn os_release_lock(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> 
         #[cfg(target_os = "freebsd")]
         l_sysid: 0,
     };
+    // SAFETY: `raw_fd` is borrowed from the still-live `file`, and
+    // `&flock` points at a fully initialised `libc::flock` local that
+    // outlives the call. `fcntl` reads it and writes nothing back.
     let r = unsafe { libc::fcntl(raw_fd, libc::F_SETLK, &flock) };
     if r < 0 {
         Err(io::Error::last_os_error())

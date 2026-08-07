@@ -694,7 +694,7 @@ mod overlay_owner_liveness_tests {
         register_overlay_owner_key(old_addr, key);
         assert!(overlay_owner_still_at(old_addr, key));
 
-        let mut pointer_map = StdHashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         gc_update_collection_overlay_refs(&pointer_map);
 
@@ -729,7 +729,7 @@ mod overlay_owner_liveness_tests {
             .entries
             .insert(1, (object(0x1000), Value::Int(7)));
 
-        let mut pointer_map = StdHashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         gc_update_collection_overlay_refs(&pointer_map);
 
@@ -783,7 +783,7 @@ mod overlay_owner_liveness_tests {
         // neighbour just left. (The moving young phase alone cannot — its keys
         // are from-space and its values are to-space or old gen — which is why
         // this only ever bites on a compacting cycle.)
-        let mut pointer_map = StdHashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         for i in 0..HOPS {
             register_overlay_owner_key(addr(i), key(i));
             pointer_map.insert(addr(i), addr(i + 1));
@@ -2414,7 +2414,24 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // serializers into such a map; with the native dropping them, canSerialize
     // returned false → LogEvent fell back to (failing) Java serialization →
     // worker→daemon stream desync. (Disabled, not deleted; impl kept for
-    // reference. native-builtins' copy is synthetic-jdk-gated, already inert.)
+    // reference.)
+    //
+    // W7-15, 2026-08-07 — DO NOT DELETE THE REGISTRAR, and mind the correction
+    // below. The `let _ =` is a dead-code silencer, so nothing here registers;
+    // the sibling copy is
+    // `native-builtins/src/util_concurrent_ext.rs::register_t31_concurrent_extras`,
+    // and it is NOT "already inert" — its CSLM block sits OUTSIDE that
+    // function's `#[cfg(feature = "synthetic-jdk")]` LinkedTransferQueue block,
+    // so it registers whenever it is reached; what gates it is its caller
+    // (`register_synthetic_overrides` <- `register_builtins`), i.e. it is live
+    // in synthetic-jdk and absent from the default real-JDK build. It covers
+    // twelve triples — `<init>()V`, `put`, `get`, `remove`, `size`, `isEmpty`,
+    // `containsKey`, `firstKey`, `lastKey`, `subMap`, `headMap`, `tailMap` —
+    // and the symmetric difference is NOT one-sided: TWO triples registered
+    // here exist nowhere else in the tree, `<init>(Ljava/util/Comparator;)V`
+    // and `keySet()Ljava/util/Set;`. Deleting this registrar would therefore
+    // drop the only record of them, and the `__test_cslm_*` hooks below drive
+    // these natives from `tests/gc_side_table_root_audit.rs`.
     let _ = register_concurrent_skip_list_map_natives;
     // StampedLock: DISABLED 2026-07-28 — this crate's copy silently destroyed
     // mutual exclusion, and it WON, because `register_collections_natives`
@@ -2444,9 +2461,22 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // BY NAME), genuinely parks on a `Condvar` instead of spinning, and
     // provides a strictly larger surface (`tryUnlockRead`/`tryUnlockWrite`,
     // `tryConvertTo*Lock`, `getReadLockCount`, plus `unlock(J)V` added
-    // alongside this change). Leaving the call site here, disabled, so the
-    // next reader sees why it must not be re-enabled.
-    let _ = register_stamped_lock_natives;
+    // alongside this change).
+    //
+    // REGISTRAR DELETED 2026-08-07 (W7-15). What stood here was
+    // `let _ = register_stamped_lock_natives;` — a dead-code silencer, not a
+    // call: the registrar it named ran in NO mode and NO feature build, so its
+    // eleven `r.register` lines read as coverage while registering nothing.
+    // All eleven triples (`<init>()V`, `readLock`/`writeLock`/`tryReadLock`/
+    // `tryWriteLock`/`tryOptimisticRead`, `unlockRead`/`unlockWrite`,
+    // `validate`, `isReadLocked`/`isWriteLocked`) are a strict subset of the
+    // twenty-five registered by
+    // `native-builtins/src/util_concurrent_ext.rs::register_stamped_lock_natives`,
+    // which runs on EVERY boot (twice inside
+    // `register_essential_natives_with_shims`, once more directly from
+    // `vm_init`). The natives themselves are still in this file, below the
+    // `StampedLock` banner, unreachable and marked as such — do not re-register
+    // them here.
     // Phaser: DISABLED 2026-08-07 — same shape as the StampedLock call above,
     // and for the same two reasons. It used to be
     // `#[cfg(feature = "synthetic-jdk")] register_phaser_natives(registry);`
@@ -2484,9 +2514,24 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // holder reference in slot 1 is type-correct there), and in real-JDK mode
     // Phaser has no native shadow at all and the real bytecode runs. The
     // default build (no `synthetic-jdk`) is unchanged: neither copy ran there.
-    // Kept, disabled, per the standing rule against deleting a synthetic
-    // method — and so the next reader sees why it must not be re-enabled.
-    let _ = register_phaser_natives;
+    // REGISTRAR DELETED 2026-08-07 (W7-15). What stood here was
+    // `let _ = register_phaser_natives;` — a dead-code silencer, not a call, so
+    // this copy's nine `r.register` lines read as coverage while registering
+    // nothing in any mode or feature build. No synthetic method is lost: the
+    // nine triples (`<init>()V`, `<init>(I)V`, `register`, `arrive`,
+    // `arriveAndAwaitAdvance`, `arriveAndDeregister`, `getPhase`,
+    // `getRegisteredParties`, `getArrivedParties`) are a strict SUBSET of the
+    // twelve registered by
+    // `native-builtins/src/phases_early.rs::register_phaser_natives`, which
+    // adds the three this copy never had (`getUnarrivedParties`,
+    // `isTerminated`, `forceTermination`) — the symmetric difference is
+    // one-sided, so there is nothing here the live registrar does not serve.
+    // That registrar is live in synthetic-jdk mode
+    // (`register_phase51_natives` <- `register_synthetic_overrides` <-
+    // `register_builtins`); in real-JDK mode `Phaser` deliberately has no
+    // native shadow at all. The natives themselves are still in this file,
+    // below the `Phaser` banner, unreachable and marked as such — do not
+    // re-register them here.
     register_priority_blocking_queue_natives(registry);
     // ScheduledThreadPoolExecutor natives use a synthetic 3-field layout
     // (poolSize=0, shutdown=1, taskList=2). On a REAL STPE that maps onto
@@ -22602,58 +22647,92 @@ fn collect_via_collector_protocol(
         }
         return make_list_of(ctx, elements);
     }
-    let supplier = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "supplier",
-        "()Ljava/util/function/Supplier;",
-        &[],
-    )? {
-        Some(Value::Object(Some(s))) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let container = ctx
-        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let accumulator = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "accumulator",
-        "()Ljava/util/function/BiConsumer;",
-        &[],
-    )? {
-        Some(Value::Object(Some(a))) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for elem in elements {
-        ctx.invoke_virtual(
-            accumulator,
-            "accept",
-            "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[container, *elem],
-        )?;
-    }
-    let finisher = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "finisher",
-        "()Ljava/util/function/Function;",
-        &[],
-    )? {
-        Some(Value::Object(Some(f))) => f,
-        // An IDENTITY_FINISH collector with no finisher: the accumulated
-        // container is itself the result.
-        _ => return Ok(Some(container)),
-    };
-    let result = ctx
-        .invoke_virtual(
-            finisher,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[container],
-        )?
-        .unwrap_or(Value::Object(None));
-    Ok(Some(result))
+    // GC-safety (2026-08-07): every `invoke_virtual*` below re-enters the
+    // interpreter and can allocate, so a moving young collection can run at
+    // any of them. `collector`, `container`, `accumulator`, `finisher` and the
+    // elements are raw `ObjectRef`s that must therefore be pinned and re-read
+    // after each call — the same discipline the degenerate-`Object` arm above
+    // and every tagged arm in `native_stream_collect` already follow. Without
+    // it the accumulated container is handed back at its pre-copy address,
+    // which the semispace swap leaves in the inactive semispace reading as an
+    // all-zero header: `java.lang.Object cannot be cast to MultiValueMap` out
+    // of `OnBeanCondition$Spec.<init>`, one run in seven. Pins are a stack and
+    // `collector_pin` is the first taken here, so the single unpin after the
+    // closure releases every pin the body pushed, on every exit path.
+    let collector_pin = ctx.pin_native_root(collector);
+    let (_, elem_handles) = pin_value_slice(ctx, elements);
+    let out = (|| -> MethodCallResult {
+        let receiver = ctx.read_native_pin(collector_pin, collector);
+        let supplier = match ctx.invoke_virtual_declared(
+            "java/util/stream/Collector",
+            receiver,
+            "supplier",
+            "()Ljava/util/function/Supplier;",
+            &[],
+        )? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let supplier_pin = ctx.pin_native_root(supplier);
+        let supplier = ctx.read_native_pin(supplier_pin, supplier);
+        let container = ctx
+            .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let container_pin = pin_value(ctx, container);
+
+        let receiver = ctx.read_native_pin(collector_pin, collector);
+        let accumulator = match ctx.invoke_virtual_declared(
+            "java/util/stream/Collector",
+            receiver,
+            "accumulator",
+            "()Ljava/util/function/BiConsumer;",
+            &[],
+        )? {
+            Some(Value::Object(Some(a))) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let accumulator_pin = ctx.pin_native_root(accumulator);
+        for i in 0..elements.len() {
+            let acc = ctx.read_native_pin(accumulator_pin, accumulator);
+            let held = read_pinned_elem(ctx, container_pin, container);
+            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+            ctx.invoke_virtual(
+                acc,
+                "accept",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                &[held, elem],
+            )?;
+        }
+
+        let receiver = ctx.read_native_pin(collector_pin, collector);
+        let finisher = match ctx.invoke_virtual_declared(
+            "java/util/stream/Collector",
+            receiver,
+            "finisher",
+            "()Ljava/util/function/Function;",
+            &[],
+        )? {
+            Some(Value::Object(Some(f))) => f,
+            // An IDENTITY_FINISH collector with no finisher: the accumulated
+            // container is itself the result. Re-read it — `finisher()` above
+            // was itself a GC-capable call.
+            _ => return Ok(Some(read_pinned_elem(ctx, container_pin, container))),
+        };
+        let finisher_pin = ctx.pin_native_root(finisher);
+        let finisher = ctx.read_native_pin(finisher_pin, finisher);
+        let held = read_pinned_elem(ctx, container_pin, container);
+        let result = ctx
+            .invoke_virtual(
+                finisher,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[held],
+            )?
+            .unwrap_or(Value::Object(None));
+        Ok(Some(result))
+    })();
+    ctx.unpin_native_roots(collector_pin);
+    out
 }
 
 /// `Stream.collect(Supplier<R>, BiConsumer<R,? super T>, BiConsumer<R,R>)`
@@ -37058,7 +37137,7 @@ pub fn gc_overlay_roots_for_matching_owners(
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
 /// its relocated address after a moving GC. Mirror of
 /// `gc_scan_collection_overlay_roots`.
-pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>) {
+pub fn gc_update_collection_overlay_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -51572,45 +51651,24 @@ const SL_SPIN_LIMIT: usize = 1000;
 #[allow(dead_code)]
 const SL_NUM_FIELDS: usize = 2;
 
-fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let c = "java/util/concurrent/locks/StampedLock";
-    r.register(c, "<init>", "()V", native_sl_init);
-    r.register(c, "readLock", "()J", native_sl_read_lock);
-    r.register(c, "unlockRead", "(J)V", native_sl_unlock_read);
-    r.register(c, "writeLock", "()J", native_sl_write_lock);
-    r.register(c, "unlockWrite", "(J)V", native_sl_unlock_write);
-    r.register(c, "tryOptimisticRead", "()J", native_sl_try_optimistic_read);
-    r.register(c, "validate", "(J)Z", native_sl_validate);
-    r.register(c, "tryReadLock", "()J", native_sl_try_read_lock);
-    r.register(c, "tryWriteLock", "()J", native_sl_try_write_lock);
-    r.register(c, "isReadLocked", "()Z", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let state = match ctx.get_field(this, SL_FIELD_STATE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        // state >= 2 means readers are present
-        Ok(Some(Value::Int(if state >= 2 { 1 } else { 0 })))
-    });
-    r.register(c, "isWriteLocked", "()Z", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        let state = match ctx.get_field(this, SL_FIELD_STATE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        // state == 1 means write-locked
-        Ok(Some(Value::Int(if state == 1 { 1 } else { 0 })))
-    });
-    r.set_category(__prev_cat);
-}
+// NO REGISTRAR — THESE NATIVES ARE UNREACHABLE AND MUST STAY THAT WAY.
+//
+// `register_stamped_lock_natives` used to live here and was deleted on
+// 2026-08-07 (W7-15). It had not been *called* since 2026-07-28: its only
+// reference was a `let _ = register_stamped_lock_natives;` dead-code silencer
+// in `register_collections_natives`, which is where the full reasoning still
+// sits. Summary: this implementation keeps `state` in slot 0 BY INDEX (a
+// `long` on the real class, so every read-back collapses to 0) and
+// `writeLock()` gives up after 1000 yields and returns stamp 0 while the
+// caller believes it holds the lock — measured at 335 threads inside the
+// critical section against HotSpot's 1.
+//
+// The live surface is
+// `native-builtins/src/util_concurrent_ext.rs::register_stamped_lock_natives`
+// (25 `StampedLock` triples + 3 `WriteLockView` + 3 `ReadLockView`), a strict
+// superset of the eleven this file used to claim. The bodies below are kept
+// only because the standing rule is to gate rather than delete; nothing calls
+// them, and re-registering them would restore both defects above.
 
 fn native_sl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -51832,36 +51890,23 @@ const PH_FIELD_PHASE: usize = 2;
 #[allow(dead_code)]
 const PH_NUM_FIELDS: usize = 3;
 
-fn register_phaser_natives(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let c = "java/util/concurrent/Phaser";
-    r.register(c, "<init>", "()V", native_ph_init_empty);
-    r.register(c, "<init>", "(I)V", native_ph_init_parties);
-    r.register(c, "register", "()I", native_ph_register);
-    r.register(
-        c,
-        "arriveAndAwaitAdvance",
-        "()I",
-        native_ph_arrive_and_await,
-    );
-    r.register(
-        c,
-        "arriveAndDeregister",
-        "()I",
-        native_ph_arrive_and_deregister,
-    );
-    r.register(c, "arrive", "()I", native_ph_arrive);
-    r.register(c, "getPhase", "()I", native_ph_get_phase);
-    r.register(
-        c,
-        "getRegisteredParties",
-        "()I",
-        native_ph_get_registered_parties,
-    );
-    r.register(c, "getArrivedParties", "()I", native_ph_get_arrived_parties);
-    r.set_category(__prev_cat);
-}
+// NO REGISTRAR — THESE NATIVES ARE UNREACHABLE AND MUST STAY THAT WAY.
+//
+// `register_phaser_natives` used to live here and was deleted on 2026-08-07
+// (W7-15); its only reference was a `let _ = register_phaser_natives;`
+// dead-code silencer in `register_collections_natives`, where the full
+// reasoning still sits. Summary: this copy keeps parties/arrived/phase in
+// object slots 0/1/2, which is neither the real `Phaser` layout
+// (state:J/parent/root/evenQ/oddQ) nor the `int[3]` holder that
+// `native-builtins/src/phases_early.rs::register_phaser_natives` uses — and
+// that holder-based registrar covers all NINE triples this one claimed plus
+// `getUnarrivedParties`, `isTerminated` and `forceTermination`. Mixing the two
+// corrupts the phaser: `ph_holder` overwrites slot 1 with its array, wiping
+// the `arrived` count these bodies keep there.
+//
+// The bodies below are kept only because the standing rule is to gate rather
+// than delete; nothing calls them, and re-registering them re-splits the
+// surface.
 
 fn native_ph_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {

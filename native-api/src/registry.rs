@@ -140,6 +140,19 @@ pub struct MethodMetadata {
     /// proxy class's `<clinit>` so that `wrap_undeclared_throwable`
     /// (WP2.5 v3 item 6) can match thrown exceptions against it.
     pub exceptions: Vec<String>,
+    /// The JVMS §4.7.9 `Signature` attribute of this method, i.e. its
+    /// generic signature, or `None` when the method is not generic.
+    ///
+    /// Carried here for the same reason as `exceptions`: whoever produced
+    /// this metadata already walked the declaring class's method table, and
+    /// `create_method_object` would otherwise search that table AGAIN, by
+    /// name+descriptor, once per mirror. In a `Class.getDeclaredMethods()`
+    /// call that loop already runs once per method, so the search made the
+    /// cost per method grow with the method count — 766 us of a 2440 us call
+    /// on a 1000-method class went to the exceptions lookup and 659 us to
+    /// this one. A fabricated method (a synthetic stub, a lambda-proxy SAM,
+    /// a shim) is not generic and correctly reports `None`.
+    pub signature: Option<String>,
 }
 
 /// WP2.3 — defineClass options carried through `NativeContext::define_class_full`.
@@ -2984,6 +2997,27 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// test the referent WITHOUT keeping it alive. The default no-op keeps
     /// mock/test contexts compiling.
     fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+
+    /// Notify the GC's reference processor that a `Reference.enqueue()` call
+    /// just enqueued this reference itself (the application's own explicit
+    /// enqueue, as opposed to the GC discovering the referent dead).
+    ///
+    /// PGJDBC-PHANTOM-GHOST (2026-08-07): without this, a `Reference` that the
+    /// application manually retires while its referent is STILL reachable
+    /// (e.g. pgjdbc's `SimpleQuery.unprepare()`/`setCleanupRef()`, which
+    /// `clear()`s and `enqueue()`s the *previous* `PhantomReference` when a
+    /// long-lived, reused `SimpleQuery` gets re-prepared) leaves a stale
+    /// `enqueued: false` bookkeeping entry in the GC's registry. If that same
+    /// referent is later shared with a NEW Reference (as in the pgjdbc
+    /// pattern) and eventually dies for real, the GC's own weak/phantom
+    /// processing rediscovers the stale entry and delivers it a SECOND time —
+    /// a ghost the application already fully drained and forgot, so its own
+    /// removal bookkeeping (e.g. a `HashMap.remove(ref)`) returns null. See
+    /// `ReferenceProcessor::mark_manually_enqueued`'s doc for the full
+    /// mechanism. The VM overrides this to retire the registry entry so it is
+    /// never rediscovered; the default no-op keeps mock/test contexts
+    /// compiling.
+    fn mark_reference_manually_enqueued(&mut self, _reference_obj: ObjectRef) {}
 }
 
 pub trait NativeThreadAccess: NativeHeapAccess {
@@ -5314,6 +5348,21 @@ impl NativeMethodRegistry {
         self.drop_real_layout_synthetic = drop;
     }
 
+    /// Whether this registry is being populated for a REAL-JDK arm.
+    ///
+    /// Read this at a registration SITE when a cluster has no working
+    /// real-bytecode fallback to drop to and so cannot be expressed as a rule
+    /// in `register` — the synthetic `FileInputStream`/`FileOutputStream`
+    /// `<init>` block in `native-io` is the case this exists for. A
+    /// `#[cfg(feature = "synthetic-jdk")]` guard is NOT equivalent and must
+    /// not be used for this: the Cargo feature decides what is COMPILED, the
+    /// launcher flag decides which CLASS LIBRARY loads, and a feature-enabled
+    /// binary run `--real-jdk` satisfies the cfg while facing real JDK
+    /// classes.
+    pub fn drops_real_layout_synthetic(&self) -> bool {
+        self.drop_real_layout_synthetic
+    }
+
     /// Set the category applied to all subsequent `register()` calls until
     /// changed again. Prefer [`with_category`](Self::with_category) for a
     /// scoped set/restore.
@@ -5986,6 +6035,103 @@ impl NativeMethodRegistry {
         // StringWriter bytecode is self-contained — it just delegates to a real
         // StringBuffer.
         if self.drop_real_layout_synthetic && class_name == "java/io/StringWriter" {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic CHARSET family.
+        //
+        // These natives fabricate their objects with the ABSTRACT class as the
+        // runtime class — `alloc_concurrent_synthetic("java/nio/charset/Charset", …)`
+        // and the same for `CharsetEncoder`. On HotSpot `StandardCharsets.UTF_8`
+        // is a `sun.nio.cs.UTF_8` and its encoder a `sun.nio.cs.UTF_8$Encoder`;
+        // here both were instances of the abstract classes themselves. Any
+        // method with no native to intercept it then resolves to an abstract
+        // declaration, and the ones that WERE intercepted read a synthetic
+        // 3-slot layout (`charset`/`averageBytesPerChar`/`maxBytesPerChar` at
+        // field indices 0/1/2) that a real coder does not have.
+        //
+        // The visible result was silent and wrong rather than an error: EVERY
+        // `String.getBytes` overload — no-arg, `(String)`, `(Charset)`, for
+        // UTF-8, ASCII and ISO-8859-1 alike — returned a correctly-SIZED,
+        // ZERO-FILLED array, and every decode round-trip failed with it.
+        //
+        // That is what made `regression-suite`'s `RCrypto` look like a crypto
+        // defect. It is not: the SHA-256 was computed correctly over the wrong
+        // input. `"abc".getBytes("UTF-8")` handed it three zero bytes, and
+        // sha256(00 00 00) is exactly the 709e80c8… digest the suite reported.
+        // `RStrings` failed the same way on its UTF-8 round-trip, so the two
+        // classes were one defect.
+        //
+        // All four names have to go together, and the order in which they were
+        // added is the evidence for that: dropping the coders alone moves the
+        // failure from zeros to `AbstractMethodError: CharsetEncoder.encodeLoop
+        // has no Code attribute`, because the Charset handing out the encoder
+        // is still a fabricated abstract instance; adding `Charset` fixes the
+        // no-arg and named overloads but leaves `getBytes(StandardCharsets.UTF_8)`
+        // failing on `Charset.newEncoder`, because the STANDARD CHARSET OBJECT
+        // is fabricated by its own registrations. With all four dropped the real
+        // `sun.nio.cs` classes are constructed and every overload matches
+        // HotSpot.
+        //
+        // Verified not to touch the shipping build: the default `cratonvm-cli`
+        // build measures the identical 30-passed/1-failed with and without this
+        // rule (the one failure, `RSocketChannelInterrupt`, is dev's own and
+        // predates it). Synthetic-jdk MODE is byte-identical too —
+        // `drop_real_layout_synthetic` is only ever set in a real-JDK arm.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/nio/charset/Charset"
+                    | "java/nio/charset/StandardCharsets"
+                    | "java/nio/charset/CharsetEncoder"
+                    | "java/nio/charset/CharsetDecoder"
+            )
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `FileChannel.open` FACTORY.
+        //
+        // `native_fc_open` (native-io) is the THIRD producer of an abstract
+        // `java/nio/channels/FileChannel` instance, and the one the suite's
+        // `RChannelInterrupt` actually reaches. The other two —
+        // `FileSystemProvider.newFileChannel`'s fallback and
+        // `RandomAccessFile.getChannel` — were audited first and are not on
+        // this path; that audit is why this took two rounds to find.
+        //
+        // It does `alloc_object(FileChannel, 2)` and writes an fd id and a
+        // position into slots 0/1. So `FileChannel.open(p, WRITE).getClass()`
+        // was `java.nio.channels.FileChannel` itself where HotSpot 25 answers
+        // `sun.nio.ch.FileChannelImpl`, and every method with no native to
+        // intercept it resolved to an ABSTRACT declaration:
+        // `AbstractMethodError: FileChannel.write(Ljava/nio/ByteBuffer;J)I has
+        // no Code attribute`. Only the no-position `write(ByteBuffer)` had a
+        // native at all. The same object also has no `interruptor`, which is
+        // the field `AbstractInterruptibleChannel.begin()` dereferences — the
+        // very defect `RChannelInterrupt` was written for.
+        //
+        // It is also wrong in a quieter way: the implementation is documented
+        // "simplified" and calls `open_read`, IGNORING the `OpenOption[]`
+        // entirely. `FileChannel.open(p, WRITE)` handed back a READ-ONLY fd.
+        //
+        // Dropping it is the whole fix because the real path is already built
+        // and already forced: `FileChannel.open` bytecode calls
+        // `FileSystemProvider.newFileChannel`, which is force-listed in
+        // `native_override.rs` and routed to the base-class registration, and
+        // that shim's RECONCILE-WITH-REAL block constructs a genuine
+        // `sun.nio.ch.FileChannelImpl` via its 7-arg `open`. Instrumenting that
+        // block previously produced NO output on this path — because
+        // `native_fc_open` intercepted the call before the provider was ever
+        // consulted. Its synthetic fallback stays in place, so a host where the
+        // real construction fails keeps exactly today's behaviour.
+        //
+        // Scoped to `open` BY NAME. The instance natives on this class
+        // (`read`/`write`/`position`/`size`/`close`) still serve that fallback
+        // object; they do not intercept a real `FileChannelImpl`, whose own
+        // declarations win because native dispatch keys on the resolved
+        // method's declaring class.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/nio/channels/FileChannel"
+            && method_name == "open"
+        {
             return;
         }
         // Real-JDK mode: drop the synthetic blocking/concurrent QUEUE family.

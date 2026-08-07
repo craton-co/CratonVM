@@ -1846,16 +1846,58 @@ fn native_bi_init_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Int(r)) => *r,
         _ => 10,
     };
+    // Unlike `toString(int)` — which IGNORES a bad radix and uses 10 — the
+    // `BigInteger(String, int)` CONSTRUCTOR throws. Measured on real JDK 25:
+    // radix 0, 1, -1, 37, 40 and Integer.MIN_VALUE all raise
+    // `NumberFormatException: Radix out of range`.
+    //
+    // This guard also closes a panic: the old body called
+    // `i128::from_str_radix(abs, radix as u32)`, and `from_str_radix` panics
+    // when the radix is outside 2..=36 (a negative radix widened to a huge
+    // `u32` besides). An ordinary `new BigInteger(s, 40)` from Java aborted
+    // the VM instead of throwing.
+    if !(2..=36).contains(&radix) {
+        return Err(RuntimeError::NumberFormatException {
+            message: "Radix out of range".to_string(),
+        }
+        .into());
+    }
     // Convert from given radix to decimal
     let decimal = if radix == 10 {
         s
     } else {
-        let (neg, abs) = bi_parse_sign(&s);
-        let val = i128::from_str_radix(abs, radix as u32).unwrap_or(0);
+        // Arbitrary precision. The old body narrowed through `i128` and then
+        // `.unwrap_or(0)`, so any value past `i128::MAX` — and any malformed
+        // string — silently became 0 where the JDK either keeps every digit
+        // or throws.
+        let (neg, abs) = match s.strip_prefix('+') {
+            // The JDK accepts a leading `+`; `bi_parse_sign` only knows `-`.
+            Some(rest) => (false, rest),
+            None => bi_parse_sign(&s),
+        };
+        if abs.is_empty() {
+            return Err(RuntimeError::NumberFormatException {
+                message: "Zero length BigInteger".to_string(),
+            }
+            .into());
+        }
+        let base = crate::bigint::BigInt::from_le_words(false, vec![radix as u32]);
+        let mut acc = crate::bigint::BigInt::zero();
+        for ch in abs.chars() {
+            let Some(d) = ch.to_digit(radix as u32) else {
+                return Err(RuntimeError::NumberFormatException {
+                    message: format!("For input string: \"{s}\" under radix {radix}"),
+                }
+                .into());
+            };
+            acc = acc
+                .mul(&base)
+                .add(&crate::bigint::BigInt::from_le_words(false, vec![d]));
+        }
         if neg {
-            format!("-{}", val)
+            acc.neg_value().to_decimal()
         } else {
-            val.to_string()
+            acc.to_decimal()
         }
     };
     bi_write_into(ctx, this, &decimal);
@@ -2039,6 +2081,84 @@ fn native_bi_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Object(Some(java_str))))
 }
 
+/// Render an unsigned `u32` in `radix` with no zero padding (`"0"` for zero).
+///
+/// `radix` must already be in `2..=36`; `char::from_digit` produces the
+/// lowercase digits the JDK uses.
+fn bi_radix_digits(mut v: u32, radix: u32) -> String {
+    if v == 0 {
+        return "0".to_string();
+    }
+    let mut buf: Vec<char> = Vec::new();
+    while v > 0 {
+        buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+        v /= radix;
+    }
+    buf.into_iter().rev().collect()
+}
+
+/// Render a limb-based [`crate::bigint::BigInt`] in `radix`, exactly as
+/// `java.math.BigInteger.toString(int)` does: SIGN-MAGNITUDE (a leading `-`,
+/// never a two's-complement bit pattern), lowercase digits, no leading zeros,
+/// `"0"` for zero.
+///
+/// `radix` must be in `2..=36` — callers substitute 10 for anything else, per
+/// the JDK contract.
+///
+/// The loop mirrors `BigInt::to_decimal`: repeated short division of the
+/// magnitude by the largest power of `radix` that still fits in a `u32`, so
+/// each pass yields `chunk_digits` digits at once. Arbitrary precision — the
+/// value is NEVER narrowed to a machine integer.
+fn bi_to_radix_string(v: &crate::bigint::BigInt, radix: u32) -> String {
+    debug_assert!((2..=36).contains(&radix));
+    if v.is_zero() {
+        return "0".to_string();
+    }
+    let mut chunk: u64 = radix as u64;
+    let mut chunk_digits: usize = 1;
+    while chunk * (radix as u64) <= u32::MAX as u64 {
+        chunk *= radix as u64;
+        chunk_digits += 1;
+    }
+    let mut work: Vec<u32> = v.mag_le().to_vec();
+    let mut chunks: Vec<u32> = Vec::new();
+    while !work.is_empty() {
+        let mut rem: u64 = 0;
+        for i in (0..work.len()).rev() {
+            let cur = (rem << 32) | (work[i] as u64);
+            work[i] = (cur / chunk) as u32;
+            rem = cur % chunk;
+        }
+        while work.last() == Some(&0) {
+            work.pop();
+        }
+        chunks.push(rem as u32);
+    }
+    let mut out = String::new();
+    if v.is_neg() {
+        out.push('-');
+    }
+    for (i, c) in chunks.iter().rev().enumerate() {
+        let digits = bi_radix_digits(*c, radix);
+        if i > 0 {
+            // Interior chunks are zero-padded to the full chunk width; only
+            // the most significant chunk may be short.
+            for _ in digits.len()..chunk_digits {
+                out.push('0');
+            }
+        }
+        out.push_str(&digits);
+    }
+    out
+}
+
+/// Registered exactly once, by the synthetic-jdk-only
+/// `register_biginteger_natives` — the lean real-JDK variant
+/// (`register_biginteger_arithmetic_overrides`) deliberately registers only
+/// `toString()`, so in real-JDK mode `BigInteger.toString(int)` stays on JDK
+/// bytecode. Verified by grepping every `register(.., "toString",
+/// "(I)Ljava/lang/String;", ..)` in the workspace; do the same before assuming
+/// this body is the one that runs.
 fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2048,21 +2168,28 @@ fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Int(r)) => *r,
         _ => 10,
     };
-    let a = bi_read(ctx, this);
+    // JDK contract (measured against real JDK 25): a radix outside
+    // `Character.MIN_RADIX`..`Character.MAX_RADIX` is IGNORED and radix 10 is
+    // used instead — `BigInteger.toString(int)` does NOT throw. Verified for
+    // radix 0, 1, -1, 37, 40, Integer.MIN_VALUE and Integer.MAX_VALUE. The
+    // substitution is shared with `Integer`/`Long.toString(…, int)`.
+    let radix: u32 = crate::java_radix_or_ten(radix);
     if radix == 10 {
         // RBIGDEC.1 — bi_read returns the decimal already; allocate a fresh
         // Java string instead of returning the raw slot 0 (which in real-JDK
         // mode is signum:I, not the value string).
+        let a = bi_read(ctx, this);
         let result = ctx.create_string(&a);
         return Ok(Some(Value::Object(Some(result))));
     }
-    let val: i128 = a.parse().unwrap_or(0);
-    let s = match radix {
-        2 => format!("{:b}", val),
-        8 => format!("{:o}", val),
-        16 => format!("{:x}", val),
-        _ => a,
-    };
+    // Sign-magnitude over the limbs. The previous body narrowed to `i128` and
+    // then used `format!("{:x}"/"{:o}"/"{:b}")`, which (a) printed the
+    // two's-complement pattern for negatives (`BigInteger.valueOf(-1)
+    // .toString(16)` answered 32 `f`s where the JDK says "-1"), (b) silently
+    // answered "0" for any value past `i128`, and (c) fell through to the
+    // DECIMAL string for every radix in 3..=36 other than 8 and 16.
+    let v = bi_read_int(ctx, this);
+    let s = bi_to_radix_string(&v, radix);
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -3510,4 +3637,134 @@ fn native_bd_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         h = h.wrapping_mul(31).wrapping_add(b as i32);
     }
     Ok(Some(Value::Int(h)))
+}
+
+/// `BigInteger.toString(int)` conformance.
+///
+/// Every expectation here was read off real JDK 25.0.3 (`java Oracle.java`),
+/// not derived from this implementation.
+#[cfg(test)]
+mod bi_to_string_radix_tests {
+    use super::bi_to_radix_string;
+    use crate::bigint::BigInt;
+    use crate::java_radix_or_ten;
+
+    fn s(dec: &str, radix: u32) -> String {
+        bi_to_radix_string(&BigInt::from_decimal(dec), radix)
+    }
+
+    /// The regression this file's `toString(int)` actually had: negatives were
+    /// rendered with `format!("{:x}", i128)`, i.e. the two's-complement bit
+    /// pattern. The JDK renders SIGN-MAGNITUDE.
+    #[test]
+    fn negatives_are_sign_magnitude_never_twos_complement() {
+        assert_eq!(s("-1", 16), "-1");
+        assert_eq!(s("-1", 2), "-1");
+        assert_eq!(s("-1", 8), "-1");
+        assert_eq!(s("-255", 16), "-ff");
+        assert_eq!(s("-5", 2), "-101");
+        assert_eq!(s("-255", 36), "-73");
+        // The exact shape the old body produced, spelled out so a revert is
+        // unmistakable rather than merely "not equal".
+        assert_ne!(s("-1", 16), "ffffffffffffffffffffffffffffffff");
+        assert_ne!(s("-1", 16), "ffffffff");
+    }
+
+    /// Radices other than 2/8/16 used to fall through to the DECIMAL string.
+    #[test]
+    fn every_legal_radix_is_honoured_not_just_two_eight_sixteen() {
+        assert_eq!(s("255", 3), "100110");
+        assert_eq!(s("255", 36), "73");
+        assert_eq!(s("255", 16), "ff");
+        assert_eq!(s("255", 8), "377");
+        assert_eq!(s("255", 2), "11111111");
+        assert_eq!(s("255", 10), "255");
+        // Both boundary radices.
+        assert_eq!(s("5", 2), "101");
+        assert_eq!(s("5", 36), "5");
+    }
+
+    /// The old body narrowed through `i128` with `.unwrap_or(0)`, so anything
+    /// past `i128::MAX` silently answered "0".
+    #[test]
+    fn values_past_i128_keep_every_digit() {
+        // 2^200 + 7
+        let huge = "1606938044258990275541962092341162602522202993782792835301383";
+        assert_eq!(
+            s(huge, 16),
+            "100000000000000000000000000000000000000000000000007"
+        );
+        assert_eq!(s(huge, 2).len(), 201);
+        assert_eq!(s(huge, 10), huge);
+        let big = "123456789012345678901234567890";
+        assert_eq!(s(big, 16), "18ee90ff6c373e0ee4e3f0ad2");
+        assert_eq!(s(big, 36), "byw97um9s91dlz68tsi");
+        assert_eq!(s(big, 8), "143564417755415637016711617605322");
+        assert_eq!(
+            s(&format!("-{big}"), 16),
+            "-18ee90ff6c373e0ee4e3f0ad2"
+        );
+        assert_eq!(s(&format!("-{big}"), 36), "-byw97um9s91dlz68tsi");
+    }
+
+    /// `Long.MIN_VALUE` has no positive counterpart — the classic overflow
+    /// trap. As a `BigInteger` it is just another magnitude, so assert it.
+    #[test]
+    fn long_min_value_and_zero() {
+        assert_eq!(s("-9223372036854775808", 16), "-8000000000000000");
+        assert_eq!(s("-9223372036854775808", 36), "-1y2p0ij32e8e8");
+        assert_eq!(
+            s("-9223372036854775808", 2),
+            "-1000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(s("9223372036854775807", 36), "1y2p0ij32e8e7");
+        for r in 2..=36u32 {
+            assert_eq!(s("0", r), "0", "zero in radix {r}");
+        }
+    }
+
+    /// Interior chunks must be zero-padded to the full chunk width; only the
+    /// most significant chunk may be short. A padding bug shows up as digits
+    /// going missing in the middle of a long rendering.
+    #[test]
+    fn chunk_padding_round_trips_through_decimal() {
+        for r in 2..=36u32 {
+            for dec in [
+                "1606938044258990275541962092341162602522202993782792835301383",
+                "123456789012345678901234567890",
+                "4294967296",
+                "18446744073709551616",
+                "-18446744073709551616",
+            ] {
+                let rendered = bi_to_radix_string(&BigInt::from_decimal(dec), r);
+                let (neg, abs) = match rendered.strip_prefix('-') {
+                    Some(rest) => (true, rest),
+                    None => (false, rendered.as_str()),
+                };
+                let mut acc = BigInt::zero();
+                let base = BigInt::from_le_words(false, vec![r]);
+                for ch in abs.chars() {
+                    let d = ch.to_digit(r).expect("digit in range");
+                    acc = acc.mul(&base).add(&BigInt::from_le_words(false, vec![d]));
+                }
+                if neg {
+                    acc = acc.neg_value();
+                }
+                assert_eq!(acc.to_decimal(), dec, "radix {r} round-trip of {dec}");
+            }
+        }
+    }
+
+    /// `toString(int)` IGNORES an out-of-range radix and uses 10 — it does not
+    /// throw and it does not clamp to 2/36. Measured on real JDK 25.
+    #[test]
+    fn out_of_range_radix_substitutes_ten() {
+        for bad in [0, 1, -1, 37, 40, i32::MIN, i32::MAX] {
+            assert_eq!(java_radix_or_ten(bad), 10, "radix {bad}");
+            assert_eq!(s("255", java_radix_or_ten(bad)), "255", "radix {bad}");
+            assert_eq!(s("-255", java_radix_or_ten(bad)), "-255", "radix {bad}");
+        }
+        assert_eq!(java_radix_or_ten(2), 2);
+        assert_eq!(java_radix_or_ten(36), 36);
+    }
 }

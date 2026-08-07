@@ -4913,7 +4913,7 @@ pub fn gc_scan_classvalue_cache_roots(
 /// `lang_system::gc_update_system_singleton_refs`.
 pub fn gc_update_classvalue_cache_refs(
     vm_identity: usize,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;
@@ -5950,7 +5950,26 @@ pub(crate) fn register_phase71_natives(registry: &mut NativeMethodRegistry) {
 // Wrapper utility extras (Integer, Long, Double, Float)
 // =============================================================================
 
-fn p71_fmt_radix(mut v: u64, radix: u32) -> String {
+/// Unsigned magnitude to a radix string, for the `toUnsignedString(…, int)`
+/// pair below.
+///
+/// Takes the RAW Java `int` radix and normalizes it here, through the single
+/// shared `crate::java_radix_or_ten`. The callers used to pre-chew it with
+/// `(*r as u32).clamp(2, 36)`, which was wrong twice over:
+///
+/// * `clamp` is not the JDK rule. Measured against real JDK 25,
+///   `Integer.toUnsignedString(255, 0)` is `"255"` — radix 10 is SUBSTITUTED
+///   for an out-of-range radix, never clamped. `clamp(2, 36)` turned radix 0
+///   into radix 2 and answered `"11111111"`.
+/// * `*r as u32` reinterprets a negative radix as a huge unsigned value, so
+///   `clamp` sent radix -1 to 36 rather than to 10.
+///
+/// Normalizing inside also makes this function total: `D[(v % radix)]` would
+/// index out of bounds (panic) for radix > 36, loop forever for radix 1, and
+/// divide by zero for radix 0. It is no longer possible to call it with any
+/// of those.
+fn p71_fmt_radix(mut v: u64, radix: i32) -> String {
+    let radix = crate::java_radix_or_ten(radix);
     if v == 0 {
         return "0".to_string();
     }
@@ -6015,8 +6034,9 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i as u32,
                 _ => 0,
             };
+            // Raw radix: `p71_fmt_radix` applies the JDK's substitute-10 rule.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
             };
             let s = ctx.create_string(&p71_fmt_radix(v as u64, rad));
@@ -6092,9 +6112,21 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => "0".into(),
             };
+            // The `parse*` family THROWS on an out-of-range radix (measured:
+            // "radix 0 less than Character.MIN_RADIX"); it does NOT substitute
+            // 10 the way `toString`/`toUnsignedString` do. The previous
+            // `clamp(2, 36)` silently parsed under the wrong base — and the
+            // clamp was load-bearing for memory safety too, since
+            // `u32::from_str_radix` PANICS outside 2..=36.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
+            };
+            let rad = match crate::lang_math::java_parse_radix_or_nfe(rad) {
+                Ok(r) => r,
+                Err(message) => {
+                    return Err(RuntimeError::NumberFormatException { message }.into())
+                }
             };
             Ok(Some(Value::Int(
                 u32::from_str_radix(s.trim(), rad).unwrap_or(0) as i32,
@@ -6196,8 +6228,9 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(l)) => *l as u64,
                 _ => 0,
             };
+            // Raw radix: `p71_fmt_radix` applies the JDK's substitute-10 rule.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
             };
             let s = ctx.create_string(&p71_fmt_radix(v, rad));
@@ -6256,9 +6289,17 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
                 _ => "0".into(),
             };
+            // See `parseUnsignedInt` above: throwing contract, and the clamp
+            // was also all that kept `u64::from_str_radix` from panicking.
             let rad = match args.get(1) {
-                Some(Value::Int(r)) => (*r as u32).clamp(2, 36),
+                Some(Value::Int(r)) => *r,
                 _ => 10,
+            };
+            let rad = match crate::lang_math::java_parse_radix_or_nfe(rad) {
+                Ok(r) => r,
+                Err(message) => {
+                    return Err(RuntimeError::NumberFormatException { message }.into())
+                }
             };
             Ok(Some(Value::Long(
                 u64::from_str_radix(s.trim(), rad).unwrap_or(0) as i64,
@@ -8564,5 +8605,194 @@ mod essential_vs_synthetic_jdk_coverage_audit {
                 report
             );
         }
+    }
+}
+
+/// `Integer.toUnsignedString(int, int)` / `Long.toUnsignedString(long, int)`
+/// and `parseUnsigned*(String, int)` radix conformance.
+///
+/// These four sites used `(*r as u32).clamp(2, 36)`. The clamp did keep them
+/// out of the panic (`p71_fmt_radix` indexes a 36-entry table;
+/// `from_str_radix` asserts 2..=36), but it answered the wrong question in
+/// both directions: `toUnsignedString` must SUBSTITUTE radix 10, and
+/// `parseUnsigned*` must THROW. Every expectation was read off real JDK
+/// 25.0.3, not derived from this implementation.
+#[cfg(test)]
+mod unsigned_radix_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    // NativeHeapAccess carries `read_string`; without it in scope, method
+    // resolution on the concrete MockNativeContext fails.
+    use cratonvm_native_api::{NativeContext, NativeHeapAccess, NativeMethodRegistry};
+
+    fn registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_p71_wrapper_extras(&mut r);
+        r
+    }
+
+    fn int_unsigned(v: i32, radix: i32) -> String {
+        let r = registry();
+        let f = r
+            .find(
+                "java/lang/Integer",
+                "toUnsignedString",
+                "(II)Ljava/lang/String;",
+            )
+            .expect("Integer.toUnsignedString(II) must be registered");
+        let mut ctx = mock_ctx();
+        match f(&mut ctx, &[Value::Int(v), Value::Int(radix)]).expect("never throws") {
+            Some(Value::Object(Some(o))) => ctx.read_string(o).expect("a readable String"),
+            other => panic!("expected a String, got {other:?}"),
+        }
+    }
+
+    fn long_unsigned(v: i64, radix: i32) -> String {
+        let r = registry();
+        let f = r
+            .find("java/lang/Long", "toUnsignedString", "(JI)Ljava/lang/String;")
+            .expect("Long.toUnsignedString(JI) must be registered");
+        let mut ctx = mock_ctx();
+        match f(&mut ctx, &[Value::Long(v), Value::Int(radix)]).expect("never throws") {
+            Some(Value::Object(Some(o))) => ctx.read_string(o).expect("a readable String"),
+            other => panic!("expected a String, got {other:?}"),
+        }
+    }
+
+    /// The exact case `clamp(2, 36)` got wrong: radix 0 clamps UP to 2 and
+    /// prints binary, where the JDK substitutes 10 and prints "255".
+    #[test]
+    fn out_of_range_radix_substitutes_ten_and_never_clamps() {
+        for bad in [0, 1, -1, 37, 40, i32::MIN, i32::MAX] {
+            assert_eq!(int_unsigned(255, bad), "255", "radix {bad}");
+            assert_eq!(int_unsigned(5, bad), "5", "radix {bad}");
+            assert_eq!(int_unsigned(0, bad), "0", "radix {bad}");
+            // Unsigned: -1 is 2^32-1, and MIN_VALUE is 2^31 — no "-" sign.
+            assert_eq!(int_unsigned(-1, bad), "4294967295", "radix {bad}");
+            assert_eq!(int_unsigned(i32::MIN, bad), "2147483648", "radix {bad}");
+            assert_eq!(long_unsigned(255, bad), "255", "radix {bad}");
+            assert_eq!(
+                long_unsigned(-1, bad),
+                "18446744073709551615",
+                "radix {bad}"
+            );
+            assert_eq!(
+                long_unsigned(i64::MIN, bad),
+                "9223372036854775808",
+                "radix {bad}"
+            );
+        }
+        // The two answers the old clamp produced, named so they cannot come
+        // back looking plausible: radix 0 -> 2, radix -1 -> 36.
+        assert_ne!(int_unsigned(255, 0), "11111111");
+        assert_ne!(int_unsigned(255, -1), "73");
+    }
+
+    /// Legal radices, including both boundaries and the unsigned wrap.
+    #[test]
+    fn legal_radices_including_both_boundaries() {
+        assert_eq!(int_unsigned(255, 2), "11111111");
+        assert_eq!(int_unsigned(255, 8), "377");
+        assert_eq!(int_unsigned(255, 16), "ff");
+        assert_eq!(int_unsigned(255, 36), "73");
+        assert_eq!(int_unsigned(-1, 16), "ffffffff");
+        assert_eq!(int_unsigned(-1, 36), "1z141z3");
+        assert_eq!(int_unsigned(i32::MIN, 36), "zik0zk");
+        assert_eq!(long_unsigned(-1, 16), "ffffffffffffffff");
+        assert_eq!(long_unsigned(-1, 36), "3w5e11264sgsf");
+        assert_eq!(long_unsigned(255, 2), "11111111");
+        assert_eq!(long_unsigned(255, 36), "73");
+    }
+
+    /// BOUNDED ON PURPOSE. `p71_fmt_radix` indexes a 36-byte digit table with
+    /// `v % radix`, divides by `radix`, and loops while `v > 0`: radix > 36
+    /// panics on the index, radix 0 divides by zero, radix 1 never terminates.
+    /// The old `clamp` was the only thing standing between ordinary Java code
+    /// and all three, and it is now gone — so this drives them on a worker
+    /// against a deadline, where a hang is a timeout and an abort is a channel
+    /// disconnect rather than a wedged suite.
+    #[test]
+    fn hostile_radices_terminate_within_a_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let out = vec![
+                p71_fmt_radix(255, 0),
+                p71_fmt_radix(255, 1),
+                p71_fmt_radix(255, -1),
+                p71_fmt_radix(255, 37),
+                p71_fmt_radix(255, i32::MIN),
+                p71_fmt_radix(255, i32::MAX),
+                p71_fmt_radix(0, 1),
+                p71_fmt_radix(u64::MAX, 1),
+                int_unsigned(255, 0),
+                int_unsigned(255, 1),
+                long_unsigned(255, 40),
+            ];
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("radix 0/1/negative/>36 must terminate and must not abort");
+        assert_eq!(
+            out,
+            vec![
+                "255",
+                "255",
+                "255",
+                "255",
+                "255",
+                "255",
+                "0",
+                "18446744073709551615",
+                "255",
+                "255",
+                "255",
+            ]
+        );
+        worker.join().expect("worker thread panicked");
+    }
+
+    /// `parseUnsignedInt` / `parseUnsignedLong` invert the rule: an
+    /// out-of-range radix is a `NumberFormatException`, not a substitution.
+    /// Bounded because the clamp that was removed here was also what kept
+    /// `from_str_radix`'s 2..=36 assertion from firing.
+    #[test]
+    fn parse_unsigned_rejects_hostile_radices_within_a_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let r = registry();
+            let pi = r
+                .find("java/lang/Integer", "parseUnsignedInt", "(Ljava/lang/String;I)I")
+                .expect("Integer.parseUnsignedInt(String,int) must be registered");
+            let pl = r
+                .find("java/lang/Long", "parseUnsignedLong", "(Ljava/lang/String;I)J")
+                .expect("Long.parseUnsignedLong(String,int) must be registered");
+            let mut ctx = mock_ctx();
+            let s = ctx.create_string("5");
+            let mut threw = Vec::new();
+            for radix in [0, 1, -1, 37, 40, i32::MIN, i32::MAX] {
+                let args = [Value::Object(Some(s)), Value::Int(radix)];
+                threw.push(pi(&mut ctx, &args).is_err());
+                threw.push(pl(&mut ctx, &args).is_err());
+            }
+            // Legal radices still parse.
+            let legal = [2i32, 10, 36]
+                .iter()
+                .map(|&radix| {
+                    let args = [Value::Object(Some(s)), Value::Int(radix)];
+                    pi(&mut ctx, &args).is_ok() && pl(&mut ctx, &args).is_ok()
+                })
+                .collect::<Vec<_>>();
+            let _ = tx.send((threw, legal));
+        });
+        let (threw, legal) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("parseUnsigned* with a bad radix must return Err, not abort");
+        assert!(
+            threw.iter().all(|&t| t),
+            "every out-of-range radix must throw NumberFormatException, got {threw:?}"
+        );
+        assert_eq!(legal, vec![true, true, true], "legal radices must still parse");
+        worker.join().expect("worker thread panicked");
     }
 }
