@@ -36498,6 +36498,25 @@ pub fn gc_overlay_roots_for_collection(
             .unwrap_or_else(|e| e.into_inner());
         index.get(&owner_addr).cloned().unwrap_or_default()
     };
+    gc_overlay_roots_for_collection_with_keys(owner_addr, owner_class_id, keys)
+}
+
+/// [`gc_overlay_roots_for_collection`] for a caller that has ALREADY read this
+/// owner's key list out of `overlay_owner_keys`.
+///
+/// Exists so a whole-index sweep can take that mutex once instead of once per
+/// owner. `gc_overlay_roots_for_matching_owners` locked it to list the owners
+/// and then re-locked it in here for every owner it had just listed — `1 + N`
+/// acquisitions and `N` key-set clones per minor GC, with `N` in the thousands
+/// for a Spring context. Visible as `overlay_forward` under
+/// `CRATONVM_DBG=gcpause`: 36–66 ms per young collection, and it does NOT
+/// shrink when the young generation does, so it grows as a share of the pause
+/// once the copying phases come down.
+pub fn gc_overlay_roots_for_collection_with_keys(
+    owner_addr: usize,
+    owner_class_id: Option<u32>,
+    keys: Vec<usize>,
+) -> Vec<ObjectRef> {
     if keys.is_empty() {
         return Vec::new();
     }
@@ -36608,25 +36627,30 @@ pub fn gc_overlay_roots_for_collection(
 pub fn gc_overlay_roots_for_matching_owners(
     owner_matches: &dyn Fn(usize) -> bool,
 ) -> Vec<ObjectRef> {
-    let owners: Vec<usize> = {
+    // ONE acquisition of `overlay_owner_keys`, taking each matching owner's key
+    // list in the same pass that selects it. This previously locked here to
+    // list the owners and then re-locked once per owner inside
+    // `gc_overlay_roots_for_collection` — `1 + N` acquisitions of one global
+    // mutex, plus `N` clones of the same key lists, on every minor GC.
+    let selected: Vec<(usize, Vec<usize>)> = {
         let index = overlay_owner_keys()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         index
-            .keys()
-            .copied()
-            .filter(|owner| owner_matches(*owner))
+            .iter()
+            .filter(|(owner, _)| owner_matches(**owner))
+            .map(|(owner, keys)| (*owner, keys.clone()))
             .collect()
     };
     let mut roots = Vec::new();
-    for owner in owners {
+    for (owner, keys) in selected {
         // `None`: this seed is address-based by construction — the predicate
         // selects owners by generation/range, and no class id is available for
         // them. It is already a deliberate over-approximation ("retain the
         // edges of every current owner"), so skipping the recycled-owner check
         // here only over-retains, which is this path's existing contract. The
         // precise per-owner rule runs in the BFS, which does pass a class id.
-        roots.extend(gc_overlay_roots_for_collection(owner, None));
+        roots.extend(gc_overlay_roots_for_collection_with_keys(owner, None, keys));
     }
     roots
 }
