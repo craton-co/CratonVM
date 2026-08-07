@@ -7283,14 +7283,18 @@ pub unsafe extern "C" fn jit_throw_aioobe(
                 std::ptr::read_unaligned(base.add(cratonvm_types::GC_AGE_OFFSET) as *const u8);
             let gc_flags =
                 std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_OFFSET) as *const u8);
-            let fwd_ptr = std::ptr::read_unaligned(
-                base.add(cratonvm_types::FORWARDING_PTR_OFFSET) as *const usize
+            // Forwarding folded into the mark word (32 -> 24 shrink), so this
+            // diagnostic reports the whole word: its 2-bit state distinguishes
+            // NEUTRAL / THIN_LOCKED / INFLATED / FORWARDED, which is strictly
+            // more than the old field could say.
+            let mark_word = std::ptr::read_unaligned(
+                base.add(cratonvm_types::MARK_WORD_OFFSET) as *const u64
             );
             eprintln!(
                 "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
 header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \
 array_length_field={arr_len_hdr} num_slots={num_slots} gc_age={gc_age} gc_flags={gc_flags} \
-forwarding_ptr={fwd_ptr:#x}"
+mark_word={mark_word:#x}"
             );
         } else {
             eprintln!(

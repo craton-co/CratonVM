@@ -249,23 +249,24 @@ documented round by round:
 
 ### Setup
 
-Measured 2026-07-11 on a GeForce RTX 2060 (sm_75) against HotSpot JDK 25
-(C2) and TornadoVM 4.0.1 (PTX backend, `@Parallel`/`@Reduce` + TaskGraph
-API). CratonVM offload is **opt-in and automatic within a narrow envelope**:
-the kernels below are plain static methods over primitive arrays with no
-annotations and no API at the call site, but they require a GPU build and an
-explicit flag (`cargo build --features gpu-driver`, run with `--gpu`), and
-anything the analyzer doesn't accept stays on the CPU. All timings are warm
-and include the full per-call H2D + kernel + D2H round-trip. There is no
-self-hosted GPU hardware CI, so these are point-in-time measurements rather
-than a continuously enforced budget.
+Measured 2026-08-02 (rerun; original pass was 2026-07-11) on a GeForce RTX
+2060 (sm_75, driver 591.86) against HotSpot JDK 25.0.3 (C2) and TornadoVM
+4.0.1 (PTX backend, `@Parallel`/`@Reduce` + TaskGraph API). CratonVM offload
+is **opt-in and automatic within a narrow envelope**: the kernels below are
+plain static methods over primitive arrays with no annotations and no API at
+the call site, but they require a GPU build and an explicit flag (`cargo
+build --features gpu-driver`, run with `--gpu`), and anything the analyzer
+doesn't accept stays on the CPU. All timings are warm and include the full
+per-call H2D + kernel + D2H round-trip. There is no self-hosted GPU hardware
+CI, so these are point-in-time measurements rather than a continuously
+enforced budget.
 
-| Kernel (N = 2²⁴)                         | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
-|------------------------------------------|------------|---------------|--------------|------------|--------------|
-| Integer div-chain (48 divs/elem)         | 1,910 ms   | 28 ms         | **9 ms**     | **212x**   | **3.1x**     |
-| Double div-chain (64 divs/elem)          | 1,508 ms   | 129 ms        | **91 ms**    | **16.6x**  | **1.4x**     |
-| 96 multiply-adds/elem (AVX2 on CPU)      | 8 ms       | 17 ms         | 11 ms        | 0.7x       | 1.5x         |
-| Dot-product reduction (int·int → long)   | 7 ms       | unimplemented | 18 ms        | 0.4x       | n/a          |
+| Kernel (N = 2²⁴)                                    | HotSpot C2 | TornadoVM GPU | CratonVM GPU | vs HotSpot | vs TornadoVM |
+|-------------------------------------------------------|------------|---------------|--------------|------------|--------------|
+| Integer div-chain (48 divs/elem)                       | 2,146 ms   | 26 ms         | **11 ms**    | **195x**   | **2.4x**     |
+| Double div-chain (64 divs/elem)                        | 1,780 ms   | 128 ms        | **95 ms**    | **18.7x**  | **1.3x**     |
+| 128 multiply-adds/elem (data-dependent multiplier)     | 1,300 ms   | 27 ms         | **8 ms**     | **163x**   | **3.4x**     |
+| Dot-product reduction (int·int → long, x300/elem)      | 1,172 ms   | unimplemented | **12 ms**    | **98x**    | n/a          |
 
 Notes:
 
@@ -276,14 +277,73 @@ Notes:
   every size (`div.rn.f64` is IEEE-754 round-to-nearest, same as x86
   `vdivpd`); TornadoVM's diverges slightly — its PTX backend doesn't
   guarantee bit-exact division.
-- TornadoVM 4.0.1 throws `TornadoInternalError: unimplemented` on the
-  equivalent `@Reduce`-over-`LongArray` kernel; CratonVM's automatic
-  `--gpu` path handles it (slowly — a proper tree/shared-memory reduction is
-  an open item).
-- The multiply-add and dot-product rows are kept as honest counter-cases:
-  CPU AVX2 stays competitive on MAD-dominated kernels at every size, and a
-  single atomic accumulator doesn't get relatively cheaper with more
-  elements.
+- **2026-08-03 root-caused: TornadoVM's `unimplemented` is a standing gap in
+  mixed-type reductions, not a version/driver issue.** `TornadoSnippetReflectionProvider
+  .forBoxed` (what the whole stack trace bottoms out in) is an unconditional
+  stub — `unimplemented(); return null;` — in both the TornadoVM 4.0.1 jar on
+  this box *and* the current `master` branch on GitHub, so upgrading would not
+  fix it. Isolated the exact trigger with three minimal repros on this same
+  GPU: a single-array `LongArray` sum reduction works; a two-array
+  `LongArray`+`LongArray` sum reduction (no cast, no multiply) works; a
+  single-array `IntArray` reduced into a `LongArray` accumulator with one
+  `(long) a.get(i)` widening cast fails with the identical stack trace. So the
+  precise gap is **a `@Reduce` kernel whose per-element expression needs a
+  primitive widening conversion (`int`→`long`) before accumulating into a
+  differently-typed reduce array** — not "long reductions" or "two-array
+  reductions" in general. `GpuDotBench.dotReduce`'s `int·int → long` shape
+  (needed to avoid `int` overflow in the product) is exactly that mixed-type
+  case, and there's no workaround that preserves what the row measures, so
+  "unimplemented" here is a real, durable TornadoVM limitation, confirmed by
+  reading the source rather than assumed from the error message. CratonVM's
+  automatic `--gpu` path handles the same reduction and completes the full
+  dispatch-and-readback (an `is_reduction: true` kernel), not just a CPU
+  fallback as the 2026-07-11 doc note assumed.
+- **2026-08-02 correction — the multiply-add row's old "honest counter-case"
+  framing was a compiler artifact, not a real result.** The previous kernel
+  used a *compile-time-constant* multiplier (`x = x*1103+12345`, repeated 96
+  times); composing an affine map with itself under constant coefficients is
+  itself affine, and HotSpot C2's GVN/reassociation folds the whole chain
+  into a single multiply+add with closed-form coefficients regardless of the
+  unroll count — confirmed by unrolling the *old* kernel to 6,528 lines and
+  seeing under 2x change in wall time. The benchmark was silently
+  memory-bandwidth-bound on the HotSpot side, not compute-bound, which is
+  why AVX2 looked "competitive." Sourcing the multiplier from a second
+  per-element array (`m = b[i]`, the same trick `GpuDivChain` already uses
+  for its divisor) removes the closed form: HotSpot now does genuine work
+  and the row flips from "GPU loses" (0.7x) to another 163x GPU win. The
+  dot-product row's swing (0.4x → 98x) is different in kind: `sum += p` was
+  never foldable (both operands are runtime array reads), so scaling its
+  per-element repeat count from 1x to 300x — needed to push HotSpot over 1
+  second — genuinely shifts the kernel from launch/PCIe-overhead-bound (GPU
+  loses on a single multiply-add) to compute-bound (GPU wins). Both rows'
+  `TornadoGpuCompute`/`GpuWarm`/`GpuCompute` and `GpuDotBench` sources carry
+  `AUDIT 2026-08-02` comments with the full detail and the measurements that
+  back them up.
+- **2026-08-03 FIXED: dot-product CratonVM-GPU background `cudarc` panic.**
+  Every `--gpu` run of `GpuDotBench` used to also print one `cudarc` panic per
+  completed dispatch to stderr — `DriverError(CUDA_ERROR_NOT_PERMITTED,
+  "operation not permitted")` out of cudarc's `CudaStream::drop`. Root cause:
+  `dispatch_async`'s `cuLaunchHostFunc` completion callback
+  (`vm/src/runtime/offload.rs`) cloned `Arc<StreamSubmission>` for its own use
+  and let that clone drop locally at the end of the closure. For a
+  synchronous (non-Future-API) dispatch — exactly `GpuDotBench`'s transparent
+  `--gpu` path, which never calls `register_submission` — that clone reliably
+  ends up the *last* strong reference by the time the driver fires the
+  callback, so its drop (cascading into `cuda_bridge::Stream`'s and cudarc's
+  `CudaStream`'s destructors, which issue a real CUDA driver call) ran from
+  inside the callback — forbidden per CUDA's own `cuLaunchHostFunc` rules
+  (and per this codebase's own doc comment on `Stream::add_host_callback`).
+  Fix: the completion reaper's queue (`REAPER_QUEUE`) now carries the
+  `Arc<StreamSubmission>` alongside the handle, so the callback *moves*
+  ownership into the queue instead of dropping it locally — the eventual
+  final drop, if any, now happens on the reaper thread (an ordinary thread,
+  where CUDA driver calls are allowed) rather than inside the CUDA callback.
+  Verified: 3 repeated `RUST_BACKTRACE=1` trials of the exact repro command
+  with zero panics, correct `DOT_CHECKSUM == DOT_REF` and unchanged ~12ms
+  timing every time; `cargo test -p cratonvm-vm --features gpu-offload --lib
+  offload` (35 tests, including the reaper-specific ones) still passes; the
+  other three kernels (div-chain, float-div-chain, warm MAD) re-verified with
+  matching checksums and no regressions.
 
 Full GPU results — more input sizes, `ldc`-constant kernels, cold-start
 numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in

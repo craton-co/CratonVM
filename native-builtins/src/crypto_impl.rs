@@ -1397,6 +1397,69 @@ pub struct BigUint {
     pub limbs: Vec<u32>,
 }
 
+/// Knuth Algorithm D step D3 — estimate one quotient digit.
+///
+/// Given the top two limbs of the current partial remainder
+/// (`u_high:u_mid`), the limb below them (`u_low`), and the divisor's top two
+/// limbs (`v_top:v_top2`), return `q_hat`: the estimate of the next quotient
+/// digit, guaranteed by D1's normalisation (`v_top >= 2^31`) to be either
+/// exact or 1 too large.
+///
+/// # Why this is a separate function
+///
+/// It is the only arithmetic in the file that can exceed 64 bits, and it is
+/// almost impossible to steer from the outside: reaching the `u_high == v_top`
+/// branch through `div_rem` means arranging for a *partial remainder* several
+/// digits into the division to have a particular top limb. That is why the
+/// overflow below reached production as a once-in-a-few-runs failure of an RSA
+/// test and survived a 400,000-pair random sweep of `div_rem` without
+/// reproducing once. Split out, the branch is three arguments away.
+///
+/// # The overflow this fixes
+///
+/// The previous form was
+///
+/// ```text
+/// while q_hat >= base || q_hat * v_top2 > base * r_hat + u_low {
+///     q_hat -= 1; r_hat += v_top;
+///     if r_hat >= base { break; }
+/// }
+/// ```
+///
+/// which is Knuth's loop with the `r_hat < b` guard moved from *in front of
+/// the test* to *after the body*. That is equivalent on every iteration but
+/// the first — and on the first, `r_hat` is only bounded by `base` on the
+/// `u_high != v_top` branch. On the other branch `r_hat` starts at
+/// `u_mid + v_top`, which reaches ~2^33, and `base * r_hat` is then 2^32 ×
+/// 2^33. Debug builds panicked with "attempt to multiply with overflow";
+/// **release builds wrapped**, so the comparison answered nonsense, the
+/// correction was skipped, and the division returned a wrong quotient with no
+/// symptom at all.
+///
+/// Restoring Knuth's guard fixes it; computing in `u128` as well means the
+/// bound no longer has to be re-derived by whoever edits this next.
+fn estimate_quotient_digit(u_high: u64, u_mid: u64, u_low: u64, v_top: u64, v_top2: u64) -> u64 {
+    const BASE: u64 = 1u64 << 32;
+    debug_assert!(v_top >= 1 << 31, "D1 must normalise the divisor first");
+    let dividend = (u_high << 32) | u_mid;
+    let mut q_hat = if u_high >= v_top {
+        BASE - 1
+    } else {
+        dividend / v_top
+    };
+    let mut r_hat = dividend - q_hat * v_top;
+    // Knuth's guard, in Knuth's position: `BASE * r_hat` is never formed for
+    // an `r_hat` that does not fit beside it.
+    while r_hat < BASE
+        && u128::from(q_hat) * u128::from(v_top2)
+            > u128::from(BASE) * u128::from(r_hat) + u128::from(u_low)
+    {
+        q_hat -= 1;
+        r_hat += v_top;
+    }
+    q_hat
+}
+
 impl BigUint {
     pub const ZERO: BigUint = BigUint { limbs: Vec::new() };
 
@@ -1655,26 +1718,16 @@ impl BigUint {
 
         for j in (0..=m).rev() {
             // D3. Calculate q_hat — estimate of the j-th quotient digit.
-            let u_high = u.limbs[j + n] as u64;
-            let u_mid = u.limbs[j + n - 1] as u64;
-            let dividend = (u_high << 32) | u_mid;
-            let mut q_hat = if u_high == v_top {
-                base - 1
-            } else {
-                dividend / v_top
-            };
-            let mut r_hat = dividend - q_hat * v_top;
-
-            // Correction: if q_hat * v_top2 > base * r_hat + u[j+n-2], reduce q_hat.
-            // The two checks are sufficient for a tight estimate.
-            let u_low = u.limbs[j + n - 2] as u64;
-            while q_hat >= base || q_hat * v_top2 > base * r_hat + u_low {
-                q_hat -= 1;
-                r_hat += v_top;
-                if r_hat >= base {
-                    break;
-                }
-            }
+            // See `estimate_quotient_digit`: the estimate can exceed 64 bits
+            // and is nearly unreachable from outside, so it lives on its own
+            // where a unit test can aim at it directly.
+            let mut q_hat = estimate_quotient_digit(
+                u.limbs[j + n] as u64,
+                u.limbs[j + n - 1] as u64,
+                u.limbs[j + n - 2] as u64,
+                v_top,
+                v_top2,
+            );
 
             // D4. Multiply and subtract: u[j..j+n+1] -= q_hat * v.
             let mut borrow: i64 = 0;
@@ -5953,6 +6006,169 @@ mod tests {
         assert_eq!(r.to_bytes_be(), BigUint::from_u64(1).to_bytes_be());
     }
 
+    /// Build a `BigUint` from little-endian limbs, so a test can aim at an
+    /// exact internal shape rather than hoping a decimal literal lands on one.
+    fn biguint_from_limbs(limbs: &[u32]) -> BigUint {
+        let mut n = BigUint {
+            limbs: limbs.to_vec(),
+        };
+        n.normalize();
+        n
+    }
+
+    /// `u = q*v + r` and `0 <= r < v`, the only thing division has to promise.
+    fn assert_div_rem_identity(u: &BigUint, v: &BigUint) {
+        let (q, r) = u.div_rem(v);
+        assert_eq!(
+            q.mul(v).add(&r).to_bytes_be(),
+            u.to_bytes_be(),
+            "q*v + r != u for u={:?} v={:?} (q={:?} r={:?})",
+            u.limbs,
+            v.limbs,
+            q.limbs,
+            r.limbs
+        );
+        assert_eq!(
+            r.cmp(v),
+            std::cmp::Ordering::Less,
+            "remainder {:?} not < divisor {:?}",
+            r.limbs,
+            v.limbs
+        );
+    }
+
+    /// Knuth D's quotient-digit estimate must not overflow, on the branch
+    /// that can only be reached from inside a division.
+    ///
+    /// `r_hat` is bounded by `base` only on the `u_high < v_top` branch. On
+    /// the other one it starts at `u_mid + v_top`, which reaches ~2^33, and
+    /// the old loop computed `base * r_hat` before testing whether `r_hat` was
+    /// in range at all. `2^32 * 2^33` does not fit: debug builds panicked,
+    /// **release builds wrapped** and skipped a correction that was due.
+    ///
+    /// Reaching this through `div_rem` means steering a *partial remainder*
+    /// several digits in — a 400,000-pair random sweep never did it once, and
+    /// neither did three full RSA keygen/encrypt/decrypt cycles. Calling the
+    /// estimate directly makes it three arguments.
+    ///
+    /// Each case is checked against the definition of the estimate rather than
+    /// a hard-coded answer: `q_hat` must be the true quotient digit or exactly
+    /// one more, which is all D3 promises and all D4/D6 need.
+    #[test]
+    fn qhat_estimate_is_exact_or_one_high_without_overflowing() {
+        const BASE: u128 = 1 << 32;
+        // `u_high == v_top` — the branch that overflowed — plus `u_high` above
+        // and below it, at the extremes of `u_mid`/`u_low`/`v_top2`.
+        let v_tops = [0x8000_0000u64, 0xFFFF_FFFF, 0xC000_0001];
+        let extremes = [0u64, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF];
+        for v_top in v_tops {
+            for v_top2 in extremes {
+                for u_mid in extremes {
+                    for u_low in extremes {
+                        for u_high in [v_top, v_top - 1, v_top.saturating_sub(0x1234_5678), 0] {
+                            let q_hat =
+                                estimate_quotient_digit(u_high, u_mid, u_low, v_top, v_top2);
+                            assert!(q_hat < BASE as u64, "q_hat must fit a limb: {q_hat:#x}");
+                            // The true digit, computed in 128-bit with the full
+                            // three-limb numerator and two-limb divisor.
+                            let numerator =
+                                ((u_high as u128) << 64) | ((u_mid as u128) << 32) | u_low as u128;
+                            let divisor = ((v_top as u128) << 32) | v_top2 as u128;
+                            let exact = numerator / divisor;
+                            let exact = exact.min(BASE - 1);
+                            assert!(
+                                q_hat as u128 == exact || q_hat as u128 == exact + 1,
+                                "q_hat {q_hat:#x} is neither the true digit {exact:#x} nor one more \
+                                 (u_high={u_high:#x} u_mid={u_mid:#x} u_low={u_low:#x} \
+                                 v_top={v_top:#x} v_top2={v_top2:#x})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The exact operands that overflowed: `u_high == v_top` with `u_mid`
+    /// large enough that `u_mid + v_top` crosses 2^32. Before the fix this
+    /// panicked with "attempt to multiply with overflow" in a debug build.
+    #[test]
+    fn qhat_estimate_survives_the_operands_that_panicked() {
+        for v_top in [0x8000_0000u64, 0xABCD_EF01, 0xFFFF_FFFF] {
+            for u_mid in [0xFFFF_FFFFu64, 0x8000_0000, 0xC000_0000] {
+                let q_hat = estimate_quotient_digit(v_top, u_mid, 0xFFFF_FFFF, v_top, 0xFFFF_FFFF);
+                assert!(q_hat < 1u64 << 32);
+            }
+        }
+    }
+
+    /// The `div_rem` shapes the estimate feeds, end to end.
+    #[test]
+    fn biguint_div_rem_qhat_estimate_does_not_overflow() {
+        let v = biguint_from_limbs(&[0x0000_0001, 0x8000_0000]);
+        for u_mid in [0x8000_0000u32, 0xFFFF_FFFF, 0xC000_0000] {
+            for u_low in [0u32, 1, 0xFFFF_FFFF] {
+                let u = biguint_from_limbs(&[u_low, u_mid, 0x8000_0000]);
+                assert_div_rem_identity(&u, &v);
+                // And with a trailing limb, so the loop runs for more than one
+                // quotient digit and `u` has been mutated by D4 before the
+                // estimate is made again.
+                let u = biguint_from_limbs(&[u_low, u_mid, 0x8000_0000, 0x7FFF_FFFF]);
+                assert_div_rem_identity(&u, &v);
+            }
+        }
+    }
+
+    /// Sweep divisor/dividend shapes deterministically.
+    ///
+    /// The defect above reached production as an intermittent failure of
+    /// `rsa_cipher_roundtrip_all_paddings`, because whether it fires depends
+    /// on the limb values of a randomly generated key — so the coverage that
+    /// would have caught it cannot itself depend on random input. This walks a
+    /// fixed LCG instead: same pairs on every run, on every machine.
+    #[test]
+    fn biguint_div_rem_identity_over_many_shapes() {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+        for v_limbs in 2..=6usize {
+            for u_limbs in v_limbs..=10usize {
+                for _ in 0..40 {
+                    let v: Vec<u32> = (0..v_limbs).map(|_| next()).collect();
+                    let u: Vec<u32> = (0..u_limbs).map(|_| next()).collect();
+                    let v = biguint_from_limbs(&v);
+                    let u = biguint_from_limbs(&u);
+                    if v.is_zero() {
+                        continue;
+                    }
+                    assert_div_rem_identity(&u, &v);
+                }
+            }
+        }
+    }
+
+    /// The extremes of the estimate: an all-ones divisor, a divisor whose top
+    /// limb is the smallest value that still normalises to itself, and top
+    /// limbs that make `q_hat` land on `base - 1`.
+    #[test]
+    fn biguint_div_rem_extreme_limb_values() {
+        let cases: &[(&[u32], &[u32])] = &[
+            (&[0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF], &[0xFFFF_FFFF, 0xFFFF_FFFF]),
+            (&[0, 0, 0xFFFF_FFFF], &[0xFFFF_FFFF, 0x8000_0000]),
+            (&[0xFFFF_FFFF, 0, 0x8000_0000], &[0, 0x8000_0000]),
+            (&[1, 0xFFFF_FFFF, 0xFFFF_FFFF], &[0xFFFF_FFFF, 0xFFFF_FFFF]),
+            (&[0, 0, 0, 1], &[1, 1]),
+            (&[0xFFFF_FFFF; 8], &[0x0000_0001, 0x8000_0000]),
+        ];
+        for (u, v) in cases {
+            assert_div_rem_identity(&biguint_from_limbs(u), &biguint_from_limbs(v));
+        }
+    }
+
     #[test]
     fn biguint_modpow() {
         // 3^13 mod 50 = 1594323 mod 50 = 23
@@ -6900,3 +7116,4 @@ mod tests {
         assert!(Rsa::try_verify_sha256(&refused, msg, &sig).is_err());
     }
 }
+

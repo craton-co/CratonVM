@@ -12,10 +12,11 @@ use std::sync::atomic::AtomicU64;
 
 /// Size of `ObjectHeader` in bytes. Must be a multiple of 8 for alignment.
 ///
-/// The array length and object shape share a word, and age/flags occupy the
-/// first word's two spare bytes, keeping both forwarding and lock words while
-/// avoiding the former 8 bytes of padding/redundant shape state.
-pub const HEADER_SIZE: usize = 32;
+/// The array length and object shape share a word, age/flags occupy the first
+/// word's two spare bytes, and GC forwarding rides in the mark word's
+/// `MARK_FORWARDED` state rather than in a field of its own — the 32 -> 24
+/// shrink of 2026-08-06.
+pub const HEADER_SIZE: usize = 24;
 
 // JIT x64 emits array element offsets as a *signed* disp8 whose value is
 // HEADER_SIZE. If HEADER_SIZE exceeds 127 the disp8 wraps negative and the
@@ -117,9 +118,9 @@ pub const FORWARDING_PTR_MASK: u64 = !MARK_STATE_MASK;
 /// Byte offset of `mark_word` within `ObjectHeader`. Documented for downstream
 /// agents (JIT lock fast-path) so they can emit direct atomic loads / CAS.
 ///
-/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(32) - 8 = 24. The
+/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(24) - 8 = 16. The
 /// `_const_check_mark_word_offset` assertion below pins this at compile time.
-pub const MARK_WORD_OFFSET: usize = 24;
+pub const MARK_WORD_OFFSET: usize = 16;
 
 /// Size of each field/array element slot in bytes.
 /// Must be >= size_of::<Value>() (which is 16 bytes: 8 for the payload + 8 for the discriminant).
@@ -229,7 +230,6 @@ pub const ARRAY_LENGTH_OFFSET: usize = 12;
 pub const NUM_SLOTS_OFFSET: usize = 12;
 pub const GC_AGE_OFFSET: usize = 6;
 pub const GC_FLAGS_OFFSET: usize = 7;
-pub const FORWARDING_PTR_OFFSET: usize = 16;
 
 /// Byte offset of the `identity_hash_code` field within [`ObjectHeader`].
 ///
@@ -417,14 +417,18 @@ pub struct ObjectHeader {
     /// Arrays store their length directly. Objects store the full 32-bit
     /// hierarchy-wide instance-field count.
     pub shape: u32,
-    /// Forwarding pointer for GC. When an object is copied during collection,
-    /// the old header's forwarding_ptr is set to the new location.
-    /// Null means the object has not been forwarded.
-    pub forwarding_ptr: *mut u8,
-    /// Mark word -- thin-lock owner / recursion / inflated-monitor pointer.
-    /// State encoded in low 2 bits; see `MARK_NEUTRAL` / `MARK_THIN_LOCKED` /
-    /// `MARK_INFLATED`. Always at byte offset `MARK_WORD_OFFSET` (= 24).
+    /// Mark word -- thin-lock owner / recursion / inflated-monitor pointer /
+    /// **GC forwarding target**. State encoded in low 2 bits; see
+    /// `MARK_NEUTRAL` / `MARK_THIN_LOCKED` / `MARK_INFLATED` /
+    /// `MARK_FORWARDED`. Always at byte offset `MARK_WORD_OFFSET` (= 16).
     /// Initialized to `MARK_NEUTRAL` by `ObjectHeader::new`.
+    ///
+    /// The dedicated `forwarding_ptr` field that used to sit at offset 16 was
+    /// deleted on 2026-08-06: its state had a designed, tested and unused
+    /// encoding here since 2026-07-26, and it was the ONLY reclaimable 8 bytes
+    /// in the header (folding `identity_hash_code` instead buys zero, because
+    /// `AtomicU64` forces 8-byte alignment and the 4 bytes reappear as
+    /// padding). See `docs/internal/arch-2026-07-26/header-shrink.md`.
     pub mark_word: AtomicU64,
 }
 
@@ -490,7 +494,6 @@ impl ObjectHeader {
             gc_flags: 0,
             identity_hash_code,
             shape,
-            forwarding_ptr: std::ptr::null_mut(),
             mark_word: AtomicU64::new(MARK_NEUTRAL),
         }
     }
@@ -533,13 +536,54 @@ impl ObjectHeader {
     }
 
     /// Returns true if this object has been forwarded by the GC.
+    ///
+    /// Reads the mark word's `MARK_FORWARDED` tag. Until 2026-08-06 this read a
+    /// dedicated `forwarding_ptr` field; folding it into the mark word — whose
+    /// `0b11` state had been designed, tested and left without a producer since
+    /// 2026-07-26 — is the whole of the 32 → 24 header shrink.
+    ///
+    /// `Relaxed` is the right ordering for the same reason the field read was
+    /// unordered: the collector installs forwarding inside a stop-the-world
+    /// pause, and the pause's own handshake is the acquire/release edge.
     pub fn is_forwarded(&self) -> bool {
-        !self.forwarding_ptr.is_null()
+        Self::is_forwarded_mark(self.mark_word.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Returns the forwarding address, or null if not forwarded.
+    ///
+    /// Null for every non-`FORWARDED` state, which preserves the field's
+    /// contract exactly: `NEUTRAL` read as a null field, and a `THIN_LOCKED` or
+    /// `INFLATED` payload must never be handed back as a relocation target.
     pub fn forwarding_address(&self) -> *mut u8 {
-        self.forwarding_ptr
+        let mark = self.mark_word.load(std::sync::atomic::Ordering::Relaxed);
+        if Self::is_forwarded_mark(mark) {
+            Self::forwarding_target(mark)
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    /// Install `target` as this object's relocation address.
+    ///
+    /// # The ordering contract this inherits
+    ///
+    /// Writing `FORWARDED` **destroys** whatever lock state the mark word held,
+    /// so the caller must have copied the object FIRST — the destination then
+    /// carries the intact `NEUTRAL` / `THIN_LOCKED` / `INFLATED` word — and
+    /// clobber the **source** only afterwards. For an `INFLATED` source this
+    /// TRANSFERS the single strong `Arc<Monitor>` reference the mark word owns
+    /// to the destination copy; releasing it against the source afterwards
+    /// leaves the live destination with a dangling `Monitor*`.
+    ///
+    /// This obligation did not exist while forwarding lived in its own field
+    /// (the two words were distinct), and it is the reason the encoding was
+    /// landed inert in 2026-07-26 rather than wired up opportunistically. See
+    /// `docs/internal/arch-2026-07-26/header-shrink.md` §4.3.
+    pub fn set_forwarding_address(&self, target: *mut u8) {
+        self.mark_word.store(
+            Self::make_forwarded(target as usize),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Returns true if this object is in the old generation.
@@ -680,7 +724,7 @@ mod tests {
 
     #[test]
     fn header_size_is_correct() {
-        assert_eq!(HEADER_SIZE, 32);
+        assert_eq!(HEADER_SIZE, 24);
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
         assert_eq!(std::mem::align_of::<ObjectHeader>(), 8);
         assert_eq!(std::mem::offset_of!(ObjectHeader, class_id), 0);
@@ -693,10 +737,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ObjectHeader, gc_flags), GC_FLAGS_OFFSET);
         assert_eq!(std::mem::offset_of!(ObjectHeader, identity_hash_code), 8);
         assert_eq!(std::mem::offset_of!(ObjectHeader, shape), NUM_SLOTS_OFFSET);
-        assert_eq!(
-            std::mem::offset_of!(ObjectHeader, forwarding_ptr),
-            FORWARDING_PTR_OFFSET
-        );
         assert_eq!(
             std::mem::offset_of!(ObjectHeader, mark_word),
             MARK_WORD_OFFSET
@@ -988,9 +1028,10 @@ mod tests {
 
     #[test]
     fn object_header_forwarded() {
-        let mut header = make_header();
-        let target = 0xABCD_0000_u64 as *mut u8;
-        header.forwarding_ptr = target;
+        let header = make_header();
+        let cell: u64 = 0;
+        let target = &cell as *const u64 as *mut u8;
+        header.set_forwarding_address(target);
         assert!(header.is_forwarded());
         assert_eq!(header.forwarding_address(), target);
     }
@@ -1167,8 +1208,10 @@ mod tests {
     #[test]
     fn mark_word_offset_is_stable() {
         // The JIT lock fast-path hardcodes this offset; if it ever changes
-        // both the constant and every emitter must be updated together.
-        assert_eq!(MARK_WORD_OFFSET, 24);
+        // both the constant and every emitter must be updated together. Moved
+        // 24 -> 16 by the 2026-08-06 header shrink; every emitter reaches it
+        // through this constant, which is why that move needed no codegen edit.
+        assert_eq!(MARK_WORD_OFFSET, 16);
         assert_eq!(
             std::mem::offset_of!(ObjectHeader, mark_word),
             MARK_WORD_OFFSET
@@ -1269,8 +1312,7 @@ mod tests {
             + 1              // gc_flags
             + 4              // identity_hash_code
             + 4              // shape
-            + 8              // forwarding_ptr
-            + 8; // mark_word
+            + 8; // mark_word (also the GC forwarding slot since 2026-08-06)
         assert_eq!(
             field_bytes, HEADER_SIZE,
             "ObjectHeader is fully packed; a shrink must delete a field, not padding"
@@ -1618,13 +1660,14 @@ mod tests {
         assert_eq!(ObjectHeader::forwarding_target(m) as usize, dest_addr);
     }
 
-    /// While `forwarding_ptr` remains a real field, it and the mark word are
-    /// independent. The shrink's second pass replaces the field with the mark
-    /// word; until then, a header can carry both, and `is_forwarded()` must
-    /// keep answering from the field alone.
+    /// This test used to pin the OPPOSITE: that `is_forwarded()` answered from
+    /// the field while the mark-word encoding sat unadopted, because a split
+    /// answer would have meant two collectors disagreeing about liveness. The
+    /// 2026-08-06 shrink adopted it, so the same hazard now reads the other way
+    /// — there must be exactly ONE source of truth, and it is the mark word.
     #[test]
-    fn field_forwarding_and_mark_word_forwarding_coexist_today() {
-        let mut header = make_header();
+    fn forwarding_is_answered_only_by_the_mark_word() {
+        let header = make_header();
         assert!(!header.is_forwarded());
 
         let dest: u64 = 0;
@@ -1632,25 +1675,48 @@ mod tests {
         header
             .mark_word
             .store(ObjectHeader::make_forwarded(dest_addr), Ordering::Release);
-        // The mark word says forwarded; the legacy field still says not.
-        assert!(ObjectHeader::is_forwarded_mark(
-            header.mark_word.load(Ordering::Acquire)
-        ));
-        assert!(
-            !header.is_forwarded(),
-            "`is_forwarded()` must still read the field — the mark-word encoding \
-             is landed but not yet adopted, and a split answer here would mean \
-             two collectors disagreeing about liveness"
-        );
 
-        header.forwarding_ptr = dest_addr as *mut u8;
-        assert!(header.is_forwarded());
-        assert_eq!(header.forwarding_address(), dest_addr as *mut u8);
+        assert!(
+            header.is_forwarded(),
+            "the mark word is the forwarding slot; nothing else can answer"
+        );
+        assert_eq!(header.forwarding_address() as usize, dest_addr);
         assert_eq!(
             ObjectHeader::forwarding_target(header.mark_word.load(Ordering::Acquire)),
             header.forwarding_address(),
-            "when both are set they must agree on the target"
+            "the accessor and the raw decode must agree on the target"
         );
+        // And the header really did lose the eight bytes.
+        assert_eq!(HEADER_SIZE, 24);
+        assert_eq!(std::mem::size_of::<ObjectHeader>(), 24);
+    }
+
+    /// The three non-forwarded mark states must all read as "not forwarded" AND
+    /// yield a null address. Before the fold this was trivially true (a separate
+    /// field); now it is the property a future consumer is most likely to break
+    /// by testing `mark & MARK_FORWARDED != 0` instead of comparing the tag —
+    /// that form accepts THIN_LOCKED and INFLATED, and would hand a monitor
+    /// pointer back as a relocation address.
+    #[test]
+    fn only_the_forwarded_tag_reads_as_forwarded() {
+        let header = make_header();
+        let cell: u64 = 0;
+        let addr = &cell as *const u64 as usize;
+        for (name, mark) in [
+            ("NEUTRAL", MARK_NEUTRAL),
+            ("THIN_LOCKED", ObjectHeader::make_thin_locked(7, 1)),
+            ("INFLATED", ObjectHeader::make_inflated(addr)),
+        ] {
+            header.mark_word.store(mark, Ordering::Release);
+            assert!(!header.is_forwarded(), "{name} must not read as forwarded");
+            assert!(
+                header.forwarding_address().is_null(),
+                "{name} must not yield a forwarding address"
+            );
+        }
+        header.set_forwarding_address(addr as *mut u8);
+        assert!(header.is_forwarded());
+        assert_eq!(header.forwarding_address() as usize, addr);
     }
 
     #[test]

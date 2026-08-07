@@ -92,3 +92,91 @@ Expect it to be much slower — budget accordingly, and cap the timeout. If the
 loop disappears under `--nojit`, it is a JIT defect and
 `docs/known-issues/…/jit-*` is the right neighbourhood; if it persists, the
 sampler will finally name the Java frame.
+
+---
+
+## 2026-08-06, later: the hang is gone, and what is under it is now named
+
+Re-measured on `dev` @ `0bcbe2032` + `docs/internal/list-out-of-range-accessors-returned-null-FIXED-20260806.md`,
+Azure `20.83.144.174`, real JDK 25, repaired classpath (0 of 254 missing).
+**Do not budget 90 minutes any more — this is a 49-second failure.**
+
+### Run the two methods separately
+
+The class's two live methods differ by an order of magnitude in cost, and only
+one of them was ever the problem. `apps/spring-suite-runner/onem.sh` runs a
+single method with `one.sh`'s classpath and JVM args:
+
+```bash
+CRATONVM_BIN=<bin> ./onem.sh org.springframework.test.context.aot.AotIntegrationTests endToEndTests
+```
+
+| method | this binary | HotSpot |
+|---|---|---|
+| `endToEndTests` | **`found=1 succ=1 fail=0`**, 73-76 s | agrees |
+| `endToEndTestsForBeanOverrides` | `found=1 succ=0 fail=1`, **49 s** | passes |
+
+That is the whole reason to stop using the class as the oracle: a 900 s+
+whole-class run that spends nearly all of its time in one method, on a shared
+box that OOM-killed four consecutive acceptance attempts here.
+
+### The remaining failure, and where it is
+
+```
+FAIL endToEndTestsForBeanOverrides() :: java.lang.IllegalArgumentException: array element type mismatch
+	at org.springframework.core.annotation.TypeMappedAnnotation.adapt(TypeMappedAnnotation.java:487)
+	at ...AbstractMergedAnnotation.getValue(AbstractMergedAnnotation.java:177)
+	at ...SynthesizedMergedAnnotationInvocationHandler.invoke(...:76)
+	at ...ContextLoaderUtils.resolveContextHierarchyAttributes(ContextLoaderUtils.java:138)
+	at ...TestContextAotGenerator.processAheadOfTime(TestContextAotGenerator.java:181)
+```
+
+`TypeMappedAnnotation.java:487` is `Array.set(array, i, annotations[i].synthesize())`,
+filling a `ContextConfiguration[]` with synthesized annotation proxies.
+
+`Array.set`'s refusal now names both sides under `CRATONVM_DBG=coerce`
+(added with this note; the message itself stays HotSpot's bare wording because
+source witnesses pin it):
+
+```
+[DBG_COERCE] Array.set: rejecting -- array=org/springframework/test/context/ContextConfiguration
+    component=org/springframework/test/context/ContextConfiguration (cid=ClassId(2547))
+    value_class=jdk/proxy3/$Proxy27 (cid=ClassId(2552))
+```
+
+Exactly one rejection per run. So `is_subclass($Proxy27, ContextConfiguration)`
+is false for a proxy that was created *from* that annotation type.
+
+**This is almost certainly not a real type error.** It is the shape recorded in
+`field-set-argument-type-mismatch-is-a-loader-split-use-dbg-coerce`: one class
+NAME with two `ClassId`s under two loaders. `jdk/proxy3/` — not `jdk/proxy1/` —
+says this proxy was defined for a third loader, and this class runs everything
+under `@CompileWithForkedClassLoader`. Corroborating: a standalone
+`Array.set(Ann[], Proxy.newProxyInstance(cl, {Ann.class}, h))`
+(`repro/ArraySetProxyRepro.java`) is byte-identical to HotSpot, proxies
+included — so `Array.set` and `is_subclass` handle proxies correctly when there
+is only one loader in play.
+
+### Next step
+
+Print the proxy's recorded interfaces and the loader id of both `ClassId`s at
+the rejection, then compare with `--dump-*` for the two `ContextConfiguration`
+entries. If they are two ids for one name, the defect is in how the forked
+loader's parent delegation is modelled, not in `Array.set` —
+`user-loader-parent-chain-was-unmodelled-rust-side` and
+`forked-loader-mixed-copies-triage-recipe` are the right neighbourhood, and
+`Array.set` is only where it happens to surface.
+
+### Two things ruled out — do not repeat them
+
+* **Not the young-GC livelock**, however much `jcmd GC.heap_info` looks like it.
+  On the older binary that did hang, it read `Young 1024.0 MB / 1.0 GB (100.0%
+  used)` with `Old 135.9 MB (6.6%)`, frozen byte-for-byte across eight minutes —
+  the exact signature in `young-gc-trigger-livelock-under-nonmoving-sweep`. It
+  was not that: `CRATONVM_DBG_YOUNG_TRIGGER=1` reported
+  `free_list=1002MB live=21MB threshold=921MB`, i.e. a young generation with
+  1 GB free. The 100 % is a high-water cursor the non-moving sweep never
+  retreats, and the GOOD control binary reaches 100 % too and then finishes.
+* **Not the per-`get` cost, confirmed independently.** A build carrying the
+  variant of the collections fix that *does* pay a `size()` dispatch per `get`
+  hung identically to one that does not, on the same host, same method.

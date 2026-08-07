@@ -57,10 +57,12 @@ record's own count was 39% low.
   is still recorded, by the `Bridge if bytecode_available` arm. Genuinely a
   deferred cleanup contingent on unifying the two forced-native lists, as the
   record says — not something running wrong today.
-* **§11 — the count is stale and low.** Filed as 217 disjuncts over ~2,650
-  lines (17595–20244). Measured 2026-08-06: **302** disjuncts, 19668–22292. The
-  item is unchanged in kind, but anyone scoping the deletion from this page
-  would plan against a number 39% too small.
+* **§11 — ~~the count is stale and low~~ RETRACTED.** This pass reported "302
+  disjuncts, the record's 217 is 39% low". That was wrong, and the record was
+  right: `grep -cE '^\s+\|\|'` counts every `||` at any indentation, including
+  those nested inside `matches!` blocks and parenthesised groups. Splitting on
+  the chain's own top-level indent gives exactly **217**. Corrected 2026-08-06
+  in the same pass that did the first deletion.
 
 ### Second pass, same day — §2, §6, §7
 
@@ -137,8 +139,85 @@ record's own count was 39% low.
   reaches these ladders (`jit_direct_native_binds = 0`), so it could not tell a
   gate that refuses from one that is never asked.
 
-**Still open:** §8, the bulk of §11, §3's Matcher-leaf residual, and the
-`jit_entry_publishable` half of §2 (which refuses nothing — see §1 above).
+### Fourth pass, same day — §8 and §11, measured
+
+Both sections describe a per-family deletion exercise and neither had been
+measured; "each entry is load-bearing for a real boot today" was an assumption.
+`CRATONVM_DBG_CHECK_OVERRIDE=1` now records, at CLI shutdown: every triple the
+§11 chain admits (with whether `is_abstract()` alone would have sufficed),
+the site's `reached=`/`chain_true=` counts, and every §8 substitution.
+
+| workload | reached | chain_true | triples | classes | §8 substitutions |
+|---|---:|---:|---:|---:|---:|
+| corpus `--real-jdk` (53 classes) | 11,648,908 | 917 | 20 | 14 | **0** |
+| corpus `--jdk-only` | 11,650,412 | 453 | 13 | 9 | **0** |
+| 16 `org.h2.test` classes | — | — | 21 | 16 | **0** |
+| **union** | | | **27** | **19** | **0** |
+
+* **§8 — FIXED under strict.** The map fires **zero** times in either mode,
+  including on real H2 application code. So the record's "under `JdkOnly` the
+  map should become unreachable rather than conditional" is now enforced: under
+  strict the substitution is refused and recorded as an `interface-substitution`
+  violation instead of silently running `HashMap$KeyItr`'s native against a
+  receiver that is not one. `Compatible` is untouched — a corpus that never
+  reaches the path cannot license removing it there, and the record warns that
+  removing shim mappings has regressed real-JDK boot before.
+* **§11 — 19 families identified, and the deletion still is not licensed.**
+  Every admitted row is earned by a NAME disjunct; `is_abstract()` alone
+  sufficed for none, so the chain cannot be reduced to its one contract-legal
+  disjunct. Two of the 19 are H2's *own* classes
+  (`org/h2/expression/condition/Comparison`, `org/h2/value/ValueBigint`), so a
+  deletion pass cannot reason about `java.*` alone.
+  Baseline checked in at
+  `scripts/baselines/jdk-only-check-override-admissions.tsv`. **It is not a
+  deletion list** — the chain was built from Spring, Tomcat, WildFly and H2
+  boots and only H2 is represented. Extend it from the app suites before
+  deleting anything; the instrument makes that one run rather than a fresh
+  investigation.
+
+Three measurement traps hit on the way, all of which produced a confident and
+false zero: the regression suite swallows per-class output into a shell
+variable (drive the classes directly); the frozen binary was swept out of
+`/tmp` mid-run so every invocation failed instantly; and the first "distinct
+triples" counts included the per-process hit column, inflating 20/13 to 37/28.
+The `reached=` counter exists so the first two are visible in the output.
+
+### Fifth pass, same day — §11's first deletion: 217 -> 205
+
+The census was the wrong licence. The chain is only consulted as
+`check_override && registry.find(...).is_some()`, so a disjunct that can only
+match classes with **no registered native** is inert whatever runs — a static
+criterion no workload can refute. Two facts make it checkable:
+
+* the native registry is **eagerly** populated (dumps from a corpus class and
+  from `org.h2.test.TestBase` are identical: 11,897 rows, 1,227 classes), so
+  "absent from the dump" is not "not loaded yet";
+* of the 46 chain-named classes absent from it, **19 appear nowhere in any
+  native crate's source**, so no feature-gated build can register them either —
+  which matters because `app-stubs` is a real default-off gate.
+
+**12 disjuncts name only those 19 classes, and they are orphaned rather than
+merely unreached.** The largest explains itself as pinning "the no-op natives
+registered in `native-builtins/src/log4j_extras.rs` (via
+`register_log4j_stubs`)" — a file that does not exist, and a symbol that
+survives nowhere in the tree except inside those comments. The registrar was
+deleted; the entries protecting it were not. All 12 are third-party shims:
+log4j-core/simple/spi, logback, `org/jboss/modules`, `org/springframework/beans`
+BeanInfo factories, Spring Boot's `DefaultLogbackConfiguration`.
+
+Verified by the admitted set not moving: corpus `chain_true` 917 -> 917 and 20
+triples -> 20 triples; H2 17 -> 17; both diffs empty; suite 29/29. **161 lines
+out.**
+
+One tooling trap worth repeating: the first cut attributed each disjunct's
+*trailing* comment block to it. Those blocks are preambles for the NEXT entry,
+so it would have stripped the rationale off entries being kept — exactly what
+§13 of this page is about. Comments must attach forward.
+
+**Still open:** the remaining 205 disjuncts — this pass licenses nothing about
+them (140 name a class that does have a native, 44 name no class at all, and
+the rest need the app-suite census). Plus §3's Matcher-leaf residual and the
+`jit_entry_publishable` half of §2, which refuses nothing per §1.
 
 ## 2026-08-04 status
 
