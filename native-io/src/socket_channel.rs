@@ -466,6 +466,49 @@ fn map_err(ctx: &str, e: std::io::Error) -> MethodCallFailed {
     }
 }
 
+/// Throw the real `java.nio.channels.<simple_name>` via its no-arg constructor.
+///
+/// The CONCRETE class is what matters here, not "some IOException":
+/// `RJdkNio.selectorAndAsyncClose` catches `AsynchronousCloseException`, then
+/// `ClosedChannelException`, then `IOException`, and records which arm ran —
+/// and every real NIO reactor makes the same distinction, because
+/// `ClosedChannelException` means "you closed it" while
+/// `AsynchronousCloseException` means "someone else closed it under you".
+/// A message-prefix convention cannot express that.
+///
+/// Falls back to a plain `IOException` when the class cannot be built, which is
+/// the synthetic-JDK case where `java.nio.channels` may not be present at all.
+fn channel_exception(ctx: &mut dyn NativeContext, simple_name: &str) -> MethodCallFailed {
+    let class = format!("java/nio/channels/{simple_name}");
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object(&class) {
+        // A failing no-arg `<init>` still leaves a usable exception object of
+        // the right type; throwing it beats degrading to a generic IOException.
+        let _ = ctx.invoke(&class, "<init>", "()V", &[Value::Object(Some(exc))]);
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    ioex(format!("{simple_name}: channel closed"))
+}
+
+/// `java.nio.channels.ClosedChannelException` — the channel was already closed
+/// when this operation started.
+fn closed_channel_exception(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    channel_exception(ctx, "ClosedChannelException")
+}
+
+/// Map a channel read failure to the exception `java.nio.channels` names for
+/// it. `ErrorKind::Interrupted` is [`channel_async_closed_err`]'s signal and
+/// nothing else — see its doc comment for why no real EINTR reaches here.
+fn closed_or_io_error(
+    ctx: &mut dyn NativeContext,
+    op: &str,
+    e: std::io::Error,
+) -> MethodCallFailed {
+    if e.kind() == ErrorKind::Interrupted {
+        return channel_exception(ctx, "AsynchronousCloseException");
+    }
+    map_err(op, e)
+}
+
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
@@ -2318,6 +2361,84 @@ fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::i
     }
 }
 
+/// How long a blocking channel read parks inside one poll before re-asking the
+/// registry whether the channel was closed under it.
+///
+/// A liveness bound, not a latency cost: the poll returns the instant the
+/// socket becomes readable, so payload is never delayed by it. Same role as
+/// [`ACCEPT_CLOSE_POLL`] on the accept side.
+const READ_CLOSE_POLL_MS: i32 = 25;
+
+/// Is `id` still a live stream? [`sc_close`] calls `tcp_remove`, so this flips
+/// exactly when Java closed the channel.
+fn stream_still_registered(id: i32) -> bool {
+    matches!(tcp_registry().read().get(&id), Some(TcpHandle::Stream(_)))
+}
+
+/// The error a parked read reports once its channel is closed from another
+/// thread.
+///
+/// `ErrorKind::Interrupted` is unambiguous at this site: [`try_read_nb`]
+/// reissues every real EINTR, and `net::poll_stream_readable` reports one as
+/// "not ready" rather than as an error. So [`closed_or_io_error`] can turn
+/// exactly this into `AsynchronousCloseException`.
+fn channel_async_closed_err() -> std::io::Error {
+    std::io::Error::new(ErrorKind::Interrupted, "channel closed asynchronously")
+}
+
+/// A blocking channel read that observes an asynchronous `close()`.
+///
+/// # Why the plain blocking read could not
+///
+/// A blocking-mode channel leaves its `TcpStream` in genuine OS-blocking mode,
+/// so [`try_read_nb`] parks inside `recv`. Nothing `sc_close` does reaches that
+/// park: `lingering_channel_close` issues `shutdown(Write)` only — deliberately
+/// so, see its comment on RST-prone `Shutdown::Both` — and `tcp_remove` merely
+/// drops the map's `Arc`, which cannot close the OS handle while this reader
+/// holds a clone of it. So the reader stayed in `recv` until the peer sent
+/// something or the process exited, which is `RJdkNio.selectorAndAsyncClose`
+/// reporting "the blocked reader never woke up".
+///
+/// HotSpot breaks the same park by closing the descriptor underneath it
+/// (`closesocket` on Windows, `dup2` of a pre-closed fd plus a signal on Unix).
+/// Neither is expressible over an `Arc<TcpStream>` without closing a handle
+/// another thread is mid-syscall on. So park in `poll` instead of in `recv`,
+/// and re-ask the registry every [`READ_CLOSE_POLL_MS`] — the close-aware shape
+/// [`accept_close_aware`] already uses, and which [`sc_blocking_read`] gets for
+/// free by re-`resolve_stream`ing on every pass.
+///
+/// The registry lock is taken per pass and never held across the poll.
+fn read_close_aware(
+    id: i32,
+    stream: &TcpStream,
+    buf: &mut [u8],
+) -> Result<Option<i32>, std::io::Error> {
+    loop {
+        let ready = match crate::net::poll_stream_readable(stream, READ_CLOSE_POLL_MS) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-07 blocking
+            // read, which cannot see the close but at least still transfers.
+            None => return try_read_nb(stream, buf),
+        };
+        // Asked AFTER the poll so a close landing while we are parked is seen
+        // on the next pass, and a close racing a readiness edge still wins —
+        // completing a read on a channel Java has closed is precisely what
+        // `AsynchronousCloseException` exists to prevent.
+        if !stream_still_registered(id) {
+            return Err(channel_async_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        match try_read_nb(stream, buf) {
+            // Readable, then not: a concurrent reader on this channel took the
+            // bytes. Park again — a blocking read must not answer 0.
+            Ok(None) => continue,
+            other => return other,
+        }
+    }
+}
+
 fn try_write_nb(stream: &TcpStream, data: &[u8]) -> Result<Option<i32>, std::io::Error> {
     let mut s = stream;
     loop {
@@ -2341,7 +2462,18 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("read: null ByteBuffer")),
     };
-    let id = read_reg_id(ctx, this).ok_or_else(|| ioex("read: channel not connected"))?;
+    let id = match read_reg_id(ctx, this) {
+        Some(id) => id,
+        // `sc_close` wipes the synthetic state, so `F_OPEN` reading back 0 with
+        // no registry id means "this channel was closed" — which
+        // `java.nio.channels` spells `ClosedChannelException`, not the bare
+        // IOException this used to answer. `RJdkNio`'s
+        // `catch (ClosedChannelException)` walked straight past that one.
+        None if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 => {
+            return Err(closed_channel_exception(ctx));
+        }
+        None => return Err(ioex("read: channel not connected")),
+    };
 
     // Determine the writable region. We materialize into a heap buffer here
     // and copy into the buffer slot afterwards so we don't hold a registry
@@ -2370,10 +2502,18 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // for the common non-blocking case, where the call returns immediately)
     // so a concurrent STW pause never waits on a thread parked here. Same
     // pattern as `re1_socket_read_stream` in `net_phase_e.rs`.
+    let blocking = read_blocking_flag(ctx, this);
     ctx.begin_blocking_region();
     let read_result = match resolve_stream(id) {
         StreamTarget::Ready(s) => {
-            let r = try_read_nb(&s, &mut buf).map_err(|e| map_err("read", e));
+            // A blocking channel leaves the OS socket blocking, so a bare
+            // `try_read_nb` parks inside `recv`, where no `close()` on another
+            // thread can reach it. See `read_close_aware`.
+            let r = if blocking {
+                read_close_aware(id, &s, &mut buf)
+            } else {
+                try_read_nb(&s, &mut buf)
+            };
             ctx.end_blocking_region();
             r
         }
@@ -2398,7 +2538,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Ok(v) => v,
         Err(e) => {
             ctx.unpin_native_roots(bb_pin);
-            return Err(e);
+            return Err(closed_or_io_error(ctx, "read", e));
         }
     };
     let n = match n_opt {
@@ -2750,8 +2890,14 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(o) => o,
         None => return Err(ioex("read(scattering): null buffer array")),
     };
-    let id =
-        read_reg_id(ctx, this).ok_or_else(|| ioex("read(scattering): channel not connected"))?;
+    let id = match read_reg_id(ctx, this) {
+        Some(id) => id,
+        // See `sc_read`: no registry id + `F_OPEN == 0` is a closed channel.
+        None if cf_get(ctx, this, F_OPEN).as_int().unwrap_or(0) == 0 => {
+            return Err(closed_channel_exception(ctx));
+        }
+        None => return Err(ioex("read(scattering): channel not connected")),
+    };
 
     // Sum the writable capacity across the buffer slice; remember each target
     // so we can scatter the bytes back afterward (in array order).
@@ -2793,10 +2939,18 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // and reloaded through `read_native_pin` (a pause inside the region may
     // relocate them) — same protocol as `sc_write_gathering`.
     let pins: Vec<_> = targets.iter().map(|bb| ctx.pin_native_root(*bb)).collect();
+    let blocking = read_blocking_flag(ctx, this);
     ctx.begin_blocking_region();
     let read_result = match resolve_stream(id) {
         StreamTarget::Ready(s) => {
-            let r = try_read_nb(&s, &mut buf).map_err(|e| map_err("read(scattering)", e));
+            // Same asynchronous-close hazard as `sc_read` — see
+            // `read_close_aware`. This is the shape Jetty/Netty-style reactors
+            // use for header+body reads, so it parks just as long.
+            let r = if blocking {
+                read_close_aware(id, &s, &mut buf)
+            } else {
+                try_read_nb(&s, &mut buf)
+            };
             ctx.end_blocking_region();
             r
         }
@@ -2828,7 +2982,7 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             for pin in pins {
                 ctx.unpin_native_roots(pin);
             }
-            return Err(e);
+            return Err(closed_or_io_error(ctx, "read(scattering)", e));
         }
     };
     let n = match n_opt {
@@ -4757,6 +4911,70 @@ mod tests {
             advertised_listener_host("127.0.0.2:49152".parse().unwrap()),
             "127.0.0.2"
         );
+    }
+
+    /// `RJdkNio.selectorAndAsyncClose` at the Rust layer: a reader parked on a
+    /// blocking channel must break out when another thread closes it.
+    /// `sc_close`'s `shutdown(Write)` + `tcp_remove` cannot reach a parked
+    /// `recv` — this reader holds an `Arc` clone of the very stream the map
+    /// dropped, so the OS handle stays open — which is why the wakeup has to
+    /// come from the registry check rather than from the socket.
+    #[test]
+    fn a_close_breaks_a_parked_blocking_channel_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold the accepted end open and silent so the reader genuinely parks.
+        let keeper = std::thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = Arc::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let id = tcp_register(TcpHandle::Stream(Arc::clone(&client)));
+
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0_u8; 16];
+            let start = std::time::Instant::now();
+            let outcome = read_close_aware(id, &client, &mut buf);
+            (outcome.map_err(|e| e.kind()), start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+        tcp_remove(id);
+
+        let (outcome, elapsed) = reader.join().unwrap();
+        assert_eq!(
+            outcome.unwrap_err(),
+            ErrorKind::Interrupted,
+            "an asynchronous close must break the parked read"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "close should wake the parked reader promptly, got {elapsed:?}"
+        );
+        drop(keeper.join().unwrap());
+    }
+
+    /// The other half of the contract: a close-aware read is still a read.
+    /// Bytes that arrive while the reader is parked come back on the next pass,
+    /// not after a poll timeout.
+    #[test]
+    fn a_close_aware_read_still_delivers_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            peer.write_all(b"ping").unwrap();
+            peer
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let id = tcp_register(TcpHandle::Stream(Arc::new(client.try_clone().unwrap())));
+        let mut buf = [0_u8; 16];
+        let n = read_close_aware(id, &client, &mut buf)
+            .expect("read must succeed")
+            .expect("a blocking close-aware read never answers UNAVAILABLE");
+        assert_eq!(&buf[..n as usize], b"ping");
+        tcp_remove(id);
+        drop(writer.join().unwrap());
     }
 
     /// Regression guard for the Jetty `givenAnInflightRequestWhenTheServerIs

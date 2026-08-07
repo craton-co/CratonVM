@@ -1458,9 +1458,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
             // Map bare library name to platform-specific filename.
             // resolve_library_path() in NativeContextImpl will search java.library.path.
-            let lib_name = platform_lib_name(&name);
-            let _ = ctx.load_native_library(&lib_name); // best-effort; errors are swallowed
-            Ok(None)
+            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
         },
     );
     registry.register(
@@ -1474,8 +1472,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             };
             let path = ctx.read_string(path_obj).unwrap_or_default();
             crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            let _ = ctx.load_native_library(&path);
-            Ok(None)
+            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
         },
     );
 
@@ -1488,9 +1485,7 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             let name_obj = obj_arg(args, 0)?;
             let name = ctx.read_string(name_obj).unwrap_or_default();
             crate::security_manager::check_host_native_access_or_throw(ctx, &name)?;
-            let lib_name = platform_lib_name(&name);
-            let _ = ctx.load_native_library(&lib_name);
-            Ok(None)
+            load_library_or_throw(ctx, &name, LibrarySpelling::BareName)
         },
     );
     registry.register(
@@ -1501,10 +1496,103 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let path = ctx.read_string(path_obj).unwrap_or_default();
             crate::security_manager::check_host_native_access_or_throw(ctx, &path)?;
-            let _ = ctx.load_native_library(&path);
-            Ok(None)
+            load_library_or_throw(ctx, &path, LibrarySpelling::AbsolutePath)
         },
     );
+}
+
+/// Which of the two JDK spellings the caller used. `System.loadLibrary("zip")`
+/// passes a BARE name that has to be mapped through `System.mapLibraryName`
+/// before it can be opened; `System.load("/x/libzip.so")` passes a complete
+/// path that must be used verbatim (JLS: "the filename argument must be an
+/// absolute path name").
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LibrarySpelling {
+    BareName,
+    AbsolutePath,
+}
+
+/// The bare library names whose ENTIRE native surface this VM supplies from
+/// Rust, so a caller that asks for them has genuinely got what it asked for
+/// even though no shared object was opened.
+///
+/// These are the java.base/java.desktop-adjacent JNI libraries that ship inside
+/// the JDK image. CratonVM never dlopen()s them — every `Java_java_util_zip_*`
+/// / `Java_java_net_*` entry point they exist to provide is registered in this
+/// process as a Rust native — but on HotSpot the call SUCCEEDS, so answering
+/// `UnsatisfiedLinkError` for them would be a fresh divergence in the opposite
+/// direction (`regression-suite/src/RJdkJni.java:189-202` asserts that at least
+/// one JDK-shipped library loads). Anything NOT on this list is a library this
+/// VM has no implementation of, and the JDK contract for that is an error, not
+/// a silent return.
+fn is_vm_provided_jdk_library(name: &str) -> bool {
+    matches!(
+        name,
+        "java"
+            | "zip"
+            | "net"
+            | "nio"
+            | "jimage"
+            | "verify"
+            | "management"
+            | "management_ext"
+            | "instrument"
+            | "extnet"
+            | "prefs"
+            | "j2pkcs11"
+            | "sunec"
+            | "sunmscapi"
+            | "jsig"
+            | "jvm"
+    )
+}
+
+/// Open a native library, or raise the `UnsatisfiedLinkError` the JDK
+/// specifies.
+///
+/// `System.load`, `System.loadLibrary`, `Runtime.load` and `Runtime.loadLibrary`
+/// are all documented to throw `UnsatisfiedLinkError` when "the library does not
+/// exist, or the library cannot be mapped". All four bodies used to end in
+/// `let _ = ctx.load_native_library(..)` — the error was computed and dropped,
+/// so a request for a library that does not exist RETURNED NORMALLY. That is a
+/// fabricated success where the spec mandates a failure, and it is worse than a
+/// missing feature: a caller like Netty's `NativeLibraryLoader` or Tomcat's
+/// `AprLifecycleListener` is written to catch this error and fall back to a pure
+/// -Java path, so swallowing it left them believing a native backend was armed
+/// and failing much later, far from the cause. Measured:
+/// `regression-suite/src/RJdkFailure.java:261` ("loading an absent library must
+/// raise UnsatisfiedLinkError") failed in BOTH `--real-jdk` and `--jdk-only`
+/// while HotSpot 25 passed.
+///
+/// The load is still attempted first, so a library that really is on
+/// `java.library.path` still loads and `JNI_OnLoad` still runs. Only the failure
+/// path changed, and only for names outside [`is_vm_provided_jdk_library`].
+fn load_library_or_throw(
+    ctx: &mut dyn NativeContext,
+    requested: &str,
+    spelling: LibrarySpelling,
+) -> MethodCallResult {
+    let target = match spelling {
+        LibrarySpelling::BareName => platform_lib_name(requested),
+        LibrarySpelling::AbsolutePath => requested.to_string(),
+    };
+    if ctx.load_native_library(&target).is_ok() {
+        return Ok(None);
+    }
+    // A JDK-image library whose natives this VM already provides is not a
+    // failure — see `is_vm_provided_jdk_library`. Only a bare name can name
+    // one; `System.load("/some/path/libzip.so")` names a FILE, and a file that
+    // is not there is an error however it is spelled.
+    if spelling == LibrarySpelling::BareName && is_vm_provided_jdk_library(requested) {
+        return Ok(None);
+    }
+    // NOT memoised as a failure: the JDK re-attempts the lookup on every call
+    // (`RJdkFailure.java:269` asserts the second attempt throws too), and a
+    // library can legitimately appear on `java.library.path` between calls.
+    Err(RuntimeError::UnsatisfiedLinkError {
+        message: format!("no {requested} in java.library.path"),
+    }
+    .into())
 }
 
 pub(crate) fn native_runtime_get_runtime(

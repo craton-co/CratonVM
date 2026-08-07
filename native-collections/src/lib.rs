@@ -17138,6 +17138,9 @@ fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Valu
 /// op-chain while sharing `src`'s SOURCE array (slot 0). Caller must have checked
 /// `src` is a synthetic stream. No `invoke_virtual` here, so no safepoint/GC moves
 /// the locals between allocations.
+///
+/// Answers `Ok(None)` — "not deferred, run your eager body" — when the policy
+/// will not mint the op record. See the guard at the top of the body.
 fn stream_make_lazy_derived(
     ctx: &mut dyn NativeContext,
     src: ObjectRef,
@@ -17145,8 +17148,63 @@ fn stream_make_lazy_derived(
     lambda: Option<ObjectRef>,
     aux: i64,
 ) -> MethodCallResult {
+    // JDK-only wave 2 (lane W2-1). Ask the policy BEFORE minting anything, for
+    // the same reason the three `cratonvm/internal/StreamCollector` sites do
+    // (lane L7, 2026-08-05): a fabrication that happens to run FIRST makes
+    // every other site's refusal order-dependent rather than a policy.
+    //
+    // `cratonvm/stream/LazyOp` is the deferred-op record this function exists
+    // to build. No JDK declares that name, so `--jdk-only` refuses it. The
+    // refusal used to arrive from the `try_alloc_synthetic` further down —
+    // after the new op-chain array was already allocated — and surfaced at the
+    // user's own `filter`/`map`/`flatMap`/`limit`/`skip`/`peek` call site as
+    // `NoClassDefFoundError: cratonvm/stream/LazyOp`. That killed
+    // `RJdkCollections` (`src.stream().filter(...)`, line 169) and `RJdkJmx`
+    // (`ManagementFactory.getPlatformMBeanServer()`, i.e. real JDK bytecode
+    // reaching a stream internally) outright, on a mode where both pass today.
+    //
+    // The refusal is not fatal, because deferring is an OPTIMISATION and not a
+    // requirement. `Ok(None)` here is the exact answer `stream_try_defer`
+    // already gives when `CRATONVM_EAGER_STREAMS=1` is set, and every caller
+    // has a complete eager body behind that answer
+    // (`native_stream_{filter,map,flat_map,limit,skip,peek}`) — the pipeline
+    // that was the shipped default until the lazy one was turned on. Element
+    // RESULTS are identical; what strict mode loses is short-circuiting:
+    // `peek` runs on every element rather than stopping at the first
+    // `findFirst`, and an unbounded source feeding `limit(n)` stops at the
+    // drain's safety cap instead of at `n`.
+    //
+    // Deliberately NOT laundered through `ensure_generated_class`
+    // (`ClassOrigin::VmInternal`, which never refuses in either mode). A
+    // `LazyOp` record is only VM-internal in shape; its REASON for existing is
+    // the synthetic `java.util.stream` model, which is the thing strict mode
+    // is supposed to be retiring. Minting it there would make the pipeline work
+    // under `--jdk-only` and take the gap off the census at the same time. This
+    // spelling keeps the `CompatibilityClassRequested` violation recorded on
+    // every refused call, so the census still reports the gap's size.
+    //
+    // Under the default `Compatible` mode this is not a behaviour change: it is
+    // the same `try_ensure_synthetic_class(name, 3)` call, with the same field
+    // count, that `try_alloc_synthetic`'s `refused_class` arm below already
+    // makes on the first deferred op of the run.
+    //
+    // GC-SAFETY: the guard sits BEHIND the two pins, not in front of them.
+    // Registering a class can allocate (the `java.lang.Class` mirror), and in
+    // `Compatible` mode this is the same call that already ran from inside
+    // `try_alloc_synthetic` — i.e. with `src` and `lambda` already pinned.
+    // Hoisting it above the pins would open a window where a moving young GC
+    // relocates the two bare argument refs. On the refusal arm, unpinning at
+    // `src_pin` (the lower handle) pops `lambda_pin` with it; the CALLER's own
+    // pins were taken first and are below both, so they survive.
     let src_pin = ctx.pin_native_root(src);
     let lambda_pin = lambda.map(|l| ctx.pin_native_root(l)).unwrap_or(usize::MAX);
+    if ctx
+        .try_ensure_synthetic_class("cratonvm/stream/LazyOp", 3)
+        .is_err()
+    {
+        ctx.unpin_native_roots(src_pin);
+        return Ok(None);
+    }
     let src_cur = ctx.read_native_pin(src_pin, src);
     // FIX (stream-eager-drain-20260715): do NOT eagerly materialize `src`
     // here. A `src` that still holds a live, undrained lazy spliterator

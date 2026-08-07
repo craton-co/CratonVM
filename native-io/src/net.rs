@@ -1645,6 +1645,103 @@ fn read0_lat_record(fd_ns: u128, lookup_ns: u128, begin_ns: u128, recv_ns: u128,
     }
 }
 
+/// How long a parked blocking `read0` waits inside one poll before re-asking
+/// the registry whether its socket was closed under it.
+///
+/// This is a liveness bound, not a latency cost: the poll returns the instant
+/// the socket becomes readable, so ordinary traffic is never delayed by it. It
+/// only bounds how long a reader stays parked after another thread closes the
+/// socket. Same role as [`NET_ACCEPT_CLOSE_POLL`] on the accept side.
+const NET_READ_CLOSE_POLL_MS: i32 = 25;
+
+/// The error a parked `read0` reports once its socket has been closed from
+/// another thread.
+///
+/// [`net_err`] has no `Interrupted` arm, so this reaches its default
+/// `SocketException: …` rendering. `NioSocketImpl.endRead` then replaces it
+/// with `SocketException("Socket closed")` regardless, because the close
+/// already moved the impl to `ST_CLOSING` — and that is exactly what HotSpot
+/// produces for a blocked read whose socket is closed.
+fn net_read_closed_err() -> std::io::Error {
+    std::io::Error::new(ErrorKind::Interrupted, "socket closed")
+}
+
+/// Is `fd` still a live stream? [`close_net_fd`] replaces the entry with
+/// `NetSocketHandle::Closed`, so this flips exactly when Java closed it.
+fn net_stream_still_registered(fd: i32) -> bool {
+    matches!(
+        net_sockets().read().get(&fd),
+        Some(NetSocketHandle::Stream(_))
+    )
+}
+
+/// One `recv`, reissued for as long as it reports EINTR. See the AUDIT
+/// 2026-07-26 note in [`net_read0`] for why EINTR must never escape to Java.
+fn read_retry_eintr(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    // The std impl is `impl Read for &TcpStream`, so this reads through a
+    // shared stream without excluding a peer writer on the same fd.
+    let mut r = stream;
+    loop {
+        match r.read(buf) {
+            Err(e) if crate::eintr::is_eintr(&e) => continue,
+            other => return other,
+        }
+    }
+}
+
+/// A blocking `read0` that observes an asynchronous `close()`.
+///
+/// # Why the plain blocking read could not
+///
+/// `Socket.close()` on another thread reaches [`close_net_fd`], which marks the
+/// registry slot `Closed` and issues `shutdown(Both)` — but it does **not**
+/// close the OS handle, because this reader is holding an `Arc` clone of the
+/// very `TcpStream` the map dropped. HotSpot's answer to the same situation is
+/// `closesocket()` underneath the blocked `recv` (Windows) or `dup2` of a
+/// pre-closed descriptor plus a signal (Unix, `NativeDispatcher.preClose`).
+/// Neither is expressible over an `Arc<TcpStream>` without closing a handle
+/// another thread is mid-syscall on, which is a use-after-close the moment the
+/// OS recycles the number.
+///
+/// `shutdown` is not a substitute. On Linux `SHUT_RD` does wake a parked `recv`
+/// with EOF, which is why this defect reads as Windows-only; Winsock does not —
+/// only `closesocket` aborts a pending blocking call — so
+/// `RJdkNet.soTimeoutAndAsyncClose`'s reader stayed parked until the test's own
+/// timeout and reported "the blocked reader never woke up".
+///
+/// So park in `poll` instead of in `recv`, and re-ask the registry every
+/// [`NET_READ_CLOSE_POLL_MS`]. That is the close-aware shape
+/// [`net_accept_close_aware`] has carried on the accept side since 2026-05-17;
+/// it costs one extra syscall on a read that would have blocked anyway, and
+/// none of the registry lock is held across it.
+fn net_read_close_aware(fd: i32, stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        let ready = match poll_stream_readable(stream, NET_READ_CLOSE_POLL_MS) {
+            Some(result) => result?,
+            // No poll primitive on this target: the pre-2026-08-07 blocking
+            // read, which cannot see the close but at least still transfers.
+            None => return read_retry_eintr(stream, buf),
+        };
+        // Ask AFTER the poll, so a close that lands while we are parked is seen
+        // on the very next pass, and a close that raced the poll's readiness
+        // still wins — a read completing on a channel Java has closed is the
+        // outcome `AsynchronousCloseException` exists to prevent.
+        if !net_stream_still_registered(fd) {
+            return Err(net_read_closed_err());
+        }
+        if !ready {
+            continue;
+        }
+        match read_retry_eintr(stream, buf) {
+            // Readable, then not: another reader on the same fd took the bytes.
+            // Park again rather than answering `WouldBlock`, which on a
+            // blocking fd would surface as a false `IOStatus.UNAVAILABLE`.
+            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+            other => return other,
+        }
+    }
+}
+
 /// `read0(FileDescriptor fd, long address, int len) -> int`
 ///
 /// Reads up to `len` bytes from the stream into the raw memory at `address`.
@@ -1689,9 +1786,6 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Stage into a reusable per-thread scratch buffer (no per-call alloc/zero).
     with_io_scratch(len_usize, |buf| {
         let read_result = {
-            // The std impl is `impl Read for &TcpStream` so we can read through
-            // a shared TcpStream without excluding a peer writer on this fd.
-            let mut r = &*stream_handle;
             // A blocking read can park in the OS indefinitely (waiting for the
             // peer to send / close). Bracket it in a GC-blocking region so a
             // stop-the-world GC requested meanwhile doesn't deadlock
@@ -1738,17 +1832,18 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // the same rationale ("EINTR consumes no bytes"); this is the
             // `NioSocketImpl` path (plain `Socket.getInputStream().read()`)
             // that was missed. Some Linux wrappers preserve it only as raw
-            // errno 4.
-            let res = loop {
-                match r.read(buf) {
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::Interrupted
-                            || e.raw_os_error() == Some(4) =>
-                    {
-                        continue
-                    }
-                    other => break other,
-                }
+            // errno 4. That retry now lives in `read_retry_eintr`.
+            //
+            // ASYNCHRONOUS CLOSE (2026-08-07): a bare blocking `recv` here is
+            // also why a reader parked in `Socket.getInputStream().read()`
+            // never noticed `Socket.close()` on another thread — the closing
+            // thread cannot take the OS handle away while this thread holds an
+            // `Arc` clone of it. `net_read_close_aware` parks in `poll` and
+            // re-checks the registry instead; see its doc comment.
+            let res = if can_park {
+                net_read_close_aware(fd, &stream_handle, buf)
+            } else {
+                read_retry_eintr(&stream_handle, buf)
             };
             let r0_recv = r0_t0.map(|_| std::time::Instant::now());
             if can_park {
@@ -2186,6 +2281,31 @@ fn net_poll_raw(_raw: NetRawHandle, _events: i32, timeout: i32) -> std::io::Resu
         std::thread::sleep(Duration::from_millis(timeout as u64));
     }
     Ok(false)
+}
+
+/// Wait up to `timeout_ms` for `stream` to become readable.
+///
+/// `Some(Ok(true))` — readable (or errored/hung up, which a read then
+/// surfaces); `Some(Ok(false))` — the timeout expired. `None` means this build
+/// has NO poll primitive at all (neither Windows nor Unix), and is the signal
+/// for the caller to fall back to a plain blocking read rather than spin on a
+/// stub that answers "not ready" forever.
+///
+/// Shared with `socket_channel.rs`, whose `SocketChannel` registry is separate
+/// from this file's but whose blocking read needs the same park-in-poll shape.
+pub(crate) fn poll_stream_readable(
+    stream: &TcpStream,
+    timeout_ms: i32,
+) -> Option<std::io::Result<bool>> {
+    #[cfg(any(windows, unix))]
+    {
+        Some(net_poll_stream(stream, NET_POLLIN, timeout_ms))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (stream, timeout_ms);
+        None
+    }
 }
 
 // `sun.nio.ch.Net` exposes the host poll ABI through these native methods.
@@ -4717,6 +4837,72 @@ mod tests {
             "close should wake blocked stream read promptly, got {elapsed:?}"
         );
         remove_fd(fd);
+    }
+
+    /// The half `t19_5_close_unblocks_blocking_stream_read` above does NOT
+    /// cover, and the one `RJdkNet.soTimeoutAndAsyncClose` asserts: that test
+    /// registers the CLIENT and then asserts the SERVER's read wakes, i.e. it
+    /// only proves the PEER observes the shutdown. The defect is the other
+    /// direction — a reader parked on the very fd being closed, in this
+    /// process. `shutdown` alone does not break that read on Windows, and the
+    /// OS handle cannot be closed while the reader holds an `Arc` clone of it.
+    #[test]
+    fn close_wakes_a_reader_parked_on_the_fd_being_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Hold the accepted end open and silent so the reader genuinely parks.
+        let keeper = thread::spawn(move || listener.accept().unwrap().0);
+
+        let client = Arc::new(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let fd = register_handle(NetSocketHandle::Stream(Arc::clone(&client)));
+
+        let reader = thread::spawn(move || {
+            let mut buf = [0_u8; 16];
+            let start = std::time::Instant::now();
+            let result = net_read_close_aware(fd, &client, &mut buf);
+            (result.map_err(|e| e.kind()), start.elapsed())
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        close_net_fd(fd);
+
+        let (result, elapsed) = reader.join().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            ErrorKind::Interrupted,
+            "an asynchronous close must break the parked read"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "close should wake the parked reader promptly, got {elapsed:?}"
+        );
+        remove_fd(fd);
+        drop(keeper.join().unwrap());
+    }
+
+    /// The other half of the same contract: a close-aware read must still be a
+    /// read. Payload that arrives while the reader is parked has to come back
+    /// on the very next pass, not after a poll timeout.
+    #[test]
+    fn close_aware_read_still_delivers_bytes_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let writer = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(100));
+            peer.write_all(b"ping").unwrap();
+            peer
+        });
+
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let fd = register_handle(NetSocketHandle::Stream(Arc::new(
+            client.try_clone().unwrap(),
+        )));
+        let mut buf = [0_u8; 16];
+        let n = net_read_close_aware(fd, &client, &mut buf).expect("read must succeed");
+        assert_eq!(&buf[..n], b"ping");
+        remove_fd(fd);
+        drop(writer.join().unwrap());
     }
 
     #[test]

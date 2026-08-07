@@ -290,9 +290,181 @@ fn infl_set_dictionary_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> 
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// Inflate error reporting
+// ---------------------------------------------------------------------------
+//
+// All four `Inflater.inflate*` natives are declared
+// `throws java.util.zip.DataFormatException` (`javap -p java.util.zip.Inflater`
+// on JDK 25 shows the `throws` clause on every one of them). That is not
+// decoration: libzip's JNI entry point maps zlib's `Z_DATA_ERROR` to
+// `JNU_ThrowByName(env, "java/util/zip/DataFormatException", strm->msg)`, and
+// `Inflater.inflate(byte[],int,int)` has NO Java-level check that turns a
+// zero-progress packed result into an exception — its bytecode stores the
+// packed long and returns (disassembled to confirm). The ONLY channel for
+// "this stream is corrupt" is a throw out of the native frame.
+//
+// So the pre-existing `Err(e) => (false, e.needs_dictionary().is_some())` arm
+// was a fabricated success where the spec mandates a failure: a hard decode
+// error became `(0, 0, false, false)`, `inflate()` returned 0, and the caller
+// could not tell corrupt input from "needs more input".
+// `RJdkJni.zipNatives:165` measures exactly that:
+//
+//     bad.setInput(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });
+//     bad.inflate(new byte[64]);            // must throw DataFormatException
+//
+// (`{1,2,...}` is not a zlib stream: CMF=0x01 carries CM=1 rather than 8, and
+// the two-byte header check `(0x01 << 8 | 0x02) % 31 != 0`, so zlib fails on
+// the header before producing a byte.)
+//
+// `Z_NEED_DICT` is deliberately NOT an error: the JDK reports it through the
+// `needDict` bit and `Inflater.needsDictionary()`. flate2 signals it as an
+// `Err` whose `needs_dictionary()` is `Some(adler)`, which is why the two are
+// split apart below rather than both being treated as failures.
+
+/// The outcome of one `flate2::Decompress::decompress` step, shared by all
+/// four `Inflater.inflate*` overloads.
+struct InflateStep {
+    input_consumed: u32,
+    output_consumed: u32,
+    finished: bool,
+    need_dict: bool,
+    /// `Some(zlib message)` when zlib reported a hard stream/data error — the
+    /// `Z_DATA_ERROR` case the JDK turns into `DataFormatException`. `None`
+    /// for every non-failing status, including `Z_NEED_DICT`.
+    data_error: Option<String>,
+}
+
+/// Construct and throw a real, catchable `java.util.zip.DataFormatException`.
+///
+/// It is a CHECKED exception on `Inflater.inflate`, so a Java `catch
+/// (DataFormatException)` is the intended handler and nothing else will do —
+/// an internal/uncatchable error here would escape the caller's `catch` and
+/// abort the whole call chain instead. If the class cannot be constructed we
+/// still raise a catchable throwable (an `IOException` naming the fault)
+/// rather than reporting success.
+fn throw_data_format(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/util/zip/DataFormatException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IOException {
+        message: format!("DataFormatException: {msg}"),
+    }
+    .into()
+}
+
+/// Stash partial progress in the receiver's `inputConsumed`/`outputConsumed`
+/// fields before throwing, the way the JDK's JNI code does: the exception
+/// handler compiled into `Inflater.inflate` reads them back to advance
+/// `inputPos` and `bytesRead`. On the non-throwing path the packed return
+/// value carries the same numbers, so this is only needed here. A no-op when
+/// the fields do not resolve (a synthetic `Inflater` layout has neither).
+fn store_progress_fields(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    input_consumed: u32,
+    output_consumed: u32,
+) {
+    let Some(this) = this else { return };
+    let cid = ctx.class_id_of_object(this);
+    let slots = ctx.object_num_fields(this);
+    // Fail closed on an out-of-range index rather than writing past a
+    // stand-in allocated with fewer slots than the real class declares.
+    for (name, value) in [
+        ("inputConsumed", input_consumed),
+        ("outputConsumed", output_consumed),
+    ] {
+        if let Some(idx) = ctx.resolve_field_index_by_class_id(cid, name) {
+            if idx < slots {
+                ctx.set_field(this, idx, Value::Int(value as i32));
+            }
+        }
+    }
+}
+
+/// Turn a completed [`InflateStep`] into the native's return value: either the
+/// packed progress long, or a thrown `DataFormatException`. Callers must have
+/// already flushed whatever output bytes were produced — the JDK writes them
+/// straight into the caller's buffer inside its critical section, so they are
+/// visible on the throwing path too.
+fn finish_inflate(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    step: InflateStep,
+) -> MethodCallResult {
+    if let Some(msg) = step.data_error {
+        store_progress_fields(ctx, this, step.input_consumed, step.output_consumed);
+        return Err(throw_data_format(ctx, &msg));
+    }
+    Ok(Some(Value::Long(pack_inflate_result(
+        step.input_consumed,
+        step.output_consumed,
+        step.finished,
+        step.need_dict,
+    ))))
+}
+
+/// Shared decompression core for all four `Inflater.inflate*` overloads.
+///
+/// Holds the handle-table mutex for the duration of the zlib step ONLY: the
+/// guard must be dropped before any caller re-enters Java (`finish_inflate`
+/// allocates and runs `DataFormatException.<init>`), so nothing here returns
+/// while still holding it.
+fn infl_do_decompress(addr: i64, input_data: &[u8], output_buf: &mut [u8]) -> InflateStep {
+    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = tbl.get_mut(&addr) else {
+        // Zero handle / already-ended stream. Report no progress, matching the
+        // long-standing behaviour: the Java wrapper's `ensureOpen()` is what
+        // rejects a closed Inflater, and a caller that legitimately races here
+        // must not be handed a decode error it cannot act on.
+        return InflateStep {
+            input_consumed: 0,
+            output_consumed: 0,
+            finished: false,
+            need_dict: false,
+            data_error: None,
+        };
+    };
+    let total_in_before = st.decomp.total_in();
+    let total_out_before = st.decomp.total_out();
+    let status = st
+        .decomp
+        .decompress(input_data, output_buf, FlushDecompress::None);
+    let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
+    let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
+    let (finished, need_dict, data_error) = match status {
+        Ok(flate2::Status::StreamEnd) => (true, false, None),
+        Ok(flate2::Status::Ok | flate2::Status::BufError) => (false, false, None),
+        // A "needs dictionary" error carries the dictionary's Adler-32; the
+        // JDK signals that through the needDict bit, NOT an exception.
+        Err(e) if e.needs_dictionary().is_some() => (false, true, None),
+        // Everything else is zlib's Z_DATA_ERROR / Z_STREAM_ERROR: the stream
+        // is corrupt and `DataFormatException` is the spec'd answer.
+        Err(e) => (false, false, Some(format!("{e}"))),
+    };
+    // `Inflater.getAdler()` reports the ADLER-32 of the uncompressed data, and
+    // must agree no matter which overload the JDK wrapper picked. `.min(len)`
+    // is belt-and-braces: a slice panic here would abort the VM.
+    let produced = (output_consumed as usize).min(output_buf.len());
+    st.adler = adler32_update(st.adler, &output_buf[..produced]);
+    InflateStep {
+        input_consumed,
+        output_consumed,
+        finished,
+        need_dict,
+        data_error,
+    }
+}
+
 fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // this, long addr, byte[] in, int inOff, int inLen, byte[] out, int outOff, int outLen
     // args[0] = this (receiver)
+    let this = arg_obj(args, 0);
     let addr = arg_long(args, 1);
     let input_arr = arg_obj(args, 2);
     let in_off = arg_int(args, 3).max(0) as usize;
@@ -307,99 +479,20 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let mut output_buf = vec![0u8; out_len];
 
-    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
-    let st = match tbl.get_mut(&addr) {
-        Some(s) => s,
-        None => {
-            // Zero handle / closed stream. Return all-zero so Java sees no progress.
-            return Ok(Some(Value::Long(0)));
-        }
-    };
-
-    let total_in_before = st.decomp.total_in();
-    let total_out_before = st.decomp.total_out();
-    let status = st
-        .decomp
-        .decompress(&input_data, &mut output_buf, FlushDecompress::None);
-    let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
-    let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
-
-    let (finished, need_dict) = match status {
-        Ok(flate2::Status::StreamEnd) => (true, false),
-        Ok(flate2::Status::Ok) => (false, false),
-        Ok(flate2::Status::BufError) => (false, false),
-        Err(e) => {
-            // A "needs dictionary" error from flate2 carries an Adler-32 on
-            // `DecompressError`; surface it via the needDict bit so Java
-            // throws the right exception.
-            let needs = e.needs_dictionary().is_some();
-            (false, needs)
-        }
-    };
-    // `Inflater.getAdler()` reports the ADLER-32 of the uncompressed data.
-    // `.min(len)` is belt-and-braces: a slice panic here would abort the VM.
-    let produced = (output_consumed as usize).min(output_buf.len());
-    st.adler = adler32_update(st.adler, &output_buf[..produced]);
-
-    drop(tbl);
+    let step = infl_do_decompress(addr, &input_data, &mut output_buf);
 
     if let Some(a) = output_arr {
-        if output_consumed > 0 {
-            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        if step.output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..step.output_consumed as usize]);
         }
     }
 
-    Ok(Some(Value::Long(pack_inflate_result(
-        input_consumed,
-        output_consumed,
-        finished,
-        need_dict,
-    ))))
-}
-
-// audit-round6 (LOW, direct-ByteBuffer inflate no-op):
-//
-// These three natives cover the inflate combinations where at least one
-// side is a *direct* `ByteBuffer`, addressed by a raw `long` rather than a
-// `byte[]`. This VM has no raw-memory view into direct buffers here, so we
-// genuinely cannot make progress on them.
-//
-// The previous implementation returned a packed `Long(0)` ("no progress")
-// and claimed the JDK would "loop around to an array-backed path". That is
-// NOT correct: the JDK's `Inflater` dispatches to the native that matches
-/// Shared decompression core for all four `Inflater.inflate*` overloads.
-fn infl_do_decompress(
-    addr: i64,
-    input_data: &[u8],
-    output_buf: &mut [u8],
-) -> (u32, u32, bool, bool) {
-    let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(st) = tbl.get_mut(&addr) else {
-        return (0, 0, false, false);
-    };
-    let total_in_before = st.decomp.total_in();
-    let total_out_before = st.decomp.total_out();
-    let status = st
-        .decomp
-        .decompress(input_data, output_buf, FlushDecompress::None);
-    let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
-    let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
-    let (finished, need_dict) = match status {
-        Ok(flate2::Status::StreamEnd) => (true, false),
-        Ok(flate2::Status::Ok | flate2::Status::BufError) => (false, false),
-        Err(e) => (false, e.needs_dictionary().is_some()),
-    };
-    // Same running ADLER-32 over the uncompressed output as the bytes-bytes
-    // overload above — `getAdler()` must agree no matter which overload the
-    // JDK wrapper picked. `.min(len)` guards against a slice panic.
-    let produced = (output_consumed as usize).min(output_buf.len());
-    st.adler = adler32_update(st.adler, &output_buf[..produced]);
-    (input_consumed, output_consumed, finished, need_dict)
+    finish_inflate(ctx, this, step)
 }
 
 fn infl_inflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // input: byte[], output: direct ByteBuffer (long addr). Cannot write the
-    // direct output buffer — no array fallback exists for a direct output.
+    // input: byte[], output: direct ByteBuffer (long addr).
+    let this = arg_obj(args, 0);
     let addr = arg_long(args, 1);
     let input_arr = arg_obj(args, 2);
     let in_off = arg_int(args, 3).max(0) as usize;
@@ -410,27 +503,21 @@ fn infl_inflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         .map(|a| read_byte_array(ctx, a, in_off, in_len))
         .unwrap_or_default();
     let mut output_buf = vec![0u8; out_len];
-    let (input_consumed, output_consumed, finished, need_dict) =
-        infl_do_decompress(addr, &input_data, &mut output_buf);
-    if output_consumed > 0
-        && !ctx.copy_to_native_memory(output_addr, &output_buf[..output_consumed as usize])
+    let step = infl_do_decompress(addr, &input_data, &mut output_buf);
+    if step.output_consumed > 0
+        && !ctx.copy_to_native_memory(output_addr, &output_buf[..step.output_consumed as usize])
     {
         return Err(RuntimeError::IOException {
             message: format!("inflateBytesBuffer: invalid output buffer address {output_addr:#x}"),
         }
         .into());
     }
-    Ok(Some(Value::Long(pack_inflate_result(
-        input_consumed,
-        output_consumed,
-        finished,
-        need_dict,
-    ))))
+    finish_inflate(ctx, this, step)
 }
 
 fn infl_inflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // input: direct ByteBuffer (long addr), output: byte[]. Cannot read the
-    // direct input bytes, so no progress is possible.
+    // input: direct ByteBuffer (long addr), output: byte[].
+    let this = arg_obj(args, 0);
     let addr = arg_long(args, 1);
     let input_addr = arg_long(args, 2);
     let in_len = arg_int(args, 3).max(0) as usize;
@@ -445,23 +532,18 @@ fn infl_inflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         .into());
     }
     let mut output_buf = vec![0u8; out_len];
-    let (input_consumed, output_consumed, finished, need_dict) =
-        infl_do_decompress(addr, &input_data, &mut output_buf);
+    let step = infl_do_decompress(addr, &input_data, &mut output_buf);
     if let Some(a) = output_arr {
-        if output_consumed > 0 {
-            write_byte_array(ctx, a, out_off, &output_buf[..output_consumed as usize]);
+        if step.output_consumed > 0 {
+            write_byte_array(ctx, a, out_off, &output_buf[..step.output_consumed as usize]);
         }
     }
-    Ok(Some(Value::Long(pack_inflate_result(
-        input_consumed,
-        output_consumed,
-        finished,
-        need_dict,
-    ))))
+    finish_inflate(ctx, this, step)
 }
 
 fn infl_inflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Both sides are direct ByteBuffers — neither readable nor writable here.
+    // Both sides are direct ByteBuffers (already resolved to native addresses).
+    let this = arg_obj(args, 0);
     let addr = arg_long(args, 1);
     let input_addr = arg_long(args, 2);
     let in_len = arg_int(args, 3).max(0) as usize;
@@ -475,22 +557,16 @@ fn infl_inflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .into());
     }
     let mut output_buf = vec![0u8; out_len];
-    let (input_consumed, output_consumed, finished, need_dict) =
-        infl_do_decompress(addr, &input_data, &mut output_buf);
-    if output_consumed > 0
-        && !ctx.copy_to_native_memory(output_addr, &output_buf[..output_consumed as usize])
+    let step = infl_do_decompress(addr, &input_data, &mut output_buf);
+    if step.output_consumed > 0
+        && !ctx.copy_to_native_memory(output_addr, &output_buf[..step.output_consumed as usize])
     {
         return Err(RuntimeError::IOException {
             message: format!("inflateBufferBuffer: invalid output buffer address {output_addr:#x}"),
         }
         .into());
     }
-    Ok(Some(Value::Long(pack_inflate_result(
-        input_consumed,
-        output_consumed,
-        finished,
-        need_dict,
-    ))))
+    finish_inflate(ctx, this, step)
 }
 
 fn infl_get_adler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1466,6 +1542,91 @@ mod tests {
         assert_eq!(used_in, compressed.len());
         assert_eq!(&output[..used_out], original);
         assert!(finished && !need_dict);
+    }
+
+    /// Corrupt deflate input must FAIL, not answer "no progress".
+    ///
+    /// All four `Inflater.inflate*` natives are declared `throws
+    /// DataFormatException` and `Inflater.inflate` has no Java-level check
+    /// that converts a zero-progress packed result into an exception, so a
+    /// swallowed decode error reaches the caller as `inflate() == 0` — a
+    /// fabricated success. `RJdkJni.zipNatives:165` asserts the throw.
+    ///
+    /// The mock context cannot construct a real
+    /// `java.util.zip.DataFormatException`, so what is asserted here is the
+    /// half that is testable off-VM: the call must be `Err`, never `Ok`. The
+    /// exception CLASS is chosen in `throw_data_format`.
+    #[test]
+    fn corrupt_input_fails_instead_of_reporting_no_progress() {
+        let mut ctx = mock_ctx();
+        // nowrap = 0 → a zlib-wrapped stream is expected. {1,2,...} has
+        // CM = 1 (not 8) and a bad two-byte header check, so zlib rejects it
+        // before producing a single byte.
+        let addr = match infl_init(&mut ctx, &[Value::Int(0)]).unwrap().unwrap() {
+            Value::Long(addr) => addr,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+        let corrupt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let input_arr = ctx.new_array(ArrayElementType::Byte, corrupt.len());
+        for (i, b) in corrupt.iter().enumerate() {
+            ctx.set_array_element(input_arr, i, Value::Int(*b as i32));
+        }
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 64);
+        let result = infl_inflate_bytes_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input_arr)),
+                Value::Int(0),
+                Value::Int(corrupt.len() as i32),
+                Value::Object(Some(output_arr)),
+                Value::Int(0),
+                Value::Int(64),
+            ],
+        );
+        assert!(
+            result.is_err(),
+            "corrupt deflate input must raise, not answer no-progress"
+        );
+
+        // A VALID stream through the same path must still succeed — the guard
+        // has to reject corrupt input without rejecting good input.
+        let original = b"hello hello hello hello world world";
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(original).unwrap();
+        let good = enc.finish().unwrap();
+        let addr = match infl_init(&mut ctx, &[Value::Int(0)]).unwrap().unwrap() {
+            Value::Long(addr) => addr,
+            other => panic!("expected Long handle, got {other:?}"),
+        };
+        let input_arr = ctx.new_array(ArrayElementType::Byte, good.len());
+        for (i, b) in good.iter().enumerate() {
+            ctx.set_array_element(input_arr, i, Value::Int(*b as i8 as i32));
+        }
+        let output_arr = ctx.new_array(ArrayElementType::Byte, 256);
+        let packed = match infl_inflate_bytes_bytes(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Object(Some(input_arr)),
+                Value::Int(0),
+                Value::Int(good.len() as i32),
+                Value::Object(Some(output_arr)),
+                Value::Int(0),
+                Value::Int(256),
+            ],
+        )
+        .expect("valid zlib stream must inflate")
+        .expect("inflate returns a long")
+        {
+            Value::Long(p) => p as u64,
+            other => panic!("expected Long result, got {other:?}"),
+        };
+        let produced = ((packed >> 31) & 0x7FFF_FFFF) as usize;
+        assert_eq!(read_byte_array(&ctx, output_arr, 0, produced), original);
+        assert!((packed >> 62) & 1 == 1, "valid stream must report finished");
     }
 
     #[test]

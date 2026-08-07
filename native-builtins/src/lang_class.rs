@@ -138,7 +138,7 @@ pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> 
     let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
         Arc::from(primitive)
     } else if slashed.contains('/') {
-        Arc::from(slashed.replace('/', "."))
+        Arc::from(dotted_binary_name(slashed))
     } else {
         Arc::from(slashed)
     };
@@ -908,6 +908,45 @@ fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option
     Some(format!("{host_dotted}$$Lambda/0x{:x}", class_id.as_u32()))
 }
 
+/// Split a hidden class's mangled internal name at its `/0x<hex>` tail.
+///
+/// The class store registers a hidden class under `<this_class>/0x<n>` — both
+/// `lookup_define.rs`'s pre-mangled `override_name` and `class_manager.rs`'s
+/// collision suffix build that shape. HotSpot reports it verbatim from
+/// `Class.getName()`: the `/` is part of the NAME, not a package separator, so
+/// the usual internal->binary `/`->`.` rewrite must not touch it. Measured
+/// before this fix: `getName()` answered `RJdkHidden$Payload.0x0`, failing
+/// `regression-suite/src/RJdkHidden.java:93`'s `getName().contains("/0x")`.
+///
+/// Returns `(base, suffix)` with the suffix still carrying its leading `/`, or
+/// `None` when there is no such tail. No legal Java package or class segment
+/// begins with a digit, so `0x...` after a `/` is unambiguous.
+fn hidden_name_suffix_split(internal: &str) -> Option<(&str, &str)> {
+    let at = internal.rfind("/0x")?;
+    let hex = &internal[at + 3..];
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((&internal[..at], &internal[at..]))
+}
+
+/// Internal (`/`-separated) name -> the binary name `Class.getName()` reports,
+/// preserving a hidden class's `/0x<hex>` suffix verbatim.
+///
+///   `RJdkHidden$Payload/0x3` -> `RJdkHidden$Payload/0x3`
+///   `com/acme/P/0x3`         -> `com.acme.P/0x3`
+///   `com/acme/P`             -> `com.acme.P`
+pub(crate) fn dotted_binary_name(internal: &str) -> String {
+    match hidden_name_suffix_split(internal) {
+        Some((base, suffix)) => {
+            let mut out = base.replace('/', ".");
+            out.push_str(suffix);
+            out
+        }
+        None => internal.replace('/', "."),
+    }
+}
+
 const SPRING_ENHANCED_CONFIGURATION_IFACE: &str =
     "org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration";
 const CRATONVM_CONFIG_CGLIB_MARKER: &str = "$$EnhancerByCGLIB$$";
@@ -1015,7 +1054,7 @@ pub(crate) fn native_class_get_name(
                 .unwrap_or(strict_name);
             let dotted = primitive_descriptor_name(&display_name)
                 .map(str::to_string)
-                .unwrap_or_else(|| display_name.replace('/', "."));
+                .unwrap_or_else(|| dotted_binary_name(&display_name));
             if dbg_bb {
                 eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
             }
@@ -1065,7 +1104,7 @@ pub(crate) fn native_class_get_name(
             let dotted_name = if let Some(primitive) = primitive_descriptor_name(&display_name) {
                 primitive.to_string()
             } else if display_name.contains('/') {
-                display_name.replace('/', ".")
+                dotted_binary_name(&display_name)
             } else {
                 display_name
             };

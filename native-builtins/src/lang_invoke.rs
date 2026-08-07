@@ -4404,24 +4404,78 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
-    for name in ["arrayElementGetter", "arrayElementSetter"] {
-        r.register(
-            mh,
-            name,
-            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-            |ctx, _args| {
-                // C19: allocate past the real-JDK instance-field count so the
-                // `type:MethodType` field at slot 0 is populated with a non-null
-                // MethodType. Synthesize `()V` — callers only need a non-null.
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-                if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                    ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-                }
-                Ok(Some(Value::Object(Some(obj))))
-            },
-        );
-    }
+    r.register(
+        mh,
+        "arrayElementGetter",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| array_element_accessor_handle(ctx, args, false),
+    );
+    r.register(
+        mh,
+        "arrayElementSetter",
+        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+        |ctx, args| array_element_accessor_handle(ctx, args, true),
+    );
     r.set_category(__prev_cat);
+}
+
+/// Shared body of the `arrayElementGetter` / `arrayElementSetter` bridges.
+///
+/// Mints a FUNCTIONAL `MH_KIND_ARRAY_GET` / `MH_KIND_ARRAY_SET` handle whose
+/// `MH_DESC` (and therefore `type()`) is the exact JDK-contract accessor
+/// signature — `(T[],int)T` for the getter, `(T[],int,T)void` for the setter —
+/// derived from the supplied array `Class` mirror. See `MH_KIND_ARRAY_GET`'s
+/// doc comment for the inert-handle defect this replaces.
+///
+/// A mirror we cannot name at all degrades to `[Ljava/lang/Object;` rather
+/// than throwing: `ObjectStreamClass$RecordSupport.<clinit>` only needs a
+/// non-null handle in its `PRIM_VALUE_EXTRACTORS` map, and a hard failure
+/// there aborts EVERY record (de)serialization with a bogus
+/// `no class def found: ObjectStreamClass$RecordSupport`. A mirror we CAN
+/// name but which is not an array type is the genuine JDK
+/// `IllegalArgumentException` case and is thrown as such.
+fn array_element_accessor_handle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    setter: bool,
+) -> MethodCallResult {
+    let factory = if setter {
+        "arrayElementSetter"
+    } else {
+        "arrayElementGetter"
+    };
+    let arr_desc: String = match args.first() {
+        Some(Value::Object(Some(mirror))) => match resolve_class_name_robust(ctx, *mirror) {
+            Some(name) => {
+                let d = class_name_to_descriptor(&name).into_owned();
+                if !d.starts_with('[') {
+                    return Err(
+                        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                            message: format!("MethodHandles.{factory}: not an array type: {name}"),
+                        }
+                        .into(),
+                    );
+                }
+                d
+            }
+            None => format!("[{DESC_OBJECT}"),
+        },
+        // A null/absent `arrayClass`. The real JDK throws NPE here, but this
+        // bridge must stay total: `vm/src/vm.rs`'s `method_handles_factories_p65`
+        // unit test calls the factory with `Value::Object(None)` and unwraps the
+        // result, and the `RecordSupport.<clinit>` caller only needs a non-null
+        // handle. Degrade to the erased `Object[]` accessor instead of throwing.
+        _ => format!("[{DESC_OBJECT}"),
+    };
+    // Component descriptor: one `[` stripped off the array descriptor.
+    let comp = arr_desc[1..].to_string();
+    let (desc, kind) = if setter {
+        (format!("({arr_desc}I{comp})V"), MH_KIND_ARRAY_SET)
+    } else {
+        (format!("({arr_desc}I){comp}"), MH_KIND_ARRAY_GET)
+    };
+    let handle = alloc_method_handle(ctx, &arr_desc, factory, &desc, kind);
+    Ok(Some(Value::Object(Some(handle))))
 }
 
 /// `MethodHandles.constant(Class type, Object value)` — a *functional*
@@ -5616,6 +5670,35 @@ pub(crate) const MH_KIND_RETURN_FILTER: i32 = 22;
 /// `JRubyScriptTemplateTests`'s `require 'ostruct'` (`ostruct.rb:477`,
 /// string interpolation in `OpenStruct`'s class body).
 pub(crate) const MH_KIND_COLLECT_ARGS: i32 = 23;
+
+/// `MethodHandles.arrayElementGetter(arrayClass)` — a handle of type
+/// `(T[],int)T` that reads `array[index]`. `MH_CLASS` holds the array
+/// descriptor (`[I`, `[Ljava/lang/String;`, …), `MH_DESC` the full
+/// `([I I)I`-shaped accessor descriptor, so `mh.type()` and the
+/// `invokeExact` return-boxing both read the right component type.
+///
+/// Was previously an INERT handle: `register_array_element_accessor_bridges`
+/// allocated a bare 17-slot `java/lang/invoke/MethodHandle` with a `()V`
+/// `type` and NO synthetic metadata at all — slots 16–20 (`MH_CLASS` …
+/// `MH_BOUND`) did not exist on a 17-slot object. That was enough for
+/// `ObjectStreamClass$RecordSupport.<clinit>`, whose `PRIM_VALUE_EXTRACTORS`
+/// map only needs the handle to be non-null (the record rebuild itself is
+/// pinned separately as `MH_KIND_RECORD_DESER`), but ANY actual invocation
+/// silently produced zero: `MethodHandle.invokeExact` read `MH_DESC` (slot
+/// 18) and `MH_KIND` (slot 19) out of bounds — the GC guard logged exactly
+/// those two indices with `num_slots=17` — and `mh_dispatch`'s `mh_read_class`
+/// then found a null `MH_CLASS` and took its `None` fast-fail, returning
+/// `null`, which the call-site return coercion turned into `Value::Int(0)`.
+/// regression-suite `RJdkHandles.adaptation` (`arrayElementGetter`,
+/// `RJdkHandles.java:147`) failed on `aget.invokeExact(new int[]{7,8,9}, 1)
+/// == 8` in BOTH `--real-jdk` and `--jdk-only`, reading 0.
+pub(crate) const MH_KIND_ARRAY_GET: i32 = 24;
+
+/// `MethodHandles.arrayElementSetter(arrayClass)` — a handle of type
+/// `(T[],int,T)void` that stores `array[index] = value`. Sibling of
+/// `MH_KIND_ARRAY_GET`; see that constant for the inert-handle defect both
+/// factories shared.
+pub(crate) const MH_KIND_ARRAY_SET: i32 = 25;
 
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
@@ -7207,6 +7290,73 @@ pub(crate) fn mh_dispatch(
             full.extend_from_slice(&extra_args[..leading]);
             full.push(Value::Object(Some(arr)));
             mh_dispatch(ctx, target, &full)
+        }
+        MH_KIND_ARRAY_GET | MH_KIND_ARRAY_SET => {
+            // `MethodHandles.arrayElementGetter` / `arrayElementSetter`:
+            //   getter  (T[],int)    -> T
+            //   setter  (T[],int,T)  -> void
+            // After `bindTo(array)` the array is pre-captured in MH_BOUND, so
+            // prepend it exactly as the MH_KIND_STATIC arm does.
+            let full: Vec<Value> = match bound {
+                Value::Object(Some(_)) => {
+                    let mut v = Vec::with_capacity(extra_args.len() + 1);
+                    v.push(bound);
+                    v.extend_from_slice(extra_args);
+                    v
+                }
+                _ => extra_args.to_vec(),
+            };
+            let arr = match full.first() {
+                Some(Value::Object(Some(a))) => *a,
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: Some(format!("{name}: array is null")),
+                    }
+                    .into());
+                }
+            };
+            // The index may arrive raw (direct `invokeExact` from bytecode) or
+            // boxed (`invokeWithArguments` / an adapter chain that spreads an
+            // `Object[]`) — accept both.
+            let idx = match full.get(1).copied() {
+                Some(Value::Int(i)) => i,
+                Some(Value::Long(l)) => l as i32,
+                Some(Value::Object(Some(o))) => match crate::lang_class::unbox_value(ctx, o) {
+                    Value::Int(i) => i,
+                    Value::Long(l) => l as i32,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            let len = ctx.array_length(arr);
+            if idx < 0 || idx as usize >= len {
+                return Err(
+                    cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                        index: idx,
+                        message: None,
+                    }
+                    .into(),
+                );
+            }
+            if kind == MH_KIND_ARRAY_GET {
+                // Raw element value; `auto_box_return` re-boxes it against
+                // MH_DESC's return token for the Object-erased invoke shim.
+                Ok(Some(ctx.get_array_element(arr, idx as usize)))
+            } else {
+                // Store: unbox a wrapper when the component type is primitive,
+                // otherwise a boxed `Integer` would land in an `int[]` slot.
+                let comp = split_descriptor_params(&desc)
+                    .and_then(|(params, _)| params.last().cloned())
+                    .unwrap_or_else(|| DESC_OBJECT.to_string());
+                let mut value = full.get(2).copied().unwrap_or(Value::Object(None));
+                if matches!(comp.as_str(), "Z" | "B" | "C" | "S" | "I" | "J" | "F" | "D") {
+                    if let Value::Object(Some(o)) = value {
+                        value = crate::lang_class::unbox_value(ctx, o);
+                    }
+                }
+                ctx.set_array_element(arr, idx as usize, value);
+                Ok(None)
+            }
         }
         MH_KIND_FILTER => mh_dispatch_filter(ctx, bound, extra_args),
         MH_KIND_FOLD => mh_dispatch_fold(ctx, bound, extra_args),
