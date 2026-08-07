@@ -79,9 +79,9 @@ own adjudication"* was counting tests.
 **Step 3 — deleting `ensure_synthetic_class` — and the blocker is not the call
 sites.** Three of the 39 *are* the infallible allocation funnels themselves:
 
-* `native-collections::alloc_synthetic`
-* `native-io::alloc_synthetic`
-* `native-builtins::alloc_concurrent_synthetic`
+* `native-collections::alloc_synthetic` — **migrated 2026-08-06**
+* `native-io::alloc_synthetic` — **migrated 2026-08-06**
+* `native-builtins::alloc_concurrent_synthetic` — **not migrated; see below**
 
 Between them they have roughly **2,300 callers**, none of which returns a
 `Result`. Deleting `ensure_synthetic_class` means making those three fallible,
@@ -90,9 +90,63 @@ that sizes this work off a grep of `.ensure_synthetic_class(` is sizing the
 wrong thing.
 
 The fallible siblings those funnels need already exist and now have real
-callers: `try_alloc_synthetic` (native-collections) and
-`try_alloc_concurrent_synthetic` (native-builtins), added by L7 alongside the
-infallible ones.
+callers: `try_alloc_synthetic` (native-collections and, since 2026-08-06,
+native-io) and `try_alloc_concurrent_synthetic` (native-builtins).
+
+### Two of the three are done, and the unit above is still wrong
+
+**"~2,300 call sites" is not the size of this work, and neither is 39.** The
+call sites are MECHANICAL — a paren-matching rewrite to the `try_` spelling
+with `?`, plus the `use` lines. What costs is the cascade: every helper that
+returned a bare `ObjectRef`/`Value`/`()` and therefore had nowhere to put a
+refusal has to gain an error channel, and so does everything that calls it.
+The compiler enumerates that set exactly, so it drives the work rather than a
+grep. Measured on 2026-08-06:
+
+| funnel | call sites | functions needing an error channel | outcome |
+|---|---:|---:|---|
+| `native-io::alloc_synthetic` | 23 | **6** | done, 2 rounds |
+| `native-collections::alloc_synthetic` | 146 | **44** | done, 4 rounds + 11 by hand |
+| `native-builtins::alloc_concurrent_synthetic` | 1,932 | **≥340** | **abandoned — see below** |
+
+Landing the first two also forced **34 cross-crate call sites** in
+native-builtins, because `make_hashset_with_elements`, the collector factories
+and the view builders are `pub` and became fallible. That is part of the cost of
+each funnel and is easy to forget when sizing one in isolation.
+
+### Why `alloc_concurrent_synthetic` was abandoned rather than finished
+
+Not because it is big. Because the cascade **stopped converging**: rounds of
+"give the reported functions an error channel, then re-ask the compiler" went
+277 → 160 → 134 → 106 → 105 → 155 → 137, and a second loop that also repaired
+the mechanical fallout (a stray `?`, a bare `return;`, an unwrapped tail) went
+315 → 317 → 322. A loop whose error count RISES is repairing less than it
+breaks, and the honest reading is that the remaining sites need per-site
+judgement, not another pass.
+
+Three tooling faults found on the way, all of which produce a PARSE error rather
+than a type error — which matters, because rustc stops at the first parse error
+per file and hides everything behind it:
+
+* a parameter that is itself a closure (`&dyn Fn(usize) -> bool`) makes "the
+  last `->` in the signature" pick the CLOSURE's return type; `str.replace` then
+  splits `Result<..>` across two parameters;
+* `(?<![\w.])get\(` matches inside `$get(`, so a `macro_rules!`-defined function
+  gets a `?` appended to its PARAMETER LIST;
+* a unit fn whose last line is a tail expression needs a `;` before the appended
+  `Ok(())`, and a tail that merely closes a multi-line call (`})`) is not an
+  expression to wrap at all — wrapping it yields the literal text `Ok(}))`.
+
+And one structural flaw worth knowing before anyone tries again: **the
+`?`-appender matches by NAME across every file**, so converting `alloc_foo` in
+one module also stamps a `?` on an unrelated `alloc_foo` in another. rustc
+reports each as "`?` operator has incompatible types" and the repair is to
+delete that `?` — but a name-based rewriter over a 112-file crate will keep
+generating them.
+
+**If you pick this up:** do it module by module, not crate-wide. The 1,932 sites
+are spread over 112 files and the modules are nearly independent; a per-module
+loop keeps the name collisions inside one file, where they are visible.
 
 **The unmodifiable/factory/comparator family is closed — and the order was the
 whole lesson.** After the bootstrap migration, `JdkOnlyCensusLoadProbe` still
@@ -234,8 +288,13 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
    `getResources` helpers, which has no such landing yet. And the refusals are
    landings, not removals — the natives themselves are still registered, which
    is item 5's business.
-5. Make the three allocation funnels fallible (~2,300 call sites), then delete
-   `ensure_synthetic_class`.
+5. Make the three allocation funnels fallible, then delete
+   `ensure_synthetic_class`. **Two of three done 2026-08-06** —
+   `native-io::alloc_synthetic` and `native-collections::alloc_synthetic`, plus
+   the 34 cross-crate callers that forced. `native-builtins::alloc_concurrent_synthetic`
+   is not done and the reason is measured, not estimated; see *Why
+   `alloc_concurrent_synthetic` was abandoned rather than finished* above. Until
+   it is, `ensure_synthetic_class` cannot be deleted and this record stays open.
 
 ## How to verify a fix
 
