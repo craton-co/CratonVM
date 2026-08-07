@@ -2018,7 +2018,7 @@ pub(super) fn gc_reference_next_slot(shared: &SharedVm) -> usize {
 /// and relocates ref processor addresses using the pointer map.
 pub(super) fn process_references_after_gc(
     shared: &SharedVm,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     // HIB-CV-24 (Manifestation B): reconcile the defining-loader side-table with
     // this collection. A user `ClassLoader` the application no longer references
@@ -4379,7 +4379,7 @@ pub fn check_pending_async_exception(
 /// Apply a GC pointer map to a thread's frame locals and operand stacks.
 pub(crate) fn apply_pointer_map_to_thread(
     thread: &mut JvmThread,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
     heap: &crate::memory::VmHeap,
 ) {
     // JNI local references (INT-2, safepoint-resume half): rewrite THIS
@@ -4679,7 +4679,7 @@ pub(crate) fn apply_pointer_map_to_thread(
 /// repointed.)
 pub(crate) fn remap_rs_cache_after_gc(
     thread: &mut JvmThread,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
     heap: &crate::memory::VmHeap,
 ) {
     if !crate::runtime::env_cache::rootsnap_cache()
@@ -4827,7 +4827,7 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .mem
             .gc_barrier
-            .complete_gc(std::collections::HashMap::new());
+            .complete_gc(cratonvm_types::PointerMap::default());
     }
 
     // Phase 2: Concurrent Mark — runs while app threads continue
@@ -4900,7 +4900,7 @@ pub(super) fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .mem
             .gc_barrier
-            .complete_gc(std::collections::HashMap::new());
+            .complete_gc(cratonvm_types::PointerMap::default());
     }
 
     // fork6 GC_STRESS fix — the remark STW is NOT optional. If another
@@ -5011,7 +5011,7 @@ pub(super) fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread
         shared
             .mem
             .gc_barrier
-            .complete_gc(std::collections::HashMap::new());
+            .complete_gc(cratonvm_types::PointerMap::default());
     }
 
     // Phase 2: Concurrent Mark — the background worker that drains
@@ -5125,7 +5125,7 @@ pub(super) fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread)
         shared
             .mem
             .gc_barrier
-            .complete_gc(std::collections::HashMap::new());
+            .complete_gc(cratonvm_types::PointerMap::default());
     } else {
         tracing::debug!("[G1] Final remark lost the STW race — retrying at next GC");
     }
@@ -5163,7 +5163,7 @@ pub(super) fn g1_remark_process_references(
     // cleanup frees dead regions and before the optional reference-processor
     // short-circuit.
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
-    let no_moves = std::collections::HashMap::new();
+    let no_moves = cratonvm_types::PointerMap::default();
     let dead_class_hints =
         cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
             shared.vm_identity,

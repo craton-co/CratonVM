@@ -320,7 +320,7 @@ impl ObjectTagMap {
     }
 
     /// Update tags after GC compaction. Applies forwarding map.
-    pub fn update_after_gc(&self, forwarding: &HashMap<usize, usize>) {
+    pub fn update_after_gc(&self, forwarding: &cratonvm_types::PointerMap) {
         let mut map = self.tags.write().unwrap();
         let entries: Vec<(usize, i64)> = map.drain().collect();
         for (old_addr, tag) in entries {
@@ -753,7 +753,7 @@ mod tests {
         let tags = ObjectTagMap::new();
         tags.set_tag(0x1000, 10);
         tags.set_tag(0x2000, 20);
-        let mut forwarding = HashMap::new();
+        let mut forwarding = cratonvm_types::PointerMap::default();
         forwarding.insert(0x1000usize, 0x5000usize);
         tags.update_after_gc(&forwarding);
         assert_eq!(tags.get_tag(0x5000), 10);
@@ -1088,7 +1088,7 @@ mod tests {
         assert_eq!(tags.count(), 3);
 
         // Simulate GC: object at 0x1000 moved to 0x5000, 0x3000 moved to 0x6000
-        let mut forwarding = HashMap::new();
+        let mut forwarding = cratonvm_types::PointerMap::default();
         forwarding.insert(0x1000usize, 0x5000usize);
         forwarding.insert(0x3000usize, 0x6000usize);
         tags.update_after_gc(&forwarding);

@@ -270,7 +270,7 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
 /// unconditionally: bounded by `class_mirrors.len()`, each entry a single
 /// `defining_loader_for` hash lookup that returns `None` (skipped) for every
 /// built-in-loader class — the overwhelmingly common case.
-pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
+pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_types::PointerMap) {
     let class_mirrors = shared.classes.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
@@ -321,13 +321,13 @@ pub(crate) fn gcpart_enabled() -> bool {
 }
 
 #[allow(clippy::type_complexity)]
-fn gcpart_ring() -> &'static std::sync::Mutex<Vec<(u64, HashMap<usize, usize>)>> {
-    static R: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, HashMap<usize, usize>)>>> =
+fn gcpart_ring() -> &'static std::sync::Mutex<Vec<(u64, cratonvm_types::PointerMap)>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<Vec<(u64, cratonvm_types::PointerMap)>>> =
         std::sync::OnceLock::new();
     R.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-pub(crate) fn gcpart_record(epoch: u64, map: &HashMap<usize, usize>) {
+pub(crate) fn gcpart_record(epoch: u64, map: &cratonvm_types::PointerMap) {
     if !gcpart_enabled() || map.is_empty() {
         return;
     }
@@ -364,7 +364,7 @@ pub(crate) fn gcpart_probe(addr: usize) -> Vec<(u64, Option<usize>, usize, bool)
 
 pub(crate) fn remap_handle_slots(
     slots: &mut [Option<ObjectRef>],
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) -> usize {
     let mut rewritten = 0;
     for slot in slots.iter_mut().flatten() {
@@ -398,7 +398,7 @@ pub(crate) fn remap_handle_slots(
 /// collector. See `docs/jit-signals-root-gap.md`.
 pub(crate) fn remap_thread_object_slots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) -> usize {
     let mut rewritten = 0;
     for slot in [
@@ -434,7 +434,7 @@ pub(crate) fn remap_thread_object_slots(
 pub fn update_all_roots(
     shared: &crate::vm::SharedVm,
     thread: &mut crate::threading::jvm_thread::JvmThread,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     let __rp_guard = crate::memory::native_roots::rootprof::on().then(|| {
         struct G(std::time::Instant, usize);
@@ -1261,7 +1261,7 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
 /// remembered-set fix); this pass targets plain object fields.
 pub fn verify_heap_object_fields(
     shared: &crate::vm::SharedVm,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     use crate::types::Value;
     use cratonvm_types::{
@@ -1456,7 +1456,7 @@ pub fn audit_overlay_refs(shared: &crate::vm::SharedVm) {
 /// Returns the number of genuine (non-recycled) stale reports, for tests.
 fn verify_no_stale_refs(
     thread: &crate::threading::jvm_thread::JvmThread,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) -> usize {
     use crate::types::Value;
     use cratonvm_types::ObjectHeader;
@@ -1646,7 +1646,7 @@ mod tests {
         let old = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
         let unmoved = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
         let mut slots = vec![Some(old), None, Some(unmoved)];
-        let pointer_map = HashMap::from([(0x1000usize, 0x2000usize)]);
+        let pointer_map = cratonvm_types::PointerMap::from_iter([(0x1000usize, 0x2000usize)]);
 
         assert_eq!(remap_handle_slots(&mut slots, &pointer_map), 1);
         assert_eq!(slots[0].unwrap().as_ptr() as usize, 0x2000);
@@ -1674,7 +1674,7 @@ mod tests {
         thread.pending_async_exception = Some(async_exc);
         thread.jit_pending_exception = Some(jit_exc);
 
-        let pointer_map = HashMap::from([
+        let pointer_map = cratonvm_types::PointerMap::from_iter([
             (0x1000usize, 0x8000usize),
             (0x2000usize, 0x9000usize),
             (0x3000usize, 0xA000usize),
@@ -1712,7 +1712,7 @@ mod tests {
         thread.jit_pending_exception = Some(unmoved);
 
         // A non-empty map that simply does not mention our object.
-        let pointer_map = HashMap::from([(0x1000usize, 0x8000usize)]);
+        let pointer_map = cratonvm_types::PointerMap::from_iter([(0x1000usize, 0x8000usize)]);
 
         assert_eq!(remap_thread_object_slots(&mut thread, &pointer_map), 0);
         assert_eq!(thread.jit_pending_exception.unwrap().as_ptr() as usize, 0x5000);
@@ -1856,7 +1856,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_updates_known_ptr() {
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x1000usize, 0x2000usize);
 
         let obj_ref = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
@@ -1882,7 +1882,7 @@ mod tests {
         use crate::runtime::frame::Frame;
         use crate::threading::jvm_thread::{JvmThread, ThreadId};
 
-        let mut map: HashMap<usize, usize> = HashMap::new();
+        let mut map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         map.insert(0x20013B00000, 0x20010200000); // drain: K -> V (V recycled)
         map.insert(0x20010200000, 0x20013DC02E8); // pass 1: V -> C (old occupant)
         map.insert(0x50000000, 0x60000000); // unrelated genuine move

@@ -595,7 +595,7 @@ impl UpcallTable {
 
     /// Apply a GC pointer map: rewrite each live entry's callback `target` to its
     /// post-relocation address. Counterpart to [`collect_roots`](Self::collect_roots).
-    pub fn update_after_gc(&mut self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    pub fn update_after_gc(&mut self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -1233,13 +1233,13 @@ mod tests {
             param_kinds: vec![],
             return_kind: -1,
         });
-        let mut pm = std::collections::HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(old.as_ptr() as usize, new_addr);
         table.update_after_gc(&pm);
         assert_eq!(table.get(0).unwrap().target.as_ptr() as usize, new_addr);
 
         // An empty pointer map (non-moving collection) leaves the target intact.
-        table.update_after_gc(&std::collections::HashMap::new());
+        table.update_after_gc(&cratonvm_types::PointerMap::default());
         assert_eq!(table.get(0).unwrap().target.as_ptr() as usize, new_addr);
     }
 

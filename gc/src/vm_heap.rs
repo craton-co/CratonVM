@@ -2184,7 +2184,7 @@ impl VmHeap {
     pub fn watched_pre_gc_addr_survived(
         &self,
         addr: usize,
-        pointer_map: &std::collections::HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) -> bool {
         if pointer_map.contains_key(&addr) {
             return true;
@@ -2370,7 +2370,7 @@ impl VmHeap {
     pub fn pre_gc_addr_did_not_survive(
         &self,
         addr: usize,
-        pointer_map: &std::collections::HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) -> bool {
         if pointer_map.contains_key(&addr) {
             return false;

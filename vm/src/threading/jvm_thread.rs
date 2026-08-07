@@ -134,7 +134,7 @@ pub struct GcBlockState {
     /// Composed `frame-held address → current address` map accumulated by GC
     /// initiators for every collection that completed while the thread was
     /// in a blocked region. Applied + cleared on wake.
-    pub fixup: PLMutex<std::collections::HashMap<usize, usize>>,
+    pub fixup: PLMutex<cratonvm_types::PointerMap>,
     /// cceres3 (WildFly boot stale-frame family): exact per-slot tracking for
     /// the blocked window. `fixup` above is keyed by the address the frames
     /// held when each object FIRST moved — a chain that breaks if any link's
@@ -152,7 +152,7 @@ impl GcBlockState {
         Self {
             in_blocked_region: AtomicBool::new(false),
             java_state: AtomicU8::new(0),
-            fixup: PLMutex::new(std::collections::HashMap::new()),
+            fixup: PLMutex::new(cratonvm_types::PointerMap::default()),
             slot_origins: PLMutex::new(Vec::new()),
         }
     }

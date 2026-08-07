@@ -102,8 +102,11 @@ hypothesis is that on CratonVM each pass costs enough more than on HotSpot
 (consistent with this repo's independently-documented, unrelated-but-similar
 findings that reflective/classloading-heavy operations run tens to hundreds
 of times slower here — see
-[`jooqautoconfigurationtests-timeout-regression-20260805.md`](jooqautoconfigurationtests-timeout-regression-20260805.md)'s
-`Class.getDeclaredMethods()` finding, and
+the retired
+`jooqautoconfigurationtests-timeout-getmodifiers-FIXED-20260807` write-up,
+whose measured term is `Method.getModifiers()` at 39 us/call against
+HotSpot's 1 ns — NOT `Class.getDeclaredMethods()`, which that page originally
+named and which measured 13 ms of a 65.6 s pass; and
 [`!springboot-ldap-dsa-tls-windows-only-gap.md`](!springboot-ldap-dsa-tls-windows-only-gap.md)
 for a differently-shaped but similarly Windows-specific gap) that the
 **cumulative** cost across dozens of test methods in one class exceeds the

@@ -346,7 +346,7 @@ mod tests {
 
     struct NoopMonitors;
     impl MonitorCleanup for NoopMonitors {
-        fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
     }
 
     fn small_collector() -> Arc<G1Collector> {

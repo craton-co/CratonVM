@@ -263,7 +263,7 @@ pub fn gc_scan_scheduled_roots(roots: &mut Vec<ObjectRef>) {
 /// place; tasks not present in `map` (and null pointers) are left
 /// untouched. Locks the process-wide registry; `parking_lot::Mutex`
 /// does not poison.
-pub fn gc_update_scheduled_refs(map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_scheduled_refs(map: &cratonvm_types::PointerMap) {
     if map.is_empty() {
         return;
     }
@@ -538,7 +538,7 @@ mod tests {
         reg.tasks.lock().push(task.clone());
         reg.tasks.lock().push(null_task.clone());
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         let relocated = 0x5A5A_1000usize;
         map.insert(synthetic, relocated);
         gc_update_scheduled_refs(&map);

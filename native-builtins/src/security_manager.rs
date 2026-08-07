@@ -310,7 +310,7 @@ pub fn gc_scan_security_manager_roots(vm_identity: usize, out: &mut Vec<ObjectRe
 /// identity hash is stable across a move.
 pub fn gc_update_security_manager_refs(
     vm_identity: usize,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;
@@ -3885,10 +3885,10 @@ mod tests {
         // second, genuinely-allocated object's address. An empty map is a
         // no-op (the non-moving sweep).
         let relocated = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
-        gc_update_security_manager_refs(vm_a, &std::collections::HashMap::new());
+        gc_update_security_manager_refs(vm_a, &cratonvm_types::PointerMap::default());
         assert_eq!(get_security_manager(&a), Some(sm_a));
 
-        let mut map = std::collections::HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(sm_a.as_ptr() as usize, relocated.as_ptr() as usize);
         gc_update_security_manager_refs(vm_a, &map);
         assert_eq!(

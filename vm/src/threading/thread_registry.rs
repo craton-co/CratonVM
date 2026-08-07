@@ -2171,7 +2171,7 @@ impl ThreadRegistry {
     /// refs into bytecode (the all-zero-header invokevirtual WARN flood),
     /// and `LockSupport.unpark(Thread)`'s O(1) lookup misses the live
     /// mirror's new address — a silently lost unpark.
-    pub fn update_thread_objs_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn update_thread_objs_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -2299,7 +2299,7 @@ impl ThreadRegistry {
     /// wake. While it still holds stale frame addresses the only consumers
     /// are this fold (keyed by those addresses) and the wake-side apply,
     /// so the chain stays consistent.
-    pub fn fold_pointer_map_into_blocked(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn fold_pointer_map_into_blocked(&self, pointer_map: &cratonvm_types::PointerMap) {
         self.fold_pointer_map_into_blocked_audited(pointer_map, None)
     }
 
@@ -2335,7 +2335,7 @@ impl ThreadRegistry {
     /// synthetic pointer map.
     pub fn fold_pointer_map_into_blocked_audited(
         &self,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         heap: Option<&crate::memory::VmHeap>,
     ) {
         if pointer_map.is_empty() {
@@ -3011,7 +3011,7 @@ mod tests {
         registry.register(b, "b", None);
 
         registry.set_jmx_owned_synchronizer(Some(a), fake_synchronizer(0x1000));
-        let mut pointer_map = HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0x1000usize, 0x9000usize);
         registry.update_thread_objs_after_gc(&pointer_map);
 
@@ -3414,7 +3414,7 @@ mod tests {
         assert!(registry.post_async_exception(tid, old_ref));
 
         // Simulate a moving collection that relocated old → new.
-        let mut pm = HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(old_addr, new_addr);
         registry.update_thread_objs_after_gc(&pm);
 
@@ -3542,7 +3542,7 @@ mod tests {
 
         registry.register(tid, "main", Some(old_ref));
 
-        let mut pm = HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(old_addr, new_addr);
         registry.update_thread_objs_after_gc(&pm);
 
@@ -3581,11 +3581,11 @@ mod tests {
 
         registry.register(tid, "main", Some(first));
 
-        let mut pm1 = HashMap::new();
+        let mut pm1 = cratonvm_types::PointerMap::default();
         pm1.insert(first_addr, second_addr);
         registry.update_thread_objs_after_gc(&pm1);
 
-        let mut pm2 = HashMap::new();
+        let mut pm2 = cratonvm_types::PointerMap::default();
         pm2.insert(second_addr, third_addr);
         registry.update_thread_objs_after_gc(&pm2);
 
