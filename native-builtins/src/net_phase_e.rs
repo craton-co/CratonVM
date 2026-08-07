@@ -1026,7 +1026,7 @@ pub fn gc_scan_inet_addr_roots(out: &mut Vec<ObjectRef>) {
 /// Companion to [`gc_scan_inet_addr_roots`]: after a moving collection,
 /// re-key the side table so lookups keyed on the OLD `ObjectRef` still
 /// resolve — the mirror's identity is now the relocated address.
-pub fn gc_update_inet_addr_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_inet_addr_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -14676,7 +14676,7 @@ pub fn gc_scan_re10_handler_roots(out: &mut Vec<ObjectRef>) {
 /// the dispatcher invokes the live handler, not a vacated from-space slot. A
 /// no-op when nothing moved (empty `pointer_map`) or for handlers the collector
 /// left in place (absent from the map).
-pub fn gc_update_re10_handler_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_re10_handler_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

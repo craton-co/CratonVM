@@ -2461,7 +2461,7 @@ impl GarbageCollector for ZgcRealHeap {
 
         // Non-moving: no object changed address, so roots and external
         // references need no fix-up and the pointer map is empty.
-        let pointer_map: HashMap<usize, usize> = HashMap::new();
+        let pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         monitors.remap_after_gc(&pointer_map);
         // ZGC-3: `remap_after_gc` early-returns on the (always-empty) map,
         // so hand the collector's EXACT dead-address list to the registry
@@ -3241,7 +3241,7 @@ mod tests {
 
     struct NoMonitors;
     impl MonitorCleanup for NoMonitors {
-        fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
     }
 
     #[test]

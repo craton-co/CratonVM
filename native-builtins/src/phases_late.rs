@@ -4911,7 +4911,7 @@ pub fn gc_scan_classvalue_cache_roots(
 /// `lang_system::gc_update_system_singleton_refs`.
 pub fn gc_update_classvalue_cache_refs(
     vm_identity: usize,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;

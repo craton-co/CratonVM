@@ -72,7 +72,7 @@ pub fn volatile_stripe_lock(
 /// need to depend on VM-internal types.
 pub trait MonitorCleanup {
     /// Re-key monitors using the old-address-to-new-address mapping.
-    fn remap_after_gc(&self, pointer_map: &HashMap<usize, usize>);
+    fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap);
 
     /// Prune registry entries keyed by addresses a WHOLE-HEAP collection
     /// just swept (`dead` is exact: every element was a live allocation
@@ -204,7 +204,7 @@ impl std::fmt::Debug for StopTheWorldToken {
 ///
 /// struct NoMonitors;
 /// impl MonitorCleanup for NoMonitors {
-///     fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+///     fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
 /// }
 ///
 /// let heap = Heap::new();
@@ -222,7 +222,7 @@ impl std::fmt::Debug for StopTheWorldToken {
 ///
 /// struct NoMonitors;
 /// impl MonitorCleanup for NoMonitors {
-///     fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+///     fn remap_after_gc(&self, _: &cratonvm_types::PointerMap) {}
 /// }
 ///
 /// let heap = Heap::new();

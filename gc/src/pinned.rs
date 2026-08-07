@@ -68,9 +68,9 @@ static PINNED_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// crate. A `HashMap` (not a `HashSet`) so overlapping critical sections on the
 /// same array refcount correctly instead of a second `unpin` prematurely
 /// dropping a still-live pin.
-fn table() -> &'static Mutex<HashMap<usize, usize>> {
-    static TABLE: std::sync::OnceLock<Mutex<HashMap<usize, usize>>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn table() -> &'static Mutex<cratonvm_types::PointerMap> {
+    static TABLE: std::sync::OnceLock<Mutex<cratonvm_types::PointerMap>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(cratonvm_types::PointerMap::default()))
 }
 
 /// Pin the heap object at `addr` so a moving collector will neither relocate
@@ -141,7 +141,7 @@ pub fn pinned_addrs() -> Vec<usize> {
 /// looks the object up by its CURRENT base) and any `is_pinned` query must
 /// find the entry under the NEW address. Refcounts are merged if both old
 /// and new keys exist (defensive — cannot happen for a bijective map).
-pub fn update_after_gc(pointer_map: &HashMap<usize, usize>) {
+pub fn update_after_gc(pointer_map: &cratonvm_types::PointerMap) {
     if PINNED_COUNT.load(Ordering::Relaxed) == 0 || pointer_map.is_empty() {
         return;
     }

@@ -2635,7 +2635,7 @@ mod tests {
         /// `tests/phase_h_integration.rs` and `gen_heap.rs::NoOpMonitors`.
         struct NoMonitors;
         impl MonitorCleanup for NoMonitors {
-            fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+            fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
         }
 
         /// Test-only `StopTheWorldToken`. These tests are mostly single-

@@ -26,7 +26,7 @@ use cratonvm_types::{ClassId, Value};
 
 struct NoMonitors;
 impl MonitorCleanup for NoMonitors {
-    fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+    fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
 }
 
 /// Test-only `StopTheWorldToken`. This test runs the heap single-threaded,

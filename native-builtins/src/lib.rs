@@ -25692,7 +25692,7 @@ pub fn gc_scan_locale_roots(out: &mut Vec<ObjectRef>) {
 }
 
 /// Post-GC remap companion to [`gc_scan_locale_roots`].
-pub fn gc_update_locale_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_locale_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

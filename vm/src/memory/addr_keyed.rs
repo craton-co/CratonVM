@@ -89,7 +89,7 @@ pub struct SweepStats {
 /// true.
 pub fn remap_and_sweep<V>(
     table: &mut FxHashMap<ObjectRef, V>,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
     is_live: &dyn Fn(usize) -> bool,
 ) -> SweepStats {
     if table.is_empty() {
@@ -385,14 +385,14 @@ mod tests {
         entries.iter().map(|&(a, v)| (key(a), v)).collect()
     }
 
-    fn nothing_moved() -> HashMap<usize, usize> {
-        HashMap::new()
+    fn nothing_moved() -> cratonvm_types::PointerMap {
+        cratonvm_types::PointerMap::default()
     }
 
     #[test]
     fn moved_entry_is_rekeyed_and_keeps_its_value() {
         let mut t = table(&[(A, 7)]);
-        let map = HashMap::from([(A, B)]);
+        let map = cratonvm_types::PointerMap::from_iter([(A, B)]);
 
         let stats = remap_and_sweep(&mut t, &map, &|_| true);
 
@@ -436,7 +436,7 @@ mod tests {
     fn mixed_cycle_sorts_each_entry_into_the_right_bucket() {
         let mut t = table(&[(A, 1), (B, 2), (C, 3)]);
         // A relocated to 0x40000; B survived in place; C died.
-        let map = HashMap::from([(A, 0x4_0000)]);
+        let map = cratonvm_types::PointerMap::from_iter([(A, 0x4_0000)]);
 
         let stats = remap_and_sweep(&mut t, &map, &|addr| addr == B);
 
@@ -460,7 +460,7 @@ mod tests {
         let mut t = table(&[(A, 1), (B, 2)]);
         // A moves onto B's address; B is dead, but `is_live(B)` now reports
         // true because A occupies that address.
-        let map = HashMap::from([(A, B)]);
+        let map = cratonvm_types::PointerMap::from_iter([(A, B)]);
 
         let stats = remap_and_sweep(&mut t, &map, &|_| true);
 
@@ -480,7 +480,7 @@ mod tests {
     fn empty_table_is_a_no_op() {
         let mut t: FxHashMap<ObjectRef, u32> = FxHashMap::default();
 
-        let stats = remap_and_sweep(&mut t, &HashMap::from([(A, B)]), &|_| true);
+        let stats = remap_and_sweep(&mut t, &cratonvm_types::PointerMap::from_iter([(A, B)]), &|_| true);
 
         assert_eq!(stats, SweepStats::default());
         assert!(t.is_empty());

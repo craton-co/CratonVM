@@ -2009,7 +2009,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset: &[usize],
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) -> usize {
         // Regions that hold at least one self-forwarded (in-place) object.
         // `lookup_region_for_addr` consults the immutable region table, so it
@@ -2092,7 +2092,7 @@ impl G1Collector {
             return first;
         }
 
-        let identities = |m: &HashMap<usize, usize>| -> Vec<usize> {
+        let identities = |m: &cratonvm_types::PointerMap| -> Vec<usize> {
             m.iter().filter(|(k, v)| k == v).map(|(&k, _)| k).collect()
         };
 
@@ -2274,11 +2274,11 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
 
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
         let mut work_list: Vec<*mut u8> = Vec::new();
@@ -2379,7 +2379,7 @@ impl G1Collector {
     /// `acc` key the `acc` entry is the meaningful one (the `next` key is a
     /// pass-1-freed address recycled as later-pass to-space — no frame local
     /// can name it).
-    fn compose_forward_maps(acc: &mut HashMap<usize, usize>, next: &HashMap<usize, usize>) {
+    fn compose_forward_maps(acc: &mut cratonvm_types::PointerMap, next: &cratonvm_types::PointerMap) {
         for v in acc.values_mut() {
             if let Some(&nv) = next.get(v) {
                 *v = nv;
@@ -2427,7 +2427,7 @@ impl G1Collector {
         // invalidated and falls to the Free-gated slow path. `Release`
         // pairs with the `Acquire` load on the fast path.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
@@ -2894,7 +2894,7 @@ impl G1Collector {
         // (Phase 5). Invalidate every mutator's RSet fast-path cache
         // before any reclassification — see `rset_cache_epoch`.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
@@ -3238,7 +3238,7 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         keepalive: &[usize],
         sources: &std::collections::HashSet<usize>,
-    ) -> (HashMap<usize, usize>, usize, usize) {
+    ) -> (cratonvm_types::PointerMap, usize, usize) {
         // One-shot confirmation that the parallel evacuator is genuinely active
         // (the gauntlet lesson: never assume a gated path was taken — verify).
         {
@@ -3442,7 +3442,7 @@ impl G1Collector {
 
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
-        let mut pointer_map: HashMap<usize, usize> = HashMap::with_capacity(main_forwards.len());
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(main_forwards.len(), Default::default());
         for (o, n) in main_forwards {
             pointer_map.insert(o, n);
         }
@@ -3528,7 +3528,7 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -3734,7 +3734,7 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -3923,7 +3923,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -3986,7 +3986,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         old_ptr: *mut u8,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         cset: &std::collections::HashSet<usize>,
@@ -4151,7 +4151,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -4251,7 +4251,7 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         source_idx: usize,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -4371,7 +4371,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         if pointer_map.is_empty() {
             return;
@@ -4545,7 +4545,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let verify = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
         if !verify {
@@ -4674,7 +4674,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         roots: &[ObjectRef],
     ) {
         if !gc_flags().g1_dbg_headers {
@@ -4684,7 +4684,7 @@ impl G1Collector {
         // SAME destination address = a TLAB allocation race (one copy clobbers
         // the other's header → `java/lang/Object`). Reverse-map the forwards.
         {
-            let mut by_dest: HashMap<usize, usize> = HashMap::with_capacity(pointer_map.len());
+            let mut by_dest: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(pointer_map.len(), Default::default());
             let mut overlaps = 0usize;
             for (&k, &v) in pointer_map.iter() {
                 if k == v {
@@ -5338,7 +5338,7 @@ impl G1Collector {
     fn remap_reference_skip_set(
         &self,
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let mut skip = self.reference_skip.lock();
         if skip.is_empty() {
@@ -8489,7 +8489,7 @@ fn consume_satb_pre_barrier_epoch() -> bool {
 /// than from a separate counter is what stops the report and the reclamation
 /// decision from ever disagreeing.
 fn g1_pause_degraded_flags(
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
     jni_pinned_out: usize,
     jit_pinned_out: usize,
     parallel: bool,
@@ -8779,7 +8779,7 @@ fn is_collectable_region_type(region_type: RegionType) -> bool {
 fn update_object_refs(
     obj_ptr: *mut u8,
     header: &ObjectHeader,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
 
@@ -8895,7 +8895,7 @@ mod tests {
     /// No-op monitor cleanup for tests.
     struct NoopMonitors;
     impl MonitorCleanup for NoopMonitors {
-        fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
     }
 
     /// Test-only `StopTheWorldToken`. Single-threaded test harness, so the
@@ -12841,10 +12841,10 @@ mod tests {
     /// over a recycled intermediate).
     #[test]
     fn compose_forward_maps_chases_and_keeps_pause_start_keys() {
-        let mut acc: HashMap<usize, usize> = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
+        let mut acc: cratonvm_types::PointerMap = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
             .into_iter()
             .collect();
-        let next: HashMap<usize, usize> = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
+        let next: cratonvm_types::PointerMap = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
             .into_iter()
             .collect();
         G1Collector::compose_forward_maps(&mut acc, &next);
@@ -13401,7 +13401,7 @@ mod tests {
                 bytes_copied: 0,
                 bytes_freed: 0,
             },
-            pointer_map: HashMap::new(),
+            pointer_map: cratonvm_types::PointerMap::default(),
         };
         let mut no_roots: Vec<ObjectRef> = Vec::new();
         let _ = gc.retry_after_evacuation_failure(clean, &mut no_roots, &NoopMonitors);

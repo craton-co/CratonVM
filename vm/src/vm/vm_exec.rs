@@ -25359,7 +25359,7 @@ mod tests {
         );
 
         // --- a moving collection runs while the continuation is parked.
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old, new);
         shared
             .threads
@@ -25487,7 +25487,7 @@ mod tests {
         }
         .deposit_root_snapshot();
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old, new);
         shared
             .threads
