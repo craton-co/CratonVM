@@ -9,21 +9,6 @@
 > name states only what is actually measured.
 
 ## Status
-
-**REOPENED 2026-08-07** — this page's own closing instruction is *"if a
-`ClassId(0)` receiver reappears, reopen this page rather than starting a new
-one, and check `object_degradation_count()` first."* It has reappeared, on a
-binary that contains the 2026-08-06 fix (`git merge-base --is-ancestor
-b50da356e f9315411a` → yes), through the RE-SERVED face this page already
-describes rather than the all-zero one. **`object_degradations = 0` on the
-failing run** — so it is not the `CompactValue` provenance mechanism recurring.
-Four witnesses, a reproducer at ~4 events in 46 runs, and the one measurement
-this page has never had — the state of the reference *before* the read barrier
-touched it — are in
-**[REOPENED 2026-08-07: the barrier rewrites a live reference](#reopened-2026-08-07-the-barrier-rewrites-a-live-reference)**
-at the end. Everything between here and there is the 2026-08-06 writeup,
-unchanged; that fix is real and its validation stands.
-
 **FIXED 2026-08-06** — `fix/compactvalue-object-provenance-20260806`, merged to
 `dev` as `b50da356e`.
 
@@ -56,6 +41,32 @@ whose top frame holds the address, with `ROOT_IN_DEAD_SPANS=0` and
 `SWEEP_LIVENESS hits=0`). If a `ClassId(0)` receiver reappears in
 `TestMultiThread`, reopen this page rather than starting a new one, and check
 `object_degradation_count()` first.
+
+**A 2026-08-07 suspected recurrence that was NOT this page — and how it was
+told apart.** `org.h2.test.db.TestTempTables` produced a receiver reading back
+as an unrelated live object (this page's RE-SERVED face) on a binary containing
+the fix above, i.e. exactly the condition the instruction just above describes.
+It was investigated here first and the answer came out elsewhere, so this page
+stays FIXED. Three readings settled it, and they are the ones to take next
+time:
+
+* `object_degradation_count()` was **0** on the failing run — not the
+  `CompactValue` mechanism recurring. That counter had no consumer anywhere in
+  the VM; `memory::reclaim_guard`'s dispatch terminal now prints it;
+* a frame **still held the correct, live object** at the moment of failure
+  (`holder=frame#14 …BitSetHelper.flip pc=38 local[0] live=true`). Nothing had
+  been reclaimed, nothing had been lost. When that is true the heap is fine and
+  something in the VM substituted the value;
+* the substituter was `execute_invoke_kind`'s stale-`java.lang.Thread`-mirror
+  recovery, gated on `class_id_of(recv) == ClassId(0)` — which **every
+  primitive array** satisfies, `long[]` having no component class id to store.
+  A live `long[]` on a recycled address matched the former-mirror table and was
+  replaced by a thread mirror.
+
+Fixed in
+[`bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`](bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md).
+The face is genuinely indistinguishable at the reader, so a `ClassId(0)`-shaped
+report is not by itself evidence for this page.
 
 **Earlier fixes that landed under this page and remain valid.** An old-gen mark
 gap (`old_gen_gc`'s root seed had no resolution for an INTERIOR conservative
@@ -1661,140 +1672,3 @@ while the locals half of the same loop used the loose screen. All four now use
 `is_heap_addr`; see
 `root_snapshot_screen_tests::operand_stack_roots_use_the_same_screen_as_locals`,
 which fails on the pre-fix screen with `1 of 2 survived`.
-
----
-
-# REOPENED 2026-08-07: the barrier rewrites a live reference
-
-Found while retiring
-[`../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md).
-That page had been carrying an H2 failure it attributed to a dispatch bug; the
-attribution was wrong and the failure is this family's, in a face that page's
-instruments could see and this page's could not.
-
-## The reproducer
-
-`org.h2.test.db.TestTempTables`, `--java-home <jdk25> --Xmx 1g --nojit`, one
-class per process, 6 concurrent workers. **4 events in 46 runs (~9 %)**, against
-0 in 30 JIT-on runs of the same class. A passing run is 500-950 s on a loaded
-host; a failing one aborts at 90-850 s. No debug flag needed — the verdict is
-unconditional.
-
-This is a materially better vehicle than `TestMultiThread` (~1 face in 8 iters)
-or `TestMVStoreCacheLoop` (~1 event per 3 worker-hours): single-threaded test
-logic, no randomisation, and the failure has a fixed call site.
-
-## What it looks like
-
-```text
-java/lang/ClassCastException: jdk.internal.misc.InnocuousThread cannot be cast to [J
-	at org/h2/mvstore/tx/TransactionStore.registerTransaction(TransactionStore.java:499)
-	at org/h2/mvstore/tx/VersionedBitSet.<init>(VersionedBitSet.java:25)
-	at org/h2/mvstore/tx/BitSetHelper.flip(BitSetHelper.java:34)
-	at java/util/Arrays.copyOf(Arrays.java:3617)          <- innermost
-```
-
-`Arrays.copyOf(long[], int)` at pc 7 is `invokevirtual "[J".clone:()Ljava/lang/Object;`.
-Before 2026-08-07 the same event surfaced as `CloneNotSupportedException` from a
-`java/lang/Thread.clone` frame, because the VM dispatched on the receiver's
-header and ran `Thread.clone`'s body; array-typed call sites now resolve
-statically per JVMS §4.4.1, so the `checkcast [J` reports the object instead.
-
-Four occurrences, all with `kind=Object`, `gc_age=2`, `gc_flags=0x01`
-(old generation), all **live, valid** objects:
-
-| receiver address | `receiver_class` |
-|---|---|
-| `0x20010039668` | `jdk/internal/misc/InnocuousThread` |
-| `0x200100e37f8` | `org/h2/mvstore/FileStore$BackgroundWriterThread` |
-| `0x200100e1dd0` | `java/lang/Thread` |
-| `0x2001003bb50` | `java/lang/Thread` |
-
-All four are `java.lang.Thread` or a subclass. Nothing about the H2 call site
-selects for that, so it is a property of *which memory the bad reference lands
-in*, and it is a lead: these are early-promoted, long-lived old-gen objects.
-
-## The measurement this page never had
-
-`vm/src/memory/reclaim_guard.rs`'s new `report_impossible_dispatch_terminal`
-records the receiver **as the operand stack handed it over**, before
-`execute_invoke_kind`'s forwarding read barrier runs:
-
-```text
-pre_refresh_obj="0x20042853308"   barrier_rewrote=true
-pre_refresh_kind=Array            pre_refresh_class=java/lang/Object
-pre_refresh_header="[00,00,00,00, 01, 0b, 00, 00, 06,17,ce,01, 01,00,00,00, 00×8]"
-holder=frame#14 org/h2/mvstore/tx/BitSetHelper.flip pc=38 local[0] kind=0 live=true
-object_degradations=0
-```
-
-Decoded against `ObjectHeader`: `class_id=0`, `kind=Array`,
-`element_type=Long`, `gc_age=0`, `gc_flags=0`, `shape=1`. **A live, intact
-`long[1]`** — the `VersionedBitSet.bits` the call site is holding — and
-`BitSetHelper.flip`'s `local[0]` still points at it, live, at the moment of the
-report.
-
-So this occurrence is **not** a lost root, **not** a missed remap, and **not** a
-`CompactValue` degradation (`object_degradations=0`). The frames are correct.
-The one statement between the correct value and the wrong one is
-
-```rust
-// vm/src/runtime/interpreter/invoke.rs, execute_invoke_kind
-*obj = shared.mem.heap.load_and_forward(*obj);
-```
-
-which read `0x20042853308` and returned `0x2001003bb50`.
-
-`VmHeap::load_and_forward` (`gc/src/vm_heap.rs`) does exactly one thing: load
-the source's `mark_word` (relaxed), and if `mark & 0b11 == MARK_FORWARDED`
-follow the upper 62 bits as a relocation target, accepting any destination
-`is_object_address` likes — which a re-served old-gen `Thread` satisfies.
-
-## The open question, stated precisely
-
-By the time the report ran, that same source header read
-`mark_word = 0` (`MARK_NEUTRAL`). So either
-
-* **the barrier read a genuine forwarding word that was afterwards cleared** —
-  in which case the target was *wrong* (a `long[1]`'s relocation target is not a
-  `Thread`), and the suspect is whoever installs forwarding on a young source:
-  `gen_heap.rs`'s selective-promotion `fwd_installs` loop (which installs
-  deferred `(src_addr, dst)` pairs collected on "anchor-verified stretches", and
-  unwinds suspect stretches — an install/unwind window is exactly the shape of a
-  marker that is present at one instant and gone at the next), or the moving
-  collector's `set_forwarding_address` at `gen_heap.rs:13055`;
-* **or the barrier's own relaxed load disagreed with a later read of the same
-  word**, which would make this a visibility/tearing problem rather than a
-  bookkeeping one.
-
-Nothing currently in the tree distinguishes them, because the barrier's decision
-is not recorded anywhere and the word is mutable behind it.
-
-## Next step — already built, needs a run
-
-`reclaim_guard::note_barrier_rewrite` / `last_barrier_rewrite` capture
-`(source, mark word AS THE BARRIER READ IT, destination)` in a thread-local at
-the moment the barrier rewrites, and the verdict prints them as
-`barrier_src` / `barrier_mark_at_read` / `barrier_mark_state` / `barrier_dst`
-alongside `pre_mark_now`. That is a one-line discriminator:
-
-* `barrier_mark_state == 3` → a real forwarding marker with a wrong target.
-  Go to the install sites above.
-* `barrier_mark_state == 0` → the barrier acted on a word that was never a
-  forwarding marker. Go to the load, not the installer.
-
-It is in the tree and compiles; it had not fired at the time of writing (0
-events in the 18 runs after it landed — the event rate is load-sensitive and the
-host had quietened). Re-run the reproducer above and read that line first.
-
-## Related
-
-* `docs/internal/repros/h2-clone-spin-20260807/CloneSpinProbe.java` — the
-  negative control. It drives the identical `BitSetHelper.flip` →
-  `Arrays.copyOf` → `original.clone()` shape with the database removed: **28.4 M
-  executions of the failing bytecode in 90 s, zero failures.** The call shape is
-  not the variable; H2's heap is.
-* `docs/internal/repros/h2-insert-scale-20260731/H2InsertScaleProbe.java` at
-  `25 1000` — the retired page's 2026-07-31 residual, recorded there as failing
-  all 25 threads. 16 runs on current `dev`, `failed=0` every time. Withdrawn as
-  an independent data point.

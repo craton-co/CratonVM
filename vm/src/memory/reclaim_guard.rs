@@ -355,12 +355,14 @@ pub(crate) fn report_impossible_dispatch_terminal(
     // the interpreter has already read its class id and kind through the same
     // header, one line above.
     //
-    // All 24 bytes, not the first 16: `mark_word` sits at `MARK_WORD_OFFSET`
-    // (16) and it is where `is_forwarded` lives since the 2026-08-06 header
-    // shrink. A 16-byte dump stops exactly one field short of the bit that
-    // decides whether `load_and_forward` will redirect through this object —
-    // which is the question the pre-refresh line below exists to answer.
-    let header: [u8; 24] = unsafe { std::ptr::read(recv.as_ptr() as *const [u8; 24]) };
+    // The WHOLE header, sized off `HEADER_SIZE` rather than a literal: the
+    // mark word is where `is_forwarded`, the identity hash and the
+    // kind/element-type/age/flags quartet all live after the 2026-08-06 and
+    // 2026-08-07 shrinks, so a dump that stops before it stops short of every
+    // bit worth reading — and a literal that outlives the next shrink would
+    // read past the object.
+    let header: [u8; cratonvm_types::HEADER_SIZE] =
+        unsafe { std::ptr::read(recv.as_ptr() as *const [u8; cratonvm_types::HEADER_SIZE]) };
     tracing::error!(
         target: "cratonvm::gc::guard",
         obj = format!("{addr:#x}"),
@@ -416,7 +418,8 @@ pub(crate) fn report_impossible_dispatch_terminal(
         // SAFETY: same contract as the receiver header read above — `pre` was
         // popped as this invoke's receiver and `load_and_forward` already
         // dereferenced its header.
-        let pre_header: [u8; 24] = unsafe { std::ptr::read(pre.as_ptr() as *const [u8; 24]) };
+        let pre_header: [u8; cratonvm_types::HEADER_SIZE] =
+            unsafe { std::ptr::read(pre.as_ptr() as *const [u8; cratonvm_types::HEADER_SIZE]) };
         let pre_cid = shared.mem.heap.class_id_of(pre).as_u32();
         // The mark word AS THE BARRIER READ IT, versus what it says now. The
         // barrier's whole decision is `mark & 0b11 == MARK_FORWARDED`, and the
