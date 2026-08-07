@@ -1,9 +1,39 @@
 # JDK-only mode — open wave-2 work list
 
-**Status:** OPEN, reduced 2026-08-04 and again 2026-08-06. Filed 2026-07-31
-from wave-1 implementation findings; re-verified against the re-landed tree the
-same day. **Two of the five tier-1 rows (items 5 and 7) closed 2026-08-06** — see
-the pass note below the table.
+**Status:** OPEN, reduced 2026-08-04, 2026-08-06, and **measured by execution
+2026-08-07**. Filed 2026-07-31 from wave-1 implementation findings; re-verified
+against the re-landed tree the same day. **Two of the five tier-1 rows (items 5
+and 7) closed 2026-08-06** — see the pass note below the table.
+
+> ## 2026-08-07 — the strict corpus was built and run: 51 passed, 3 failed
+>
+> Most records in this directory say "FIXED in source ... not yet verified,
+> no binary was built in this session". A binary was built (dev `5d22671e3`,
+> default features) and `CRATONVM_ARGS="--jdk-only" bash regression-suite/run.sh`
+> was run three times, with the identical result each time. The campaign's 14
+> failures are down to **3**:
+>
+> | vector | strict-only? | record |
+> |---|---|---|
+> | `RJdkModule` | **yes** — `rc=0` in Compatible | [`W6-11`](W6-11-strict-mode-module-serviceloader.md); `moduleServices()` reached for the first time, and finds `module service providers: []` |
+> | `RJdkFieldModule` | no — identical in both modes | [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](method-invoke-refuses-the-jls-6-6-2-protected-receiver.md), newly filed |
+> | `RMapGcStress` | no — fails in every mode and every build | dev's own; not this campaign |
+>
+> **What this does and does not license.** Every record whose corpus vector is
+> in `JDKONLY_CLASSES` and is not one of those three now has its vector passing,
+> so its "unverified by execution" caveat is discharged **at the vector level**.
+> It is not a per-assertion audit: a record claiming something narrower than its
+> vector asserts still owns that claim. Do not mass-flip statuses to FIXED on
+> the strength of this line — check what your record actually claims.
+>
+> **If you re-measure, pass `--java-home`.** `run.sh` gives every CratonVM
+> invocation one; a hand-run that omits it measures the host's default JDK
+> instead of the JDK 25 image, which on this host inverted the per-mode verdict
+> for `RJdkModule`. Trace the real command rather than reconstructing it:
+> `ONLY="RJdkModule" bash -x regression-suite/run.sh 2>&1 | grep <binary>`.
+>
+> Campaign-level record:
+> [`STRICT-CORPUS-CAMPAIGN-20260807.md`](../../feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md).
 
 > ## Looking for the plan? It is not here.
 >
