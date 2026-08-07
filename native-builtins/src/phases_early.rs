@@ -18186,7 +18186,9 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) -> Result<(
                 let (peer_host, peer_port) = {
                     let reg = s2_registry().lock();
                     if let Some(stream) = reg.streams.get(&sid) {
-                        let addr = stream.peer_addr().ok()?;
+                        let Some(addr) = stream.peer_addr().ok() else {
+                            return Ok(None);
+                        };
                         (
                             addr.as_ref()
                                 .map(|a| a.ip().to_string())

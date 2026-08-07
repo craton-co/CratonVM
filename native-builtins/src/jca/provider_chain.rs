@@ -2242,7 +2242,9 @@ fn resolve_service(
             }
         }
     }
-    let entry = entry?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
     let prov_obj = make_provider(ctx, provider, ver, coverage)?;
     Ok(Some(make_service(ctx, &entry, prov_obj).ok()?))
@@ -2744,7 +2746,9 @@ fn build_jca_instance(
     type_str: &str,
     algo: &str,
 ) -> Result<Option<MethodCallResult>, MethodCallFailed> {
-    let impl_result = build_jca_impl(ctx, provider, type_str, algo)?;
+    let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
+        return Ok(None);
+    };
     Ok(Some((|| {
         let impl_ref = match impl_result? {
             Some(Value::Object(Some(o))) => o,
@@ -2919,7 +2923,9 @@ pub(crate) fn try_build_real_certificate_factory(
     args: &[Value],
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let algo = read_arg_string(ctx, args, 0);
-    let provider = find_service_provider("CertificateFactory", &algo)?;
+    let Some(provider) = find_service_provider("CertificateFactory", &algo) else {
+        return Ok(None);
+    };
     let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo)? {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return Ok(None),

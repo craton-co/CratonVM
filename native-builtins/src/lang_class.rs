@@ -5224,9 +5224,9 @@ fn build_mirror_array<F>(
     ctx: &mut dyn NativeContext,
     len: usize,
     make: F,
-) -> cratonvm_types::ObjectRef
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed>
 where
-    F: FnMut(&mut dyn NativeContext, usize) -> cratonvm_types::ObjectRef,
+    F: FnMut(&mut dyn NativeContext, usize) -> Result<cratonvm_types::ObjectRef, MethodCallFailed>,
 {
     build_mirror_array_comp(ctx, cratonvm_types::ClassId::new(0), len, make)
 }
@@ -5238,14 +5238,14 @@ fn build_mirror_array_comp<F>(
     comp: cratonvm_types::ClassId,
     len: usize,
     mut make: F,
-) -> cratonvm_types::ObjectRef
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed>
 where
-    F: FnMut(&mut dyn NativeContext, usize) -> cratonvm_types::ObjectRef,
+    F: FnMut(&mut dyn NativeContext, usize) -> Result<cratonvm_types::ObjectRef, MethodCallFailed>,
 {
     let mut arr = ctx.new_ref_array(comp, len);
     let pin = ctx.pin_native_root(arr);
     for i in 0..len {
-        let elem = make(ctx, i);
+        let elem = make(ctx, i)?;
         let elem_pin = ctx.pin_native_root(elem);
         // `make` may have moved `arr` (and the already-stored elements, which
         // are remapped through it); re-read the forwarded array reference.
@@ -5256,7 +5256,7 @@ where
     }
     arr = ctx.read_native_pin(pin, arr);
     ctx.unpin_native_roots(pin);
-    arr
+    Ok(arr)
 }
 
 /// The `java/lang/Class` ClassId, for typing reflective `Class[]` results
@@ -6454,8 +6454,8 @@ pub(crate) fn native_class_get_declared_fields(
         .class_id_by_name("java/lang/reflect/Field")
         .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
     let arr = build_mirror_array_comp(ctx, field_component, selected.len(), |ctx, i| {
-        create_field_object(ctx, selected[i])
-    });
+        Ok(create_field_object(ctx, selected[i]))
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -6677,8 +6677,8 @@ pub(crate) fn create_method_object(
     let class_comp = class_component_id(ctx);
     let decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
-        descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], decl_cid)
-    });
+        Ok(descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], decl_cid))
+    })?;
     let param_arr_pin = ctx.pin_native_root(param_arr);
 
     // G2: Always allocate non-null array fields. JDK 25 `Method` and its
@@ -6704,8 +6704,8 @@ pub(crate) fn create_method_object(
     let exception_arr =
         build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
             let desc = format!("L{};", exception_names[i]);
-            descriptor_to_class_mirror(ctx, &desc)
-        });
+            Ok(descriptor_to_class_mirror(ctx, &desc))
+        })?;
     let exception_arr_pin = ctx.pin_native_root(exception_arr);
     let desc_str = ctx.create_string(&meta.descriptor);
     let desc_str_pin = ctx.pin_native_root(desc_str);
@@ -8981,8 +8981,8 @@ pub(crate) fn native_class_get_declared_methods(
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
         let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
-            create_method_object(ctx, visible[i])
-        });
+            Ok(create_method_object(ctx, visible[i]))
+        })?;
         Ok(Some(Value::Object(Some(arr))))
     })();
     // Restore depth on every exit path (success or error).
@@ -9474,8 +9474,8 @@ pub(crate) fn create_constructor_object(
     let class_comp = class_component_id(ctx);
     let ctor_decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
-        descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], ctor_decl_cid)
-    });
+        Ok(descriptor_to_class_mirror_via_loader(ctx, &param_descs[i], ctor_decl_cid))
+    })?;
     let param_arr_pin = ctx.pin_native_root(param_arr);
     let desc_str = ctx.create_string(&meta.descriptor);
     let desc_str_pin = ctx.pin_native_root(desc_str);
@@ -9493,8 +9493,8 @@ pub(crate) fn create_constructor_object(
     let exception_arr =
         build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
             let desc = format!("L{};", exception_names[i]);
-            descriptor_to_class_mirror(ctx, &desc)
-        });
+            Ok(descriptor_to_class_mirror(ctx, &desc))
+        })?;
     let exception_arr_pin = ctx.pin_native_root(exception_arr);
 
     // Re-read every pinned local's forwarded reference now that all the
@@ -10156,8 +10156,8 @@ pub(crate) fn native_class_get_declared_constructors(
     // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
     let constructor_component = reflection_component_id(ctx, "java/lang/reflect/Constructor");
     let arr = build_mirror_array_comp(ctx, constructor_component, constructors.len(), |ctx, i| {
-        create_constructor_object(ctx, constructors[i])
-    });
+        Ok(create_constructor_object(ctx, constructors[i]))
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -10299,8 +10299,8 @@ fn collect_public_fields(
     }
     let field_component = reflection_component_id(ctx, "java/lang/reflect/Field");
     build_mirror_array_comp(ctx, field_component, metas.len(), |ctx, i| {
-        create_field_object(ctx, &metas[i])
-    })
+        Ok(create_field_object(ctx, &metas[i]))
+    })?
 }
 
 /// Collect all public methods from the class hierarchy.
@@ -10473,8 +10473,8 @@ fn collect_public_methods(
     // same fix, same residual-gap doc reference.
     let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
     build_mirror_array_comp(ctx, method_component, metas.len(), |ctx, i| {
-        create_method_object(ctx, &metas[i])
-    })
+        Ok(create_method_object(ctx, &metas[i]))
+    })?
 }
 
 pub(crate) fn native_class_get_fields(
@@ -10867,8 +10867,8 @@ pub(crate) fn native_class_get_constructors(
 
     let constructor_component = reflection_component_id(ctx, "java/lang/reflect/Constructor");
     let arr = build_mirror_array_comp(ctx, constructor_component, public_ctors.len(), |ctx, i| {
-        create_constructor_object(ctx, public_ctors[i])
-    });
+        Ok(create_constructor_object(ctx, public_ctors[i]))
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11098,8 +11098,8 @@ pub(crate) fn native_class_get_interfaces(
             // GC-safe mirror materialisation, as in the non-lambda path below.
             let class_comp = class_component_id(ctx);
             let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
-                ctx.get_class_mirror(iface_ids[i])
-            });
+                Ok(ctx.get_class_mirror(iface_ids[i]))
+            })?;
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -11116,8 +11116,8 @@ pub(crate) fn native_class_get_interfaces(
     // Component type is `Class` (HotSpot returns `[Ljava/lang/Class;`), not Object.
     let class_comp = class_component_id(ctx);
     let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
-        ctx.get_class_mirror(iface_ids[i])
-    });
+        Ok(ctx.get_class_mirror(iface_ids[i]))
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -11487,7 +11487,9 @@ fn cached_annotation_proxy_resolving(
     {
         return Ok(Some(cached));
     }
-    let ann_class_id = resolve_annotation_type_near(ctx, ann, Some(queried_class_id))?;
+    let Some(ann_class_id) = resolve_annotation_type_near(ctx, ann, Some(queried_class_id)) else {
+        return Ok(None);
+    };
     Ok(Some(cached_annotation_proxy(
         ctx,
         queried_class_id,
@@ -11828,7 +11830,7 @@ fn ctx_annotation_value_hash(ctx: &mut dyn NativeContext, val: Value) -> i32 {
                 }
             }
             if cname == "java/lang/annotation/AnnotationProxy" {
-                return ctx_annotation_proxy_hash_code(ctx, obj);
+                return ctx_annotation_proxy_hash_code(ctx, obj)?;
             }
             // Class mirror, Enum constant, and any other reference-typed
             // member hash via `value.hashCode()` вЂ” identity hash, matching
@@ -11858,13 +11860,13 @@ fn ctx_annotation_member_hash(ctx: &mut dyn NativeContext, name: &str, val: Valu
 }
 
 /// Mirrors `annotation_proxy_hash_code` in vm_exec.rs.
-pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> i32 {
+pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy: ObjectRef) -> Result<i32, MethodCallFailed> {
     let elems = ctx_annotation_proxy_elements(ctx, proxy);
     let mut h: i32 = 0;
     for (name, val) in elems {
         h = h.wrapping_add(ctx_annotation_member_hash(ctx, &name, val));
     }
-    h
+    Ok(h)
 }
 
 fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) -> bool {
@@ -11904,7 +11906,7 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
             if xname == "java/lang/annotation/AnnotationProxy"
                 && yname == "java/lang/annotation/AnnotationProxy"
             {
-                return ctx_annotation_proxy_equals(ctx, x, Value::Object(Some(y)));
+                return ctx_annotation_proxy_equals(ctx, x, Value::Object(Some(y)))?;
             }
             if xname == "java/lang/String" && yname == "java/lang/String" {
                 let sx = ctx.read_string(x).unwrap_or_default();
@@ -11953,19 +11955,19 @@ pub(crate) fn ctx_annotation_proxy_equals(
     ctx: &mut dyn NativeContext,
     a: ObjectRef,
     b: Value,
-) -> bool {
+) -> Result<bool, MethodCallFailed> {
     let other = match b {
         Value::Object(Some(o)) => o,
-        _ => return false,
+        _ => return Ok(false),
     };
     if a == other {
-        return true;
+        return Ok(true);
     }
     if ctx.heap_kind_of(other) != cratonvm_types::ObjectKind::Object {
-        return false;
+        return Ok(false);
     }
     if ctx_class_name_of(ctx, other) != "java/lang/annotation/AnnotationProxy" {
-        return false;
+        return Ok(false);
     }
     let a_desc = match ctx.get_field(a, ANN_PROXY_TYPE_DESC) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -11976,7 +11978,7 @@ pub(crate) fn ctx_annotation_proxy_equals(
         _ => String::new(),
     };
     if a_desc != b_desc {
-        return false;
+        return Ok(false);
     }
     let a_elems = ctx_annotation_proxy_elements(ctx, a);
     let b_elems = ctx_annotation_proxy_elements(ctx, other);
@@ -11992,7 +11994,7 @@ pub(crate) fn ctx_annotation_proxy_equals(
             return false;
         }
     }
-    true
+    Ok(true)
 }
 
 fn ctx_java_string_escape(s: &str) -> String {
@@ -12028,7 +12030,7 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Strin
             }
             let cname = ctx_class_name_of(ctx, obj);
             if cname == "java/lang/annotation/AnnotationProxy" {
-                return ctx_annotation_proxy_to_string(ctx, obj);
+                return ctx_annotation_proxy_to_string(ctx, obj)?;
             }
             if cname == "java/lang/String" {
                 if let Some(s) = ctx.read_string(obj) {
@@ -12085,7 +12087,7 @@ fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> S
 pub(crate) fn ctx_annotation_proxy_to_string(
     ctx: &mut dyn NativeContext,
     proxy: ObjectRef,
-) -> String {
+) -> Result<String, MethodCallFailed> {
     let desc = match ctx.get_field(proxy, ANN_PROXY_TYPE_DESC) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -12116,7 +12118,7 @@ pub(crate) fn ctx_annotation_proxy_to_string(
         s.push_str(&ctx_format_annotation_value(ctx, val));
     }
     s.push(')');
-    s
+    Ok(s)
 }
 
 /// Build a `java.lang.TypeNotPresentException(typeName, cause)` to store as a
@@ -12432,9 +12434,13 @@ fn create_annotation_proxy(
     container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    let class_name = annotation_desc_to_class_name(&ann.type_descriptor)?;
+    let Some(class_name) = annotation_desc_to_class_name(&ann.type_descriptor) else {
+        return Ok(None);
+    };
     let owned = class_name.to_string();
-    let cid = resolve_annotation_type_class_id(ctx, &owned, container_class_id)?;
+    let Some(cid) = resolve_annotation_type_class_id(ctx, &owned, container_class_id) else {
+        return Ok(None);
+    };
     Ok(Some(create_annotation_proxy_with_type(
         ctx,
         ann,
@@ -13632,8 +13638,8 @@ fn build_annotation_array_for(
             _ => None,
         };
         let (ann, ann_cid) = resolvable[i];
-        create_annotation_proxy_with_type(ctx, ann, ann_cid, declaring_class_id, loader_cur)?
-    });
+        Ok(create_annotation_proxy_with_type(ctx, ann, ann_cid, declaring_class_id, loader_cur)?)
+    })?;
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
     }
@@ -13664,8 +13670,8 @@ fn build_class_annotation_array(
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
     Ok(build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        cached_annotation_proxy(ctx, queried_class_id, ann, ann_cid)?
-    }))
+        Ok(cached_annotation_proxy(ctx, queried_class_id, ann, ann_cid)?)
+    })?)
 }
 
 /// Equivalent to [`build_class_annotation_array`] for Method and Constructor.
@@ -13682,15 +13688,15 @@ fn build_method_annotation_array(
     let component = annotation_component_class_id(ctx);
     Ok(build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        cached_method_annotation_proxy(
+        Ok(cached_method_annotation_proxy(
             ctx,
             declaring_class_id,
             method_name,
             method_desc,
             ann,
             ann_cid,
-        )?
-    }))
+        )?)
+    })?)
 }
 
 /// Class.getDeclaredAnnotations() вЂ” only this class's own annotations.
@@ -14118,8 +14124,8 @@ fn class_annotations_by_type_impl(
     let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array_comp(ctx, ann_class_id, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?
-    });
+        Ok(create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?)
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -14200,8 +14206,8 @@ pub(crate) fn native_method_get_annotations_by_type(
     let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array_comp(ctx, ann_class_id, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?
-    });
+        Ok(create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?)
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -15096,8 +15102,8 @@ pub(crate) fn native_class_get_generic_interfaces(
             }
             let class_comp = class_component_id(ctx);
             let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
-                ctx.get_class_mirror(iface_ids[i])
-            });
+                Ok(ctx.get_class_mirror(iface_ids[i]))
+            })?;
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
@@ -15115,8 +15121,8 @@ pub(crate) fn native_class_get_generic_interfaces(
     // Component type is `Class` (HotSpot returns `[Ljava/lang/Class;`), not Object.
     let class_comp = class_component_id(ctx);
     let arr = build_mirror_array_comp(ctx, class_comp, iface_ids.len(), |ctx, i| {
-        ctx.get_class_mirror(iface_ids[i])
-    });
+        Ok(ctx.get_class_mirror(iface_ids[i]))
+    })?;
     Ok(Some(Value::Object(Some(arr))))
 }
 

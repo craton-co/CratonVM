@@ -421,7 +421,9 @@ fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result
 /// JBoss manager, so allocate our synthetic JBoss-classed singleton directly
 /// instead of invoking the real constructor.
 fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    let prop = ctx.get_system_property("java.util.logging.manager")?;
+    let Some(prop) = ctx.get_system_property("java.util.logging.manager") else {
+        return Ok(None);
+    };
     let dotted = prop.trim();
     if dotted.is_empty() {
         return Ok(None);

@@ -7651,7 +7651,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
             // (os error 123) that would otherwise mask the real not-found error
             // from the canonical `C:/...` path.
             let mut first_err: Option<std::io::Error> = None;
-            let mut result: Option<Vec<u8>> = None?;
+            let Some(result) = None else {
+                return Ok(None);
+            };
             for p in &try_paths {
                 match std::fs::read(p) {
                     Ok(b) => {

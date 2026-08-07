@@ -5323,7 +5323,9 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         let Some(Value::Object(Some(obj))) = args.first().copied() else {
             return Ok(None);
         };
-        let mh_class_id = ctx.class_id_by_name("java/lang/invoke/MethodHandle")?;
+        let Some(mh_class_id) = ctx.class_id_by_name("java/lang/invoke/MethodHandle") else {
+            return Ok(None);
+        };
         let obj_class_id = ctx.class_id_of_object(obj);
         if obj_class_id == mh_class_id || ctx.is_subclass(obj_class_id, mh_class_id) {
             Ok(Some(obj))
@@ -6450,12 +6452,18 @@ fn build_reflective_lambda_callsite(
     // a reflective `altMetafactory`. Always empty for plain `metafactory`.
     marker_interfaces: &[String],
 ) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
-    let invoked_mt = invoked_type?;
-    let impl_mh = impl_method?;
+    let Some(invoked_mt) = invoked_type else {
+        return Ok(None);
+    };
+    let Some(impl_mh) = impl_method else {
+        return Ok(None);
+    };
 
     // Factory signature: (captures...)FunctionalInterface.
     let invoked_desc = descriptor_from_method_type(ctx, invoked_mt);
-    let functional_interface = descriptor_return_internal_name(&invoked_desc)?;
+    let Some(functional_interface) = descriptor_return_internal_name(&invoked_desc) else {
+        return Ok(None);
+    };
     let capture_types = descriptor_param_chars(&invoked_desc);
 
     // SAM erased descriptor (default to the most common erasure if unreadable).
@@ -6469,7 +6477,9 @@ fn build_reflective_lambda_callsite(
     };
 
     // Implementation method coordinates from the impl MethodHandle object.
-    let impl_class = mh_read_class(ctx, impl_mh)?;
+    let Some(impl_class) = mh_read_class(ctx, impl_mh) else {
+        return Ok(None);
+    };
     if impl_class.is_empty() {
         return Ok(None);
     }

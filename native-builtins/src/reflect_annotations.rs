@@ -3384,7 +3384,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                 // `CHECKCAST Integer; Integer.intValue()`, so the result must be a
                 // real boxed Integer, not a raw `Value::Int` (which isn't a valid
                 // object reference and CHECKCAST/unbox turns into null).
-                let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler);
+                let hash = crate::lang_class::ctx_annotation_proxy_hash_code(ctx, handler)?;
                 return Ok(Some(crate::lang_class::box_value(
                     ctx,
                     Value::Int(hash),
@@ -3415,7 +3415,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                                     ctx,
                                     handler,
                                     Value::Object(Some(other_handler)),
-                                );
+                                )?;
                                 let flag = Value::Int(if eq { 1 } else { 0 });
                                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
                             }
@@ -3462,7 +3462,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
                         return Ok(Some(crate::lang_class::box_value(ctx, Value::Int(0), "Z")));
                     }
                 }
-                let eq = crate::lang_class::ctx_annotation_proxy_equals(ctx, handler, other);
+                let eq = crate::lang_class::ctx_annotation_proxy_equals(ctx, handler, other)?;
                 let flag = Value::Int(if eq { 1 } else { 0 });
                 return Ok(Some(crate::lang_class::box_value(ctx, flag, "Z")));
             }
