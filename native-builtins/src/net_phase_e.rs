@@ -539,13 +539,53 @@ pub(crate) fn take_raw_socket_stream_for_tls(
     // legacy s2 registry.  Extract its FileDescriptor and hand the stream to
     // rustls before MockWebServer calls SSLSocketFactory.createSocket(Socket,
     // ...).
-    let implementation = match ctx.get_field_by_name(this, "impl") {
+    let mut implementation = match ctx.get_field_by_name(this, "impl") {
         Value::Object(Some(implementation)) => implementation,
         _ => return Err("wrapped Socket is not connected".to_string()),
     };
-    let descriptor = match ctx.get_field_by_name(implementation, "fd") {
-        Value::Object(Some(descriptor)) => descriptor,
-        _ => return Err("wrapped Socket has no FileDescriptor".to_string()),
+    // FIX (mysql-connector-j STARTTLS layered-socket handshake): a plain
+    // client-side `new Socket()` + `.connect(SocketAddress, timeout)` (the
+    // shape `com.mysql.cj.protocol.StandardSocketFactory` uses to build the
+    // socket it later upgrades to TLS) does NOT get a bare `NioSocketImpl` in
+    // `impl` the way `ServerSocket.accept()` does. Since (at least) JDK 13,
+    // `Socket.createImpl()` always wraps the real impl in
+    // `java.net.SocksSocketImpl` (a `DelegatingSocketImpl`) so a SOCKS proxy
+    // configured after construction is still honored — CONFIRMED via
+    // reflection on both HotSpot and CratonVM: `impl.getClass()` is
+    // `java.net.SocksSocketImpl` and `impl.fd` itself is null on BOTH VMs;
+    // the live `FileDescriptor` sits one level deeper, at
+    // `impl.delegate.fd`. This extraction only ever looked at `impl.fd`
+    // directly, so it always answered "wrapped Socket has no
+    // FileDescriptor" for this socket shape and silently fell back to
+    // `PendingLayeredStream::DialFresh` (a brand-new TCP connection to the
+    // same host:port). That fallback is invisible for a protocol that
+    // speaks TLS as the very first thing on the wire (a fresh dial looks
+    // identical to the caller's original connection), but MySQL's protocol
+    // upgrades an ALREADY-connected, already-used-for-plaintext socket to
+    // TLS mid-stream (the SSLRequest packet) — the fresh dial instead hands
+    // rustls the server's plaintext initial-handshake packet as if it were
+    // the first TLS record, which fails immediately with exactly the
+    // observed `SSLHandshakeException: handshake process: received corrupt
+    // message of type InvalidContentType` (rustls's `Display` for
+    // `InvalidMessage::InvalidContentType`, produced when the first bytes
+    // read aren't a valid TLS record). Unwrap `delegate` (bounded, in case a
+    // real SOCKS chain or a future JDK adds another layer) before giving up.
+    let mut descriptor = None;
+    for _ in 0..4 {
+        match ctx.get_field_by_name(implementation, "fd") {
+            Value::Object(Some(d)) => {
+                descriptor = Some(d);
+                break;
+            }
+            _ => match ctx.get_field_by_name(implementation, "delegate") {
+                Value::Object(Some(next)) => implementation = next,
+                _ => break,
+            },
+        }
+    }
+    let descriptor = match descriptor {
+        Some(descriptor) => descriptor,
+        None => return Err("wrapped Socket has no FileDescriptor".to_string()),
     };
     let fd = match ctx.get_field_by_name(descriptor, "fd") {
         Value::Int(fd) if fd >= 0 => fd,
