@@ -7063,7 +7063,7 @@ pub enum JitNewSite {
 /// nothing to them:
 ///
 /// ```text
-/// TEST BYTE [receiver + GC_FLAGS_OFFSET], GC_FLAG_COMPACT ; JZ legacy
+/// TEST BYTE [receiver + GC_FLAGS_BYTE_OFFSET], GC_FLAG_COMPACT ; JZ legacy
 /// MOV    rax, [receiver + layout.value_compact_offset]  ; compact: bare ptr
 /// MOVZX  eax, BYTE [receiver + layout.coder_compact_offset] ; natural width
 /// legacy:

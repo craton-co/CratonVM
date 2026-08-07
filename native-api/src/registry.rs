@@ -140,6 +140,19 @@ pub struct MethodMetadata {
     /// proxy class's `<clinit>` so that `wrap_undeclared_throwable`
     /// (WP2.5 v3 item 6) can match thrown exceptions against it.
     pub exceptions: Vec<String>,
+    /// The JVMS §4.7.9 `Signature` attribute of this method, i.e. its
+    /// generic signature, or `None` when the method is not generic.
+    ///
+    /// Carried here for the same reason as `exceptions`: whoever produced
+    /// this metadata already walked the declaring class's method table, and
+    /// `create_method_object` would otherwise search that table AGAIN, by
+    /// name+descriptor, once per mirror. In a `Class.getDeclaredMethods()`
+    /// call that loop already runs once per method, so the search made the
+    /// cost per method grow with the method count — 766 us of a 2440 us call
+    /// on a 1000-method class went to the exceptions lookup and 659 us to
+    /// this one. A fabricated method (a synthetic stub, a lambda-proxy SAM,
+    /// a shim) is not generic and correctly reports `None`.
+    pub signature: Option<String>,
 }
 
 /// WP2.3 — defineClass options carried through `NativeContext::define_class_full`.
@@ -5986,6 +5999,57 @@ impl NativeMethodRegistry {
         // StringWriter bytecode is self-contained — it just delegates to a real
         // StringBuffer.
         if self.drop_real_layout_synthetic && class_name == "java/io/StringWriter" {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic CHARSET family.
+        //
+        // These natives fabricate their objects with the ABSTRACT class as the
+        // runtime class — `alloc_concurrent_synthetic("java/nio/charset/Charset", …)`
+        // and the same for `CharsetEncoder`. On HotSpot `StandardCharsets.UTF_8`
+        // is a `sun.nio.cs.UTF_8` and its encoder a `sun.nio.cs.UTF_8$Encoder`;
+        // here both were instances of the abstract classes themselves. Any
+        // method with no native to intercept it then resolves to an abstract
+        // declaration, and the ones that WERE intercepted read a synthetic
+        // 3-slot layout (`charset`/`averageBytesPerChar`/`maxBytesPerChar` at
+        // field indices 0/1/2) that a real coder does not have.
+        //
+        // The visible result was silent and wrong rather than an error: EVERY
+        // `String.getBytes` overload — no-arg, `(String)`, `(Charset)`, for
+        // UTF-8, ASCII and ISO-8859-1 alike — returned a correctly-SIZED,
+        // ZERO-FILLED array, and every decode round-trip failed with it.
+        //
+        // That is what made `regression-suite`'s `RCrypto` look like a crypto
+        // defect. It is not: the SHA-256 was computed correctly over the wrong
+        // input. `"abc".getBytes("UTF-8")` handed it three zero bytes, and
+        // sha256(00 00 00) is exactly the 709e80c8… digest the suite reported.
+        // `RStrings` failed the same way on its UTF-8 round-trip, so the two
+        // classes were one defect.
+        //
+        // All four names have to go together, and the order in which they were
+        // added is the evidence for that: dropping the coders alone moves the
+        // failure from zeros to `AbstractMethodError: CharsetEncoder.encodeLoop
+        // has no Code attribute`, because the Charset handing out the encoder
+        // is still a fabricated abstract instance; adding `Charset` fixes the
+        // no-arg and named overloads but leaves `getBytes(StandardCharsets.UTF_8)`
+        // failing on `Charset.newEncoder`, because the STANDARD CHARSET OBJECT
+        // is fabricated by its own registrations. With all four dropped the real
+        // `sun.nio.cs` classes are constructed and every overload matches
+        // HotSpot.
+        //
+        // Verified not to touch the shipping build: the default `cratonvm-cli`
+        // build measures the identical 30-passed/1-failed with and without this
+        // rule (the one failure, `RSocketChannelInterrupt`, is dev's own and
+        // predates it). Synthetic-jdk MODE is byte-identical too —
+        // `drop_real_layout_synthetic` is only ever set in a real-JDK arm.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/nio/charset/Charset"
+                    | "java/nio/charset/StandardCharsets"
+                    | "java/nio/charset/CharsetEncoder"
+                    | "java/nio/charset/CharsetDecoder"
+            )
+        {
             return;
         }
         // Real-JDK mode: drop the synthetic blocking/concurrent QUEUE family.

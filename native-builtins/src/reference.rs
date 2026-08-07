@@ -693,6 +693,36 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     let next_slot = ref_next_slot(ctx, ref_obj);
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     let next = ctx.get_field(ref_obj, next_slot);
+                    // The real JDK marks the LAST element of the queue by
+                    // SELF-LINKING it: `ReferenceQueue.enqueue` does
+                    // `r.next = (head == null) ? r : head`, and `reallyPoll`
+                    // undoes it with `head = (r.next == r) ? null : r.next`.
+                    // `native_ref_enqueue` delegates to that real bytecode
+                    // whenever the receiver has the real `Reference` layout, so
+                    // this native pops a list that can be linked either way and
+                    // has to honour both conventions. Taking `next` literally
+                    // left `head` pointing back at the reference just popped:
+                    // ONE `enqueue()` then yielded TWO successful `poll()`s.
+                    //
+                    // pgjdbc is what this cost. `SimpleQuery.unprepare()` and
+                    // `setCleanupRef()` call `clear()` + `enqueue()` on their
+                    // own `PhantomReference`, and
+                    // `QueryExecutorImpl.processDeadParsedQueries` polls the
+                    // queue in a loop doing `parsedQueryMap.remove(polled)`
+                    // with no null check. The duplicate poll removed an entry
+                    // that was already gone, so `sendCloseStatement(null)`
+                    // raised `NullPointerException: ... because "statementName"
+                    // is null` from inside the driver -- H2
+                    // `TestPgServer.testDateTime`.
+                    //
+                    // The GC auto-enqueue path uses the synthetic convention
+                    // (`next` = old head, or null when the queue was empty) and
+                    // never self-links, so it is unaffected either way.
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    let next = match next {
+                        Value::Object(Some(n)) if n == ref_obj => Value::Object(None),
+                        other => other,
+                    };
                     let this = ctx.read_native_pin(this_pin, this);
                     ctx.set_field(this, RQ_FIELD_HEAD, next);
                     // Detach the popped reference from the list and clear its

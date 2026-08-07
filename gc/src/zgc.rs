@@ -79,7 +79,7 @@ use crate::collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
 use crate::gc::{GcResult, GcStats};
 use crate::heap::{
     array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
-    ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
+    ObjectKind, GC_FLAG_MARKED, ARRAY_DATA_OFFSET, HEADER_SIZE, SLOT_SIZE,
 };
 use crate::reference::{ReferenceProcessingResult, ReferenceProcessor, ReferenceType};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -1563,31 +1563,6 @@ impl ZgcRealHeap {
         }
     }
 
-    /// Lazily mint and durably install a non-zero identity hash for an
-    /// object whose header field is still 0 (the JIT inline `new` fast path
-    /// leaves it TLAB-zeroed — see `identity_hash_code`'s doc comment on the
-    /// `GenerationalHeap` backend for the full rationale). Safe under
-    /// concurrency: the header field is written via CAS from 0, so a losing
-    /// racer's mint is discarded and every caller converges on the single
-    /// value that ends up durably stored.
-    fn mint_identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let minted = match self.next_hash() {
-            0 => i32::MAX,
-            h => h,
-        };
-        // SAFETY: see the identical justification in
-        // `gen_heap::GenerationalHeap::mint_identity_hash_code`.
-        unsafe {
-            let field_ptr =
-                std::ptr::addr_of_mut!((*(obj.as_ptr() as *mut ObjectHeader)).identity_hash_code);
-            let atomic = &*(field_ptr as *const AtomicI32);
-            match atomic.compare_exchange(0, minted, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => minted,
-                Err(existing) => existing,
-            }
-        }
-    }
-
     /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
     /// base address. Returns `None` on OOM.
     fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
@@ -1615,7 +1590,6 @@ impl ZgcRealHeap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).ok()?,
         );
@@ -1636,14 +1610,13 @@ impl ZgcRealHeap {
             return None;
         }
         let data_size = array_data_size(length, element_type).ok()?;
-        let total = HEADER_SIZE.checked_add(data_size)?;
+        let total = ARRAY_DATA_OFFSET.checked_add(data_size)?;
         let ptr = self.alloc_raw(total)?;
         let len_u32 = u32::try_from(length).ok()?;
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
             len_u32,
             len_u32,
         );
@@ -1763,7 +1736,7 @@ impl ZgcRealHeap {
             ObjectKind::Array => {
                 let data =
                     array_data_size(header.array_length() as usize, header.element_type).unwrap_or(0);
-                HEADER_SIZE + data
+                ARRAY_DATA_OFFSET + data
             }
         }
     }
@@ -1834,7 +1807,7 @@ impl ZgcRealHeap {
                     let len = header.array_length() as usize;
                     // SAFETY: data area begins at base + HEADER_SIZE; each ref
                     // element is REF_ELEMENT_SIZE and `i < len`.
-                    let data = unsafe { base.add(HEADER_SIZE) };
+                    let data = unsafe { base.add(ARRAY_DATA_OFFSET) };
                     for i in 0..len {
                         let val =
                             unsafe { read_prim_element(data, i, ArrayElementType::Reference) };
@@ -1980,7 +1953,6 @@ impl GarbageCollector for ZgcRealHeap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
-            self.next_hash(),
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
@@ -2045,11 +2017,16 @@ impl GarbageCollector for ZgcRealHeap {
     }
 
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        let existing = self.header(obj).identity_hash_code;
-        if existing != 0 {
-            return existing;
+        let header = self.header(obj);
+        match header.mark_word_identity_hash(|| match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => crate::collector::displaced_identity_hash(
+                header.mark_word.load(Ordering::Relaxed),
+            ),
         }
-        self.mint_identity_hash_code(obj)
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
@@ -2129,7 +2106,7 @@ impl GarbageCollector for ZgcRealHeap {
         }
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         let val = unsafe {
-            let base = obj.as_ptr().add(HEADER_SIZE);
+            let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
             read_prim_element(base, index, header.element_type)
         };
         Ok(val)
@@ -2146,7 +2123,7 @@ impl GarbageCollector for ZgcRealHeap {
         let element_type = header.element_type;
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
         unsafe {
-            let base = obj.as_ptr().add(HEADER_SIZE);
+            let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
             if element_type == ArrayElementType::Reference {
                 match value {
                     Value::Object(_) => {
@@ -2160,7 +2137,7 @@ impl GarbageCollector for ZgcRealHeap {
                         // Re-fetch base: alloc_object cannot move existing
                         // objects (non-moving heap), so `base` is still valid,
                         // but reads are clearer with the explicit comment.
-                        write_prim_element(base, index, element_type, Value::Object(Some(wrapper)));
+                        write_prim_element(base, index, element_type, Value::Object(Some(wrapper));
                     }
                 }
             } else {

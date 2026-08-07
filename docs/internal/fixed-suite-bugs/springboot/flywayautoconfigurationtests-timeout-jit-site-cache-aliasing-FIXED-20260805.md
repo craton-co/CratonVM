@@ -161,3 +161,19 @@ is the mechanism-level guard; the suite-level guard is this class's own
 
 Original log:
 `craton-fullsuite-azure-20260805-s5/all-jit/logs/module_spring-boot-flyway.org.springframework.boot.flyway.autoconfigure.FlywayAutoConfigurationTests.{out,err}.log`
+
+## 2026-08-07: recurred as a TIMEOUT on the Windows full suite — confirmed NOT this bug again
+
+`FlywayAutoConfigurationTests` HANGed again (300.026s) on
+`craton-fullsuite-windows-20260806-s3`. Checked before assuming a
+regression: `383e7f5cf` is still an ancestor of `dev`
+(`git merge-base --is-ancestor` confirms it), and the current `.out.log`
+shows none of this bug's exception shapes (`ClassCastException`, `Bad
+method descriptor`, the `Class.isAssignableFrom` NPE, etc.) — instead
+continuous, unbroken progress through the normal migration-cycle logging
+right up to the kill, exactly the "margin ran out" reading this doc's own
+"300s margin is pre-existing" section anticipated, now also hitting
+`IntegrationAutoConfigurationTests` in the same run for the same reason
+(both are many-`ApplicationContext`-refresh classes running under this
+run's 16-way parallel host load). Full writeup:
+[`docs/known-issues/springboot/flyway-integration-autoconfigurationtests-300s-margin-exhausted-windows-20260807.md`](../../../known-issues/springboot/flyway-integration-autoconfigurationtests-300s-margin-exhausted-windows-20260807.md).

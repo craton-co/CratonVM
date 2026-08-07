@@ -5,6 +5,13 @@
 and it is **not** the dispatch bug that took out the four sibling
 `*AutoConfigurationTests` classes filed the same day.
 
+**Scope note (2026-08-07):** this page now covers the whole jOOQ family, not
+just this one class — four more classes confirmed as the same mechanism, see
+"Four sibling classes" section below. It also now covers one
+non-jOOQ class, `SpringApplicationTests`, filed as the same underlying
+`Class.getDeclaredMethods()` cost at a much smaller per-cycle scale — see
+"`SpringApplicationTests`" section below.
+
 ## Reconfirmed 2026-08-06, Windows box, longer timeout
 
 Same class, same throughput shape, on a fresh `dev` merge and a 1500s
@@ -15,6 +22,163 @@ per-cycle cost, consistent HANG — nothing here changes this doc's diagnosis.
 Not re-investigated further; filed only to confirm the throughput problem is
 still live and still the whole story, not superseded by anything newer.
 Log: `apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-20260806-s4/all-jit/logs/module_spring-boot-jooq.org.springframework.boot.jooq.autoconfigure.JooqAutoConfigurationTests.out.log`.
+
+## `SpringApplicationTests` — fifth instance, much smaller per-cycle cost, same mechanism by elimination (2026-08-07)
+
+`core/spring-boot`'s `org.springframework.boot.SpringApplicationTests` HANGs
+in the same 2026-08-06 full-suite Windows run
+(`craton-fullsuite-windows-20260806-s1`), TIMEOUT/HANG at 300.065s, no
+`SBRUNNER_RESULT`. Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-fullsuite-windows-20260806-s1/all-jit/logs/core_spring-boot.org.springframework.boot.SpringApplicationTests.{out,err}.log`.
+
+This class is a poor superficial match for the rest of this doc — it has no
+jOOQ dependency, no `DefaultDSLContext`, no HikariPool, and (checked by
+source grep) only 3 of its ~104 `@Test` methods carry any
+`ModifiedClassPathExtension`-driving annotation (method-level
+`@ForkedClassPath`, not class-level, and not `@ClassPathExclusions`/
+`@ClassPathOverrides`) — ruling out both this doc's jOOQ mechanism as a
+literal match and the unrelated `ModifiedClassPathExtension` per-method
+overhead documented in
+[`log4j2-logback-loggingsystemtests-modifiedclasspath-throughput-hang-20260807.md`](log4j2-logback-loggingsystemtests-modifiedclasspath-throughput-hang-20260807.md).
+Filed here anyway because the *timing shape*, once measured, points at the
+same underlying native cost as this doc's root cause, just at a much smaller
+per-call scale.
+
+**Timeline.** `SpringApplicationTests` builds a fresh minimal
+`SpringApplication` context in most of its ~104 test methods. The log shows
+a `Starting SbRunner`/`Started SbRunner in N seconds` pair for each one,
+remarkably steady from the very first cycle to the process being killed:
+
+```
+02:27:00.464  Started SbRunner in 6.836 seconds (process running for 17.808)
+02:27:05.509  Started SbRunner in 3.478 seconds (process running for 22.853)
+02:27:09.072  Started SbRunner in 3.079 seconds (process running for 26.416)
+02:27:13.631  Started SbRunner in 4.348 seconds (process running for 30.975)
+...
+02:31:32.826  Started SbRunner in 3.455 seconds (process running for 290.17)
+02:31:36.773  Started SbRunner in 3.538 seconds (process running for 294.117)
+```
+
+54 `Starting SbRunner` lines and 50 `Started SbRunner` lines appear before
+the 300s kill (the other ~4 cycles were still in progress or belong to test
+methods that build a `SpringApplication` without fully starting it). Unlike
+this doc's jOOQ classes or the sibling `ModifiedClassPathExtension` doc,
+there is **no multi-minute silent stretch** here — the cost is a flat
+~3.1-6.8s per context bootstrap, paid consistently for the entire run, never
+spiking or stalling. On HotSpot this same class runs to completion at 17.9s
+total per the suite's `hotspot-baseline-latest.tsv` cross-reference used
+elsewhere in this doc — i.e. HotSpot's *entire class* costs less than one
+single CratonVM context-bootstrap cycle here.
+
+**Why this is filed as the same mechanism as (a) above, not a new one.**
+`SpringApplicationTests`'s minimal contexts still register and initialize
+Spring's standard infrastructure `BeanPostProcessor`s on every refresh —
+`EventListenerMethodProcessor`, `AutowiredAnnotationBeanPostProcessor`,
+`CommonAnnotationBeanPostProcessor`, etc. — each of which walks every
+singleton bean's class via `MethodIntrospector.selectMethods()` →
+`ReflectionUtils.doWithMethods()` → `Class.getDeclaredMethods()`, exactly
+the call chain this doc's "(a) is `Class.getDeclaredMethods()`" section
+measured at **73x** HotSpot's per-call cost, worsening super-linearly with a
+class's declared-method count. `SpringApplicationTests`'s contexts have far
+fewer, far smaller bean classes than jOOQ's 1003-method `DefaultDSLContext`
+(there is nothing here remotely that large), so the fixed multi-millisecond
+floor of that native call, multiplied across however many framework +
+`ApplicationContextInitializer`/bean classes Spring Boot's own bootstrap
+registers even in a "do nothing" context, is consistent with landing in the
+**single-digit-seconds** range per cycle rather than (a)'s 90-175s — a
+smaller manifestation of the identical underlying cost, not a re-derivation.
+**Not independently re-confirmed with a stack sample this pass** — filed on
+the strength of the timing shape (flat, no stalls, no exceptions, no GC
+warnings in `.err.log`) being the signature this doc's mechanism predicts at
+a smaller scale, and the process of elimination ruling out both jOOQ-specific
+setup and the sibling `ModifiedClassPathExtension` per-method-relaunch
+mechanism. Confirming this would need the same `--stack-sample-ms`/
+`ReflectionCacheProbe`-style measurement this doc's (a) section used,
+scoped to one `SpringApplicationTests` cycle.
+
+**Practical effect:** ~104 test methods × ~3-4s floor per context easily
+exceeds the 300s class budget on its own, with no single method needing to
+hang — same class of problem as this doc's jOOQ classes ("(a) throughput"),
+just reached by volume of small operations instead of one or two large ones.
+
+## Four sibling classes, same mechanism, additional instances (2026-08-07)
+
+The 2026-08-06 full-suite Windows run (`craton-fullsuite-windows-20260806`,
+`-Xmx 2g`, 300s/class, Generational GC) also HANGs on four more jOOQ-family
+classes, all shard `s3`:
+
+| Class | Module | Seconds |
+|---|---|---:|
+| `JooqFlywayDatabaseInitializationTests` | `spring-boot-jooq` | 300.002 |
+| `JooqTestIntegrationTests` | `spring-boot-jooq-test` | 300.088 |
+| `JooqTestPropertiesIntegrationTests` | `spring-boot-jooq-test` | 300.010 |
+| `JooqTestWithAutoConfigureTestDatabaseIntegrationTests` | `spring-boot-jooq-test` | 300.182 |
+
+Logs: `craton-fullsuite-windows-20260806-s3/all-jit/logs/module_spring-boot-jooq{,-test}.org.springframework.boot.jooq...{.out,.err}.log` (see `results.tsv` for the hashed filenames).
+
+**Same mechanism as (a) above, confirmed structurally, not just by timing
+shape.** The three `spring-boot-jooq-test` classes are all `@JooqTest`
+slices; `@JooqTest` carries `@AutoConfigureJooq` which resolves via
+`META-INF/spring/org.springframework.boot.jooq.test.autoconfigure.AutoConfigureJooq.imports`
+straight to `org.springframework.boot.jooq.autoconfigure.JooqAutoConfiguration`
+— the exact same auto-configuration that registers the 1003-method
+`DefaultDSLContext` bean diagnosed above. `JooqFlywayDatabaseInitializationTests`
+constructs the same bean directly (`new DefaultDSLContext(SQLDialect.H2)` in
+its `JooqConfiguration` inner class). All four pay the identical
+`getDeclaredMethods()`/`EventListenerMethodProcessor` reflection wall.
+
+The *shape* differs from `JooqAutoConfigurationTests` only because of how
+each test builds its context, not because of a different root cause:
+
+- **`JooqFlywayDatabaseInitializationTests`** uses `ApplicationContextRunner`
+  (fresh context per `@Test`, same as `JooqAutoConfigurationTests`). Its log
+  shows exactly the documented signature: context 1's Flyway migration
+  finishes fast (`03:26:20.850`, "Schema is up to date"), then **143.7s of
+  total silence** before the embedded DB shuts down (`03:28:44.085`) — a
+  single-cycle cost that lands inside the 90-175s range already measured for
+  (a). Context 2 starts its embedded DB at `03:28:45.265` and never logs
+  another line before the 300s kill.
+- **The three `@JooqTest` classes** use Spring's normal test-context
+  caching: one shared `ApplicationContext` built once and reused across all
+  `@Test` methods in the class (6 tests for `JooqTestIntegrationTests`, 2 for
+  `JooqTestPropertiesIntegrationTests`, 1 for
+  `JooqTestWithAutoConfigureTestDatabaseIntegrationTests`). Each log shows
+  the embedded database starting (H2 or HSQLDB) and then **total silence for
+  the rest of the ~290s remaining budget** — zero test output, because the
+  one context refresh that all their tests depend on never finishes. This
+  reads as a single oversized instance of the same per-context cost
+  documented in (a) (90-175s there), not a different failure: no exceptions,
+  no stack traces, no distinguishing symptom in any `.err.log` beyond the
+  usual clinit-fixup/Mockito-agent boilerplate common to every class in this
+  suite.
+
+**Not independently re-derived (no stack-sample was taken on these four
+classes)** — filed on the strength of the structural match (same
+autoconfiguration, same bean, same "silence during the test body" signature)
+plus the timing match for `JooqFlywayDatabaseInitializationTests`'s first
+cycle. The `@JooqTest` classes' single stall running the *entire* remaining
+budget (not a partial cycle) is the one point worth flagging as unconfirmed:
+it's consistent with (a) being simply slower in this slice's context (more
+singleton beans for `EventListenerMethodProcessor` to walk, or HSQLDB's own
+reflection surface adding to the total), but a HANG kill leaves no thread
+dump, so a genuine deadlock distinct from (a) cannot be fully ruled out
+without a longer-timeout rerun with `--stack-sample-ms`.
+
+**On the G1/ZGC "timeout-boundary noise" framing:** `g1-fullsuite-regression-20260807.md`
+and `zgc-real-fullsuite-regression-20260807.md` both list these same
+classes (3 of 4 in the G1 doc, all 4 in the ZGC doc) as flipping
+HANG-under-Generational -> PASS-under-G1/ZGC, tentatively dismissed as
+"timeout-boundary noise." The logs here argue against reading that literally
+as *noise*: the three `@JooqTest` classes show **zero forward progress for
+the entire ~290s window**, not a near-miss (e.g. a shutdown log a few
+seconds short of the 300s cutoff) — that's a large, not marginal, overrun
+under Generational. A more likely explanation than noise is that (a)'s
+`getDeclaredMethods()`/mirror-allocation cost is itself GC-sensitive (it is
+allocation-heavy — 1003 `Method` mirrors materialized per call) and runs
+enough faster under G1/ZGC's different allocation/pause behavior to land
+just under 300s there while overrunning it under Generational. Consistent
+with the hypothesis, not proven by it; worth revisiting if (a) is ever
+profiled under G1/ZGC specifically.
 
 ## Correction (2026-08-05, measured)
 
@@ -219,5 +383,13 @@ other "severe slowdown" classes (e.g.
 ## Affected classes
 
 - `module/spring-boot-jooq` — `org.springframework.boot.jooq.autoconfigure.JooqAutoConfigurationTests`
-
-Log: `craton-fullsuite-azure-20260805-s6/all-jit/logs/module_spring-boot-jooq.org.springframework.boot.jooq.autoconfigure.JooqAutoConfigurationTests.{out,err}.log`
+  (original root-caused instance; log:
+  `craton-fullsuite-azure-20260805-s6/all-jit/logs/module_spring-boot-jooq.org.springframework.boot.jooq.autoconfigure.JooqAutoConfigurationTests.{out,err}.log`)
+- `module/spring-boot-jooq` — `org.springframework.boot.jooq.autoconfigure.JooqFlywayDatabaseInitializationTests`
+  (added 2026-08-07, same mechanism, see above)
+- `module/spring-boot-jooq-test` — `org.springframework.boot.jooq.test.autoconfigure.JooqTestIntegrationTests`
+  (added 2026-08-07, same mechanism, see above)
+- `module/spring-boot-jooq-test` — `org.springframework.boot.jooq.test.autoconfigure.JooqTestPropertiesIntegrationTests`
+  (added 2026-08-07, same mechanism, see above)
+- `module/spring-boot-jooq-test` — `org.springframework.boot.jooq.test.autoconfigure.JooqTestWithAutoConfigureTestDatabaseIntegrationTests`
+  (added 2026-08-07, same mechanism, see above)

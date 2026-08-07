@@ -13,7 +13,7 @@ use crate::g1::{G1Collector, G1CollectorConfig};
 use crate::g1_concurrent::ConcurrentMarkController;
 use crate::gc::GcResult;
 use crate::gen_heap::GenerationalHeap;
-use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
+use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE};
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
 #[cfg(feature = "zgc")]
@@ -951,8 +951,8 @@ impl VmHeap {
     /// For non-array objects the returned value is meaningless.
     pub fn array_element_type(&self, obj: ObjectRef) -> Option<ArrayElementType> {
         let header = self.get_header(obj);
-        if header.kind == ObjectKind::Array {
-            Some(header.element_type)
+        if header.kind() == ObjectKind::Array {
+            Some(header.element_type())
         } else {
             None
         }
@@ -1095,7 +1095,7 @@ impl VmHeap {
         // Contiguous from `obj + HEADER_SIZE` for every array: generational and
         // single-region G1 trivially, and G1 humongous because all regions are
         // adjacent slices of one arena (so a humongous span is one block).
-        Some(unsafe { obj.as_ptr().add(HEADER_SIZE) })
+        Some(unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET) })
     }
 
     // =====================================================================
@@ -2975,7 +2975,7 @@ mod concurrent_mark_controller_tests {
             .expect("ordinary array must have a flat pointer");
         assert_eq!(
             sptr,
-            unsafe { small.as_ptr().add(HEADER_SIZE) },
+            unsafe { small.as_ptr().add(ARRAY_DATA_OFFSET) },
             "flat pointer must be obj + HEADER_SIZE",
         );
 
@@ -2988,7 +2988,7 @@ mod concurrent_mark_controller_tests {
             as *mut i32;
         assert_eq!(
             lptr as *mut u8,
-            unsafe { large.as_ptr().add(HEADER_SIZE) },
+            unsafe { large.as_ptr().add(ARRAY_DATA_OFFSET) },
             "humongous flat pointer must be obj + HEADER_SIZE",
         );
 

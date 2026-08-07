@@ -12160,8 +12160,30 @@ fn native_files_delete_if_exists(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 fn native_files_create_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let s = validated_path(&files_path_str(ctx, args))?;
-    if let Err(e) = std::fs::File::create(&s) {
-        return Err(io_err(e));
+    // `Files.createFile` is specified as `CREATE_NEW`: it must FAIL with
+    // `FileAlreadyExistsException` when the path already exists. It is the
+    // atomic create-if-absent primitive of `java.nio.file`, so callers use it
+    // AS a lock rather than merely to make a file. `std::fs::File::create` is
+    // `O_CREAT|O_WRONLY|O_TRUNC`, which did the opposite twice over: it
+    // reported success on an existing path AND truncated whatever was in it.
+    //
+    // H2 `FilePathDisk.createFile` catches `FileAlreadyExistsException` to
+    // return `false` (meaning: another process already holds this lock file),
+    // so a silent success let two `FileLock` instances both believe they had
+    // taken the database lock. `TestFileLock.testSimple` then saw
+    // ERROR_OPENING_DATABASE_1 ("Concurrent update") from the second locker
+    // where it asserts DATABASE_ALREADY_OPEN_1 — and, worse, the truncation
+    // had already destroyed the first lock file holder id on disk.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&s)
+    {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(nio_native::file_already_exists(ctx, &s));
+        }
+        Err(e) => return Err(io_err_nio(e, &s)),
     }
     let path = match args.first() {
         Some(v) => *v,

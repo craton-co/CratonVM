@@ -416,11 +416,11 @@ pub(crate) fn emit_hashed_vtable_stub(
     // receiver and is called into `Foo`'s method body. `ObjectHeader.kind`
     // (offset 4) separates them; anything not a plain object takes the
     // resolving helper, which dispatches arrays on `java/lang/Object`.
-    //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+    //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
     buf.emit(&[
         0x80,
         0x78,
-        cratonvm_types::OBJECT_KIND_OFFSET as u8,
+        cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8,
         cratonvm_types::ObjectKind::Object as u8,
     ]);
     miss_patches.push(emit_jcc(buf, 0x85)); // JNE slow
@@ -517,7 +517,7 @@ mod tests {
         let guard = [
             0x80u8,
             0x78,
-            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8,
             cratonvm_types::ObjectKind::Object as u8,
         ];
         let guard_at = bytes

@@ -22602,58 +22602,92 @@ fn collect_via_collector_protocol(
         }
         return make_list_of(ctx, elements);
     }
-    let supplier = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "supplier",
-        "()Ljava/util/function/Supplier;",
-        &[],
-    )? {
-        Some(Value::Object(Some(s))) => s,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let container = ctx
-        .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
-        .unwrap_or(Value::Object(None));
-    let accumulator = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "accumulator",
-        "()Ljava/util/function/BiConsumer;",
-        &[],
-    )? {
-        Some(Value::Object(Some(a))) => a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    for elem in elements {
-        ctx.invoke_virtual(
-            accumulator,
-            "accept",
-            "(Ljava/lang/Object;Ljava/lang/Object;)V",
-            &[container, *elem],
-        )?;
-    }
-    let finisher = match ctx.invoke_virtual_declared(
-        "java/util/stream/Collector",
-        collector,
-        "finisher",
-        "()Ljava/util/function/Function;",
-        &[],
-    )? {
-        Some(Value::Object(Some(f))) => f,
-        // An IDENTITY_FINISH collector with no finisher: the accumulated
-        // container is itself the result.
-        _ => return Ok(Some(container)),
-    };
-    let result = ctx
-        .invoke_virtual(
-            finisher,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[container],
-        )?
-        .unwrap_or(Value::Object(None));
-    Ok(Some(result))
+    // GC-safety (2026-08-07): every `invoke_virtual*` below re-enters the
+    // interpreter and can allocate, so a moving young collection can run at
+    // any of them. `collector`, `container`, `accumulator`, `finisher` and the
+    // elements are raw `ObjectRef`s that must therefore be pinned and re-read
+    // after each call — the same discipline the degenerate-`Object` arm above
+    // and every tagged arm in `native_stream_collect` already follow. Without
+    // it the accumulated container is handed back at its pre-copy address,
+    // which the semispace swap leaves in the inactive semispace reading as an
+    // all-zero header: `java.lang.Object cannot be cast to MultiValueMap` out
+    // of `OnBeanCondition$Spec.<init>`, one run in seven. Pins are a stack and
+    // `collector_pin` is the first taken here, so the single unpin after the
+    // closure releases every pin the body pushed, on every exit path.
+    let collector_pin = ctx.pin_native_root(collector);
+    let (_, elem_handles) = pin_value_slice(ctx, elements);
+    let out = (|| -> MethodCallResult {
+        let receiver = ctx.read_native_pin(collector_pin, collector);
+        let supplier = match ctx.invoke_virtual_declared(
+            "java/util/stream/Collector",
+            receiver,
+            "supplier",
+            "()Ljava/util/function/Supplier;",
+            &[],
+        )? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let supplier_pin = ctx.pin_native_root(supplier);
+        let supplier = ctx.read_native_pin(supplier_pin, supplier);
+        let container = ctx
+            .invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[])?
+            .unwrap_or(Value::Object(None));
+        let container_pin = pin_value(ctx, container);
+
+        let receiver = ctx.read_native_pin(collector_pin, collector);
+        let accumulator = match ctx.invoke_virtual_declared(
+            "java/util/stream/Collector",
+            receiver,
+            "accumulator",
+            "()Ljava/util/function/BiConsumer;",
+            &[],
+        )? {
+            Some(Value::Object(Some(a))) => a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let accumulator_pin = ctx.pin_native_root(accumulator);
+        for i in 0..elements.len() {
+            let acc = ctx.read_native_pin(accumulator_pin, accumulator);
+            let held = read_pinned_elem(ctx, container_pin, container);
+            let elem = read_pinned_elem(ctx, elem_handles[i], elements[i]);
+            ctx.invoke_virtual(
+                acc,
+                "accept",
+                "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                &[held, elem],
+            )?;
+        }
+
+        let receiver = ctx.read_native_pin(collector_pin, collector);
+        let finisher = match ctx.invoke_virtual_declared(
+            "java/util/stream/Collector",
+            receiver,
+            "finisher",
+            "()Ljava/util/function/Function;",
+            &[],
+        )? {
+            Some(Value::Object(Some(f))) => f,
+            // An IDENTITY_FINISH collector with no finisher: the accumulated
+            // container is itself the result. Re-read it — `finisher()` above
+            // was itself a GC-capable call.
+            _ => return Ok(Some(read_pinned_elem(ctx, container_pin, container))),
+        };
+        let finisher_pin = ctx.pin_native_root(finisher);
+        let finisher = ctx.read_native_pin(finisher_pin, finisher);
+        let held = read_pinned_elem(ctx, container_pin, container);
+        let result = ctx
+            .invoke_virtual(
+                finisher,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[held],
+            )?
+            .unwrap_or(Value::Object(None));
+        Ok(Some(result))
+    })();
+    ctx.unpin_native_roots(collector_pin);
+    out
 }
 
 /// `Stream.collect(Supplier<R>, BiConsumer<R,? super T>, BiConsumer<R,R>)`
