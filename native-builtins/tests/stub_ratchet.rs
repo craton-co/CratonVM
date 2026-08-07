@@ -220,7 +220,47 @@ use cratonvm_types::compat::CompatibilityMode;
 /// This is what "wave 1 is measurement" buys: the count rises because the
 /// census finally sees a fake it had mislabelled, at the moment that fake stops
 /// being reachable on a real-JDK image.
-const BASELINE_SYNTHETIC_STUBS: usize = 644;
+///
+/// # 644 -> 689, 2026-08-06 (giving `--jdk-only` a real `java.lang.ProcessImpl`)
+///
+/// Forty-five, and again **no new fake was added** — 45 registrations that
+/// were already fakes stopped being labelled `Bridge`. They fall in three
+/// groups, and the count is worth reading as three numbers rather than one:
+///
+///  * **29** on `cratonvm/synthetic/{Process, ProcessPipeInputStream,
+///    ProcessPipeOutputStream, ProcessExitWaiter}` and
+///    `cratonvm/synthetic/AnonymousObject$2` — receivers this VM mints and no
+///    image contains, so §1.5's "what an `ACC_NATIVE` method binds to" has
+///    nothing to point at. `Bridge` was keeping a fabricated class reachable
+///    under `--jdk-only`, which is what §5 forbids outright. (The adjudication
+///    that opened this counted 37; `58f0ffb30` deleted eight of them —
+///    `phases_late`'s duplicate `cratonvm/synthetic/Process` surface — while
+///    this change was in flight, so the retag lands on the 29 that remain.)
+///  * **11** on `java/lang/ProcessBuilder` — every one shadowing ordinary
+///    bytecode (`acc_native: false, has_code: true` for all eleven), so §1.4
+///    gives the real method precedence. The cluster has to move together:
+///    restating `start()` alone leaves `<init>([Ljava/lang/String;)V` writing a
+///    raw `String[]` into the `command` field, and the JDK's own `start()` then
+///    dies on `command.toArray(...)`.
+///  * **5** `java.io` constructors — `BufferedOutputStream(OutputStream)` and
+///    its sized twin, `FilterOutputStream(OutputStream)`, and
+///    `FileInputStream`/`FileOutputStream(FileDescriptor)`. Each shim assigns
+///    the wrapped stream and stops, while each real constructor also
+///    initializes `private final Object closeLock = new Object()` — and every
+///    matching `close()` opens with `synchronized (closeLock)`. A stream built
+///    through these shims throws NullPointerException, not IOException, on its
+///    first close, which `ProcessImpl.destroy`'s `catch (IOException ignored)`
+///    cannot absorb.
+///
+/// What the 53 bought, measured rather than argued: `--jdk-only` now returns a
+/// real `java.lang.ProcessImpl` from `ProcessBuilder.start()`, and
+/// `probes/RealProcessSurfaceProbe` — 21 lines covering pid, all three streams
+/// in both directions, `redirectErrorStream`, file and INHERIT redirects,
+/// `onExit`, `destroy`, timed `waitFor`, an empty argument and an unspawnable
+/// command — is **byte-identical to HotSpot 25**. Compatible `--real-jdk` mode
+/// is byte-identical to the build before the change; it keeps every one of
+/// these registrations and still answers with the VM's own process object.
+const BASELINE_SYNTHETIC_STUBS: usize = 689;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.
