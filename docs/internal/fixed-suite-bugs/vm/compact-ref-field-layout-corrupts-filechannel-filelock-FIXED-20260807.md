@@ -1,72 +1,81 @@
-# `FileChannelImpl.fileLockTable` reads back corrupt: the final `monitorexit` erased the object's compact-layout flag
-
-*(Filed under the compact reference-field layout, which is where the evidence
-pointed before the flag transition was instrumented. The layout is the victim,
-not the cause — see "Root cause" below. Filename kept so existing links resolve.)*
+# The compact reference-field layout corrupts `FileChannelImpl.fileLockTable`, so every file lock fails
 
 ## Status
-**FIXED 2026-08-07** on `claude/h2-mvstore-insert-perf-20260807`, by
-`fix(vm): the last thin-lock release erased the mark word's quartet`. The
-original triage below is kept because its measurements are all correct and
-because its leading hypothesis was wrong in an instructive way.
+**✅ FIXED 2026-08-07.** One line in `vm/src/threading/monitor.rs`:
+`try_thin_unlock`'s last release stored the bare `MARK_NEUTRAL` constant into
+the mark word, erasing the `kind` / `element_type` / `gc_age` / `gc_flags`
+quartet that moved into bits 48..61 when the header shrank. `GC_FLAG_COMPACT`
+lives in that quartet, so **the first `synchronized` block on a compact object
+converted it to "legacy" on exit**, and every field read after that decoded a
+compact-packed body as 16-byte cells.
 
-Regression, deterministic, bisected to `6ba350cdd` — *"Merge
-perf/header-16-and-field-packing-20260806: HEADER_SIZE 24 -> 16"*. Its first
-parent `9ddbc9c61` is clean.
+The title is therefore half right: the compact layout is not corrupt, and the
+writers were not wrong. The reader was reading a header the monitor had
+rewritten. Regression test:
+`monitor::tests::a_thin_lock_round_trip_preserves_the_mark_word_quartet`; the
+witness this page shipped, `probes/CompactLayoutFileLockProbe.java`, goes
+`PROBE-FAILURES=1` -> `PROBE-OK`.
+
+### The leading hypothesis below was wrong — three measurements killed it
+
+This page proposed *"allocated legacy, written compact"*: an object that took
+the legacy fallback in `plan_object_alloc` and was then written by the several
+writers that decide compact-ness per CLASS from the global flag. Not so.
+
+| measurement | result |
+|---|---|
+| `CRATONVM_DBG=compact-legacy` | never names `FileChannelImpl` — it does not take the legacy fallback |
+| allocation-site probe | `id=413 num_fields=17 compact_body=Some(96)` — a compact layout IS registered and chosen |
+| birth-header probe | `gc_flags=0x4` when `ctx.new_object` returns, `0x0` at the failing read of the SAME object |
+
+The object is **born compact and loses the flag**. That reframes the search from
+"which writer used the wrong offset" to "what rewrote the header", and the
+window is one `synchronized` block. The per-CLASS writers the page pointed at
+(`interpreter.rs`, `jit_bridge.rs`, `jit/helpers.rs`) are JIT-codegen metadata
+and are not on this path at all — `--nojit` reproduces byte-identically, which
+the page itself records.
+
+`CRATONVM_COMPACT_REF_FIELDS=0` is a complete workaround for the honest reason
+that with the layout off nothing is born compact, so losing the flag is a no-op.
+
+### It does not close the whole cluster
+
+First 40 H2 suite classes, same host and cap:
+
+| build | PASS | FAIL | HANG |
+|---|---|---|---|
+| `1ec856c2c` (before the header landing) | 34 | 1 | 5 |
+| broken dev | **1** | 38 | 1 |
+| with this fix | **29** | 5 | 6 |
+
+So this was the large majority of it and every file-lock failure, but five
+classes short of the old baseline. The sibling defect on the same landing is
+GC-driven `Reference` enqueue: `probes/EnqProbe.java` shows a `WeakReference`
+whose referent is unreachable gets CLEARED but never ENQUEUED after
+`System.gc()`, byte-identically with and without this fix, where HotSpot
+enqueues it. `TestLob`, `TestMemoryUsage` and `TestLIRSMemoryConsumption` are
+the shape that would notice. That one still needs its own hunt.
+
+**Everything below is the original OPEN write-up, kept for its bisect and its
+ruled-out list, both of which stand.**
+
+---
+
+## Status (original)
+**OPEN, regression, deterministic (2026-08-07).** Bisected to
+`6ba350cdd` — *"Merge perf/header-16-and-field-packing-20260806: HEADER_SIZE 24
+-> 16"*. Its first parent `9ddbc9c61` is clean; `6ba350cdd` fails, and so does
+every dev tip since, up to and including `51d68e1b7`.
+
+**`CRATONVM_COMPACT_REF_FIELDS=0` is a complete workaround** — and the fact that
+it is complete is the finding: the defect is in the compact reference-field
+layout, not in the file-lock natives.
 
 **Not the same bug as `5853e9069`** (*"the inline allocator must write the mark
 word UNCONDITIONALLY"*), which landed for a Spring Boot `read_slot` corruption
-from the same header change. That one is in the JIT's inline allocator; this
-one reproduces with `--nojit`, byte-identically, and is still present on the
-tip that contains it.
-
-## Root cause: the final `monitorexit`, not the layout
-
-`try_thin_unlock` (`vm/src/threading/monitor.rs`) returned to NEUTRAL by
-storing the **literal** `MARK_NEUTRAL`, which is `0`. The same merge moved
-`kind` / `element_type` / `gc_age` / `gc_flags` into mark-word bits 48..63, so
-that store erased all four on **every final thin-lock release**. The object
-keeps its compact body and loses `GC_FLAG_COMPACT`, so from that instant
-`is_compact_object` says no and every reader — correctly honouring the
-per-object flag — uses the legacy 16-byte stride over an 8-byte-packed body.
-
-`try_thin_lock`, twenty lines above, had already been taught to mask the
-quartet out of its compare for exactly this reason. The release is the other
-half of that change and did not get it.
-
-`CRATONVM_DBG_OOBFIELD=sun/nio/ch/FileChannelImpl` against an instrumented
-build prints the transition directly — ten accesses compact, then every
-subsequent one legacy, with the switch landing between the `putfield` inside
-`synchronized (this)` and the `return fileLockTable` after it:
-
-```
-[CDIAG alloc] class=sun/nio/ch/FileChannelImpl id=411 num_fields=17 body=Some(96)
-[CDIAG get] index=16 num_slots=17 gc_flags=0x4 compact_obj=true  slot=Some((80, Reference))
-[CDIAG get] index=10 num_slots=17 gc_flags=0x4 compact_obj=true  slot=Some((56, Reference))
-[CDIAG get] index=16 num_slots=17 gc_flags=0x0 compact_obj=false slot=None      <-- after monitorexit
-```
-
-`body=Some(96)` is the first line that settles it: the object was allocated
-**compact**, not legacy. So the split is not "allocated legacy, written
-compact" (the hypothesis below) but "allocated compact, and stopped being
-compact halfway through its life".
-
-A second defect of the same family was found beside it and fixed in the same
-branch: `MARK_QUARTET_MASK` was `0x3FFF << 48`, two bits short of `gc_age`'s
-top, so an object that had survived four young collections failed
-`try_thin_lock`'s screen forever and **every `synchronized` on it inflated a
-`Monitor`** — and `quartet_of` truncated `gc_age` on every transition.
-
-`probes/CompactLayoutFileLockProbe.java` prints `PROBE-OK` on the fixed build,
-with and without `--nojit`, and is kept as the regression test. Unit-level
-guards were added at both sites (`thin_unlock_preserves_the_quartet`,
-`recursive_thin_unlock_preserves_the_quartet`,
-`quartet_mask_covers_every_quartet_subfield`,
-`quartet_survives_a_lock_transition_at_every_age`) — the reason neither defect
-was caught is that the one existing release test asserts
-`mark_state(mark) == MARK_NEUTRAL`, i.e. the low two bits, which a bare
-`MARK_NEUTRAL` store satisfies, and the one existing `gc_age` test used age 3,
-which fits in the two bits the mask did cover.
+from the same header change. That one is in the JIT's inline allocator; this one
+reproduces with **`--nojit`**, byte-identically, and is still present on the tip
+that contains it.
 
 ## Severity
 **HIGH.** `FileChannel.tryLock()` / `lock()` is how every file-backed database
@@ -129,23 +138,7 @@ The field is assigned and then read back through a cell the heap guard rejects.
 [CELLCORRUPT]   target-header: class_id=0 class=java/lang/Object num_slots=0 gc_flags=0x4
 ```
 
-## The original leading hypothesis — REFUTED, and worth keeping
-
-*Everything in this section was written before the flag transition was
-instrumented. It is wrong at its first step, and the way it is wrong is the
-lesson: `gc_flags=0x0` in a `CELLCORRUPT` dump was read as "this object was
-allocated legacy", when the allocator had in fact stamped it compact and
-something cleared the flag later. A header field is a **time series**, not a
-constant; one sample cannot tell "never set" from "set and then cleared", and
-the instrument that does is a per-access trace, not a single dump.*
-
-*The negative control in "Ruled out" below could not have reproduced it
-either: a user-class object with the same shape never gets a compact layout at
-all (`compact_obj=false` from its very first field access), so losing
-`GC_FLAG_COMPACT` costs it nothing. A negative control has to be shown to be
-capable of failing.*
-
-### (original) The leading hypothesis: allocated legacy, written compact
+## The leading hypothesis: allocated legacy, written compact
 
 Stated as a hypothesis because it has not been instrumented to proof — but it
 predicts every number above, and it names a concrete design seam rather than a
@@ -219,12 +212,10 @@ a separate question this bug did not need to answer, but it is adjacent.
 
 ## Next steps
 
-1. **Done, differently.** The per-class writer gating this section proposed to
-   change is not what broke `FileChannelImpl` — the readers and writers agreed
-   throughout; the object's flag moved under both of them. The question it
-   raises is still a real one (a per-allocation decision consumed per-class is
-   an uncomfortable seam) but it is **not** load-bearing for this bug and
-   should not be changed on its evidence.
+1. Decide the contract: either every writer consults `is_compact_object(header)`
+   like `compact_field_slot` does, or `plan_object_alloc` stops silently falling
+   back so a registered layout is binding for every instance. The current split
+   — per-allocation decision, per-class consumption — cannot be right either way.
 2. Whatever lands, `probes/CompactLayoutFileLockProbe.java` is the regression
    test; it is deterministic and needs no H2.
 3. Until then `CRATONVM_COMPACT_REF_FIELDS=0` restores correctness, at the cost

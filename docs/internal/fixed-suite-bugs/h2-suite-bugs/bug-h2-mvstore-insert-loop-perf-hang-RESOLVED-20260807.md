@@ -89,51 +89,50 @@ under 1%. Top entries are `AtomicReference.get` (544 288), `Enum.ordinal`
 
 Census artefacts: `/data/data/mvperf/natreg.json` (host-side, not committed).
 
-## Two real defects were found on the way, and both are fixed
+## Two real defects blocked the reproduction, and both are fixed — by someone else
 
-Neither was the throughput factor. Both were found because reproducing this
-page on `origin/dev` @ `6ba350cdd` was impossible: **every file-backed H2 test
-died at `getConnection`**.
+Neither was the throughput factor, and neither is this branch's to claim.
+Reproducing this page on `origin/dev` @ `6ba350cdd` was impossible because
+**every file-backed H2 test died at `getConnection`**:
 
     FileChannel ch = new RandomAccessFile(f, "rw").getChannel();
     ch.tryLock();
     // NPE: Cannot invoke "sun.nio.ch.FileLockTable.add(...)" because "flt" is null
 
-1. **`try_thin_unlock` erased the mark word's quartet** (`fix(vm)`, this
-   branch). The last thin-lock release stored the literal `MARK_NEUTRAL`, which
-   is `0`, and since `kind` / `element_type` / `gc_age` / `gc_flags` moved into
-   bits 48..63 that erased all four on every final `monitorexit`. Losing
-   `GC_FLAG_COMPACT` means the object keeps its compact body but stops
-   answering `is_compact_object`, so every later field access falls to the
-   legacy 16-byte-cell path over it. `FileChannelImpl.fileLockTable()` is
-   double-checked locking: the `putfield` inside `synchronized (this)` landed
-   correctly at compact offset 80, the `monitorexit` cleared the flag, and the
-   `return fileLockTable` one instruction later read offset 256 of a 96-byte
-   body and got `Int(0)`.
+Both defects are in the mark word, both arrived with the `HEADER_SIZE 24 -> 16`
+merge, and both were root-caused and fixed **concurrently and independently by
+another session**, landing on `dev` while this branch was measuring:
 
-2. **`MARK_QUARTET_MASK` covered 14 of the quartet's 16 bits** (`fix(types)`,
-   this branch). `gc_age` runs to bit 64; the mask stopped at 61. An object that
-   had survived four young collections therefore failed `try_thin_lock`'s
-   `cur & !MARK_QUARTET_MASK == MARK_NEUTRAL` screen forever and **every
+1. **`try_thin_unlock` erased the mark word's quartet.** The last thin-lock
+   release stored the literal `MARK_NEUTRAL`, which is `0`, and since `kind` /
+   `element_type` / `gc_age` / `gc_flags` moved into bits 48..63 that erased
+   all four on every final `monitorexit`. Losing `GC_FLAG_COMPACT` means the
+   object keeps its compact body but stops answering `is_compact_object`, so
+   every later field access falls to the legacy 16-byte-cell path over it.
+   `FileChannelImpl.fileLockTable()` is double-checked locking: the `putfield`
+   inside `synchronized (this)` landed correctly at compact offset 80, the
+   `monitorexit` cleared the flag, and the `return fileLockTable` one
+   instruction later read offset 256 of a 96-byte body.
+
+2. **`MARK_QUARTET_MASK` covered 14 of the quartet's 16 bits.** `gc_age` runs
+   to bit 64; the mask stopped at 61. An object that had survived four young
+   collections therefore failed `try_thin_lock`'s screen forever and **every
    `synchronized` on it inflated a `Monitor`** instead of doing one CAS — a
-   pure throughput loss falling exactly on the long-lived lock-heavy objects
-   H2 keeps (`MVStore`, `MVMap`, `SessionLocal`). The same mask feeds
-   `quartet_of`, so every lock/inflate/forward transition also truncated
-   `gc_age` to two bits.
+   throughput loss falling exactly on the long-lived lock-heavy objects H2
+   keeps (`MVStore`, `MVMap`, `SessionLocal`).
 
-Both were invisible to the suite because the one test of the release path
-asserts `mark_state(mark) == MARK_NEUTRAL` — the low two bits, which a bare
-`MARK_NEUTRAL` store satisfies — and the one test of `gc_age` used age 3, which
-fits in the two bits the mask did cover. Four tests were added that assert the
-other sixteen bits and sweep `0..=MAX_GC_AGE`.
+The full write-up, including the refutation of its own first hypothesis, is
+`docs/internal/fixed-suite-bugs/vm/compact-ref-field-layout-corrupts-filechannel-filelock-FIXED-20260807.md`.
 
-An A/B of the two fixes on the insert loop was run (ABBA, 8 runs, pre-fix vs
-post-fix, both with `CRATONVM_COMPACT_REF_FIELDS=0` so the pre-fix arm can run
-at all) and is **not reportable**: pre-fix 18.2 / 29.0 / 37.4 s against post-fix
-19.9 / 20.7 / 23.3 s, with host load moving 27 → 60 across the sequence. The
-post-fix band is tighter and its median lower, but the bands overlap and the
-quietest single run in the whole set is a pre-fix one. Correctness is the
-claim; throughput is not.
+This branch reached the identical two fixes and the same root cause from the
+opposite end (`CRATONVM_DBG_FIELD_WATCH` on `fileLockTable` and a per-access
+layout trace, rather than an allocation-site probe) and its versions were
+dropped at merge time in favour of theirs, whose tests are strictly broader.
+**What that cost, and what it bought:** three release builds, and the four
+`TestTempTables` / `TestIndex` A/B arms below, which are the evidence that a
+*third* defect from the same merge is still open. Recording it because the
+lesson is cheap and recurs: `git log --oneline origin/dev | grep -i <symbol>`
+before the first build, and again before each rebuild on a long task.
 
 ## The diagnostic residual is root-caused and fixed
 
@@ -166,7 +165,7 @@ only interpretable next to a HotSpot control on the same invocation**, and this
 page never had one. They are dropped from the table below.
 
 The ten that HotSpot does pass (`pre` = the merge's first parent `9ddbc9c61`;
-`jit` / `nojit` = dev tip plus this branch):
+`jit` / `nojit` = dev tip with the two mark-word quartet fixes applied):
 
 | class | HotSpot | pre (JIT) | dev tip (JIT) | dev tip `--nojit` |
 | --- | --- | --- | --- | --- |
@@ -198,13 +197,13 @@ progressing. That is the throughput factor and nothing else.
 | --- | --- | --- |
 | `9ddbc9c61` (the merge's first parent) | default | **PASS 174 s** |
 | `6ba350cdd` (the merge) | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 79 s** |
-| `6ba350cdd` + this branch | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 127 s** |
-| `6ba350cdd` + this branch | default | **OOM 110 s** |
+| `6ba350cdd` + the quartet fixes | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 127 s** |
+| `6ba350cdd` + the quartet fixes | default | **OOM 110 s** |
 
 The pre-merge binary completes the class; the post-merge one cannot — and
 `TestTempTables` OOMs at `--Xmx 4g` as well as at 1 g. That is a **new defect
 from the `HEADER_SIZE 24 -> 16` merge, not this page's throughput factor**, it
-predates and survives this branch's two fixes, and it has its own record:
+predates and survives the two quartet fixes, and it has its own record:
 `docs/known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md`.
 
 With it held off (`--nojit`), the classes behave exactly as this page described

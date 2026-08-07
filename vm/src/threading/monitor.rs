@@ -361,31 +361,27 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
         }
         let recursion = ObjectHeader::thin_lock_recursion(cur);
         let (new, ret) = if recursion == 0 {
-            // Last release → return to NEUTRAL, **keeping the quartet**.
+            // Last release → return to NEUTRAL, CARRYING THE QUARTET.
             //
-            // `MARK_NEUTRAL` is the literal `0`, and since `kind` /
-            // `element_type` / `gc_age` / `gc_flags` moved into bits 48..61
-            // storing it bare erases all four on every final monitorexit.
-            // `try_thin_lock` above already masks the quartet out of its
-            // compare for exactly this reason; the release is the other half
-            // of that change and did not get it.
+            // `MARK_NEUTRAL` is a bare state constant (`0b00`). Storing it raw
+            // erases bits 48..61 — the `kind` / `element_type` / `gc_age` /
+            // `gc_flags` quartet that moved into this word when the header
+            // shrank 24 -> 16 (2026-08-07). Every other transition on this word
+            // already rides the quartet across: `make_thin_locked`,
+            // `make_inflated` and `make_neutral_hashed` all derive from the
+            // previous value. This one did not, so the FIRST `synchronized`
+            // block on an object reset its GC flags on exit.
             //
-            // Losing `GC_FLAG_COMPACT` (0x4) is the sharpest edge: the object
-            // keeps its compact body but stops answering `is_compact_object`,
-            // so every later field access falls to the legacy 16-byte-cell
-            // path over it -- reads return neighbouring bytes and writes land
-            // outside the object. `sun.nio.ch.FileChannelImpl.fileLockTable`
-            // read back as `Int(0)` immediately after `synchronized (this)`
-            // released inside `fileLockTable()`, which NPE'd `tryLock` and
-            // with it every file-backed H2 test
-            // (`SingleFileStore.lockFileChannel`). Losing `kind` /
-            // `element_type` mis-sizes an array the same way, and losing
-            // `gc_age` / `GC_FLAG_OLD_GEN` mis-ages it for the collector.
-            //
-            // The pre-existing `thin_lock_uncontended_fast_path` test asserts
-            // `mark_state(mark) == MARK_NEUTRAL`, which the quartet does not
-            // affect -- which is why this was invisible. See
-            // `thin_unlock_preserves_the_quartet` below.
+            // `GC_FLAG_COMPACT` living in that quartet is what made it fatal: a
+            // compact object silently became "legacy" the moment it was
+            // unlocked, and every later field read then decoded a
+            // compact-packed body as 16-byte cells — reading past the end of
+            // the object. `FileChannelImpl.fileLockTable()` is
+            // double-checked locking over a volatile field, so the assignment
+            // landed inside the lock and the read after `monitorexit` came back
+            // null: `NullPointerException ... because "flt" is null`, and no
+            // file-backed database could open. See
+            // docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md.
             (ObjectHeader::quartet_of(cur) | types::MARK_NEUTRAL, None)
         } else {
             (
@@ -2362,6 +2358,69 @@ mod tests {
         heap.alloc_object(ClassId::new(0), 0)
     }
 
+    /// A thin lock/unlock round trip must leave the mark word's quartet
+    /// (`kind` / `element_type` / `gc_age` / `gc_flags`) exactly as it found
+    /// it.
+    ///
+    /// Those bits live in the mark word since the header shrank 24 -> 16, and
+    /// the last release used to store the bare `MARK_NEUTRAL` constant over
+    /// them. `GC_FLAG_COMPACT` is one of them, so the first `synchronized`
+    /// block on a compact object converted it to "legacy" and every later field
+    /// read decoded a compact-packed body with 16-byte cells.
+    #[test]
+    fn a_thin_lock_round_trip_preserves_the_mark_word_quartet() {
+        use cratonvm_types::{GC_FLAG_COMPACT, GC_FLAG_OLD_GEN};
+
+        let obj = test_object();
+        let header = header_of(obj);
+        header.set_gc_flags(GC_FLAG_COMPACT | GC_FLAG_OLD_GEN);
+        let before = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(
+            header.gc_flags(),
+            GC_FLAG_COMPACT | GC_FLAG_OLD_GEN,
+            "precondition: the flags are in the mark word"
+        );
+
+        try_thin_lock(header, 7).expect("an unlocked, unhashed object thin-locks");
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed)),
+            ObjectHeader::quartet_of(before),
+            "locking must carry the quartet"
+        );
+
+        // Recursive acquire/release must carry it too — that arm derives from
+        // `cur`, but pin it so a future rewrite cannot regress silently.
+        try_thin_recursive_lock(header, 7).expect("recursive acquire");
+        try_thin_unlock(header, 7).expect("recursive release");
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed)),
+            ObjectHeader::quartet_of(before),
+            "recursive release must carry the quartet"
+        );
+
+        assert_eq!(
+            try_thin_unlock(header, 7),
+            Ok(None),
+            "the last release returns the lock to NEUTRAL"
+        );
+        let after = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(
+            ObjectHeader::mark_state(after),
+            types::MARK_NEUTRAL,
+            "and the state really is NEUTRAL"
+        );
+        assert_eq!(
+            header.gc_flags(),
+            GC_FLAG_COMPACT | GC_FLAG_OLD_GEN,
+            "the LAST release is the one that used to erase the flags"
+        );
+        assert_eq!(
+            ObjectHeader::quartet_of(after),
+            ObjectHeader::quartet_of(before),
+            "kind / element_type / gc_age must survive the unlock too"
+        );
+    }
+
     #[test]
     fn monitor_enter_exit_basic() {
         let table = MonitorTable::new();
@@ -3238,82 +3297,6 @@ mod tests {
             "release must restore NEUTRAL state"
         );
         assert_eq!(monitor_registry_len(&table), 0);
-    }
-
-    /// The quartet — `kind`, `element_type`, `gc_age`, `gc_flags` — lives in
-    /// the mark word's bits 48..61, so a lock/unlock round trip must give it
-    /// back untouched.
-    ///
-    /// `thin_lock_uncontended` above only asserts `mark_state(mark) ==
-    /// MARK_NEUTRAL`, i.e. the low two bits, which is invariant under a bare
-    /// `MARK_NEUTRAL` store — so it passed while the final release erased all
-    /// four fields. `GC_FLAG_COMPACT` is the one with teeth: an object that
-    /// keeps its compact body but loses the flag is read afterwards through
-    /// the legacy 16-byte-cell path, which walks off the end of it.
-    #[test]
-    fn thin_unlock_preserves_the_quartet() {
-        let table = MonitorTable::new();
-        let obj = test_object();
-        let tid = ThreadId(9);
-        let header = header_of(obj);
-
-        header.set_shape_tags(cratonvm_types::ObjectKind::Array, cratonvm_types::ArrayElementType::Int);
-        header.set_gc_age(5);
-        header.set_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
-        let before = header.mark_word.load(Ordering::Acquire) & types::MARK_QUARTET_MASK;
-        assert_ne!(before, 0, "the fixture must actually set quartet bits");
-
-        table.enter(obj, tid);
-        assert!(is_thin_locked(obj), "fixture must take the thin-lock path");
-        assert_eq!(
-            header.mark_word.load(Ordering::Acquire) & types::MARK_QUARTET_MASK,
-            before,
-            "acquire must not disturb the quartet",
-        );
-
-        table.exit(obj, tid).unwrap();
-        let after = header.mark_word.load(Ordering::Acquire);
-        assert_eq!(
-            ObjectHeader::mark_state(after),
-            types::MARK_NEUTRAL,
-            "release must restore NEUTRAL state",
-        );
-        assert_eq!(
-            after & types::MARK_QUARTET_MASK,
-            before,
-            "release must restore NEUTRAL *without* erasing the quartet",
-        );
-        assert_eq!(header.kind(), cratonvm_types::ObjectKind::Array);
-        assert_eq!(header.element_type(), cratonvm_types::ArrayElementType::Int);
-        assert_eq!(header.gc_age(), 5);
-        assert_eq!(header.gc_flags(), cratonvm_types::GC_FLAG_COMPACT);
-    }
-
-    /// Same guard for the recursive arm: only the outermost release rewrites
-    /// the state, but every intermediate one rebuilds the word too.
-    #[test]
-    fn recursive_thin_unlock_preserves_the_quartet() {
-        let table = MonitorTable::new();
-        let obj = test_object();
-        let tid = ThreadId(11);
-        let header = header_of(obj);
-
-        header.set_shape_tags(cratonvm_types::ObjectKind::Object, cratonvm_types::ArrayElementType::Reference);
-        header.set_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
-        let before = header.mark_word.load(Ordering::Acquire) & types::MARK_QUARTET_MASK;
-
-        for _ in 0..4 {
-            table.enter(obj, tid);
-        }
-        for _ in 0..4 {
-            table.exit(obj, tid).unwrap();
-            assert_eq!(
-                header.mark_word.load(Ordering::Acquire) & types::MARK_QUARTET_MASK,
-                before,
-                "every release level must keep the quartet",
-            );
-        }
-        assert_eq!(header.gc_flags(), cratonvm_types::GC_FLAG_COMPACT);
     }
 
     #[test]

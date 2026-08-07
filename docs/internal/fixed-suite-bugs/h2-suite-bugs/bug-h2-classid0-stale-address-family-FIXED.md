@@ -42,6 +42,32 @@ whose top frame holds the address, with `ROOT_IN_DEAD_SPANS=0` and
 `TestMultiThread`, reopen this page rather than starting a new one, and check
 `object_degradation_count()` first.
 
+**A 2026-08-07 suspected recurrence that was NOT this page — and how it was
+told apart.** `org.h2.test.db.TestTempTables` produced a receiver reading back
+as an unrelated live object (this page's RE-SERVED face) on a binary containing
+the fix above, i.e. exactly the condition the instruction just above describes.
+It was investigated here first and the answer came out elsewhere, so this page
+stays FIXED. Three readings settled it, and they are the ones to take next
+time:
+
+* `object_degradation_count()` was **0** on the failing run — not the
+  `CompactValue` mechanism recurring. That counter had no consumer anywhere in
+  the VM; `memory::reclaim_guard`'s dispatch terminal now prints it;
+* a frame **still held the correct, live object** at the moment of failure
+  (`holder=frame#14 …BitSetHelper.flip pc=38 local[0] live=true`). Nothing had
+  been reclaimed, nothing had been lost. When that is true the heap is fine and
+  something in the VM substituted the value;
+* the substituter was `execute_invoke_kind`'s stale-`java.lang.Thread`-mirror
+  recovery, gated on `class_id_of(recv) == ClassId(0)` — which **every
+  primitive array** satisfies, `long[]` having no component class id to store.
+  A live `long[]` on a recycled address matched the former-mirror table and was
+  replaced by a thread mirror.
+
+Fixed in
+[`bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`](bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md).
+The face is genuinely indistinguishable at the reader, so a `ClassId(0)`-shaped
+report is not by itself evidence for this page.
+
 **Earlier fixes that landed under this page and remain valid.** An old-gen mark
 gap (`old_gen_gc`'s root seed had no resolution for an INTERIOR conservative
 root), and separately a JIT miscompile that bound an `invokevirtual` to the

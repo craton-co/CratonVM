@@ -19,7 +19,7 @@ CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 |---|---|---|---|
 | **Generational** (default) | [`gc/src/gen_heap.rs`](../gc/src/gen_heap.rs) | Production | Latency-sensitive workloads. Young copying + old free-list + write barriers + card table. STW pauses bounded by live young-set size. |
 | **G1** (Garbage-First) | [`gc/src/g1.rs`](../gc/src/g1.rs) | Production | Throughput-oriented workloads on larger heaps. Region-based, mixed young/old collections, optional concurrent marking. STW today; parallel evacuator deferred. |
-| **ZGC** | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Experimental, gated behind `--features zgc` | Not yet wired into `VmConfig::GcAlgorithm`; treat as a research vehicle. |
+| **ZGC** | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Experimental, gated behind `--features zgc` (default **off**) | Wired and selectable, but **not a real ZGC**: a stop-the-world, non-moving, whole-heap mark-sweep. Treat as a research vehicle. |
 
 Trade-offs at a glance:
 
@@ -31,7 +31,22 @@ Trade-offs at a glance:
   per pause target. It pays a per-store remembered-set cost (~10 ns) but
   amortises full-heap compaction. Use it when the old generation is large
   and reclamation latency matters more than minor-GC throughput.
-- **ZGC** is stub-only today. Do not depend on it in production.
+- **ZGC** is **not** stub-only (that claim was true when written and is
+  superseded 2026-08-07). `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real
+  memory-backed collector — `Arena` storage, real `ObjectHeader`s, real
+  reference processing — and `-XX:+UseZGC` really selects it
+  (`GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`). What it is *not* is
+  ZGC: it is stop-the-world, non-moving, whole-heap, non-generational, and has
+  no TLABs (every allocation takes the arena lock). The colored-pointer /
+  `ZPage` code above it in the same file is a metadata-only simulation with no
+  production consumer. Measured 2026-08-07 on the 1975-class Spring Boot suite:
+  1860 PASS vs. Generational's 1902, with 49 HANG vs. 18 — see
+  [`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`](known-issues/springboot/zgc-real-fullsuite-regression-20260807.md).
+  **Do not depend on it in production.** The path to a real one is
+  [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
+- Because the `zgc` feature is default-off, a stock build has only two backends
+  compiled in; `-XX:+UseZGC` there warns and falls back to Generational. A
+  ZGC-capable launcher is `cargo build -p cratonvm-cli --features zgc`.
 
 ## Sizing knobs
 

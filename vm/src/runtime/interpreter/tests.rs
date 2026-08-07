@@ -13,6 +13,78 @@ fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
     ) -> bool = jit_method_calls_forced_class_generic_metadata;
 }
 
+/// The `java.lang.Thread`-mirror recovery in `execute_invoke_kind` replaces the
+/// receiver with a live thread mirror when the receiver's address is in
+/// `former_mirror_addrs`. Its gate used to be `class_id_of(recv) == ClassId(0)`,
+/// justified in-comment as "the receiver header is genuinely all-zero".
+///
+/// It is not the same test. **Every primitive array reads `ClassId(0)`** —
+/// `Instruction::Newarray` allocates with `ClassId::new(0)` because an array
+/// header carries its COMPONENT class id (JVMS §4.4.1) and `long[]` has none —
+/// so a perfectly live `long[]` that landed on a recycled young address matched
+/// and was replaced by a `java.lang.Thread`. Measured on
+/// `org.h2.test.db.TestTempTables`: `Arrays.copyOf(long[], int)`'s
+/// `original.clone()` dispatching into the mirror's inherited `Thread.clone`,
+/// i.e. `CloneNotSupportedException`. See
+/// `fixed-suite-bugs/h2-suite-bugs/bug-h2-testtemptables-clonenotsupportedexception-thread-clone-frame-FIXED.md`.
+///
+/// Restoring the old gate (dropping the header term from
+/// `stale_mirror_recovery_applies`) fails the first assertion below.
+#[test]
+fn stale_mirror_recovery_skips_a_live_primitive_array() {
+    use super::invoke::stale_mirror_recovery_applies;
+    use cratonvm_gc::heap::ObjectHeader;
+    use cratonvm_types::{ArrayElementType, ObjectKind, HEADER_SIZE};
+
+    let header_bytes = |h: &ObjectHeader| -> [u8; HEADER_SIZE] {
+        // SAFETY: `ObjectHeader` is `#[repr(C)]` and exactly `HEADER_SIZE`
+        // bytes; this reads it exactly as the interpreter reads a header off a
+        // heap address.
+        unsafe { std::ptr::read(h as *const ObjectHeader as *const [u8; HEADER_SIZE]) }
+    };
+
+    // A live `long[1]` — `bits` in H2's `VersionedBitSet`, the witness shape.
+    let live_long_array = ObjectHeader::new(
+        ClassId::new(0),
+        ObjectKind::Array,
+        ArrayElementType::Long,
+        1,
+        1,
+    );
+    assert_eq!(
+        live_long_array.class_id,
+        ClassId::new(0),
+        "the trap itself: a primitive array's header carries no component class id"
+    );
+    assert!(
+        !stale_mirror_recovery_applies(live_long_array.class_id, &header_bytes(&live_long_array)),
+        "a live long[] must never be mistaken for a reclaimed span and replaced \
+         by a java.lang.Thread mirror"
+    );
+
+    // A live `Object[3]`. Its component class id is `java/lang/Object` =
+    // ClassId(0) too, and `ArrayElementType::Reference` is discriminant 0, so
+    // this one is separated from the wipe by `kind` and `shape` alone.
+    let live_ref_array = ObjectHeader::new(
+        ClassId::new(0),
+        ObjectKind::Array,
+        ArrayElementType::Reference,
+        3,
+        3,
+    );
+    assert!(
+        !stale_mirror_recovery_applies(live_ref_array.class_id, &header_bytes(&live_ref_array)),
+        "a live Object[] must not be mistaken for a reclaimed span either"
+    );
+
+    // What the recovery is actually for: the all-zero header a collector
+    // leaves over a span it reclaimed.
+    assert!(
+        stale_mirror_recovery_applies(ClassId::new(0), &[0u8; HEADER_SIZE]),
+        "the collector's own wipe must still reach the former-mirror lookup"
+    );
+}
+
 #[test]
 fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
     // The guard never dereferences these values; aligned sentinel addresses

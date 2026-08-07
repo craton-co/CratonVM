@@ -319,6 +319,17 @@ processor uses.
 * `zgc.rs` / `zgc_concurrent.rs` — ZGC is opt-in and experimental; its
   address-keyed state (colour pointers, forwarding tables) is a distinct model
   that deserves its own pass rather than a paragraph here.
+  **Scope note added 2026-08-07:** "opt-in" means the default-off `zgc` Cargo
+  feature, *not* unreachable — `ZgcRealHeap` (`zgc.rs:1396`) is fully wired
+  (`GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`) and selectable with
+  `-XX:+UseZGC`. The colour-pointer / forwarding-table state named above belongs
+  to the *simulation* half of the file (lines 1–1395), which has no production
+  consumer; the selectable half is a non-moving STW mark-sweep whose pointer map
+  is always empty (`zgc.rs:2464`). Both halves remain un-audited, and the pass
+  owed here gets larger under
+  [`docs/feature-designs/zgc-production-implementation-plan.md`](../feature-designs/zgc-production-implementation-plan.md),
+  which adds real colour pointers, a real forwarding table, and — in its Phase
+  3b — the tree's first object motion outside a stop-the-world.
 * `metaspace.rs`, `class_unloading.rs` — class-space liveness has its own
   `update_after_gc` pair with collision and self-reference rejection already
   under test (`class_unloading.rs:1261`, `:1282`); not re-derived.

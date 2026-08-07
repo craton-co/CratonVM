@@ -21,7 +21,7 @@ inside ten minutes.
 | --- | --- | --- |
 | `9ddbc9c61` — the merge's **first parent** | default | **PASS 174 s** |
 | `6ba350cdd` — the merge | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 79 s** |
-| `6ba350cdd` + the two mark-word fixes on this branch | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 127 s** |
+| `6ba350cdd` + the two mark-word quartet fixes | `CRATONVM_COMPACT_REF_FIELDS=0` | **OOM 127 s** |
 | ... the same binary | default | **OOM 110 s** |
 | dev tip `70bf05ed3` + this branch | default | **OOM 63 s** |
 | dev tip `70bf05ed3` + this branch | `--nojit` | **PASS 190 s** |
@@ -163,7 +163,9 @@ cargo build --release -p cratonvm-cli --bin cratonvm
   `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`.
   This regression sits on top of it and currently masks it: with `--nojit` the
   same classes go back to being merely too slow.
-* **Not the two mark-word quartet defects** fixed on the same branch
+* **Not the two mark-word quartet defects** from the same merge
   (`try_thin_unlock` storing a bare `MARK_NEUTRAL`; `MARK_QUARTET_MASK` two
-  bits short of `gc_age`). Those are fixed, and the OOM both predates them and
-  survives them — which is how this third defect became visible at all.
+  bits short of `gc_age`), written up in
+  `docs/internal/fixed-suite-bugs/vm/compact-ref-field-layout-corrupts-filechannel-filelock-FIXED-20260807.md`.
+  Those are fixed on `dev`, and this OOM both predates them and survives them —
+  which is how the third defect became visible at all.
