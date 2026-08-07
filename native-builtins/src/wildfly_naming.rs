@@ -1237,7 +1237,7 @@ fn native_context_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
     let result = if let Err(msg) = bind_value(&name, &class_name, value) {
-        Err(flat_store_error(ctx, &msg))
+        Err(flat_store_error(ctx, &msg)?)
     } else {
         Ok(None)
     };
@@ -1312,7 +1312,7 @@ fn native_context_rebind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .class_name_of_id(ctx.class_id_of_object(value))
         .unwrap_or_else(|| "java/lang/Object".to_string());
     let result = if let Err(msg) = rebind_value(&name, &class_name, value) {
-        Err(flat_store_error(ctx, &msg))
+        Err(flat_store_error(ctx, &msg)?)
     } else {
         Ok(None)
     };

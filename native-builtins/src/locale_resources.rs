@@ -794,7 +794,10 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
 /// it), the innermost captured Java frame is the caller.
 fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let frames = ctx.capture_stack_trace(0);
-    let Some(cid) = frames.last()?.class_id else {
+    let Some(frame) = frames.last() else {
+        return Ok(None);
+    };
+    let Some(cid) = frame.class_id else {
         return Ok(None);
     };
     let mirror = ctx.get_class_mirror(cid);
@@ -1047,7 +1050,10 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
     // An explicit `ClassLoader` argument wins; otherwise honour the JDK's
     // caller-sensitive resolution -- see `caller_bundle_class_loader`.
-    let loader = bundle_class_loader(ctx, args).or_else(|| caller_bundle_class_loader(ctx)?);
+    let loader = match bundle_class_loader(ctx, args) {
+        Some(loader) => Some(loader),
+        None => caller_bundle_class_loader(ctx)?,
+    };
 
     // cceres5 (WildFly metrics stale-ResourceBundle, live-captured via
     // CRATONVM_DBG_STALE_RECV): `obj`/`map`/`loader` were carried raw across

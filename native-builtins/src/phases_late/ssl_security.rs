@@ -989,9 +989,7 @@ pub(crate) fn p68_create_socket_inet_address(
     }
     let extra_roots = p68_factory_trust_roots(ctx, args)?;
     let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
-    let Some(max_protocol) = p68_factory_max_protocol(ctx, args) else {
-        return Ok(None);
-    };
+    let max_protocol = p68_factory_max_protocol(ctx, args);
     new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, max_protocol)
 }
 

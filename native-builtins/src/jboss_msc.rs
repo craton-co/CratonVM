@@ -1187,7 +1187,10 @@ pub(crate) fn alloc_java_service_name(
         .unwrap_or(canonical_text);
     let leaf_str = ctx.create_string(leaf);
     ctx.set_field_by_name(obj, "name", Value::Object(Some(leaf_str)));
-    let parent = name.parent().map(|p| alloc_java_service_name(ctx, &p))?;
+    let parent = name
+        .parent()
+        .map(|p| alloc_java_service_name(ctx, &p))
+        .transpose()?;
     ctx.set_field_by_name(obj, "parent", Value::Object(parent));
     ctx.set_field_by_name(obj, "hashCode", Value::Int(service_name_hash(name)));
     Ok(obj)

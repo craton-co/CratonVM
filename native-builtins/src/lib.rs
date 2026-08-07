@@ -35562,7 +35562,7 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodC
     // `algorithm_supported` / `digest_length_bytes`.
     let upper = algo.to_uppercase().replace(['-', '/'], "");
     match upper.as_str() {
-        "MD5" => real_md5(data),
+        "MD5" => Ok(real_md5(data)),
         "SHA1" | "SHA" => Ok(real_sha1(data)),
         "SHA224" => {
             // SHA-224: the hand-rolled `crypto_impl` SHA-256 code does not
@@ -35637,7 +35637,7 @@ const MD5_K: [u32; 64] = [
     0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
 ];
 
-pub(crate) fn real_md5(data: &[u8]) -> Result<Vec<u8>, MethodCallFailed> {
+pub(crate) fn real_md5(data: &[u8]) -> Vec<u8> {
     let mut h0: u32 = 0x67452301;
     let mut h1: u32 = 0xefcdab89;
     let mut h2: u32 = 0x98badcfe;
@@ -35696,7 +35696,7 @@ pub(crate) fn real_md5(data: &[u8]) -> Result<Vec<u8>, MethodCallFailed> {
     result.extend_from_slice(&h1.to_le_bytes());
     result.extend_from_slice(&h2.to_le_bytes());
     result.extend_from_slice(&h3.to_le_bytes());
-    Ok(result)
+    result
 }
 
 // ===========================================================================
@@ -36269,7 +36269,7 @@ fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             data.push(b as u8);
         }
     }
-    let digest = compute_digest(&algo, &data);
+    let digest = compute_digest(&algo, &data)?;
     // GC-safety: `this` is a bare Rust local (from `args.first()`) held
     // across two further allocating calls below (`new_array` x2). Either
     // can trigger a moving GC that relocates `this`; the final "reset"
@@ -36278,7 +36278,7 @@ fn native_md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // un-reset -- same unread-pin anti-pattern fixed in
     // `populate_real_thread_holder` (GCBARRIER-CDLWAIT-FIX, 2026-07-17).
     let this_handle = ctx.pin_native_root(this);
-    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest?.len());
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Byte, digest.len());
     let result_handle = ctx.pin_native_root(result);
     for (i, &b) in digest.iter().enumerate() {
         ctx.set_array_element(result, i, Value::Int(b as i8 as i32));
@@ -36351,18 +36351,18 @@ fn native_md_digest_buf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
         _ => Vec::new(),
     };
-    let digest = compute_digest(&algo, &data);
+    let digest = compute_digest(&algo, &data)?;
     // JDK writes the full digest (callers size `len` to the digest length); we
     // additionally clamp to both `len` and the array bounds to fail safe.
     let cap = ctx.array_length(buf);
-    let n = digest?.len().min(len).min(cap.saturating_sub(offset));
+    let n = digest.len().min(len).min(cap.saturating_sub(offset));
     for i in 0..n {
         ctx.set_array_element(buf, offset + i, Value::Int(digest[i] as i8 as i32));
     }
     // Reset the running state, matching `digest()`'s post-finalization reset.
     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field(this, MD_FIELD_DATA, Value::Object(Some(empty)));
-    Ok(Some(Value::Int(digest?.len() as i32)))
+    Ok(Some(Value::Int(digest.len() as i32)))
 }
 
 fn native_md_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

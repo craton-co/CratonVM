@@ -2203,13 +2203,13 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     let reified = jdk_tree_to_typesig(ctx, node)
                         .map(|ts| crate::generics::typesig_to_real_type(ctx, &ts))
                         .filter(|v| !matches!(v, Ok(Value::Object(None))))
-                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls))
+                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls).map(Ok))
                         .or_else(|| {
                             // Unresolvable exotic bound: degrade to Object
                             // (the JDK's implicit upper bound) rather than
                             // leaking a non-Type.
                             ctx.class_id_by_name("java/lang/Object")
-                                .map(|c| Value::Object(Some(ctx.get_class_mirror(c))))
+                                .map(|c| Ok(Value::Object(Some(ctx.get_class_mirror(c)))))
                         })
                         .unwrap_or(Ok(Value::Object(None)));
                     out.push(reified?);
