@@ -61,10 +61,13 @@ timing issue. `MemoryUnmapper` wraps `sun.misc.Unsafe::invokeCleaner` to
 force-unmap a `MappedByteBuffer`; "expected 2, actual 1" suggests the test
 unmaps in two different ways (or checks two distinct buffers/paths) and
 one of them isn't registering as unmapped. Thematically adjacent to
-[`bug-h2-niomapped-unmap-gc-timeout.md`](bug-h2-niomapped-unmap-gc-timeout.md)
-(a *different* class, `TestFileSystem`'s `nioMapped:` unmap timeout) but not
-confirmed to share a cause — that one is a GC-timing/weak-reference-clearing
-issue, this one is an immediate count check with no timeout involved at all.
+the retired `bug-h2-niomapped-unmap-gc-timeout` write-up (a *different* class,
+`TestFileSystem`'s `nioMapped:` unmap timeout) but not confirmed to share a
+cause — and that one is now FIXED, and was not what it looked like: not
+GC-timing or weak-reference clearing, but the conservative JIT root scan marking
+the whole native stack on the leftovers of a compiled frame that had already
+returned. This one is an immediate count check with no timeout involved at all,
+so the fix there is not expected to touch it.
 
 ## 4. `TestFileLock.testSimple` (inside `assertThrows`)
 
