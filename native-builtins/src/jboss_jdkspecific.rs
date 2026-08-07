@@ -566,19 +566,56 @@ pub(crate) fn native_module_layer_find_module(
 /// `vm/src/runtime/interpreter/native_override.rs::force_native_over_real_jdk_bytecode`
 /// or the real bytecode shadows this in real-JDK mode.
 ///
-/// Encapsulation, per the `java.lang.Module#getResourceAsStream` javadoc:
+/// Encapsulation. Transcribed from the JDK 25 source
+/// (`lib/src.zip!java.base/java/lang/Module.java`, method body reproduced here
+/// because it is the whole specification of this native):
 ///
-///   * a resource whose name ends in `.class` is NEVER encapsulated;
-///   * a resource in a package of a NAMED module is readable from outside the
-///     module only if that package is `open`;
-///   * a name that is not in one of the module's packages (`META-INF/...`, a
-///     top-level name) is not encapsulated;
-///   * a resource that does not exist is `null`, not an empty stream.
+/// ```text
+/// if (name.startsWith("/")) name = name.substring(1);
+/// if (isNamed() && Resources.canEncapsulate(name)) {
+///     Module caller = getCallerModule(Reflection.getCallerClass());
+///     if (caller != this && caller != Object.class.getModule()) {
+///         String pn = Resources.toPackageName(name);
+///         if (getPackages().contains(pn)) {
+///             if (caller == null) { if (!isOpen(pn)) return null; }
+///             else if (!isOpen(pn, caller)) return null;
+///         }
+///     }
+/// }
+/// ```
 ///
-/// Known narrowing: the openness test is the UNQUALIFIED one, so
-/// `opens p to some.other.module` reads as closed here rather than as open to
-/// that one module. Widening it needs the caller's module, which this native
-/// has no `@CallerSensitive` plumbing for.
+/// The load-bearing point, and the reason this is NOT the rule the constructor
+/// gate uses: the test is `isOpen`, never `isExported`. `exports` grants
+/// compile/link access to the package's public API; it grants NOTHING for
+/// resources. `java.base` exports `java.util` without opening it, so a public
+/// `new ArrayList()` must be allowed while `java.base
+/// .getResourceAsStream("java/util/x.properties")` must not — the two gates
+/// answer opposite questions and must stay separate. `jdk.internal.module
+/// .Resources.canEncapsulate` supplies the `.class` carve-out
+/// (`len > 6 && endsWith(".class")` ⇒ never encapsulated) and
+/// `Resources.toPackageName` the package derivation (text before the LAST
+/// `'/'`; `""` when there is no `'/'` or the name ends in one — which is why
+/// `META-INF/MANIFEST.MF` and top-level names are never encapsulated).
+///
+/// Deviations from that source, both deliberate:
+///
+///   * `Checks.isPackageName(pn)` is not re-implemented. The membership test
+///     against the module's own package set is strictly stronger: a string
+///     that is not a legal package name cannot be a registered package.
+///   * `Reflection.getCallerClass()` has no equivalent here, so the caller
+///     module is recovered from the interpreter frame stack
+///     (`resource_caller_module`). When the stack names no caller at all the
+///     UNQUALIFIED `isOpen(pn)` is used as the fallback, matching the JDK's
+///     own `caller == null` arm.
+///
+/// Resolution of a non-encapsulated name is delegated to
+/// `classloader::module_get_resource_as_stream` rather than re-done here: that
+/// is the callback this triple actually dispatched to before this fix (see the
+/// registration note below), and it carries the T19.H10 name validation, the
+/// leading-`/` strip, the dynamically-DEFINED-class `.class` fallback and the
+/// SB-15 kotlin-reflect classpath behaviour. Re-implementing the byte fetch
+/// here would have been a second copy of a rule that already exists — the same
+/// mistake that let the `reads` bug survive three waves.
 pub(crate) fn native_module_get_resource_as_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -602,29 +639,85 @@ pub(crate) fn native_module_get_resource_as_stream(
         }
     };
 
+    // `name.startsWith("/") -> substring(1)` happens BEFORE the package is
+    // derived, so a caller spelling the resource `"/com/x/secret.txt"` is
+    // encapsulated exactly like `"com/x/secret.txt"`.
+    let res_name: &str = name.strip_prefix('/').unwrap_or(name.as_str());
+
+    // `isNamed()` — the registry's unnamed-module sentinel is the empty name.
     let module_name = module_registry_name(ctx, this);
-    if !module_name.is_empty() && !name.ends_with(".class") {
-        if let Some(pos) = name.rfind('/') {
-            let pkg = &name[..pos];
-            let in_module = ctx.module_packages(&module_name).iter().any(|p| p == pkg);
-            if in_module && !ctx.is_package_open_unqualified(&module_name, pkg) {
+    if !module_name.is_empty() && resource_can_encapsulate(res_name) {
+        let pkg = resource_package_name(res_name);
+        // `getPackages().contains(pn)`: a name outside the module's own
+        // packages is not encapsulated. `ModuleRegistry` keys packages in
+        // internal (slash) form and so does `pkg`, so this compares like with
+        // like — `module_package_names` is the one that dots them, for Java.
+        if !pkg.is_empty() && ctx.module_packages(&module_name).iter().any(|p| p == pkg) {
+            // Bound to a local first: a `&mut ctx` reborrow inside a match
+            // scrutinee is live for the whole match, and the arms below need
+            // `ctx` again.
+            let caller_module = resource_caller_module(ctx);
+            let encapsulated = match caller_module {
+                // `caller != Object.class.getModule()`: java.base reads
+                // everything, and CratonVM's own JDK-internal resource
+                // plumbing runs there.
+                Some(caller) if caller == "java.base" => false,
+                // `isOpen(pn, caller)`. This also supplies the JDK's
+                // `caller != this` exemption: `is_package_open_to` answers
+                // true whenever the two module names are equal.
+                Some(caller) => !ctx.is_package_open_to(&module_name, pkg, &caller),
+                // The JDK's `caller == null` arm: unqualified `isOpen(pn)`.
+                None => !ctx.is_package_open_unqualified(&module_name, pkg),
+            };
+            if encapsulated {
                 return Ok(Some(Value::Object(None)));
             }
         }
     }
 
-    let Some(bytes) = ctx.find_resource(&name) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
-    for (i, b) in bytes.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    crate::classloader::module_get_resource_as_stream(ctx, args)
+}
+
+/// `jdk.internal.module.Resources.canEncapsulate` — a name ending in `.class`
+/// (and longer than `".class"` itself) is never encapsulated.
+fn resource_can_encapsulate(name: &str) -> bool {
+    !(name.len() > 6 && name.ends_with(".class"))
+}
+
+/// `jdk.internal.module.Resources.toPackageName`, kept in slash form because
+/// that is how `ModuleRegistry` keys packages. Empty when the name has no
+/// `'/'` or ends with one (a directory), which is the JDK's "not in a package,
+/// therefore not encapsulated" answer.
+fn resource_package_name(name: &str) -> &str {
+    match name.rfind('/') {
+        Some(pos) if pos + 1 < name.len() => &name[..pos],
+        _ => "",
     }
-    ctx.new_object_initialized(
-        "java/io/ByteArrayInputStream",
-        "([B)V",
-        &[Value::Object(Some(arr))],
-    )
+}
+
+/// The calling module's registry name, i.e. what the JDK gets from
+/// `getCallerModule(Reflection.getCallerClass())`.
+///
+/// Frame walk copied from `lang_class::class_for_name_one_arg_caller_loader`:
+/// `frame_class_ids` is innermost-first, and the innermost frames can be
+/// `java/lang/Module` itself (this native is force-dispatched from there), which
+/// is not the caller the JDK means.
+///
+/// `None` and `Some(String::new())` are DIFFERENT answers and the caller relies
+/// on it: `None` is "the stack named nobody" (fall back to the unqualified
+/// open test), while an empty string is the unnamed module — a real, ordinary
+/// classpath caller, which is what this vector's `RJdkModule` is.
+fn resource_caller_module(ctx: &mut dyn NativeContext) -> Option<String> {
+    for cid in ctx.frame_class_ids() {
+        if matches!(
+            ctx.class_name_of_id(cid).as_deref(),
+            Some("java/lang/Module")
+        ) {
+            continue;
+        }
+        return Some(ctx.module_name_of_class(cid).unwrap_or_default());
+    }
+    None
 }
 
 /// `Module.getName()` — return the real `name` field (resolved by field
@@ -1532,6 +1625,19 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // `BuiltinClassLoader`/`ModuleReader` machinery CratonVM does not model, and
     // in synthetic mode there was nothing to call. Needs the companion entry in
     // `force_native_over_real_jdk_bytecode` to win over the real bytecode.
+    //
+    // THIS REGISTRATION LOSES, and must stay anyway. `register()` is
+    // last-registration-wins, and `native-builtins/src/lib.rs` re-registers the
+    // very same triple later in the SAME function
+    // (`register_essential_natives_with_shims` calls
+    // `register_jboss_jdkspecific` at ~:9578 and registers
+    // `java/lang/Module.getResourceAsStream` again at ~:18208). Until that site
+    // was pointed at this callback, the encapsulation check above was DEAD CODE
+    // and every module resource was served unconditionally — `RJdkModule.java:198`
+    // ("a resource in a non-open package must NOT be readable from another
+    // module") failed in both jdk modes while the three permissive checks around
+    // it passed. Keeping this row means the gate is installed even if the lib.rs
+    // registrar is ever reordered or dropped.
     registry.register(
         m,
         "getResourceAsStream",

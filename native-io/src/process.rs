@@ -2186,8 +2186,173 @@ fn os_process_start_time(pid: i64) -> Option<i64> {
     Some(boot_time_millis()? + ticks.checked_mul(1000)? / hz)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// `GetProcessTimes` — `(creation time in epoch millis, kernel+user CPU in
+/// nanoseconds)` for `pid`, or `None` when the process cannot be opened.
+///
+/// The Win32 counterpart of `/proc/<pid>/stat` fields 14/15/22, and the same
+/// call HotSpot's `ProcessHandleImpl_md.c` makes on this platform. One
+/// `OpenProcess` answers both quantities, so they can never disagree about
+/// which process they describe.
+///
+/// A `FILETIME` counts 100-nanosecond intervals since 1601-01-01 UTC;
+/// `FILETIME_UNIX_EPOCH` is that origin expressed against 1970-01-01 (134774
+/// days x 86400 s x 10^7). `dwSize`-style layout traps do not apply here — the
+/// struct is two `DWORD`s — but the two halves must be recombined explicitly
+/// rather than aliased as a `u64`, because `FILETIME` is only 4-byte aligned.
+#[cfg(windows)]
+fn win_process_times(pid: i64) -> Option<(i64, i64)> {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    type Bool = i32;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    impl FileTime {
+        fn as_u64(self) -> u64 {
+            (u64::from(self.high) << 32) | u64::from(self.low)
+        }
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: Bool, process_id: u32) -> Handle;
+        fn GetProcessTimes(
+            h_process: Handle,
+            lp_creation_time: *mut FileTime,
+            lp_exit_time: *mut FileTime,
+            lp_kernel_time: *mut FileTime,
+            lp_user_time: *mut FileTime,
+        ) -> Bool;
+        fn CloseHandle(h_object: Handle) -> Bool;
+    }
+
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return None;
+    }
+    // SAFETY: the four out-parameters are live, fully-initialised locals of
+    // exactly the documented layout; the handle is closed on every path out and
+    // the null failure return is refused before use.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h.is_null() {
+            return None;
+        }
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        CloseHandle(h);
+        if !ok {
+            return None;
+        }
+        let created = creation.as_u64().checked_sub(FILETIME_UNIX_EPOCH)?;
+        let start_ms = i64::try_from(created / 10_000).ok()?;
+        let cpu_100ns = kernel.as_u64().saturating_add(user.as_u64());
+        let cpu_nanos = i64::try_from(cpu_100ns.saturating_mul(100)).unwrap_or(i64::MAX);
+        Some((start_ms, cpu_nanos))
+    }
+}
+
+#[cfg(windows)]
+fn os_process_start_time(pid: i64) -> Option<i64> {
+    win_process_times(pid).map(|(start_ms, _)| start_ms)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn os_process_start_time(_pid: i64) -> Option<i64> {
+    None
+}
+
+/// Cumulative kernel+user CPU time of `pid`, in nanoseconds — the unit
+/// `ProcessHandle.Info.totalCpuDuration()` reads back through
+/// `Duration.ofNanos`.
+///
+/// Only the Windows arm reports a value: it comes free from the same
+/// `GetProcessTimes` call the start time already needs. The Linux arm would
+/// need a second parse of `/proc/<pid>/stat` (fields 14/15) and is left at
+/// `None` — `Info.totalTime` then keeps its `-1` constructor default, which is
+/// the JDK's own "unknown" sentinel and renders as `Optional.empty()`.
+#[cfg(windows)]
+fn os_process_cpu_nanos(pid: i64) -> Option<i64> {
+    win_process_times(pid).map(|(_, cpu_nanos)| cpu_nanos)
+}
+
+#[cfg(not(windows))]
+fn os_process_cpu_nanos(_pid: i64) -> Option<i64> {
+    None
+}
+
+/// The full path of the executable image backing `pid`.
+///
+/// Windows has no `/proc/<pid>/cmdline` equivalent that a bystander process can
+/// read cheaply, which is why real HotSpot 25 on Windows reports
+/// `Info.command()` PRESENT while `commandLine()` and `arguments()` are both
+/// EMPTY (measured against this host's JDK 25.0.3, see the lane record). So
+/// only the image name is sourced here, from `QueryFullProcessImageNameW` —
+/// the same call `ProcessHandleImpl_md.c` makes.
+#[cfg(windows)]
+fn os_process_image_name(pid: i64) -> Option<String> {
+    use std::ffi::c_void;
+    type Handle = *mut c_void;
+    type Bool = i32;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // `MAX_PATH` is not the ceiling for a full image path; the API takes the
+    // buffer size in CHARACTERS and reports back how many it wrote.
+    const BUF_CHARS: u32 = 32_768;
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: Bool, process_id: u32) -> Handle;
+        fn QueryFullProcessImageNameW(
+            h_process: Handle,
+            dw_flags: u32,
+            lp_exe_name: *mut u16,
+            lpdw_size: *mut u32,
+        ) -> Bool;
+        fn CloseHandle(h_object: Handle) -> Bool;
+    }
+
+    if pid <= 0 || pid > u32::MAX as i64 {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0; BUF_CHARS as usize];
+    // SAFETY: `buf` is a live allocation of exactly `BUF_CHARS` u16s and `size`
+    // is initialised to that same count, which is the contract the API
+    // documents; it writes at most `size` characters and updates `size` to the
+    // count actually written. The handle is closed on every path out.
+    let written = unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if h.is_null() {
+            return None;
+        }
+        let mut size: u32 = BUF_CHARS;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size) != 0;
+        CloseHandle(h);
+        if !ok {
+            return None;
+        }
+        size as usize
+    };
+    if written == 0 || written > buf.len() {
+        return None;
+    }
+    let name = String::from_utf16_lossy(&buf[..written]);
+    if name.trim().is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(not(windows))]
+fn os_process_image_name(_pid: i64) -> Option<String> {
     None
 }
 
@@ -2226,6 +2391,32 @@ fn boot_time_millis() -> Option<i64> {
 /// that, and every comparison against it is short-circuited.
 fn start_time_or_any(pid: i64) -> i64 {
     os_process_start_time(pid).unwrap_or(PROCESS_STARTTIME_ANY)
+}
+
+/// The start time to stamp into THE `ProcessHandle.current()` handle.
+///
+/// Exported for `native-builtins`' `p60_process_handle_current`, which mints
+/// that object. It must be **this** function rather than a second
+/// implementation, because `ProcessHandleImpl$Info.info(pid, startTime)` — real
+/// JDK bytecode, not something this VM can influence — WIPES `command`,
+/// `arguments`, `startTime`, `totalTime` and `user` off the freshly filled
+/// record whenever the handle's `startTime` differs by so much as one from the
+/// value `info0` wrote:
+///
+/// ```text
+/// info.info0(pid);
+/// if (startTime != info.startTime) { info.command = null; ... }
+/// ```
+///
+/// `info0` writes `start_time_or_any(pid)`, `isAlive0` returns
+/// `start_time_or_any(pid)`, and HotSpot's own `<clinit>` seeds `current` with
+/// `new ProcessHandleImpl(pid, isAlive0(pid))` — so all three must be the one
+/// number. The handle used to be built with a hardcoded `0` (`STARTTIME_ANY`),
+/// which `equals()`/`isAlive()` treat as a wildcard but `Info.info` does not,
+/// and that single mismatch is what silently emptied
+/// `ProcessHandle.current().info()`.
+pub fn current_process_start_time() -> i64 {
+    start_time_or_any(std::process::id() as i64)
 }
 
 /// `ProcessHandleImpl.STARTTIME_ANY` — "the process exists; its start time is
@@ -3767,6 +3958,43 @@ fn native_proc_handle_get_process_pids0(
 /// `java.lang.ProcessHandleImpl$Info.info0(long pid)V` — an INSTANCE method,
 /// so `args[0]` is the `Info` receiver whose fields are filled in and
 /// `args[1]` is the pid.
+///
+/// **`startTime` is not optional here, on any platform.** The only caller is
+/// `Info.info(long pid, long startTime)`, whose bytecode (JDK 25, verified with
+/// `javap -c java.lang.ProcessHandleImpl$Info`) is:
+///
+/// ```text
+/// Info info = new Info();      // command=null, startTime=-1, totalTime=-1
+/// info.info0(pid);
+/// if (startTime != info.startTime) {
+///     info.command = null; info.arguments = null;
+///     info.startTime = -1; info.totalTime = -1; info.user = null;
+/// }
+/// return info;
+/// ```
+///
+/// That comparison is a bare `!=` with no wildcard — unlike `equals()` and
+/// `isAlive()`, which both treat `STARTTIME_ANY` (0) as "matches anything". So
+/// an `info0` that filled `command` but left `startTime` at its `-1` default
+/// had every field it just wrote thrown away by the caller, on Linux as well as
+/// on Windows, and `ProcessHandle.current().info()` reported an entirely empty
+/// record while nothing threw. The two `RJdkProcess.java` checks that sit behind
+/// `info.command().isPresent()` (:135) and `info.startInstant().isPresent()`
+/// (:138) then never ran, and the vector still printed `PASS` — two checks
+/// lower than HotSpot's 53.
+///
+/// `start_time_or_any` is the single source for all three of `isAlive0`, this
+/// native and `current_process_start_time`, which is what makes the comparison
+/// agree by construction rather than by luck. When the OS will not tell us
+/// (no permission, no probe on this platform) all three degrade to the same
+/// `STARTTIME_ANY` 0, the comparison still holds, and `startInstant()` reports
+/// `Optional.empty()` because its own guard is `startTime > 0`.
+///
+/// What is populated is what the platform actually knows, and matches the real
+/// JDK's own per-platform split: Linux reports command + commandLine +
+/// arguments from `/proc/<pid>/cmdline`; Windows reports the image path only,
+/// which is exactly what HotSpot 25 answers there (`commandLine()` and
+/// `arguments()` measured EMPTY on real HotSpot for this host).
 fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -3781,35 +4009,60 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     } else {
         pid
     };
-    // Nothing to report on a host without `/proc`: leave the fields at their
-    // constructor defaults, which `Info` renders as `Optional.empty()`.
-    let Some((command, arguments)) = os_process_cmdline(pid) else {
-        return Ok(None);
-    };
-    let command_line = if arguments.is_empty() {
-        command.clone()
+
+    // Every OS read happens before the first allocation, so no `ctx` call sits
+    // between a probe and the write of what it produced.
+    let start_time = start_time_or_any(pid);
+    let cpu_nanos = os_process_cpu_nanos(pid);
+    let cmdline = os_process_cmdline(pid);
+    // Only consulted when there is no `/proc`-style command line to prefer.
+    let image_name = if cmdline.is_none() {
+        os_process_image_name(pid)
     } else {
-        format!("{command} {}", arguments.join(" "))
+        None
     };
+
     // Pin `this` across every allocation below — each `create_string` /
     // `new_array` can trigger a moving young GC that would relocate it.
     let this_pin = ctx.pin_native_root(this);
-    let cmd_str = ctx.create_string(&command);
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    ctx.set_field_by_name(this_cur, "command", Value::Object(Some(cmd_str)));
-    let line_str = ctx.create_string(&command_line);
-    let this_cur = ctx.read_native_pin(this_pin, this);
-    ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len());
-    let arr_pin = ctx.pin_native_root(arr);
-    for (i, a) in arguments.iter().enumerate() {
-        let s = ctx.create_string(a);
+    if let Some((command, arguments)) = cmdline {
+        let command_line = if arguments.is_empty() {
+            command.clone()
+        } else {
+            format!("{command} {}", arguments.join(" "))
+        };
+        let cmd_str = ctx.create_string(&command);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this_cur, "command", Value::Object(Some(cmd_str)));
+        let line_str = ctx.create_string(&command_line);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len());
+        let arr_pin = ctx.pin_native_root(arr);
+        for (i, a) in arguments.iter().enumerate() {
+            let s = ctx.create_string(a);
+            let arr_cur = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_array_element(arr_cur, i, Value::Object(Some(s)));
+        }
+        let this_cur = ctx.read_native_pin(this_pin, this);
         let arr_cur = ctx.read_native_pin(arr_pin, arr);
-        ctx.set_array_element(arr_cur, i, Value::Object(Some(s)));
+        // `arr_pin` is deliberately not released here: the final
+        // `unpin_native_roots(this_pin)` below frees every root from `this_pin`
+        // onward, which includes it.
+        ctx.set_field_by_name(this_cur, "arguments", Value::Object(Some(arr_cur)));
+    } else if let Some(command) = image_name {
+        let cmd_str = ctx.create_string(&command);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this_cur, "command", Value::Object(Some(cmd_str)));
     }
+
+    // Scalars last: neither write can allocate, so `this` cannot move between
+    // the two of them.
     let this_cur = ctx.read_native_pin(this_pin, this);
-    let arr_cur = ctx.read_native_pin(arr_pin, arr);
-    ctx.set_field_by_name(this_cur, "arguments", Value::Object(Some(arr_cur)));
+    ctx.set_field_by_name(this_cur, "startTime", Value::Long(start_time));
+    if let Some(nanos) = cpu_nanos {
+        ctx.set_field_by_name(this_cur, "totalTime", Value::Long(nanos));
+    }
     ctx.unpin_native_roots(this_pin);
     Ok(None)
 }

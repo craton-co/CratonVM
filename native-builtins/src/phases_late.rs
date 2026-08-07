@@ -2142,16 +2142,35 @@ fn p60_current_handle_memo() -> &'static std::sync::Mutex<std::collections::Hash
 ///        fabricated "this process has no children", indistinguishable from a
 ///        true empty answer (`RJdkProcess.java:188-189`).
 ///
-/// So prefer a REAL `java.lang.ProcessHandleImpl(pid, 0)`, exactly as
+/// So prefer a REAL `java.lang.ProcessHandleImpl(pid, startTime)`, exactly as
 /// `native-io::process::build_process_handle` already does for
-/// `Process.toHandle()`. `startTime = 0` is the JDK's own `STARTTIME_ANY`
-/// wildcard: `ProcessHandleImpl.equals` (verified by `javap -c` against JDK
-/// 25.0.3) answers true when the pids match and EITHER start time is zero, so
-/// this handle compares equal to the one `ProcessHandle.of(pid)` builds with a
-/// real start time. Everything else on the handle then routes through the JDK's
-/// own bytecode into the `ProcessHandleImpl` natives already registered in
-/// `native-io/src/process.rs` (`isAlive0`, `parent0`, `destroy0`,
+/// `Process.toHandle()`. Everything else on the handle then routes through the
+/// JDK's own bytecode into the `ProcessHandleImpl` natives already registered
+/// in `native-io/src/process.rs` (`isAlive0`, `parent0`, `destroy0`,
 /// `getProcessPids0`, `Info.info0`).
+///
+/// 3. `startTime` was a hardcoded `0`. That is the JDK's `STARTTIME_ANY`
+///    wildcard, and it IS honoured by `ProcessHandleImpl.equals` and
+///    `.isAlive()` — which is why the handle still compared equal to the one
+///    `ProcessHandle.of(pid)` builds with a real start time, and why this went
+///    unnoticed. `ProcessHandleImpl$Info.info(long pid, long startTime)` does
+///    NOT honour it: its check is a bare `startTime != info.startTime`, and on
+///    a mismatch it nulls `command`, `arguments`, `startTime`, `totalTime` and
+///    `user` on the record `info0` has just filled in. With `0` on this side
+///    and a real start time from `info0` on the other, the mismatch was
+///    permanent and `ProcessHandle.current().info()` was permanently empty —
+///    silently, because every field of `Info` is an `Optional` and an empty one
+///    is a legal answer.
+///
+///    HotSpot's `<clinit>` seeds its own singleton with `new
+///    ProcessHandleImpl(pid, isAlive0(pid))`, so the correct value is whatever
+///    `isAlive0` reports; `current_process_start_time()` IS that function
+///    (`start_time_or_any`), which makes the three answers agree by
+///    construction. Measured: `regression-suite/src/RJdkProcess.java` runs 53
+///    checks on HotSpot 25 and ran 51 here, because the two `check(...)` calls
+///    guarded by `info.command().isPresent()` (:135) and
+///    `info.startInstant().isPresent()` (:138) never executed. Nothing threw;
+///    only the counter moved.
 ///
 /// The bare-interface allocation stays as the synthetic-JDK fallback, where
 /// `java/lang/ProcessHandleImpl` does not exist; there the memo alone supplies
@@ -2173,10 +2192,17 @@ fn p60_process_handle_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     }
 
     let pid = std::process::id() as i64;
+    // NOT the `STARTTIME_ANY` 0 this used to pass. `startTime` is a wildcard for
+    // `equals()`/`isAlive()` only; `ProcessHandleImpl$Info.info(pid, startTime)`
+    // compares it with a bare `!=` and, on a mismatch, WIPES every field
+    // `info0` just wrote. `current_process_start_time` is the same
+    // `start_time_or_any` that `isAlive0` and `info0` answer with, so the three
+    // agree by construction — see its doc comment.
+    let start_time = cratonvm_native_io::process::current_process_start_time();
     let obj = match ctx.new_object_initialized(
         "java/lang/ProcessHandleImpl",
         "(JJ)V",
-        &[Value::Long(pid), Value::Long(0)],
+        &[Value::Long(pid), Value::Long(start_time)],
     ) {
         Ok(Some(Value::Object(Some(real)))) => real,
         _ => {

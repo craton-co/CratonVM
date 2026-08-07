@@ -1516,35 +1516,86 @@ enum LibrarySpelling {
 /// Rust, so a caller that asks for them has genuinely got what it asked for
 /// even though no shared object was opened.
 ///
-/// These are the java.base/java.desktop-adjacent JNI libraries that ship inside
-/// the JDK image. CratonVM never dlopen()s them — every `Java_java_util_zip_*`
-/// / `Java_java_net_*` entry point they exist to provide is registered in this
-/// process as a Rust native — but on HotSpot the call SUCCEEDS, so answering
+/// These are the java.base-adjacent JNI libraries that ship inside the JDK
+/// image. CratonVM never successfully dlopen()s them — they are linked against
+/// `libjvm`/`jvm.dll`, which this process does not have, so the real load fails
+/// with `ERROR_MOD_NOT_FOUND` (measured on Windows: `LoadLibraryW` on
+/// `<java.home>/bin/{java,zip,net,nio,jimage,verify,management,management_ext,
+/// instrument,extnet,prefs}.dll` all fail with 126 outside a JVM process) —
+/// while every `Java_java_util_zip_*` / `Java_java_net_*` entry point they
+/// exist to provide is registered in this process as a Rust native. On HotSpot
+/// a *cold* `System.loadLibrary` of them SUCCEEDS, so answering
 /// `UnsatisfiedLinkError` for them would be a fresh divergence in the opposite
-/// direction (`regression-suite/src/RJdkJni.java:189-202` asserts that at least
-/// one JDK-shipped library loads). Anything NOT on this list is a library this
-/// VM has no implementation of, and the JDK contract for that is an error, not
-/// a silent return.
+/// direction. Anything NOT on this list is a library this VM has no
+/// implementation of, and the JDK contract for that is an error, not a silent
+/// return.
+///
+/// MEASURED (JDK 25.0.3 Windows x64, `System.loadLibrary` from the app class
+/// loader, nothing pre-loaded). Three names that used to be on this list are
+/// NOT loadable on HotSpot at all, because the file does not exist on
+/// `java.library.path`:
+///
+///   * `sunec`  — deleted from the JDK image; SunEC's native ECC was replaced
+///     by a Java implementation, which is why this crate ships
+///     `sunec_intpoly`/`sunec_point` intrinsics instead of a library.
+///   * `jvm`    — lives in `<java.home>/bin/server` (`lib/server` on Linux),
+///     which is on neither `java.library.path` nor `sun.boot.library.path`.
+///   * `jsig`   — no `jsig.dll` in the Windows image. `libjsig.so` DOES exist
+///     in `<java.home>/lib` on Linux/macOS, so this one is platform-split
+///     rather than deleted (see `PLATFORM_ONLY`).
+///
+/// `zip` is deliberately absent for a different, DYNAMIC reason. HotSpot's real
+/// rule is not "does the file exist" but "has the BOOT loader already loaded
+/// it": `NativeLibraries` rejects a second load of the same file from a
+/// different class loader with `UnsatisfiedLinkError: Native Library
+/// <path> already loaded in another classloader`. Measured, same image:
+///
+///   cold, directory classpath          loadLibrary("zip") -> LOADS
+///   after any java.util.zip native use  ->  THROWS (already loaded)
+///   cold, but classpath is a JAR        ->  THROWS (already loaded)
+///
+/// java.base itself boot-loads it (`ZipUtils.loadLibrary()` ->
+/// `BootLoader.loadLibrary("zip")` from `Inflater.<clinit>`), so ANY program
+/// that has touched `java.util.zip` — or that was merely launched from a jar —
+/// is in the throwing state before its own `loadLibrary("zip")` runs. CratonVM
+/// is permanently in the equivalent state: its zip natives are bound in-process
+/// from VM init and no shared object is ever opened. `RJdkJni` measures exactly
+/// this: `zipNatives()` runs immediately before `libraryLoading()`, so HotSpot's
+/// oracle prints `loadedLibrary=net` — `zip` must FAIL and fall through to the
+/// `net` probe (`RJdkJni.java:189-202`). This is a test-produced state, not a
+/// file-layout fact, so it holds identically on Linux.
+///
+/// KNOWN RESIDUAL: the same dynamic rule applies to `net`/`nio`/`prefs`, and
+/// this list cannot model it — there is no class-loader-scoped
+/// `loadedLibraryNames` bookkeeping anywhere in this VM. A program that uses
+/// `java.net` and then calls `System.loadLibrary("net")` gets a silent success
+/// here where HotSpot throws. `net` stays on the list because the measured
+/// oracle needs it: `RJdkJni` never touches `java.net` before line 195.
 fn is_vm_provided_jdk_library(name: &str) -> bool {
-    matches!(
-        name,
-        "java"
-            | "zip"
-            | "net"
-            | "nio"
-            | "jimage"
-            | "verify"
-            | "management"
-            | "management_ext"
-            | "instrument"
-            | "extnet"
-            | "prefs"
-            | "j2pkcs11"
-            | "sunec"
-            | "sunmscapi"
-            | "jsig"
-            | "jvm"
-    )
+    // Ships as a real, separately-present shared object in the JDK 25 image on
+    // every platform, and cold-loads on HotSpot.
+    const EVERY_PLATFORM: &[&str] = &[
+        "java",
+        "net",
+        "nio",
+        "jimage",
+        "verify",
+        "management",
+        "management_ext",
+        "instrument",
+        "extnet",
+        "prefs",
+        "j2pkcs11",
+    ];
+    // Present in one platform's image only. `sunmscapi.dll` is the Windows
+    // SunMSCAPI crypto provider and has no Unix counterpart; `libjsig.so` is
+    // the Unix signal-chaining shim and has no Windows counterpart.
+    #[cfg(windows)]
+    const PLATFORM_ONLY: &[&str] = &["sunmscapi"];
+    #[cfg(not(windows))]
+    const PLATFORM_ONLY: &[&str] = &["jsig"];
+
+    EVERY_PLATFORM.contains(&name) || PLATFORM_ONLY.contains(&name)
 }
 
 /// Open a native library, or raise the `UnsatisfiedLinkError` the JDK
