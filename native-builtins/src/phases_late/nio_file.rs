@@ -1893,11 +1893,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
             // (the real-JDK static iterates installedProviders by scheme) so the
             // in-process compiler can read platform classes from the runtime
             // image (HIB-CV-27).
-            let file_p = mk_provider(ctx, "file");
+            let file_p = mk_provider(ctx, "file")?;
             let file_pin = ctx.pin_native_root(file_p);
-            let jar_p = mk_provider(ctx, "jar");
+            let jar_p = mk_provider(ctx, "jar")?;
             let jar_pin = ctx.pin_native_root(jar_p);
-            let jrt_p = mk_provider(ctx, "jrt");
+            let jrt_p = mk_provider(ctx, "jrt")?;
             let jrt_pin = ctx.pin_native_root(jrt_p);
             let arr = ctx.new_array(ArrayElementType::Reference, 3);
             let arr_pin = ctx.pin_native_root(arr);

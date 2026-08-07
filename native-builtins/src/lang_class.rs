@@ -11868,7 +11868,7 @@ pub(crate) fn ctx_annotation_proxy_hash_code(ctx: &mut dyn NativeContext, proxy:
     let elems = ctx_annotation_proxy_elements(ctx, proxy)?;
     let mut h: i32 = 0;
     for (name, val) in elems {
-        h = h.wrapping_add(ctx_annotation_member_hash(ctx, &name, val));
+        h = h.wrapping_add(ctx_annotation_member_hash(ctx, &name, val)?);
     }
     Ok(h)
 }
