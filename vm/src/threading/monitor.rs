@@ -511,6 +511,24 @@ pub struct Monitor {
     /// with a `swap`, so a monitor that is reached by both `prune_dead` and
     /// `remap_after_gc` releases exactly once.
     mark_ref: std::sync::atomic::AtomicBool,
+    /// This object's identity hash, displaced here when the object inflated.
+    ///
+    /// The hash normally lives in the upper bits of a `MARK_NEUTRAL` mark word
+    /// (`ObjectHeader::make_neutral_hashed`). Inflation overwrites the whole
+    /// word with `INFLATED | monitor_ptr`, so it is the one transition that
+    /// would destroy a hash -- `publish_inflated` moves it here first.
+    ///
+    /// A monitor is the right home for it rather than a separate address-keyed
+    /// table: a displaced hash exists only for an inflated object, every
+    /// inflated object has exactly one monitor, and this table is ALREADY
+    /// re-keyed on relocation and pruned on death by `MonitorCleanup` -- which
+    /// carries the "a new object at a recycled address inherits the dead one's
+    /// entry" analysis that a fresh side table would have to repeat. Reaching
+    /// it is a pointer dereference through the mark word, not a hash probe.
+    ///
+    /// `0` means "none displaced": either the object was never hashed before it
+    /// inflated, or it has not been hashed at all yet.
+    displaced_hash: std::sync::atomic::AtomicI32,
 }
 
 /// The mutable state protected by a monitor's mutex.
@@ -557,6 +575,33 @@ impl Monitor {
             entry_condvar: Condvar::new(),
             wait_condvar: Condvar::new(),
             mark_ref: std::sync::atomic::AtomicBool::new(false),
+            displaced_hash: std::sync::atomic::AtomicI32::new(0),
+        }
+    }
+
+    /// The identity hash displaced into this monitor, or `0` if none.
+    #[inline]
+    pub fn displaced_hash(&self) -> i32 {
+        self.displaced_hash.load(Ordering::Acquire)
+    }
+
+    /// Install `hash` as this object's identity hash if none is recorded yet,
+    /// and return the hash that is now in force.
+    ///
+    /// Idempotent and racy-safe: the first writer wins and every caller --
+    /// including the losers -- converges on that one value. An object's
+    /// identity hash may never change once observed, so a plain store would be
+    /// wrong even though it looks equivalent.
+    #[inline]
+    pub fn displace_hash(&self, hash: i32) -> i32 {
+        match self.displaced_hash.compare_exchange(
+            0,
+            hash,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => hash,
+            Err(existing) => existing,
         }
     }
 
@@ -1190,6 +1235,15 @@ impl MonitorTable {
         // the count is already correct the instant another thread can observe
         // the pointer.
         let mark_owned = Arc::clone(monitor);
+        // Carry any identity hash out of the word being overwritten, BEFORE the
+        // CAS publishes the monitor. Any thread that can observe the INFLATED
+        // pointer can already reach the hash through it; doing this after the
+        // CAS would leave a window where the object's hash is simply gone, and
+        // a reader in that window would mint a second, different one.
+        let displaced = ObjectHeader::neutral_hash(expected);
+        if displaced != 0 {
+            monitor.displace_hash(displaced);
+        }
         let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(monitor) as usize);
         if header
             .mark_word
@@ -2976,6 +3030,83 @@ mod tests {
     /// (summed across shards).
     fn monitor_registry_len(table: &MonitorTable) -> usize {
         table.indexed_monitor_count()
+    }
+
+    /// The whole point of the displacement: a hash installed while the object
+    /// was NEUTRAL must still be its hash after inflation destroys the word.
+    ///
+    /// This is also the test that shows the free half of the design working
+    /// end to end -- nothing here asks for inflation. `enter` takes the thin
+    /// lock fast path, whose CAS is against the literal `MARK_NEUTRAL`; the
+    /// hashed word is non-zero, so that CAS loses and the object inflates on
+    /// its own.
+    #[test]
+    fn an_identity_hash_survives_the_inflation_that_overwrites_its_word() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let header = header_of(obj);
+
+        let hash = header
+            .mark_word_identity_hash(|| 0x0051_1EEF)
+            .expect("a fresh object is NEUTRAL");
+        assert_ne!(hash, 0);
+        assert!(!is_inflated(obj));
+
+        // No explicit inflation: a hashed word cannot win the thin-lock CAS.
+        table.enter(obj, ThreadId(3));
+        assert!(
+            is_inflated(obj),
+            "a hashed object must inflate rather than thin-lock"
+        );
+
+        let mark = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(
+            ObjectHeader::neutral_hash(mark),
+            0,
+            "the word no longer carries the hash -- that is what makes the              displacement necessary, not optional"
+        );
+        let monitor = monitor_arc_from_mark(mark).expect("inflated => monitor");
+        assert_eq!(
+            monitor.displaced_hash(),
+            hash,
+            "the hash must have moved into the monitor, not vanished"
+        );
+
+        assert!(table.exit(obj, ThreadId(3)).is_ok());
+        // Releasing an inflated monitor leaves it inflated, so the hash stays
+        // reachable. This is why there is no path back to a bare NEUTRAL word
+        // that would let a second, different hash be minted.
+        assert!(is_inflated(obj));
+        let monitor = monitor_arc_from_mark(header.mark_word.load(Ordering::Acquire))
+            .expect("still inflated after exit");
+        assert_eq!(monitor.displaced_hash(), hash);
+    }
+
+    /// An object that inflates *without* ever having been hashed displaces
+    /// nothing -- `0` has to stay "none", or the first hash request after
+    /// inflation would read a phantom.
+    #[test]
+    fn an_unhashed_object_displaces_nothing_on_inflation() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(4);
+        table.enter(obj, tid);
+        table.wait(obj, tid, Some(1), None).unwrap();
+        table.exit(obj, tid).unwrap();
+        assert!(is_inflated(obj));
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        let monitor = monitor_arc_from_mark(mark).expect("inflated => monitor");
+        assert_eq!(monitor.displaced_hash(), 0);
+    }
+
+    /// A displaced hash is write-once. Two racers must converge, because an
+    /// identity hash may never change once observed.
+    #[test]
+    fn displacing_a_hash_twice_keeps_the_first() {
+        let m = Monitor::new();
+        assert_eq!(m.displace_hash(111), 111);
+        assert_eq!(m.displace_hash(222), 111);
+        assert_eq!(m.displaced_hash(), 111);
     }
 
     #[test]
