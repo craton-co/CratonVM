@@ -2572,9 +2572,12 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// paths mis-aligned — see `entrySet`).  `this` is pinned across the
 /// re-entrant `create_string`/`add` calls so a moving GC cannot leave a stale
 /// `vec`.
-fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
-    let empty = |ctx: &mut dyn NativeContext| {
-        crate::try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?
+fn build_enumeration(
+    ctx: &mut dyn NativeContext,
+    items: Vec<String>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let empty = |ctx: &mut dyn NativeContext| -> Result<ObjectRef, MethodCallFailed> {
+        crate::try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
     };
     let vec = match ctx.new_object("java/util/Vector") {
         Ok(Some(Value::Object(Some(o)))) => o,
@@ -2606,10 +2609,10 @@ fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectR
     let vec = ctx.read_native_pin(pin, vec);
     let result = match ctx.invoke_virtual(vec, "elements", "()Ljava/util/Enumeration;", &[]) {
         Ok(Some(Value::Object(Some(e)))) => e,
-        _ => empty(ctx),
+        _ => empty(ctx)?,
     };
     ctx.unpin_native_roots(pin);
-    result
+    Ok(result)
 }
 
 /// Native `Properties.stringPropertyNames()Ljava/util/Set;` — Surefire
@@ -2939,14 +2942,14 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Ok(Some(Value::Object(Some(build_enumeration(
                 ctx,
                 Vec::new(),
-            )))))
+            )?))))
         }
     };
     let mut this = this;
     let mut keys: Vec<String> = ordered_snapshot_kv(ctx, &mut this)
         .into_iter()
         .map(|(k, _v)| k)
-        .collect();
+        .collect()?;
     // Include String keys of CHM-exclusive (non-String-valued) entries.
     let side = side_key_set(ctx, this);
     for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
@@ -2954,7 +2957,7 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             keys.push(s);
         }
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)?))))
 }
 
 /// Collect this Properties object's own String keys (side-table + CHM-exclusive
@@ -3003,7 +3006,7 @@ fn native_properties_property_names(
             return Ok(Some(Value::Object(Some(build_enumeration(
                 ctx,
                 Vec::new(),
-            )))))
+            )?))))
         }
     };
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3020,7 +3023,7 @@ fn native_properties_property_names(
         cur = props_defaults(ctx, p);
         depth += 1;
     }
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)))))
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, out)?))))
 }
 
 /// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
@@ -3033,7 +3036,7 @@ fn native_properties_elements(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             .collect(),
         _ => Vec::new(),
     };
-    Ok(Some(Value::Object(Some(build_enumeration(ctx, vals)))))
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, vals)?))))
 }
 
 /// Native `Properties.contains(Object)Z` — Hashtable-style value lookup.

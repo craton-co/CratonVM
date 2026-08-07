@@ -1672,8 +1672,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
     // `CipherFactory.createSocket`/`NetUtils.createLoopbackSocket`; see
     // `bug-h2-netutils-dsa-privatekey-tls-unsupported.md`'s residuals).
     r.register(ssf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
-        let extra_roots = p68_factory_trust_roots(ctx, args);
-        let java_tm_key = p68_factory_java_tm_key(ctx, args);
+        let extra_roots = p68_factory_trust_roots(ctx, args)?;
+        let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
         let max_protocol = p68_factory_max_protocol(ctx, args);
         let sock =
             try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS)?;
@@ -1715,8 +1715,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let extra_roots = p68_factory_trust_roots(ctx, args)?;
+            let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
             let max_protocol = p68_factory_max_protocol(ctx, args);
             new13_do_create_socket(
                 ctx,
@@ -1766,8 +1766,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let extra_roots = p68_factory_trust_roots(ctx, args)?;
+            let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
             let max_protocol = p68_factory_max_protocol(ctx, args);
             new13_do_create_socket(
                 ctx,
@@ -1877,8 +1877,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
             // legacy p68 factory-identity-keyed table populated by
             // `SSLContext.getSocketFactory()`'s own "carry trust anchors
             // forward onto the factory" fix.
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let extra_roots = p68_factory_trust_roots(ctx, args)?;
+            let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
             let pending_id = crate::t27_tls::stash_pending_layered_socket(
                 ctx,
                 wrapped,

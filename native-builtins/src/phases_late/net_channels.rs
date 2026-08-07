@@ -3261,7 +3261,7 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
-            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() }?;
+            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
             addr.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
             let rc = unsafe {
                 libc::connect(

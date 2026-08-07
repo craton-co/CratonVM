@@ -405,14 +405,14 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     let algo = read_algo(ctx, this);
     let data = read_accumulator(ctx, this);
-    let hash = compute_digest(&algo, &data);
+    let hash = compute_digest(&algo, &data)?;
     // JDK contract (MessageDigestSpi.engineDigest(byte[],int,int)): the caller's
     // window must be able to hold the whole digest, else DigestException.
     let buf_len = ctx.array_length(buf);
-    if len < hash?.len() {
+    if len < hash.len() {
         return Err(throw_digest_exception(ctx, "partial digests not returned"));
     }
-    if buf_len.saturating_sub(offset) < hash?.len() {
+    if buf_len.saturating_sub(offset) < hash.len() {
         return Err(throw_digest_exception(
             ctx,
             "insufficient space in the output buffer to store the digest",
@@ -423,7 +423,7 @@ fn md_digest_into(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
     // Reset accumulator after digest() per JDK contract (see md_digest).
     write_accumulator(ctx, this, &[]);
-    Ok(Some(Value::Int(hash?.len() as i32)))
+    Ok(Some(Value::Int(hash.len() as i32)))
 }
 
 /// Construct & throw a real `java.security.DigestException` (a

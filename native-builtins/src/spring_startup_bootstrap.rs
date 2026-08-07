@@ -576,7 +576,7 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
     ctx.unpin_native_roots(bean_factory_pin);
 }
 
-fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
+fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
     // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
@@ -598,7 +598,7 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
         );
     }
     if let Value::Object(Some(bf)) = current {
-        return bf;
+        return Ok(bf);
     }
 
     // GC-safety: `receiver` is dereferenced again (`set_field_by_name`)
@@ -663,17 +663,18 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
                 Some(obj)
             })()
         })
+        .map(Ok)
         .unwrap_or_else(|| {
             // Fallback: synthetic allocation with generous field count.
-            crate::try_alloc_concurrent_synthetic(ctx, DLBF, 64)?
-        });
+            crate::try_alloc_concurrent_synthetic(ctx, DLBF, 64)
+        })?;
     let receiver = ctx.read_native_pin(receiver_pin, receiver);
     ctx.unpin_native_roots(receiver_pin);
 
     // Write the newly created factory back into the context object so future
     // reads from the bytecode (GETFIELD beanFactory) also see it.
     ctx.set_field_by_name(receiver, "beanFactory", Value::Object(Some(bf)));
-    bf
+    Ok(bf)
 }
 
 fn get_bean_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -690,7 +691,7 @@ fn get_bean_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ))
         }
     };
-    let bf = get_or_create_bean_factory(ctx, receiver);
+    let bf = get_or_create_bean_factory(ctx, receiver)?;
     // GC-safety: `ensure_bean_post_processors_list` can allocate; pin `bf`
     // and re-read the forwarded reference before returning it.
     let bf_pin = ctx.pin_native_root(bf);
@@ -3842,14 +3843,14 @@ fn throw_cannot_load_bean_class_exception(
     bean_name: &str,
     bean_class_name: &str,
 ) -> Result<MethodCallFailed, MethodCallFailed> {
-    let cause = build_class_not_found(ctx, bean_class_name);
+    let cause = build_class_not_found(ctx, bean_class_name)?;
     // GC-safety: `cause` is read again well after the `new_object`/several
     // `create_string` calls below (each of which allocates); `exc` is
     // likewise read again after the LATER `create_string` calls; each of
     // `resource_val`/`name_val` (if present) is read again after whichever
     // `create_string` calls follow it. Pin each right after it's bound and
     // unpin once at the end via the earliest handle (`cause_pin`).
-    let cause_pin = ctx.pin_native_root(cause?);
+    let cause_pin = ctx.pin_native_root(cause);
     match ctx.new_object("org/springframework/beans/factory/CannotLoadBeanClassException") {
         Ok(Some(Value::Object(Some(exc)))) => {
             let exc_pin = ctx.pin_native_root(exc);
@@ -3876,7 +3877,7 @@ fn throw_cannot_load_bean_class_exception(
                 (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
                 _ => name_val,
             };
-            let cause = ctx.read_native_pin(cause_pin, cause?);
+            let cause = ctx.read_native_pin(cause_pin, cause);
             let _ = ctx.invoke(
                 "org/springframework/beans/factory/CannotLoadBeanClassException",
                 "<init>",
