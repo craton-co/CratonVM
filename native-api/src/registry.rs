@@ -5754,7 +5754,7 @@ impl NativeMethodRegistry {
         // Real-JDK mode: drop the `Executors` POOL FACTORIES so the real
         // `java.util.concurrent.Executors` bytecode builds every executor.
         //
-        // JDK-ONLY-WAVE2 L10 (`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`,
+        // JDK-ONLY-WAVE2 L10 (`L10-blocker-threadpool-init-DONE-20260806.md`,
         // `docs/jdk-only-runtime-services.md` P1). The scheduled pair has been
         // dropped here since the Tomcat `ContainerBase` fix; the three plain-pool
         // factories were the ones still fabricating. What they did was subtler

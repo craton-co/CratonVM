@@ -444,7 +444,7 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// and pays for it on the hottest path in strict mode. The identities are what
 /// the migration needs; the magnitude only has to be non-zero.
 ///
-/// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement moves every
+/// Zero when `CRATONVM_ENFORCE_NATIVE_SHADOW` is set: enforcement moves every
 /// one of these into [`jdk_only_native_shadow_attempts`] instead, so the two
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {
@@ -554,7 +554,7 @@ fn offer_native_shadow_observation(
 /// RAN" observation — §1.4's shadow, seen at the moment it actually dispatched.
 ///
 /// This is the census hole
-/// `docs/internal/jdk-only-step1-bytecode-available-*.md` was filed for:
+/// `jdk-only-step1-bytecode-available-*.md` was filed for:
 /// `resolve_step1_native` passed a hard-coded `bytecode_available: false`, so
 /// step 1 — which answers first for nearly every dispatch in the VM — recorded
 /// nothing at all, and the shadow lists could read as inert while the natives
@@ -4448,7 +4448,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
+    /// See `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         crate::memory::reclaim_guard::audit_thread_frames(self.shared, self.thread, site);
     }
@@ -20095,17 +20095,6 @@ fn invoke_on_class_shared_inner(
                                 | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
                                 | ("java/lang/reflect/Method", "getReturnType", "()Ljava/lang/Class;")
                         )
-                        || ((class_name == "javax/net/ssl/SSLSocketFactory"
-                                || class_name.starts_with("sun/security/ssl/SSLSocketFactoryImpl"))
-                            && method_name == "createSocket"
-                            && matches!(
-                                descriptor,
-                                "(Ljava/lang/String;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/lang/String;ILjava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/InetAddress;ILjava/net/InetAddress;I)Ljava/net/Socket;"
-                                    | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
-                            ))
                         || ((class_name == "javax/net/ssl/SSLSocket"
                                 || class_name.starts_with("sun/security/ssl/SSLSocketImpl"))
                             && matches!(
@@ -21553,14 +21542,6 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/util/concurrent/LinkedBlockingQueue"
                             && method_name == "clear"
                             && descriptor == "()V")
-                        || (class_name == "java/io/FilterInputStream"
-                            && matches!(
-                                (method_name, descriptor),
-                                ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
-                            ))
-                        || (matches!(class_name, "java/lang/Iterable" | "java/util/Collection" | "java/util/Set" | "java/util/EnumSet")
-                            && method_name == "iterator"
-                            && descriptor == "()Ljava/util/Iterator;")
                         || (class_name == "java/util/Iterator"
                             && matches!(method_name, "hasNext" | "next" | "remove"))
                         // Spring Reactor StepVerifier uses timed
@@ -21594,18 +21575,6 @@ fn invoke_on_class_shared_inner(
                             method_name,
                             descriptor,
                         )
-                        // Spring CacheAdviceNamespaceTests: keep Spring XML
-                        // namespace validation active but force our
-                        // DefaultDocumentLoader factory bridge so it can attach
-                        // a shared Xerces grammar pool. Without this gate the
-                        // protected concrete Java method wins over the native
-                        // and every GenericXmlApplicationContext reparses the
-                        // same Spring XSDs from scratch.
-                        || (class_name
-                            == "org/springframework/beans/factory/xml/DefaultDocumentLoader"
-                            && method_name == "createDocumentBuilderFactory"
-                            && descriptor
-                                == "(IZ)Ljavax/xml/parsers/DocumentBuilderFactory;")
                         || crate::runtime::interpreter::is_liquibase_checksum_native_override(
                             class_name,
                             method_name,
@@ -21824,13 +21793,6 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "write" | "toByteArray" | "size" | "reset" | "toString"
                             ))
-                        // ES provider loading closes InputStreamReader wrappers
-                        // created by the lightweight resource-reader bridge. The
-                        // real close() body dereferences StreamDecoder state we do
-                        // not initialize; force the registered no-op native.
-                        || (class_name == "java/io/InputStreamReader"
-                            && method_name == "close"
-                            && descriptor == "()V")
                         || ((class_name == "java/lang/Runtime"
                             && method_name == "version"
                             && descriptor == "()Ljava/lang/Runtime$Version;")
@@ -23272,8 +23234,8 @@ fn invoke_on_class_shared_inner(
                 // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
-                // docs/known-issues/h2/
-                // bug-h2-classid0-stale-address-family.md.
+                // fixed-suite-bugs/h2-suite-bugs/
+                // bug-h2-classid0-stale-address-family-FIXED.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     let addr = recv.as_ptr() as usize;
                     if crate::memory::reclaim_guard::report_reclaimed_receiver(

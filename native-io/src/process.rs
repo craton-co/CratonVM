@@ -1296,7 +1296,7 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 /// opposite answers — the first is a stub Process the VM owns, the second is
 /// someone else's.
 ///
-/// See `docs/known-issues/jdk-only/process-natives-answer-for-user-subclasses.md`
+/// See `process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 /// and `probes/UserProcessInterceptProbe.java`.
 fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
@@ -3505,7 +3505,7 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 /// registration runs later and wins), but "dead" was the only thing keeping
 /// them harmless, and a registration-order change would have reintroduced the
 /// empty-CGI-body bug the same shape caused on the `Runtime.exec` route. See
-/// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
+/// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
 pub fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if pb_debug_enabled() {
         eprintln!("[PB-START-IO] ProcessBuilder.start via native-io");

@@ -11,7 +11,7 @@
 > on `real_protected_stub_class_common`'s allow-list, so the one centralised
 > arbitration yields it to the real `execute()` body class-scoped, on both the
 > warm and the cold path. Outcome record:
-> [`jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`](../../internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md).
+> `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
 
 
 **Owns:** `vm/src/runtime/interpreter/native_override.rs`,
@@ -118,7 +118,7 @@ condition that required it is provably gone — which is what L9 and L10 deliver
    factory at all, so nothing can mint a receiver the real `<init>` did not
    build. Measured `true=62 false=0` / `true=38 false=0` over both
    strict-corpus workloads in both modes with `CRATONVM_DBG_TPE_SHAPE`. See
-   `docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`. **Do not
+   `L10-blocker-threadpool-init-DONE-20260806.md`. **Do not
    re-derive this from the transcript** — the census probe's `concurrent`
    section matched HotSpot *before* L10 as well as after, so a green transcript
    is not evidence for step 2's precondition. Run the flag.
@@ -137,7 +137,7 @@ condition that required it is provably gone — which is what L9 and L10 deliver
    dispatch paths. `CRATONVM_DBG_TPE_SHAPE` and
    `probes/L10ShapeInstrumentControlProbe` were retired with the predicate
    they instrumented. Outcome record:
-   `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+   `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
 5. Replace both with `resolve_dispatch`. §7 step 3 already fires ~3,344 times per
    short run, so this path is exercised — but see the caution below.
 

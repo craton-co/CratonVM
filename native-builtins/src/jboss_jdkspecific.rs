@@ -34,6 +34,7 @@ use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Package names seeded into every synthetic `Module.getPackages()` call.
 ///
@@ -305,14 +306,14 @@ fn build_package_set(ctx: &mut dyn NativeContext, packages: &[&str]) -> ObjectRe
 }
 
 /// Build a synthetic Module for `name`, bound to the boot layer.
-fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> ObjectRef {
+fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     let module = alloc_concurrent_synthetic(ctx, "java/lang/Module", MODULE_FIELD_COUNT);
     let pin = ctx.pin_native_root(module);
     let name_str = ctx.create_string(name);
     let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(module, "layer", Value::Object(Some(layer)));
-    let desc = crate::build_synthetic_module_descriptor(ctx, name);
+    let desc = crate::build_synthetic_module_descriptor(ctx, name)?;
     let module = ctx.read_native_pin(pin, module);
     ctx.set_field_by_name(module, "descriptor", Value::Object(Some(desc)));
     ctx.unpin_native_roots(pin);
@@ -331,7 +332,7 @@ fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Ob
     module_packages_evict_if_needed(&mut t, id);
     t.insert(id, packages);
     drop(t);
-    module
+    Ok(module)
 }
 
 /// `Module.defineModule0(Module, boolean, String, String, Object[])` — record
@@ -433,7 +434,7 @@ pub(crate) fn native_module_layer_find_module(
         Some(Value::Object(Some(l))) => *l,
         _ => build_boot_layer(ctx)?,
     };
-    let module = build_module(ctx, &name, layer_ref);
+    let module = build_module(ctx, &name, layer_ref)?;
     let opt = wrap_optional_present(ctx, module);
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -1315,7 +1316,7 @@ mod tests {
     fn module_get_packages_returns_populated_set_for_java_base() {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer);
+        let module = build_module(&mut ctx, "java.base", layer)?;
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1349,7 +1350,7 @@ mod tests {
         // name (module_packages_table) — getPackages() must still return a
         // valid (non-null) Set, not null/panic.
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.sql", layer);
+        let module = build_module(&mut ctx, "java.sql", layer)?;
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1363,7 +1364,7 @@ mod tests {
     fn module_get_name_returns_string() {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer);
+        let module = build_module(&mut ctx, "java.base", layer)?;
         let result = native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1409,7 +1410,7 @@ mod tests {
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer);
+        let module = build_module(&mut ctx, "java.base", layer)?;
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1442,7 +1443,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         // Build a fully-populated module (java.base records the full JDK package list).
-        let module = build_module(&mut ctx, "java.base", layer);
+        let module = build_module(&mut ctx, "java.base", layer)?;
         // Sanity: getPackages() reflects the recorded data for this module.
         let pkgs = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()

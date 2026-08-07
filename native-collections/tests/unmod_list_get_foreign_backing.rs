@@ -25,7 +25,7 @@
 //! runs the generated source through QDox and `DefaultJavaSource.getClasses()`
 //! hands back `Collections.unmodifiableList(<LinkedList>)`. `size() == 1`
 //! passed the assertion on the line above; `get(0)` on the line below threw.
-//! See `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
+//! See `beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
 
 mod common;
 

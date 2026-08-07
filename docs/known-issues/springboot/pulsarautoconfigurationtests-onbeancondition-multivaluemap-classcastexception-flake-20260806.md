@@ -1,6 +1,7 @@
 # `PulsarAutoConfigurationTests` — intermittent `ClassCastException: Object cannot be cast to MultiValueMap` inside `OnBeanCondition$Spec`, 2026-08-06
 
-**Status: OPEN — reproduced once; 5 further attempts clean.**
+**Status: OPEN — reproduced once; 6 further attempts clean. The prescribed
+site-alias census has now been RUN, and it is not quiet.**
 
 **2026-08-06 update.** Two things changed, neither of them a fix:
 
@@ -96,7 +97,7 @@ root-cause it live.
 resolved, and *not* as a GC defect: it was the recycled-`JitInvokeInfo`
 dispatch defect (`383e7f5cf`), where a site key freed with its `CompiledMethod`
 and re-issued let one call site return another's answer — see
-[`spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`](../../internal/fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md).
+`fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`.
 Two things follow for this page. First, its ~1030 instrumented hunt runs found
 nothing because both detectors watched the map and the map was innocent — a hit
 rate is not worth buying with runs while the instrument points at the wrong
@@ -118,7 +119,7 @@ this as new:
   empty-deduction/wrong-exception-message, tied to `@ClassPathExclusions`
   isolated classloaders). This class doesn't use classpath exclusion.
 - `spring-bean-attribute-type-null-flake` (now
-  [`...-RESOLVED-20260806.md`](../../internal/fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md))
+  `fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md`)
   — same general "rare, one-shot, Spring reflection/annotation-processing miss"
   family and same `OnBeanCondition.Spec` constructor neighborhood, but a
   different concrete failure: an `IdentityHashMap` primitive-wrapper lookup
@@ -143,6 +144,56 @@ this as new:
 
 Log:
 `apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-20260806-s5/all-jit/logs/module_spring-boot-pulsar.org.springframework.boot.pulsar.autoconfigure.PulsarAutoC-72a68e29781a.{out,err}.log`
+
+## The site-alias census has been run — NOT quiet (2026-08-07)
+
+Ran the class once under `CRATONVM_DBG_SITE_ALIAS=1` on a binary containing
+`383e7f5cf` (`cratonvm-ovlbatch0806`, dev + the overlay GC fixes).
+
+* **Verdict: `tests=74 failed=0 aborted=0 skipped=2`** — no repro. That makes it
+  **1 failure in 7 known attempts**.
+* **Census: loud.** 1007 site keys observed; the printer hit its 40-line cap and
+  emitted `(further hits are counted, not printed)`. Key recycling is pervasive
+  in this workload, not marginal.
+* **The aliased keys include the annotation-reading sites this bug runs on:**
+
+  | key | was | now |
+  |---|---|---|
+  | `…f1340` | `AnnotatedElement.getDeclaredAnnotations()` | `asm/ClassReader.readUnsignedShort(I)I` |
+  | `…f1740` | `AnnotatedElement.getDeclaredAnnotation(Class)` | `ConcurrentReferenceHashMap$Segment.getReference(…)` |
+  | `…f1e40` | `AnnotatedElement.getAnnotations()` | `ConcurrentReferenceHashMap$Reference.get()` |
+  | `…f6340` | `AnnotationTypeMappings.size()I` | `bytebuddy/utility/Invoker.invoke(…)` |
+
+**What this does and does not establish.** The fix is already on this binary, so
+per the caveat below a positive census says the workload **recycles keys**, not
+that it is still corrupting — the instrument measures the *precondition*. It is
+still the answer the page asked for: the census is not quiet, so by this page's
+own decision rule the **dispatch framing is the one to pursue and the GC framing
+can be deprioritised** without buying a hit rate. What is new is that the
+precondition is dense at *exactly* the annotation-reading sites
+`OnBeanCondition$Spec` uses to build the `MultiValueMap`.
+
+The next question is therefore narrow: is there a site-keyed structure that does
+**not** re-validate identity after `383e7f5cf`? That fix cleared the eight
+site-keyed dispatch memos; anything else keyed on a `JitInvokeInfo` address
+would still be exposed, and this workload would trigger it.
+
+**Answered the same day: no, not in `vm/`.** Every `JitSiteKey`-keyed structure
+is declared through the `site_keyed_memos!` macro, which *generates* the flush
+alongside the declaration — so coverage is structural, not a list someone has to
+remember to update. Enumerating `JitSiteKey`-keyed statics finds the eight memos
+plus `SITE_IDENTITY`, which is the `CRATONVM_DBG_SITE_ALIAS` diagnostic map
+itself and carries no dispatch decision. So the dense aliasing above is the
+precondition being satisfied against a defence that is, as far as `vm/` goes,
+complete — which makes "an uncovered site memo" the wrong place to look next and
+leaves this page genuinely open rather than nearly-solved.
+
+**Harness trap, cost one run of confusion.** The emitter writes `[site-alias]`
+(hyphen); a census grep for `site_alias` (underscore) matched nothing and
+reported "CENSUS QUIET", which reads exactly like the negative result that would
+have sent this investigation to the GC framing. **Grep the emitter's literal tag,
+and treat a clean negative as a harness bug until the instrument is shown to
+speak.**
 
 ## Suggested next step
 

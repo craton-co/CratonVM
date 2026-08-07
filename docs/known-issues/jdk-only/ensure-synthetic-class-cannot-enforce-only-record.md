@@ -7,6 +7,16 @@ replaced this record's "52 call sites" with a measured 10. What remains is
 step 3 — deleting the infallible entry point — and the reason it is still open
 is not the call sites. See *What is still open*.
 
+> **2026-08-06.** Item 4's last shape is closed: `java/util/Enumeration$Impl`
+> now has somewhere for its refusal to land (a real
+> `Collections.enumeration(Arrays$ArrayList)`), so every class this record ever
+> listed as "refused with nowhere to go" is answered. Item 5 is **two thirds
+> done**: `native-io` and `native-collections` allocation funnels are fallible,
+> `native-builtins::alloc_concurrent_synthetic` is not, and the reason is
+> measured rather than estimated — see *Why `alloc_concurrent_synthetic` was
+> abandoned rather than finished*. `ensure_synthetic_class` therefore still
+> exists and this record stays here.
+
 The original defect: under `--jdk-only` this API recorded the violation and
 then fabricated the class anyway, so the run reported a violation while
 continuing in the exact state the contract forbids. That is now false for every
@@ -79,9 +89,9 @@ own adjudication"* was counting tests.
 **Step 3 — deleting `ensure_synthetic_class` — and the blocker is not the call
 sites.** Three of the 39 *are* the infallible allocation funnels themselves:
 
-* `native-collections::alloc_synthetic`
-* `native-io::alloc_synthetic`
-* `native-builtins::alloc_concurrent_synthetic`
+* `native-collections::alloc_synthetic` — **migrated 2026-08-06**
+* `native-io::alloc_synthetic` — **migrated 2026-08-06**
+* `native-builtins::alloc_concurrent_synthetic` — **not migrated; see below**
 
 Between them they have roughly **2,300 callers**, none of which returns a
 `Result`. Deleting `ensure_synthetic_class` means making those three fallible,
@@ -90,9 +100,100 @@ that sizes this work off a grep of `.ensure_synthetic_class(` is sizing the
 wrong thing.
 
 The fallible siblings those funnels need already exist and now have real
-callers: `try_alloc_synthetic` (native-collections) and
-`try_alloc_concurrent_synthetic` (native-builtins), added by L7 alongside the
-infallible ones.
+callers: `try_alloc_synthetic` (native-collections and, since 2026-08-06,
+native-io) and `try_alloc_concurrent_synthetic` (native-builtins).
+
+### Two of the three are done, and the unit above is still wrong
+
+**"~2,300 call sites" is not the size of this work, and neither is 39.** The
+call sites are MECHANICAL — a paren-matching rewrite to the `try_` spelling
+with `?`, plus the `use` lines. What costs is the cascade: every helper that
+returned a bare `ObjectRef`/`Value`/`()` and therefore had nowhere to put a
+refusal has to gain an error channel, and so does everything that calls it.
+The compiler enumerates that set exactly, so it drives the work rather than a
+grep. Measured on 2026-08-06:
+
+| funnel | call sites | functions needing an error channel | outcome |
+|---|---:|---:|---|
+| `native-io::alloc_synthetic` | 23 | **6** | done, 2 rounds |
+| `native-collections::alloc_synthetic` | 146 | **44** | done, 4 rounds + 11 by hand |
+| `native-builtins::alloc_concurrent_synthetic` | 1,932 | **≥340** | **abandoned — see below** |
+
+Landing the first two also forced **34 cross-crate call sites** in
+native-builtins, because `make_hashset_with_elements`, the collector factories
+and the view builders are `pub` and became fallible. That is part of the cost of
+each funnel and is easy to forget when sizing one in isolation.
+
+### Why `alloc_concurrent_synthetic` was abandoned rather than finished
+
+Not because it is big. Because the cascade **stopped converging**: rounds of
+"give the reported functions an error channel, then re-ask the compiler" went
+277 → 160 → 134 → 106 → 105 → 155 → 137, and a second loop that also repaired
+the mechanical fallout (a stray `?`, a bare `return;`, an unwrapped tail) went
+315 → 317 → 322. A loop whose error count RISES is repairing less than it
+breaks, and the honest reading is that the remaining sites need per-site
+judgement, not another pass.
+
+Three tooling faults found on the way, all of which produce a PARSE error rather
+than a type error — which matters, because rustc stops at the first parse error
+per file and hides everything behind it:
+
+* a parameter that is itself a closure (`&dyn Fn(usize) -> bool`) makes "the
+  last `->` in the signature" pick the CLOSURE's return type; `str.replace` then
+  splits `Result<..>` across two parameters;
+* `(?<![\w.])get\(` matches inside `$get(`, so a `macro_rules!`-defined function
+  gets a `?` appended to its PARAMETER LIST;
+* a unit fn whose last line is a tail expression needs a `;` before the appended
+  `Ok(())`, and a tail that merely closes a multi-line call (`})`) is not an
+  expression to wrap at all — wrapping it yields the literal text `Ok(}))`.
+
+And one structural flaw worth knowing before anyone tries again: **the
+`?`-appender matches by NAME across every file**, so converting `alloc_foo` in
+one module also stamps a `?` on an unrelated `alloc_foo` in another. rustc
+reports each as "`?` operator has incompatible types" and the repair is to
+delete that `?` — but a name-based rewriter over a 112-file crate will keep
+generating them.
+
+**If you pick this up:** do it module by module, not crate-wide. The 1,932 sites
+are spread over 112 files and the modules are nearly independent; a per-module
+loop keeps the name collisions inside one file, where they are visible.
+
+### What making a funnel fallible actually FINDS — the reason to do it at all
+
+Two mint sites the earlier waves had missed, both surfaced the moment the
+funnel stopped fabricating silently, and neither would have been found by
+reading:
+
+* **`java/util/ServiceLoader$Itr`** (`native_stream_iterator`). Refusing it
+  broke `ServiceLoader`, and `ServiceLoader` is how the CLDR locale provider is
+  discovered — so ONE unlanded refusal produced
+  `ServiceConfigurationError: Locale provider adapter "CLDR" cannot be
+  instantiated` in the probe's `textformat` section *and*
+  `attach=throw-NoClassDefFoundError` in `JdkOnlyPlatformProbe`'s `agent`
+  section. Two gate sections, one cause, neither naming the class. It now lands
+  on a real `Arrays$ArrayItr` like its siblings.
+* **`java/util/HashMap$KeyItr` on the `ConcurrentHashMap` key-set path**
+  (`native_ksv_iterator`). The 2026-08-05 wave routed the four `HashSet`-side
+  mint sites through the refusal and left this one on the infallible funnel, so
+  `for (String x : ConcurrentHashMap.newKeySet())` died outright. `RChmKeySetView`
+  caught it.
+
+**And the second one is the exception that proves the rule about landings.** It
+is deliberately left on the infallible funnel. Every other snapshot iterator
+lands on a real `Arrays$ArrayItr`, and that trade was argued as free — "on the
+strict path the alternative was never a working `remove()`, it was an iteration
+that did not reach `next()`". That argument does not hold here: HotSpot's
+`ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
+`remove()` writes through, `RChmKeySetView` exercises exactly that, and a
+fixed-size list's iterator answers `UnsupportedOperationException: remove`.
+Landing it would trade a WORKING capability for a fidelity gain.
+
+So `counts.compatibility_classes` is **1**, not 0, on any workload that iterates
+a `ConcurrentHashMap` key set — and that number is the honest reading, not a
+regression to paper over. It goes to zero when CratonVM's `ConcurrentHashMap`
+carries a real `table[]` its own `KeyIterator` can walk, which is the
+collections reclassification wave. **Do not "fix" it by landing that site**
+without checking `RChmKeySetView` first.
 
 **The unmodifiable/factory/comparator family is closed — and the order was the
 whole lesson.** After the bootstrap migration, `JdkOnlyCensusLoadProbe` still
@@ -130,7 +231,7 @@ error.
 > iterator class, hand back the snapshot through a real `Arrays$ArrayList`'s
 > own iterator, which reads only the `Object[]` it was given. All six sections
 > are fixed; see
-> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
+> `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
 > (retired from this directory 2026-08-06, once its fifth class — the
 > `System.Logger` one, which had taken out every `ObjectInputStream`
 > construction — landed on a real `jdk.internal.logger.SimpleConsoleLogger`).
@@ -209,7 +310,7 @@ Reclassifying them is the dangerous direction in *Blast radius* — it silences
 the violation, keeps fabricating, and makes the zero-stub census green while
 the substitution continues. L7 acted on that verdict: the bootstrap site
 **refuses** them rather than relabelling them. See
-[VM-internal classes are mislabelled `CompatibilityStub`](../../internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md)
+VM-internal classes are mislabelled `CompatibilityStub` (`jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`)
 (RETIRED 2026-08-06).
 
 ## What specifically must change
@@ -229,13 +330,18 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
    That last one was reached from `ObjectInputFilter$Config.<clinit>`, so
    refusing it had been costing every `ObjectInputStream` construction in the
    VM. See
-   `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
+   `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
    **Still open here:** `java/util/Enumeration$Impl` in `classloader.rs`'s
    `getResources` helpers, which has no such landing yet. And the refusals are
    landings, not removals — the natives themselves are still registered, which
    is item 5's business.
-5. Make the three allocation funnels fallible (~2,300 call sites), then delete
-   `ensure_synthetic_class`.
+5. Make the three allocation funnels fallible, then delete
+   `ensure_synthetic_class`. **Two of three done 2026-08-06** —
+   `native-io::alloc_synthetic` and `native-collections::alloc_synthetic`, plus
+   the 34 cross-crate callers that forced. `native-builtins::alloc_concurrent_synthetic`
+   is not done and the reason is measured, not estimated; see *Why
+   `alloc_concurrent_synthetic` was abandoned rather than finished* above. Until
+   it is, `ensure_synthetic_class` cannot be deleted and this record stays open.
 
 ## How to verify a fix
 

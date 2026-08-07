@@ -33,7 +33,7 @@ unbuilt in increment 3 is the **GP** register class, and the reason is no longer
 the prologue — it is the safepoint obligation the section below states.
 
 Consolidates the `hir-01` and `hir-02` lanes of
-`docs/known-issues/c2/deep-research-vm-c2.md`, which asked for an HIR/LIR/MIR
+`docs/feature-designs/c2/deep-research-vm-c2.md`, which asked for an HIR/LIR/MIR
 split and for somewhere to send `isel`'s output. Both are answered here.
 
 Every claim is checked against the tree and cited `file:line`.
