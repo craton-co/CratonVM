@@ -5417,6 +5417,37 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `FileSystemProvider.setAttribute(Path, String, Object, LinkOption...)` —
+    // the write-side twin of the two `readAttributes` registrations above, and
+    // the last abstract declaration on this class that `Files` routes traffic
+    // to. It has exactly the same shape as the `readAttributes(String)` gap:
+    // implemented once on `sun.nio.fs.AbstractFileSystemProvider` in the real
+    // JDK, only declared (abstract) on `java.nio.file.spi.FileSystemProvider`,
+    // and CratonVM's default provider object is stamped with the abstract
+    // class. So every `Files.setAttribute` — and therefore
+    // `Files.setLastModifiedTime`, and H2's `FilePathDisk.setReadOnly` on
+    // Windows — died with `AbstractMethodError: ... has no Code attribute`.
+    //
+    // NOT Windows-only, despite where it was found: the pure-JDK witness fails
+    // identically on Linux. What is platform-specific is only which branch H2
+    // takes to get here (see `set_named_attribute`).
+    //
+    // Args: `[this, path, attribute, value, options]`.
+    r.register(
+        fsp,
+        "setAttribute",
+        "(Ljava/nio/file/Path;Ljava/lang/String;Ljava/lang/Object;[Ljava/nio/file/LinkOption;)V",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let spec = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let value = args.get(3).copied().unwrap_or(Value::Object(None));
+            set_named_attribute(ctx, path_obj, &spec, value)
+        },
+    );
+
     r.register(
         fsp,
         "newDirectoryStream",
@@ -10316,6 +10347,55 @@ fn attr_view_flag_arg(args: &[Value]) -> bool {
     args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0
 }
 
+/// Set (or clear) a path's read-only bit.
+///
+/// Split out of `dos_view_set_read_only` so `FileSystemProvider.setAttribute`
+/// — which is handed a `Path` and an attribute *name*, never a view object —
+/// changes the file exactly the way the view does. Two spellings of
+/// "`dos:readonly` is now true" that can drift apart is the
+/// `two-caches-one-invalidation-hook` shape.
+pub(crate) fn set_read_only_on_path(path: &str, on: bool) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(on);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_dos_flag_on_path(path: &str, flag: u32, on: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    extern "system" {
+        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
+    }
+    let meta = std::fs::metadata(path)?;
+    let mut attrs = meta.file_attributes();
+    if on {
+        attrs |= flag;
+    } else {
+        attrs &= !flag;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-Windows hosts have no DOS hidden/system/archive bits. Clearing one is
+/// trivially satisfied; SETTING one is refused out loud rather than pretended.
+/// `Ok(false)` means "refuse" — the caller turns that into the
+/// `UnsupportedOperationException` its own surface owes.
+#[cfg(not(windows))]
+pub(crate) fn set_dos_flag_on_path_supported(path: &str, on: bool) -> std::io::Result<bool> {
+    // Validate the file the way the real view does, whichever branch we take.
+    std::fs::metadata(path)?;
+    Ok(!on)
+}
+
 pub(crate) fn dos_view_set_read_only(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10323,40 +10403,18 @@ pub(crate) fn dos_view_set_read_only(
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    let mut perms = meta.permissions();
-    perms.set_readonly(on);
-    std::fs::set_permissions(&path, perms).map_err(|e| p57_io_error(&e))?;
+    set_read_only_on_path(&path, on).map_err(|e| p57_io_error(&e))?;
     Ok(None)
 }
 
 #[cfg(windows)]
 fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], flag: u32) -> MethodCallResult {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::MetadataExt;
-    extern "system" {
-        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
-    }
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    let mut attrs = meta.file_attributes();
-    if on {
-        attrs |= flag;
-    } else {
-        attrs &= !flag;
-    }
-    let wide: Vec<u16> = std::ffi::OsStr::new(&path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
-        return Err(RuntimeError::IOException {
-            message: format!("SetFileAttributes failed for {path}"),
-        }
-        .into());
-    }
+    set_dos_flag_on_path(&path, flag, on).map_err(|e| RuntimeError::IOException {
+        message: format!("SetFileAttributes failed for {path}: {e}"),
+    })?;
     Ok(None)
 }
 
@@ -10365,10 +10423,7 @@ fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], _flag: u32) ->
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    // Validate the file the way the real view does, whichever branch we take.
-    std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    if !on {
-        // Clearing a flag that can never be set here is trivially satisfied.
+    if set_dos_flag_on_path_supported(&path, on).map_err(|e| p57_io_error(&e))? {
         return Ok(None);
     }
     Err(RuntimeError::UnsupportedOperationException {
@@ -15689,8 +15744,286 @@ pub(crate) fn read_named_attributes(
     Ok(Some(Value::Object(Some(map))))
 }
 
+/// The attribute names a given view can *write*.
+///
+/// This is a strict subset of [`attribute_names_for_view`]: `size`,
+/// `isDirectory`, `fileKey` and friends are derived facts, and the JDK's own
+/// views answer `IllegalArgumentException` when asked to set one. Keeping the
+/// writable set in its own table (rather than deriving it by subtraction at the
+/// call site) is what stops "readable" and "writable" from silently becoming
+/// the same question.
+fn settable_attribute_names_for_view(view: &str) -> Option<&'static [&'static str]> {
+    const BASIC: &[&str] = &["lastModifiedTime", "lastAccessTime", "creationTime"];
+    const DOS: &[&str] = &[
+        "lastModifiedTime",
+        "lastAccessTime",
+        "creationTime",
+        "readonly",
+        "hidden",
+        "system",
+        "archive",
+    ];
+    const POSIX: &[&str] = &[
+        "lastModifiedTime",
+        "lastAccessTime",
+        "creationTime",
+        "permissions",
+        "owner",
+        "group",
+    ];
+    const OWNER: &[&str] = &["owner"];
+    match view {
+        "basic" => Some(BASIC),
+        "dos" => Some(DOS),
+        "posix" | "unix" => Some(POSIX),
+        "owner" => Some(OWNER),
+        _ => None,
+    }
+}
+
+/// `FileSystemProvider.setAttribute(path, "[view:]name", value, options)` —
+/// the write-side twin of [`read_named_attributes`].
+///
+/// In the real JDK this is implemented once, on
+/// `sun.nio.fs.AbstractFileSystemProvider`, and every concrete provider
+/// inherits it; `java.nio.file.spi.FileSystemProvider` only *declares* it,
+/// abstract. CratonVM's default-filesystem provider object is stamped with that
+/// abstract class, so with no native registered on it every
+/// `Files.setAttribute` call in the world resolved the abstract declaration and
+/// died with `AbstractMethodError: ... setAttribute ... has no Code attribute`
+/// — on **every** platform, not just Windows (docs/known-issues/h2/
+/// bug-h2-windows-files-setattribute-abstract.md). H2's
+/// `FilePathDisk.setReadOnly` is only the loudest caller: it takes the
+/// `Files.setAttribute(f, "dos:readonly", true)` branch on Windows and the
+/// `Files.setPosixFilePermissions` branch on Linux, which is the whole reason
+/// the failure looked platform-specific from H2's side.
+pub(crate) fn set_named_attribute(
+    ctx: &mut dyn NativeContext,
+    path_obj: ObjectRef,
+    spec: &str,
+    value: Value,
+) -> MethodCallResult {
+    let (view, name) = split_attribute_spec(spec);
+    if !supported_attribute_view_names().contains(&view) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    }
+    let Some(settable) = settable_attribute_names_for_view(view) else {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    };
+    if name.is_empty() || !settable.iter().any(|k| *k == name) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("'{view}:{name}' not recognized"),
+        }
+        .into());
+    }
+
+    let path = p57_read_path(ctx, path_obj);
+    // The JDK stats the file first, so a missing path is a NoSuchFileException
+    // and not whatever errno the individual setter would have produced.
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(p57_no_such_file(ctx, &path));
+    }
+
+    // `null` is never a legal value for any of these; the JDK NPEs before it
+    // reaches the filesystem.
+    let Value::Object(Some(value_obj)) = value else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some(format!("null value for '{view}:{name}'")),
+        }
+        .into());
+    };
+
+    match name {
+        "lastModifiedTime" | "lastAccessTime" | "creationTime" => {
+            let millis = filetime_read_millis(ctx, value_obj);
+            let (creation, access, modified) = match name {
+                "creationTime" => (Some(millis), None, None),
+                "lastAccessTime" => (None, Some(millis), None),
+                _ => (None, None, Some(millis)),
+            };
+            set_file_attribute_times(&path, creation, access, modified)
+                .map_err(|e| p57_io_error(&e))?;
+        }
+        "readonly" => {
+            let on = boxed_boolean_value(ctx, value_obj, view, name)?;
+            set_read_only_on_path(&path, on).map_err(|e| p57_io_error(&e))?;
+        }
+        "hidden" | "system" | "archive" => {
+            let on = boxed_boolean_value(ctx, value_obj, view, name)?;
+            #[cfg(windows)]
+            {
+                let flag = match name {
+                    "hidden" => DOS_ATTR_HIDDEN,
+                    "system" => DOS_ATTR_SYSTEM,
+                    _ => DOS_ATTR_ARCHIVE,
+                };
+                set_dos_flag_on_path(&path, flag, on).map_err(|e| {
+                    MethodCallFailed::from(RuntimeError::IOException {
+                        message: format!("SetFileAttributes failed for {path}: {e}"),
+                    })
+                })?;
+            }
+            #[cfg(not(windows))]
+            {
+                if !set_dos_flag_on_path_supported(&path, on).map_err(|e| p57_io_error(&e))? {
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: format!(
+                            "'{view}:{name}' is not settable on this platform: {path}"
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+        "permissions" => {
+            let mode = posix_permission_bits_from_set(ctx, value_obj);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                    .map_err(|e| p57_io_error(&e))?;
+            }
+            #[cfg(not(unix))]
+            {
+                // Unreachable: `posix` is not in `supported_attribute_view_names()`
+                // on Windows, so the view check above already rejected it.
+                let _ = mode;
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("'{view}:{name}' is not settable on this platform: {path}"),
+                }
+                .into());
+            }
+        }
+        // Recognised, and deliberately NOT implemented. Changing a file's owner
+        // or group needs a real `chown`, and the only id CratonVM could read off
+        // a `UserPrincipal` here comes from `get_field_by_name`, which answers
+        // `Int(0)` for an ABSENT field — i.e. the failure mode of guessing is
+        // "chown to root". A loud refusal is the honest answer; a silent no-op
+        // would let a caller believe the ownership changed.
+        "owner" | "group" => {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: format!(
+                    "'{view}:{name}' is not settable by CratonVM (no chown support): {path}"
+                ),
+            }
+            .into());
+        }
+        // `settable_attribute_names_for_view` is the only gate above, so this
+        // arm is reachable only if that table grows a name this match does not
+        // handle. Refuse rather than silently succeed.
+        _ => {
+            return Err(RuntimeError::UnsupportedOperationException {
+                message: format!("'{view}:{name}' is not settable by CratonVM: {path}"),
+            }
+            .into());
+        }
+    }
+    Ok(None)
+}
+
+/// Unbox a `Boolean` argument to `setAttribute`. The JDK throws
+/// `ClassCastException` when the value is not the type the attribute wants;
+/// answering `false` for, say, a `String` would silently clear a flag the
+/// caller asked to set.
+fn boxed_boolean_value(
+    ctx: &mut dyn NativeContext,
+    value_obj: ObjectRef,
+    view: &str,
+    name: &str,
+) -> Result<bool, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(value_obj);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    if class_name != "java/lang/Boolean" {
+        return Err(RuntimeError::ClassCastException {
+            message: format!(
+                "'{view}:{name}' expects a java.lang.Boolean, got {}",
+                class_name.replace('/', ".")
+            ),
+        }
+        .into());
+    }
+    match crate::lang_class::unbox_value(ctx, value_obj) {
+        Value::Int(v) => Ok(v != 0),
+        _ => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod named_attribute_tests {
+    use super::{
+        attribute_names_for_view, settable_attribute_names_for_view, supported_attribute_view_names,
+    };
+
+    /// Every name a view can WRITE must also be a name it can READ. A settable
+    /// name that `readAttributes` does not know is a round-trip that cannot be
+    /// verified — `setAttribute` reports success and reading it back throws
+    /// `IllegalArgumentException`.
+    #[test]
+    fn every_settable_name_is_also_a_readable_name() {
+        for view in ["basic", "dos", "posix", "unix", "owner"] {
+            let readable = attribute_names_for_view(view)
+                .unwrap_or_else(|| panic!("no readable name table for view '{view}'"));
+            let settable = settable_attribute_names_for_view(view)
+                .unwrap_or_else(|| panic!("no settable name table for view '{view}'"));
+            for name in settable {
+                assert!(
+                    readable.contains(name),
+                    "'{view}:{name}' is settable but not readable"
+                );
+            }
+        }
+    }
+
+    /// Derived facts are not settable. The JDK's own views answer
+    /// `IllegalArgumentException` for these; if the table ever admits one,
+    /// `set_named_attribute` would reach a match arm that does not handle it.
+    #[test]
+    fn derived_facts_are_not_settable() {
+        for view in ["basic", "dos", "posix", "unix"] {
+            let settable = settable_attribute_names_for_view(view).unwrap();
+            for derived in [
+                "size",
+                "isRegularFile",
+                "isDirectory",
+                "isSymbolicLink",
+                "isOther",
+                "fileKey",
+            ] {
+                assert!(
+                    !settable.contains(&derived),
+                    "'{view}:{derived}' must not be settable"
+                );
+            }
+        }
+    }
+
+    /// A view CratonVM advertises through `supportedFileAttributeViews()` must
+    /// have a settable-name table too, or `setAttribute` answers
+    /// `UnsupportedOperationException` for a view the same VM just claimed to
+    /// support. `user` (extended attributes, no fixed names) and `acl` (whose
+    /// only attribute is the ACL itself) are the documented exceptions.
+    #[test]
+    fn every_advertised_view_except_user_and_acl_has_a_settable_table() {
+        for view in supported_attribute_view_names() {
+            if *view == "user" || *view == "acl" {
+                continue;
+            }
+            assert!(
+                settable_attribute_names_for_view(view).is_some(),
+                "advertised view '{view}' has no settable-name table"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod named_attribute_read_tests {
     use super::{attribute_names_for_view, split_attribute_spec, supported_attribute_view_names};
 
     /// `Files` treats a spec with no colon as the `basic` view. Getting this
