@@ -158,6 +158,43 @@ generating them.
 are spread over 112 files and the modules are nearly independent; a per-module
 loop keeps the name collisions inside one file, where they are visible.
 
+### What making a funnel fallible actually FINDS — the reason to do it at all
+
+Two mint sites the earlier waves had missed, both surfaced the moment the
+funnel stopped fabricating silently, and neither would have been found by
+reading:
+
+* **`java/util/ServiceLoader$Itr`** (`native_stream_iterator`). Refusing it
+  broke `ServiceLoader`, and `ServiceLoader` is how the CLDR locale provider is
+  discovered — so ONE unlanded refusal produced
+  `ServiceConfigurationError: Locale provider adapter "CLDR" cannot be
+  instantiated` in the probe's `textformat` section *and*
+  `attach=throw-NoClassDefFoundError` in `JdkOnlyPlatformProbe`'s `agent`
+  section. Two gate sections, one cause, neither naming the class. It now lands
+  on a real `Arrays$ArrayItr` like its siblings.
+* **`java/util/HashMap$KeyItr` on the `ConcurrentHashMap` key-set path**
+  (`native_ksv_iterator`). The 2026-08-05 wave routed the four `HashSet`-side
+  mint sites through the refusal and left this one on the infallible funnel, so
+  `for (String x : ConcurrentHashMap.newKeySet())` died outright. `RChmKeySetView`
+  caught it.
+
+**And the second one is the exception that proves the rule about landings.** It
+is deliberately left on the infallible funnel. Every other snapshot iterator
+lands on a real `Arrays$ArrayItr`, and that trade was argued as free — "on the
+strict path the alternative was never a working `remove()`, it was an iteration
+that did not reach `next()`". That argument does not hold here: HotSpot's
+`ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
+`remove()` writes through, `RChmKeySetView` exercises exactly that, and a
+fixed-size list's iterator answers `UnsupportedOperationException: remove`.
+Landing it would trade a WORKING capability for a fidelity gain.
+
+So `counts.compatibility_classes` is **1**, not 0, on any workload that iterates
+a `ConcurrentHashMap` key set — and that number is the honest reading, not a
+regression to paper over. It goes to zero when CratonVM's `ConcurrentHashMap`
+carries a real `table[]` its own `KeyIterator` can walk, which is the
+collections reclassification wave. **Do not "fix" it by landing that site**
+without checking `RChmKeySetView` first.
+
 **The unmodifiable/factory/comparator family is closed — and the order was the
 whole lesson.** After the bootstrap migration, `JdkOnlyCensusLoadProbe` still
 fabricated `cratonvm/internal/UnmodifiableSet` and `JdkOnlyBreadthProbe` four
