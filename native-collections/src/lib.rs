@@ -44263,24 +44263,29 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let (arr, total) = ksv_snapshot_array(ctx, this);
     let arr_pin = ctx.pin_native_root(arr);
-    // Same landing as `native_hs_iterator`: no JDK declares
-    // `java.util.HashMap$KeyItr` (the real one is `HashMap$KeyIterator`), so
-    // `--jdk-only` refuses this shape — and a refusal with nowhere to go took
-    // out `for (String x : ConcurrentHashMap.newKeySet())` entirely, which is
-    // what `RChmKeySetView` caught. Hand the same snapshot back through a real
-    // `Arrays$ArrayItr`.
+    // THE ONE MINT SITE DELIBERATELY LEFT ON THE INFALLIBLE FUNNEL.
     //
-    // Not `?`: `this_pin` is this frame's pin base, and unwinding past the
-    // `unpin_native_roots` below would strand it and everything pinned above.
-    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
-        Ok(itr) => itr,
-        Err(_refused) => {
-            let arr = ctx.read_native_pin(arr_pin, arr);
-            let real = real_snapshot_iterator(ctx, arr, total);
-            ctx.unpin_native_roots(this_pin);
-            return real;
-        }
-    };
+    // Every other snapshot iterator lands on a real `Arrays$ArrayItr` when
+    // `--jdk-only` refuses the fabricated shape, and the trade was argued as
+    // free: "on the strict path the alternative was never a working `remove()`
+    // — it was an iteration that did not reach `next()`"
+    // (`docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`).
+    //
+    // That argument does NOT hold here, and `RChmKeySetView` is what measured
+    // it. HotSpot's `ConcurrentHashMap$KeySetView.iterator()` returns a
+    // `KeyIterator` whose `remove()` writes through to the map, the test
+    // exercises exactly that, and a fixed-size list's iterator answers
+    // `UnsupportedOperationException: remove`. So landing on the real array
+    // iterator here would trade a WORKING capability for a fidelity gain,
+    // which is the wrong direction.
+    //
+    // Leaving it infallible means a strict run still fabricates
+    // `java/util/HashMap$KeyItr` for this one path, and
+    // `counts.compatibility_classes` will report it. That is the honest
+    // reading: the refusal is not free until CratonVM's `ConcurrentHashMap`
+    // carries a real `table[]` its own `KeyIterator` can walk, which is the
+    // collections reclassification wave, not this one.
+    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
     let arr = ctx.read_native_pin(arr_pin, arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));

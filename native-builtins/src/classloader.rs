@@ -4937,7 +4937,7 @@ fn deduplicate_rooted_urls(ctx: &mut dyn NativeContext, urls: &mut Vec<RootedUrl
     *urls = unique;
 }
 
-fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> ObjectRef {
+fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     // GC-safety: `build_synthetic_url` per iteration allocates (transitively
     // GC-triggering); `arr` is written into again via `set_array_element`
@@ -4949,19 +4949,17 @@ fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) ->
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
-    enm
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
+    Ok(enm)
 }
 
 /// Build a merged enumeration without converting its URLs through external
 /// forms.  Custom URLStreamHandler instances are object state, so rebuilding a
 /// URL from its String (as the flat-classpath path does) makes in-memory
 /// archives such as ShrinkWrap's `archive:` resources unreadable.
-fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl]) -> ObjectRef {
+fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, rooted) in urls.iter().copied().enumerate() {
@@ -4979,12 +4977,10 @@ fn enumeration_from_rooted_urls(ctx: &mut dyn NativeContext, urls: &[RootedUrl])
             let _ = ctx.remove_global_root(rooted.root);
         }
     }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
-    enm
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
+    Ok(enm)
 }
 
 /// `allow_delegate` = whether a non-builtin `ClassLoader` receiver may be
@@ -5093,7 +5089,7 @@ fn cl_get_resources_impl(
                 }
                 ctx.unpin_native_roots(p_this);
                 deduplicate_rooted_urls(ctx, &mut urls);
-                let enm = enumeration_from_rooted_urls(ctx, &urls);
+                let enm = enumeration_from_rooted_urls(ctx, &urls)?;
                 return Ok(Some(Value::Object(Some(enm))));
             }
         }
@@ -5217,7 +5213,7 @@ fn cl_get_resources_impl(
                         // this loader's local entries, so return the combined
                         // enumeration even when it is empty.
                         deduplicate_rooted_urls(ctx, &mut delegated_urls);
-                        let enm = enumeration_from_rooted_urls(ctx, &delegated_urls);
+                        let enm = enumeration_from_rooted_urls(ctx, &delegated_urls)?;
                         return Ok(Some(Value::Object(Some(enm))));
                     }
                 }
@@ -5308,7 +5304,7 @@ fn cl_get_resources_impl(
     // are registered unconditionally by `register_enumeration_impl_natives`
     // so this works in both synthetic-JDK and real-JDK modes without
     // relying on java.util.Vector's internal layout.
-    let enm = enumeration_from_url_strings(ctx, &urls);
+    let enm = enumeration_from_url_strings(ctx, &urls)?;
     Ok(Some(Value::Object(Some(enm))))
 }
 
