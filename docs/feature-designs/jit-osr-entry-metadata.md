@@ -6,7 +6,7 @@ OSR entry itself has worked for a long time. What had no owner is the *contract
 between* the vectors it rides on, and every near-miss this campaign found there
 was one bug class — **a plausible integer in the wrong coordinate space**.
 
-Answers the `osr-01` lane of `docs/known-issues/c2/deep-research-vm-c2.md`. The
+Answers the `osr-01` lane of `docs/feature-designs/c2/deep-research-vm-c2.md`. The
 brief is retired to
 `osr-01-entry-metadata-contract-RETIRED-20260804.md`.
 

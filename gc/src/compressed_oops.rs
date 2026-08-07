@@ -14,7 +14,7 @@
 //! whose header already costs 32 bytes moves a minority of the bytes, so the
 //! header shrink is the item with the leverage here, not this one. Full
 //! derivation in
-//! `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
+//! `beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
 //!
 //! Three modes are supported:
 //!
@@ -98,7 +98,7 @@
 //! feature, just not an urgent one.
 //!
 //! For what closing hole 1 did and did not buy on the workload that prompted
-//! it, see `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
+//! it, see `beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.
 //!
 //! ## Verified NOT needed (contrary to the older remaining-work list)
 //!

@@ -192,6 +192,73 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
      removing it means teaching that pass to chase forwarding pointers instead
      — a contained change, ~1M hash inserts and one large map per cycle saved.
 
+1a. **TRIED AND REVERTED — filtering the overlay walk is NOT the remaining cost.**
+
+   The obvious next move after the lock batching was to stop materialising
+   roots the collector throws away: push the young-span test *into* the
+   provider's walk so only young-pointing refs are collected. Implemented
+   (provider contract grew a `RefPredicate`, all three call sites updated,
+   977/977 gc lib tests and every native-collections target green) and then
+   **measured, interleaved A,B,B,A** against the batched binary:
+
+   | | pooled median | pooled mean |
+   |---|---|---|
+   | A (batched only) | 43 ms | 43.3 |
+   | B (batched + filtered) | 43 ms | 43.9 |
+
+   No difference. The block means run 38.1 → 41.8 → 45.8 → 47.9 in *time*
+   order regardless of arm, i.e. the host drifted ~3–4 ms per block over the
+   run; fitting that drift out gives A ≈ 38.1 and B ≈ 37.8–38.5. Failures also
+   went 12/24 to 20/24 versus the earlier session on the same box, so this run
+   was measured under worse conditions than the one before it — the
+   interleaving is the only reason that is visible rather than being read as a
+   regression.
+
+   **The premise was wrong, and it was inherited from this page rather than
+   checked.** The claim that the phase materialises "millions of `ObjectRef`s
+   per pause" was never measured. If building the `Vec` were the cost, removing
+   nearly all of it would have moved the number. It did not, so the remaining
+   ~43 ms is the **walk itself** — visiting every element of every overlay
+   collection and doing the per-key table lookups.
+
+   Reverted rather than carried: it is a cross-crate provider API change for an
+   unmeasured benefit. **Do not re-attempt this.** The only lever left on this
+   phase is the dirty flag below, which shortens the walk instead of shrinking
+   its output; anything that keeps visiting every element will land in the same
+   place.
+
+1b. **CORRECTION — `pointer_map` is NOT simply redundant. Do not delete it.**
+
+   An earlier note on this page framed `pointer_map` as ~1M `FxHashMap` inserts
+   per cycle duplicating forwarding pointers the headers already hold, removable
+   by teaching the remap to chase them. **Scoped 2026-08-07; that framing is
+   wrong**, and acting on it would have broken two unrelated things:
+
+   * It is a **public `GcResult` field consumed by a different collector.**
+     `g1.rs` composes forward maps across evacuation rounds
+     (`compose_forward_maps`, `identities(&acc.pointer_map)`) and asserts on its
+     contents. Header forwarding pointers cannot serve that: composition needs
+     the accumulated old→new mapping across rounds, not a single hop.
+   * It is a **survivor oracle whose consumers outlive forwarding pointers.**
+     Post-GC reference processing tests
+     `pointer_map.contains_key(addr) || is_addr_live(addr)`, and the non-moving
+     sweep keeps survivors in place with no entry at all — the gap behind the
+     2026-07-07 RRWL / `ThreadLocalMap$Entry` IMSE/hang family. Chasing a
+     forwarding pointer answers "where did it move", never "did it survive".
+
+   The map is load-bearing for consumers that have nothing to do with
+   forwarding. **The 82 references in `gen_heap.rs` are not 82 copies of one
+   idea**, which is what made this look like a contained cleanup from the
+   outside.
+
+   What does survive scoping: the `FxHashMap`→`HashMap` rebuild at the end of
+   the moving path (`pointer_map.into_iter().collect()`) pays ~1M SipHash
+   inserts purely to satisfy the public field's type. The existing comment
+   already argues this is the cheap end of a deliberate trade — the Cheney scan
+   was moved to `FxHashMap` precisely to avoid SipHash per insert — so the
+   remaining win is changing the *public field* to `FxHashMap`, which touches
+   `g1.rs` and the VM consumers. Real, but an API change, not a local cleanup.
+
 2. **`overlay_forward` is O(every overlay in the process), per minor GC** —
    68–125 ms and growing with heap population. `gen_heap.rs` seeds it with
    `external_roots_for_matching_owners(&|_| true)`: an always-true predicate
@@ -218,16 +285,49 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
    and then walks every element of every overlay collection. All of it to
    discover which handful of refs happen to be in young.
 
-   Three fixes, cheapest first, none of them started:
-   * hold the mutex **once** and gather owner→keys in a single pass (removes N
-     locks and N clones; local to `native-collections`, no cross-crate API
-     change);
-   * append into one caller-owned buffer instead of returning a fresh `Vec` per
-     owner (removes N allocations);
-   * the real one — a **dirty/card flag on overlay side-table writes**, so a
-     minor GC visits only owners mutated since the last cycle. That is what
-     makes the phase proportional to the young set instead of to the heap, and
-     it mirrors what the card table already does for ordinary object fields.
+   Three fixes, cheapest first:
+   * ~~hold the mutex **once** and gather owner→keys in a single pass~~ —
+     **LANDED** `828f8a68b`. 102 → 59 ms per collection (~42%).
+   * ~~batch the per-key table locks~~ — **LANDED** `8e8446104`. The owner-index
+     fix above left the *dominant* half untouched: the per-key loop still took
+     **7 more global mutexes per key**, and with the key count being the whole
+     index that is thousands of acquisitions inside the pause. Each table is now
+     locked once for a whole key list (`hm_int_fast` is sharded *by key*, so its
+     keys are grouped by shard instead — bounded by 64, never locking an empty
+     shard). Critically, this only pays off together with **flattening**
+     `gc_overlay_roots_for_matching_owners`: batching the per-owner helper alone
+     would still run one full set of acquisitions per owner (`6 * N`), which
+     would have read as a fix and moved almost nothing.
+
+     Measured interleaved **A,B,B,A**, 6 lanes, `CRATONVM_DBG=gcpause`:
+
+     | arm | n | median | mean | p90 | max |
+     |---|---|---|---|---|---|
+     | A (before) | 33 | 57 ms | 59.9 | 76 | 107 |
+     | B (after)  | 34 | **40 ms** | 41.7 | 61 | **62** |
+
+     −30% median, −42% max; every B sample lands ≤62 ms while A reaches 107 ms,
+     and *both* A rounds are worse than *both* B rounds, so the separation
+     survives the ordering. **The `[gcpause]` line only prints when the TOTAL
+     pause is ≥100 ms**, so as collections shrink they drop out of the sample and
+     the survivors skew slow — this understates the fix rather than flattering
+     it. No pass/fail rate is claimed: the arms alternated 6/12 and 4/12
+     failures with the same config landing on both sides, the same pattern that
+     already refuted one rate claim on this page.
+
+   * **still open, and now the whole remaining cost** — the phase still walks
+     every element of every overlay collection and materialises them all into a
+     `Vec` the collector immediately discards. Two levels:
+     - *cheap:* push a young-span **predicate** down into `native-collections`
+       so only young-pointing refs are collected. It must be a predicate, **not
+       a callback** — a callback would run with a table guard held and calls
+       `forward_object`, which mutates the heap and could re-enter
+       `native-collections`; a pure span read cannot. This shrinks the `Vec`
+       from millions to a handful but keeps the walk.
+     - *the real one:* a **dirty/card flag on overlay side-table writes**, so a
+       minor GC visits only owners mutated since the last cycle. That is what
+       makes the phase proportional to the young set instead of to the heap, and
+       it mirrors what the card table already does for ordinary object fields.
 
 ### Fix 1 landed (default OFF): pause-goal feedback on the young trigger
 
@@ -324,9 +424,17 @@ investigated:
   while the tail was worse in the one arm where it was sampled (679 vs 550 ms).
   Whether card-table-only helps, hurts, or is neutral end-to-end is **open**,
   and needs a quiet host — not another run on this one.
-* `overlay_forward` barely moves (57→40 ms) because it is proportional to the
-  whole heap's overlay population, not to young — the 1+N global-mutex defect
-  below. Its *share* of the pause is now much larger.
+* `overlay_forward` barely moves under the pause goal (57→40 ms) because it is
+  proportional to the whole heap's overlay population, not to young. Its *share*
+  of the pause is therefore much larger once the copying phases come down.
+
+  **Do not read those two numbers as the lock fix.** `8e8446104` independently
+  moved `overlay_forward` 57→40 ms median — the same figures, from a different
+  comparison (batched vs per-key locking, pause goal off in both arms). The
+  coincidence is unfortunate; the two results are unrelated and do not compound
+  into 57→40→23. The mutex defect this bullet used to point at is now fixed
+  (`828f8a68b` + `8e8446104`); what survives is the *walk*, which is what keeps
+  the phase proportional to the heap rather than to young.
 
 **Neither of the two defects below is fixed.** The moving-Cheney phase breakdown is new
 (`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection on this

@@ -898,7 +898,7 @@ impl OldGen {
         // pass — at the time it still exhausted the heap in javac, it just got
         // there sooner. (The test passes as of 2026-08-06, for an unrelated
         // reason: see
-        // `docs/internal/beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.)
+        // `beanregistrations-verylarge-heap-footprint-FIXED-20260806.md`.)
         // And on the 1001-definition
         // sibling, whose old gen is small enough that the quadratic never bites,
         // an alternating 2-binary A/B is within noise (221 s vs 229 s). The
@@ -1195,7 +1195,7 @@ impl OldGen {
         // lock in the old generation reset, and every INFLATED word's single
         // strong `Arc<Monitor>` reference dropped on the floor, leaving the slid
         // survivor with no monitor. Snapshot before clobbering, restore after
-        // the copy. See `docs/internal/arch-2026-07-26/header-shrink.md` §4.3.
+        // the copy. See `arch-2026-07-26/header-shrink.md` §4.3.
         let mut live_objects: Vec<(*mut u8, usize, *mut u8, u64)> = Vec::new();
 
         for &(obj_ptr, total_size) in &objects {

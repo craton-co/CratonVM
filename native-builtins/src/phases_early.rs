@@ -891,7 +891,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         // S111r7: use the native-collections HashSet layout (single
         // `map` field holding the backing HashMap) so real-JDK
         // `HashSet.iterator()` bytecode reads the correct receiver.
-        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(
@@ -1781,7 +1781,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // `AbstractSet.equals()` bytecode finds a HashMap on `getfield map`.
     let si = "java/util/Set";
     r.register(si, "of", "()Ljava/util/Set;", |ctx, _args| {
-        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+        let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
         Ok(Some(Value::Object(Some(set))))
     });
     r.register(
@@ -1798,7 +1798,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                     elems.push(ctx.get_array_element(arr, i));
                 }
             }
-            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems);
+            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems)?;
             Ok(Some(Value::Object(Some(set))))
         },
     );

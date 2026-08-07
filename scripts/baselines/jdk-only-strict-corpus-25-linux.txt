@@ -8,7 +8,7 @@
 #
 # note: JNI argument/return marshalling is fixed — the thirteen filed families plus a new upcall-exception family all match HotSpot 25 in both modes over three consecutive three-arm runs, so JdkOnlyPlatformProbe real/jni and strict/jni come off. Removed by hand rather than by --update-baseline: that regenerates the whole set from ONE run, and two runs of this gate ten minutes apart disagreed about */vthreads (both arms diverging, then neither), so a regenerate would have written the documented intermittent section out on a coin flip. Dropping two measured lines can only tighten the ratchet.
 #
-# note: the three JdkOnlyBreadthProbe/strict serialization lines come off — the last of the five classes in docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md is fixed, so that probe is byte-identical to HotSpot in BOTH modes and the strict arm has no divergent section left. Removed by hand, not by --update-baseline, for the reason the note above gives: a regenerate rewrites the whole set from one run and would drop the documented-intermittent */vthreads pair on a coin flip.
+# note: the three JdkOnlyBreadthProbe/strict serialization lines come off — the last of the five classes in jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md is fixed, so that probe is byte-identical to HotSpot in BOTH modes and the strict arm has no divergent section left. Removed by hand, not by --update-baseline, for the reason the note above gives: a regenerate rewrites the whole set from one run and would drop the documented-intermittent */vthreads pair on a coin flip.
 #
 # The gate fails when this set GROWS. A line that stops diverging is
 # reported and passes, so a fix is never blocked by the gate that

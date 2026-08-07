@@ -1958,7 +1958,7 @@ fn provider_get_services_native(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         .unwrap_or_default();
 
     let this_pin = ctx.pin_native_root(this);
-    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?;
     let set_pin = ctx.pin_native_root(set);
     for entry in entries {
         let prov = ctx.read_native_pin(this_pin, this);

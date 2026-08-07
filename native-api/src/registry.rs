@@ -5661,6 +5661,28 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the synthetic `java/io/StringWriter` surface.
+        // It models the writer as `char[] buf` (slot 0) + `int count` (slot 1).
+        // The real JDK layout is the inherited `Writer.lock` (slot 0, Object)
+        // and `StringWriter.buf` (slot 1, StringBuffer), which the JDK holds
+        // EQUAL to each other. The synthetic state squats two real
+        // reference-typed fields, so a SUBCLASS reading the inherited
+        // `this.lock` saw an `int[]` where the JDK guarantees the StringBuffer
+        // — the assertion `regression-suite`'s `RSerial` fails on. A moving GC
+        // tracing a `char[]` parked in that mislabelled slot is the same hazard.
+        //
+        // The registration already sits behind `#[cfg(feature = "synthetic-jdk")]`
+        // with the comment "let the real bytecode run by default", but a Cargo
+        // feature only decides what is COMPILED: a feature-enabled binary RUN
+        // in real-JDK mode still registered it over the real class. This is the
+        // runtime half of that same intent. It is the only production
+        // registration site for the class (the others are `#[cfg(test)]`), so
+        // dropping it here reproduces the default build exactly, and the real
+        // StringWriter bytecode is self-contained — it just delegates to a real
+        // StringBuffer.
+        if self.drop_real_layout_synthetic && class_name == "java/io/StringWriter" {
+            return;
+        }
         // Real-JDK mode: drop the synthetic blocking/concurrent QUEUE family.
         // Every one of these is registered with the native-collections
         // four-slot layout (array/head/size/capacity), which no real JDK class
@@ -5732,7 +5754,7 @@ impl NativeMethodRegistry {
         // Real-JDK mode: drop the `Executors` POOL FACTORIES so the real
         // `java.util.concurrent.Executors` bytecode builds every executor.
         //
-        // JDK-ONLY-WAVE2 L10 (`docs/internal/L10-blocker-threadpool-init-DONE-20260806.md`,
+        // JDK-ONLY-WAVE2 L10 (`L10-blocker-threadpool-init-DONE-20260806.md`,
         // `docs/jdk-only-runtime-services.md` P1). The scheduled pair has been
         // dropped here since the Tomcat `ContainerBase` fix; the three plain-pool
         // factories were the ones still fabricating. What they did was subtler

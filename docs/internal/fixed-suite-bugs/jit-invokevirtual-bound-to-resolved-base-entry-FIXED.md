@@ -149,7 +149,7 @@ Each step is a measurement, on the dev-tip control binary unless stated.
 
 `org.h2.test.db.TestMultiThread` runs to completion again. That class is the
 reproduction vehicle for
-`docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`, which
+`fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`, which
 could not be validated at all while every run died in the first four seconds.
 
 ## Verification

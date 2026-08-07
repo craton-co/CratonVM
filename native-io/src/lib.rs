@@ -17048,6 +17048,44 @@ fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: us
     ctx.alloc_object(cid, num_fields)
 }
 
+/// The fallible spelling of [`alloc_synthetic`] — same operation, with the
+/// refusal `--jdk-only` requires.
+///
+/// [`alloc_synthetic`] reaches `ensure_synthetic_class`, whose signature has no
+/// error channel, so under `--jdk-only` it records a
+/// `CompatibilityClassRequested` violation and then fabricates anyway. This one
+/// goes through `try_ensure_synthetic_class`, so the refusal reaches the caller
+/// as the `NoClassDefFoundError` contract §5 names.
+///
+/// Under the default `Compatible` mode the two are byte-for-byte identical:
+/// `try_ensure_synthetic_class` is documented as `ensure_synthetic_class` there.
+///
+/// `refusal_to_java_failure`, not the `?` conversion: the latter yields
+/// `MethodCallFailed::InternalError`, which is uncatchable and aborts the run.
+/// A policy refusal has to arrive as a throwable the program can catch. This
+/// mirrors `native-collections`' `try_alloc_synthetic` and
+/// `native-builtins`' `try_alloc_concurrent_synthetic` deliberately: three
+/// funnels that differ in their real-class preference must not also differ in
+/// what a refusal looks like.
+#[track_caller]
+fn try_alloc_synthetic(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let cid = match ctx.ensure_class_initialized(class_name) {
+        Ok(cid) => cid,
+        Err(_) => match ctx.class_id_by_name(class_name) {
+            Some(cid) => cid,
+            None => match ctx.try_ensure_synthetic_class(class_name, num_fields) {
+                Ok(id) => id,
+                Err(err) => return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+            },
+        },
+    };
+    Ok(ctx.alloc_object(cid, num_fields))
+}
+
 fn obj_arg92(args: &[Value], index: usize) -> Result<ObjectRef, MethodCallFailed> {
     match args.get(index) {
         Some(Value::Object(Some(o))) => Ok(*o),
@@ -17402,11 +17440,11 @@ fn alloc_afc_channel(
         message: format!("AsynchronousFileChannel.open: {e}"),
     })?;
 
-    let afc = alloc_synthetic(
+    let afc = try_alloc_synthetic(
         ctx,
         "java/nio/channels/AsynchronousFileChannel",
         AFC_NUM_FIELDS,
-    );
+    )?;
     ctx.set_field(afc, AFC_FIELD_FD, Value::Int(handle_id as i32));
     let path_s = ctx.create_string(path_str);
     ctx.set_field(afc, AFC_FIELD_PATH, Value::Object(Some(path_s)));
@@ -17459,8 +17497,8 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         // other exit point) crashes the VM instead of raising. Box +
         // wrap like the rest of this function.
         _ => {
-            let boxed = afc_box_integer(ctx, -1);
-            return Ok(Some(wrap_completed_future(ctx, boxed)));
+            let boxed = afc_box_integer(ctx, -1)?;
+            return Ok(Some(wrap_completed_future(ctx, boxed)?));
         }
     };
 
@@ -17469,8 +17507,8 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        let boxed = afc_box_integer(ctx, 0);
-        return Ok(Some(wrap_completed_future(ctx, boxed)));
+        let boxed = afc_box_integer(ctx, 0)?;
+        return Ok(Some(wrap_completed_future(ctx, boxed)?));
     }
 
     let mut buf = vec![0u8; remaining];
@@ -17501,8 +17539,8 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     })?;
 
     if n == 0 {
-        let boxed = afc_box_integer(ctx, -1);
-        return Ok(Some(wrap_completed_future(ctx, boxed)));
+        let boxed = afc_box_integer(ctx, -1)?;
+        return Ok(Some(wrap_completed_future(ctx, boxed)?));
     }
 
     let view = bb_storage_view(ctx, bb)?;
@@ -17520,8 +17558,8 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // proper Integer. The sibling CompletionHandler-based overloads
     // below already box via afc_box_integer -- this just brings the
     // plain Future overload in line with that established pattern.
-    let boxed = afc_box_integer(ctx, n as i32);
-    Ok(Some(wrap_completed_future(ctx, boxed)))
+    let boxed = afc_box_integer(ctx, n as i32)?;
+    Ok(Some(wrap_completed_future(ctx, boxed)?))
 }
 
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17541,8 +17579,8 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // See the matching arm in native_afc_read: must be a boxed
         // Integer inside a real completed Future, not a bare Value::Int.
         _ => {
-            let boxed = afc_box_integer(ctx, -1);
-            return Ok(Some(wrap_completed_future(ctx, boxed)));
+            let boxed = afc_box_integer(ctx, -1)?;
+            return Ok(Some(wrap_completed_future(ctx, boxed)?));
         }
     };
 
@@ -17579,8 +17617,8 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        let boxed = afc_box_integer(ctx, 0);
-        return Ok(Some(wrap_completed_future(ctx, boxed)));
+        let boxed = afc_box_integer(ctx, 0)?;
+        return Ok(Some(wrap_completed_future(ctx, boxed)?));
     }
 
     let mut data = vec![0u8; remaining];
@@ -17606,14 +17644,14 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // See native_afc_read above for the full rationale: box before
     // wrapping, matching the CompletionHandler overloads' afc_box_integer
     // usage, so Future<Integer>.get()'s checkcast Integer succeeds.
-    let boxed = afc_box_integer(ctx, n as i32);
-    Ok(Some(wrap_completed_future(ctx, boxed)))
+    let boxed = afc_box_integer(ctx, n as i32)?;
+    Ok(Some(wrap_completed_future(ctx, boxed)?))
 }
 
-fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Value {
-    let obj = alloc_synthetic(ctx, "java/lang/Integer", 1);
+fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Result<Value, MethodCallFailed> {
+    let obj = try_alloc_synthetic(ctx, "java/lang/Integer", 1)?;
     ctx.set_field(obj, 0, Value::Int(n));
-    Value::Object(Some(obj))
+    Ok(Value::Object(Some(obj)))
 }
 
 /// Read with CompletionHandler callback — performs read then invokes handler.completed()
@@ -17643,7 +17681,7 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             // CompletionHandler.completed erases to (Object,Object); box the
             // byte count just like HotSpot's AsynchronousFileChannel does.
             let completed_arg = match bytes_read {
-                Value::Int(n) => afc_box_integer(ctx, n),
+                Value::Int(n) => afc_box_integer(ctx, n)?,
                 other => other,
             };
             let _ = ctx.invoke_virtual(
@@ -17656,7 +17694,7 @@ fn native_afc_read_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Err(e) => {
             // Call handler.failed(exception, attachment)
             let exc_msg = format!("{:?}", e);
-            let exc = afc_io_exception(ctx, &exc_msg);
+            let exc = afc_io_exception(ctx, &exc_msg)?;
             let _ = ctx.invoke_virtual(
                 handler,
                 "failed",
@@ -17692,7 +17730,7 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
                 Value::Int(0)
             };
             let completed_arg = match bytes_written {
-                Value::Int(n) => afc_box_integer(ctx, n),
+                Value::Int(n) => afc_box_integer(ctx, n)?,
                 other => other,
             };
             let _ = ctx.invoke_virtual(
@@ -17704,7 +17742,7 @@ fn native_afc_write_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         Err(e) => {
             let exc_msg = format!("{:?}", e);
-            let exc = afc_io_exception(ctx, &exc_msg);
+            let exc = afc_io_exception(ctx, &exc_msg)?;
             let _ = ctx.invoke_virtual(
                 handler,
                 "failed",
@@ -17750,11 +17788,14 @@ pub(crate) fn native_afc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 /// Wrap a value in a "CompletedFuture" synthetic object.
 /// CompletedFuture layout: [0] = result value, [1] = done (always 1)
-fn wrap_completed_future(ctx: &mut dyn NativeContext, value: Value) -> Value {
-    let future = alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2);
+fn wrap_completed_future(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<Value, MethodCallFailed> {
+    let future = try_alloc_synthetic(ctx, "java/util/concurrent/CompletedFuture", 2)?;
     ctx.set_field(future, 0, value);
     ctx.set_field(future, 1, Value::Int(1)); // done
-    Value::Object(Some(future))
+    Ok(Value::Object(Some(future)))
 }
 
 fn native_completed_future_cancel(
@@ -17786,7 +17827,10 @@ fn native_completed_future_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(ctx.get_field(this, 0)))
 }
 
-fn afc_io_exception(ctx: &mut dyn NativeContext, message: &str) -> ObjectRef {
+fn afc_io_exception(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let msg = ctx.create_string(message);
     let msg_root = ctx.add_global_root(msg);
     let msg_now = ctx.resolve_global_root(msg_root).unwrap_or(msg);
@@ -17799,14 +17843,14 @@ fn afc_io_exception(ctx: &mut dyn NativeContext, message: &str) -> ObjectRef {
     let exc = match constructed {
         Ok(Some(Value::Object(Some(exc)))) => exc,
         _ => {
-            let exc = alloc_synthetic(ctx, "java/io/IOException", 2);
+            let exc = try_alloc_synthetic(ctx, "java/io/IOException", 2)?;
             let msg_now = ctx.resolve_global_root(msg_root).unwrap_or(msg);
             ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg_now)));
             exc
         }
     };
     let _ = ctx.remove_global_root(msg_root);
-    exc
+    Ok(exc)
 }
 
 // ---------------------------------------------------------------------------
@@ -18035,19 +18079,19 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         kinds,
         "ENTRY_CREATE",
         "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_CREATE))),
+        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_CREATE)?)),
     );
     r.register(
         kinds,
         "ENTRY_DELETE",
         "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_DELETE))),
+        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_DELETE)?)),
     );
     r.register(
         kinds,
         "ENTRY_MODIFY",
         "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_MODIFY))),
+        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_MODIFY)?)),
     );
     r.set_category(__prev_cat);
 }
@@ -18101,7 +18145,10 @@ fn watch_event_kind_bit(ctx: &mut dyn NativeContext, kind: ObjectRef) -> i32 {
 
 /// The `WatchEvent.Kind` object for `bit` — the real JDK singleton when the
 /// class is loadable, else a synthetic one-field stand-in.
-fn watch_event_kind_object(ctx: &mut dyn NativeContext, bit: i32) -> Value {
+fn watch_event_kind_object(
+    ctx: &mut dyn NativeContext,
+    bit: i32,
+) -> Result<Value, MethodCallFailed> {
     let field = match bit {
         EVENT_CREATE => "ENTRY_CREATE",
         EVENT_DELETE => "ENTRY_DELETE",
@@ -18112,13 +18159,13 @@ fn watch_event_kind_object(ctx: &mut dyn NativeContext, bit: i32) -> Value {
         if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
             let v = ctx.get_static_field(cid, idx);
             if matches!(v, Value::Object(Some(_))) {
-                return v;
+                return Ok(v);
             }
         }
     }
-    let k = alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1);
+    let k = try_alloc_synthetic(ctx, "java/nio/file/WatchEvent$Kind", 1)?;
     ctx.set_field(k, 0, Value::Int(bit));
-    Value::Object(Some(k))
+    Ok(Value::Object(Some(k)))
 }
 
 /// Build the `WatchEvent.context()` value for `name` (a basename) relative to
@@ -18134,7 +18181,7 @@ fn watch_context_path(
     ctx: &mut dyn NativeContext,
     watchable: Option<ObjectRef>,
     name: &str,
-) -> Value {
+) -> Result<Value, MethodCallFailed> {
     if let Some(dir) = watchable {
         // `create_string` allocates, so `dir` must be re-read afterwards.
         let dir_pin = ctx.pin_native_root(dir);
@@ -18165,18 +18212,18 @@ fn watch_context_path(
         };
         ctx.unpin_native_roots(dir_pin);
         if let Some(v) = out {
-            return v;
+            return Ok(v);
         }
     }
     // No watchable (or the real Path surface refused): fall back to the
     // historical 2-field synthetic Path — [0] = name String, [1] = FileSystem.
     let path_s = ctx.create_string(name);
     let path_pin = ctx.pin_native_root(path_s);
-    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
+    let path_obj = try_alloc_synthetic(ctx, "java/nio/file/Path", 2)?;
     let path_s = ctx.read_native_pin(path_pin, path_s);
     ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
     ctx.unpin_native_roots(path_pin);
-    Value::Object(Some(path_obj))
+    Ok(Value::Object(Some(path_obj)))
 }
 
 /// `java.nio.file.ClosedWatchServiceException` — what the JDK throws from
@@ -18221,7 +18268,7 @@ fn ws_require_open(
 /// an IOException — the Java side treats WatchService setup as a
 /// checked operation so throwing here is spec-compliant.
 fn native_ws_new(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let ws = alloc_synthetic(ctx, "java/nio/file/WatchService", WS_NUM_FIELDS);
+    let ws = try_alloc_synthetic(ctx, "java/nio/file/WatchService", WS_NUM_FIELDS)?;
     let regs = ctx.new_array(ArrayElementType::Reference, 64);
     ctx.set_field(ws, WS_FIELD_REGS, Value::Object(Some(regs)));
     ctx.set_field(ws, WS_FIELD_COUNT, Value::Int(0));
@@ -18378,7 +18425,7 @@ fn native_ws_register(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // key into freed memory (the Family-1 stale-ObjectRef defect).
     let path_obj_pin = ctx.pin_native_root(path_obj);
     let watcher_pin = ctx.pin_native_root(watcher);
-    let wk = alloc_synthetic(ctx, "java/nio/file/WatchKey", WK_NUM_FIELDS);
+    let wk = try_alloc_synthetic(ctx, "java/nio/file/WatchKey", WK_NUM_FIELDS)?;
     let wk_pin = ctx.pin_native_root(wk);
     let path_s = ctx.create_string(&canonical_str);
     let wk = ctx.read_native_pin(wk_pin, wk);
@@ -18485,14 +18532,14 @@ fn ws_signalled_key(
         let pending = ctx.new_array(ArrayElementType::Reference, events.len());
         let pending_pin = ctx.pin_native_root(pending);
         for (j, (kind, name)) in events.iter().enumerate() {
-            let we = alloc_synthetic(ctx, "java/nio/file/WatchEvent", WE_NUM_FIELDS);
+            let we = try_alloc_synthetic(ctx, "java/nio/file/WatchEvent", WE_NUM_FIELDS)?;
             let we_pin = ctx.pin_native_root(we);
             let watchable = match ctx.get_field(ctx.read_native_pin(wk_pin, wk), WK_FIELD_WATCHABLE)
             {
                 Value::Object(Some(p)) => Some(p),
                 _ => None,
             };
-            let context = watch_context_path(ctx, watchable, name);
+            let context = watch_context_path(ctx, watchable, name)?;
             let we_now = ctx.read_native_pin(we_pin, we);
             ctx.set_field(we_now, WE_FIELD_KIND, Value::Int(*kind));
             ctx.set_field(we_now, WE_FIELD_CONTEXT, context);
@@ -18728,7 +18775,7 @@ fn native_wk_poll_events(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     // Fallback for a VM configuration without a usable real ArrayList: the
     // historical 2-field synthetic list.
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
+    let list = try_alloc_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr = match pending_pin {
         Some((pin, fallback)) => ctx.read_native_pin(pin, fallback),
         None => ctx.new_array(ArrayElementType::Reference, 0),
@@ -18766,7 +18813,7 @@ fn native_wk_watchable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let path_s = ctx.create_string(&name);
     let path_pin = ctx.pin_native_root(path_s);
-    let path_obj = alloc_synthetic(ctx, "java/nio/file/Path", 2);
+    let path_obj = try_alloc_synthetic(ctx, "java/nio/file/Path", 2)?;
     let path_s = ctx.read_native_pin(path_pin, path_s);
     ctx.set_field(path_obj, 0, Value::Object(Some(path_s)));
     ctx.unpin_native_roots(path_pin);
@@ -18794,7 +18841,7 @@ fn native_we_kind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // The real `StandardWatchEventKinds` constants are singletons that callers
     // compare by identity (`event.kind() == ENTRY_CREATE`); a freshly minted
     // synthetic Kind would never match one.
-    Ok(Some(watch_event_kind_object(ctx, bit)))
+    Ok(Some(watch_event_kind_object(ctx, bit)?))
 }
 
 fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -19062,7 +19109,7 @@ fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
             message: format!("DatagramChannel.open: {e}"),
         })?;
 
-    let dc = alloc_synthetic(ctx, "java/nio/channels/DatagramChannel", DC_NUM_FIELDS);
+    let dc = try_alloc_synthetic(ctx, "java/nio/channels/DatagramChannel", DC_NUM_FIELDS)?;
     // "A newly-created channel is always in blocking mode"
     // (`java.nio.channels.SelectableChannel`). Assert it rather than assume
     // it: the side tables are keyed by identity hash, and a fresh object may
@@ -19320,7 +19367,10 @@ fn native_dc_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 /// Build a real-JDK-layout InetSocketAddress for a received IPv4 datagram.
 /// `DnsClient.blockingReceive` compares this object with its connected target,
 /// so a generic SocketAddress or a flat synthetic layout is insufficient.
-fn dc_inet_socket_address(ctx: &mut dyn NativeContext, source: &str) -> ObjectRef {
+fn dc_inet_socket_address(
+    ctx: &mut dyn NativeContext,
+    source: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
     let (host, port) = source
         .rsplit_once(':')
         .and_then(|(host, port)| port.parse::<i32>().ok().map(|port| (host, port)))
@@ -19330,23 +19380,23 @@ fn dc_inet_socket_address(ctx: &mut dyn NativeContext, source: &str) -> ObjectRe
         .map(|ip| i32::from_be_bytes(ip.octets()))
         .unwrap_or(0);
 
-    let inet = alloc_synthetic(ctx, "java/net/Inet4Address", 2);
-    let inet_holder = alloc_synthetic(ctx, "java/net/InetAddress$InetAddressHolder", 3);
+    let inet = try_alloc_synthetic(ctx, "java/net/Inet4Address", 2)?;
+    let inet_holder = try_alloc_synthetic(ctx, "java/net/InetAddress$InetAddressHolder", 3)?;
     let host_string = ctx.create_string(host);
     ctx.set_field_by_name(inet_holder, "hostName", Value::Object(Some(host_string)));
     ctx.set_field_by_name(inet_holder, "address", Value::Int(packed));
     ctx.set_field_by_name(inet_holder, "family", Value::Int(1));
     ctx.set_field_by_name(inet, "holder", Value::Object(Some(inet_holder)));
 
-    let socket = alloc_synthetic(ctx, "java/net/InetSocketAddress", 2);
+    let socket = try_alloc_synthetic(ctx, "java/net/InetSocketAddress", 2)?;
     let socket_holder =
-        alloc_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
+        try_alloc_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
     let socket_host = ctx.create_string(host);
     ctx.set_field_by_name(socket_holder, "hostname", Value::Object(Some(socket_host)));
     ctx.set_field_by_name(socket_holder, "addr", Value::Object(Some(inet)));
     ctx.set_field_by_name(socket_holder, "port", Value::Int(port));
     ctx.set_field_by_name(socket, "holder", Value::Object(Some(socket_holder)));
-    socket
+    Ok(socket)
 }
 
 fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -19393,7 +19443,7 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     buf_set_position(ctx, bb, pos + n as i32);
 
-    let sa = dc_inet_socket_address(ctx, &source_addr);
+    let sa = dc_inet_socket_address(ctx, &source_addr)?;
     Ok(Some(Value::Object(Some(sa))))
 }
 
@@ -19619,7 +19669,7 @@ fn register_selector(r: &mut NativeMethodRegistry) {
 }
 
 fn native_sel_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let sel = alloc_synthetic(ctx, "java/nio/channels/Selector", SEL_NUM_FIELDS);
+    let sel = try_alloc_synthetic(ctx, "java/nio/channels/Selector", SEL_NUM_FIELDS)?;
     let regs = ctx.new_array(ArrayElementType::Reference, 128);
     ctx.set_field(sel, SEL_FIELD_REGS, Value::Object(Some(regs)));
     ctx.set_field(sel, SEL_FIELD_COUNT, Value::Int(0));
@@ -19635,7 +19685,7 @@ fn native_channel_register(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => OP_READ,
     };
 
-    let sk = alloc_synthetic(ctx, "java/nio/channels/SelectionKey", SK_NUM_FIELDS);
+    let sk = try_alloc_synthetic(ctx, "java/nio/channels/SelectionKey", SK_NUM_FIELDS)?;
     ctx.set_field(sk, SK_FIELD_CHANNEL, Value::Object(Some(channel)));
     ctx.set_field(sk, SK_FIELD_INTEREST, Value::Int(ops));
     ctx.set_field(sk, SK_FIELD_READY, Value::Int(0));
@@ -19758,7 +19808,7 @@ fn native_sel_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let regs = match ctx.get_field(this, SEL_FIELD_REGS) {
         Value::Object(Some(a)) => a,
         _ => {
-            let set = alloc_synthetic(ctx, "java/util/HashSet", 2);
+            let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             ctx.set_field(set, 1, Value::Int(0));
@@ -19785,7 +19835,7 @@ fn native_sel_selected_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     for (i, sk) in selected.iter().enumerate() {
         ctx.set_array_element(set_arr, i, Value::Object(Some(*sk)));
     }
-    let set = alloc_synthetic(ctx, "java/util/HashSet", 2);
+    let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
     ctx.set_field(set, 0, Value::Object(Some(set_arr)));
     ctx.set_field(set, 1, Value::Int(selected.len() as i32));
     Ok(Some(Value::Object(Some(set))))
@@ -19800,7 +19850,7 @@ fn native_sel_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let regs = match ctx.get_field(this, SEL_FIELD_REGS) {
         Value::Object(Some(a)) => a,
         _ => {
-            let set = alloc_synthetic(ctx, "java/util/HashSet", 2);
+            let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
             let arr = ctx.new_array(ArrayElementType::Reference, 0);
             ctx.set_field(set, 0, Value::Object(Some(arr)));
             ctx.set_field(set, 1, Value::Int(0));
@@ -19821,7 +19871,7 @@ fn native_sel_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     for (i, sk) in valid.iter().enumerate() {
         ctx.set_array_element(set_arr, i, Value::Object(Some(*sk)));
     }
-    let set = alloc_synthetic(ctx, "java/util/HashSet", 2);
+    let set = try_alloc_synthetic(ctx, "java/util/HashSet", 2)?;
     ctx.set_field(set, 0, Value::Object(Some(set_arr)));
     ctx.set_field(set, 1, Value::Int(valid.len() as i32));
     Ok(Some(Value::Object(Some(set))))
@@ -21292,7 +21342,14 @@ mod io_tests {
             .expect("CompletedFuture timed get must be registered");
 
         let mut ctx = MockNativeContext::new();
-        let future = match wrap_completed_future(&mut ctx, Value::Int(123)) {
+        // `?` in a `-> ()` test does not compile, and `wrap_completed_future`
+        // returns `Result<Value, MethodCallFailed>` -- so unwrap the Result and
+        // match the `Value`. Landed broken in 1a07c0e54: `cargo test -p
+        // cratonvm-native-io` could not build the lib TEST TARGET at all, so
+        // every test in the crate was unrunnable and none of them said so.
+        let future = match wrap_completed_future(&mut ctx, Value::Int(123))
+            .expect("wrap_completed_future must not fail")
+        {
             Value::Object(Some(o)) => o,
             other => panic!("expected future object, got {other:?}"),
         };

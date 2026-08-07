@@ -8368,7 +8368,7 @@ pub fn register_essential_natives_with_shims(
                 Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
                 _ => String::new(),
             };
-            let descriptor = build_synthetic_module_descriptor(ctx, &name);
+            let descriptor = build_synthetic_module_descriptor(ctx, &name)?;
             Ok(Some(Value::Object(Some(descriptor))))
         },
     );
@@ -11734,7 +11734,7 @@ pub fn register_essential_natives_with_shims(
             ctx.set_field(m_obj, 0, module_name_val);
             ctx.set_field_by_name(m_obj, "name", module_name_val);
             if let Some(name) = module_name.as_deref() {
-                let desc = build_synthetic_module_descriptor(ctx, name);
+                let desc = build_synthetic_module_descriptor(ctx, name)?;
                 let m_obj = ctx.read_native_pin(pin, m_obj);
                 ctx.set_field_by_name(m_obj, "descriptor", Value::Object(Some(desc)));
             }
@@ -11905,7 +11905,7 @@ pub fn register_essential_natives_with_shims(
                 // Unnamed module: matches real Module.getDescriptor()'s null.
                 return Ok(Some(Value::Object(None)));
             }
-            let desc = build_synthetic_module_descriptor(ctx, &module_name);
+            let desc = build_synthetic_module_descriptor(ctx, &module_name)?;
             ctx.set_field_by_name(this, "descriptor", Value::Object(Some(desc)));
             Ok(Some(Value::Object(Some(desc))))
         },
@@ -17095,39 +17095,22 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Real-JDK `java.util.logging.Logger` objects (created by the JDK's
-            // demandLogger / 2-arg getLogger path and handed to e.g.
-            // `org.apache.juli.ClassLoaderLogManager.addLogger`) keep the name in
-            // their real `name` field, NOT at slot 0 (slot 0 is `config`, a
-            // `Logger$ConfigurationData`). Reading slot 0 unconditionally returned
-            // that ConfigurationData, so the caller's `getName().lastIndexOf('.')`
-            // threw NoSuchMethodError and aborted the VM.
-            //
-            // Check our OWN synthetic layout (slot 0 = name, a String) FIRST,
-            // before `get_field_by_name(this, "name")`: `allocate_logger`
-            // (logmanager.rs) now links non-root synthetic loggers to a real
-            // parent `Logger` at slot 2, and `get_field_by_name` resolves
-            // "name" using the REAL class's field metadata -- which for
-            // `java.util.logging.Logger` happens to BE slot 2. Checking
-            // `get_field_by_name` first would therefore alias onto the
-            // parent Logger object (any non-null object satisfies the `Some`
-            // pattern below, uncaught by any type check), returning it in
-            // place of the true name and blowing up the very next
-            // `getName().someStringMethod()` call with a `NoSuchMethodError`
-            // on `Logger`. A real Logger's slot 0 is never a String (it's
-            // `config`), so this ordering is safe for both layouts.
-            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
-                if ctx.class_name_of_id(ctx.class_id_of_object(s)).as_deref()
-                    == Some("java/lang/String")
-                {
-                    return Ok(Some(Value::Object(Some(s))));
-                }
-            }
-            if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
-                return Ok(Some(Value::Object(Some(s))));
-            }
-            let s = ctx.create_string("");
-            Ok(Some(Value::Object(Some(s))))
+            // Second of the three registrations for this triple. The reasoning
+            // that used to be written out here -- real-JDK `Logger` keeps the
+            // name in `name` and slot 0 is a `Logger$ConfigurationData`, so an
+            // unconditional slot-0 read makes the caller's
+            // `getName().lastIndexOf('.')` throw `NoSuchMethodError`; and the
+            // by-name lookup must NOT be tried first, because on a real
+            // `Logger` "name" resolves to the same slot `logmanager` uses for
+            // the parent link -- is the reason `jul_logger_name_object` exists
+            // and lives in one place. All three registrations call it now, so
+            // the accessor no longer depends on which one won the slot.
+            Ok(Some(
+                match crate::logmanager::jul_logger_name_object(&*ctx, this) {
+                    Some(name) => Value::Object(Some(name)),
+                    None => Value::Object(Some(ctx.create_string(""))),
+                },
+            ))
         },
     );
     registry.register(
@@ -30398,7 +30381,7 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
 pub(crate) fn build_synthetic_module_descriptor(
     ctx: &mut dyn NativeContext,
     module_name: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let uses: Vec<String> = ctx
         .module_uses(module_name)
         .into_iter()
@@ -30424,7 +30407,7 @@ pub(crate) fn build_synthetic_module_descriptor(
         "provides",
         "packages",
     ] {
-        let empty = module_descriptor_empty_set(ctx);
+        let empty = module_descriptor_empty_set(ctx)?;
         let desc = ctx.read_native_pin(pin, desc);
         ctx.set_field_by_name(desc, field, Value::Object(Some(empty)));
     }
@@ -30432,7 +30415,7 @@ pub(crate) fn build_synthetic_module_descriptor(
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "uses", Value::Object(Some(uses_set)));
     ctx.unpin_native_roots(pin);
-    desc
+    Ok(desc)
 }
 
 // ---------------------------------------------------------------------------
@@ -30474,8 +30457,8 @@ pub(crate) fn build_synthetic_module_descriptor(
 /// native-collections helper that uses the correct 1-field-with-
 /// backing-HashMap layout, matching `<init>()` / 0..3-arg `Set.of`
 /// behaviour and unblocking Spring `getConvertibleTypes()` paths.
-fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> ObjectRef {
-    cratonvm_native_collections::make_hashset_with_elements(ctx, args)
+fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, args)?)
 }
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
@@ -30498,7 +30481,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
@@ -30508,7 +30491,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
@@ -30518,7 +30501,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
@@ -30528,44 +30511,44 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |ctx, args| {
             Ok(Some(Value::Object(Some(build_hashset_from_args(
                 ctx, args,
-            )))))
+            )?))))
         },
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
     registry.register(
         s,
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args))))),
+        |ctx, args| Ok(Some(Value::Object(Some(build_hashset_from_args(ctx, args)?)))),
     );
 
     // --- Reflection.registerFieldsToFilter(Class, Set) ---
@@ -34728,12 +34711,23 @@ fn native_logger_get_global(ctx: &mut dyn NativeContext, _args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(logger))))
 }
 
+/// `Logger.getName()`, third of the three registrations for this triple.
+///
+/// All three now delegate to `logmanager::jul_logger_name_object`, which is the
+/// only code that knows where each of the VM's three JUL Logger layouts keeps
+/// the name. Reading one slot here was right for exactly one of them, and which
+/// one won was decided by registration order.
 fn native_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, LOGGER_FIELD_NAME)))
+    Ok(Some(
+        match crate::logmanager::jul_logger_name_object(&*ctx, this) {
+            Some(name) => Value::Object(Some(name)),
+            None => Value::Object(Some(ctx.create_string(""))),
+        },
+    ))
 }
 
 fn native_logger_get_level(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -41987,7 +41981,7 @@ mod t2_6_crypto_acceptance_tests {
 // position 3 and limit 2, and `CharBuffer.wrap(new char[4], 3, 2)` a buffer
 // running two limbs past its own array, where HotSpot throws.
 //
-// See `docs/known-issues/buffer-constructor-does-not-validate-position-and-limit.md`
+// See `buffer-constructor-does-not-validate-position-and-limit-FIXED-20260806.md`
 // (retired) — and note that the validation is NOT missing from
 // `Buffer.limit(int)`/`position(int)` themselves, which are correct and do
 // fire for every direct caller. It was missing only here, because this native

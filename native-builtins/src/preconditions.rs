@@ -34,7 +34,7 @@
 //! `IndexOutOfBoundsException` an `Objects.check*`/NIO caller is promised, so
 //! `catch (IndexOutOfBoundsException)` still worked but nothing narrower did.
 //! See
-//! `docs/internal/preconditions-ignores-the-exception-formatter-FIXED-20260805.md`.
+//! `preconditions-ignores-the-exception-formatter-FIXED-20260805.md`.
 //!
 //! # Why these are natives at all
 //!

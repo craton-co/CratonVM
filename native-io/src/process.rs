@@ -231,6 +231,14 @@ const PROC_FIELD_HANDLE: usize = JAVA_PROCESS_FIELD_COUNT + 5;
 /// Sentinel "not yet exited" value stored in the exit-code field.
 const EXIT_NOT_YET: i32 = i32::MIN;
 
+/// `ProcessHandleImpl.NOT_A_CHILD` — what `waitForProcessExit0` answers for a
+/// pid that is not a child of this process.
+///
+/// `@Native`-annotated on the JDK side, which makes it part of the native
+/// contract rather than an implementation detail: `ProcessHandleImpl.completion`
+/// compares against it by name and branches.
+const PROCESS_NOT_A_CHILD: i32 = -2;
+
 /// Total number of fields on the synthetic Process.
 const PROC_FIELD_COUNT: usize = JAVA_PROCESS_FIELD_COUNT + 6;
 
@@ -987,6 +995,23 @@ pub fn destroy_handle(handle: i64, force: bool) -> bool {
     signal_pid(pid_for_handle(handle), force)
 }
 
+/// Is `pid` still the process the caller's `startTime` came from?
+///
+/// The guard against acting on a recycled pid. `STARTTIME_ANY` (0) means the
+/// caller never learned one and is trusted — the JDK's native makes the same
+/// allowance, and without it every handle minted before start times were
+/// reported would stop working. An unreadable `/proc` entry is treated as a
+/// match for the same reason: unknown is not disagreement.
+fn start_time_matches(pid: i64, start_time: i64) -> bool {
+    if start_time == PROCESS_STARTTIME_ANY {
+        return true;
+    }
+    match os_process_start_time(pid) {
+        Some(actual) => actual == start_time,
+        None => true,
+    }
+}
+
 /// Send a termination signal straight to a pid.
 ///
 /// Only ever called with a pid that is provably un-reaped — see
@@ -1288,7 +1313,7 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 /// opposite answers — the first is a stub Process the VM owns, the second is
 /// someone else's.
 ///
-/// See `docs/known-issues/jdk-only/process-natives-answer-for-user-subclasses.md`
+/// See `process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 /// and `probes/UserProcessInterceptProbe.java`.
 fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
@@ -1693,6 +1718,89 @@ fn handle_for_pid(pid: i64) -> Option<i64> {
         .map(|(handle, _)| *handle)
 }
 
+/// Milliseconds since the epoch at which `pid` started, or `None`.
+///
+/// This is the value the JDK calls a process's *start time*, and it is what
+/// makes a pid safe to act on: a pid alone is ambiguous, because the OS recycles
+/// them, and `(pid, startTime)` is not. `ProcessHandleImpl` threads it through
+/// `isAlive0` -> the handle's `startTime` field -> `destroy0`, which refuses to
+/// signal when the two disagree. Reporting the JDK's "unknown" sentinel 0
+/// everywhere, as this bridge used to, collapses that pair back to a bare pid
+/// and leaves `destroy0` with nothing to check.
+///
+/// `/proc/<pid>/stat` field 22 is the start time in clock ticks since boot.
+/// Field 2 is the executable name in parentheses and may itself contain spaces
+/// AND parentheses, so the fields are counted from the LAST `)` rather than by
+/// splitting the whole line — the classic way to misparse this file.
+///
+/// Converted to the epoch, because that is the unit the rest of the JDK's
+/// process surface speaks: `ProcessHandle.Info.startInstant()` is
+/// `Instant.ofEpochMilli` of the same quantity. Ticks would compare equal to
+/// themselves and satisfy `destroy0` just as well, but would be wrong the moment
+/// anything displayed one.
+#[cfg(target_os = "linux")]
+fn os_process_start_time(pid: i64) -> Option<i64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // The remaining fields start at field 3 (`state`), so field 22 is index 19.
+    let ticks: i64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+    let hz = clock_ticks_per_second();
+    if hz <= 0 {
+        return None;
+    }
+    Some(boot_time_millis()? + ticks.checked_mul(1000)? / hz)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_process_start_time(_pid: i64) -> Option<i64> {
+    None
+}
+
+/// `sysconf(_SC_CLK_TCK)` — the unit of `/proc/<pid>/stat`'s tick fields.
+#[cfg(target_os = "linux")]
+fn clock_ticks_per_second() -> i64 {
+    static HZ: OnceLock<i64> = OnceLock::new();
+    // SAFETY: `sysconf` reads a process-wide constant and touches no caller
+    // memory.
+    *HZ.get_or_init(|| unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+}
+
+/// Wall-clock time of the last boot, in milliseconds since the epoch.
+///
+/// `/proc/stat`'s `btime` line, in seconds. Cached: it does not change while
+/// this process runs, and every `isAlive0` would otherwise re-read a file whose
+/// first lines are the whole machine's CPU accounting.
+#[cfg(target_os = "linux")]
+fn boot_time_millis() -> Option<i64> {
+    static BOOT: OnceLock<Option<i64>> = OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        stat.lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .and_then(|secs| secs.trim().parse::<i64>().ok())
+            .and_then(|secs| secs.checked_mul(1000))
+    })
+}
+
+/// The start time to report for a process known to exist.
+///
+/// Falls back to `STARTTIME_ANY` rather than to "no such process": a
+/// `/proc/<pid>/stat` this VM cannot read (permissions, a non-Linux host, a
+/// process that exited between the liveness check and this read) means the start
+/// time is unknown, not that the process is absent. 0 is the JDK's own word for
+/// that, and every comparison against it is short-circuited.
+fn start_time_or_any(pid: i64) -> i64 {
+    os_process_start_time(pid).unwrap_or(PROCESS_STARTTIME_ANY)
+}
+
+/// `ProcessHandleImpl.STARTTIME_ANY` — "the process exists; its start time is
+/// not available". Distinct from `STARTTIME_PROCESS_UNKNOWN` (-1), which is the
+/// only value `isAlive()` reads as not-alive.
+const PROCESS_STARTTIME_ANY: i64 = 0;
+
 /// Is a pid we did not spawn still alive?
 ///
 /// `/proc/<pid>` is present for a zombie too, which is the answer we want: a
@@ -1758,17 +1866,17 @@ fn native_proc_handle_is_alive0(_ctx: &mut dyn NativeContext, args: &[Value]) ->
     // we do not track a start time, and every comparison against it is
     // short-circuited by the `startTime == 0` disjunct anyway.
     if pid == std::process::id() as i64 {
-        return Ok(Some(Value::Long(0)));
+        return Ok(Some(Value::Long(start_time_or_any(pid))));
     }
     match handle_for_pid(pid) {
         // One of our own children: the process table knows for certain.
         Some(handle) => match try_exit_handle(handle) {
             Some(_) => Ok(Some(Value::Long(-1))), // exited
-            None => Ok(Some(Value::Long(0))),     // still running
+            None => Ok(Some(Value::Long(start_time_or_any(pid)))),
         },
         // Someone else's process: ask the OS.
         None => Ok(Some(Value::Long(if foreign_pid_is_alive(pid) {
-            0
+            start_time_or_any(pid)
         } else {
             -1
         }))),
@@ -1791,9 +1899,38 @@ fn native_proc_handle_wait_for_process_exit0(
         _ => return Ok(Some(Value::Int(-1))),
     };
     // A pid we did not spawn cannot be waited for: `wait(2)` only works on
-    // one's own children. -1 is what the JDK's own native reports there.
+    // one's own children. That is not an error, and it is not an exit status —
+    // it is a specific answer the JDK asks for by name:
+    //
+    //     int exitValue = waitForProcessExit0(pid, shouldReap);
+    //     if (exitValue == NOT_A_CHILD) {
+    //         // pid not alive or not a child of this process
+    //         // If it is alive wait for it to terminate
+    //         long startTime = isAlive0(pid);
+    //         while (startTime >= 0) { Thread.sleep(..); startTime = isAlive0(pid); }
+    //         exitValue = 0;
+    //     }
+    //     newCompletion.complete(exitValue);
+    //
+    // Anything else is taken at face value, so the -1 that used to stand here
+    // completed `ProcessHandle.of(pid).onExit()` IMMEDIATELY, with a fabricated
+    // exit status of -1, for a process that was still running. HotSpot's own
+    // native returns `NOT_A_CHILD` on `ECHILD` for exactly this case.
+    //
+    // Measured with `probes/ForeignHandleProbe.java`, whose subject is a
+    // grandchild (`sh` forks it and exits, so it is reparented and `waitpid`
+    // gives ECHILD). Bounding the wait at 400ms against a process that lives 30s:
+    //
+    //   HotSpot 25   onExitWaitsWhileAlive=still-waiting
+    //   before       onExitWaitsWhileAlive=completed-while-alive
+    //   after        onExitWaitsWhileAlive=still-waiting
+    //
+    // The fallback then depends on `isAlive0` answering for a pid we did not
+    // spawn, which `foreign_pid_is_alive` does; without that this would trade a
+    // wrong answer for a hang, so the probe waits on the future after the
+    // process really dies rather than only checking that it does not complete.
     let Some(handle) = handle_for_pid(pid) else {
-        return Ok(Some(Value::Int(-1)));
+        return Ok(Some(Value::Int(PROCESS_NOT_A_CHILD)));
     };
     ctx.begin_blocking_region();
     let code = wait_for_handle(handle);
@@ -3007,8 +3144,11 @@ fn native_proc_handle_get_process_pids0(
         }
         if let Some(a) = starts {
             if i < ctx.array_length(a) {
-                // 0 = "start time unknown", the JDK's own sentinel.
-                ctx.set_array_element(a, i, Value::Long(0));
+                // `children()` and `allProcesses()` build their handles straight
+                // out of this array — `new ProcessHandleImpl(cpids[i],
+                // stimes[i])` — so a 0 here is what left every handle in those
+                // streams unable to tell itself apart from a recycled pid.
+                ctx.set_array_element(a, i, Value::Long(start_time_or_any(*pid)));
             }
         }
     }
@@ -3186,10 +3326,30 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Long(p)) => *p,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            let start_time = match args.get(1) {
+                Some(Value::Long(t)) => *t,
+                _ => PROCESS_STARTTIME_ANY,
+            };
             let force = matches!(args.get(2), Some(Value::Int(1)));
             let ok = match handle_for_pid(pid) {
+                // Our own child: go through the table, which also keeps the
+                // exit-status bookkeeping straight. Its pid cannot be stale —
+                // we hold the `Child`, so it has not been reaped.
                 Some(handle) => destroy_handle(handle, force),
-                None => false,
+                // Someone else's. This used to answer a flat `false`: safe, but
+                // wrong, and `ProcessHandle.destroy()` on a process this VM did
+                // not spawn simply did nothing where HotSpot kills it. The
+                // reason given was that the bridge had no way to detect a
+                // recycled pid — which was true only because `isAlive0` reported
+                // no start time. It does now, so run the JDK's own check:
+                //
+                //   jlong start = os_getStartTime(pid);
+                //   if (start == startTime || startTime == 0) { kill(pid, sig); }
+                //
+                // A caller that never learned a start time (0) is trusted, which
+                // is what HotSpot does and is the only way `ProcessHandle`s built
+                // before this change keep working.
+                None => start_time_matches(pid, start_time) && signal_pid(pid, force),
             };
             Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         },
@@ -3468,7 +3628,7 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
 /// registration runs later and wins), but "dead" was the only thing keeping
 /// them harmless, and a registration-order change would have reintroduced the
 /// empty-CGI-body bug the same shape caused on the `Runtime.exec` route. See
-/// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
+/// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
 pub fn native_process_builder_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if pb_debug_enabled() {
         eprintln!("[PB-START-IO] ProcessBuilder.start via native-io");
@@ -3673,12 +3833,14 @@ mod tests {
         assert_eq!(handle_for_pid(pid), Some(handle), "by pid");
 
         // `isAlive0` answers a START TIME, not a boolean: >= 0 is alive and -1
-        // is the only way to say otherwise. 0 is the JDK's "alive, start time
-        // unknown".
+        // is the only way to say otherwise.
         let alive =
             native_proc_handle_is_alive0(&mut MockNativeContext::new(), &[Value::Long(pid)])
                 .unwrap();
-        assert_eq!(alive, Some(Value::Long(0)), "alive, start time unknown");
+        let Some(Value::Long(start)) = alive else {
+            panic!("isAlive0 must answer a long, got {alive:?}");
+        };
+        assert!(start >= 0, "a running child is alive, got {start}");
 
         destroy_handle(handle, true);
         let code = wait_for_handle(handle);
@@ -3786,6 +3948,11 @@ mod tests {
 
     /// A pid we never spawned resolves to nothing, and the bridge says so
     /// rather than reaching into the table with it.
+    ///
+    /// The literal -2 is written out on purpose: it is the value
+    /// `ProcessHandleImpl.completion` compares against, so a test that spelled
+    /// it `PROCESS_NOT_A_CHILD` on both sides would pass no matter what the
+    /// constant was changed to.
     #[test]
     fn an_unspawned_pid_resolves_to_no_handle() {
         let foreign = 0x7fff_0000i64; // far above any pid this host will mint
@@ -3793,7 +3960,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let rc =
             native_proc_handle_wait_for_process_exit0(&mut ctx, &[Value::Long(foreign)]).unwrap();
-        assert_eq!(rc, Some(Value::Int(-1)), "cannot wait on a non-child");
+        assert_eq!(rc, Some(Value::Int(-2)), "NOT_A_CHILD, not an exit status");
         assert_eq!(
             native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(foreign), Value::Int(1)])
                 .unwrap(),
@@ -3809,11 +3976,50 @@ mod tests {
     fn the_current_process_is_alive_by_its_real_pid() {
         let mut ctx = MockNativeContext::new();
         let self_pid = std::process::id() as i64;
-        assert_eq!(
-            native_proc_handle_is_alive0(&mut ctx, &[Value::Long(self_pid)]).unwrap(),
-            Some(Value::Long(0)),
-            "alive, start time unknown"
+        let answer = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(self_pid)]).unwrap();
+        let Some(Value::Long(start)) = answer else {
+            panic!("isAlive0 must answer a long, got {answer:?}");
+        };
+        assert!(start >= 0, "this process exists, got {start}");
+    }
+
+    /// `destroy0` must refuse a pid whose start time disagrees with the
+    /// caller's — that is the whole guard against acting on a recycled pid —
+    /// and must trust a caller that never learned one.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn destroy_refuses_a_stale_start_time_and_trusts_an_absent_one() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn /bin/sleep");
+        let pid = child.id() as i64;
+        // Deliberately NOT installed in the process table: this is the foreign
+        // path, and a child in the table is destroyed through its `Child`.
+        let mut child = child;
+
+        let real = os_process_start_time(pid).expect("/proc start time");
+        assert!(start_time_matches(pid, real), "its own start time");
+        assert!(
+            !start_time_matches(pid, real - 1),
+            "a start time from some earlier holder of this pid"
         );
+        assert!(
+            start_time_matches(pid, PROCESS_STARTTIME_ANY),
+            "a caller that never learned one is trusted, as in HotSpot"
+        );
+        // An exited process has no start time to disagree with, so the check
+        // cannot be what stops a signal — `kill` failing is.
+        assert!(
+            start_time_matches(pid + 4_000_000, real),
+            "unknown is not disagreement"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// A receiver shaped AND named like one of the VM's own process objects.
@@ -4012,11 +4218,36 @@ mod tests {
         let alive = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(pid)])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            alive,
-            Value::Long(0),
-            "a running child must report a start time >= 0"
-        );
+        let Value::Long(start) = alive else {
+            panic!("isAlive0 must answer a long, got {alive:?}");
+        };
+        assert!(start >= 0, "a running child must be alive, got {start}");
+
+        // On a host with `/proc` the answer is a real epoch-millisecond start
+        // time, and the value is what makes a pid safe to act on — so it has to
+        // be STABLE. A start time that changed between calls would pass
+        // `destroy0`'s staleness check only by accident. Not asserted as a
+        // literal: it is different on every run, and different again on a host
+        // without `/proc`, where the honest answer is the `STARTTIME_ANY` 0.
+        let again = native_proc_handle_is_alive0(&mut ctx, &[Value::Long(pid)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, alive, "the start time must not move under us");
+        if cfg!(target_os = "linux") {
+            assert!(
+                start > 0,
+                "on Linux the start time comes from /proc/<pid>/stat, got {start}"
+            );
+            assert!(
+                start_time_matches(pid, start),
+                "the value isAlive0 reports must be the one destroy0 accepts"
+            );
+            assert!(
+                !start_time_matches(pid, start + 1),
+                "and a value it did NOT report must be refused, or the check is \
+                 decoration"
+            );
+        }
 
         // A pid that is neither ours nor anyone's must be -1. (Deliberately
         // NOT asserted for the internal handle id: on Linux a small integer is
@@ -4055,14 +4286,19 @@ mod tests {
         let (handle, pid) = install_child_for_test(child);
         let mut ctx = MockNativeContext::new();
 
-        // A pid we never spawned cannot be waited for.
+        // A pid we never spawned cannot be waited for, and the way to say so
+        // is `NOT_A_CHILD` (-2), not -1. This assertion read -1 when it was
+        // written; -1 is a value `ProcessHandleImpl.completion` hands the
+        // caller as the process's exit status, so it completed
+        // `ProcessHandle.of(pid).onExit()` immediately for a live process.
+        // See `probes/ForeignHandleProbe.java`.
         let unknown = native_proc_handle_wait_for_process_exit0(
             &mut ctx,
             &[Value::Long(pid + 4_000_000), Value::Int(0)],
         )
         .unwrap()
         .unwrap();
-        assert_eq!(unknown, Value::Int(-1));
+        assert_eq!(unknown, Value::Int(-2));
 
         let killed =
             native_proc_handle_destroy_process0(&mut ctx, &[Value::Long(pid), Value::Int(1)])
@@ -4077,7 +4313,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(
-            matches!(code, Value::Int(c) if c != -1),
+            matches!(code, Value::Int(c) if c != -1 && c != -2),
             "waitForProcessExit0 must find the child by pid, got {code:?}"
         );
 

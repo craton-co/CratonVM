@@ -819,28 +819,79 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
     obj
 }
 
-pub(crate) fn read_jul_logger_name(ctx: &dyn NativeContext, logger: ObjectRef) -> String {
-    // Real-JDK Logger instances keep their name in the `name` field; slot 0 is
-    // `Logger$ConfigurationData`. CratonVM synthetic Logger instances keep the
-    // name in slot 0. Prefer the real layout, then fall back only if slot 0 is
-    // actually a String.
-    if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(logger, "name") {
-        if let Some(name) = ctx.read_string(name_obj) {
-            return name;
+/// The one place that knows where a `java.util.logging.Logger` keeps its name.
+///
+/// **THREE layouts reach this VM's JUL surface**, which is why this is a
+/// function and not a slot constant:
+///
+/// * a **real-JDK** `Logger` keeps it in the `name` field. Slot 0 there is
+///   `Logger$ConfigurationData`, so an unconditional slot-0 read hands the
+///   caller a `ConfigurationData` and the next `getName().lastIndexOf('.')`
+///   dies with `NoSuchMethodError`;
+/// * the **`logmanager` synthetic** (`allocate_logger`) keeps it at
+///   [`LOGGER_FIELD_NAME`] and deliberately does NOT also write it by name,
+///   because on a real layout that name resolves to the slot this module uses
+///   for the PARENT link;
+/// * the **legacy 2/3-field shim synthetic** (`logging_shims`) keeps it at
+///   slot 0.
+///
+/// The type check on the slot reads is what makes the three separable: a real
+/// `Logger`'s slot 0 is never a `String`.
+///
+/// Returns the Java `String` object itself, so `getName()` can hand back the
+/// one the Logger already holds instead of minting a copy per call.
+///
+/// # Why this is shared rather than inlined
+///
+/// It was inlined, three times, and the copies disagreed. `logging_shims`'s
+/// `Logger.getName` read slot 0 unconditionally and -- being the LAST
+/// registration for the triple -- won the slot, so on the 13-field
+/// `logmanager` Logger that `Logger.getLogger(name)` actually returns,
+/// `getName()` answered the raw contents of slot 0. In the synthetic-JDK build
+/// that is `Int(0)`: not a String, not null, and not something any Java caller
+/// can use. Registration order was deciding which layout the accessor believed
+/// in.
+pub(crate) fn jul_logger_name_object(
+    ctx: &dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    // The legacy shim layout first, and only when slot 0 really holds a
+    // String -- that is the discriminator against a real `Logger`'s
+    // `ConfigurationData`.
+    if let Value::Object(Some(name_obj)) = ctx.get_field(logger, 0) {
+        if ctx
+            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .as_deref()
+            == Some("java/lang/String")
+        {
+            return Some(name_obj);
         }
     }
+    // The real-JDK layout.
+    if let Value::Object(Some(name_obj)) = ctx.get_field_by_name(logger, "name") {
+        if ctx.read_string(name_obj).is_some() {
+            return Some(name_obj);
+        }
+    }
+    // The `logmanager` synthetic layout.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, LOGGER_FIELD_NAME) {
         if ctx
             .class_name_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
-            if let Some(name) = ctx.read_string(name_obj) {
-                return name;
-            }
+            return Some(name_obj);
         }
     }
-    String::new()
+    None
+}
+
+/// [`jul_logger_name_object`] as a Rust string, empty when the Logger has no
+/// name in any of the three layouts.
+pub(crate) fn read_jul_logger_name(ctx: &dyn NativeContext, logger: ObjectRef) -> String {
+    jul_logger_name_object(ctx, logger)
+        .and_then(|name_obj| ctx.read_string(name_obj))
+        .unwrap_or_default()
 }
 
 fn jboss_log_manager_requested(ctx: &dyn NativeContext) -> bool {

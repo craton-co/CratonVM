@@ -2961,11 +2961,9 @@ pub(crate) fn native_module_classloader_find_resources(
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
     }
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
     Ok(Some(Value::Object(Some(enm))))
 }
 
@@ -2974,11 +2972,9 @@ fn build_empty_enumeration(ctx: &mut dyn NativeContext) -> MethodCallResult {
     // GC-safety: `alloc_concurrent_synthetic` below can trigger a moving GC;
     // `arr` is reused in the following `set_field` unpinned otherwise.
     let arr_pin = ctx.pin_native_root(arr);
-    let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
-    ctx.set_field(enm, 0, Value::Object(Some(arr)));
-    ctx.set_field(enm, 1, Value::Int(0));
+    let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
     Ok(Some(Value::Object(Some(enm))))
 }
 

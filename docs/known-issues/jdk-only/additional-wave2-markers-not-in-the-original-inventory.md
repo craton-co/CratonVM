@@ -214,10 +214,73 @@ One tooling trap worth repeating: the first cut attributed each disjunct's
 so it would have stripped the rationale off entries being kept — exactly what
 §13 of this page is about. Comments must attach forward.
 
-**Still open:** the remaining 205 disjuncts — this pass licenses nothing about
-them (140 name a class that does have a native, 44 name no class at all, and
-the rest need the app-suite census). Plus §3's Matcher-leaf residual and the
-`jit_entry_publishable` half of §2, which refuses nothing per §1.
+### Sixth pass — §11 second tranche: 205 -> 184
+
+The first tranche fell back to a source grep for feature-gated registrations,
+which was a co-location heuristic ("some file mentions this class and this
+method") and kept 21 of 24 candidates for no better reason than a comment.
+Replaced with a measurement: `--features` reaches a transitive dependency's
+features from the workspace root, so the maximal-registration binary can be
+built and dumped —
+
+    -p cratonvm-cli --features synthetic-jdk,      cratonvm-native-builtins/{app-stubs,legacy-synthetic-crypto,synthetic-quarkus-arc}
+
+| build | pairs | classes |
+|---|---:|---:|
+| default | 8,862 | 1,227 |
+| maximal | 9,064 | 1,224 |
+| **union** | **9,096** | **1,235** |
+
+The maximal build has three *fewer* classes than default, so neither dump alone
+is the answer — the union is. Against it, at **(class, method)** granularity,
+**21 of 205 disjuncts can never match a registered native in any build**; 182
+lines. The class×method cross product is a superset of what a disjunct can
+match, so the test errs toward keeping entries.
+
+Two are a shape the class-level pass could not see — the class IS registered
+and these methods never are: `java/security/Provider.getEngineName` (13 other
+methods registered) and `java/security/Security.getAlgorithms` (8 others).
+
+Verified the admitted set does not move: corpus `chain_true` 917 -> 917,
+20 -> 20 triples; H2 17 -> 17; both diffs empty; suite 30/30.
+
+**Cumulative for §11: 217 -> 184 disjuncts, 343 lines.**
+
+### Seventh pass — §11 third tranche: 184 -> 179, and the static seam runs out
+
+Unreachability is exhausted: every remaining disjunct that names a
+(class, method) pair names one the registry does have. Two *redundancy*
+criteria — the entry adds nothing, rather than the entry cannot fire — find
+five more:
+
+* **Redundant with the chain's own first disjunct (2).** `check_override`
+  begins with `method.is_abstract()`, which §7 permits (step 3b). A name entry
+  whose every registered pair resolves to an image method that is
+  `declared && !has_code && !acc_native` is admitted before the name is
+  consulted: `SSLSocketFactory`/`sun.security.ssl` `createSocket`, and
+  `Iterable`/`Collection` `iterator`.
+* **Subsumed by an earlier entry (3).** Scoring each disjunct by its
+  *registered* coverage only (an unregistered pair cannot pass the `find()`
+  guard), three cover nothing an earlier disjunct already admits —
+  `FilterInputStream.<init>/skip`, Spring's
+  `createDocumentBuilderFactory`, and a **second copy** of
+  `InputStreamReader.close`.
+
+Verified the same way: corpus `chain_true` 926 -> 926, 20 -> 20 triples, diff
+empty, suite 31/31. (926 not 917 because `dev` added corpus classes between
+tranches; both arms of each A/B share a corpus.)
+
+**Cumulative for §11: 217 -> 179 disjuncts, 381 lines.**
+
+**The static seam is now closed.** The remaining 179 break down as 133 naming a
+(class, method) that is registered AND concrete, 2 class-only, and 44 naming no
+class literal. For those the question is no longer "can this fire?" — it can —
+but "is this compatibility exception still wanted?", which is a per-family
+decision needing app-suite evidence, not an analysis. That is the exercise the
+original record described, and it is what remains of §11.
+
+Also still open: §3's Matcher-leaf residual and the `jit_entry_publishable`
+half of §2, which refuses nothing per §1.
 
 ## 2026-08-04 status
 
