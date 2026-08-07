@@ -1988,20 +1988,6 @@ impl VmHeap {
         if let VmHeap::G1(g1) = self {
             g1.print_gc_summary();
         }
-        // The collector's own per-cycle decision record and its histogram:
-        // which backend ran, whether its young half relocated, and — when it
-        // did not — which coverage obligation stopped it.
-        //
-        // [`crate::gc_metrics::collector_decision_report`] was written to
-        // settle exactly that question (the `docs/GC.md` ↔ `ARCHITECTURE.md`
-        // disagreement about whether young collections move) and had **no
-        // caller anywhere in the tree**, so the answer it computes was never
-        // readable from a run. That is the same class of defect the report
-        // exists to expose. Emitting it here — behind the gate the CLI already
-        // applies to this function — is what makes G1's root-coverage refusal
-        // (`g1-no-evacuation-root-coverage-incomplete`) observable from a log
-        // instead of inferable from a crash dump.
-        eprintln!("{}", crate::gc_metrics::collector_decision_report());
         // Collection COUNTS, unconditionally. Without these the summary is not
         // comparable across configurations: the moving-young line below only
         // prints when moving-young is requested, so a `CRATONVM_NO_MOVING_YOUNG`
@@ -2086,6 +2072,15 @@ impl VmHeap {
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
         // ("per-cycle coverage proof, moving is possible") disagreement for
         // THIS run — see `docs/gc/tlab-and-card-audit.md` §3.
+        //
+        // Under G1 this used to be uninformative by construction:
+        // `G1Collector::collect_garbage` passed the constant
+        // `incomplete_reason::NONE`, so the record said "the backend always
+        // evacuates" and nothing else, whatever the root scan had found. It now
+        // carries the obligation that actually failed, and
+        // `collector_decision_report` appends the `[GC] g1 root coverage:` rate
+        // — which is what makes "was this pause's root set complete?" a
+        // question a log answers instead of a crash dump.
         eprintln!("{}", crate::gc_metrics::collector_decision_report());
         // Card / remembered-set costs, raw and normalized per allocated object
         // and per live byte.

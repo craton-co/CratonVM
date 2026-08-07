@@ -7430,6 +7430,45 @@ impl G1Collector {
         })
     }
 
+    /// Box a non-Object `Value` for storage in a REFERENCE array element, or
+    /// return it unchanged when it is already a reference (or the array is not
+    /// a reference array).
+    ///
+    /// The wrapper is a one-field `AUTOBOX_CLASS_ID` object, exactly as
+    /// `GenerationalHeap::set_array_element` and `Heap::set_array_element`
+    /// build it, so [`Self::autobox_payload`] and every other backend's reader
+    /// recognise it. Must be called BEFORE taking the `regions` lock — the
+    /// allocation needs it.
+    fn autobox_for_reference_array(&self, array: ObjectRef, value: Value) -> Value {
+        if matches!(value, Value::Object(_)) {
+            return value;
+        }
+        if self.get_header(array).element_type() != ArrayElementType::Reference {
+            return value;
+        }
+        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+        self.set_field(wrapper, 0, value);
+        Value::Object(Some(wrapper))
+    }
+
+    /// The primitive inside an auto-box wrapper, or `None` when `candidate` is
+    /// an ordinary object.
+    ///
+    /// Validates the address before dereferencing its header: a reference array
+    /// element is a raw word and a stale or garbage one could point anywhere,
+    /// so an unchecked read here would be wild. Mirrors the same guard in
+    /// `GenerationalHeap::get_array_element`.
+    fn autobox_payload(&self, candidate: ObjectRef) -> Option<Value> {
+        self.is_object_address(candidate.as_ptr() as usize)?;
+        // SAFETY: `is_object_address` confirmed `candidate` points at a valid
+        // object header inside one of this collector's regions.
+        let header = unsafe { &*(candidate.as_ptr() as *const ObjectHeader) };
+        if header.class_id != crate::heap::AUTOBOX_CLASS_ID {
+            return None;
+        }
+        Some(self.get_field(candidate, 0))
+    }
+
     /// Whether this pause must decline to evacuate: the detection from
     /// [`Self::root_coverage_incomplete_reason`] AND the opt-in
     /// `CRATONVM_G1_COVERAGE_PIN` lever.
@@ -8271,10 +8310,37 @@ impl GarbageCollector for G1Collector {
                 }
             }
         }
-        Ok(array_element_from_bytes(element_type, &raw))
+        let value = array_element_from_bytes(element_type, &raw);
+        // Un-box the auto-box wrapper the store side installs for a non-Object
+        // value — see `set_array_element`, and `GenerationalHeap::
+        // get_array_element` for the same read.
+        if element_type == ArrayElementType::Reference {
+            if let Value::Object(Some(boxed)) = value {
+                if let Some(inner) = self.autobox_payload(boxed) {
+                    return Ok(inner);
+                }
+            }
+        }
+        Ok(value)
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        // A reference array element is a raw 8-byte pointer, so a non-Object
+        // `Value` cannot be stored in one directly. Natives across the tree
+        // nonetheless use a reference array as a generic `Value` store (the
+        // stream pipeline collects `Value::Long`/`Value::Double` into one), and
+        // `GenerationalHeap::set_array_element` has always honoured that by
+        // auto-boxing into a one-field `AUTOBOX_CLASS_ID` wrapper.
+        //
+        // G1 did not: its encoder is `Value::Object(Some(r)) => r.as_ptr(),
+        // _ => 0`, so a `Value::Long(42)` was written as a null reference and
+        // read back as `Value::Object(None)`. `.mapToDouble(...).toArray()`
+        // therefore returned all zeros under `-XX:+UseG1GC` and was correct
+        // under the default collector, with no GC involved at all.
+        //
+        // Boxed BEFORE the `regions` lock below: `alloc_object` takes that same
+        // lock.
+        let value = self.autobox_for_reference_array(obj, value);
         let header = self.get_header(obj);
         let len = header.array_length() as usize;
         if index >= len {
@@ -10094,6 +10160,94 @@ mod tests {
             Some(crate::gc_quiescence::incomplete_reason::OSR_SHADOW),
         );
         crate::gc_quiescence::clear_force_non_moving_jit_roots();
+    }
+
+    // -- Reference arrays as a generic Value store --
+
+    /// A REFERENCE array element is a raw 8-byte pointer, but every backend
+    /// must accept an arbitrary `Value` in one: natives across the tree use a
+    /// reference array as a generic `Value` store, and the generational heap
+    /// has always honoured that by auto-boxing into an `AUTOBOX_CLASS_ID`
+    /// wrapper.
+    ///
+    /// G1 had neither half. `Value::Long(42)` was encoded as `0u64` — the
+    /// `_ => 0u64` arm of `array_element_to_unaligned_ptr` — and read back as
+    /// `Value::Object(None)`. In Java that made
+    /// `stream.mapToDouble(Double::doubleValue).toArray()` return all zeros
+    /// under `-XX:+UseG1GC` and the right values under the default collector,
+    /// with no collection involved: deterministic, and identical with `--nojit`
+    /// and at a heap large enough that no GC runs.
+    #[test]
+    fn reference_array_round_trips_every_value_kind() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 6);
+        let obj = gc.alloc_object(ClassId::new(2), 1);
+
+        let cases = [
+            Value::Long(-42),
+            Value::Double(2.5),
+            Value::Int(7),
+            Value::Float(1.5),
+            Value::Object(Some(obj)),
+            Value::Object(None),
+        ];
+        for (i, v) in cases.iter().enumerate() {
+            <G1Collector as crate::collector::GarbageCollector>::set_array_element(&gc, arr, i, *v)
+                .expect("in bounds");
+        }
+        for (i, want) in cases.iter().enumerate() {
+            let got =
+                <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, i)
+                    .expect("in bounds");
+            match (want, got) {
+                (Value::Object(Some(w)), Value::Object(Some(g))) => {
+                    assert_eq!(w.as_ptr(), g.as_ptr(), "element {i}: reference identity")
+                }
+                (w, g) => assert_eq!(*w, g, "element {i} did not round-trip"),
+            }
+        }
+    }
+
+    /// The boxing must not leak into a PRIMITIVE array: those store the value
+    /// directly and a wrapper there would be a wrong-width write.
+    #[test]
+    fn primitive_arrays_are_not_auto_boxed() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Double, 2);
+        <G1Collector as crate::collector::GarbageCollector>::set_array_element(
+            &gc,
+            arr,
+            0,
+            Value::Double(3.25),
+        )
+        .expect("in bounds");
+        assert_eq!(
+            <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, 0),
+            Ok(Value::Double(3.25))
+        );
+    }
+
+    /// An ordinary object stored in a reference array must come back as
+    /// itself, not be mistaken for a wrapper. The un-box keys on
+    /// `AUTOBOX_CLASS_ID`, so this pins that a real object's class id cannot
+    /// collide with it.
+    #[test]
+    fn an_ordinary_object_is_not_mistaken_for_an_auto_box() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 1);
+        let obj = gc.alloc_object(ClassId::new(3), 1);
+        gc.set_field(obj, 0, Value::Int(99));
+        <G1Collector as crate::collector::GarbageCollector>::set_array_element(
+            &gc,
+            arr,
+            0,
+            Value::Object(Some(obj)),
+        )
+        .expect("in bounds");
+        match <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, 0) {
+            Ok(Value::Object(Some(got))) => assert_eq!(got.as_ptr(), obj.as_ptr()),
+            other => panic!("expected the object back, got {other:?}"),
+        }
     }
 
     #[test]
