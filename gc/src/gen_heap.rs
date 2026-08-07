@@ -1616,7 +1616,7 @@ unsafe impl Sync for GenerationalHeap {}
 // objects_copied_young].
 // ---------------------------------------------------------------------------
 thread_local! {
-    static COPY_TALLY: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static COPY_TALLY: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
 }
 
 /// Record one copied object, classified by the arena it actually landed in
@@ -1633,11 +1633,35 @@ fn copy_tally_add(promoted: bool, bytes: u64) {
     });
 }
 
+/// Bump one of the two `forward_object` arm counters: slot 4 counts
+/// re-encounters (the object was already forwarded, so this call is a pure
+/// lookup), slot 5 counts actual copies. Their ratio is what says whether
+/// `cheney_drain` is a copying cost or a lookup cost.
+#[inline]
+fn copy_tally_arm(reencounter: bool) {
+    // Diagnostic only, and it fires on the re-encounter path as well -- about
+    // 1.5M calls per collection on a Spring workload -- so it is behind the
+    // same flag that prints the breakdown rather than paid for unconditionally.
+    // (`copy_tally_add` next door is NOT gated: it replaced Phase H's
+    // statistics walk, and those counters are committed to `self.stats` every
+    // cycle.)
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| gc_flags().dbg_gcpause) {
+        return;
+    }
+    COPY_TALLY.with(|t| {
+        let mut a = t.get();
+        a[if reencounter { 4 } else { 5 }] += 1;
+        t.set(a);
+    });
+}
+
 /// Read and clear the tally for this cycle.
-fn copy_tally_take() -> [u64; 4] {
+fn copy_tally_take() -> [u64; 6] {
     COPY_TALLY.with(|t| {
         let a = t.get();
-        t.set([0; 4]);
+        t.set([0; 6]);
         a
     })
 }
@@ -6702,7 +6726,17 @@ impl GenerationalHeap {
             objects_promoted_cycle,
             bytes_copied_young_cycle,
             objects_copied_young_cycle,
+            fwd_reencounters_cycle,
+            fwd_copies_cycle,
         ] = copy_tally_take();
+        if mv_phase_on {
+            // How many `forward_object` calls were pure lookups on an already
+            // forwarded object. Each one is a hash probe of a map with as many
+            // entries as there are survivors, so if this dwarfs the copy count
+            // then `cheney_drain` is a lookup cost, not a copying cost.
+            moving_phase_count_push("fwd_reencounters", fwd_reencounters_cycle as u128);
+            moving_phase_count_push("fwd_copies", fwd_copies_cycle as u128);
+        }
         // The walk below no longer produces those counters — `copy_tally_add`
         // does, at the copy site. What is left of it is the BUG-Z forward
         // validation, which is a diagnostic and does not need to run on every
@@ -12841,6 +12875,7 @@ impl GenerationalHeap {
             // Ensure pointer_map has this entry so update_all_roots can update
             // all references to this old address, even if this is a second
             // encounter of the same object (e.g., root + dirty card + Cheney scan).
+            copy_tally_arm(true);
             pointer_map.entry(old_ptr as usize).or_insert(fwd as usize);
             return fwd;
         }
@@ -13043,6 +13078,7 @@ impl GenerationalHeap {
         // ACTUALLY landed: the promotion branch falls back to to-space when
         // old gen is full, so `should_promote` is not the answer.
         copy_tally_add(old_gen.contains(new_ptr), total_size as u64);
+        copy_tally_arm(false);
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
