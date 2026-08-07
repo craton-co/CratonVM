@@ -1934,6 +1934,36 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_late::register_phase57_nio_file(
                     &mut native_methods,
                 );
+                // 2026-08-07: the jar/zip bridge, which this arm was missing.
+                //
+                // This is a REAL-JDK arm, so it has to register what the shipping
+                // real-JDK arm below registers — the two arms differ only in what
+                // the feature COMPILED IN, never in which class library is loaded.
+                // These three were registered in that arm and not in this one, so
+                // a `--features synthetic-jdk` binary run `--real-jdk` fell back to
+                // `native-io`'s `zip_real_jar` surface for `JarFile`.
+                //
+                // That surface builds its entry objects with `alloc_zip_entry`
+                // unconditionally, so `JarFile.entries()`, `getJarEntry()` and
+                // `getEntry()` all handed back a bare `java.util.zip.ZipEntry`.
+                // `JarFile.entries()` is declared `Enumeration<JarEntry>`, so the
+                // implicit checkcast the compiler emits at the call site threw
+                // `ClassCastException: java.util.zip.ZipEntry cannot be cast to
+                // java.util.jar.JarEntry` — measured by `regression-suite`'s
+                // `RFileTimes`, and it would hit any caller that iterates a jar.
+                // `register_p59_jar` is force-listed in `native_override.rs` for
+                // exactly these methods, so registering it here makes it win, and
+                // it answers `java.util.jar.JarEntry` like the shipping build.
+                //
+                // Kept in the shipping arm's order (nio_file → file → jar → bulk
+                // → zip-output) because this registry is last-write-wins.
+                cratonvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+                cratonvm_native_builtins::phases_late::register_p59_bulk_stream_transfer(
+                    &mut native_methods,
+                );
+                cratonvm_native_builtins::phases_late::register_p59_zip_output_primitives(
+                    &mut native_methods,
+                );
                 // KC26: Register URL codec (URLDecoder/URLEncoder) natives — the real JDK
                 // bytecode depends on internal sun.net classes we don't support.
                 //

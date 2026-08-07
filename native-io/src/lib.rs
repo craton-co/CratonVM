@@ -5631,8 +5631,31 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // raises NoSuchMethodError. The synthetic streams use the legacy slot-0
     // `FdId` layout that these `<init>` natives and the `write`/`flush`/`close`
     // natives above all agree on, so they are safe here and only here.
+    //
+    // 2026-08-07: "here and only here" was enforced by the WRONG GUARD, and it
+    // silently un-did the FOS-FIX above for anyone building with the feature.
+    // `#[cfg(feature = "synthetic-jdk")]` asks what was COMPILED; what decides
+    // whether a real `FileOutputStream` is on the other end is which CLASS
+    // LIBRARY was LOADED, i.e. the launcher flag. A feature build run
+    // `--real-jdk` satisfies the cfg and registered these over the real class,
+    // reproducing the exact 2026-05-20 defect the comment above describes:
+    // `<init>` skipped the real constructor, so no `FileDescriptor` was
+    // allocated (`getFD()` threw), the fd went to instance slot 0 — the
+    // reference-typed `fd` field, where an `Value::Int` write is dropped — and
+    // every `write`/`flush`/`close` became a silent no-op.
+    //
+    // Measured on `regression-suite`'s `RFileTimes`: `new FileOutputStream(f)`
+    // + `write(5 bytes)` + `close()` left a ZERO-LENGTH file, and the
+    // `JarOutputStream` built on one produced an archive with no EOCD record.
+    // `Files.write`, `Files.newOutputStream` and `RandomAccessFile` were all
+    // unaffected, which is what kept it hidden.
+    //
+    // The runtime flag is the correct guard and is already set in exactly the
+    // arms that matter — both real-JDK arms of `vm_init`, and neither
+    // synthetic arm. The cfg stays as well: in a default build these natives
+    // should not even be compiled in.
     #[cfg(feature = "synthetic-jdk")]
-    {
+    if !registry.drops_real_layout_synthetic() {
         registry.register(
             "java/io/FileOutputStream",
             "<init>",
