@@ -2855,16 +2855,34 @@ mod concurrent_mark_controller_tests {
 
         // Simulate a mutator overwrite: barrier sees the old value.
         heap.satb_barrier(Value::Object(Some(obj)));
-        // The pre-barrier writes through the thread-local SATB buffer,
-        // so the global queue may not see it yet. Flush this thread's
-        // buffer so the assertion is deterministic.
+        // The pre-barrier writes through the thread-local SATB buffer, so the
+        // global queue may not see it yet. Flush this thread's buffer.
         heap.flush_thread_satb();
 
+        // FLAKE FIX: `after > before` alone is a race, and it is the same
+        // under-approximation `g1_concurrent::satb_captures_mutator_writes_during_concurrent_mark`
+        // already documents. `g1_start_concurrent_mark()` above spawns a real
+        // background marker, and since G1MARK-6 `concurrent_mark_step` drains
+        // the queue shards on every step — so the worker can consume the entry
+        // between the flush and this read, leaving `after == before == 0` on a
+        // queue that did exactly what it was supposed to. Measured at roughly
+        // one failure in twenty full-suite runs on a loaded host; it needs the
+        // worker scheduled inside a sub-millisecond window.
+        //
+        // Assert the SATB *guarantee* instead of the transient: the overwritten
+        // reference reached the marker either by still being queued, or by
+        // already having been pulled into the gray set / marked. Both routes
+        // are the barrier working; only neither is a bug.
         let after = satb_queue.len();
+        let grayed_or_marked = g1_state(&heap)
+            .unwrap()
+            .collector
+            .dbg_is_grayed_or_marked(obj.as_ptr() as usize);
         assert!(
-            after > before,
-            "satb_barrier during concurrent mark must enqueue the old reference \
-             (before={before}, after={after})",
+            after > before || grayed_or_marked,
+            "satb_barrier during concurrent mark must deliver the old reference \
+             to the marker (before={before}, after={after}, \
+             grayed_or_marked={grayed_or_marked})",
         );
 
         // Cleanup so we don't strand the worker.
