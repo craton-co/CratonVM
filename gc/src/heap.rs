@@ -8,10 +8,15 @@
 //! [ObjectHeader (HEADER_SIZE bytes)] [field0] [field1] ... [fieldN]
 //! ```
 //!
-//! [`HEADER_SIZE`] is 32 today. It is written symbolically here on purpose:
-//! a shrink to 24 is mapped out in
-//! `arch-2026-07-26/header-shrink.md`, and a baked "32" in a doc
-//! comment is exactly the kind of staleness that document's §6.9 catalogues.
+//! [`HEADER_SIZE`] is **16** today — the authority is
+//! `cratonvm_types::HEADER_SIZE` (`types/src/heap_types.rs`), never a literal
+//! written here. It is used symbolically throughout this file on purpose: the
+//! header has already shrunk twice, 32 -> 24 (2026-08-06) and 24 -> 16
+//! (completed 2026-08-07), and until 2026-08-07 this very paragraph still read
+//! "32 today, a shrink to 24 is mapped out in `arch-2026-07-26/header-shrink.md`"
+//! — i.e. it was itself an instance of the staleness that document's §6.9
+//! catalogues, wrong about both the current value and the pending one. Anything
+//! below that needs the number must read the constant.
 //!
 //! Field cell width depends on the field's type:
 //!
@@ -29,8 +34,8 @@
 //! `long`/`double`, and `REF_ELEMENT_SIZE` (8) for reference elements. See
 //! [`element_byte_size`] and [`array_data_size`], which are the authority:
 //! ```text
-//! [ObjectHeader (32 bytes)] [elem0] [elem1] ... [elemN]   // element_byte_size(elem_type) each,
-//!                                                        // data area rounded up to 8 bytes
+//! [ObjectHeader (HEADER_SIZE bytes)] [elem0] [elem1] ... [elemN]   // element_byte_size(elem_type) each,
+//!                                                                  // data area rounded up to 8 bytes
 //! ```
 //!
 //! The heap uses two arenas (from-space and to-space) for a semi-space
@@ -1650,6 +1655,170 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
 // Compact primitive array element access
 // ---------------------------------------------------------------------------
 
+// --- Reference-element decode chokepoint for `read_prim_element` ------------
+//
+// WHY THIS EXISTS. `read_prim_element`'s `Reference` arm ended commit
+// `6a04b0e3c1` (2026-06-29, "degrade stale references to null at every decode
+// boundary") applying `cratonvm_types::plausible_heap_pointer` to the loaded
+// word and, on failure, returning `Value::Object(None)` — handing Java a `null`
+// where the slot held bits. That commit's own message records what the filter
+// is: defense-in-depth for an *unfixed* GC defect (live blocked-thread frame
+// objects swept by the non-moving young sweep; observed as 8000+ all-zero-header
+// stale `Thread` receivers, then `0x77..` / `": contex"` buffer bytes read back
+// through this arm), not an integrity guard on trusted data. Two failure modes
+// hid behind the bare `else`:
+//
+// (1) THE DEGRADE WAS SILENT — and its interpreter twin is not. The same commit
+//     put the same filter on `cratonvm_types`' own decode paths (`decode_value`
+//     `VTAG_OBJECT`, `CompactValue::to_value` SUB_OBJECT), where it feeds a
+//     process-wide counter and a one-shot stderr line (`note_object_degradation`,
+//     types/src/compact_value.rs:330, read back via the `pub`
+//     `cratonvm_types::compact_value::object_degradation_count`). THIS arm fed
+//     nothing at all. `read_prim_element` is the array-element read for EVERY
+//     collector — `Heap::get_array_element` / `get_array_element_unboxing` above,
+//     `GenerationalHeap`'s twins (gc/src/gen_heap.rs:4072, :4092, :3518) and
+//     `zgc.rs:2601` all funnel through it — so on the DEFAULT (Generational)
+//     collector a live `Object[]` element could be nulled with no trace
+//     anywhere: no counter, no log, no assert, and `object_degradation_count()`
+//     reading a reassuring 0. That is an observability bug today, independent of
+//     ZGC, and [`REF_ELEMENT_DEGRADATIONS`] closes it.
+//
+//     NULL IS NOT A DEGRADATION. `plausible_heap_pointer(0)` is `false`, so an
+//     ordinary null element — by far the common case for `Object[]` — reaches
+//     the cold arm too. Counting it would put the counter in the millions on a
+//     clean run and make "non-zero means a live object was nulled" false on
+//     first use. The `raw == 0` test in [`ref_element_word_implausible`] is
+//     therefore load-bearing, not a micro-optimisation.
+//
+// (2) A ZGC COLORED WORD IS NOT CORRUPTION, and must never take the degrade.
+//     `gc/src/zgc/vaddr.rs` sets bit 63 (`Z_COLORED_TAG`) on every non-null
+//     colored word *precisely so* it fails `plausible_heap_pointer`'s 47-bit
+//     test and is caught loudly rather than dereferenced as a wild pointer. The
+//     bare `else` did the exact opposite of loud: it converted "the load barrier
+//     has not run on this word" into a null handed to Java, i.e. an NPE or a
+//     silently dropped store at an arbitrary point far from the cause. Under a
+//     relocating collector that is silent heap corruption, which
+//     `docs/feature-designs/zgc-jit-load-barrier.md` (risk J1) rates worse than
+//     a clean SIGSEGV; `docs/feature-designs/zgc-reference-slot-representation.md`
+//     names this arm as the most dangerous unmigrated read in the tree, and
+//     `gc/src/zgc/census.rs` reads raw words rather than call it for exactly
+//     this reason.
+//
+//     The fix is NOT to weaken `plausible_heap_pointer` — both studies say so
+//     explicitly — it is to make the caller barrier the word first. Until that
+//     lands, a *structurally well-formed* colored word is an invariant violation
+//     and fails loudly instead of fabricating a null. Genuine garbage keeps the
+//     old degrade: `0x8D8D8D8D8D8D8D8D` has bit 63 set but fails
+//     `vaddr::is_well_formed` (which additionally demands bits 62-46 clear and
+//     exactly one metadata bit), so a `--features zgc` build running
+//     Generational or G1 behaves as before.
+
+/// Process-wide count of **non-null** array reference elements
+/// [`read_prim_element`] degraded to `null` because they failed
+/// [`cratonvm_types::plausible_heap_pointer`].
+///
+/// The read-side companion to [`COMPACT_OOP_MAP_MISSING`]: that one is a
+/// marking FAIL-OPEN, this one is a read FAIL-SILENT. Non-zero means Java was
+/// handed `null` for a slot that held bits — i.e. the GC root-coverage gap
+/// recorded in commit `6a04b0e3c1` is live in this run. Expected to be ZERO;
+/// zero is the only good value.
+///
+/// Advisory and `Relaxed`: it carries no happens-before relationship with the
+/// slot it counts.
+///
+/// TODO: `VmHeap::print_gc_summary` (gc/src/vm_heap.rs) already reports
+/// [`COMPACT_OOP_MAP_MISSING`]; this counter belongs on the same line. That file
+/// is outside this change.
+pub static REF_ELEMENT_DEGRADATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the running count of stale array reference elements degraded to `null`.
+/// See [`REF_ELEMENT_DEGRADATIONS`]; zero is the only good value.
+#[inline]
+pub fn ref_element_degradation_count() -> u64 {
+    REF_ELEMENT_DEGRADATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decode a raw reference word read out of an array element slot into the
+/// `Value` the interpreter expects, degrading a provably-impossible pointer to
+/// `Value::Object(None)`.
+///
+/// The fast path is byte-for-byte the predicate the `Reference` arm used before
+/// this chokepoint existed: `plausible_heap_pointer(raw)` and nothing else.
+/// Everything new lives in the `#[cold]`, `#[inline(never)]` callee, which is
+/// only reached once that predicate has *already* failed — so this costs
+/// nothing per element read on any build or any collector. See the block
+/// comment above for why the callee exists.
+///
+/// # Safety
+/// Nothing beyond `ObjectRef::from_raw`'s contract, and `raw` has passed
+/// [`cratonvm_types::plausible_heap_pointer`] before it is wrapped.
+#[inline(always)]
+unsafe fn decode_ref_element_word(raw: u64) -> Value {
+    if cratonvm_types::plausible_heap_pointer(raw) {
+        Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+    } else {
+        ref_element_word_implausible(raw)
+    }
+}
+
+/// Cold arm of [`decode_ref_element_word`]: the word cannot be a live heap
+/// pointer. Separates the three reasons a word lands here, which the previous
+/// bare `else { Value::Object(None) }` conflated into one silent answer:
+///
+/// * **`raw == 0`** — an ordinary null element. Not a degradation, not counted;
+///   the slot said null and the caller gets null. See the block comment above:
+///   counting this would destroy the counter's meaning on the first clean run.
+/// * **A structurally well-formed ZGC colored word** — legitimate data that has
+///   simply not been through the load barrier. Nulling it is the silent-null
+///   corruption of `zgc-jit-load-barrier.md` J1; returning the colored word is a
+///   wild-pointer deref. Neither is acceptable, so this is a hard failure that
+///   names the missing barrier.
+/// * **Stale/garbage bits** (the `0x8D8D..` class from commit `6a04b0e3c1`) —
+///   genuinely not a pointer. Keeps the existing degrade-to-null contract,
+///   now counted.
+///
+/// The ZGC arm is `#[cfg(feature = "zgc")]`, so a default build does not merely
+/// behave identically — the branch is not compiled. `crate::zgc` is itself
+/// `#[cfg(feature = "zgc")]` in `gc/src/lib.rs`, so the path is only nameable
+/// under that cfg.
+#[cold]
+#[inline(never)]
+fn ref_element_word_implausible(raw: u64) -> Value {
+    if raw == 0 {
+        return Value::Object(None);
+    }
+    #[cfg(feature = "zgc")]
+    {
+        // TODO(zgc): once the load barrier runs AHEAD of this decode (see the
+        // TODO in `read_prim_element`'s `Reference` arm) this branch becomes
+        // unreachable, because the word arriving here will already be a plain
+        // address. The barrier entry point is
+        // `crate::zgc::barrier::z_load(slot: &std::sync::atomic::AtomicU64,
+        // ctx: &C) -> u64` where `C: crate::zgc::barrier::ZBarrierContext +
+        // ?Sized` (gc/src/zgc/barrier.rs, `pub fn z_load`, line 1233 as of
+        // 2026-08-07). It must be applied to the element SLOT before any
+        // plausibility test, and the test must then ask about the barrier's
+        // UNMASKED address, never about the colored word. Do not weaken
+        // `plausible_heap_pointer` to admit colored words. Keep this panic as
+        // the tripwire for a caller that was missed.
+        if crate::zgc::vaddr::is_colored_word(raw) && crate::zgc::vaddr::is_well_formed(raw) {
+            panic!(
+                "ZGC colored word {raw:#018x} reached `read_prim_element`'s \
+                 Reference arm with no load barrier: bit 63 (Z_COLORED_TAG) is \
+                 set by gc/src/zgc/vaddr.rs, so this word is a legitimate \
+                 reference that has not been unmasked, not corruption. Barrier \
+                 it via crate::zgc::barrier::z_load and plausibility-check the \
+                 UNMASKED address; do not degrade it to null (that is the silent \
+                 heap corruption of zgc-jit-load-barrier.md J1) and do not weaken \
+                 plausible_heap_pointer to admit it."
+            );
+        }
+    }
+    REF_ELEMENT_DEGRADATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Value::Object(None)
+}
+
 /// Read an array element from compact storage.
 ///
 /// # Safety
@@ -1688,6 +1857,18 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
             let offset = index
                 .checked_mul(ref_element_size())
                 .expect("array ref element offset overflow");
+            // TODO(zgc): this is a raw reference-array element load — Category A
+            // in `docs/feature-designs/zgc-jit-load-barrier.md` §2.3, and entry
+            // 13 of `zgc-reference-slot-representation.md`'s migration table.
+            // Under `VmHeap::Zgc` the word must go through
+            // `crate::zgc::barrier::z_load(slot: &std::sync::atomic::AtomicU64,
+            // ctx: &C)` (gc/src/zgc/barrier.rs, `pub fn z_load`, line 1233 as of
+            // 2026-08-07) HERE — between `read_ref_slot` and the decode below —
+            // and the plausibility test inside `decode_ref_element_word` must
+            // then be applied to the barrier's unmasked address rather than to
+            // the colored word. Until that lands,
+            // `ref_element_word_implausible` fails loudly on a well-formed
+            // colored word instead of nulling it.
             let raw: u64 = read_ref_slot(base.add(offset));
             // Defense-in-depth reference-slot decode. Mirrors the VTAG_OBJECT
             // degrade in `cratonvm_types::decode_value` (operand/local SoA path)
@@ -1695,23 +1876,17 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
             // this hot heap-read path previously bypassed by wrapping ANY
             // non-zero bits verbatim. A non-null reference slot whose bits are
             // unaligned, inside the null-guard page, or outside the 47-bit
-            // user-address range is provably NOT a live object pointer: it is
-            // reused/garbage memory surfaced through a STALE reference (a GC
-            // root-coverage gap that swept-then-reused the young slot this ref
-            // still points at — observed as 8000+ all-zero-header stale `Thread`
-            // receivers, then `0x77..`/`": contex"` buffer bytes read back here).
+            // user-address range is provably NOT a live object pointer.
             // Fabricating an `ObjectRef` from such bits SIGSEGVs on its next
-            // deref, or panics in `CompactValue::object` for >47-bit bits
-            // (compact_value.rs:502). Degrade to null instead — the field/array
-            // read callers already normalise `Object(None)`, matching HotSpot's
-            // "you get a null, not a VM crash". Pure bit ops (no heap probe), so
-            // it is safe on this hot path and never rejects a valid pointer
-            // (every real object is 8-aligned, above the guard page, ≤47-bit).
-            if cratonvm_types::plausible_heap_pointer(raw) {
-                Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
-            } else {
-                Value::Object(None)
-            }
+            // deref, or panics in `CompactValue::object` for >47-bit bits.
+            // Degrade to null instead — the field/array read callers already
+            // normalise `Object(None)`, matching HotSpot's "you get a null, not
+            // a VM crash". Pure bit ops (no heap probe), so it is safe on this
+            // hot path and never rejects a valid pointer (every real object is
+            // 8-aligned, above the guard page, <=47-bit). The degrade is now
+            // COUNTED rather than silent — see the chokepoint block comment
+            // above `REF_ELEMENT_DEGRADATIONS` for the failure that closes.
+            decode_ref_element_word(raw)
         }
     }
 }
@@ -1867,6 +2042,136 @@ mod tests {
             "Value ({} bytes) exceeds SLOT_SIZE ({SLOT_SIZE} bytes)!",
             std::mem::size_of::<Value>()
         );
+    }
+
+    /// Serialises every test that reads [`REF_ELEMENT_DEGRADATIONS`] against
+    /// every test that *increments* it.
+    ///
+    /// The counter is process-wide and `cargo test` runs this crate's tests in
+    /// one process, in parallel — so a test that merely triggers a degradation
+    /// perturbs a concurrently-running test that measures one. Same reasoning
+    /// (and same mistake, already paid for once) as
+    /// `cratonvm_types::compact_value::degrade_counter_test_lock`. Deltas, never
+    /// absolute counts, and never a reset: a reset would destroy whatever window
+    /// a concurrent observer had already opened.
+    fn ref_degrade_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A null reference element is NOT a degradation.
+    ///
+    /// `plausible_heap_pointer(0)` is `false`, so an ordinary null `Object[]`
+    /// element takes the same cold arm as genuine garbage. If that arm counted
+    /// it, [`ref_element_degradation_count`] would read in the millions on a
+    /// clean run and "non-zero means a live object was nulled" would be false on
+    /// first use — the counter would be worse than none at all.
+    #[test]
+    fn null_ref_element_is_not_counted_as_a_degradation() {
+        let _guard = ref_degrade_test_lock();
+        let before = ref_element_degradation_count();
+        for _ in 0..1000 {
+            assert_eq!(
+                ref_element_word_implausible(0),
+                Value::Object(None),
+                "a null element must still decode to null"
+            );
+        }
+        assert_eq!(
+            ref_element_degradation_count() - before,
+            0,
+            "reading null elements must not move the degradation counter"
+        );
+    }
+
+    /// The degrade stopped being silent.
+    ///
+    /// Before this counter existed, `read_prim_element` handing Java a `null`
+    /// for a slot that held bits left no trace anywhere — no counter, no log, no
+    /// assert — while `cratonvm_types`' `object_degradation_count()` reported a
+    /// reassuring 0 because it only sees the interpreter's SoA/compact decode
+    /// paths, never this one.
+    #[test]
+    fn implausible_ref_element_degrades_to_null_and_is_counted() {
+        let _guard = ref_degrade_test_lock();
+        // The `0x8D8D..` class from commit `6a04b0e3c1`, plus an unaligned word
+        // and a >47-bit word. None can be a live object pointer.
+        let garbage: [u64; 3] = [0x8D8D_8D8D_8D8D_8D8D, 0x1001, 0x0001_0000_0000_0000];
+        let before = ref_element_degradation_count();
+        for raw in garbage {
+            assert!(
+                !cratonvm_types::plausible_heap_pointer(raw),
+                "{raw:#018x} must fail the plausibility test for this test to mean anything"
+            );
+            assert_eq!(
+                ref_element_word_implausible(raw),
+                Value::Object(None),
+                "garbage bits must still degrade to null, not fabricate an ObjectRef"
+            );
+        }
+        assert_eq!(
+            ref_element_degradation_count() - before,
+            garbage.len() as u64,
+            "every non-null degrade must be counted exactly once"
+        );
+    }
+
+    /// The fast path is unchanged: a plausible word still decodes verbatim and
+    /// costs nothing (it never reaches the cold arm, so it never touches the
+    /// counter).
+    #[test]
+    fn plausible_ref_element_decodes_verbatim_without_counting() {
+        let _guard = ref_degrade_test_lock();
+        let heap = Heap::new();
+        let obj = heap.alloc_object(ClassId::new(9), 1);
+        let raw: u64 = obj.as_ptr() as usize as u64;
+        assert!(cratonvm_types::plausible_heap_pointer(raw));
+        let before = ref_element_degradation_count();
+        // SAFETY: `raw` is the address of a live object just allocated above.
+        let decoded = unsafe { decode_ref_element_word(raw) };
+        match decoded {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), obj.as_ptr()),
+            other => panic!("a live object pointer must decode verbatim, got {other:?}"),
+        }
+        assert_eq!(
+            ref_element_degradation_count() - before,
+            0,
+            "the fast path must not touch the counter"
+        );
+    }
+
+    /// A well-formed ZGC colored word is legitimate data that has not been
+    /// through the load barrier — nulling it is silent heap corruption
+    /// (`zgc-jit-load-barrier.md` J1), so the cold arm must fail loudly instead.
+    #[cfg(feature = "zgc")]
+    #[test]
+    #[should_panic(expected = "with no load barrier")]
+    fn well_formed_colored_word_panics_instead_of_degrading() {
+        use crate::zgc::vaddr;
+        // Tagged (bit 63), reserved bits 62-46 clear, exactly one metadata bit.
+        let colored: u64 = vaddr::Z_COLORED_TAG | vaddr::Z_MARKED0 | 0x40;
+        assert!(vaddr::is_well_formed(colored));
+        assert!(!cratonvm_types::plausible_heap_pointer(colored));
+        let _ = ref_element_word_implausible(colored);
+    }
+
+    /// ...but garbage that merely happens to have bit 63 set is NOT a colored
+    /// word, and must keep the old degrade even in a `--features zgc` build
+    /// running Generational or G1. `0x8D8D..` sets bit 63 and fails
+    /// `is_well_formed` (reserved bits set, several metadata bits set).
+    #[cfg(feature = "zgc")]
+    #[test]
+    fn stale_garbage_with_bit63_still_degrades_under_the_zgc_feature() {
+        let _guard = ref_degrade_test_lock();
+        let raw: u64 = 0x8D8D_8D8D_8D8D_8D8D;
+        assert!(crate::zgc::vaddr::is_colored_word(raw));
+        assert!(
+            !crate::zgc::vaddr::is_well_formed(raw),
+            "if this ever becomes well-formed the panic arm would fire on real garbage"
+        );
+        let before = ref_element_degradation_count();
+        assert_eq!(ref_element_word_implausible(raw), Value::Object(None));
+        assert_eq!(ref_element_degradation_count() - before, 1);
     }
 
     #[test]
@@ -2659,7 +2964,7 @@ mod tests {
         /// `tests/phase_h_integration.rs` and `gen_heap.rs::NoOpMonitors`.
         struct NoMonitors;
         impl MonitorCleanup for NoMonitors {
-            fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+            fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
         }
 
         /// Test-only `StopTheWorldToken`. These tests are mostly single-

@@ -1985,7 +1985,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset: &[usize],
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) -> usize {
         // Regions that hold at least one self-forwarded (in-place) object.
         // `lookup_region_for_addr` consults the immutable region table, so it
@@ -2068,7 +2068,7 @@ impl G1Collector {
             return first;
         }
 
-        let identities = |m: &HashMap<usize, usize>| -> Vec<usize> {
+        let identities = |m: &cratonvm_types::PointerMap| -> Vec<usize> {
             m.iter().filter(|(k, v)| k == v).map(|(&k, _)| k).collect()
         };
 
@@ -2250,11 +2250,11 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
 
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
         let mut work_list: Vec<*mut u8> = Vec::new();
@@ -2355,7 +2355,7 @@ impl G1Collector {
     /// `acc` key the `acc` entry is the meaningful one (the `next` key is a
     /// pass-1-freed address recycled as later-pass to-space — no frame local
     /// can name it).
-    fn compose_forward_maps(acc: &mut HashMap<usize, usize>, next: &HashMap<usize, usize>) {
+    fn compose_forward_maps(acc: &mut cratonvm_types::PointerMap, next: &cratonvm_types::PointerMap) {
         for v in acc.values_mut() {
             if let Some(&nv) = next.get(v) {
                 *v = nv;
@@ -2403,7 +2403,7 @@ impl G1Collector {
         // invalidated and falls to the Free-gated slow path. `Release`
         // pairs with the `Acquire` load on the fast path.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
@@ -2870,7 +2870,7 @@ impl G1Collector {
         // (Phase 5). Invalidate every mutator's RSet fast-path cache
         // before any reclassification — see `rset_cache_epoch`.
         self.rset_cache_epoch.fetch_add(1, Ordering::Release);
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
 
@@ -3214,7 +3214,7 @@ impl G1Collector {
         roots: &mut [ObjectRef],
         keepalive: &[usize],
         sources: &std::collections::HashSet<usize>,
-    ) -> (HashMap<usize, usize>, usize, usize) {
+    ) -> (cratonvm_types::PointerMap, usize, usize) {
         // One-shot confirmation that the parallel evacuator is genuinely active
         // (the gauntlet lesson: never assume a gated path was taken — verify).
         {
@@ -3418,7 +3418,7 @@ impl G1Collector {
 
         // Merge the per-worker forward shards into the pointer map consumed by
         // the VM root remap and Phases 4/5.
-        let mut pointer_map: HashMap<usize, usize> = HashMap::with_capacity(main_forwards.len());
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(main_forwards.len(), Default::default());
         for (o, n) in main_forwards {
             pointer_map.insert(o, n);
         }
@@ -3504,7 +3504,7 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -3710,7 +3710,7 @@ impl G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let cset_set: std::collections::HashSet<usize> = cset.iter().copied().collect();
@@ -3899,7 +3899,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -3962,7 +3962,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         old_ptr: *mut u8,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         cset: &std::collections::HashSet<usize>,
@@ -4127,7 +4127,7 @@ impl G1Collector {
         obj_ptr: *mut u8,
         header: &ObjectHeader,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -4227,7 +4227,7 @@ impl G1Collector {
         regions: &mut Vec<G1Region>,
         source_idx: usize,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &mut HashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         objects_copied: &mut usize,
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
@@ -4347,7 +4347,7 @@ impl G1Collector {
         &self,
         regions: &mut Vec<G1Region>,
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         if pointer_map.is_empty() {
             return;
@@ -4521,7 +4521,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         cset: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let verify = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
         if !verify {
@@ -4650,7 +4650,7 @@ impl G1Collector {
         &self,
         regions: &[G1Region],
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         roots: &[ObjectRef],
     ) {
         if !gc_flags().g1_dbg_headers {
@@ -4660,7 +4660,7 @@ impl G1Collector {
         // SAME destination address = a TLAB allocation race (one copy clobbers
         // the other's header → `java/lang/Object`). Reverse-map the forwards.
         {
-            let mut by_dest: HashMap<usize, usize> = HashMap::with_capacity(pointer_map.len());
+            let mut by_dest: cratonvm_types::PointerMap = cratonvm_types::PointerMap::with_capacity_and_hasher(pointer_map.len(), Default::default());
             let mut overlaps = 0usize;
             for (&k, &v) in pointer_map.iter() {
                 if k == v {
@@ -5329,7 +5329,7 @@ impl G1Collector {
     fn remap_reference_skip_set(
         &self,
         cset_set: &std::collections::HashSet<usize>,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let mut skip = self.reference_skip.lock();
         if skip.is_empty() {
@@ -7904,6 +7904,48 @@ impl GarbageCollector for G1Collector {
         }
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_object_field_storage`
+        // returns `None` for TWO different reasons and the `unwrap_or` below
+        // treats them as one: "this is a legacy object" (correct — the uniform
+        // `index * SLOT_SIZE` 16-byte cell, unchanged) and "this IS a compact
+        // object (`GC_FLAG_COMPACT`, set at allocation) whose
+        // `(class_id, num_slots)` no longer resolves to a registered layout"
+        // (its `class_layout_for_fields(..)?` early return — e.g. a class
+        // redefinition racing the layout registry).
+        //
+        // For the second, `alloc_object` above sized this object's body with
+        // `compact_object_body_size`, NOT `num_fields * SLOT_SIZE`, and
+        // `num_slots()` on a compact object is the FIELD COUNT — so the
+        // `index >= num_slots` screen above does not bound the legacy stride,
+        // and the read at `ARRAY_DATA_OFFSET + index * SLOT_SIZE` runs past
+        // the allocation. That is the read half of the `SIGSEGV` observed
+        // against the real `DefaultCatalogAndSchemaTest` workload.
+        //
+        // `is_compact_object(header)` is the per-object header bit, read
+        // independently of the registry, and is exactly how this collector's
+        // own walkers already separate the two cases — see
+        // `for_each_flat_object_reference` and the concurrent mark's object
+        // arm, both of which then simply skip the object when
+        // `with_class_layout` misses. An accessor cannot skip, so it degrades
+        // as this function's neighbouring guards do: benign null read, loud
+        // `cratonvm::gc::guard` record, no panic. Matches
+        // `GenerationalHeap::get_field` (gen_heap.rs), which carries the full
+        // rationale and the open `TODO` about the unchecked `layout_domain` on
+        // the read path.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
         let (payload_off, payload_size) = compact
             .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
@@ -8015,6 +8057,32 @@ impl GarbageCollector for G1Collector {
         }
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
+        // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
+        // on the matching guard in `get_field` above for why this `None` is
+        // two different states and why only the legacy one may reach the
+        // `unwrap_or` below. This half is the more damaging: the legacy stride
+        // does not merely read past a compact-sized body, it *writes* a
+        // 16-byte `Value` cell over whatever follows the object.
+        //
+        // The SATB pre-barrier above has already run, and in this state its
+        // `self.get_field(obj, index)` returned `Value::Object(None)` through
+        // that same guard — so no bogus edge was logged, and the second
+        // `cratonvm::gc::guard` record it emits for this object is expected.
+        if compact.is_none() && cratonvm_types::is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "g1::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the write rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
         let (payload_off, payload_size) = compact
             .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
@@ -8497,7 +8565,7 @@ fn consume_satb_pre_barrier_epoch() -> bool {
 /// than from a separate counter is what stops the report and the reclamation
 /// decision from ever disagreeing.
 fn g1_pause_degraded_flags(
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
     jni_pinned_out: usize,
     jit_pinned_out: usize,
     parallel: bool,
@@ -8787,7 +8855,7 @@ fn is_collectable_region_type(region_type: RegionType) -> bool {
 fn update_object_refs(
     obj_ptr: *mut u8,
     header: &ObjectHeader,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     let data_start = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET) };
 
@@ -8903,7 +8971,7 @@ mod tests {
     /// No-op monitor cleanup for tests.
     struct NoopMonitors;
     impl MonitorCleanup for NoopMonitors {
-        fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
     }
 
     /// Test-only `StopTheWorldToken`. Single-threaded test harness, so the
@@ -8953,6 +9021,50 @@ mod tests {
         assert!(
             bytes.iter().all(|&byte| byte == 0),
             "G1 must return a fully zeroed TLAB even from dirty recycled Eden"
+        );
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side. `compact_object_field_storage`
+    /// returns `None` both for a legacy object and for a genuinely compact one
+    /// whose `(class_id, field_count)` no longer resolves to a registered
+    /// layout, and `get_field`/`set_field` collapsed the two into
+    /// `.unwrap_or((index * SLOT_SIZE, SLOT_SIZE))`. On a real instance of the
+    /// second state `alloc_object` sized the body with
+    /// `compact_object_body_size` and `num_slots()` is the FIELD COUNT, so the
+    /// `index >= num_slots` screen does not bound that legacy stride: the read
+    /// escapes the allocation and the write puts a 16-byte `Value` cell past
+    /// it. This collector's own walkers already separate the two cases via the
+    /// `GC_FLAG_COMPACT` header bit; the accessors must too.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let gc = make_collector();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY and the cells written below are real, readable cells. Setting
+        // the bit afterwards reproduces the racing state (header says compact,
+        // registry cannot serve it) without a live redefinition.
+        let obj = gc.alloc_object(ClassId::new(999_997), 4);
+        gc.set_field(obj, 0, Value::Int(1));
+        gc.set_field(obj, 1, Value::Int(2));
+
+        // SAFETY: flips the per-object compact bit on a live, fully
+        // initialized allocation; both flag helpers take `&self` and drive the
+        // atomic mark word.
+        let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(gc.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        gc.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert!(
+            matches!(gc.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
         );
     }
 
@@ -12866,10 +12978,10 @@ mod tests {
     /// over a recycled intermediate).
     #[test]
     fn compose_forward_maps_chases_and_keeps_pause_start_keys() {
-        let mut acc: HashMap<usize, usize> = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
+        let mut acc: cratonvm_types::PointerMap = [(0xa0, 0xb0), (0x40, 0x40), (0x70, 0x71)]
             .into_iter()
             .collect();
-        let next: HashMap<usize, usize> = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
+        let next: cratonvm_types::PointerMap = [(0xb0, 0xc0), (0x40, 0x90), (0xe0, 0xf0), (0x70, 0x99)]
             .into_iter()
             .collect();
         G1Collector::compose_forward_maps(&mut acc, &next);
@@ -13426,7 +13538,7 @@ mod tests {
                 bytes_copied: 0,
                 bytes_freed: 0,
             },
-            pointer_map: HashMap::new(),
+            pointer_map: cratonvm_types::PointerMap::default(),
         };
         let mut no_roots: Vec<ObjectRef> = Vec::new();
         let _ = gc.retry_after_evacuation_failure(clean, &mut no_roots, &NoopMonitors);

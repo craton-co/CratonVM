@@ -1051,7 +1051,7 @@ impl OldGen {
     ///
     /// Returns a pointer map (old_addr → new_addr) for objects that moved.
     /// Objects that stay in place are NOT included in the map.
-    pub fn compact(&mut self) -> HashMap<usize, usize> {
+    pub fn compact(&mut self) -> cratonvm_types::PointerMap {
         self.compact_with_drop_flags(&HashMap::new())
     }
 
@@ -1065,7 +1065,7 @@ impl OldGen {
     pub fn compact_with_drop_flags(
         &mut self,
         drop_flags: &HashMap<usize, u8>,
-    ) -> HashMap<usize, usize> {
+    ) -> cratonvm_types::PointerMap {
         let base = self.data.as_mut_ptr();
         let objects = self.walk_objects();
         // GCAUD-4: bumped up front, so it covers both abandoned paths below
@@ -1125,7 +1125,7 @@ impl OldGen {
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
                 header.clear_gc_flags(GC_FLAG_MARKED);
             }
-            return HashMap::new();
+            return cratonvm_types::PointerMap::default();
         }
 
         // Phase 0 (dangling-ref guard): close the live set under "referenced
@@ -1177,13 +1177,13 @@ impl OldGen {
                 let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
                 header.clear_gc_flags(GC_FLAG_MARKED);
             }
-            return HashMap::new();
+            return cratonvm_types::PointerMap::default();
         }
 
         // Phase 1: Compute forwarding addresses for live objects.
         // `write_cursor` tracks the next available byte offset (8-byte aligned).
         let mut write_cursor: usize = 0;
-        let mut pointer_map: HashMap<usize, usize> = HashMap::new();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         // (src_ptr, total_size, dest_ptr, saved_mark) for each live object.
         //
         // `saved_mark` exists because of the 32 -> 24 header shrink. Forwarding

@@ -1908,7 +1908,7 @@ impl Frame {
     /// heap object, leaving the long value intact.
     pub fn update_local_refs(
         &mut self,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         heap: &crate::memory::VmHeap,
     ) {
         let _ = heap;
@@ -2912,7 +2912,7 @@ mod tests {
         let old = 0x2000usize as i64;
         frame.set_local_unchecked(0, Value::Long(old));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x2000usize, 0x3000usize);
         let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         frame.update_local_refs(&map, &heap);
@@ -3179,7 +3179,7 @@ mod tests {
         frame.set_local_compact_unchecked(0, CompactValue::long(old_addr as i64));
         assert!(!frame.get_local_compact(0).is_object());
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_addr as usize, new_addr as usize);
         frame.update_local_refs(&map, &heap);
 
@@ -3217,7 +3217,7 @@ mod tests {
         assert_eq!(frame.get_local_compact(0).as_object_ptr(), Some(0x2000));
 
         // A relocation of *some other* object that happened to live at 0x2000.
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x2000usize, 0x3000usize);
         let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         frame.update_local_refs(&map, &heap);

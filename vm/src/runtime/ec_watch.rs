@@ -204,7 +204,7 @@ pub fn detect(vm: usize) -> Vec<(usize, u32, usize, usize)> {
 /// Rewrite each watched holder through the collector's `pointer_map` after a
 /// GC. MUST be called on every GC instead of clearing — a moving collector
 /// relocates survivors, and the corruption frequently hits a survivor.
-pub fn remap(vm: usize, pointer_map: &HashMap<usize, usize>) {
+pub fn remap(vm: usize, pointer_map: &cratonvm_types::PointerMap) {
     if !enabled() || pointer_map.is_empty() {
         return;
     }

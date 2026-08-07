@@ -805,7 +805,7 @@ impl SharedVm {
     /// entries whose Throwable was collected. The registry deliberately does
     /// not keep its key object alive; `is_object_address` is the collector's
     /// stable post-collection liveness probe.
-    pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &cratonvm_types::PointerMap) {
         let mut traces = self.threads.throwable_stacks.write();
         traces.retain(|_, trace| {
             let old_addr = trace.throwable.as_ptr() as usize;
@@ -1429,6 +1429,23 @@ impl SharedVm {
                     }
                 }
             }
+        }
+
+        // --- ZGC relocation --------------------------------------------------
+        //
+        // Beside the compressed-oops gate above because it is the same shape: a
+        // GC capability the JIT has not been taught about, decided once, here,
+        // while the heap is young enough for the answer to be honoured.
+        //
+        // `RELOCATION_REQUESTED` stands in for the eventual relocation switch.
+        // Nothing requests relocation today — see `zgc_relocation_permitted` —
+        // so this is inert, which is the point: the gate is placed AHEAD of the
+        // capability. Whoever wires the switch replaces this constant and
+        // inherits the refusal rather than having to remember it.
+        #[cfg(feature = "zgc")]
+        if gc_backend == GcBackend::Zgc {
+            const RELOCATION_REQUESTED: bool = false;
+            let _zgc_relocation = zgc_relocation_permitted(RELOCATION_REQUESTED);
         }
 
         // bug-h2-largeblob-direct-memory-oom fix — resolve the process-wide
@@ -3689,6 +3706,73 @@ impl SharedVm {
 
         vm
     }
+}
+
+/// Whether ZGC **relocation** may run in this configuration — a refusal, not a
+/// warning.
+///
+/// `requested` is the eventual relocation switch. There is none today: no
+/// `-XX:` option, no `CRATONVM_*` name in `types/src/flag_groups.rs`, no field
+/// on `crate::config::VmConfig`, and `gc/src/zgc/relocate.rs` has no caller —
+/// `ZgcRealHeap` is still the non-moving stop-the-world mark-sweep it has
+/// always been. So the one call site passes a `false` constant and this gate is
+/// a no-op. It exists anyway because a gate added *after* the capability it
+/// guards is a gate that shipped one release too late.
+///
+/// # Why a refusal
+///
+/// Under a relocating ZGC a reference slot holds a *colored* word, not a
+/// machine pointer: a heap offset plus metadata bits plus `Z_COLORED_TAG` at
+/// bit 63 (`gc/src/zgc/vaddr.rs`). The load barrier
+/// (`gc/src/zgc/barrier.rs`) is what turns that word into a live address and
+/// heals the slot, and the interpreter takes it on every read. JIT-compiled
+/// code does not: there are nine raw reference-load emission points across the
+/// baseline and optimizing x64 tiers — `getfield`, `getstatic`, `aaload`, the
+/// `String.value` intrinsic, the LICM hoist, the SIMD row load — and the helper
+/// arms that do reach Rust run the loaded word through `plausible_heap_pointer`
+/// and answer `0` when it fails, which a colored word is designed to do.
+///
+/// So compiled code reads either a stale from-space address into an evacuated
+/// object (use-after-free) or a spurious `null` for a live one (a wrong answer,
+/// silently). Unlike the compressed-oops gate in `SharedVm::new`, whose
+/// degraded mode is "slower but correct", there is no correct degraded mode
+/// here, so this returns `false` rather than logging and continuing.
+///
+/// Refusing *relocation* rather than the *JIT* is deliberate: it degrades ZGC
+/// to the non-moving collector it already is, instead of degrading the whole VM
+/// to the interpreter.
+///
+/// # What lifts the gate
+///
+/// Stage (a) of `docs/feature-designs/zgc-jit-load-barrier.md`: the barrier
+/// inside the `jit_getfield` / `jit_aaload` / `jit_getstatic` helpers, the
+/// inline arms routed to those helpers behind the JIT-side kill switch, and the
+/// seven value-degrading plausibility filters removed from the load path. Until
+/// then the permitted relocating configuration is "JIT off".
+#[cfg(feature = "zgc")]
+pub fn zgc_relocation_permitted(requested: bool) -> bool {
+    if !requested {
+        return false;
+    }
+    if crate::runtime::env_cache::disable_jit() {
+        return true;
+    }
+    // Reported on stderr, not just through `tracing`, for the reason the
+    // compressed-oops gate states: a silent fallback would look identical to a
+    // successful run, and the operator must see which one they got. The stakes
+    // are higher here — the un-refused configuration corrupts the heap rather
+    // than merely using more of it.
+    eprintln!(
+        "[cratonvm] ZGC relocation requested but the JIT is enabled - relocation \
+         REFUSED, running the non-moving mark-sweep instead. JIT-compiled code \
+         loads reference fields without the ZGC load barrier, so a relocating \
+         cycle would hand it stale pointers into evacuated objects \
+         (use-after-free) or a spurious null for a live object, with no error \
+         path. Re-run with --nojit (CRATONVM_DISABLE_JIT=1) to get relocation, \
+         or wait for the JIT-side load barrier - stage (a) of \
+         docs/feature-designs/zgc-jit-load-barrier.md."
+    );
+    false
 }
 
 // ---------------------------------------------------------------------------

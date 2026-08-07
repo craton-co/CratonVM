@@ -11745,7 +11745,7 @@ pub fn gc_scan_annotation_proxy_roots(vm_identity: usize, out: &mut Vec<ObjectRe
 /// new address after a moving collection.
 pub fn gc_update_annotation_proxy_refs(
     vm_identity: usize,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;

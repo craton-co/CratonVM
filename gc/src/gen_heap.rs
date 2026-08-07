@@ -1615,7 +1615,7 @@ unsafe impl Sync for GenerationalHeap {}
 // objects_copied_young].
 // ---------------------------------------------------------------------------
 thread_local! {
-    static COPY_TALLY: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static COPY_TALLY: std::cell::Cell<[u64; 6]> = const { std::cell::Cell::new([0; 6]) };
 }
 
 /// Record one copied object, classified by the arena it actually landed in
@@ -1632,11 +1632,35 @@ fn copy_tally_add(promoted: bool, bytes: u64) {
     });
 }
 
+/// Bump one of the two `forward_object` arm counters: slot 4 counts
+/// re-encounters (the object was already forwarded, so this call is a pure
+/// lookup), slot 5 counts actual copies. Their ratio is what says whether
+/// `cheney_drain` is a copying cost or a lookup cost.
+#[inline]
+fn copy_tally_arm(reencounter: bool) {
+    // Diagnostic only, and it fires on the re-encounter path as well -- about
+    // 1.5M calls per collection on a Spring workload -- so it is behind the
+    // same flag that prints the breakdown rather than paid for unconditionally.
+    // (`copy_tally_add` next door is NOT gated: it replaced Phase H's
+    // statistics walk, and those counters are committed to `self.stats` every
+    // cycle.)
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| gc_flags().dbg_gcpause) {
+        return;
+    }
+    COPY_TALLY.with(|t| {
+        let mut a = t.get();
+        a[if reencounter { 4 } else { 5 }] += 1;
+        t.set(a);
+    });
+}
+
 /// Read and clear the tally for this cycle.
-fn copy_tally_take() -> [u64; 4] {
+fn copy_tally_take() -> [u64; 6] {
     COPY_TALLY.with(|t| {
         let a = t.get();
-        t.set([0; 4]);
+        t.set([0; 6]);
         a
     })
 }
@@ -3532,6 +3556,65 @@ impl GenerationalHeap {
             }
             return v;
         }
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_field_slot` answers
+        // `None` for TWO different reasons, and only the first licenses the
+        // fall-through below:
+        //
+        //   (1) "this is a legacy object" — its documented contract. The
+        //       uniform 16-byte `Value` cell read below is correct and this
+        //       arm is unchanged.
+        //   (2) "this IS a compact object (`GC_FLAG_COMPACT`, set at
+        //       allocation) but its `(class_id, num_slots)` no longer
+        //       resolves to a registered layout" — its `with_class_layout`
+        //       miss, e.g. a class redefinition racing the layout registry.
+        //
+        // Case (2) must NOT fall through. A compact object's body was sized
+        // by `compact_object_body_size` (see `plan_object_alloc`), and its
+        // `num_slots()` is the FIELD COUNT, not a legacy slot count — so the
+        // `index >= num_slots` screen above does not bound
+        // `HEADER_SIZE + index * SLOT_SIZE`, and an entirely in-range `index`
+        // still strides past the allocation for `read_slot` to dereference.
+        // That is the read half of the `SIGSEGV` observed against the real
+        // `DefaultCatalogAndSchemaTest` workload, whose Hibernate/ByteBuddy
+        // proxies churn redefinitions.
+        //
+        // Testing `is_compact_object(header)` — the per-object header bit,
+        // independent of the registry — is what tells the two cases apart; it
+        // is the same discriminator the GC walkers use, see the matching
+        // notes in `for_each_ref_slot`/`forward_ref_slots` below. Those
+        // walkers SKIP such an object ("no provably-safe reference slots to
+        // visit ... rather than guessing"). An accessor cannot skip, so it
+        // degrades the way this function's other unserviceable-access guards
+        // already do (suspect header, out-of-bounds index): a benign null
+        // read plus a loud `cratonvm::gc::guard` record. Deliberately not a
+        // panic — those guards' own comments give the reason (a corrupt
+        // receiver must let the Java side surface an error instead of
+        // aborting the JVM) — and deliberately not a silent fall-through,
+        // which is precisely what made the original `SIGSEGV` unattributable.
+        //
+        // TODO(types/src/field_layout.rs): the converse hazard is still open
+        // and cannot be closed from this file. `compact_object_body_size`
+        // refuses a FOREIGN `layout_domain`'s entry at allocation time, but
+        // the read path (`with_class_layout` / `compact_object_field_storage`)
+        // performs no domain check at all — so a same-numbered `class_id`
+        // registered by a different `ClassStore` resolves here and is read as
+        // if it described this class. Those two functions need the
+        // `layout_owner(class_id) != domain` screen that
+        // `compact_object_body_size` already applies.
+        if is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "gen_heap::get_field: compact receiver has no registered layout \
+                 for its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
         // `num_slots` (checked above). `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
@@ -3800,6 +3883,34 @@ impl GenerationalHeap {
                     )
                 };
             }
+            return;
+        }
+        // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
+        // on the matching guard in `get_field` above for why
+        // `compact_field_slot`'s `None` is two different states and why only
+        // the legacy one may fall through. This half is the more damaging of
+        // the two: `write_slot` at `HEADER_SIZE + index * SLOT_SIZE` on a
+        // compact-sized body does not merely read past the allocation, it
+        // *writes* a 16-byte `Value` cell over whatever follows the object —
+        // a neighbouring object's header, or unmapped memory. As in
+        // `get_field`, the walkers' answer to this state is "skip, do not
+        // guess"; the accessor's equivalent is this function's own
+        // established one for an unserviceable write (suspect header,
+        // out-of-bounds index): drop the store, record it loudly, do not
+        // panic.
+        if is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "gen_heap::set_field: compact receiver has no registered layout \
+                 for its (class_id, field_count) — dropping the write rather \
+                 than striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
             return;
         }
         // SAFETY: Same as `get_field` — `index` is within `num_slots` so the
@@ -5568,7 +5679,7 @@ impl GenerationalHeap {
                         bytes_copied: 0,
                         bytes_freed: 0,
                     },
-                    pointer_map: HashMap::new(),
+                    pointer_map: cratonvm_types::PointerMap::default(),
                 },
                 Vec::new(),
             );
@@ -6021,7 +6132,7 @@ impl GenerationalHeap {
                         bytes_copied: 0,
                         bytes_freed: 0,
                     },
-                    pointer_map: HashMap::new(),
+                    pointer_map: cratonvm_types::PointerMap::default(),
                 },
                 Vec::new(),
             );
@@ -6038,7 +6149,7 @@ impl GenerationalHeap {
         // forwarded pointer (N hash ops per GC for N live objects).
         // Converted back to std HashMap at the end for public-API
         // compatibility (`GcResult.pointer_map` and `MonitorCleanup`).
-        let mut pointer_map: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut pointer_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         // CRIT-P2 fix: explicit worklist of promoted (old-gen) objects awaiting
         // a scan. Replaces the O(promoted^2) filter loop that previously
         // rebuilt `Vec<unscanned>` from `pointer_map.values()` per iteration.
@@ -6672,7 +6783,17 @@ impl GenerationalHeap {
             objects_promoted_cycle,
             bytes_copied_young_cycle,
             objects_copied_young_cycle,
+            fwd_reencounters_cycle,
+            fwd_copies_cycle,
         ] = copy_tally_take();
+        if mv_phase_on {
+            // How many `forward_object` calls were pure lookups on an already
+            // forwarded object. Each one is a hash probe of a map with as many
+            // entries as there are survivors, so if this dwarfs the copy count
+            // then `cheney_drain` is a lookup cost, not a copying cost.
+            moving_phase_count_push("fwd_reencounters", fwd_reencounters_cycle as u128);
+            moving_phase_count_push("fwd_copies", fwd_copies_cycle as u128);
+        }
         // The walk below no longer produces those counters — `copy_tally_add`
         // does, at the copy site. What is left of it is the BUG-Z forward
         // validation, which is a diagnostic and does not need to run on every
@@ -6842,13 +6963,17 @@ impl GenerationalHeap {
             young_from.reset();
         }
 
-        // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
-        // expected by `MonitorCleanup::remap_after_gc` (defined in
-        // `collector.rs`) and `GcResult.pointer_map` (the public-API field
-        // in `gc.rs`). The conversion is a single O(N) walk — cheap
-        // compared to N SipHash operations across the Cheney scan.
+        // CRIT-P2 (2026-08-07): the conversion this used to do is gone.
+        // `GcResult.pointer_map` and `MonitorCleanup::remap_after_gc` now name
+        // `cratonvm_types::PointerMap`, i.e. the same `FxHashMap` the Cheney
+        // scan builds, so the map is moved rather than rehashed. The old
+        // comment called the rebuild "a single O(N) walk — cheap compared to N
+        // SipHash operations across the Cheney scan"; it was N SipHash
+        // operations, just moved to the end of the cycle, and it measured
+        // 43 ms median / 98 ms max of a 424 ms pause on the OAuth2 6-lane
+        // repro.
         mv_phase!("cardclear+young_reset");
-        let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
+        let mut pointer_map = pointer_map;
 
         mv_phase!("pointer_map_rebuild");
         // Phase 4: Swap young spaces (monitor remap deferred until after a
@@ -8125,7 +8250,7 @@ impl GenerationalHeap {
         // a non-pointer slot. Objects reachable only via precise heap edges (the
         // tree's interior nodes) are movable and get tenured, draining young
         // while the few pinned objects stay put.
-        let mut evac_map: HashMap<usize, usize> = HashMap::new();
+        let mut evac_map: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
         // Fix A: selective promotion is the proven-correct drain for the
         // JIT-active non-moving sweep (bt18 = 68332206 = HotSpot), so it is now
         // DEFAULT-ON. Opt out with `CRATONVM_NO_SELECTIVE_PROMOTE` to get the pure
@@ -8374,7 +8499,7 @@ impl GenerationalHeap {
                 fn unwind_evac(
                     fwd_installs: &mut Vec<(usize, *mut u8)>,
                     evacuated: &mut Vec<*mut u8>,
-                    evac_map: &mut HashMap<usize, usize>,
+                    evac_map: &mut cratonvm_types::PointerMap,
                     age_bumps: &mut Vec<usize>,
                     fwd_wm: usize,
                     evac_wm: usize,
@@ -10855,8 +10980,8 @@ impl GenerationalHeap {
     fn sweep_old_gen_non_moving(
         &self,
         roots: &[ObjectRef],
-        promotions: &HashMap<usize, usize>,
-    ) -> (usize, HashMap<usize, usize>) {
+        promotions: &cratonvm_types::PointerMap,
+    ) -> (usize, cratonvm_types::PointerMap) {
         let young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
         let before = old_gen.used();
@@ -10968,7 +11093,7 @@ impl GenerationalHeap {
         young_from: &Arena,
         old_gen: &mut OldGen,
         young_skips: &[(usize, usize)],
-    ) -> HashMap<usize, usize> {
+    ) -> cratonvm_types::PointerMap {
         // See `oldgen_compact_enabled`: compaction is disabled by default as
         // of 2026-08-03 pending root-cause attribution of the corruption it
         // was found to cause (fixed-suite-bugs/hibernate/
@@ -10996,7 +11121,7 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         compact: bool,
         young_skips: &[(usize, usize)],
-    ) -> HashMap<usize, usize> {
+    ) -> cratonvm_types::PointerMap {
         // ---- Mark phase ---- BFS from roots + young-gen cross-references ----
 
         let mut worklist: Vec<*mut u8> = Vec::new();
@@ -11368,7 +11493,7 @@ impl GenerationalHeap {
             // from "the address is inside old gen". Emit an identity entry for
             // each watched survivor, mirroring what `OldGen::compact` already
             // does for watched objects that happen not to move.
-            let mut watched_survivors: HashMap<usize, usize> = HashMap::new();
+            let mut watched_survivors: cratonvm_types::PointerMap = cratonvm_types::PointerMap::default();
             // GCAUD-8: the grid derived before the mark. Nothing since then has
             // allocated or freed in old gen, so re-walking would return the
             // same slice; the mark oracle above and the free loop below now
@@ -12037,7 +12162,7 @@ impl GenerationalHeap {
     /// pointed to old-gen objects which have been relocated.
     fn fixup_young_old_refs(
         young_from: &Arena,
-        compact_map: &HashMap<usize, usize>,
+        compact_map: &cratonvm_types::PointerMap,
         young_skips: &[(usize, usize)],
     ) {
         // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
@@ -12602,7 +12727,7 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
         objects_copied: &mut usize,
-        pointer_map: &mut FxHashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         promoted_worklist: &mut Vec<*mut u8>,
         force_promote_all: bool,
     ) -> *mut u8 {
@@ -12638,7 +12763,7 @@ impl GenerationalHeap {
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
         objects_copied: &mut usize,
-        pointer_map: &mut FxHashMap<usize, usize>,
+        pointer_map: &mut cratonvm_types::PointerMap,
         promoted_worklist: &mut Vec<*mut u8>,
         force_promote_all: bool,
     ) -> *mut u8 {
@@ -12806,6 +12931,7 @@ impl GenerationalHeap {
             // Ensure pointer_map has this entry so update_all_roots can update
             // all references to this old address, even if this is a second
             // encounter of the same object (e.g., root + dirty card + Cheney scan).
+            copy_tally_arm(true);
             pointer_map.entry(old_ptr as usize).or_insert(fwd as usize);
             return fwd;
         }
@@ -13008,6 +13134,7 @@ impl GenerationalHeap {
         // ACTUALLY landed: the promotion branch falls back to to-space when
         // old gen is full, so `should_promote` is not the answer.
         copy_tally_add(old_gen.contains(new_ptr), total_size as u64);
+        copy_tally_arm(false);
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
@@ -16049,7 +16176,7 @@ mod tests {
     /// No-op monitor cleanup for tests in the gc crate.
     struct NoOpMonitors;
     impl crate::collector::MonitorCleanup for NoOpMonitors {
-        fn remap_after_gc(&self, _pointer_map: &std::collections::HashMap<usize, usize>) {}
+        fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
     }
 
     unsafe fn corrupt_header_byte(obj: ObjectRef, offset: usize, value: u8) {
@@ -16169,6 +16296,54 @@ mod tests {
         assert!(
             visited.is_empty(),
             "an unresolvable compact object must be skipped, not walked as legacy"
+        );
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side: the walkers were hardened
+    /// against a compact object whose layout no longer resolves, but
+    /// `get_field`/`set_field` were not. `compact_field_slot` answers `None`
+    /// for that object exactly as it does for a legacy one, and both
+    /// accessors read that `None` as "legacy" and fall through to
+    /// `slot_ptr` — `HEADER_SIZE + index * SLOT_SIZE`. On a real instance of
+    /// this state the body was sized by `compact_object_body_size` and
+    /// `num_slots()` is the FIELD COUNT, so the `index >= num_slots` screen
+    /// does not bound that stride: the read runs past the allocation and the
+    /// write puts a 16-byte `Value` cell past it.
+    ///
+    /// Both accessors must now degrade the way their sibling guards do —
+    /// null read, dropped write — rather than guessing a layout.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let heap = small_gen_heap();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY (`plan_object_alloc` falls through to `num_fields *
+        // SLOT_SIZE`) and the cells written below are real, readable cells.
+        // Flipping the bit afterwards is what reproduces the racing state
+        // without needing a live redefinition: the header claims compact, the
+        // registry cannot serve it.
+        let obj = heap.alloc_object(ClassId::new(999_997), 4);
+        heap.set_field(obj, 0, Value::Int(1));
+        heap.set_field(obj, 1, Value::Int(2));
+
+        // SAFETY: flips the per-object compact bit on a live, fully
+        // initialized allocation; `add_gc_flags`/`clear_gc_flags` take `&self`
+        // and drive the atomic mark word.
+        let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+        header.add_gc_flags(GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(heap.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        heap.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(GC_FLAG_COMPACT);
+        assert!(
+            matches!(heap.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
         );
     }
 
@@ -17689,7 +17864,7 @@ mod tests {
         // SAFETY: `live_addr + 32` is inside a live 4-slot object.
         let interior = unsafe { ObjectRef::from_raw((live_addr + 32) as *mut u8) };
         let (reclaimed, _survivors) =
-            heap.sweep_old_gen_non_moving(&[interior], &HashMap::new());
+            heap.sweep_old_gen_non_moving(&[interior], &cratonvm_types::PointerMap::default());
 
         let bases: Vec<usize> = heap
             .old_gen_lock()
@@ -17857,7 +18032,7 @@ mod tests {
         // Keep the first half; the second half's storage is one adjacent run.
         let live: Vec<ObjectRef> = roots[..N / 2].to_vec();
         let blocks_before = heap.old_gen_lock().free_block_count();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
         assert!(reclaimed > 0, "the dropped half must be reclaimed");
 
         let og = heap.old_gen_lock();
@@ -17903,7 +18078,7 @@ mod tests {
         assert!(heap.is_in_old(roots[1].as_ptr()));
 
         let old_used_before = heap.old_gen_used();
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[live_old], &cratonvm_types::PointerMap::default());
 
         assert!(
             reclaimed > 0,
@@ -17949,7 +18124,7 @@ mod tests {
         // Both addresses are watched — exactly what the VM publishes for every
         // address the reference processor holds.
         crate::gc_quiescence::set_watched_referents(&[live_old, dead_old]);
-        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &HashMap::new());
+        let (reclaimed, survivors) = heap.sweep_old_gen_non_moving(&[roots[0]], &cratonvm_types::PointerMap::default());
         crate::gc_quiescence::set_watched_referents(&[]);
 
         assert!(reclaimed > 0, "the unreachable promotion must be reclaimed");
@@ -18823,7 +18998,7 @@ mod tests {
         let doomed_addr = roots[1].as_ptr() as usize;
 
         let live = vec![keep];
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
         assert!(
             reclaimed > 0,
             "the sweep must actually have reclaimed the dropped object in place",
@@ -18880,7 +19055,7 @@ mod tests {
         // Only the holder is rooted; the victim must survive via the holder's
         // ref slot, which is precisely the edge the detector inspects.
         let live = vec![holder];
-        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &HashMap::new());
+        let (_reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&live, &cratonvm_types::PointerMap::default());
 
         let vm = crate::vm_heap::VmHeap::Generational(heap);
         assert!(
@@ -18929,7 +19104,7 @@ mod tests {
         // is exactly the state `sweep_young_non_moving` hands over.
         let stale_young = heap.alloc_object(ClassId::new(0), 0);
         let promoted_addr = promoted.as_ptr() as usize;
-        let mut promotions = HashMap::new();
+        let mut promotions = cratonvm_types::PointerMap::default();
         promotions.insert(stale_young.as_ptr() as usize, promoted_addr);
 
         let stale_roots = vec![stale_young];
@@ -19272,7 +19447,7 @@ mod tests {
         // Only A is rooted. B is reachable ONLY through A's reference slot —
         // exactly the edge the screen used to drop.
         let (b_addr, c_addr) = (b.as_ptr() as usize, c.as_ptr() as usize);
-        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[a], &HashMap::new());
+        let (reclaimed, _survivors) = heap.sweep_old_gen_non_moving(&[a], &cratonvm_types::PointerMap::default());
 
         let bases: Vec<usize> = heap
             .old_gen_lock()
@@ -19353,7 +19528,7 @@ mod tests {
             }
         }
 
-        fn remap(pointer_map: &HashMap<usize, usize>) {
+        fn remap(pointer_map: &cratonvm_types::PointerMap) {
             for slot in [&OWNER, &HELD] {
                 let addr = slot.load(Ordering::Relaxed);
                 if addr != 0 {
@@ -19618,7 +19793,7 @@ mod tests {
 
         // Sweep old gen in place with NO root naming the payload — the young
         // referrer is the only path to it.
-        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &HashMap::new());
+        let (_freed, _survivors) = heap.sweep_old_gen_non_moving(&[], &cratonvm_types::PointerMap::default());
 
         assert_eq!(
             heap.get_field(payload, 0).as_int(),

@@ -1,68 +1,218 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Concurrent-mark thread controller for ZGC (task #55).
+//! Concurrent-mark **cycle driver** for ZGC.
 //!
-//! Mirrors the G1 `ConcurrentMarkController` shape (see `g1_concurrent.rs`
-//! on `dev`; the API is intentionally narrow so the two converge once the
-//! ZGC simulation gains real backing pages) but operates on ZGC's
-//! colored-pointer mark word instead of G1's mark bitmap + SATB queue.
+//! This module owns the phase sequencing of one ZGC marking cycle: it runs
+//! the concurrent phase on a background thread, drives the mark-end
+//! safepoint, implements the **restart loop** that ZGC's read-barrier
+//! marking requires, and runs the non-strong-reference phase with the
+//! re-drain that a resurrection obliges. The marking *engine* — the worker
+//! pool, the striped work queues, work stealing and the termination
+//! handshake — is [`crate::zgc::mark`]; this module never touches an object
+//! header itself.
 //!
-//! ## Why a parallel implementation rather than reuse
+//! ## What changed, and why the old module doc was wrong
 //!
-//! The G1 controller is statically bound to `Arc<G1Collector>` because it
-//! calls `g1.concurrent_mark_step(BUDGET)` on the collector directly.
-//! Making it generic over a "concurrent-markable collector" trait would
-//! require pulling `concurrent_mark_step` onto a public trait that both
-//! collectors implement; given ZGC is still a simulation (no real backing
-//! storage — see `concurrent_relocate`'s long comment in `zgc.rs`) we
-//! defer that abstraction. **TODO(converge):** once ZGC moves off the
-//! simulation, lift `concurrent_mark_step` into a `ConcurrentMarkable`
-//! trait and parameterise both controllers over it.
+//! Until this rewrite this file drove [`crate::zgc::ZgcCollector`], the
+//! **metadata-only simulation**: pages with synthetic `u64` addresses, no
+//! backing storage, and a "concurrent" mark step that could only bump
+//! `ZPage::live_bytes`. It could not mark an object graph because there was
+//! no object graph to mark. That dependency is gone. The controller now
+//! drives [`ZMarkCoordinator`], which marks a real graph through the
+//! [`ZMarkContext`](crate::zgc::mark::ZMarkContext) seam.
 //!
-//! ## Phase split (mirrors G1)
+//! ## Why this is not `g1_concurrent.rs` with the names changed
 //!
-//! 1. **STW initial mark** — caller flips the load barrier's good-color
-//!    set to the next mark-color via `ZgcCollector::pause_mark_start`,
-//!    which also seeds the mark stack with root page bases. Caller holds
-//!    the STW token.
+//! [`crate::g1_concurrent::ConcurrentMarkController`] and this type share a
+//! thread lifecycle (spawn a background worker, park with a bounded wait,
+//! stop via a flag, join deterministically) and that resemblance is
+//! deliberate. The **termination protocol is not shared**, and cannot be:
 //!
-//! 2. **Concurrent mark** — `ZgcConcurrentMarkController::spawn` launches
-//!    a background thread that calls `ZgcCollector::concurrent_mark_step`
-//!    in a loop with a per-call budget. ZGC's SATB-equivalent is the load
-//!    barrier itself: mutators that load a colored pointer with the wrong
-//!    color take the slow path, which flips them to the current good
-//!    color and effectively re-greys the reference. No STW token required.
+//! * G1 marks under a SATB **pre-write** barrier. The live set is a snapshot
+//!   taken at initial mark, so the producer set is bounded and the remark
+//!   pause — which quiesces the only producer — is final by construction.
+//!   One pass, one pause, done.
+//! * ZGC has **no write barrier at all**. It marks on *read*, in the load
+//!   barrier, so **every mutator thread is a producer** and stays one until
+//!   it is stopped. "All queues are empty" is a *fixed point*, not a
+//!   completion: the very next `getfield` any thread executes can publish
+//!   new mark work.
 //!
-//! 3. **STW remark** — `request_stop_and_join` quiesces the worker; the
-//!    caller then re-runs `pause_mark_end` to drain stragglers.
+//! So the mark-end safepoint is a **decision point**, not a conclusion. With
+//! mutators stopped and every per-thread mark buffer flushed,
+//! [`ZMarkCoordinator::try_end_mark`] answers
+//! [`ZMarkEndResult::Restart`] if that flush produced anything, and the whole
+//! concurrent phase runs again. [`ZgcConcurrentMarkController`] is the thing
+//! that implements that loop. It is the single biggest structural difference
+//! from the G1 controller and the reason the two cannot be collapsed into one
+//! generic "concurrent-markable collector".
 //!
-//! ## Page-storage simulation status
+//! ## Phase sequence this driver executes
 //!
-//! ZGC pages in this crate are pure metadata: `ZPage::virtual_start` is a
-//! synthetic `u64` handed out by `ZgcHeap::next_virtual_addr`, not a
-//! pointer to mapped memory. As a consequence:
+//! ```text
+//!   caller, at the mark-start safepoint:
+//!       ZGoodMask::flip_to_mark()          (barrier module)
+//!       coordinator.begin_cycle()
+//!       coordinator.push_roots(&roots)     (the VM's root set)
+//!       ZgcConcurrentMarkController::spawn(params)
 //!
-//! - The mark loop can only manipulate `ZPage::live_bytes` and the
-//!   collector's `phase` / `load_barrier.good_colors`. It cannot walk
-//!   real object headers or follow real references — there's nothing to
-//!   walk.
-//! - The "color invariant" we can preserve here is the *bookkeeping*
-//!   invariant: across a concurrent-mark cycle the load barrier's
-//!   `good_colors` are flipped in the right order and the collector
-//!   ends in the `ZgcPhase::None` state with the post-mark color set.
-//! - A truly faithful test of "every live colored pointer ends up with a
-//!   marked-color bit" would require attaching the load barrier to a
-//!   real heap. That's gated on the rewrite described in
-//!   `concurrent_relocate`.
+//!   this driver, on the "zgc-concurrent-mark" thread:
+//!   +-> start_marking()                    arm the pool
+//!   |   await fixed point                  concurrent; mutators run
+//!   |   ---- mark-end safepoint ----
+//!   |     ZgcMarkSafepoint::begin_mark_end_safepoint()   (VM stops mutators)
+//!   |     coordinator.pause_for_safepoint()              (mark workers yield)
+//!   |     ZgcMarkSafepoint::flush_mutator_buffers()      (per-thread buffers)
+//!   |     try_end_mark()
+//!   |       |-- Restart --------------------------------+
+//!   |       `-- Complete
+//!   |   ---- reference processing (still at a safepoint) ----
+//!   |     process_non_strong_refs(hook)
+//!   |       `-- resurrected > 0 -> re-drain -------------+
+//!   |
+//!   `-> outcome published; thread exits
 //!
-//! What this module ships:
+//!   caller, at the mark-end/relocate-start safepoint:
+//!       controller.join_cycle()            -> ZgcMarkCycleOutcome
+//!       coordinator.end_cycle()
+//! ```
 //!
-//! - The full controller lifecycle (spawn, run, stop, join, drop).
-//! - A `concurrent_mark_step` on `ZgcCollector` that does one bounded
-//!   drain of the mark stack and returns whether the stack is empty.
-//! - Three tests covering spawn/join, stop honouring, and the colour-flip
-//!   invariant across a full cycle.
+//! ## What is real here, and what still is not
+//!
+//! Real:
+//!
+//! * The restart loop, its ceiling, and the "incomplete mark set" verdict.
+//! * The reference-processing re-drain (a resurrected soft referent drags an
+//!   unscanned subgraph behind it).
+//! * The safepoint handshake with the mark workers, via
+//!   [`ZMarkCoordinator::pause_for_safepoint`].
+//! * Deterministic shutdown that cannot hang: every wait in this module is a
+//!   bounded `wait_for`, and the stop flag is re-read at every loop head.
+//!
+//! **Not** real yet, and this must not be overclaimed — stale ZGC docs are
+//! how this tree got into trouble the first time:
+//!
+//! * **No [`ZMarkContext`](crate::zgc::mark::ZMarkContext) implementation for
+//!   [`ZgcRealHeap`](crate::zgc::ZgcRealHeap) exists.** That implementation
+//!   lives in `gc/src/zgc.rs` (which this module does not own) and is the
+//!   wiring step; see "What the wiring step must provide" below. Until it
+//!   lands, the only context in the tree is
+//!   [`TestMarkContext`](crate::zgc::mark::TestMarkContext) and
+//!   `ZgcRealHeap::collect_garbage` remains the single-threaded
+//!   stop-the-world mark-sweep it has always been. Nothing in this module is
+//!   on a production code path.
+//! * **The load barrier is not wired into field reads.** Nothing calls
+//!   [`ZMarkHandle::mark_live_offset`] from a `getfield`, so the mutator ingress is
+//!   empty in practice, so [`try_end_mark`](ZMarkCoordinator::try_end_mark)
+//!   will answer [`Complete`](ZMarkEndResult::Complete) on the first pass
+//!   every time. **The restart loop is therefore untaken in production
+//!   today.** It is implemented and tested anyway because the moment the
+//!   barrier does land, a missing restart loop is a use-after-free: a live
+//!   object a mutator touched at the end of the cycle would be swept.
+//! * The relocation half of ZGC (forwarding, remap, compaction) is not this
+//!   module's business and is not driven from here.
+//!
+//! ## Safepoints: how a caller connects this to the VM's STW protocol
+//!
+//! [`crate::zgc::mark`] deliberately does **not** use `gc/src/safepoint.rs`.
+//! That module is the GPU-critical-section token behind the `gpu-offload`
+//! feature; it is not the VM safepoint protocol and has nothing to do with
+//! stopping mutators. The VM's stop-the-world proof token is
+//! [`crate::collector::StopTheWorldToken`], constructed by the orchestrator
+//! in `vm/src/runtime/interpreter.rs` only after `gc_barrier.wait_for_all()`
+//! reports every other mutator parked.
+//!
+//! This module does **not** invent a safepoint mechanism. It declares the
+//! [`ZgcMarkSafepoint`] seam and calls it. A production implementor is
+//! expected to:
+//!
+//! 1. `begin_mark_end_safepoint` — drive the VM's existing safepoint request
+//!    (the same path that produces a `StopTheWorldToken`) and block until
+//!    every mutator is parked. Holding the token for the duration of the
+//!    callback triple is the intended pattern; it is not passed through this
+//!    trait because the token is `!Send` by intent and this driver runs on
+//!    its own thread. An implementor therefore owns the token on the thread
+//!    that actually performs the stop.
+//! 2. `flush_mutator_buffers` — walk every thread that owns a
+//!    [`ZMarkMutatorBuffer`](crate::zgc::mark::ZMarkMutatorBuffer) and call
+//!    [`ZMarkHandle::flush_buffer`] on it. This is the exact analogue of
+//!    `g1_concurrent`'s remark calling
+//!    [`crate::satb::flush_thread_satb_buffer`], and skipping it is the exact
+//!    analogue of the bug that motivated that call: an address still sitting
+//!    in a per-thread buffer is invisible to `try_end_mark`, which then
+//!    answers `Complete` with a live object unscanned.
+//!
+//!    **Construct those buffers with
+//!    [`ZMarkHandle::new_buffer`](crate::zgc::mark::ZMarkHandle::new_buffer),
+//!    not `ZMarkMutatorBuffer::new`.** A thread that exits *between*
+//!    safepoints — which no `flush_mutator_buffers` call can reach — is
+//!    covered by the buffer's `Drop`, but only for an **attached** buffer.
+//!    `ZMarkMutatorBuffer::new` produces a detached one, covered by nothing:
+//!    `mark_live_buffered` sets the mark bit *before* the address reaches the
+//!    ingress, so a detached buffer dropped non-empty leaves objects
+//!    marked-and-unscanned — permanently invisible to the mark, since the
+//!    mark bit is what dedups them. That is a use-after-free, not a missed
+//!    optimisation.
+//! 3. `end_mark_end_safepoint` — resume the mutators.
+//!
+//! The mark workers are quiesced by this driver, not by the implementor:
+//! [`ZMarkCoordinator::pause_for_safepoint`] is taken *inside* the VM
+//! safepoint and released before it ends.
+//!
+//! ## What the wiring step must provide
+//!
+//! To connect [`ZgcRealHeap`](crate::zgc::ZgcRealHeap) to this driver, a
+//! future change to `gc/src/zgc.rs` must implement
+//! [`ZMarkContext`](crate::zgc::mark::ZMarkContext) for it. Every method has
+//! an existing counterpart inside `ZgcRealHeap::collect_garbage`, and the two
+//! that are easy to get silently wrong are called out:
+//!
+//! * `is_in_heap(addr)` — `self.registry.lock().contains(&addr)`, i.e. the
+//!   `registered.contains(&addr)` gate the current marker already applies to
+//!   every child pointer. Refusals are counted as
+//!   `ZMarkStats::off_heap_children`, which is today's `wild_skipped`.
+//! * `try_mark(addr)` — must be an **atomic** test-and-set of
+//!   `GC_FLAG_MARKED`. The current code does a plain read-modify-write of
+//!   `header.gc_flags` under STW, which is *not* sufficient once N workers
+//!   and arbitrary mutators race on the same header: two `true` answers for
+//!   one object means it is pushed twice (merely wasteful), and a lost update
+//!   means an object is popped once but never scanned — a live object with
+//!   unscanned out-edges, i.e. a use-after-free. This is the one place the
+//!   wiring step must change the header protocol rather than reuse it.
+//! * `is_marked(addr)` — query only. It must never set the bit, or every
+//!   weak referent becomes immortal.
+//! * `visit_refs(addr, f)` — **strong edges only.** `ZgcRealHeap` already has
+//!   exactly the right mechanism: `enumerate_references(base, work,
+//!   skip_for(addr))`, where `skip_for` returns `Some(0)` for any address in
+//!   `ref_skip_objs` (the registered `Weak`/`Soft`/`Phantom`/`Cleaner`
+//!   `Reference` object addresses, from
+//!   `ReferenceProcessor::reference_object_addresses()`). Slot 0 of a
+//!   `Reference` is the referent and **must not** be reported, or the
+//!   referent is trivially reachable through its own `Reference` and can
+//!   never be cleared — `WeakReference` and `Cleaner` then silently stop
+//!   working. The skip set must be snapshotted at mark start and held for the
+//!   whole cycle (it is read concurrently by every worker). The same call
+//!   must also report the three pin edges the current marker pushes by hand:
+//!   `loader_pin::loader_pin_addr(class_id)`,
+//!   `mirror_pin::mirrors_for_loader(addr)` and
+//!   `metadata_pin::roots_for_loader(addr)` — dropping those is a class-loader
+//!   unloading bug, not a marking optimisation.
+//! * `object_size(addr)` — `Self::alloc_size(header)`, for per-page liveness.
+//! * The [`ZNonStrongRefHook`] implementation is the *rest* of
+//!   `collect_garbage`'s reference block: call
+//!   `ReferenceProcessor::process_references(&is_marked, free_mb, now_ms)`,
+//!   then hand `soft_survivor_referents()` and the finalizer referents to
+//!   `keep_alive`. Everything handed to `keep_alive` is re-published as mark
+//!   work and this driver re-drains it. That re-drain is the `INT-8 remark`
+//!   block in `zgc.rs` expressed as a phase.
+//!
+//! ## No process-global state
+//!
+//! Everything here is instance-owned and reachable only from a controller.
+//! No `static`, no `OnceLock`, no `thread_local!` — this tree has had
+//! parallel-test crashes from process-global GC caches, and the test harness
+//! hosts more than one heap per process.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -71,57 +221,297 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
-use crate::zgc::ZgcCollector;
-
-/// Gray pointers drained per `concurrent_mark_step` call. Small enough to
-/// observe a stop request within microseconds, large enough to amortise
-/// the per-call lock acquisition.
-const WORKER_STEP_BUDGET: usize = 256;
-
-/// Park-with-timeout interval when the mark stack is empty but stop has
-/// not been signalled. Bounded so a missed `notify_work_available` (which
-/// shouldn't happen given the lock discipline, but defensive) still makes
-/// progress.
-const WORKER_POLL_MS: u64 = 5;
+use crate::zgc::mark::{ZMarkCoordinator, ZMarkEndResult, ZMarkHandle, ZNonStrongRefHook};
 
 // ---------------------------------------------------------------------------
-// Shared coordinator/worker state
+// Tunables
 // ---------------------------------------------------------------------------
 
-/// Shared coordination state between the VM thread that started the cycle
-/// and the background mark worker. Held inside an `Arc<>` so the worker
-/// keeps it alive after the coordinator drops its handle.
+/// Bounded park interval for the driver thread while it waits for the mark
+/// pool to reach a fixed point.
+///
+/// Kept at the value (and, up to the rename, the name) the simulation-era
+/// controller used, for the same reason: every wait in this family is a
+/// `wait_for`, never a bare `wait`, so a lost notification costs one poll
+/// interval instead of a hang. This codebase diagnoses GC hangs often enough
+/// that "cannot hang even if the signalling is wrong" is worth 200 wakeups a
+/// second on one thread.
+///
+/// The cost of polling rather than waiting on the pool's own condvar is up to
+/// one interval of added latency at the end of the concurrent phase.
+/// [`ZMarkTerminator`](crate::zgc::mark::ZMarkTerminator) does expose a
+/// blocking `wait_for_fixed_point`, but it can only be released by the
+/// *pool's* stop flag, not by this controller's — so waiting on it would make
+/// `request_stop_and_join` unable to interrupt a cycle, which is precisely
+/// the hang this module must not have.
+const DRIVER_POLL_MS: u64 = 5;
+
+/// Default ceiling on mark-end restarts within one cycle.
+///
+/// Each restart costs one real safepoint, so 64 of them means the mutators
+/// out-raced the marker on 64 consecutive attempts. That is a *policy*
+/// failure — the cycle was started too late — not a transient, and HotSpot
+/// answers it by escalating to marking inside the pause. Until this tree has
+/// that escalation, the honest response is to stop, log loudly, and report
+/// [`ZgcMarkCycleOutcome::mark_set_complete`] as `false`.
+///
+/// An unbounded loop here would be a hang, and this codebase has a documented
+/// history of GC livelocks presenting to the user as an unexplained freeze.
+pub const DEFAULT_MAX_MARK_END_RESTARTS: usize = 64;
+
+/// Default ceiling on reference-processing resurrection rounds.
+///
+/// Resurrection is monotone for a well-behaved hook — an object can only be
+/// marked once, so the rounds strictly shrink — and two rounds is already
+/// unusual. The bound exists because a *misbehaving* hook (one that resurrects
+/// from a set it also mutates) would otherwise spin forever, and "the GC never
+/// returns" is a far worse failure than "the GC says its answer is
+/// incomplete".
+pub const DEFAULT_MAX_RESURRECTION_ROUNDS: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Safepoint seam
+// ---------------------------------------------------------------------------
+
+/// The VM stop-the-world protocol, as the mark-end pause needs it.
+///
+/// See the module docs ("Safepoints") for how an implementor connects this to
+/// [`crate::collector::StopTheWorldToken`]. The three calls are always made in
+/// order and are balanced even if a later step panics — the driver wraps them
+/// in an RAII scope.
+///
+/// # Contract
+///
+/// * `begin_mark_end_safepoint` must not return until **every** mutator
+///   thread is stopped. Returning early makes `try_end_mark`'s answer a lie:
+///   a running mutator can publish mark work between the flush and the probe.
+/// * `flush_mutator_buffers` must flush **every** per-thread
+///   [`ZMarkMutatorBuffer`](crate::zgc::mark::ZMarkMutatorBuffer), and returns
+///   how many addresses it moved (telemetry only — the driver does not branch
+///   on it; `try_end_mark` re-probes authoritatively).
+/// * Those buffers must come from
+///   [`ZMarkHandle::new_buffer`](crate::zgc::mark::ZMarkHandle::new_buffer).
+///   A thread exiting between safepoints is covered by the buffer's `Drop`,
+///   but ONLY for an attached buffer; `ZMarkMutatorBuffer::new` is detached
+///   and is covered by nothing. See the module header, step 2.
+/// * None of the three may block indefinitely. The driver checks its stop
+///   flag at every loop head, but it cannot interrupt a call that is inside
+///   this trait, so a blocking implementation turns
+///   [`ZgcConcurrentMarkController::request_stop_and_join`] into a hang.
+pub trait ZgcMarkSafepoint: Send + Sync {
+    /// Stop every mutator thread. Blocks until they are all parked.
+    fn begin_mark_end_safepoint(&self);
+
+    /// Flush every per-thread mutator mark buffer into the ingress. Returns
+    /// the number of addresses moved.
+    fn flush_mutator_buffers(&self, handle: &ZMarkHandle) -> usize;
+
+    /// Resume the mutators.
+    fn end_mark_end_safepoint(&self);
+}
+
+/// A [`ZgcMarkSafepoint`] for a caller that has no other mutator threads.
+///
+/// Legal **only** when the thread driving the heap is the sole mutator — a
+/// unit test, or a single-threaded embedding. It stops nothing and flushes
+/// nothing, which is correct exactly when there is nothing to stop and no
+/// per-thread buffer to flush. Using it in a multi-threaded VM makes every
+/// `try_end_mark` answer unsound.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ZgcNoMutatorSafepoint;
+
+impl ZgcMarkSafepoint for ZgcNoMutatorSafepoint {
+    fn begin_mark_end_safepoint(&self) {}
+
+    fn flush_mutator_buffers(&self, _handle: &ZMarkHandle) -> usize {
+        0
+    }
+
+    fn end_mark_end_safepoint(&self) {}
+}
+
+/// RAII pairing of [`ZgcMarkSafepoint::begin_mark_end_safepoint`] with
+/// [`ZgcMarkSafepoint::end_mark_end_safepoint`].
+///
+/// Exists so that an early return — or a panic inside `try_end_mark` — cannot
+/// leave the world stopped. A leaked safepoint is a whole-VM freeze, which is
+/// exactly the failure this module is written to avoid.
+struct ZgcSafepointScope<'a> {
+    safepoint: &'a dyn ZgcMarkSafepoint,
+}
+
+impl<'a> ZgcSafepointScope<'a> {
+    fn enter(safepoint: &'a dyn ZgcMarkSafepoint) -> Self {
+        safepoint.begin_mark_end_safepoint();
+        ZgcSafepointScope { safepoint }
+    }
+}
+
+impl Drop for ZgcSafepointScope<'_> {
+    fn drop(&mut self) {
+        self.safepoint.end_mark_end_safepoint();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle parameters and outcome
+// ---------------------------------------------------------------------------
+
+/// Everything [`ZgcConcurrentMarkController::spawn`] needs.
+///
+/// A struct rather than five positional arguments: two of the fields are
+/// `usize` budgets and two are trait-object `Arc`s, so a positional signature
+/// would be easy to transpose and impossible to notice.
+pub struct ZgcConcurrentMarkParams {
+    /// The marking engine. Shared, not owned: a caller that keeps its own
+    /// clone keeps the worker pool alive across cycles (spawning a pool per
+    /// GC is exactly the cost the pool exists to avoid). When the last clone
+    /// drops, [`ZMarkCoordinator`]'s own `Drop` stops and joins the workers.
+    pub coordinator: Arc<ZMarkCoordinator>,
+
+    /// The VM's stop-the-world protocol for the mark-end pause.
+    pub safepoint: Arc<dyn ZgcMarkSafepoint>,
+
+    /// The weak/soft/phantom/final reference phase. `None` skips the phase
+    /// entirely, which is only correct for a heap with no registered
+    /// `Reference` objects (i.e. a test).
+    pub refs: Option<Arc<dyn ZNonStrongRefHook + Send + Sync>>,
+
+    /// Ceiling on mark-end restarts. See [`DEFAULT_MAX_MARK_END_RESTARTS`].
+    pub max_mark_end_restarts: usize,
+
+    /// Ceiling on resurrection rounds. See
+    /// [`DEFAULT_MAX_RESURRECTION_ROUNDS`].
+    pub max_resurrection_rounds: usize,
+}
+
+impl ZgcConcurrentMarkParams {
+    /// Parameters with the default budgets and no reference-processing hook.
+    pub fn new(coordinator: Arc<ZMarkCoordinator>, safepoint: Arc<dyn ZgcMarkSafepoint>) -> Self {
+        ZgcConcurrentMarkParams {
+            coordinator,
+            safepoint,
+            refs: None,
+            max_mark_end_restarts: DEFAULT_MAX_MARK_END_RESTARTS,
+            max_resurrection_rounds: DEFAULT_MAX_RESURRECTION_ROUNDS,
+        }
+    }
+
+    /// Attach the reference-processing hook.
+    pub fn with_refs(mut self, refs: Arc<dyn ZNonStrongRefHook + Send + Sync>) -> Self {
+        self.refs = Some(refs);
+        self
+    }
+
+    /// Override the mark-end restart ceiling.
+    pub fn with_max_mark_end_restarts(mut self, max: usize) -> Self {
+        self.max_mark_end_restarts = max;
+        self
+    }
+
+    /// Override the resurrection-round ceiling.
+    pub fn with_max_resurrection_rounds(mut self, max: usize) -> Self {
+        self.max_resurrection_rounds = max;
+        self
+    }
+}
+
+impl std::fmt::Debug for ZgcConcurrentMarkParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZgcConcurrentMarkParams")
+            .field("workers", &self.coordinator.worker_count())
+            .field("has_ref_hook", &self.refs.is_some())
+            .field("max_mark_end_restarts", &self.max_mark_end_restarts)
+            .field("max_resurrection_rounds", &self.max_resurrection_rounds)
+            .finish()
+    }
+}
+
+/// What one marking cycle did.
+///
+/// `Default` is the "nothing succeeded" shape — in particular
+/// `mark_set_complete` defaults to `false`, so a partially-constructed or
+/// abandoned outcome can never be mistaken for a usable mark set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ZgcMarkCycleOutcome {
+    /// Concurrent phases run (1 = no restart was needed).
+    pub passes: usize,
+    /// How many of those were forced by a non-empty mark-end flush.
+    pub restarts: usize,
+    /// Re-drains forced by reference processing resurrecting objects.
+    pub redrains: usize,
+    /// Objects the reference hook resurrected, summed over all rounds.
+    pub resurrected: usize,
+    /// **The load-bearing field.** `true` iff the transitive closure of the
+    /// root set (plus every resurrection) is fully marked. A sweep against a
+    /// mark set with this `false` is a use-after-free.
+    pub mark_set_complete: bool,
+    /// The mark-end restart ceiling was hit.
+    pub restart_budget_exhausted: bool,
+    /// The resurrection-round ceiling was hit.
+    pub resurrection_budget_exhausted: bool,
+    /// The controller was told to stop mid-cycle.
+    pub stopped_early: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Shared coordinator/driver state
+// ---------------------------------------------------------------------------
+
+/// Shared state between the VM thread that opened the cycle and the
+/// background driver thread. Held in an `Arc` so the driver keeps it alive
+/// after the controller drops its handle.
 pub struct ZgcConcurrentMarkState {
-    /// Set by `request_stop`; the worker exits on the next poll.
+    /// Set by `request_stop`; the driver leaves the cycle at its next loop
+    /// head. `Release` on store / `Acquire` on load so a driver that observes
+    /// the stop also observes everything the stopper did beforehand.
     pub should_stop: AtomicBool,
-    /// Telemetry: number of `concurrent_mark_step` calls completed.
-    pub steps_performed: AtomicU64,
-    /// Telemetry: cumulative budget granted across all steps.
-    pub work_units_done: AtomicU64,
 
-    /// Park flag protected by the mutex: the worker sets it `true` before
-    /// waiting on the cvar so a coordinator wake racing with park is not
-    /// lost (parking_lot lock-then-wait discipline).
+    /// Telemetry: concurrent phases started, across the cycle. `Relaxed`:
+    /// pure telemetry, no control flow reads it, nothing is published
+    /// through it. (The authoritative per-cycle figures are in
+    /// [`ZgcMarkCycleOutcome`], which is published under a mutex.)
+    pub passes_performed: AtomicU64,
+    /// Telemetry: mark-end restarts. `Relaxed`, as above.
+    pub restarts_performed: AtomicU64,
+    /// Telemetry: reference-processing re-drains. `Relaxed`, as above.
+    pub resurrection_redrains: AtomicU64,
+
+    /// Park flag protected by the mutex: the driver sets it `true` before
+    /// waiting on the cvar, so a wake racing with the park is not lost
+    /// (parking_lot's lock-then-wait discipline).
     pub parked: Mutex<bool>,
-    /// Wake condition: coordinator notifies after pushing new gray
-    /// pointers or after setting `should_stop`.
+    /// Wake condition for the parked driver.
     pub done_cvar: Condvar,
+
+    /// The finished cycle's report. `None` until the driver publishes it,
+    /// which it does as its last act before the thread exits. A mutex rather
+    /// than a pile of atomics so the whole report is published as one value
+    /// and no reader can see a half-updated cycle.
+    outcome: Mutex<Option<ZgcMarkCycleOutcome>>,
 }
 
 impl ZgcConcurrentMarkState {
     fn new() -> Self {
-        Self {
+        ZgcConcurrentMarkState {
             should_stop: AtomicBool::new(false),
-            steps_performed: AtomicU64::new(0),
-            work_units_done: AtomicU64::new(0),
+            passes_performed: AtomicU64::new(0),
+            restarts_performed: AtomicU64::new(0),
+            resurrection_redrains: AtomicU64::new(0),
             parked: Mutex::new(false),
             done_cvar: Condvar::new(),
+            outcome: Mutex::new(None),
         }
     }
 
-    /// Coordinator → worker: new gray pointers may be on the stack now.
-    /// Cheap fast-path: when the worker is not parked we only pay the
-    /// mutex acquisition, no cvar work.
+    /// Wake the driver if it is parked waiting for the fixed point, so it
+    /// re-checks immediately instead of sleeping out its poll interval.
+    ///
+    /// **This does not wake the mark workers.** Publishing work into a stripe
+    /// or the ingress notifies them through
+    /// [`ZMarkTerminator::note_work_published`](crate::zgc::mark::ZMarkTerminator::note_work_published),
+    /// which the engine calls for itself; that is the responsibility this
+    /// method used to carry against the simulation and no longer does.
     pub fn notify_work_available(&self) {
         let mut parked = self.parked.lock();
         if *parked {
@@ -130,8 +520,8 @@ impl ZgcConcurrentMarkState {
         }
     }
 
-    /// Coordinator → worker: stop ASAP. Also kicks the cvar so a parked
-    /// worker wakes to observe the stop flag.
+    /// Coordinator -> driver: stop ASAP. Also kicks the cvar so a parked
+    /// driver wakes to observe the flag.
     pub fn request_stop(&self) {
         self.should_stop.store(true, Ordering::Release);
         let mut parked = self.parked.lock();
@@ -139,9 +529,9 @@ impl ZgcConcurrentMarkState {
         self.done_cvar.notify_all();
     }
 
-    /// Worker: park with timeout. Returns either on a notification or on
-    /// the `WORKER_POLL_MS` timeout; either way the loop body re-checks
-    /// `should_stop` and the mark stack.
+    /// Driver: park with timeout. Returns on a notification or on the
+    /// `DRIVER_POLL_MS` timeout; either way the caller re-checks both the
+    /// fixed-point flag and the stop flag.
     fn park_for_work(&self) {
         let mut parked = self.parked.lock();
         if self.should_stop.load(Ordering::Acquire) {
@@ -150,8 +540,13 @@ impl ZgcConcurrentMarkState {
         *parked = true;
         let _ = self
             .done_cvar
-            .wait_for(&mut parked, Duration::from_millis(WORKER_POLL_MS));
+            .wait_for(&mut parked, Duration::from_millis(DRIVER_POLL_MS));
         *parked = false;
+    }
+
+    /// The finished cycle's report, or `None` while it is still running.
+    pub fn outcome(&self) -> Option<ZgcMarkCycleOutcome> {
+        *self.outcome.lock()
     }
 }
 
@@ -161,114 +556,347 @@ impl Default for ZgcConcurrentMarkState {
     }
 }
 
+impl std::fmt::Debug for ZgcConcurrentMarkState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZgcConcurrentMarkState")
+            .field("should_stop", &self.should_stop.load(Ordering::Relaxed))
+            .field("passes", &self.passes_performed.load(Ordering::Relaxed))
+            .field("restarts", &self.restarts_performed.load(Ordering::Relaxed))
+            .field("outcome", &self.outcome.lock().as_ref().copied())
+            .finish()
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Coordinator-side controller
+// Controller
 // ---------------------------------------------------------------------------
 
-/// Coordinator handle for a spawned ZGC concurrent-mark worker.
+/// Drives one ZGC marking cycle on a background thread.
 ///
-/// Drop semantics: dropping without calling `request_stop_and_join`
-/// flips the stop flag and detaches the worker (best-effort cleanup, no
-/// block in Drop). Production callers should always call
-/// `request_stop_and_join` explicitly for deterministic shutdown.
+/// One controller drives **one cycle**, then its thread exits. The expensive,
+/// long-lived thing is the [`ZMarkCoordinator`] worker pool, which the caller
+/// owns and reuses; spawning one driver thread per GC is noise next to the
+/// cycle it drives, and a one-shot driver means "the cycle finished" is
+/// simply "the thread joined" — no completion flag to get wrong.
+///
+/// Drop semantics: dropping without calling [`Self::join_cycle`] or
+/// [`Self::request_stop_and_join`] flips the stop flag and **detaches** the
+/// driver (best-effort cleanup; `Drop` is sync and the driver may be inside a
+/// caller-supplied safepoint callback that this type cannot interrupt). The
+/// detached driver holds its own `Arc<ZMarkCoordinator>`, so the pool cannot
+/// be freed underneath it. Production callers should always join explicitly.
 pub struct ZgcConcurrentMarkController {
+    /// Shared driver state. Public for the same reason the G1 controller's
+    /// is: callers poll telemetry off it and the load barrier may want to
+    /// nudge a parked driver.
     pub state: Arc<ZgcConcurrentMarkState>,
+    coordinator: Arc<ZMarkCoordinator>,
     handle: Option<JoinHandle<()>>,
 }
 
+impl std::fmt::Debug for ZgcConcurrentMarkController {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZgcConcurrentMarkController")
+            .field("running", &self.is_running())
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 impl ZgcConcurrentMarkController {
-    /// Spawn the background mark thread.
+    /// Spawn the driver thread for a cycle the caller has already opened.
     ///
-    /// **Caller responsibility**: `ZgcCollector::pause_mark_start` must
-    /// have run first so the load barrier's good-colors are flipped and
-    /// the mark stack is seeded with the root set. The worker assumes
-    /// this seeding and will park immediately if the stack is empty.
+    /// **Caller responsibility**, all at the mark-start safepoint and all
+    /// before this call:
     ///
-    /// `collector` is `Arc<Mutex<ZgcCollector>>` because:
+    /// 1. Flip the good mask to the cycle's mark color
+    ///    (`ZGoodMask::flip_to_mark`).
+    /// 2. [`ZMarkCoordinator::begin_cycle`] — clears the previous cycle's
+    ///    residue and opens the ingress.
+    /// 3. [`ZMarkCoordinator::push_roots`] with the VM's root set.
     ///
-    /// - The worker mutates the mark stack, the page live-bytes, and the
-    ///   load barrier counters — all are owned by `ZgcCollector`.
-    /// - In a real implementation each mutator thread would also need to
-    ///   reach into the collector via the load barrier slow path; the
-    ///   mutex models that shared-mutation discipline cleanly.
-    /// - Lock granularity is fine because a `concurrent_mark_step` is a
-    ///   tight loop over a `Vec<u64>` pop + a single page-lookup; it
-    ///   releases the lock between every step so mutators (and the
-    ///   coordinator's eventual `request_stop`) can progress.
-    pub fn spawn(collector: Arc<Mutex<ZgcCollector>>) -> Self {
+    /// Root scanning is deliberately *not* a seam on this type. It is a
+    /// stop-the-world operation the VM must perform with its own thread list,
+    /// stack maps and JIT frame maps; a background driver has no business
+    /// doing it, and pretending otherwise would put a root-capture gap behind
+    /// an innocent-looking callback.
+    ///
+    /// Spawning without a seeded root set is legal and produces a cycle that
+    /// reaches a fixed point immediately and marks nothing.
+    pub fn spawn(params: ZgcConcurrentMarkParams) -> Self {
         let state = Arc::new(ZgcConcurrentMarkState::new());
-        let worker_state = Arc::clone(&state);
-        let worker_collector = Arc::clone(&collector);
+        let coordinator = Arc::clone(&params.coordinator);
+        let driver_state = Arc::clone(&state);
 
         let handle = std::thread::Builder::new()
             .name("zgc-concurrent-mark".to_string())
             .spawn(move || {
-                Self::worker_loop(worker_collector, worker_state);
+                let outcome = Self::run_cycle(&params, &driver_state);
+                *driver_state.outcome.lock() = Some(outcome);
+                if outcome.mark_set_complete {
+                    tracing::debug!(
+                        target: "zgc",
+                        passes = outcome.passes,
+                        restarts = outcome.restarts,
+                        redrains = outcome.redrains,
+                        resurrected = outcome.resurrected,
+                        "ZGC concurrent mark cycle complete"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "zgc",
+                        passes = outcome.passes,
+                        restarts = outcome.restarts,
+                        stopped_early = outcome.stopped_early,
+                        restart_budget_exhausted = outcome.restart_budget_exhausted,
+                        resurrection_budget_exhausted = outcome.resurrection_budget_exhausted,
+                        "ZGC concurrent mark cycle ended with an INCOMPLETE mark set; \
+                         it must not be swept against"
+                    );
+                }
             })
             .expect("zgc-concurrent-mark thread spawn failed");
 
         Self {
             state,
+            coordinator,
             handle: Some(handle),
         }
     }
 
-    /// Body of the background mark thread.
+    // -- the cycle ----------------------------------------------------------
+
+    /// The driver thread body: strong marking to completion, then the
+    /// non-strong-reference phase with its re-drains.
+    fn run_cycle(
+        params: &ZgcConcurrentMarkParams,
+        state: &ZgcConcurrentMarkState,
+    ) -> ZgcMarkCycleOutcome {
+        let mut outcome = ZgcMarkCycleOutcome::default();
+
+        // ---- strong marking ------------------------------------------------
+        if !Self::drive_to_mark_end(params, state, &mut outcome) {
+            outcome.stopped_early = true;
+            return outcome;
+        }
+        if outcome.restart_budget_exhausted {
+            return outcome; // mark_set_complete stays false
+        }
+
+        // ---- weak / soft / phantom / final ---------------------------------
+        //
+        // Each round runs at a safepoint with the mark workers quiesced: the
+        // liveness answers the hook sees must be final, and `is_marked` must
+        // not be racing a worker that is still setting bits. A non-zero
+        // return means objects were resurrected with unscanned out-edges, so
+        // the strong-mark loop runs again — a resurrected soft referent drags
+        // a whole subgraph behind it, and skipping that re-drain is precisely
+        // the bug `zgc.rs`'s `INT-8 remark` block exists to fix.
+        if let Some(hook) = params.refs.as_ref() {
+            let mut round: usize = 0;
+            loop {
+                let resurrected = {
+                    let _sp = ZgcSafepointScope::enter(&*params.safepoint);
+                    let _pause = params.coordinator.pause_for_safepoint();
+                    params.coordinator.process_non_strong_refs(&**hook)
+                };
+                if resurrected == 0 {
+                    break;
+                }
+                outcome.resurrected += resurrected;
+                outcome.redrains += 1;
+                state.resurrection_redrains.fetch_add(1, Ordering::Relaxed);
+
+                round += 1;
+                if round > params.max_resurrection_rounds {
+                    outcome.resurrection_budget_exhausted = true;
+                    tracing::warn!(
+                        target: "zgc",
+                        round,
+                        max = params.max_resurrection_rounds,
+                        resurrected = outcome.resurrected,
+                        "ZGC mark: reference processing is still resurrecting objects after \
+                         the round budget; the mark set is INCOMPLETE and must not be swept \
+                         against (a hook that resurrects unboundedly is the likely cause)"
+                    );
+                    return outcome;
+                }
+
+                if !Self::drive_to_mark_end(params, state, &mut outcome) {
+                    outcome.stopped_early = true;
+                    return outcome;
+                }
+                if outcome.restart_budget_exhausted {
+                    return outcome;
+                }
+            }
+        }
+
+        outcome.mark_set_complete = true;
+        outcome
+    }
+
+    /// **The restart loop.** Run concurrent phases until the mark-end
+    /// safepoint reports [`ZMarkEndResult::Complete`], or the ceiling is hit.
     ///
-    /// Loop invariant:
-    /// - On entry to each iteration, neither the mark stack nor the stop
-    ///   flag have been observed for this iteration.
-    /// - On exit, `should_stop` was observed `true` AND the worker
-    ///   performed one final drain pass so any straggler the coordinator
-    ///   pushed between the last step and the stop signal is processed.
-    fn worker_loop(collector: Arc<Mutex<ZgcCollector>>, state: Arc<ZgcConcurrentMarkState>) {
+    /// Returns `false` iff the controller was told to stop; the caller then
+    /// abandons the cycle. Returning `true` means the loop *ended*, which is
+    /// not the same as succeeding — check
+    /// [`ZgcMarkCycleOutcome::restart_budget_exhausted`].
+    ///
+    /// # Why the loop exists
+    ///
+    /// See the module docs. In one line: `wait_for_fixed_point` establishes
+    /// that no *worker* holds work, but mutators are still running and are
+    /// producers, so only the safepoint — where they are stopped and their
+    /// buffers are flushed — can tell whether the fixed point was final.
+    ///
+    /// # Ordering inside the safepoint
+    ///
+    /// 1. Stop the mutators (`ZgcSafepointScope::enter`).
+    /// 2. Quiesce the mark workers
+    ///    ([`ZMarkCoordinator::pause_for_safepoint`]). Cheap here — they are
+    ///    already at a fixed point — but it is what makes "nothing is inside
+    ///    `visit_refs`" true rather than merely likely, and the restart case
+    ///    re-arms them afterwards.
+    /// 3. Flush every per-thread mutator buffer. **Before** the probe: an
+    ///    address still in a buffer is invisible to it.
+    /// 4. Probe ([`ZMarkCoordinator::try_end_mark`]).
+    ///
+    /// Unwinding is the reverse (Rust drops locals in reverse declaration
+    /// order): the workers resume, then the mutators.
+    fn drive_to_mark_end(
+        params: &ZgcConcurrentMarkParams,
+        state: &ZgcConcurrentMarkState,
+        outcome: &mut ZgcMarkCycleOutcome,
+    ) -> bool {
         loop {
-            // Drain under the budget. Take the lock for the step duration
-            // only — release between steps so mutators / coordinator can
-            // interleave.
-            let drained = {
-                let mut c = collector.lock();
-                c.concurrent_mark_step(WORKER_STEP_BUDGET)
+            params.coordinator.start_marking();
+            outcome.passes += 1;
+            state.passes_performed.fetch_add(1, Ordering::Relaxed);
+
+            if !Self::await_fixed_point(params, state) {
+                return false;
+            }
+
+            let result = {
+                let _sp = ZgcSafepointScope::enter(&*params.safepoint);
+                let _pause = params.coordinator.pause_for_safepoint();
+                let handle = params.coordinator.handle();
+                let flushed = params.safepoint.flush_mutator_buffers(&handle);
+                if flushed > 0 {
+                    tracing::debug!(
+                        target: "zgc",
+                        flushed,
+                        "ZGC mark end: flushed per-thread mutator mark buffers"
+                    );
+                }
+                params.coordinator.try_end_mark()
             };
 
-            state.steps_performed.fetch_add(1, Ordering::Relaxed);
-            state
-                .work_units_done
-                .fetch_add(WORKER_STEP_BUDGET as u64, Ordering::Relaxed);
+            match result {
+                ZMarkEndResult::Complete => return true,
+                ZMarkEndResult::Restart => {
+                    outcome.restarts += 1;
+                    state.restarts_performed.fetch_add(1, Ordering::Relaxed);
+                    if outcome.restarts > params.max_mark_end_restarts {
+                        outcome.restart_budget_exhausted = true;
+                        tracing::warn!(
+                            target: "zgc",
+                            restarts = outcome.restarts,
+                            max_restarts = params.max_mark_end_restarts,
+                            passes = outcome.passes,
+                            "ZGC mark: mark-end restart budget exhausted with work still \
+                             pending; the mark set is INCOMPLETE and must not be swept \
+                             against. Marking is losing the race with the application — \
+                             the cycle should have started earlier"
+                        );
+                        return true;
+                    }
+                }
+            }
 
-            // Check stop between every step.
+            // Re-read the stop flag before committing to another concurrent
+            // phase, so a stop that arrived during the safepoint is honoured
+            // without paying for a whole extra pass.
             if state.should_stop.load(Ordering::Acquire) {
-                // One final drain so a coordinator that pushed and
-                // stopped in the same instant doesn't leave work behind.
-                let _ = {
-                    let mut c = collector.lock();
-                    c.concurrent_mark_step(WORKER_STEP_BUDGET)
-                };
-                return;
+                return false;
             }
-
-            if drained {
-                // Stack truly empty. Park until coordinator pushes more
-                // work or requests stop. Cycle termination is the STW
-                // coordinator's prerogative (it owns the transition to
-                // the remark phase) — the worker never self-exits on a
-                // drained stack.
-                state.park_for_work();
-            }
-            // else: still gray pointers to chase, keep going.
         }
     }
 
-    /// Coordinator: wake the worker if it's parked. Call after pushing
-    /// new gray pointers onto the mark stack (e.g. via the load barrier
-    /// slow path or after a mutator field-store).
+    /// Wait for the mark pool to reach a fixed point. Returns `false` iff the
+    /// controller was told to stop first.
+    ///
+    /// Polls rather than blocking on the pool's condvar; see the
+    /// `DRIVER_POLL_MS` comment for why that is the stop-responsiveness
+    /// price.
+    /// [`ZMarkTerminator::is_terminated`](crate::zgc::mark::ZMarkTerminator::is_terminated)
+    /// is the authoritative read (it takes the terminator's state lock); the
+    /// lock-free `is_terminated_hint` deliberately is not used, because it can
+    /// lag and a stale "terminated" would take the safepoint while workers are
+    /// still tracing.
+    fn await_fixed_point(
+        params: &ZgcConcurrentMarkParams,
+        state: &ZgcConcurrentMarkState,
+    ) -> bool {
+        loop {
+            if params.coordinator.shared().terminator().is_terminated() {
+                return true;
+            }
+            if state.should_stop.load(Ordering::Acquire) {
+                return false;
+            }
+            state.park_for_work();
+        }
+    }
+
+    // -- coordinator-side API -----------------------------------------------
+
+    /// The marking engine this controller drives.
+    pub fn coordinator(&self) -> &ZMarkCoordinator {
+        &self.coordinator
+    }
+
+    /// A load-barrier handle for the engine. Convenience for a caller that
+    /// handed the coordinator over and kept only the controller.
+    pub fn handle(&self) -> ZMarkHandle {
+        self.coordinator.handle()
+    }
+
+    /// Wake the driver if it is parked. See
+    /// [`ZgcConcurrentMarkState::notify_work_available`] for what this does
+    /// and — importantly — what it no longer does.
     pub fn notify_work_available(&self) {
         self.state.notify_work_available();
     }
 
-    /// Coordinator: signal stop and join the worker. Must be called from
-    /// the STW remark phase. Returns the join handle's result so a panic
-    /// in the worker surfaces here rather than being silently dropped.
+    /// Wait for the cycle to finish and take its report.
+    ///
+    /// Does **not** request a stop: this is the normal end of a cycle, where
+    /// the driver has already decided the mark set is final (or has decided,
+    /// loudly, that it is not). A panic in the driver surfaces here as `Err`
+    /// rather than being silently dropped.
+    ///
+    /// The caller runs [`ZMarkCoordinator::end_cycle`] afterwards, at the
+    /// safepoint where it flips the good mask on to relocation.
+    pub fn join_cycle(mut self) -> std::thread::Result<ZgcMarkCycleOutcome> {
+        if let Some(h) = self.handle.take() {
+            h.join()?;
+        }
+        Ok(self.state.outcome().unwrap_or_default())
+    }
+
+    /// Abandon the cycle: signal stop and join the driver.
+    ///
+    /// The driver leaves at its next loop head — between concurrent phases,
+    /// or out of the fixed-point park within one `DRIVER_POLL_MS` interval.
+    /// It cannot be interrupted while inside a [`ZgcMarkSafepoint`] callback,
+    /// which is why that trait's contract forbids blocking indefinitely.
+    ///
+    /// The resulting mark set is incomplete
+    /// ([`ZgcMarkCycleOutcome::stopped_early`]); the caller must discard it,
+    /// not sweep against it.
     pub fn request_stop_and_join(mut self) -> std::thread::Result<()> {
         self.state.request_stop();
         if let Some(h) = self.handle.take() {
@@ -277,7 +905,7 @@ impl ZgcConcurrentMarkController {
         Ok(())
     }
 
-    /// Test/inspection helper: is the worker thread still alive?
+    /// Is the driver thread still alive?
     pub fn is_running(&self) -> bool {
         self.handle
             .as_ref()
@@ -285,19 +913,38 @@ impl ZgcConcurrentMarkController {
             .unwrap_or(false)
     }
 
-    /// Test/inspection helper: how many steps has the worker completed?
-    pub fn steps_performed(&self) -> u64 {
-        self.state.steps_performed.load(Ordering::Relaxed)
+    /// The cycle report, or `None` while the cycle is still running.
+    pub fn outcome(&self) -> Option<ZgcMarkCycleOutcome> {
+        self.state.outcome()
+    }
+
+    /// Telemetry: concurrent phases started so far.
+    ///
+    /// Replaces the simulation-era `steps_performed`, which counted
+    /// `ZgcCollector::concurrent_mark_step` calls — a unit that no longer
+    /// exists. One "pass" is one full concurrent phase driven to a fixed
+    /// point, so this is the restart count plus one for a healthy cycle.
+    pub fn passes_performed(&self) -> u64 {
+        self.state.passes_performed.load(Ordering::Relaxed)
+    }
+
+    /// Telemetry: mark-end restarts so far. Persistently non-zero means the
+    /// mutators are marking faster than the pool traces, i.e. the cycle is
+    /// starting too late.
+    pub fn restarts_performed(&self) -> u64 {
+        self.state.restarts_performed.load(Ordering::Relaxed)
     }
 }
 
 impl Drop for ZgcConcurrentMarkController {
     fn drop(&mut self) {
-        // Best-effort cleanup if the user forgot to call
-        // `request_stop_and_join`. We can't block on join here (Drop is
-        // sync, and the worker may legitimately be mid-step holding the
-        // collector lock), but we flip the stop flag so the worker exits
-        // on its next poll.
+        // Best-effort cleanup if the caller forgot to join. We do not block
+        // here: `Drop` is sync and the driver may be inside a caller-supplied
+        // safepoint callback we cannot interrupt. Detaching is safe because
+        // the driver owns its own `Arc<ZMarkCoordinator>` clone, so the pool
+        // (and the `ZMarkContext` behind it) outlives the detached thread —
+        // the "detached worker outliving its heap" hazard that
+        // `ZMarkCoordinator::drop` joins to avoid does not arise here.
         self.state.request_stop();
         if let Some(h) = self.handle.take() {
             std::mem::drop(h);
@@ -308,198 +955,594 @@ impl Drop for ZgcConcurrentMarkController {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+//
+// Every assertion below is on counts, states or set equality. There are no
+// wall-clock bounds anywhere: this tree has documented CI flakes from fixed
+// timing assertions, and every spin in these tests is bounded and asserts
+// nothing about how long it took.
+//
+// The three simulation-era tests this file used to carry are gone; see the
+// module history. They asserted on `ZgcCollector::pause_mark_start`,
+// `LoadBarrier::good_colors` and `ColoredPointer`, none of which this
+// controller touches any more — and one of them asserted `elapsed < 500ms`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zgc::{ZPageType, ZgcCollector, ZgcConfig, ZgcPhase};
+    use crate::zgc::mark::TestMarkContext;
+    use rustc_hash::FxHashMap;
+    use std::sync::atomic::AtomicUsize;
 
-    fn small_collector() -> Arc<Mutex<ZgcCollector>> {
-        let mut cfg = ZgcConfig::default();
-        cfg.heap_size = 8 * 1024 * 1024;
-        let mut c = ZgcCollector::new(cfg);
-        // Add a couple of pages so `pause_mark_start` seeds non-empty
-        // roots — the worker should then take at least one step before
-        // parking.
-        c.heap.add_page(ZPageType::Small);
-        c.heap.add_page(ZPageType::Small);
-        Arc::new(Mutex::new(c))
-    }
-
-    /// Test #1 — the ZGC concurrent-mark thread spawns and joins cleanly.
-    ///
-    /// Mirrors `g1_concurrent::tests::concurrent_mark_thread_spawns_and_joins`.
-    /// Verifies the basic lifecycle: spawn → run → stop → join — no panic.
-    #[test]
-    fn zgc_concurrent_mark_thread_spawns_and_joins() {
-        let collector = small_collector();
-
-        // STW initial mark: seed roots and flip the load barrier to the
-        // marking good-colors.
-        {
-            let mut c = collector.lock();
-            c.pause_mark_start();
-            assert_eq!(c.phase, ZgcPhase::PauseMarkStart);
-        }
-
-        let controller = ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
-        assert!(controller.is_running(), "worker thread must be alive");
-
-        // Let the worker step at least once.
-        std::thread::sleep(Duration::from_millis(30));
-
-        // Stop and join cleanly. The collector is left in
-        // `ConcurrentMark` (the worker advanced it on its first step);
-        // a real caller would now run `pause_mark_end` to finish.
-        let result = controller.request_stop_and_join();
-        assert!(result.is_ok(), "worker panic on join: {:?}", result.err());
-    }
-
-    /// Test #2 — the worker honors `request_stop` even when parked on an
-    /// empty mark stack. Regression guard for a missed cvar notification
-    /// (same shape as `g1_concurrent::tests::worker_stops_promptly_when_parked`).
-    #[test]
-    fn zgc_worker_stops_promptly_when_parked() {
-        let collector = small_collector();
-
-        // Don't seed roots → mark stack stays empty after pause_mark_start
-        // pushes the (small) root set; the worker will drain it in one
-        // step and park immediately on the second iteration.
-        {
-            let mut c = collector.lock();
-            c.pause_mark_start();
-        }
-
-        let controller = ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
-
-        // Give the worker time to drain + park.
-        std::thread::sleep(Duration::from_millis(20));
-
-        // Now request stop. Even parked, the worker must wake within a
-        // few poll intervals (5 ms each, plus the final drain).
-        let start = std::time::Instant::now();
-        controller
-            .request_stop_and_join()
-            .expect("worker joined cleanly");
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "worker did not stop promptly when parked (took {:?})",
-            elapsed
-        );
-    }
-
-    /// Test #3 — the load barrier's colour invariant is preserved across
-    /// a full concurrent-mark cycle.
-    ///
-    /// Page-storage simulation limitation (see module-doc): without real
-    /// backing memory we can't verify "every live colored pointer ends
-    /// the cycle with a marked-color bit". What we *can* verify is the
-    /// bookkeeping invariant the controller wraps around the mark phase:
-    ///
-    /// 1. Before `pause_mark_start`, the load-barrier good-colors are
-    ///    `REMAPPED` (the post-cycle steady state).
-    /// 2. During concurrent mark, good-colors are the `MARKED0 | MARKED1`
-    ///    union — load barrier accepts either parity's mark bit.
-    /// 3. After `pause_mark_end`, good-colors are still the marked union
-    ///    (the relocate phase flips them back to REMAPPED).
-    /// 4. The collector's `phase` follows the documented sequence.
-    ///
-    /// All three invariants are preserved across the spawn/join cycle.
-    #[test]
-    fn zgc_color_invariant_preserved_across_concurrent_mark() {
-        use crate::zgc::{
-            ColoredPointer, ZGC_COLOR_MARKED0, ZGC_COLOR_MARKED1, ZGC_COLOR_REMAPPED,
-        };
-
-        let collector = small_collector();
-
-        // ── Phase 0: idle. Good-colors are REMAPPED.
-        {
-            let c = collector.lock();
-            assert_eq!(c.phase, ZgcPhase::None);
-            assert_eq!(c.load_barrier.good_colors, ZGC_COLOR_REMAPPED);
-        }
-
-        // Build a sample colored pointer with the REMAPPED bit set —
-        // i.e. a pointer that is "good" in the idle state.
-        let p_remapped = ColoredPointer::new(0x1000, ZGC_COLOR_REMAPPED);
-        let p_marked0 = ColoredPointer::new(0x2000, ZGC_COLOR_MARKED0);
-
-        // ── Phase 1: STW initial mark.
-        {
-            let mut c = collector.lock();
-            c.pause_mark_start();
-            assert_eq!(c.phase, ZgcPhase::PauseMarkStart);
-            // Load barrier flipped: marked union is now good, REMAPPED is not.
-            assert_eq!(
-                c.load_barrier.good_colors,
-                ZGC_COLOR_MARKED0 | ZGC_COLOR_MARKED1
-            );
-            // The previously-good REMAPPED pointer would now miss the
-            // fast path; a MARKED0 pointer is fast-path good.
-            assert!(matches!(
-                c.load_barrier.check(&p_remapped),
-                crate::zgc::LoadBarrierResult::NeedsSlowPath(_)
-            ));
-            assert!(matches!(
-                c.load_barrier.check(&p_marked0),
-                crate::zgc::LoadBarrierResult::GoodColor(_)
-            ));
-        }
-
-        // ── Phase 2: spawn worker, let it drive concurrent mark.
-        let controller = ZgcConcurrentMarkController::spawn(Arc::clone(&collector));
-        // Poll until the worker has at least one step under its belt
-        // (the small seeded root set drains in a single budget'd step).
-        for _ in 0..50 {
-            if controller.steps_performed() > 0 {
-                break;
+    /// Build a graph from `(node, children)` pairs, auto-inserting any child
+    /// that was not declared as a leaf. Mirrors `zgc::mark`'s test helper so
+    /// the two read the same way.
+    fn graph(edges: &[(u64, &[u64])]) -> FxHashMap<u64, Vec<u64>> {
+        let mut g: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        for (node, children) in edges {
+            g.insert(*node, children.to_vec());
+            for c in children.iter() {
+                g.entry(*c).or_default();
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
-        // The worker transitioned the phase to ConcurrentMark on its
-        // first step (via `concurrent_mark_step`).
-        {
-            let c = collector.lock();
-            assert_eq!(c.phase, ZgcPhase::ConcurrentMark);
-            // good_colors still the marked union — they only flip back
-            // to REMAPPED at the relocate-start STW.
-            assert_eq!(
-                c.load_barrier.good_colors,
-                ZGC_COLOR_MARKED0 | ZGC_COLOR_MARKED1
-            );
+        g
+    }
+
+    /// A safepoint that hands the load barrier one scripted address per
+    /// mark-end flush, newest entry last.
+    ///
+    /// This is how these tests make a mutator mark arrive *exactly* at the
+    /// mark-end pause, deterministically: the driver calls
+    /// `flush_mutator_buffers` inside the safepoint, so an address published
+    /// from here lands in the ingress immediately before `try_end_mark`
+    /// probes it. No sleeps, no races.
+    struct ScriptedSafepoint {
+        /// Popped from the back, so the script reads bottom-up. Empty means
+        /// "flush nothing", i.e. a quiet safepoint.
+        script: Mutex<Vec<u64>>,
+        entered: AtomicUsize,
+        left: AtomicUsize,
+        flushes: AtomicUsize,
+    }
+
+    impl ScriptedSafepoint {
+        fn new(script: Vec<u64>) -> Self {
+            ScriptedSafepoint {
+                script: Mutex::new(script),
+                entered: AtomicUsize::new(0),
+                left: AtomicUsize::new(0),
+                flushes: AtomicUsize::new(0),
+            }
         }
 
-        // Capture the step count BEFORE consuming the controller via
-        // `request_stop_and_join` (which takes self).
-        let steps_during_concurrent = controller.steps_performed();
+        fn balanced(&self) -> bool {
+            self.entered.load(Ordering::Relaxed) == self.left.load(Ordering::Relaxed)
+        }
+    }
 
-        // ── Phase 3: STW remark — coordinator stops worker, joins, and
-        // drives `pause_mark_end` to drain stragglers.
+    impl ZgcMarkSafepoint for ScriptedSafepoint {
+        fn begin_mark_end_safepoint(&self) {
+            self.entered.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn flush_mutator_buffers(&self, handle: &ZMarkHandle) -> usize {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+            let next = self.script.lock().pop();
+            match next {
+                // `mark_live` is the load-barrier slow path: it marks and
+                // hands the address to the ingress, which is exactly what a
+                // per-thread buffer flush would have produced.
+                Some(addr) => usize::from(handle.mark_live(0, addr)),
+                None => 0,
+            }
+        }
+
+        fn end_mark_end_safepoint(&self) {
+            self.left.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Reference hook that resurrects everything in `candidates` that is not
+    /// already strongly marked, and records what it observed as live.
+    struct KeepAliveHook {
+        candidates: Vec<u64>,
+        observed_live: Mutex<Vec<u64>>,
+        calls: AtomicUsize,
+    }
+
+    impl ZNonStrongRefHook for KeepAliveHook {
+        fn process(&self, is_marked: &dyn Fn(u64) -> bool, keep_alive: &mut dyn FnMut(u64)) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut live = self.observed_live.lock();
+            for &c in &self.candidates {
+                if is_marked(c) {
+                    live.push(c);
+                } else {
+                    keep_alive(c);
+                }
+            }
+        }
+    }
+
+    /// Open a cycle over `g` rooted at `roots`, returning the context and the
+    /// pool. The caller drives the rest.
+    fn open_cycle(
+        g: FxHashMap<u64, Vec<u64>>,
+        roots: &[u64],
+        workers: usize,
+    ) -> (Arc<TestMarkContext>, Arc<ZMarkCoordinator>) {
+        let ctx = Arc::new(TestMarkContext::new(g));
+        let pool = Arc::new(ZMarkCoordinator::new(ctx.clone(), workers));
+        pool.begin_cycle();
+        pool.push_roots(roots);
+        (ctx, pool)
+    }
+
+    // -- lifecycle ----------------------------------------------------------
+
+    /// The driver spawns, marks the reachable set, and joins cleanly.
+    ///
+    /// The replacement for the simulation-era
+    /// `zgc_concurrent_mark_thread_spawns_and_joins`, which could only assert
+    /// that a thread started and stopped — there was no object graph for it
+    /// to mark. This one asserts the mark set.
+    #[test]
+    fn driver_marks_the_reachable_set_and_joins_cleanly() {
+        let g = graph(&[(1, &[2, 3]), (2, &[4]), (3, &[4, 5]), (4, &[]), (5, &[])]);
+        let (ctx, pool) = open_cycle(g, &[1], 2);
+
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint.clone(),
+        ));
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete, "{outcome:?}");
+        assert_eq!(outcome.passes, 1, "a quiet cycle needs exactly one pass");
+        assert_eq!(outcome.restarts, 0);
+        assert_eq!(outcome.redrains, 0);
+        assert_eq!(ctx.marked_sorted(), vec![1, 2, 3, 4, 5]);
+        assert!(
+            safepoint.balanced(),
+            "every begin_mark_end_safepoint must be paired with an end"
+        );
+        assert_eq!(safepoint.flushes.load(Ordering::Relaxed), 1);
+    }
+
+    /// A cycle with no roots converges without marking anything, and the
+    /// driver still publishes a well-formed outcome.
+    #[test]
+    fn an_empty_root_set_converges_in_one_pass() {
+        let (ctx, pool) = open_cycle(graph(&[(1, &[2]), (2, &[])]), &[], 3);
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint,
+        ));
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete);
+        assert_eq!(outcome.passes, 1);
+        assert_eq!(ctx.marked_count(), 0);
+    }
+
+    // -- the restart loop ---------------------------------------------------
+
+    /// **The reason this module exists.** A mutator mark that arrives at the
+    /// mark-end pause must force the concurrent phase to run again, and the
+    /// object's whole closure must end up marked.
+    ///
+    /// Under SATB this cannot happen: the remark pause quiesces the only
+    /// producer, so one pass is always enough. Under ZGC the mutators *are*
+    /// producers until they are stopped, so the pause is a decision point.
+    /// The scripted safepoint publishes `50` during the first flush, which is
+    /// exactly the interleaving the restart loop exists for.
+    #[test]
+    fn a_mark_arriving_at_the_mark_end_pause_forces_a_restart() {
+        let g = graph(&[
+            (1, &[2]),
+            (2, &[]),
+            // Reachable only through the simulated load barrier.
+            (50, &[51, 52]),
+            (51, &[53]),
+            (52, &[]),
+            (53, &[]),
+        ]);
+        let (ctx, pool) = open_cycle(g, &[1], 2);
+
+        let safepoint = Arc::new(ScriptedSafepoint::new(vec![50]));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint.clone(),
+        ));
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete, "{outcome:?}");
+        assert_eq!(
+            outcome.restarts, 1,
+            "the mark-end probe must have seen the mutator's mark exactly once"
+        );
+        assert_eq!(
+            outcome.passes, 2,
+            "one restart means two concurrent phases ran"
+        );
+        assert_eq!(
+            ctx.marked_sorted(),
+            vec![1, 2, 50, 51, 52, 53],
+            "the mutator's object AND its transitive closure must be marked"
+        );
+        assert_eq!(
+            safepoint.flushes.load(Ordering::Relaxed),
+            2,
+            "one flush per mark-end pause"
+        );
+        assert!(safepoint.balanced());
+        assert!(
+            pool.stats().mark_end_restarts.load(Ordering::Relaxed) >= 1,
+            "the engine must have counted the restart too"
+        );
+    }
+
+    /// Several late marks in a row are each folded in; the loop iterates as
+    /// many times as it needs to and still terminates.
+    #[test]
+    fn successive_late_marks_each_force_another_pass() {
+        let mut g: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        g.insert(1, Vec::new());
+        let mut expected = vec![1u64];
+        let mut script = Vec::new();
+        for i in 0..5u64 {
+            let a = 200 + i * 2;
+            let b = 201 + i * 2;
+            g.insert(a, vec![b]);
+            g.insert(b, Vec::new());
+            expected.push(a);
+            expected.push(b);
+            script.push(a);
+        }
+        // Popped from the back: the order does not matter, only the count.
+        let (ctx, pool) = open_cycle(g, &[1], 3);
+
+        let safepoint = Arc::new(ScriptedSafepoint::new(script));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint,
+        ));
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete, "{outcome:?}");
+        assert_eq!(outcome.restarts, 5);
+        assert_eq!(outcome.passes, 6);
+        expected.sort_unstable();
+        assert_eq!(ctx.marked_sorted(), expected);
+    }
+
+    /// The ceiling trips instead of looping forever.
+    ///
+    /// The script publishes a fresh object at **every** mark-end pause, so
+    /// the fixed point is never final and an unbounded loop would never
+    /// return — which is how a GC livelock presents to a user. With
+    /// `max_mark_end_restarts = 2` the driver gives up on the third restart,
+    /// logs a `tracing::warn!`, and — the part that actually matters —
+    /// reports `mark_set_complete == false` so the caller cannot mistake the
+    /// partial mark set for a sweepable one.
+    #[test]
+    fn the_restart_ceiling_trips_instead_of_looping_forever() {
+        let mut g: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        g.insert(1, Vec::new());
+        // Far more injections than the budget allows, so the loop can only
+        // end by hitting the ceiling.
+        let mut script = Vec::new();
+        for i in 0..64u64 {
+            let a = 300 + i;
+            g.insert(a, Vec::new());
+            script.push(a);
+        }
+        let (_ctx, pool) = open_cycle(g, &[1], 2);
+
+        let safepoint = Arc::new(ScriptedSafepoint::new(script));
+        let params = ZgcConcurrentMarkParams::new(Arc::clone(&pool), safepoint.clone())
+            .with_max_mark_end_restarts(2);
+        let controller = ZgcConcurrentMarkController::spawn(params);
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(
+            outcome.restart_budget_exhausted,
+            "the ceiling must trip: {outcome:?}"
+        );
+        assert!(
+            !outcome.mark_set_complete,
+            "an exhausted budget leaves the mark set INCOMPLETE; reporting it as \
+             complete would be a use-after-free waiting to happen"
+        );
+        assert_eq!(
+            outcome.restarts, 3,
+            "the budget is exceeded on the restart AFTER the budget'th one"
+        );
+        assert_eq!(outcome.passes, 3);
+        assert!(!outcome.stopped_early);
+        assert!(safepoint.balanced());
+    }
+
+    // -- reference processing ----------------------------------------------
+
+    /// A resurrected referent drags an unscanned subgraph behind it, so the
+    /// driver must re-drain after the hook — and must stop once the hook has
+    /// nothing left to resurrect.
+    #[test]
+    fn a_resurrected_referent_triggers_a_redrain_of_its_closure() {
+        let g = graph(&[
+            (1, &[2]),
+            (2, &[]),
+            // Softly-reachable island: strongly unreachable, so the strong
+            // mark cannot find it.
+            (60, &[61]),
+            (61, &[62]),
+            (62, &[]),
+        ]);
+        let (ctx, pool) = open_cycle(g, &[1], 2);
+
+        let hook = Arc::new(KeepAliveHook {
+            candidates: vec![2, 60],
+            observed_live: Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let params = ZgcConcurrentMarkParams::new(Arc::clone(&pool), safepoint)
+            .with_refs(hook.clone() as Arc<dyn ZNonStrongRefHook + Send + Sync>);
+        let controller = ZgcConcurrentMarkController::spawn(params);
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete, "{outcome:?}");
+        assert_eq!(outcome.resurrected, 1, "only 60 was dead; 2 was already live");
+        assert_eq!(outcome.redrains, 1, "the resurrection must force a re-drain");
+        assert_eq!(
+            outcome.passes, 2,
+            "one strong pass, then one more to trace the resurrection"
+        );
+        assert_eq!(
+            ctx.marked_sorted(),
+            vec![1, 2, 60, 61, 62],
+            "a resurrected referent drags its whole subgraph with it"
+        );
+        assert_eq!(
+            hook.calls.load(Ordering::Relaxed),
+            2,
+            "the hook runs again after the re-drain, and only then reports nothing \
+             left to resurrect"
+        );
+        assert_eq!(
+            hook.observed_live.lock().clone(),
+            vec![2, 2, 60],
+            "round 1 saw only the strongly-live 2; round 2 saw 2 and the now-live 60 \
+             — the hook must never be told an object is live merely because it \
+             itself just marked it"
+        );
+    }
+
+    /// With no hook the phase is skipped entirely and the cycle is a single
+    /// pass. Guards against a future refactor that runs an empty reference
+    /// phase and pays a safepoint for it.
+    #[test]
+    fn no_reference_hook_means_no_reference_safepoint() {
+        let (_ctx, pool) = open_cycle(graph(&[(1, &[2]), (2, &[])]), &[1], 2);
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint.clone(),
+        ));
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete);
+        assert_eq!(outcome.redrains, 0);
+        assert_eq!(
+            safepoint.entered.load(Ordering::Relaxed),
+            1,
+            "exactly one safepoint: the mark-end pause"
+        );
+    }
+
+    /// A hook that resurrects without ever converging must hit the round
+    /// ceiling rather than spinning forever.
+    #[test]
+    fn the_resurrection_ceiling_trips_instead_of_looping_forever() {
+        /// Resurrects a *fresh* object every round, so the fixed point of
+        /// "nothing left to resurrect" is never reached. A real hook cannot
+        /// do this (marking is monotone), which is exactly why the bound is a
+        /// guard against a broken hook rather than a policy knob.
+        struct NeverConvergingHook {
+            next: AtomicUsize,
+        }
+        impl ZNonStrongRefHook for NeverConvergingHook {
+            fn process(&self, _is_marked: &dyn Fn(u64) -> bool, keep_alive: &mut dyn FnMut(u64)) {
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                keep_alive(400 + i as u64);
+            }
+        }
+
+        let mut g: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        g.insert(1, Vec::new());
+        for i in 0..64u64 {
+            g.insert(400 + i, Vec::new());
+        }
+        let (_ctx, pool) = open_cycle(g, &[1], 2);
+
+        let hook = Arc::new(NeverConvergingHook {
+            next: AtomicUsize::new(0),
+        });
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let params = ZgcConcurrentMarkParams::new(Arc::clone(&pool), safepoint.clone())
+            .with_refs(hook as Arc<dyn ZNonStrongRefHook + Send + Sync>)
+            .with_max_resurrection_rounds(3);
+        let controller = ZgcConcurrentMarkController::spawn(params);
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(
+            outcome.resurrection_budget_exhausted,
+            "the round ceiling must trip: {outcome:?}"
+        );
+        assert!(!outcome.mark_set_complete);
+        assert_eq!(outcome.redrains, 4, "budget 3 means the 4th round gives up");
+        assert!(safepoint.balanced());
+    }
+
+    // -- shutdown -----------------------------------------------------------
+
+    /// Stopping the controller while marking is in flight must not hang.
+    ///
+    /// The pool is deliberately wedged: a visit hook holds a worker inside
+    /// `visit_refs`, so the fixed point cannot be reached and the driver is
+    /// parked in `await_fixed_point`. `request_stop_and_join` must still
+    /// return — the driver's park is bounded and it re-reads the stop flag
+    /// every interval. If it waited on the pool's own condvar instead, this
+    /// would deadlock, which is the whole reason `await_fixed_point` polls.
+    ///
+    /// Nothing here asserts on elapsed time; the test simply cannot pass
+    /// without the join returning.
+    #[test]
+    fn stopping_the_driver_mid_cycle_does_not_hang() {
+        let mut g: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        let mut children = Vec::new();
+        for i in 0..64u64 {
+            let c = 500 + i;
+            g.insert(c, Vec::new());
+            children.push(c);
+        }
+        g.insert(1, children);
+
+        let release = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let hook_release = Arc::clone(&release);
+        let hook_entered = Arc::clone(&entered);
+        let ctx = Arc::new(TestMarkContext::new(g).with_visit_hook(Box::new(
+            move |addr: u64| {
+                if addr != 1 {
+                    return;
+                }
+                hook_entered.fetch_add(1, Ordering::SeqCst);
+                // Bounded spin, exactly as `zgc::mark`'s own interleaving
+                // tests do it: if the wedge does not materialise on this run
+                // the test still checks that the join returns, it just does
+                // not exercise the mid-cycle case that time.
+                let mut spins: u64 = 0;
+                while !hook_release.load(Ordering::Acquire) && spins < 20_000_000 {
+                    spins += 1;
+                    std::thread::yield_now();
+                }
+            },
+        )));
+
+        let pool = Arc::new(ZMarkCoordinator::new(ctx.clone(), 2));
+        pool.begin_cycle();
+        pool.push_roots(&[1]);
+
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint,
+        ));
+
+        // Wait (bounded, unasserted) until a worker is actually wedged inside
+        // `visit_refs`, so the stop really does land mid-cycle.
+        let mut spins: u64 = 0;
+        while entered.load(Ordering::SeqCst) == 0 && spins < 20_000_000 {
+            spins += 1;
+            std::thread::yield_now();
+        }
+
         controller
             .request_stop_and_join()
-            .expect("worker joined cleanly");
-        {
-            let mut c = collector.lock();
-            c.pause_mark_end();
-            assert_eq!(c.phase, ZgcPhase::PauseMarkEnd);
-            // Color invariant still the marked union after remark — the
-            // flip back to REMAPPED happens at the next STW
-            // (PauseRelocateStart), which we don't run in this test.
-            assert_eq!(
-                c.load_barrier.good_colors,
-                ZGC_COLOR_MARKED0 | ZGC_COLOR_MARKED1
-            );
-        }
+            .expect("driver must join after a stop request");
 
-        // The worker did real work: at least one step completed under
-        // the budget. This guards against a regression where the worker
-        // would silently park without ever entering `concurrent_mark_step`.
+        // Let the wedged worker out so the pool can be torn down.
+        release.store(true, Ordering::Release);
+        pool.end_cycle();
+        // The pool's own `Drop` stops and joins the workers when this last
+        // clone goes; doing it explicitly keeps the teardown in the test.
+        drop(pool);
+    }
+
+    /// Dropping the controller without joining must not hang either, and must
+    /// leave the detached driver able to finish on its own.
+    #[test]
+    fn dropping_the_controller_requests_stop_without_blocking() {
+        let (_ctx, pool) = open_cycle(graph(&[(1, &[2]), (2, &[3]), (3, &[])]), &[1], 2);
+        let safepoint = Arc::new(ScriptedSafepoint::new(Vec::new()));
+        let state = {
+            let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+                Arc::clone(&pool),
+                safepoint,
+            ));
+            let state = Arc::clone(&controller.state);
+            // Dropped here: flips the stop flag and detaches.
+            state
+        };
         assert!(
-            steps_during_concurrent >= 1,
-            "worker should have performed at least one mark step (got {})",
-            steps_during_concurrent
+            state.should_stop.load(Ordering::Acquire),
+            "Drop must request a stop"
         );
+        pool.end_cycle();
+    }
+
+    // -- seam sanity --------------------------------------------------------
+
+    /// The no-mutator safepoint is a legitimate `ZgcMarkSafepoint`: it stops
+    /// nothing and flushes nothing, which is correct precisely when there is
+    /// no other mutator. Pins the default so an accidental change to it is a
+    /// test failure rather than a silent unsoundness in single-threaded
+    /// embeddings.
+    #[test]
+    fn the_no_mutator_safepoint_drives_a_cycle() {
+        let (ctx, pool) = open_cycle(graph(&[(1, &[2]), (2, &[3]), (3, &[])]), &[1], 1);
+        let safepoint: Arc<dyn ZgcMarkSafepoint> = Arc::new(ZgcNoMutatorSafepoint);
+        let controller =
+            ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(Arc::clone(&pool), safepoint));
+
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert!(outcome.mark_set_complete);
+        assert_eq!(outcome.passes, 1);
+        assert_eq!(ctx.marked_sorted(), vec![1, 2, 3]);
+    }
+
+    /// Telemetry on the shared state tracks the outcome. Guards the accessor
+    /// surface a caller polls while the cycle is still running.
+    #[test]
+    fn state_telemetry_matches_the_cycle_outcome() {
+        let g = graph(&[(1, &[2]), (2, &[]), (70, &[71]), (71, &[])]);
+        let (_ctx, pool) = open_cycle(g, &[1], 2);
+        let safepoint = Arc::new(ScriptedSafepoint::new(vec![70]));
+        let controller = ZgcConcurrentMarkController::spawn(ZgcConcurrentMarkParams::new(
+            Arc::clone(&pool),
+            safepoint,
+        ));
+
+        let state = Arc::clone(&controller.state);
+        let outcome = controller.join_cycle().expect("driver joined");
+        pool.end_cycle();
+
+        assert_eq!(state.passes_performed.load(Ordering::Relaxed), outcome.passes as u64);
+        assert_eq!(
+            state.restarts_performed.load(Ordering::Relaxed),
+            outcome.restarts as u64
+        );
+        assert_eq!(state.outcome(), Some(outcome));
     }
 }

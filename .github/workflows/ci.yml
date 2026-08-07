@@ -480,6 +480,75 @@ jobs:
           -p cratonvm-native-builtins
           --features app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto
 
+      # THE ZGC HALF OF THIS JOB, AND WHY IT IS TWO MORE STEPS RATHER THAN ONE
+      # MORE NAME ON THE FEATURE LIST ABOVE.
+      #
+      # `zgc` was already on that list, and it was not enough. On 2026-08-05
+      # `ZgcRealHeap::with_capacity()` was left out of the change that gave the
+      # compact-layout registry a domain — its three sibling collectors (`Heap`,
+      # `G1Collector`, `GenHeap`) all got `layout_domain`, it did not — and the
+      # feature stopped compiling with E0063. It was found on 2026-08-07 by a
+      # human running a full suite, not by this job.
+      #
+      # Two gaps let that through, and these steps close both:
+      #
+      #  1. NOTHING BUILT THE BINARY. Every zgc step here is `-p cratonvm-vm -p
+      #     cratonvm-native-builtins`, i.e. libraries. `cratonvm-cli` was never
+      #     compiled with the feature by any job in this file. That matters more
+      #     than the usual lib-vs-bin distinction because `zgc` also gates an
+      #     enum variant (`GcAlgorithm::Zgc`) and a `parse_gc_algorithm` match
+      #     arm in `vm/src/config.rs`, plus the `VmHeap::Zgc` arms in
+      #     `gc/src/vm_heap.rs` — whole dispatch paths that a default build
+      #     resolves to nothing. It is also the `-p`-scoped resolve a suite build
+      #     actually gets, for the same reason the "Default-feature native
+      #     registry surface" step in `build-and-test` is `-p`-scoped.
+      #  2. THE COLLECTOR'S OWN TESTS RAN NOWHERE. When these steps were added
+      #     that was 89 `#[test]`s (86 in `gc/src/zgc.rs`, 3 in
+      #     `gc/src/zgc_concurrent.rs`), all inside `#[cfg(feature = "zgc")]`
+      #     modules of a crate that no job selected with the feature on.
+      #     As of 2026-08-07 it is 368, after eleven new `gc/src/zgc/` modules
+      #     landed and `zgc_concurrent.rs` was rewritten: 91 in `zgc.rs`,
+      #     12 in `zgc_concurrent.rs`, 265 across `gc/src/zgc/*.rs`. Recount
+      #     with (bash, from the repo root):
+      #       grep -c '#\[test\]' gc/src/zgc.rs gc/src/zgc_concurrent.rs \
+      #         $(sed -n 's/^pub mod \(.*\);$/gc\/src\/zgc\/\1.rs/p' gc/src/zgc.rs)
+      #     Count only modules `zgc.rs` actually declares — an undeclared file
+      #     in `gc/src/zgc/` does not compile and its tests do not run, which is
+      #     how `census.rs`'s 24 tests sat unexecuted until it was declared.
+      #     Compiling them is not the point — `ZgcRealHeap` is a real
+      #     memory-backed mark-sweep collector (`GarbageCollector` impl, real
+      #     `Arena` storage, real `ObjectHeader`s), so its unit tests are a
+      #     behavioural signal and must execute.
+      #
+      # `--features zgc` resolves bare here because `cratonvm-cli` declares its
+      # own pass-through (`zgc = ["cratonvm-vm/zgc"]`, added with these steps) —
+      # that is also the command a developer uses for a ZGC-capable launcher.
+      # `cargo build`, not `cargo check`: the missing-field class of break is a
+      # type error either way, but this is the only place the shipped launcher
+      # is linked with the collector in it, and a link-time break is not a
+      # compile-time one.
+      #
+      # NOT A MATRIX. `ubuntu-latest` only, like the rest of this job — the
+      # collector is platform-agnostic Rust over an owned `Arena`, so a second
+      # OS leg would re-prove the same compile. Behavioural parity with
+      # `Generational` is not asserted anywhere in CI and deliberately so: the
+      # backend is default-off precisely because it is not at parity yet
+      # (docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md).
+      - name: Build the cratonvm launcher with the ZGC backend compiled in
+        run: cargo build -p cratonvm-cli --features zgc
+
+      # NOT `--lib`. The unit tests alone cannot catch two ZGC modules
+      # disagreeing with each other: each module declares its own decoupling
+      # traits and its own tests exercise only its own side. The cross-module
+      # seams live in `gc/tests/zgc_module_integration.rs`, and while this step
+      # was `--lib`-scoped that target was compiled by NOTHING — it silently
+      # stopped compiling, and eight consecutive reconciliation passes were
+      # merged against a suite that had not run since. Same shape as the E0063
+      # and the never-executed-tests gaps above: a target no job builds rots.
+      - name: Test the ZGC collector (cratonvm-gc unit + integration tests)
+        timeout-minutes: 20
+        run: cargo test -p cratonvm-gc --features zgc
+
       # Some test targets are gated in their entirety —
       # `vm/tests/t4_8_jdwp_conformance.rs` is `#![cfg(feature =
       # "experimental-debug")]` — and so execute nowhere else.

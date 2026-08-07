@@ -361,8 +361,28 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
         }
         let recursion = ObjectHeader::thin_lock_recursion(cur);
         let (new, ret) = if recursion == 0 {
-            // Last release → return to NEUTRAL.
-            (types::MARK_NEUTRAL, None)
+            // Last release → return to NEUTRAL, CARRYING THE QUARTET.
+            //
+            // `MARK_NEUTRAL` is a bare state constant (`0b00`). Storing it raw
+            // erases bits 48..61 — the `kind` / `element_type` / `gc_age` /
+            // `gc_flags` quartet that moved into this word when the header
+            // shrank 24 -> 16 (2026-08-07). Every other transition on this word
+            // already rides the quartet across: `make_thin_locked`,
+            // `make_inflated` and `make_neutral_hashed` all derive from the
+            // previous value. This one did not, so the FIRST `synchronized`
+            // block on an object reset its GC flags on exit.
+            //
+            // `GC_FLAG_COMPACT` living in that quartet is what made it fatal: a
+            // compact object silently became "legacy" the moment it was
+            // unlocked, and every later field read then decoded a
+            // compact-packed body as 16-byte cells — reading past the end of
+            // the object. `FileChannelImpl.fileLockTable()` is
+            // double-checked locking over a volatile field, so the assignment
+            // landed inside the lock and the read after `monitorexit` came back
+            // null: `NullPointerException ... because "flt" is null`, and no
+            // file-backed database could open. See
+            // docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md.
+            (ObjectHeader::quartet_of(cur) | types::MARK_NEUTRAL, None)
         } else {
             (
                 ObjectHeader::make_thin_locked(cur, thread_id, recursion - 1),
@@ -2140,7 +2160,7 @@ impl MonitorTable {
     ///   `gc/src/gen_heap.rs` — left to the owner of those files. Until then a
     ///   dead object's monitor is retained by the moving collectors, which is a
     ///   bounded leak and strictly preferable to a dangling mark word.
-    pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    pub fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -2244,7 +2264,7 @@ impl Default for MonitorTable {
 }
 
 impl cratonvm_gc::MonitorCleanup for MonitorTable {
-    fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    fn remap_after_gc(&self, pointer_map: &cratonvm_types::PointerMap) {
         self.remap_after_gc(pointer_map);
     }
 
@@ -2336,6 +2356,69 @@ mod tests {
     fn test_object() -> ObjectRef {
         let heap: &'static Heap = Box::leak(Box::new(Heap::with_capacity(4096)));
         heap.alloc_object(ClassId::new(0), 0)
+    }
+
+    /// A thin lock/unlock round trip must leave the mark word's quartet
+    /// (`kind` / `element_type` / `gc_age` / `gc_flags`) exactly as it found
+    /// it.
+    ///
+    /// Those bits live in the mark word since the header shrank 24 -> 16, and
+    /// the last release used to store the bare `MARK_NEUTRAL` constant over
+    /// them. `GC_FLAG_COMPACT` is one of them, so the first `synchronized`
+    /// block on a compact object converted it to "legacy" and every later field
+    /// read decoded a compact-packed body with 16-byte cells.
+    #[test]
+    fn a_thin_lock_round_trip_preserves_the_mark_word_quartet() {
+        use cratonvm_types::{GC_FLAG_COMPACT, GC_FLAG_OLD_GEN};
+
+        let obj = test_object();
+        let header = header_of(obj);
+        header.set_gc_flags(GC_FLAG_COMPACT | GC_FLAG_OLD_GEN);
+        let before = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(
+            header.gc_flags(),
+            GC_FLAG_COMPACT | GC_FLAG_OLD_GEN,
+            "precondition: the flags are in the mark word"
+        );
+
+        try_thin_lock(header, 7).expect("an unlocked, unhashed object thin-locks");
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed)),
+            ObjectHeader::quartet_of(before),
+            "locking must carry the quartet"
+        );
+
+        // Recursive acquire/release must carry it too — that arm derives from
+        // `cur`, but pin it so a future rewrite cannot regress silently.
+        try_thin_recursive_lock(header, 7).expect("recursive acquire");
+        try_thin_unlock(header, 7).expect("recursive release");
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Relaxed)),
+            ObjectHeader::quartet_of(before),
+            "recursive release must carry the quartet"
+        );
+
+        assert_eq!(
+            try_thin_unlock(header, 7),
+            Ok(None),
+            "the last release returns the lock to NEUTRAL"
+        );
+        let after = header.mark_word.load(Ordering::Relaxed);
+        assert_eq!(
+            ObjectHeader::mark_state(after),
+            types::MARK_NEUTRAL,
+            "and the state really is NEUTRAL"
+        );
+        assert_eq!(
+            header.gc_flags(),
+            GC_FLAG_COMPACT | GC_FLAG_OLD_GEN,
+            "the LAST release is the one that used to erase the flags"
+        );
+        assert_eq!(
+            ObjectHeader::quartet_of(after),
+            ObjectHeader::quartet_of(before),
+            "kind / element_type / gc_age must survive the unlock too"
+        );
     }
 
     #[test]
@@ -2516,7 +2599,7 @@ mod tests {
             .mark_word
             .store(old_mark, Ordering::Release);
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         table.remap_after_gc(&pointer_map);
 
@@ -2543,7 +2626,7 @@ mod tests {
             .mark_word
             .store(old_mark, Ordering::Release);
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         table.remap_after_gc(&pointer_map);
 
@@ -2570,7 +2653,7 @@ mod tests {
         // whole-heap collection in which `obj` was not forwarded (= dead).
         // (An empty map early-returns; use a dummy unrelated remap so the body
         // actually runs.)
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0xdead_0000usize, 0xbeef_0000usize);
         table.remap_after_gc(&pointer_map);
 
@@ -2605,7 +2688,7 @@ mod tests {
 
         // Partial GC: pointer_map mentions some *other* object, not `obj`
         // (which survived in place). Default flag is off → must NOT reclaim.
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(0xfeed_0000usize, 0xface_0000usize);
         table.remap_after_gc(&pointer_map);
 
@@ -3028,7 +3111,7 @@ mod tests {
         // Populate this OS thread's raw-pointer cache, then simulate the
         // stop-the-world re-key that a moving collection performs.
         table.with_cas_lock(old_obj, || {});
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_obj.as_ptr() as usize, new_obj.as_ptr() as usize);
         table.remap_after_gc(&pointer_map);
 
@@ -3044,7 +3127,7 @@ mod tests {
         let tid = ThreadId(1);
 
         table.enter(obj, tid);
-        let empty_map = std::collections::HashMap::new();
+        let empty_map = cratonvm_types::PointerMap::default();
         table.remap_after_gc(&empty_map);
         // Monitor should still be accessible with original address
         assert!(table.exit(obj, tid).is_ok());

@@ -181,9 +181,9 @@ impl Drop for DumpSafepoint<'_> {
         if self.acquired {
             // No object moved, so the empty map is not a shortcut — it is
             // the exact and complete answer for a non-moving pause. See
-            // `vm/src/native/jni.rs`'s `gc_barrier.complete_gc(HashMap::new())`
+            // `vm/src/native/jni.rs`'s `gc_barrier.complete_gc(cratonvm_types::PointerMap::default())`
             // test usage for the same pattern.
-            self.vm.mem.gc_barrier.complete_gc(HashMap::new());
+            self.vm.mem.gc_barrier.complete_gc(cratonvm_types::PointerMap::default());
         }
     }
 }
