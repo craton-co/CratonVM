@@ -15954,8 +15954,8 @@ fn settable_attribute_names_for_view(view: &str) -> Option<&'static [&'static st
 /// abstract class, so with no native registered on it every
 /// `Files.setAttribute` call in the world resolved the abstract declaration and
 /// died with `AbstractMethodError: ... setAttribute ... has no Code attribute`
-/// — on **every** platform, not just Windows (docs/known-issues/h2/
-/// bug-h2-windows-files-setattribute-abstract.md). H2's
+/// — on **every** platform, not just Windows, despite being filed as a
+/// Windows-only virtual-dispatch defect. H2's
 /// `FilePathDisk.setReadOnly` is only the loudest caller: it takes the
 /// `Files.setAttribute(f, "dos:readonly", true)` branch on Windows and the
 /// `Files.setPosixFilePermissions` branch on Linux, which is the whole reason
@@ -16004,6 +16004,17 @@ pub(crate) fn set_named_attribute(
 
     match name {
         "lastModifiedTime" | "lastAccessTime" | "creationTime" => {
+            // Type-check BEFORE reading. `filetime_read_millis` falls back to
+            // slot 0 and then to `0`, so handing it a `String` would have set
+            // the timestamp to the epoch and reported success — a silent wrong
+            // answer where the JDK throws.
+            require_value_class(
+                ctx,
+                value_obj,
+                "java/nio/file/attribute/FileTime",
+                view,
+                name,
+            )?;
             let millis = filetime_read_millis(ctx, value_obj);
             let (creation, access, modified) = match name {
                 "creationTime" => (Some(millis), None, None),
@@ -16045,6 +16056,25 @@ pub(crate) fn set_named_attribute(
             }
         }
         "permissions" => {
+            // `posix_permission_bits_from_set` answers `0` for anything it
+            // cannot probe, and `0` is also the legitimate answer for an EMPTY
+            // set — so a non-collection value would `chmod 000` and report
+            // success. `size()` separates the two: a real collection answers it
+            // (with `0` when empty), a `String` does not have it at all.
+            if !matches!(
+                ctx.invoke_virtual(value_obj, "size", "()I", &[]),
+                Ok(Some(Value::Int(_)))
+            ) {
+                let class_id = ctx.class_id_of_object(value_obj);
+                let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+                return Err(RuntimeError::ClassCastException {
+                    message: format!(
+                        "class {} cannot be cast to class java.util.Set (setting '{view}:{name}')",
+                        class_name.replace('/', ".")
+                    ),
+                }
+                .into());
+            }
             let mode = posix_permission_bits_from_set(ctx, value_obj);
             #[cfg(unix)]
             {
@@ -16090,9 +16120,42 @@ pub(crate) fn set_named_attribute(
     Ok(None)
 }
 
-/// Unbox a `Boolean` argument to `setAttribute`. The JDK throws
-/// `ClassCastException` when the value is not the type the attribute wants;
-/// answering `false` for, say, a `String` would silently clear a flag the
+/// Require a `setAttribute` value to be of the class the attribute wants.
+///
+/// The JDK expresses a wrong-typed value as `ClassCastException` — it casts,
+/// and the cast fails — so this raises the same type with the JVM's own message
+/// shape. Not merely cosmetic: `Files.setAttribute` callers that pass the wrong
+/// type catch `ClassCastException`, and the *reader* on the other side of each
+/// arm here (`filetime_read_millis`, `unbox_value`) has a benign fallback that
+/// would otherwise turn the mistake into a silent wrong write.
+///
+/// The `(… are in module java.base of loader 'bootstrap')` clause HotSpot
+/// appends is deliberately NOT reproduced: it would mean asserting module and
+/// loader facts this call site has not looked up.
+fn require_value_class(
+    ctx: &mut dyn NativeContext,
+    value_obj: ObjectRef,
+    want: &str,
+    view: &str,
+    name: &str,
+) -> Result<(), MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(value_obj);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    if class_name == want {
+        return Ok(());
+    }
+    Err(RuntimeError::ClassCastException {
+        message: format!(
+            "class {} cannot be cast to class {} (setting '{view}:{name}')",
+            class_name.replace('/', "."),
+            want.replace('/', ".")
+        ),
+    }
+    .into())
+}
+
+/// Unbox a `Boolean` argument to `setAttribute`, after checking it really is
+/// one — answering `false` for, say, a `String` would silently clear a flag the
 /// caller asked to set.
 fn boxed_boolean_value(
     ctx: &mut dyn NativeContext,
@@ -16100,17 +16163,7 @@ fn boxed_boolean_value(
     view: &str,
     name: &str,
 ) -> Result<bool, MethodCallFailed> {
-    let class_id = ctx.class_id_of_object(value_obj);
-    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    if class_name != "java/lang/Boolean" {
-        return Err(RuntimeError::ClassCastException {
-            message: format!(
-                "'{view}:{name}' expects a java.lang.Boolean, got {}",
-                class_name.replace('/', ".")
-            ),
-        }
-        .into());
-    }
+    require_value_class(ctx, value_obj, "java/lang/Boolean", view, name)?;
     match crate::lang_class::unbox_value(ctx, value_obj) {
         Value::Int(v) => Ok(v != 0),
         _ => Ok(false),
