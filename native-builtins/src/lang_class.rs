@@ -823,14 +823,22 @@ fn check_reflection_module_access_with_target_id(
 /// The `exports` half of `Reflection.verifyMemberAccess`, for a reflective
 /// operation on a PUBLIC member that has NOT been `setAccessible(true)`.
 ///
-/// JEP 261: a public constructor of a public class is still unreachable from
-/// the class path when its package is not `exports`ed to the caller's module.
-/// HotSpot 25 reaches this through `Constructor.newInstance` ->
-/// `AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
+/// JEP 261: a public member of a public class is still unreachable from the
+/// class path when its package is not `exports`ed to the caller's module.
+/// HotSpot 25 reaches this through `Constructor.newInstance` / `Method.invoke`
+/// -> `AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
 /// `verifyModuleAccess` -> `memberModule.isExported(pkg, callerModule)`, and
-/// throws `IllegalAccessException`. `regression-suite/src/RJdkModule.java:172`
+/// throws `IllegalAccessException`. `verifyMemberAccess` runs that module test
+/// BEFORE its `Modifier.isPublic(modifiers)` shortcut, which is why a public
+/// member does not skip it. `regression-suite/src/RJdkModule.java:172`
 /// is the witness: a public no-arg ctor on the public `EnGreeter`, in the one
 /// package `cratonvm.jdkonly.svc` neither exports nor opens.
+///
+/// Both reflective entry points are the SAME shape here — `Constructor` passes
+/// `clazz` as both `memberClass` and `targetClass`, `Method` passes
+/// `isStatic ? null : obj.getClass()` as `targetClass`, and that argument only
+/// steers the `protected` sub-rule, never the module test. So the two call
+/// sites read identically.
 ///
 /// Deliberately NOT folded into [`check_reflection_module_access_with_target_id`]:
 /// that one asks the `opens` question, which over-denies here — every public
@@ -7560,6 +7568,14 @@ pub(crate) fn native_method_invoke(
         }
     }
 
+    // Capture the declaring class's EXACT id from the mirror once, before the
+    // access checks. Both the caller-entitlement step and the JPMS step want
+    // it, and resolving it by binary name instead is ambiguous when two child
+    // loaders define the same name (see
+    // `check_reflection_module_access_with_target_id`'s doc comment and
+    // `regression-suite/src/RFieldSiteCache.java` `twoLoadersOneName`).
+    let declaring_cid = mirror_class_id(ctx, declaring_mirror);
+
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
     let is_public = (modifiers & ACC_PUBLIC) != 0;
@@ -7576,7 +7592,6 @@ pub(crate) fn native_method_invoke(
         // `check_field_access` is the field-shaped half of the same rule.
         // Pure widening: the fallback below is unchanged for every input the
         // caller step does not accept.
-        let declaring_cid = mirror_class_id(ctx, declaring_mirror);
         let caller_cid = resolve_caller_class_id(ctx);
         let caller_entitled = match (caller_cid, declaring_cid) {
             (Some(caller), Some(declaring)) => {
@@ -7598,13 +7613,26 @@ pub(crate) fn native_method_invoke(
             )?;
         }
     }
-    // NEW-19: module-level opens check (JPMS). When `accessible == true`
-    // the override flag short-circuits the deep check (JEP 403).
+    // NEW-19: module-level JPMS check. When `accessible == true` the override
+    // flag short-circuits it (JEP 403).
     //
-    // JEP 403/261 distinction: PUBLIC methods of EXPORTED packages need
-    // only `exports`, not `opens`. Only enforce the deep check when the
-    // method is non-public (ACC_PUBLIC = 0x0001) вЂ” that's the case where
-    // setAccessible / opens is required.
+    // JEP 403/261 distinction: a PUBLIC method of an EXPORTED package needs
+    // only `exports`, not `opens` — `ArrayList.size()` must invoke without any
+    // --add-opens, because java.base exports java.util WITHOUT opening it.
+    // Only a non-public method requires the opens/deep check.
+    //
+    // But "needs only exports" is not "needs nothing", and the public arm used
+    // to have NO check at all. `Method.invoke` is the exact shape of
+    // `Constructor.newInstance`: both call `AccessibleObject.checkAccess` ->
+    // `Reflection.verifyMemberAccess` -> `verifyModuleAccess` ->
+    // `memberModule.isExported(pkg, callerModule)`, and `verifyMemberAccess`
+    // runs that module test BEFORE the `Modifier.isPublic(modifiers)` shortcut,
+    // so public members do not skip it. Measured on Temurin 25.0.3:
+    // `jdk.internal.misc.VM.isBooted()` is public+static on a public class, and
+    // `Method.invoke` throws IllegalAccessException ("module java.base does not
+    // export jdk.internal.misc to unnamed module"), while
+    // `ArrayList.size()` invokes normally. Without this arm CratonVM
+    // fabricated a success where the spec mandates a failure.
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
             return Err(
@@ -7614,6 +7642,18 @@ pub(crate) fn native_method_invoke(
                 .into(),
             );
         }
+    } else if let Err(msg) = check_reflection_export_access_with_target_id(
+        ctx,
+        &class_name,
+        declaring_cid,
+        accessible,
+    ) {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
+            }
+            .into(),
+        );
     }
 
     // Get descriptor вЂ” stored in CratonVM extra slot (not a real JDK field).

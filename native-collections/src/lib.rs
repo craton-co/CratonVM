@@ -2447,19 +2447,46 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // alongside this change). Leaving the call site here, disabled, so the
     // next reader sees why it must not be re-enabled.
     let _ = register_stamped_lock_natives;
-    // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
-    // phase=2) that conflicts with the real JDK field layout (state(0, J),
-    // parent(1, L), root(2, L), evenQ(3, L), oddQ(4, L)). In real-JDK mode the
-    // synthetic `<init>` writes Int(parties) to slot 0 — but the real `state`
-    // field is a `long`, so descriptor-aware coercion turns it into Long and
-    // the Int-matching `getRegisteredParties` reads it back as 0; slot 2 gets
-    // Int(0) coerced to a null `root`, so the un-shadowed `getUnarrivedParties`
-    // runs real bytecode and NPEs in `reconcileState` on `root.state`. Gate
-    // behind synthetic-jdk only so real Phaser bytecode runs in real-JDK mode
-    // (same fix pattern as register_blocking_queue_natives above) —
-    // gaps/gap-phaser-real-bytecode-state.md.
-    #[cfg(feature = "synthetic-jdk")]
-    register_phaser_natives(registry);
+    // Phaser: DISABLED 2026-08-07 — same shape as the StampedLock call above,
+    // and for the same two reasons. It used to be
+    // `#[cfg(feature = "synthetic-jdk")] register_phaser_natives(registry);`
+    // (gaps/gap-phaser-real-bytecode-state.md), which was not enough:
+    //
+    //  1. SPLIT-BRAIN under synthetic-jdk. `native-builtins`
+    //     `phases_early::register_phaser_natives` registers TWELVE triples via
+    //     `register_synthetic_overrides` -> `register_phase51_natives`; this
+    //     copy registers NINE of the same twelve and, running later
+    //     (`register_builtins` then `register_collections_natives` in
+    //     `vm_init`), WON them. The two implementations do not share state:
+    //     this one keeps parties/arrived/phase in object slots 0/1/2, the
+    //     `native-builtins` one keeps an `int[3]` holder in slot 1. So the
+    //     three triples this copy does NOT register (`getUnarrivedParties`,
+    //     `isTerminated`, `forceTermination`) read a holder that `arrive()`
+    //     never updates — and worse, `ph_holder` finds a non-Object in slot 1,
+    //     takes its migration path, and OVERWRITES slot 1 with the new array,
+    //     destroying the `arrived` count this copy's `arrive()` had been
+    //     keeping there. One `getUnarrivedParties()` call corrupts the phaser.
+    //     A partial surface is the failure mode here, exactly as with
+    //     StampedLock; the twelve-triple holder-based implementation is a
+    //     strict superset of these nine and serves the whole surface alone.
+    //  2. The `cfg` gate was a BUILD-time gate standing in for a MODE
+    //     question. `use_synthetic_jdk` is runtime config: a synthetic-jdk
+    //     *feature* build running real-JDK *mode* takes the `vm_init` arm that
+    //     skips `register_builtins` but still calls
+    //     `register_collections_natives` — so the cfg was satisfied, this copy
+    //     registered, and the synthetic 3-int layout shadowed real `Phaser`
+    //     bytecode over the real state(0,J)/parent(1,L)/root(2,L)/evenQ/oddQ
+    //     layout anyway. That is the very regression the cfg was added to fix.
+    //
+    // Dropping the call site fixes both: under synthetic-jdk the
+    // `native-builtins` holder implementation serves all twelve triples
+    // (the fabricated `Phaser` gets 3 `Ljava/lang/Object;` slots, so the
+    // holder reference in slot 1 is type-correct there), and in real-JDK mode
+    // Phaser has no native shadow at all and the real bytecode runs. The
+    // default build (no `synthetic-jdk`) is unchanged: neither copy ran there.
+    // Kept, disabled, per the standing rule against deleting a synthetic
+    // method — and so the next reader sees why it must not be re-enabled.
+    let _ = register_phaser_natives;
     register_priority_blocking_queue_natives(registry);
     // ScheduledThreadPoolExecutor natives use a synthetic 3-field layout
     // (poolSize=0, shutdown=1, taskList=2). On a REAL STPE that maps onto

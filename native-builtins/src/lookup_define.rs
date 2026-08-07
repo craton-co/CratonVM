@@ -301,17 +301,50 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
     // field answers `Int(0)` from `get_field_by_name`, so a `Value::Object`
     // answer for `prevLookupClass` means the real JDK class is what we
     // allocated.
+    //
+    // W6-3 hardening, two additions:
+    //
+    //  1. A POSITIVE class-side witness. `resolve_field_index_by_class_id` asks
+    //     the CLASS whether it declares the field, so unlike the value-shape
+    //     test it does not have to distinguish "absent" (`Int(0)`) from "a real
+    //     reference field that is currently null" (`Object(None)`) — the two
+    //     answers a fresh object of either layout can give. A fabricated stub
+    //     names its fields `_f0.._fN`, so this misses there and the synthetic
+    //     arm still runs; the old value-shape test is kept as a disjunct so
+    //     this is a strict superset of the previous condition.
+    //
+    //  2. The by-name write is VERIFIED. Pinning only the positive half is what
+    //     made the original bug invisible: a `Lookup` whose `allowedModes` never
+    //     received the value reads back 0 — "no access at all" — and throws
+    //     nothing. If the named write did not land, fall through to the
+    //     synthetic indices rather than returning a powerless Lookup.
     let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
     // Slot 0 is `lookupClass` in BOTH layouts.
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(lookup_mirror)));
     ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(lookup_mirror)));
-    if matches!(
-        ctx.get_field_by_name(obj, "prevLookupClass"),
-        Value::Object(_)
-    ) {
+    let real_layout = {
+        let cid = ctx.class_id_of_object(obj);
+        ctx.resolve_field_index_by_class_id(cid, "prevLookupClass")
+            .is_some()
+            || matches!(
+                ctx.get_field_by_name(obj, "prevLookupClass"),
+                Value::Object(_)
+            )
+    };
+    if real_layout {
         ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
         ctx.set_field_by_name(obj, "allowedModes", Value::Int(LK_FULL_POWER));
-    } else {
+        // `cachedProtectionDomain` (real slot 3) is deliberately NOT written.
+        // It is a lazy `volatile ProtectionDomain` cache that
+        // `Lookup.lookupClassProtectionDomain()` fills on first use, so null is
+        // its correct fresh value. The old index write put `Int(0x5F)` into that
+        // REFERENCE slot — an integer the GC would have scanned as an oop.
+    }
+    // Negative half: a named write that silently did not land leaves a Lookup
+    // reporting zero modes. Re-assert on the synthetic indices in that case.
+    let modes_landed =
+        matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == LK_FULL_POWER);
+    if !modes_landed {
         ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
         ctx.set_field(obj, 2, Value::Object(None));
         ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
@@ -1310,6 +1343,111 @@ mod tests {
             captured.as_deref(),
             Some("weld/cdi/BeanManagerImpl"),
             "WithClassData variant must also resolve to the outer nest host"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W6-3 — the REAL-JDK `MethodHandles$Lookup` layout
+    // -----------------------------------------------------------------
+
+    /// `javap -p java.lang.invoke.MethodHandles$Lookup` on JDK 25, instance
+    /// fields in declaration order:
+    ///
+    /// ```text
+    ///   0 lookupClass            (ref)  private final Class<?>
+    ///   1 prevLookupClass        (ref)  private final Class<?>
+    ///   2 allowedModes           (int)  private final int
+    ///   3 cachedProtectionDomain (ref)  private volatile ProtectionDomain
+    /// ```
+    ///
+    /// The synthetic layout disagrees from slot 1 onwards
+    /// (`lookupClass | allowedModes | previousLookupClass | lookupMode`), so
+    /// writing modes BY INDEX type-confused all three: `Int(0x5F)` landed in the
+    /// `prevLookupClass` REFERENCE slot, a null ref landed in `allowedModes` —
+    /// which every JDK access check reads as 0, "no access at all" — and another
+    /// `Int(0x5F)` landed in the `cachedProtectionDomain` reference slot. None of
+    /// the three threw anything; the only symptom was a powerless Lookup.
+    ///
+    /// Declaring the real field names on the mock's class makes the by-name arm
+    /// the one that runs, which is what this asserts.
+    #[test]
+    fn alloc_lookup_for_writes_real_jdk_layout_by_name() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = MockNativeContext::new();
+        let lk_cid = ctx.ensure_class_initialized(LK_CLASS).expect("lookup cid");
+        let fm = |name: &str, descriptor: &str, slot_index: usize| FieldMetadata {
+            name: name.to_string(),
+            descriptor: descriptor.to_string(),
+            access_flags: 0,
+            slot_index,
+            declaring_class_id: lk_cid,
+            is_static: false,
+        };
+        ctx.set_declared_fields(
+            lk_cid,
+            vec![
+                fm("lookupClass", "Ljava/lang/Class;", 0),
+                fm("prevLookupClass", "Ljava/lang/Class;", 1),
+                fm("allowedModes", "I", 2),
+                fm(
+                    "cachedProtectionDomain",
+                    "Ljava/security/ProtectionDomain;",
+                    3,
+                ),
+            ],
+        );
+
+        let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
+        let mirror = ctx.get_class_mirror(host_cid);
+        let lookup = alloc_lookup_for(&mut ctx, mirror);
+
+        assert!(
+            matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
+            "lookupClass is slot 0 in BOTH layouts"
+        );
+        assert_ne!(
+            ctx.get_field(lookup, 1),
+            Value::Int(0x5F),
+            "slot 1 is the `prevLookupClass` REFERENCE — the mode word must not land here"
+        );
+        assert_eq!(
+            ctx.get_field(lookup, 2),
+            Value::Int(0x5F),
+            "allowedModes must be FULL_POWER_MODES (95 — measured on JDK 25 as \
+             `MethodHandles.lookup().lookupModes()`); a null here reads back as 0, \
+             which is `no access at all`"
+        );
+        assert_ne!(
+            ctx.get_field(lookup, 3),
+            Value::Int(0x5F),
+            "cachedProtectionDomain is a lazy volatile REFERENCE cache; it must stay \
+             null rather than receive an integer the GC would scan as an oop"
+        );
+    }
+
+    /// The negative half: with NO real field names declared, the object is a
+    /// fabricated stub (`_f0.._f3`), the by-name lookups all miss, and the
+    /// synthetic indices must still be written — `allowedModes` at slot 1.
+    /// A by-name-only fix would have left this arm powerless.
+    #[test]
+    fn alloc_lookup_for_still_writes_the_synthetic_indices() {
+        let mut ctx = MockNativeContext::new();
+        let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
+        let mirror = ctx.get_class_mirror(host_cid);
+        let lookup = alloc_lookup_for(&mut ctx, mirror);
+        assert!(
+            matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
+            "synthetic slot 0 is lookupClass"
+        );
+        assert_eq!(
+            ctx.get_field(lookup, 1),
+            Value::Int(0x5F),
+            "synthetic slot 1 is allowedModes"
+        );
+        assert_eq!(
+            ctx.get_field(lookup, 2),
+            Value::Object(None),
+            "synthetic slot 2 is previousLookupClass"
         );
     }
 

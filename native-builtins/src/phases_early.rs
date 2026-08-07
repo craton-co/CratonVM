@@ -8028,11 +8028,40 @@ pub(crate) fn fjp_state_get(o: ObjectRef) -> (bool, Value) {
     }
 }
 
-/// Mark the task done with the given result.
+/// Record a raw result against the task and mark it done — i.e. the real
+/// `complete(V)`, which is `setRawResult(v); setDone();` and nothing else.
+///
+/// W6-9: this used to ALSO do `e.thrown = Value::Object(None)`, on the
+/// reasoning that "the task produced a value" and "the task threw" are mutually
+/// exclusive in the real status word. They are not, and the status word is the
+/// proof. Verified against `javap -c java.util.concurrent.ForkJoinTask` on JDK
+/// 25:
+///
+/// ```text
+/// private void setDone() { getAndBitwiseOrStatus(DONE); signalWaiters(); }
+/// ```
+///
+/// `setDone()` is a pure bitwise OR into a write-once status word (`DONE` =
+/// `1<<31`), so it cannot clear `ABNORMAL` (`1<<16`) or `THROWN` (`1<<17`) —
+/// the bits `trySetCancelled` (`|= DONE|ABNORMAL`) and `trySetThrown`
+/// (`|= DONE|ABNORMAL|THROWN`) stamp. So on a real JDK,
+/// `t.completeExceptionally(ex); t.complete(v);` leaves `t` ABNORMAL with `ex`
+/// still readable through `getException()`.
+///
+/// Clearing `thrown` here flipped exactly that task to "completed normally":
+/// `isCompletedAbnormally()` answered `false`, `getException()` answered null,
+/// and `join()`/`get()` handed back `v` instead of raising — a fabricated
+/// success for a task the caller had explicitly failed. Nothing clears `thrown`
+/// any more. The one real API that DOES reset a task's status is
+/// `reinitialize()` (`aux = null; status &= 1<<24`), and this VM registers no
+/// native for it, so no caller here wants the reset.
 ///
 /// A cancelled task stays cancelled and keeps its null result: `cancel()`
-/// already completed it, and the real `ForkJoinTask` likewise ignores a later
-/// `complete()`/`setRawResult()` once the status word is DONE.
+/// already completed it, and the real `setDone()` likewise cannot clear
+/// `CANCELLED` once `trySetCancelled` has stamped it. (The real `setRawResult`
+/// inside `complete` IS still executed for a cancelled task, so this diverges
+/// on a bare `getRawResult()` alone — `join()`/`get()` raise
+/// `CancellationException` either way.)
 pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
     let mut m = fjp_state().lock();
     {
@@ -8040,17 +8069,56 @@ pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
         if !e.cancelled {
             e.done = true;
             e.result = result;
-            // A normal completion clears any recorded throwable: this is the
-            // only path that says "the task produced a value", and the two
-            // states are mutually exclusive in the real `ForkJoinTask` status
-            // word too.
-            e.thrown = Value::Object(None);
         }
     }
     // Best-effort reap: if the table has grown beyond 4096 entries, drop
     // the oldest "done" half. With 1M-element FjpProbe at threshold 1000
     // we expect <2048 live tasks so this is rarely hit; it just bounds
     // memory under pathological recursion.
+    if m.len() > 4096 {
+        let drained: Vec<usize> = m
+            .iter()
+            .filter_map(|(k, v)| if v.done { Some(*k) } else { None })
+            .take(2048)
+            .collect();
+        for k in drained {
+            m.remove(&k);
+        }
+    }
+}
+
+/// `ForkJoinTask.setDone()` — OR `DONE` into the status and touch NOTHING ELSE.
+///
+/// This is deliberately NOT [`fjp_state_set_done`], and the two are not
+/// interchangeable. The real `setDone()` ORs one bit into a write-once status
+/// word: an already-`ABNORMAL` task stays abnormal, and the raw-result slot is
+/// not written (`complete(T)` writes it separately, through `setRawResult`).
+/// `fjp_state_set_done` models the OTHER completion — `complete(V)`, "the task
+/// produced this value" — so it also overwrites `result`.
+///
+/// Calling `fjp_state_set_done(this, Value::Object(None))` from
+/// `quietlyComplete()` would therefore null out a raw result a
+/// `CountedCompleter` had already stashed via `setRawResult` before calling
+/// `tryComplete()` — `java.util.stream.AbstractTask.compute()` is exactly
+/// `setLocalResult(doLeaf()); tryComplete();`, and `tryComplete()` ends in
+/// `quietlyComplete()`.
+///
+/// (W6-9: it would ALSO have erased the abnormal record, because
+/// `fjp_state_set_done` used to clear `thrown`. It no longer does — that was
+/// its own defect, reached through the four `complete(Ljava/lang/Object;)V`
+/// registrations — so the erasure is no longer a reason to prefer this
+/// function. The raw-result clobber still is.)
+///
+/// A cancelled entry is already `done`, so this is a no-op there — matching the
+/// write-once status word that `trySetCancelled` has already stamped.
+pub(crate) fn fjp_state_set_done_preserving_thrown(o: ObjectRef) {
+    let mut m = fjp_state().lock();
+    {
+        let e = m.entry(fjp_key(o)).or_insert_with(FjpEntry::new);
+        e.done = true;
+    }
+    // Same bounded reap as `fjp_state_set_done`: this is a completion path too,
+    // so a `quietlyComplete()`-only workload must not grow the table forever.
     if m.len() > 4096 {
         let drained: Vec<usize> = m
             .iter()
@@ -8570,6 +8638,222 @@ fn fjp_join_void_body(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCal
         outcome?;
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// Shared body of the whole `quietly*` family — drive the task to completion
+/// and SWALLOW its outcome.
+///
+/// The defining property of `quietlyJoin()` / `quietlyInvoke()` is that they
+/// neither hand back a value nor throw: the caller is expected to ask
+/// `isCompletedAbnormally()` / `getException()` afterwards. So the throwable is
+/// still RECORDED — `fjp_compute_and_complete` routes it through
+/// `fjp_state_set_thrown` before this sees it — it is simply not raised here.
+/// "Swallow" means "do not rethrow", NOT "do not record"; discarding it would
+/// make `getException()` answer null for a task that had just blown up, which
+/// is the same class of silent-success bug `fjp_complete_from_outcome` exists
+/// to prevent. An internal VM error is not a task outcome and still propagates.
+///
+/// The done-check reads [`fjp_state_flags`] rather than
+/// [`fjp_state_get_checked`] on purpose: the checked variant raises the
+/// `CancellationException` proxy for a cancelled task, and that proxy is a
+/// `MethodCallFailed::InternalError`, not an `ExceptionThrown` — it would sail
+/// straight through the swallow below and abort the caller. The real
+/// `quietlyJoin()` on a cancelled task returns silently (its `status` is
+/// already negative, so it never even reaches `awaitDone`).
+pub(crate) fn fjp_quietly_body(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let (done, _cancelled) = fjp_state_flags(this);
+    if done {
+        return Ok(());
+    }
+    let (_this, outcome) = fjp_compute_and_complete(ctx, this);
+    match outcome {
+        Ok(_) | Err(MethodCallFailed::ExceptionThrown(_)) => Ok(()),
+        Err(internal) => Err(internal),
+    }
+}
+
+/// Does this receiver keep its raw result in a field of its OWN, rather than in
+/// the `fjp_state` side table?
+///
+/// `ForkJoinTask` / `RecursiveTask` / `RecursiveAction` are modelled entirely in
+/// the side table — their `getRawResult`/`setRawResult` registrations right
+/// below read and write [`FjpEntry::result`] — so for those three the table
+/// write IS the raw-result slot and invoking the virtual would only re-enter
+/// this module. Every OTHER receiver (a user subclass of `ForkJoinTask`,
+/// `java.util.stream.AbstractTask`) declares its own field, and only its own
+/// `setRawResult` can write it.
+///
+/// The `method_exists` half is what makes this safe in synthetic-JDK mode,
+/// where the task classes are fabricated stubs with no `setRawResult` to call:
+/// it answers `false` there and the caller takes the side-table-only path.
+fn fjt_has_own_raw_result_slot(ctx: &mut dyn NativeContext, task: ObjectRef) -> bool {
+    let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(task)) else {
+        return false;
+    };
+    !matches!(
+        cls.as_str(),
+        "java/util/concurrent/ForkJoinTask"
+            | "java/util/concurrent/RecursiveTask"
+            | "java/util/concurrent/RecursiveAction"
+    ) && ctx.method_exists(&cls, "setRawResult", "(Ljava/lang/Object;)V")
+}
+
+/// Shared body of every `complete(Ljava/lang/Object;)V` registration.
+///
+/// Real body (`javap -c java.util.concurrent.ForkJoinTask`, JDK 25):
+///
+/// ```text
+/// public void complete(V v) {
+///     try { setRawResult(v); }
+///     catch (Throwable rex) { trySetException(rex); return; }
+///     setDone();
+/// }
+/// ```
+///
+/// All four registrations used to be a bare `fjp_state_set_done(this, val)`,
+/// which got two things wrong:
+///
+/// * `fjp_state_set_done` cleared `thrown`, so `t.complete(v)` on a task that
+///   had already completed exceptionally ERASED the abnormal record. The real
+///   `setDone()` is a bitwise OR into a write-once status word and cannot clear
+///   `ABNORMAL` — see [`fjp_state_set_done`], which no longer clears it either.
+/// * `setRawResult` is VIRTUAL, and for a receiver that keeps its raw result in
+///   its own field (see [`fjt_has_own_raw_result_slot`]) the side-table write
+///   left that field untouched: a later real `getRawResult()` answered null for
+///   the very value the caller had just handed to `complete()`.
+///
+/// A `setRawResult` that throws is RECORDED as the task's abnormal completion,
+/// exactly like the real `catch (Throwable rex) { trySetException(rex); }`, and
+/// the task is NOT marked normally done. Reporting success there would be the
+/// same fabricated success this family keeps producing.
+fn fjp_complete_body(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    val: Value,
+) -> Result<(), MethodCallFailed> {
+    if !fjt_has_own_raw_result_slot(ctx, this) {
+        fjp_state_set_done(this, val);
+        return Ok(());
+    }
+    // `setRawResult` runs arbitrary bytecode and can allocate, so both the
+    // receiver and the value have to survive it behind pins.
+    let this_pin = ctx.pin_native_root(this);
+    let val_pin = pinned_object_value(ctx, val);
+    let outcome = ctx.invoke_virtual(this, "setRawResult", "(Ljava/lang/Object;)V", &[val]);
+    let live_this = ctx.read_native_pin(this_pin, this);
+    let live_val = read_pinned_object_value(ctx, val_pin, val);
+    // Complete while the pins are still held and before any further
+    // allocation, the same ordering `fjp_compute_and_complete` relies on.
+    let recorded = match outcome {
+        Ok(_) => {
+            fjp_state_set_done(live_this, live_val);
+            Ok(())
+        }
+        Err(MethodCallFailed::ExceptionThrown(exc)) => {
+            fjp_state_set_thrown(live_this, exc);
+            Ok(())
+        }
+        // A VM-level failure is not something the task "completed with".
+        Err(internal) => Err(internal),
+    };
+    ctx.unpin_native_roots(this_pin);
+    recorded
+}
+
+/// `ex instanceof RuntimeException || ex instanceof Error` — the test the real
+/// `completeExceptionally` uses to decide whether to wrap.
+///
+/// Walks the superclass chain by NAME rather than using
+/// `is_subclass(ClassId, ClassId)`, because that needs both reference classes
+/// loaded and loading one from inside a completion path would allocate. The
+/// walk stops at `Exception`/`Throwable`/`Object` — anything reaching those
+/// without passing `RuntimeException`/`Error` is checked — and is hop-bounded
+/// so a malformed hierarchy cannot spin.
+fn fjt_is_unchecked_throwable(ctx: &mut dyn NativeContext, ex: ObjectRef) -> bool {
+    let mut cur = Some(ctx.class_id_of_object(ex));
+    for _ in 0..64 {
+        let Some(cid) = cur else { return false };
+        match ctx.class_name_of_id(cid).as_deref() {
+            Some("java/lang/RuntimeException") | Some("java/lang/Error") => return true,
+            Some("java/lang/Exception") | Some("java/lang/Throwable") | Some("java/lang/Object") => {
+                return false
+            }
+            _ => {}
+        }
+        cur = ctx.superclass_of(cid);
+    }
+    false
+}
+
+/// Shared body of every `completeExceptionally(Ljava/lang/Throwable;)V`
+/// registration.
+///
+/// Real body (`javap -c java.util.concurrent.ForkJoinTask`, JDK 25):
+///
+/// ```text
+/// public void completeExceptionally(Throwable ex) {
+///     trySetException((ex instanceof RuntimeException) || (ex instanceof Error)
+///                     ? ex : new RuntimeException(ex));
+/// }
+/// ```
+///
+/// W6-9: this was registered NOWHERE and named in NEITHER allow-list, so in
+/// real-JDK mode it ran real bytecode — `trySetThrown` CASes the real
+/// `aux`/`status` fields, which nothing in this VM ever reads, because every
+/// completion this model publishes lives in the `fjp_state` side table. A task
+/// the caller had explicitly failed therefore stayed `done == false`, and the
+/// next `join()`/`get()` RAN ITS BODY and handed back a value, with
+/// `isCompletedAbnormally()` answering `false` and `getException()` answering
+/// null. That is the fabricated success the `complete()` fix above is measured
+/// against, and without this registration the measurement cannot be taken.
+///
+/// The done-check is `trySetThrown`'s own `status >= 0` guard: the real status
+/// word is write-once and the FIRST completion wins, so this is a no-op on an
+/// already-complete task.
+fn fjp_complete_exceptionally_body(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    ex: Value,
+) -> Result<(), MethodCallFailed> {
+    let (done, _cancelled) = fjp_state_flags(this);
+    if done {
+        return Ok(());
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let ex_pin = pinned_object_value(ctx, ex);
+    let unchecked = match ex {
+        Value::Object(Some(t)) => fjt_is_unchecked_throwable(ctx, t),
+        // The real `null instanceof RuntimeException` is false, so a null cause
+        // is wrapped rather than passed through.
+        _ => false,
+    };
+    let recorded = if unchecked {
+        read_pinned_object_value(ctx, ex_pin, ex)
+    } else {
+        let cause = read_pinned_object_value(ctx, ex_pin, ex);
+        match ctx.new_object_initialized(
+            "java/lang/RuntimeException",
+            "(Ljava/lang/Throwable;)V",
+            &[cause],
+        ) {
+            Ok(Some(wrapped @ Value::Object(Some(_)))) => wrapped,
+            // Constructor unavailable: the bare throwable still RECORDS the
+            // failure, which beats recording nothing — the same degrade
+            // `fjp_execution_exception` takes. (For a null `ex` there is then
+            // nothing to record at all and the task stays incomplete; that is
+            // the one input this cannot model without the wrapper class.)
+            _ => read_pinned_object_value(ctx, ex_pin, ex),
+        }
+    };
+    let live_this = ctx.read_native_pin(this_pin, this);
+    if let Value::Object(Some(t)) = recorded {
+        fjp_state_set_thrown(live_this, t);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(())
 }
 
 /// Run one `Callable.call()` inline and complete a fresh task key with the
@@ -9108,12 +9392,29 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
     });
-    r.register(fjt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
+    r.register(fjt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
-        fjp_state_set_done(this, val);
+        fjp_complete_body(ctx, this, val)?;
         Ok(Some(Value::Object(None)))
     });
+    // W6-9: `completeExceptionally(Throwable)` — see
+    // `fjp_complete_exceptionally_body` for why leaving it unregistered is a
+    // silent success rather than a hang. Registered on `ForkJoinTask`,
+    // `RecursiveTask` and `RecursiveAction` (the three classes both allow-lists
+    // name), same as the real-JDK boot path in
+    // `register_real_jdk_forkjoin_essentials`.
+    r.register(
+        fjt,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ex = args.get(1).copied().unwrap_or(Value::Object(None));
+            fjp_complete_exceptionally_body(ctx, this, ex)?;
+            Ok(None)
+        },
+    );
 
     // RecursiveTask — done+result tracked in `fjp_state` side-table.
     // WP4.3 fix: switched off field-index access (broken in real-JDK mode).
@@ -9172,12 +9473,23 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
     });
-    r.register(rt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
+    r.register(rt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
-        fjp_state_set_done(this, val);
+        fjp_complete_body(ctx, this, val)?;
         Ok(Some(Value::Object(None)))
     });
+    r.register(
+        rt,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ex = args.get(1).copied().unwrap_or(Value::Object(None));
+            fjp_complete_exceptionally_body(ctx, this, ex)?;
+            Ok(None)
+        },
+    );
 
     // RecursiveAction — done tracked in `fjp_state` side-table; result
     // always Value::Object(None) since compute() returns void.
@@ -9224,6 +9536,17 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     r.register(ra, "getRawResult", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
+    r.register(
+        ra,
+        "completeExceptionally",
+        "(Ljava/lang/Throwable;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ex = args.get(1).copied().unwrap_or(Value::Object(None));
+            fjp_complete_exceptionally_body(ctx, this, ex)?;
+            Ok(None)
+        },
+    );
     r.set_category(__prev_cat);
 }
 
@@ -9443,6 +9766,28 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
                 }))
             },
         );
+        // W6-9: `completeExceptionally(Throwable)` — the WRITER for the record
+        // `getException()` above reads. It was registered nowhere and named in
+        // neither allow-list, so real bytecode CASed the real `aux`/`status`
+        // fields that nothing here reads: the task stayed `done == false`, the
+        // next `join()` ran its body, and the trio `getException()` /
+        // `isCompletedAbnormally()` / `isCompletedNormally()` all reported a
+        // clean task the caller had explicitly failed. See
+        // `fjp_complete_exceptionally_body`. Must stay in step with
+        // `keep_real_forkjointask_bridge` (native-api/src/registry.rs) and
+        // `is_forkjoin_native_override`
+        // (vm/src/runtime/interpreter/native_override.rs), entry for entry.
+        r.register(
+            task_class,
+            "completeExceptionally",
+            "(Ljava/lang/Throwable;)V",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                let ex = args.get(1).copied().unwrap_or(Value::Object(None));
+                fjp_complete_exceptionally_body(ctx, this, ex)?;
+                Ok(None)
+            },
+        );
     }
 
     // `awaitQuiescence` must observe the FutureTask roots created by the
@@ -9578,10 +9923,10 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
     });
-    r.register(fjt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
+    r.register(fjt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
-        fjp_state_set_done(this, val);
+        fjp_complete_body(ctx, this, val)?;
         Ok(Some(Value::Object(None)))
     });
 
@@ -9646,10 +9991,10 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
     });
-    r.register(rt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
+    r.register(rt, "complete", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
-        fjp_state_set_done(this, val);
+        fjp_complete_body(ctx, this, val)?;
         Ok(Some(Value::Object(None)))
     });
 

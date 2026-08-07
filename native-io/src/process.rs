@@ -2270,23 +2270,51 @@ fn os_process_start_time(_pid: i64) -> Option<i64> {
     None
 }
 
-/// Cumulative kernel+user CPU time of `pid`, in nanoseconds — the unit
-/// `ProcessHandle.Info.totalCpuDuration()` reads back through
-/// `Duration.ofNanos`.
+/// The start time to stamp into an `Info` record, together with that process's
+/// cumulative kernel+user CPU time in nanoseconds (`Info.totalTime`, which
+/// `Info.totalCpuDuration()` reads back through `Duration.ofNanos`) — from ONE
+/// OS probe.
 ///
-/// Only the Windows arm reports a value: it comes free from the same
-/// `GetProcessTimes` call the start time already needs. The Linux arm would
-/// need a second parse of `/proc/<pid>/stat` (fields 14/15) and is left at
-/// `None` — `Info.totalTime` then keeps its `-1` constructor default, which is
-/// the JDK's own "unknown" sentinel and renders as `Optional.empty()`.
+/// Only the Windows arm reports a CPU time: it comes free from the same
+/// `GetProcessTimes` the start time already needs. The Linux arm would need a
+/// second parse of `/proc/<pid>/stat` (fields 14/15) and is left at `None` —
+/// `Info.totalTime` then keeps its `-1` constructor default, which is the JDK's
+/// own "unknown" sentinel and renders as `Optional.empty()`.
+///
+/// **Why the two are fetched together.** `info0` used to ask
+/// `start_time_or_any(pid)` and then a separate `os_process_cpu_nanos(pid)`,
+/// and on Windows both bottom out in [`win_process_times`] — so a single
+/// `ProcessHandle.info()` opened the same process TWICE, ran `GetProcessTimes`
+/// twice, and read a different half of the same struct each time. That is a
+/// wasted `OpenProcess`/`CloseHandle` pair per call, and worse, it re-opened
+/// the defect [`win_process_times`]'s own contract exists to close: with two
+/// opens the start time and the CPU total no longer provably describe the same
+/// process instance, because a pid can be recycled between them.
+///
+/// **The start time is the same number `start_time_or_any` answers, by
+/// construction.** The Windows arm here is `os_process_start_time`'s body plus
+/// `start_time_or_any`'s `STARTTIME_ANY` fallback, inlined; the non-Windows arm
+/// calls `start_time_or_any` outright. That identity is load-bearing:
+/// `ProcessHandleImpl$Info.info(pid, startTime)` wipes `command`, `arguments`,
+/// `startTime`, `totalTime` and `user` off the record unless `startTime ==
+/// info.startTime` — a bare `!=` with no `STARTTIME_ANY` wildcarding — and
+/// `isAlive0` and `current_process_start_time` both source their number from
+/// `start_time_or_any`. All three must stay one function's answer.
 #[cfg(windows)]
-fn os_process_cpu_nanos(pid: i64) -> Option<i64> {
-    win_process_times(pid).map(|(_, cpu_nanos)| cpu_nanos)
+fn start_time_and_cpu(pid: i64) -> (i64, Option<i64>) {
+    match win_process_times(pid) {
+        Some((start_ms, cpu_nanos)) => (start_ms, Some(cpu_nanos)),
+        None => (PROCESS_STARTTIME_ANY, None),
+    }
 }
 
+/// No platform outside Windows has a CPU-time probe wired up here, so
+/// `Info.totalTime` keeps its `-1` constructor default. The start time still
+/// comes from `start_time_or_any`, the one source `isAlive0`, `info0` and
+/// `current_process_start_time` all share.
 #[cfg(not(windows))]
-fn os_process_cpu_nanos(_pid: i64) -> Option<i64> {
-    None
+fn start_time_and_cpu(pid: i64) -> (i64, Option<i64>) {
+    (start_time_or_any(pid), None)
 }
 
 /// The full path of the executable image backing `pid`.
@@ -3217,25 +3245,78 @@ fn direct_child_pids(pid: i64) -> Vec<i64> {
     children
 }
 
-/// Direct child pids of `pid` — Win32. Derived from the same Toolhelp snapshot
-/// [`os_list_processes`] reads, so `Process.descendants()` and
-/// `ProcessHandle.descendants()` cannot report different trees.
-#[cfg(windows)]
-fn direct_child_pids(pid: i64) -> Vec<i64> {
-    if pid <= 0 {
-        return Vec::new();
-    }
-    os_list_processes(pid).into_iter().map(|(p, _)| p).collect()
-}
-
 #[cfg(not(any(target_os = "linux", windows)))]
 fn direct_child_pids(_pid: i64) -> Vec<i64> {
     Vec::new()
 }
 
 /// Every live descendant (children, grandchildren, ...) of `pid`, in
+/// breadth-first discovery order — Win32.
+///
+/// **One machine-wide snapshot for the whole walk.** The Win32 primitive here
+/// is `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)`, which enumerates ALL `N`
+/// processes on the machine and hands back `th32ParentProcessID` for each — the
+/// entire parent/child topology, in one call. The previous shape asked for that
+/// whole snapshot once per node of the walk: `direct_child_pids(cur)` ->
+/// `os_list_processes(cur)` -> `os_snapshot_processes()`, filtered down to the
+/// one parent it cared about and threw the other `N - k` rows away. A tree with
+/// `D` descendants therefore cost `1 + D` machine-wide snapshots — `O(N * D)`
+/// work, and `1 + D` kernel snapshot allocations — for an answer the FIRST
+/// snapshot already contained in full.
+///
+/// Indexing that one snapshot by parent pid makes the walk `O(N + D)` and costs
+/// exactly ONE snapshot no matter how deep the tree is. Nothing about the
+/// answer changes: `by_parent[cur]` holds precisely the rows
+/// `os_list_processes(cur)` selected (`ppid == cur`), in the same snapshot
+/// order, so the breadth-first sequence this returns is identical to the one
+/// the per-node version produced.
+///
+/// It is still derived from [`os_snapshot_processes`], the single source
+/// `os_parent_pid` and `os_list_processes` also read, so `Process.descendants()`
+/// and `ProcessHandle.descendants()` cannot report different trees.
+///
+/// Linux is deliberately NOT restructured this way: its per-node probe is
+/// `/proc/<pid>/task/*/children`, a direct read of the node being expanded
+/// rather than a machine-wide scan, so there is no re-enumeration to hoist.
+#[cfg(windows)]
+fn collect_descendant_pids(pid: i64) -> Vec<i64> {
+    let mut result = Vec::new();
+    if pid <= 0 {
+        return result;
+    }
+    // The one snapshot, turned into parent -> children before the walk starts.
+    // `os_snapshot_processes` only emits rows with `pid > 0`, so every value
+    // reachable through this map already satisfies `direct_child_pids`' old
+    // `pid <= 0` guard.
+    let mut by_parent: std::collections::HashMap<i64, Vec<i64>> =
+        std::collections::HashMap::new();
+    for (child, parent) in os_snapshot_processes() {
+        by_parent.entry(parent).or_default().push(child);
+    }
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(pid);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(pid);
+    while let Some(cur) = queue.pop_front() {
+        // A pid with no row is a leaf; `continue` is the empty-vec case the
+        // per-node version reached by way of an empty `os_list_processes`.
+        let Some(children) = by_parent.get(&cur) else {
+            continue;
+        };
+        for child in children {
+            if seen.insert(*child) {
+                result.push(*child);
+                queue.push_back(*child);
+            }
+        }
+    }
+    result
+}
+
+/// Every live descendant (children, grandchildren, ...) of `pid`, in
 /// breadth-first discovery order — the same "descendants" contract as
 /// java.lang.Process.descendants()/ProcessHandle.descendants().
+#[cfg(not(windows))]
 fn collect_descendant_pids(pid: i64) -> Vec<i64> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -4012,8 +4093,15 @@ fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
     // Every OS read happens before the first allocation, so no `ctx` call sits
     // between a probe and the write of what it produced.
-    let start_time = start_time_or_any(pid);
-    let cpu_nanos = os_process_cpu_nanos(pid);
+    // ONE probe for both: on Windows these are the two halves of a single
+    // `GetProcessTimes`, and asking twice cost a second `OpenProcess` for a
+    // struct we had already read. `start_time_and_cpu`'s first element is
+    // `start_time_or_any(pid)` by construction, so the number written to
+    // `startTime` below is still the number `isAlive0` returns and the number
+    // `current_process_start_time` stamps on `ProcessHandle.current()` — which
+    // is what stops `Info.info(pid, startTime)`'s bare `!=` from wiping the
+    // record.
+    let (start_time, cpu_nanos) = start_time_and_cpu(pid);
     let cmdline = os_process_cmdline(pid);
     // Only consulted when there is no `/proc`-style command line to prefer.
     let image_name = if cmdline.is_none() {

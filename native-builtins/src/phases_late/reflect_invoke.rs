@@ -167,8 +167,54 @@ pub(crate) const VH_KIND_BYTE_ARRAY_VIEW_LE: i32 = 4;
 
 pub(crate) const VH_KIND_BYTE_ARRAY_VIEW_BE: i32 = 5;
 
-/// Resolve the field index for a named field in a class (instance fields only).
-/// Walks the inheritance chain. Returns `None` if not found.
+// --- W6-1: the two describe-yourself slots -------------------------------
+//
+// `VarHandle.varType()` and `VarHandle.coordinateTypes()` are CONCRETE JDK
+// bytecode that reads `this.vform` (slot 0 of the real class) and walks a
+// `VarForm`/`MethodType` chain CratonVM never populates — on a CratonVM
+// handle slot 0 holds an `Int` ClassId, so the real body cannot run at all.
+// Answering them needs the two `Class` mirrors the factory was handed, and
+// nothing in the 3-slot layout above records a `Class` at all.
+//
+// They are stored at 4 and 5, PAST the real `java.lang.invoke.VarHandle`
+// layout, which declares exactly four instance fields in JDK 25 (`vform`,
+// `exact`, `methodTypeTable`, `methodHandleTable` — `javap -p`). So unlike
+// slots 0-2, these two alias no real-JDK field: `alloc_concurrent_synthetic`
+// sizes the object `num_fields.max(class_num_total_fields)`, and asking for
+// `VH_META_NUM_FIELDS` grows it from 4 to 6 without moving anything.
+//
+// Every read is guarded by `object_num_fields(vh) > VH_COORD0` AND by slot
+// `VH_VAR_TYPE` actually holding an object, so a VarHandle minted by a
+// factory that does NOT stamp them (`phases_late/foreign_ffm.rs`'s
+// memory-segment handles, which are not this lane's files, and the legacy
+// sub-`VH_NUM_FIELDS` array convention) reads as "no metadata" and the
+// accessors REFUSE rather than invent a plausible `Class`.
+
+/// Slot 4: the `Class` mirror of the variable the handle accesses — exactly
+/// the object `varType()` must return. Stamped by the factories below.
+pub(crate) const VH_VAR_TYPE: usize = 4;
+
+/// Slot 5: the `Class` mirror of the handle's LEADING coordinate — the
+/// receiver class for an instance-field handle, the array class for an
+/// array-element handle, and `null` for a static-field handle (which has no
+/// coordinates at all). Trailing coordinates are implied by the kind tag and
+/// are rebuilt in [`vh_coordinate_mirrors`] rather than stored.
+pub(crate) const VH_COORD0: usize = 5;
+
+/// Allocation size for a VarHandle that carries the describe-yourself slots.
+pub(crate) const VH_META_NUM_FIELDS: usize = 6;
+
+/// Resolve `(declaring class, ABSOLUTE heap slot)` for a named instance field,
+/// walking the inheritance chain. Returns `None` if not found.
+///
+/// The index is [`FieldMetadata::slot_index`], which the VM documents as the
+/// absolute heap field index and computes as `first_field_index + n`th
+/// instance field — i.e. exactly what `get_field`/`set_field` take. This used
+/// to return the `enumerate()` position over `declared_fields`, which counts
+/// STATIC fields too and ignores inherited ones, so it was only accidentally
+/// correct for a class that declares no statics before the field and inherits
+/// none (`RJdkHandles$Holder.i/l/s` are such fields; `Holder.arr`, declared
+/// after `static int stat`, was not).
 pub(crate) fn vh_find_instance_field(
     ctx: &dyn NativeContext,
     class_id: ClassId,
@@ -176,15 +222,69 @@ pub(crate) fn vh_find_instance_field(
 ) -> Option<(ClassId, usize)> {
     let mut current = class_id;
     loop {
-        let fields = ctx.declared_fields(current);
-        for (i, f) in fields.iter().enumerate() {
-            if f.name == name {
-                // Field index is a class-local index; we need the total offset.
-                // Use declared_fields count in supers to compute absolute offset.
-                return Some((current, i));
+        for f in ctx.declared_fields(current) {
+            if f.name == name && !f.is_static {
+                return Some((current, f.slot_index));
             }
         }
         current = ctx.superclass_of(current)?;
+    }
+}
+
+/// The JVM field descriptor of a named instance field, walking the chain.
+/// `None` when no such instance field exists.
+pub(crate) fn vh_instance_field_descriptor(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<String> {
+    let mut current = class_id;
+    loop {
+        for f in ctx.declared_fields(current) {
+            if f.name == name && !f.is_static {
+                return Some(f.descriptor);
+            }
+        }
+        current = ctx.superclass_of(current)?;
+    }
+}
+
+/// `(static-block index, descriptor)` of a named static field.
+///
+/// The index is [`FieldMetadata::slot_index`], which for a static field is
+/// its position among the class's STATIC fields only — the indexing
+/// `get_static_field`/`set_static_field` document and `static_field_index_by_name`
+/// computes. A position over all declared fields (statics *and* instances)
+/// is a different number the moment the class declares any instance field
+/// first, which is the ordinary case.
+pub(crate) fn vh_find_static_field(
+    ctx: &dyn NativeContext,
+    class_id: ClassId,
+    name: &str,
+) -> Option<(usize, String)> {
+    ctx.declared_fields(class_id)
+        .into_iter()
+        .find(|f| f.is_static && f.name == name)
+        .map(|f| (f.slot_index, f.descriptor))
+}
+
+/// Can the VM enumerate any fields for this class (or a superclass)?
+///
+/// This is the guard that separates "the field genuinely does not exist", where
+/// `findVarHandle` MUST raise `NoSuchFieldException` exactly as the JDK does,
+/// from "we cannot see this class's fields at all" (an unresolved mirror, a
+/// mock `NativeContext` in a unit test), where raising would turn a modelling
+/// gap into a spurious failure. Only the first case throws.
+pub(crate) fn vh_class_fields_visible(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
+    let mut current = class_id;
+    loop {
+        if !ctx.declared_fields(current).is_empty() {
+            return true;
+        }
+        match ctx.superclass_of(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => return false,
+        }
     }
 }
 
@@ -353,6 +453,40 @@ pub(crate) fn vh_array_target(args: &[Value]) -> Option<(ObjectRef, usize)> {
         _ => return None,
     };
     Some((arr, idx))
+}
+
+/// Bounds-check an array-element VarHandle access BEFORE it happens.
+///
+/// `NativeContext::get_array_element` fails **safe**: an out-of-range index
+/// reads back `Int(0)`, and `set_array_element` drops the write. So
+/// `MethodHandles.arrayElementVarHandle(int[].class).get(arr, 7)` on a
+/// three-element array answered `0` — a value indistinguishable from a real
+/// element — where the JDK raises `ArrayIndexOutOfBoundsException` (a
+/// VarHandle array accessor bounds-checks exactly as `iaload` does). That is
+/// the fabricated-success shape: the access "succeeds" and the caller has no
+/// way to tell it read past the end.
+///
+/// A negative index arrives here as a very large `usize` (`vh_array_target`
+/// casts) and is caught by the same comparison; the message reports the index
+/// the caller actually passed, not the cast one.
+fn vh_array_bounds_check(ctx: &dyn NativeContext, args: &[Value]) -> Result<(), MethodCallFailed> {
+    let Some((arr, idx)) = vh_array_target(args) else {
+        return Ok(());
+    };
+    let len = ctx.array_length(arr);
+    if idx >= len {
+        let reported = match args.get(2) {
+            Some(Value::Int(i)) => *i,
+            Some(Value::Long(i)) => *i as i32,
+            _ => idx as i32,
+        };
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: reported,
+            message: Some(format!("Index {reported} out of bounds for length {len}")),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Read element from an array-kind VarHandle call: `args = [vh, array, idx]`.
@@ -685,6 +819,169 @@ pub(crate) fn vh_auto_box(ctx: &mut dyn NativeContext, val: Value) -> Value {
     }
 }
 
+// =============================================================================
+// W6-1: `VarHandle.varType()` / `VarHandle.coordinateTypes()`
+// =============================================================================
+
+/// Stamp the describe-yourself slots on a freshly minted VarHandle.
+///
+/// `coord0` is `None` for a static-field handle, which the JDK specifies as
+/// having zero coordinates.
+fn vh_stamp_meta(
+    ctx: &mut dyn NativeContext,
+    vh_obj: ObjectRef,
+    var_type: Option<ObjectRef>,
+    coord0: Option<ObjectRef>,
+) {
+    if ctx.object_num_fields(vh_obj) <= VH_COORD0 {
+        return;
+    }
+    ctx.set_field(vh_obj, VH_VAR_TYPE, Value::Object(var_type));
+    ctx.set_field(vh_obj, VH_COORD0, Value::Object(coord0));
+}
+
+/// Read one describe-yourself slot. `None` means "this handle carries no
+/// metadata" — never "the answer is null".
+fn vh_meta_mirror(ctx: &dyn NativeContext, vh: ObjectRef, slot: usize) -> Option<ObjectRef> {
+    if ctx.object_num_fields(vh) <= VH_COORD0 {
+        return None;
+    }
+    match ctx.get_field(vh, slot) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// `varType()`'s answer, or `None` when this handle was not stamped.
+///
+/// Presence is keyed on `VH_VAR_TYPE` alone: every stamping factory writes a
+/// non-null `Class` there, and no handle has a null variable type, so a null
+/// slot is unambiguously "unstamped".
+fn vh_var_type_mirror(ctx: &dyn NativeContext, vh: ObjectRef) -> Option<ObjectRef> {
+    vh_meta_mirror(ctx, vh, VH_VAR_TYPE)
+}
+
+/// `coordinateTypes()`'s answer as a mirror list, or `None` when this handle
+/// was not stamped.
+///
+/// The leading coordinate is stored; the trailing ones follow from the kind
+/// tag and are rebuilt here:
+///
+/// | kind | coordinates |
+/// | --- | --- |
+/// | instance field (0) | `{receiverClass}` |
+/// | static field (1) | `{}` |
+/// | array element (`VH_KIND_ARRAY`) | `{arrayClass, int}` |
+/// | byte-array view (`..._LE`/`..._BE`) | `{byte[], int}` |
+///
+/// `VH_KIND_MEMORY_SEGMENT` is deliberately absent: those handles are minted
+/// in `phases_late/foreign_ffm.rs` with three slots and no metadata, so they
+/// fall out through the unstamped path and the accessor refuses.
+fn vh_coordinate_mirrors(ctx: &mut dyn NativeContext, vh: ObjectRef) -> Option<Vec<ObjectRef>> {
+    // Unstamped handles have no answer at all — including the static case,
+    // whose empty list must not be confused with "we know nothing".
+    vh_var_type_mirror(ctx, vh)?;
+    let kind = vh_kind(ctx, vh);
+    let coord0 = vh_meta_mirror(ctx, vh, VH_COORD0);
+    match kind {
+        VH_KIND_ARRAY | VH_KIND_BYTE_ARRAY_VIEW_LE | VH_KIND_BYTE_ARRAY_VIEW_BE => {
+            let arr = coord0?;
+            let idx = ctx.primitive_class_mirror("int");
+            Some(vec![arr, idx])
+        }
+        // Static field: zero coordinates, and that is the ANSWER, not a gap.
+        1 => Some(Vec::new()),
+        // Instance field.
+        0 => Some(vec![coord0?]),
+        _ => None,
+    }
+}
+
+/// Build the `List<Class<?>>` `coordinateTypes()` returns.
+///
+/// `List.of(Object[])` is the JDK-owned immutable-list construction, so the
+/// result `equals` the `List.of(...)` a caller compares against (the wave-2
+/// corpus asserts exactly that). `Arrays.asList` is the synthetic-JDK
+/// fallback, matching `lang_system.rs`'s `boxed_int_list`.
+///
+/// Every mirror is pinned across the allocations: `new_ref_array` and the
+/// `List.of` invocation can both collect, and a raw `ObjectRef` held over a
+/// collection is stale.
+fn vh_class_list(ctx: &mut dyn NativeContext, mirrors: &[ObjectRef]) -> Option<Value> {
+    let object_cid = ctx.class_id_by_name("java/lang/Object")?;
+    let mut pins: Vec<usize> = Vec::with_capacity(mirrors.len());
+    let mut base: Option<usize> = None;
+    for m in mirrors {
+        let h = ctx.pin_native_root(*m);
+        if base.is_none() {
+            base = Some(h);
+        }
+        pins.push(h);
+    }
+    let array = ctx.new_ref_array(object_cid, mirrors.len());
+    let array_pin = ctx.pin_native_root(array);
+    if base.is_none() {
+        base = Some(array_pin);
+    }
+    let mut array = array;
+    for (i, (m, h)) in mirrors.iter().zip(pins.iter()).enumerate() {
+        let m = ctx.read_native_pin(*h, *m);
+        array = ctx.read_native_pin(array_pin, array);
+        ctx.set_array_element(array, i, Value::Object(Some(m)));
+    }
+    array = ctx.read_native_pin(array_pin, array);
+    let list = ctx
+        .invoke(
+            "java/util/List",
+            "of",
+            "([Ljava/lang/Object;)Ljava/util/List;",
+            &[Value::Object(Some(array))],
+        )
+        .ok()
+        .flatten();
+    let list = match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => {
+            let array = ctx.read_native_pin(array_pin, array);
+            ctx.invoke(
+                "java/util/Arrays",
+                "asList",
+                "([Ljava/lang/Object;)Ljava/util/List;",
+                &[Value::Object(Some(array))],
+            )
+            .ok()
+            .flatten()
+        }
+    };
+    if let Some(b) = base {
+        ctx.unpin_native_roots(b);
+    }
+    match list {
+        Some(Value::Object(Some(_))) => list,
+        _ => None,
+    }
+}
+
+/// The refusal both accessors raise when the receiver carries no metadata.
+///
+/// There is no JDK failure mode for `varType()`/`coordinateTypes()` — every
+/// real VarHandle can answer — so any exception here is a CratonVM deviation.
+/// It is still the right one: the alternative is inventing a `Class`, and a
+/// fabricated variable type is exactly the "plausible value where the VM does
+/// not know" shape this corpus exists to find. `UnsupportedOperationException`
+/// is catchable, names the receiver's kind, and cannot be mistaken for a real
+/// answer.
+fn vh_undescribable(what: &str, kind: i32) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "VarHandle.{what}: this CratonVM VarHandle carries no variable/coordinate type \
+             metadata (kind {kind}); it was minted by a factory that does not stamp it, so \
+             the answer is unknown rather than absent"
+        ),
+    }
+    .into()
+}
+
 pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -706,6 +1003,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(Some(vh_byte_array_view_get(ctx, this, args)));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             return Ok(Some(vh_array_get(ctx, args)));
         }
         let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
@@ -739,6 +1037,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(Some(vh_byte_array_view_get(ctx, this, args)));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             fence(Ordering::SeqCst);
             return Ok(Some(vh_array_get(ctx, args)));
         }
@@ -776,6 +1075,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(Some(v));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             let v = vh_array_get(ctx, args);
             fence(Ordering::Acquire);
             return Ok(Some(v));
@@ -845,6 +1145,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(None);
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             vh_array_set(ctx, args, 3);
             return Ok(None);
         }
@@ -884,6 +1185,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(None);
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             vh_array_set(ctx, args, 3);
             fence(Ordering::SeqCst);
             return Ok(None);
@@ -925,6 +1227,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(None);
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             fence(Ordering::Release);
             vh_array_set(ctx, args, 3);
             return Ok(None);
@@ -993,6 +1296,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(if success { 1 } else { 0 })));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             // args = [vh, array, idx, expected, new_val]
             let (arr, idx) = match vh_array_target(args) {
                 Some(p) => p,
@@ -1098,6 +1402,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(Some(current));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             let (arr, idx) = match vh_array_target(args) {
                 Some(p) => p,
                 None => return Ok(Some(Value::Object(None))),
@@ -1165,6 +1470,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             return Ok(Some(old));
         }
         if vh_kind(ctx, this) == VH_KIND_ARRAY {
+            vh_array_bounds_check(ctx, args)?;
             let (arr, idx) = match vh_array_target(args) {
                 Some(p) => p,
                 None => return Ok(Some(Value::Object(None))),
@@ -1293,14 +1599,48 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         mhs,
         "arrayElementVarHandle",
         "(Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
-        |ctx, _args| {
+        |ctx, args| {
+            // args[0] = the array Class mirror (a static factory: no receiver).
+            // `varType()` is the COMPONENT type and the coordinates are
+            // `{arrayClass, int}`; resolve both before allocating, and pin the
+            // caller's mirror across the allocation.
+            let arr_mirror = match args.first() {
+                Some(Value::Object(Some(m))) => Some(*m),
+                _ => None,
+            };
+            let comp_desc = arr_mirror
+                .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
+                .and_then(|name| name.strip_prefix('[').map(str::to_string));
+            let comp_mirror = comp_desc
+                .as_deref()
+                .map(|d| crate::lang_class::descriptor_to_class_mirror(ctx, d));
+            let pin = arr_mirror.map(|m| ctx.pin_native_root(m));
+            let comp_pin = comp_mirror.map(|m| ctx.pin_native_root(m));
             let vh_obj =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS);
             ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Object(None));
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(0));
             // Mark this VarHandle as array-element kind so the get/set/cas
             // implementations interpret args[1]=array, args[2]=index.
             ctx.set_field(vh_obj, VH_IS_STATIC, Value::Int(VH_KIND_ARRAY));
+            let arr_mirror = match (arr_mirror, pin) {
+                (Some(m), Some(h)) => Some(ctx.read_native_pin(h, m)),
+                _ => None,
+            };
+            let comp_mirror = match (comp_mirror, comp_pin) {
+                (Some(m), Some(h)) => Some(ctx.read_native_pin(h, m)),
+                _ => None,
+            };
+            // Only stamp when BOTH are known: a half-known handle would make
+            // `coordinateTypes()` answer `{arrayClass}` — a plausible-looking
+            // one-element list that is simply wrong.
+            if let (Some(comp), Some(arr)) = (comp_mirror, arr_mirror) {
+                vh_stamp_meta(ctx, vh_obj, Some(comp), Some(arr));
+            }
+            // `pin` was taken first, so releasing it releases `comp_pin` too.
+            if let Some(h) = pin.or(comp_pin) {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(vh_obj))))
         },
     );
@@ -1311,8 +1651,15 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let elem = vh_byte_array_view_elem_from_mirror(ctx, args.get(0));
             let le = vh_byte_order_is_little(ctx, args.get(1));
+            // The viewed element type and the fixed `{byte[], int}` coordinates
+            // (JDK: `byteArrayViewVarHandle` handles are `(byte[], int)T`).
+            let elem_desc = (elem as char).to_string();
+            let var_type = crate::lang_class::descriptor_to_class_mirror(ctx, &elem_desc);
+            let coord0 = crate::lang_class::descriptor_to_class_mirror(ctx, "[B");
+            let vt_pin = ctx.pin_native_root(var_type);
+            let c0_pin = ctx.pin_native_root(coord0);
             let vh_obj =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS);
             ctx.set_field(vh_obj, VH_CLASS_OR_TARGET, Value::Int(elem as i32));
             ctx.set_field(
                 vh_obj,
@@ -1328,6 +1675,10 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
                     VH_KIND_BYTE_ARRAY_VIEW_BE
                 }),
             );
+            let var_type = ctx.read_native_pin(vt_pin, var_type);
+            let coord0 = ctx.read_native_pin(c0_pin, coord0);
+            vh_stamp_meta(ctx, vh_obj, Some(var_type), Some(coord0));
+            ctx.unpin_native_roots(vt_pin);
             Ok(Some(Value::Object(Some(vh_obj))))
         },
     );
@@ -1339,20 +1690,69 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         "findVarHandle",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         |ctx, args| {
-            let vh_obj =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
-            // args[1] = class mirror (JClass), args[2] = field name String, args[3] = field type
+            // args[0] = the Lookup, args[1] = holder Class mirror,
+            // args[2] = field name String, args[3] = declared field type mirror.
+            //
+            // Everything is resolved BEFORE the allocation: `args` holds raw
+            // `ObjectRef`s and `alloc_concurrent_synthetic` can collect.
+            let holder_mirror = match args.get(1) {
+                Some(Value::Object(Some(mirror))) => Some(*mirror),
+                _ => None,
+            };
+            let type_mirror = match args.get(3) {
+                Some(Value::Object(Some(mirror))) => Some(*mirror),
+                _ => None,
+            };
             let field_name = match args.get(2) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let class_id = match args.get(1) {
-                Some(Value::Object(Some(mirror))) => ctx.class_id_of_object(*mirror),
-                _ => ClassId::new(0),
+            // A `Class` mirror's OWN heap class is `java.lang.Class`, so
+            // `class_id_of_object` answered "java/lang/Class" for every call —
+            // no field of that name is ever found and the index fell back to 0,
+            // which is why every instance VarHandle in this VM pointed at the
+            // receiver's FIRST field regardless of which field was asked for.
+            // `mirror_class_id` is the reverse-map lookup that actually names
+            // the represented class.
+            let holder_class = holder_mirror.and_then(|m| crate::lang_class::mirror_class_id(ctx, m));
+            // A mirror we could not resolve keeps the historical fallback
+            // (ClassId 0, index 0) rather than raising: we do not know that the
+            // field is absent, only that we cannot see the class. The handle it
+            // yields is left UNSTAMPED, so `varType()` refuses instead of
+            // reporting the caller's requested type as fact.
+            let class_id = holder_class.unwrap_or_else(|| ClassId::new(0));
+            let resolved = holder_class.and_then(|c| vh_find_instance_field(ctx, c, &field_name));
+            if resolved.is_none()
+                && holder_class.is_some_and(|c| vh_class_fields_visible(ctx, c))
+            {
+                // The JDK raises NoSuchFieldException here. Handing back a
+                // handle aimed at field 0 is the fabricated-success shape: the
+                // caller gets a working-looking VarHandle onto the wrong
+                // variable.
+                return Err(RuntimeError::NoSuchFieldException {
+                    field_name: field_name.clone(),
+                }
+                .into());
+            }
+            let field_idx = resolved.map(|(_, i)| i as i32).unwrap_or(0);
+            // `varType()` must be the field's REAL type. The mirror the caller
+            // handed us is used only once it is confirmed to name that type —
+            // then it is the identical `Class` object the caller will compare
+            // against (`Integer.TYPE`, an `ldc`'d class constant), which a
+            // freshly resolved mirror is not guaranteed to be.
+            let declared =
+                holder_class.and_then(|c| vh_instance_field_descriptor(ctx, c, &field_name));
+            let requested = type_mirror
+                .map(|m| crate::lang_invoke::mirror_to_descriptor(ctx, m).into_owned());
+            let var_type = match (&declared, &requested, type_mirror) {
+                (Some(d), Some(rq), Some(m)) if d == rq => Some(m),
+                (Some(d), _, _) => Some(crate::lang_class::descriptor_to_class_mirror(ctx, d)),
+                _ => None,
             };
-            let field_idx = vh_find_instance_field(ctx, class_id, &field_name)
-                .map(|(_, i)| i as i32)
-                .unwrap_or(0);
+            let vt_pin = var_type.map(|m| ctx.pin_native_root(m));
+            let hm_pin = holder_mirror.map(|m| ctx.pin_native_root(m));
+            let vh_obj =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS);
             ctx.set_field(
                 vh_obj,
                 VH_CLASS_OR_TARGET,
@@ -1360,6 +1760,24 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             );
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(field_idx));
             ctx.set_field(vh_obj, VH_IS_STATIC, Value::Int(0));
+            let var_type = match (var_type, vt_pin) {
+                (Some(m), Some(h)) => Some(ctx.read_native_pin(h, m)),
+                _ => None,
+            };
+            let holder_mirror = match (holder_mirror, hm_pin) {
+                (Some(m), Some(h)) => Some(ctx.read_native_pin(h, m)),
+                _ => None,
+            };
+            // Both halves or neither: a coordinate list without a variable type
+            // (or the reverse) would let one accessor answer while the other
+            // invents.
+            if let (Some(vt), Some(recv)) = (var_type, holder_mirror) {
+                vh_stamp_meta(ctx, vh_obj, Some(vt), Some(recv));
+            }
+            // `vt_pin` was taken first, so releasing it releases `hm_pin` too.
+            if let Some(h) = vt_pin.or(hm_pin) {
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(vh_obj))))
         },
     );
@@ -1368,21 +1786,48 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
         "findStaticVarHandle",
         "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;",
         |ctx, args| {
-            let vh_obj =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_NUM_FIELDS);
-            let class_id = match args.get(1) {
-                Some(Value::Object(Some(mirror))) => ctx.class_id_of_object(*mirror),
-                _ => ClassId::new(0),
+            // Same shape as `findVarHandle`, with two differences: the index is
+            // a STATIC-block index (see `vh_find_static_field`), and a static
+            // handle has NO coordinates, so only the variable type is stamped.
+            let type_mirror = match args.get(3) {
+                Some(Value::Object(Some(mirror))) => Some(*mirror),
+                _ => None,
             };
+            // Same `class_id_of_object` mis-read as `findVarHandle`: it answered
+            // `java.lang.Class` for every mirror, so the static index was
+            // computed against the wrong class.
+            let holder_class = match args.get(1) {
+                Some(Value::Object(Some(mirror))) => {
+                    crate::lang_class::mirror_class_id(ctx, *mirror)
+                }
+                _ => None,
+            };
+            let class_id = holder_class.unwrap_or_else(|| ClassId::new(0));
             let field_name = match args.get(2) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let fields = ctx.declared_fields(class_id);
-            let field_idx = fields
-                .iter()
-                .position(|f| f.name == field_name)
-                .unwrap_or(0) as i32;
+            let resolved = holder_class.and_then(|c| vh_find_static_field(ctx, c, &field_name));
+            if resolved.is_none()
+                && holder_class.is_some_and(|c| vh_class_fields_visible(ctx, c))
+            {
+                return Err(RuntimeError::NoSuchFieldException {
+                    field_name: field_name.clone(),
+                }
+                .into());
+            }
+            let field_idx = resolved.as_ref().map(|(i, _)| *i as i32).unwrap_or(0);
+            let declared = resolved.map(|(_, d)| d);
+            let requested = type_mirror
+                .map(|m| crate::lang_invoke::mirror_to_descriptor(ctx, m).into_owned());
+            let var_type = match (&declared, &requested, type_mirror) {
+                (Some(d), Some(rq), Some(m)) if d == rq => Some(m),
+                (Some(d), _, _) => Some(crate::lang_class::descriptor_to_class_mirror(ctx, d)),
+                _ => None,
+            };
+            let vt_pin = var_type.map(|m| ctx.pin_native_root(m));
+            let vh_obj =
+                alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_META_NUM_FIELDS);
             ctx.set_field(
                 vh_obj,
                 VH_CLASS_OR_TARGET,
@@ -1390,9 +1835,39 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             );
             ctx.set_field(vh_obj, VH_FIELD_INDEX, Value::Int(field_idx));
             ctx.set_field(vh_obj, VH_IS_STATIC, Value::Int(1));
+            if let (Some(m), Some(h)) = (var_type, vt_pin) {
+                let m = ctx.read_native_pin(h, m);
+                vh_stamp_meta(ctx, vh_obj, Some(m), None);
+                ctx.unpin_native_roots(h);
+            }
             Ok(Some(Value::Object(Some(vh_obj))))
         },
     );
+    // --- varType / coordinateTypes ---------------------------------------
+    //
+    // Both are CONCRETE JDK bytecode, so a registration alone is not enough on
+    // the `vm_exec.rs` `check_override` route — see the record in
+    // docs/known-issues/jdk-only/W6-1-varhandle-vartype-coordinatetypes.md.
+    r.register(vh, "varType", "()Ljava/lang/Class;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        match vh_var_type_mirror(ctx, this) {
+            Some(m) => Ok(Some(Value::Object(Some(m)))),
+            None => Err(vh_undescribable("varType", vh_kind(ctx, this))),
+        }
+    });
+    r.register(vh, "coordinateTypes", "()Ljava/util/List;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let Some(mirrors) = vh_coordinate_mirrors(ctx, this) else {
+            return Err(vh_undescribable("coordinateTypes", vh_kind(ctx, this)));
+        };
+        match vh_class_list(ctx, &mirrors) {
+            Some(list) => Ok(Some(list)),
+            // The mirrors are known but no `List` implementation would build.
+            // Returning null here would be a null `coordinateTypes()`, which
+            // no JDK VarHandle ever answers.
+            None => Err(vh_undescribable("coordinateTypes", vh_kind(ctx, this))),
+        }
+    });
     r.register(
         vh,
         "withInvokeExactBehavior",

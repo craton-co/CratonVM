@@ -1571,7 +1571,7 @@ enum LibrarySpelling {
 /// `java.net` and then calls `System.loadLibrary("net")` gets a silent success
 /// here where HotSpot throws. `net` stays on the list because the measured
 /// oracle needs it: `RJdkJni` never touches `java.net` before line 195.
-fn is_vm_provided_jdk_library(name: &str) -> bool {
+pub(crate) fn is_vm_provided_jdk_library(name: &str) -> bool {
     // Ships as a real, separately-present shared object in the JDK 25 image on
     // every platform, and cold-loads on HotSpot.
     const EVERY_PLATFORM: &[&str] = &[
