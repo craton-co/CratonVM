@@ -1540,9 +1540,11 @@ pub(super) fn execute_invokestatic_cached(
             /// failure is retried within a few hundred calls rather than after
             /// another full warmup threshold.
             const JIT_RETRY_STRIDE: u32 = 64;
-            let invoc_count = jit_enabled
-                .then(|| shared.jit.profile_store.increment_invocation(invoc_key))
-                .unwrap_or(0);
+            let invoc_count = if jit_enabled {
+                shared.jit.profile_store.increment_invocation(invoc_key)
+            } else {
+                0
+            };
             // Fire on the first crossing of the threshold, then re-attempt every
             // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
             // the invoke cache routes through JIT and this block is bypassed).

@@ -4816,7 +4816,7 @@ impl G1Collector {
             let h = unsafe { &*(addr as *const ObjectHeader) };
             h.class_id.as_u32() == 0
                 && h.num_slots() == 0
-                && ObjectHeader::kind_tag((h.mark_word.load(Ordering::Relaxed))) == 0
+                && ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                 && h.array_length() == 0
         };
         let mut report = |holder: usize, hreg: Option<usize>, where_: &str, target: usize| {
@@ -4930,7 +4930,7 @@ impl G1Collector {
             // not be read as equivalent to what it replaced.
             h.class_id.as_u32() == 0
                 && h.num_slots() == 0
-                && ObjectHeader::kind_tag((h.mark_word.load(Ordering::Relaxed))) == 0
+                && ObjectHeader::kind_tag(h.mark_word.load(Ordering::Relaxed)) == 0
                 && h.array_length() == 0
                 && h.mark_word.load(Ordering::Relaxed) == 0
         };
