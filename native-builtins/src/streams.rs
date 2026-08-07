@@ -31,7 +31,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::Value;
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 
 /// Process-wide demand counter for `Flow.Subscription.request(long)`.
 ///
@@ -286,7 +286,7 @@ fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // the backing array and iterator shell and reread both after every
         // allocation-capable operation.
         let arr_pin = ctx.pin_native_root(arr);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         let itr_pin = ctx.pin_native_root(itr);
         let itr_cur = ctx.read_native_pin(itr_pin, itr);
         let arr_cur = ctx.read_native_pin(arr_pin, arr);
@@ -297,7 +297,7 @@ fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         ctx.unpin_native_roots(arr_pin);
         return Ok(Some(Value::Object(Some(itr_cur))));
     }
-    let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
+    let iter = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
     Ok(Some(Value::Object(Some(iter))))
 }
 

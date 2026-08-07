@@ -175,7 +175,7 @@ fn native_aclv_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let entry = rooted_entry(ctx, value);
     let mut t = table().lock();
     if let Some(existing) = t.get(&key).copied() {
-        drop(t);
+        drop(t)?;
         return Ok(Some(resolve_entry(ctx, existing)));
     }
     if t.len() >= MAX_ENTRIES {
@@ -257,7 +257,7 @@ fn native_aclv_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // Race: another caller may have raced ahead. If so, prefer the existing
     // entry (matches CHM.computeIfAbsent semantics).
     if let Some(existing) = t.get(&key).copied() {
-        drop(t);
+        drop(t)?;
         return Ok(Some(resolve_entry(ctx, existing)));
     }
     if t.len() < MAX_ENTRIES {

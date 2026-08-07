@@ -247,7 +247,7 @@ impl TransactionState {
             return Err(XAER_DUPID);
         }
         seen.insert(key);
-        drop(seen);
+        drop(seen)?;
         self.resources.lock().push(res);
         Ok(())
     }

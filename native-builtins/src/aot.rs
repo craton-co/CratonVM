@@ -2224,7 +2224,7 @@ mod aot_tests {
         assert!(loaded.lookup("Test", "compute", "(I)I").is_some());
 
         // Clean up (TempDir auto-removes file via RAII)
-        drop(cache_guard);
+        drop(cache_guard)?;
         reset_aot_globals();
     }
 
@@ -2256,7 +2256,7 @@ mod aot_tests {
         assert_eq!(mr.invocation_count, 3);
         assert_eq!(mr.receiver_types["com/example/FooImpl"], 2);
         assert_eq!(mr.receiver_types["com/example/FooSub"], 1);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2275,7 +2275,7 @@ mod aot_tests {
         let br = rec.branch_record("com/example/Foo", "bar", 10).unwrap();
         assert_eq!(br.taken_count, 2);
         assert_eq!(br.not_taken_count, 1);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2293,7 +2293,7 @@ mod aot_tests {
         assert_eq!(mr.invocation_count, 3);
         assert_eq!(mr.receiver_types["FooImpl"], 2);
         assert_eq!(mr.receiver_types["BarImpl"], 1);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2326,7 +2326,7 @@ mod aot_tests {
         let br2 = rec.branch_record("B", "m2", 20).unwrap();
         assert_eq!(br2.taken_count, 0);
         assert_eq!(br2.not_taken_count, 5);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2347,7 +2347,7 @@ mod aot_tests {
         assert_eq!(mr.invocation_count, 8); // 5 + 3
         assert_eq!(mr.receiver_types["ImplA"], 5);
         assert_eq!(mr.receiver_types["ImplB"], 3);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2375,7 +2375,7 @@ mod aot_tests {
             cache.get("com/example/MyClass").unwrap().class_name,
             "com/example/MyClass"
         );
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2389,7 +2389,7 @@ mod aot_tests {
         let guard = AOT_PRELINKER_CACHE.lock().unwrap();
         let cache = guard.as_ref().unwrap();
         assert_eq!(cache.class_count(), 1);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2412,7 +2412,7 @@ mod aot_tests {
         let bp = profile.method_profile("X", "run", "").unwrap();
         assert_eq!(bp.branch_taken[&5], 1);
         assert_eq!(bp.branch_not_taken[&5], 1);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 
@@ -2430,7 +2430,7 @@ mod aot_tests {
         // Verify magic
         let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
         assert_eq!(magic, 0xA07CAC4E);
-        drop(guard);
+        drop(guard)?;
         reset_aot_globals();
     }
 

@@ -1279,16 +1279,16 @@ pub(crate) fn native_secure_random_generate_seed(
 /// The String is created and pinned *before* the object allocation so a moving
 /// GC during `alloc_concurrent_synthetic` cannot leave us writing through a
 /// stale reference.
-fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef {
+fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> Result<ObjectRef, MethodCallFailed> {
     let algo_str = ctx.create_string(algorithm);
     let pin = ctx.pin_native_root(algo_str);
-    let sr = crate::alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4);
+    let sr = crate::try_alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4)?;
     let algo_str = ctx.read_native_pin(pin, algo_str);
     // Resolve `algorithm:String` by name so the slot matches the real layout
     // regardless of synthetic vs real-JDK field ordering.
     ctx.set_field_by_name(sr, "algorithm", Value::Object(Some(algo_str)));
     ctx.unpin_native_roots(pin);
-    sr
+    Ok(sr)
 }
 
 /// `SecureRandom.getInstance(String algorithm)` — static factory.  `algorithm`
@@ -1309,7 +1309,7 @@ pub(crate) fn native_secure_random_get_instance(
             .into(),
         );
     }
-    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)))))
+    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)?))))
 }
 
 /// `SecureRandom.getInstance(String algorithm, String provider)` and
@@ -1356,7 +1356,7 @@ pub(crate) fn native_secure_random_get_instance_strong(
     Ok(Some(Value::Object(Some(make_secure_random(
         ctx,
         "OS-CSPRNG",
-    )))))
+    )?))))
 }
 
 // ---------------------------------------------------------------------------

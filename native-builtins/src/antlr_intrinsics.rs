@@ -1022,7 +1022,7 @@ fn antlr_new_linked_hash_map(ctx: &mut dyn NativeContext) -> Result<ObjectRef, M
         Ok(Some(Value::Object(Some(map)))) => Ok(map),
         _ => {
             let mut scope = NativeHandleScope::new(ctx);
-            let map = alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(&mut *scope, "java/util/HashMap", 3)?;
             let map_h = scope.root(map);
             let init_args = [Value::Object(Some(scope.get(&map_h)))];
             cratonvm_native_collections::native_map_init(&mut *scope, &init_args)?;
@@ -5107,7 +5107,7 @@ fn antlr_new_arraylist_with_capacity(
     capacity: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let mut scope = NativeHandleScope::new(ctx);
-    let list = alloc_concurrent_synthetic(&mut *scope, "java/util/ArrayList", 2);
+    let list = try_alloc_concurrent_synthetic(&mut *scope, "java/util/ArrayList", 2)?;
     let list_h = scope.root(list);
     let data = scope.new_array(cratonvm_types::ArrayElementType::Reference, capacity.max(1));
     let list = scope.get(&list_h);
@@ -5128,7 +5128,7 @@ fn antlr_new_bitset_with_alts(
         .unwrap_or(0) as usize;
     let word_count = (max_alt / 64) + 1;
     let mut scope = NativeHandleScope::new(ctx);
-    let bitset = alloc_concurrent_synthetic(&mut *scope, "java/util/BitSet", 3);
+    let bitset = try_alloc_concurrent_synthetic(&mut *scope, "java/util/BitSet", 3)?;
     let bitset_h = scope.root(bitset);
     let words = scope.new_array(cratonvm_types::ArrayElementType::Long, word_count);
     let bitset = scope.get(&bitset_h);
@@ -7119,7 +7119,7 @@ mod antlr_prediction_context_tests {
     fn antlr_double_key_map_insert_releases_temporary_native_pins() {
         let mut ctx = mock_ctx();
         let map = ctx.fresh_object_ref();
-        let data = alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3);
+        let data = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3)?;
         cratonvm_native_collections::native_map_init(&mut ctx, &[Value::Object(Some(data))])
             .unwrap();
         ctx.set_field(map, 0, Value::Object(Some(data)));

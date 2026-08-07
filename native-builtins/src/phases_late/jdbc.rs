@@ -1624,7 +1624,7 @@ pub(crate) fn register_p68_jdbc_driver_manager(r: &mut NativeMethodRegistry) {
             match jdbc_registry::open_connection(&url) {
                 Ok(conn_id) => {
                     // Connection = 4-field: conn_id=0, closed=1, auto_commit=2, tx_isolation=3
-                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4);
+                    let conn = try_alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4)?;
                     ctx.set_field(conn, 0, Value::Long(conn_id));
                     ctx.set_field(conn, 1, Value::Int(0));
                     ctx.set_field(conn, 2, Value::Int(1)); // auto_commit=true
@@ -1656,7 +1656,7 @@ pub(crate) fn register_p68_jdbc_driver_manager(r: &mut NativeMethodRegistry) {
                     // `getAutoCommit()` / `getTransactionIsolation()` never
                     // reflected the change for any connection obtained
                     // through this overload.
-                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4);
+                    let conn = try_alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4)?;
                     ctx.set_field(conn, 0, Value::Long(conn_id));
                     ctx.set_field(conn, 1, Value::Int(0));
                     ctx.set_field(conn, 2, Value::Int(1)); // auto_commit=true
@@ -1688,7 +1688,7 @@ pub(crate) fn register_p68_jdbc_driver_manager(r: &mut NativeMethodRegistry) {
                     // `getAutoCommit()` / `getTransactionIsolation()` never
                     // reflected the change for any connection obtained
                     // through this overload.
-                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4);
+                    let conn = try_alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4)?;
                     ctx.set_field(conn, 0, Value::Long(conn_id));
                     ctx.set_field(conn, 1, Value::Int(0));
                     ctx.set_field(conn, 2, Value::Int(1)); // auto_commit=true
@@ -1742,7 +1742,7 @@ pub(crate) fn register_p68_jdbc_driver_manager(r: &mut NativeMethodRegistry) {
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
             }
             // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            let en = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2)?;
             ctx.set_field(en, 0, Value::Object(Some(arr)));
             ctx.set_field(en, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(en))))
@@ -1804,7 +1804,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             // getUpdateCount() trio; before they existed those three natives
             // were constants (null / -1 / false) and every `execute` +
             // `getResultSet` caller silently saw an empty result.
-            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/Statement", 8);
+            let stmt = try_alloc_concurrent_synthetic(ctx, "java/sql/Statement", 8)?;
             ctx.set_field(stmt, 0, Value::Long(conn_id)); // pass conn_id through
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
             ctx.set_field(stmt, 2, Value::Long(conn_id)); // uniform conn_id slot
@@ -1837,7 +1837,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             // maxRows=6, queryTimeout=7) so every Statement native the
             // `alias_class` calls copy onto this class reads and writes the
             // same slots it would on a plain Statement.
-            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/PreparedStatement", 8);
+            let stmt = try_alloc_concurrent_synthetic(ctx, "java/sql/PreparedStatement", 8)?;
             ctx.set_field(stmt, 0, Value::Long(ps_id));
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
             ctx.set_field(stmt, 2, Value::Long(conn_id));
@@ -1872,7 +1872,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let ps_id = jdbc_registry::prepare(conn_id, &sql);
-            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/CallableStatement", 8);
+            let stmt = try_alloc_concurrent_synthetic(ctx, "java/sql/CallableStatement", 8)?;
             ctx.set_field(stmt, 0, Value::Long(ps_id));
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
             ctx.set_field(stmt, 2, Value::Long(conn_id));
@@ -1944,7 +1944,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let conn_id = ctx.get_field(this, 0);
-            let dbmd = alloc_concurrent_synthetic(ctx, "java/sql/DatabaseMetaData", 1);
+            let dbmd = try_alloc_concurrent_synthetic(ctx, "java/sql/DatabaseMetaData", 1)?;
             ctx.set_field(dbmd, 0, conn_id);
             Ok(Some(Value::Object(Some(dbmd))))
         },
@@ -2024,7 +2024,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                     ctx.set_field(this, 4, Value::Long(stmt_id));
                     ctx.set_field(this, 5, Value::Int(-1));
                     // ResultSet = 3-field (stmt_id=0, cursor=1, rowCount=2)
-                    let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
+                    let rs = try_alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3)?;
                     ctx.set_field(rs, 0, Value::Long(stmt_id));
                     ctx.set_field(rs, 1, Value::Int(-1)); // cursor before first row
                     ctx.set_field(rs, 2, Value::Int(row_count as i32));
@@ -2157,7 +2157,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             }
             let rows = jdbc_registry::get_row_count(stmt_id);
             // ResultSet = 3-field (stmt_id=0, cursor=1, rowCount=2)
-            let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
+            let rs = try_alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3)?;
             ctx.set_field(rs, 0, Value::Long(stmt_id));
             ctx.set_field(rs, 1, Value::Int(-1)); // cursor before first row
             ctx.set_field(rs, 2, Value::Int(rows as i32));
@@ -2405,7 +2405,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                     // allocation can move `this` (see Statement.executeQuery).
                     ctx.set_field(this, 4, Value::Long(stmt_id));
                     ctx.set_field(this, 5, Value::Int(-1));
-                    let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
+                    let rs = try_alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3)?;
                     ctx.set_field(rs, 0, Value::Long(stmt_id));
                     ctx.set_field(rs, 1, Value::Int(-1));
                     ctx.set_field(rs, 2, Value::Int(row_count as i32));
@@ -2884,7 +2884,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let stmt_id = ctx.get_field(this, 0);
-            let rsmd = alloc_concurrent_synthetic(ctx, "java/sql/ResultSetMetaData", 1);
+            let rsmd = try_alloc_concurrent_synthetic(ctx, "java/sql/ResultSetMetaData", 1)?;
             ctx.set_field(rsmd, 0, stmt_id); // pass stmt_id for column metadata
             Ok(Some(Value::Object(Some(rsmd))))
         },
@@ -3472,14 +3472,14 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // =========================================================================
     r.register(conn, "createBlob", "()Ljava/sql/Blob;", |ctx, _args| {
         let id = jdbc_registry::blob_create(Vec::new());
-        let obj = alloc_concurrent_synthetic(ctx, "java/sql/Blob", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/sql/Blob", 2)?;
         ctx.set_field(obj, 0, Value::Long(id));
         ctx.set_field(obj, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(conn, "createClob", "()Ljava/sql/Clob;", |ctx, _args| {
         let id = jdbc_registry::clob_create(String::new());
-        let obj = alloc_concurrent_synthetic(ctx, "java/sql/Clob", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/sql/Clob", 2)?;
         ctx.set_field(obj, 0, Value::Long(id));
         ctx.set_field(obj, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(obj))))
@@ -3497,7 +3497,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::savepoint_create(conn_id, None) {
                 Ok((id, name)) => {
-                    let sp_obj = alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2);
+                    let sp_obj = try_alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2)?;
                     ctx.set_field(sp_obj, 0, Value::Long(id));
                     let name_ref = ctx.create_string(&name);
                     ctx.set_field(sp_obj, 1, Value::Object(Some(name_ref)));
@@ -3524,7 +3524,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::savepoint_create(conn_id, name) {
                 Ok((id, effective)) => {
-                    let sp_obj = alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2);
+                    let sp_obj = try_alloc_concurrent_synthetic(ctx, "java/sql/Savepoint", 2)?;
                     ctx.set_field(sp_obj, 0, Value::Long(id));
                     let name_ref = ctx.create_string(&effective);
                     ctx.set_field(sp_obj, 1, Value::Object(Some(name_ref)));

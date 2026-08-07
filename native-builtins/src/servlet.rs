@@ -11,7 +11,7 @@ use crate::phases_late::{
     p56_build_stream, p58_new_cf, CLEANABLE_ACTION, CLEANABLE_CLEANED, CLEANABLE_FIELDS,
     CLEANABLE_INDEX, REF_TYPE_CLEANER,
 };
-use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 
 use std::collections::HashMap;
 use std::io::{Read as StdRead, Write as StdWrite};
@@ -1266,7 +1266,7 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                     for (i, &b) in bytes.iter().enumerate() {
                         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
                     }
-                    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+                    let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
                     ctx.set_field(stream, 0, Value::Object(Some(arr))); // buf
                     ctx.set_field(stream, 1, Value::Int(0)); // pos
                     ctx.set_field(stream, 2, Value::Int(0)); // mark
@@ -1300,7 +1300,7 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
             match ctx.find_resource(&resource_name) {
                 None => Ok(Some(Value::Object(None))),
                 Some(_) => {
-                    let url = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+                    let url = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
                     let full_str = ctx.create_string(&format!("classpath:{resource_name}"));
                     ctx.set_field(url, 5, Value::Object(Some(full_str)));
                     Ok(Some(Value::Object(Some(url))))
@@ -1711,7 +1711,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         "([Ljava/net/URL;)Ljava/net/URLClassLoader;",
         |ctx, args| {
             let url_arr = args.first().copied().unwrap_or(Value::Object(None));
-            let loader = alloc_concurrent_synthetic(ctx, "java/net/URLClassLoader", 2);
+            let loader = try_alloc_concurrent_synthetic(ctx, "java/net/URLClassLoader", 2)?;
             ctx.set_field(loader, 0, url_arr);
             ctx.set_field(loader, 1, Value::Object(None));
             register_url_array(ctx, url_arr);
@@ -1727,7 +1727,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let url_arr = args.first().copied().unwrap_or(Value::Object(None));
             let parent = args.get(1).copied().unwrap_or(Value::Object(None));
-            let loader = alloc_concurrent_synthetic(ctx, "java/net/URLClassLoader", 2);
+            let loader = try_alloc_concurrent_synthetic(ctx, "java/net/URLClassLoader", 2)?;
             ctx.set_field(loader, 0, url_arr);
             ctx.set_field(loader, 1, parent);
             register_url_array(ctx, url_arr);
@@ -1865,7 +1865,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_mirror = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             ctx.set_field(obj, 0, class_mirror);
             ctx.set_field(obj, 1, Value::Object(None)); // not yet loaded
             Ok(Some(Value::Object(Some(obj))))
@@ -1879,7 +1879,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_mirror = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             ctx.set_field(obj, 0, class_mirror);
             ctx.set_field(obj, 1, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
@@ -1893,7 +1893,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_mirror = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             ctx.set_field(obj, 0, class_mirror);
             ctx.set_field(obj, 1, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
@@ -1907,7 +1907,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         // Build a simple iterator backed by index over the array:
         // Iterator = 2-field: array=0, index=1
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         // Register hasNext/next for ServiceLoader$Itr if not already
@@ -1966,7 +1966,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         let arr = s1_service_loader_ensure_loaded(ctx, this);
         let len = ctx.array_length(arr);
         let elems: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
-        let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
+        let s = p56_build_stream(ctx, elems, "java/util/stream/Stream")?;
         Ok(Some(Value::Object(Some(s))))
     });
 
@@ -1974,7 +1974,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
     r.register(sl, "findFirst", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let arr = s1_service_loader_ensure_loaded(ctx, this);
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         if ctx.array_length(arr) > 0 {
             let first = ctx.get_array_element(arr, 0);
             ctx.set_field(opt, 0, first);
@@ -2700,7 +2700,7 @@ const S2DC_SOCK_ID: usize = 4;
 
 // ---- ByteBuffer helpers ----------------------------------------------------
 
-fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
+fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectRef>, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
     // and on a full heap the backing `new byte[n]` must raise a *catchable*
@@ -2715,11 +2715,11 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Option<ObjectRef> {
     // trigger a collection that relocates `arr` (read again by
     // `bb_write_hb` immediately after); pin it and re-read.
     let arr_pin = ctx.pin_native_root(arr);
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
-    Some(buf)
+    Ok(Some(buf))
 }
 
 /// NEW-17 — synthetic-mode `ByteBuffer.allocateDirect(cap)`.
@@ -2764,12 +2764,12 @@ fn s2_bb_alloc_direct(ctx: &mut dyn NativeContext, cap: i32) -> MethodCallResult
     // `dealloc` are pinned across the later ones and re-read through the pins;
     // `cleanable` is minted last so nothing can move it before its raw address
     // reaches the reference processor.
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
     let buf_pin = ctx.pin_native_root(buf);
-    let dealloc = alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, DEALLOC_FIELDS);
+    let dealloc = try_alloc_concurrent_synthetic(ctx, DEALLOC_CLASS, DEALLOC_FIELDS)?;
     let dealloc_pin = ctx.pin_native_root(dealloc);
     let cleanable =
-        alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", CLEANABLE_FIELDS);
+        try_alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner$Cleanable", CLEANABLE_FIELDS)?;
     let buf = ctx.read_native_pin(buf_pin, buf);
     let dealloc = ctx.read_native_pin(dealloc_pin, dealloc);
     ctx.unpin_native_roots(buf_pin);
@@ -3019,7 +3019,7 @@ fn s2_bb_set_mark(ctx: &mut dyn NativeContext, buf: ObjectRef, value: i32) {
 }
 /// True for the 6-slot pure-synthetic ByteBuffer layout that the indexed
 /// `BB_*` accessors address. In REAL-JDK mode this is false for every s2
-/// `ByteBuffer`: `alloc_concurrent_synthetic(_, "java/nio/ByteBuffer", 6)`
+/// `ByteBuffer`: `try_alloc_concurrent_synthetic(_, "java/nio/ByteBuffer", 6)?`
 /// resolves the real (abstract) class and allocates its FULL field layout
 /// (11 slots — `Buffer{mark,position,limit,capacity,address,segment}` +
 /// `ByteBuffer{hb,offset,isReadOnly,bigEndian,nativeByteOrder}`), where
@@ -3271,7 +3271,7 @@ fn s2_bb_is_read_only(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
 /// (`order() == ByteOrder.LITTLE_ENDIAN`) and `toString()` behave exactly
 /// like HotSpot. Falls back to a 1-slot synthetic (field 0 = order int)
 /// only when the real class/statics are unavailable (synthetic-jdk mode).
-pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> ObjectRef {
+pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Result<ObjectRef, MethodCallFailed> {
     let cid = ctx
         .ensure_class_initialized("java/nio/ByteOrder")
         .ok()
@@ -3284,13 +3284,13 @@ pub(crate) fn s2_byte_order_object(ctx: &mut dyn NativeContext, ord: i32) -> Obj
         };
         if let Some(idx) = ctx.static_field_index_by_name(cid, field) {
             if let Value::Object(Some(o)) = ctx.get_static_field(cid, idx) {
-                return o;
+                return Ok(o);
             }
         }
     }
-    let bo = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+    let bo = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
     ctx.set_field(bo, 0, Value::Int(ord));
-    bo
+    Ok(bo)
 }
 
 /// Write a buffer's `position`. Buffers with a heap array keep this
@@ -3973,7 +3973,7 @@ fn s2_selector_do_poll_with_timeout(
 
     // Append the wakeup fd. If the wakeup channel can't be built, we
     // proceed without it; the caller can still return via timeout.
-    drop(reg); // drop registry lock before touching wakeup map
+    drop(reg)?; // drop registry lock before touching wakeup map
     let wakeup_req = ensure_wakeup_channel(ctx, sel, |ch| PollReq {
         fd: dgram_pollreq_fd(&ch.socket),
         events: POLL_IN,
@@ -4211,7 +4211,7 @@ macro_rules! s2_view_buf_fn {
             let pos = s2_bb_pos(ctx, this);
             let lim = s2_bb_limit(ctx, this);
             let rem = (lim - pos) / $elem_sz;
-            let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+            let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
             // BUG (found 2026-07-11): `ctx.get_field(this, BB_ARRAY)` reads
             // the SOURCE ByteBuffer's raw indexed slot 0 — but in real-JDK
             // mode `this` is allocated with the real Buffer+ByteBuffer field
@@ -4375,7 +4375,7 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             _ => 16,
         };
         let read_only = matches!(ctx.get_field_by_name(this, "isReadOnly"), Value::Int(1));
-        let vb = alloc_concurrent_synthetic(ctx, view_cls, 0);
+        let vb = try_alloc_concurrent_synthetic(ctx, view_cls, 0)?;
         ctx.set_field_by_name(vb, "bb", Value::Object(Some(this)));
         ctx.set_field_by_name(vb, "mark", Value::Int(-1));
         ctx.set_field_by_name(vb, "position", Value::Int(0));
@@ -4404,7 +4404,7 @@ fn s2_bb_as_char_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // trigger a collection that relocates `chars_arr` (written into the
     // new CharBuffer's fields further below); pin it and re-read.
     let chars_arr_pin = ctx.pin_native_root(chars_arr);
-    let vb = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 6);
+    let vb = try_alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 6)?;
     let chars_arr = ctx.read_native_pin(chars_arr_pin, chars_arr);
     ctx.unpin_native_roots(chars_arr_pin);
     // Write to BOTH indexed slot 0 (synthetic-mode layout used by our
@@ -4449,8 +4449,8 @@ fn s2_bb_new_heap_view(
     mark: i32,
     read_only: bool,
     ord: i32,
-) -> ObjectRef {
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
     ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
     ctx.set_field_by_name(buf, "offset", Value::Int(offset as i32));
     ctx.set_field_by_name(buf, "isReadOnly", Value::Int(read_only as i32));
@@ -4474,7 +4474,7 @@ fn s2_bb_new_heap_view(
         ctx.set_field(buf, BB_MARK, Value::Int(mark));
     }
     s2_bb_set_order(ctx, buf, ord);
-    buf
+    Ok(buf)
 }
 
 /// Build an ALIASING direct ByteBuffer view over native memory at `addr`
@@ -4492,8 +4492,8 @@ fn s2_bb_new_direct_view(
     mark: i32,
     read_only: bool,
     ord: i32,
-) -> ObjectRef {
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
     ctx.set_field_by_name(buf, "isReadOnly", Value::Int(read_only as i32));
     ctx.set_field_by_name(buf, "position", Value::Int(pos));
     ctx.set_field_by_name(buf, "limit", Value::Int(lim));
@@ -4501,7 +4501,7 @@ fn s2_bb_new_direct_view(
     ctx.set_field_by_name(buf, "mark", Value::Int(mark));
     ctx.set_field_by_name(buf, "address", Value::Long(addr));
     s2_bb_set_order(ctx, buf, ord);
-    buf
+    Ok(buf)
 }
 
 fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
@@ -4520,7 +4520,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             .into());
         }
         let cap = requested as usize;
-        match s2_bb_alloc(ctx, cap) {
+        match s2_bb_alloc(ctx, cap)? {
             Some(buf) => Ok(Some(Value::Object(Some(buf)))),
             None => Err(RuntimeError::OutOfMemoryError {
                 message: "Java heap space".to_string(),
@@ -4571,7 +4571,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
         let arr = obj_arg(args, 0)?;
         let len = ctx.array_length(arr) as i32;
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
         bb_write_hb(ctx, buf, arr, len);
         Ok(Some(Value::Object(Some(buf))))
     });
@@ -4591,7 +4591,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         if off < 0 || len < 0 || i64::from(off) + i64::from(len) > i64::from(cap) {
             return Err(RuntimeError::ioobe_no_message().into());
         }
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
         bb_write_hb(ctx, buf, arr, cap);
         // Override position/limit set by bb_write_hb.
         ctx.set_field_by_name(buf, "position", Value::Int(off));
@@ -5373,7 +5373,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         // fresh synthetic (printing as BIG_ENDIAN, failing identity
         // comparisons) when `order()` ran before any Java-side ByteOrder
         // access had triggered <clinit> (residual-doc item 6).
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
     });
     r.register(
         bb,
@@ -5431,14 +5431,14 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(new_arr, i, b);
                 }
             }
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+            let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
             bb_write_hb(ctx, buf, new_arr, rem);
             s2_bb_set_order(ctx, buf, ord);
             return Ok(Some(Value::Object(Some(buf))));
         }
         let buf = match s2_bb_storage(ctx, this) {
             Some(S2BbStorage::Heap { arr, base }) => {
-                s2_bb_new_heap_view(ctx, arr, base + pos as usize, 0, rem, rem, -1, ro, ord)
+                s2_bb_new_heap_view(ctx, arr, base + pos as usize, 0, rem, rem, -1, ro, ord)?
             }
             Some(S2BbStorage::Direct { addr }) => s2_bb_new_direct_view(
                 ctx,
@@ -5449,11 +5449,11 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 -1,
                 ro,
                 ord,
-            ),
+            )?,
             // Storage-less synthetic: keep the historic empty-copy result.
             None => {
                 let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
-                let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
                 bb_write_hb(ctx, buf, new_arr, rem);
                 buf
             }
@@ -5484,7 +5484,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     -1,
                     ro,
                     ord,
-                )
+                )?
             }
             Some(S2BbStorage::Direct { addr }) => s2_bb_new_direct_view(
                 ctx,
@@ -5495,7 +5495,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 -1,
                 ro,
                 ord,
-            ),
+            )?,
             _ => {
                 // Bare-synthetic / storage-less: copying fallback.
                 let new_arr = ctx.new_array(ArrayElementType::Byte, length as usize);
@@ -5505,7 +5505,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                         ctx.set_array_element(new_arr, i, b);
                     }
                 }
-                let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
                 bb_write_hb(ctx, buf, new_arr, length);
                 s2_bb_set_order(ctx, buf, ord);
                 buf
@@ -5523,15 +5523,15 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let ord = s2_bb_order(ctx, this);
         let buf = match s2_bb_storage(ctx, this) {
             Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
-                s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, ro, ord)
+                s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, ro, ord)?
             }
             Some(S2BbStorage::Direct { addr }) => {
-                s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, ro, ord)
+                s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, ro, ord)?
             }
             _ => {
                 // Bare-synthetic / storage-less: legacy shared-array
                 // rebuild (aliases the array, no offset support needed).
-                let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
                 if let Some(src_arr) = s2_bb_arr(ctx, this) {
                     bb_write_hb(ctx, buf, src_arr, cap);
                     ctx.set_field_by_name(buf, "position", Value::Int(pos));
@@ -5560,13 +5560,13 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             let ord = s2_bb_order(ctx, this);
             let buf = match s2_bb_storage(ctx, this) {
                 Some(S2BbStorage::Heap { arr, base }) if !s2_bb_synthetic_layout(ctx, this) => {
-                    s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, true, ord)
+                    s2_bb_new_heap_view(ctx, arr, base, pos, lim, cap, mark, true, ord)?
                 }
                 Some(S2BbStorage::Direct { addr }) => {
-                    s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, true, ord)
+                    s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, true, ord)?
                 }
                 _ => {
-                    let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6);
+                    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
                     if let Some(src_arr) = s2_bb_arr(ctx, this) {
                         bb_write_hb(ctx, buf, src_arr, cap);
                         ctx.set_field_by_name(buf, "position", Value::Int(pos));
@@ -5875,7 +5875,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 // as BIG_ENDIAN regardless of value in real-JDK mode
                 // (residual-doc item 6).
                 let ord = s2_bb_order(ctx, this);
-                Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+                Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
             }
             fn $slice(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 let this = obj_arg(args, 0)?;
@@ -5887,7 +5887,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
                     .unwrap_or(bs);
-                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
                 if let Some(arr) = s2_bb_arr(ctx, this) {
                     ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
                     ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
@@ -5918,7 +5918,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     .checked_mul($width)
                     .and_then(|b| bs.checked_add(b))
                     .unwrap_or(bs);
-                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
                 if let Some(arr) = s2_bb_arr(ctx, this) {
                     ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
                     ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
@@ -5942,7 +5942,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let lim = s2_bb_limit(ctx, this);
                 let cap = s2_bb_cap(ctx, this);
                 let bs_field = ctx.get_field(this, BB_MARK);
-                let vb = alloc_concurrent_synthetic(ctx, $cls, 6);
+                let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
                 if let Some(arr) = s2_bb_arr(ctx, this) {
                     ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
                     ctx.set_field(vb, BB_MARK, bs_field);
@@ -6401,13 +6401,13 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) {
     // (residual-doc item 6).
     r.register(bo, "nativeOrder", "()Ljava/nio/ByteOrder;", |ctx, _| {
         let ord = if cfg!(target_endian = "big") { 0 } else { 1 };
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
     });
     r.register(bo, "BIG_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)?))))
     });
     r.register(bo, "LITTLE_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)?))))
     });
     // Layout-aware decode shared by toString/equals: real ByteOrder keeps
     // its `name` String at field 0; the synthetic stand-in keeps an order
@@ -6462,7 +6462,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         "open",
         "()Ljava/nio/channels/SocketChannel;",
         |ctx, _| {
-            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+            let ch = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5)?;
             ctx.set_field(ch, S2SC_CONNECTED, Value::Int(0));
             ctx.set_field(ch, S2SC_OPEN, Value::Int(1));
             ctx.set_field(ch, S2SC_ADDR, Value::Object(None));
@@ -6477,7 +6477,7 @@ fn register_s2_socket_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;",
         |ctx, args| {
             let addr_val = args.first().copied().unwrap_or(Value::Object(None));
-            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+            let ch = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5)?;
             ctx.set_field(ch, S2SC_CONNECTED, Value::Int(0));
             ctx.set_field(ch, S2SC_OPEN, Value::Int(1));
             ctx.set_field(ch, S2SC_ADDR, addr_val);
@@ -6688,7 +6688,7 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
         "open",
         "()Ljava/nio/channels/ServerSocketChannel;",
         |ctx, _| {
-            let ch = alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 5);
+            let ch = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/ServerSocketChannel", 5)?;
             ctx.set_field(ch, S2SSC_OPEN, Value::Int(1));
             ctx.set_field(ch, S2SSC_BOUND, Value::Int(0));
             ctx.set_field(ch, S2SSC_LISTENER_ID, Value::Int(-1));
@@ -6745,7 +6745,7 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
                 .unwrap_or(-1);
             if lid < 0 {
                 // Stub-bound (null address) — return a disconnected stub SocketChannel
-                let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+                let sc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5)?;
                 ctx.set_field(sc, S2SC_CONNECTED, Value::Int(1));
                 ctx.set_field(sc, S2SC_OPEN, Value::Int(1));
                 ctx.set_field(sc, S2SC_ADDR, Value::Object(None));
@@ -6772,7 +6772,7 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
                     None => return Ok(Some(Value::Object(None))),
                 }
             };
-            let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5);
+            let sc = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 5)?;
             ctx.set_field(sc, S2SC_CONNECTED, Value::Int(1));
             ctx.set_field(sc, S2SC_OPEN, Value::Int(1));
             ctx.set_field(sc, S2SC_ADDR, Value::Object(None));
@@ -6838,7 +6838,7 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
     let channel = args.first().copied().unwrap_or(Value::Object(None));
     let selector = args.get(1).copied().unwrap_or(Value::Object(None));
     let ops = args.get(2).copied().unwrap_or(Value::Int(0));
-    let mut key = alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4);
+    let mut key = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/SelectionKey", 4)?;
     ctx.set_field(key, 0, channel);
     ctx.set_field(key, 1, selector);
     ctx.set_field(key, 2, ops);
@@ -6869,13 +6869,13 @@ pub(crate) fn s2_register_channel(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(Value::Object(Some(key))))
 }
 
-fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bool) -> Value {
+fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bool) -> Result<Value, MethodCallFailed> {
     let n = ctx.get_field(sel, S2SEL_NKEYS).as_int().unwrap_or(0) as usize;
     // GC-safety: `alloc_concurrent_synthetic`/`new_ref_array` below allocate
     // and can trigger a collection that relocates `sel`/`set` (both read
     // again after); pin both for the whole function.
     let sel_pin = ctx.pin_native_root(sel);
-    let mut set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let mut set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
     let set_pin = ctx.pin_native_root(set);
     let sel = ctx.read_native_pin(sel_pin, sel);
     let keys_v = ctx.get_field(sel, S2SEL_KEYS);
@@ -6908,7 +6908,7 @@ fn s2_keys_as_set(ctx: &mut dyn NativeContext, sel: ObjectRef, selected_only: bo
         ctx.set_field(set, 1, Value::Int(0));
     }
     ctx.unpin_native_roots(sel_pin);
-    Value::Object(Some(set))
+    Ok(Value::Object(Some(set)))
 }
 
 fn register_s2_selector(r: &mut NativeMethodRegistry) {
@@ -6918,7 +6918,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         if crate::nbflags().dbg_sel {
             eprintln!("[SEL] Selector.open()");
         }
-        let s = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 3);
+        let s = try_alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 3)?;
         ctx.set_field(s, S2SEL_OPEN, Value::Int(1));
         ctx.set_field(s, S2SEL_KEYS, Value::Object(None));
         ctx.set_field(s, S2SEL_NKEYS, Value::Int(0));
@@ -7015,11 +7015,11 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     });
     r.register(sel, "keys", "()Ljava/util/Set;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(s2_keys_as_set(ctx, this, false)))
+        Ok(Some(s2_keys_as_set(ctx, this, false)?))
     });
     r.register(sel, "selectedKeys", "()Ljava/util/Set;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(s2_keys_as_set(ctx, this, true)))
+        Ok(Some(s2_keys_as_set(ctx, this, true)?))
     });
 
     // SelectionKey — upgrade readyOps to field 3, add convenience predicates
@@ -7165,7 +7165,7 @@ pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let resp = s3_http_send(ctx, args)?;
             let resp_val = resp.unwrap_or(Value::Object(None));
-            let cf = p58_new_cf(ctx, resp_val, true);
+            let cf = p58_new_cf(ctx, resp_val, true)?;
             Ok(Some(Value::Object(Some(cf))))
         },
     );
@@ -7321,7 +7321,7 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
 
     // ---- Build HttpResponse synthetic ----
-    let response = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 3);
+    let response = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 3)?;
     ctx.set_field(response, 0, Value::Int(status_code));
     let body_ref = ctx.create_string(&body_str);
     ctx.set_field(response, 1, Value::Object(Some(body_ref)));
@@ -7377,7 +7377,7 @@ fn s3_parse_status_code(response: &str) -> i32 {
 
 /// Create a stub HttpResponse (for error/unsupported cases).
 fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> MethodCallResult {
-    let response = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 3);
+    let response = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 3)?;
     ctx.set_field(response, 0, Value::Int(status));
     let body_ref = ctx.create_string(msg);
     ctx.set_field(response, 1, Value::Object(Some(body_ref)));

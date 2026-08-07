@@ -16,7 +16,7 @@ use cratonvm_types::error::{
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use crate::lang_class::{box_value, mirror_class_id, mirror_class_name};
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Hoisted descriptor / class-name string constants
@@ -569,10 +569,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
             let params = args.get(1).copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, params);
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -582,13 +582,13 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
         |ctx, args| {
             let ret = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             // Empty params — allocate a 0-length Class[] so `parameterCount()`
             // and the form-builder both see a non-null array.
             let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(obj, 1, Value::Object(Some(empty)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -601,10 +601,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
             let param = obj_arg(args, 1)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(param)));
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -630,10 +630,10 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(arr, 1 + i, elem);
                 }
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             ctx.set_field(obj, 0, Value::Object(Some(ret)));
             ctx.set_field(obj, 1, Value::Object(Some(arr)));
-            populate_method_type_form(ctx, obj);
+            populate_method_type_form(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -841,12 +841,12 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodHandles$Lookup;",
         |ctx, _args| {
             let lookup =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
             Ok(Some(Value::Object(Some(lookup))))
         },
     );
     r.register(mhs, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, _args| {
-        let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1);
+        let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
         Ok(Some(Value::Object(Some(lookup))))
     });
 
@@ -884,7 +884,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 },
                 _ => true,
             };
-            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
             vh_meta_put(
                 ctx,
                 vh,
@@ -932,7 +932,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 },
                 _ => true,
             };
-            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+            let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
             vh_meta_put(
                 ctx,
                 vh,
@@ -973,7 +973,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // For simplicity, return a Lookup wrapping a synthetic hidden class mirror.
             // Full implementation would parse the byte[] and define the class.
-            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1);
+            let lookup = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 1)?;
             Ok(Some(Value::Object(Some(lookup))))
         }
     );
@@ -1274,8 +1274,8 @@ pub(crate) fn alloc_instance_var_handle(
     field_desc: &str,
     field_index: usize,
     class_id: cratonvm_types::ClassId,
-) -> ObjectRef {
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
     // Only on OUR layout — see `vh_has_synthetic_layout`. On a real
     // `VarHandle` these six writes null `vform` and corrupt `exact`.
     if vh_has_synthetic_layout(ctx, vh) {
@@ -1303,7 +1303,7 @@ pub(crate) fn alloc_instance_var_handle(
             class_id: class_id.as_u32(),
         },
     );
-    vh
+    Ok(vh)
 }
 
 /// Allocate a VarHandle for a static field.
@@ -1312,8 +1312,8 @@ pub(crate) fn alloc_static_var_handle(
     class_name: &str,
     field_name: &str,
     field_desc: &str,
-) -> ObjectRef {
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
     // Only on OUR layout — see `vh_has_synthetic_layout`.
     if vh_has_synthetic_layout(ctx, vh) {
         ctx.set_field(vh, VH_KIND, Value::Int(VH_KIND_STATIC));
@@ -1339,7 +1339,7 @@ pub(crate) fn alloc_static_var_handle(
             class_id: 0,
         },
     );
-    vh
+    Ok(vh)
 }
 
 /// Resolve a STATIC VarHandle's storage slot: `(class_id, static-block index)`.
@@ -1633,7 +1633,7 @@ fn varhandle_access_mode_type_uncached(
         vh_access_mode_descriptor(access_type, &coords, &value_desc)
     };
 
-    match build_method_type_from_descriptor(ctx, &desc) {
+    match build_method_type_from_descriptor(ctx, &desc)? {
         Some(mt) => Ok(Some(Value::Object(Some(mt)))),
         None => Ok(None),
     }
@@ -3417,7 +3417,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // Allocate with room for the real 3-field layout (lookupClass,
             // prevLookupClass, allowedModes) so the by-name `allowedModes`
             // write below actually lands.
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
             ctx.set_field_by_name(obj, "lookupClass", caller_class);
             ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
             // Slot-0 lookupClass fallback for the pure-synthetic layout.
@@ -3455,7 +3455,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let object_mirror = ctx.get_class_mirror(object_cid);
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
             ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(object_mirror)));
             ctx.set_field(obj, 0, Value::Object(Some(object_mirror)));
             // JDK 9+ contract (verified against JDK 25 src.zip,
@@ -3481,7 +3481,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     );
     r.register(mh, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, args| {
         let target = args.first().copied().unwrap_or(Value::Object(None));
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
         ctx.set_field_by_name(obj, "lookupClass", target);
         ctx.set_field(obj, 0, target);
         // privateLookupIn grants full private access but drops ORIGINAL:
@@ -3561,7 +3561,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             let _this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
             let lookup =
-                alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3)?;
             ctx.set_field_by_name(lookup, "lookupClass", target_class);
             ctx.set_field(lookup, 0, target_class); // lookupClass = targetClass
                                                     // Access reduced to PUBLIC + UNCONDITIONAL when crossing packages
@@ -3698,7 +3698,7 @@ fn lookup_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_VIRTUAL);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_VIRTUAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -3760,7 +3760,7 @@ fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let desc = descriptor_from_method_type(ctx, mt_obj);
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_STATIC);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_STATIC)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -3786,7 +3786,7 @@ fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     // Ensure class is loaded so constructor resolution works at dispatch time
     let _ = ctx.ensure_class_initialized(&class);
-    let mh = alloc_method_handle(ctx, &class, "<init>", &desc, MH_KIND_CONSTRUCTOR);
+    let mh = alloc_method_handle(ctx, &class, "<init>", &desc, MH_KIND_CONSTRUCTOR)?;
     // Stash the ALREADY-RESOLVED ClassId (from the caller's own Class
     // mirror, class_obj) in the otherwise-unused MH_BOUND slot. Two
     // classes minted under different ClassLoaders can share the same
@@ -3860,7 +3860,7 @@ fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let loaded = ctx.ensure_class_initialized(&class).is_ok();
     ctx.unpin_native_roots(class_obj_pin);
     lookup_require_method(ctx, loaded, &class, &name, &desc)?;
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SPECIAL);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SPECIAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -3928,7 +3928,7 @@ fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // predicate that understands stubs shows up.
     let _ = ctx.resolve_field_index(&class, &name);
     let desc = format!("(L{class};){field_desc}");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -3958,7 +3958,7 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Permissive for the same reason as `lookup_find_getter` above.
     let _ = ctx.resolve_field_index(&class, &name);
     let desc = format!("(L{class};{field_desc})V");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -3972,7 +3972,7 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_GETTER,
-            )))));
+            )?))));
         }
     };
     let name_obj = match args.get(2) {
@@ -3984,7 +3984,7 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_GETTER,
-            )))));
+            )?))));
         }
     };
     let type_obj = match args.get(3) {
@@ -3996,14 +3996,14 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_GETTER,
-            )))));
+            )?))));
         }
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let desc = format!("(){field_desc}");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4017,7 +4017,7 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_SETTER,
-            )))));
+            )?))));
         }
     };
     let name_obj = match args.get(2) {
@@ -4029,7 +4029,7 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_SETTER,
-            )))));
+            )?))));
         }
     };
     let type_obj = match args.get(3) {
@@ -4041,14 +4041,14 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 "",
                 "",
                 MH_KIND_SETTER,
-            )))));
+            )?))));
         }
     };
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
     let desc = format!("({field_desc})V");
-    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER);
+    let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -4092,7 +4092,7 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
 
     let vh =
-        alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id);
+        alloc_instance_var_handle(ctx, &class, &field_name, &field_desc, field_index, class_id)?;
     Ok(Some(Value::Object(Some(vh))))
 }
 
@@ -4119,7 +4119,7 @@ fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let field_name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
 
-    let vh = alloc_static_var_handle(ctx, &class, &field_name, &field_desc);
+    let vh = alloc_static_var_handle(ctx, &class, &field_name, &field_desc)?;
     Ok(Some(Value::Object(Some(vh))))
 }
 
@@ -4200,7 +4200,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
     // Build the MemberName. Its declared layout is documented on the `MN_*`
     // constants next to `native_mhn_resolve`.
-    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+    let mn = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT)?;
 
     // clazz: Class mirror of the declaring class. Fall back to a synthetic
     // mirror only if the class is genuinely unloadable.
@@ -4210,7 +4210,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             let _ = ctx.ensure_class_initialized(&class);
             match ctx.class_id_by_name(&class) {
                 Some(cid) => ctx.get_class_mirror(cid),
-                None => alloc_concurrent_synthetic(ctx, "java/lang/Class", 1),
+                None => try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?,
             }
         }
     };
@@ -4234,10 +4234,10 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // raw write is what a real one needs resolved on the receiver.
     let type_value = if kind_flag == IS_FIELD {
         let field_type_slice = field_type_from_desc(&desc, ref_kind);
-        Value::Object(Some(field_type_mirror(ctx, &field_type_slice)))
+        Value::Object(Some(field_type_mirror(ctx, &field_type_slice)?))
     } else {
-        let mt = build_method_type_from_descriptor(ctx, &desc)
-            .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+        let mt = build_method_type_from_descriptor(ctx, &desc)?
+            .or_else(|| build_method_type_from_descriptor(ctx, "()V")?);
         Value::Object(mt)
     };
     mn_set(ctx, mn, "type", MN_TYPE, type_value);
@@ -4258,7 +4258,7 @@ fn lookup_reveal_direct(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // bypass <init> assertions by direct field writes — they're disabled in
     // production JDKs anyway.
     let lookup_this = args.first().copied().unwrap_or(Value::Object(None));
-    let info = alloc_concurrent_synthetic(ctx, "java/lang/invoke/InfoFromMemberName", 2);
+    let info = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/InfoFromMemberName", 2)?;
     // Invoke the real constructor so any future-version field additions are
     // populated correctly. Falls back to direct field writes if invocation
     // fails (e.g. class not yet on the classpath in stripped runtimes).
@@ -4341,7 +4341,7 @@ fn field_type_from_desc(desc: &str, ref_kind: i32) -> String {
 }
 
 /// Build a Class mirror for a field-type descriptor slice (one JVM type).
-fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> ObjectRef {
+fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> Result<ObjectRef, MethodCallFailed> {
     // Primitive shortcuts: use a wrapper class mirror as a reasonable proxy.
     // Real JDK uses primitive-Class mirrors here; our wrapper substitutes
     // keep MemberName.getMethodType / getDeclaringClass consumers happy.
@@ -4354,22 +4354,22 @@ fn field_type_mirror(ctx: &mut dyn NativeContext, ty: &str) -> ObjectRef {
         Some('J') => "java/lang/Long",
         Some('S') => "java/lang/Short",
         Some('Z') => "java/lang/Boolean",
-        Some('L') => return field_type_mirror_class(ctx, &ty[1..ty.len().saturating_sub(1)]),
-        Some('[') => return field_type_mirror_class(ctx, ty),
+        Some('L') => return field_type_mirror_class(ctx, &ty[1..ty.len().saturating_sub(1)])?,
+        Some('[') => return field_type_mirror_class(ctx, ty)?,
         _ => "java/lang/Object",
     };
-    field_type_mirror_class(ctx, class_name)
+    Ok(field_type_mirror_class(ctx, class_name)?)
 }
 
-fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
+fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(cid) = ctx.class_id_by_name(class_name) {
-        return ctx.get_class_mirror(cid);
+        return Ok(ctx.get_class_mirror(cid));
     }
     let _ = ctx.ensure_class_initialized(class_name);
     if let Some(cid) = ctx.class_id_by_name(class_name) {
-        return ctx.get_class_mirror(cid);
+        return Ok(ctx.get_class_mirror(cid));
     }
-    alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)
+    Ok(try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?)
 }
 
 // =============================================================================
@@ -4408,8 +4408,8 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
                 // C19: allocate past the real-JDK instance-field count so the
                 // `type:MethodType` field at slot 0 is populated with a non-null
                 // MethodType. Synthesize `()V` — callers only need a non-null.
-                let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-                if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
+                let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
+                if let Some(mt) = build_method_type_from_descriptor(ctx, "()V")? {
                     ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
                 }
                 Ok(Some(Value::Object(Some(obj))))
@@ -4437,7 +4437,7 @@ pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegist
 /// This mirrors the existing `register_array_element_accessor_bridges`
 /// pattern (another concrete `MethodHandles` static factory whose JDK
 /// bytecode CratonVM cannot execute).
-pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
@@ -4451,13 +4451,14 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
                 _ => DESC_OBJECT.to_string(),
             };
             let desc = format!("(){ret_desc}");
-            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT);
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_CONSTANT)?;
             let value = args.get(1).copied().unwrap_or(Value::Object(None));
             ctx.set_field(handle, MH_BOUND, value);
             Ok(Some(Value::Object(Some(handle))))
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// `MethodHandles.identity(Class type)` — a *functional* shim returning an
@@ -4471,7 +4472,7 @@ pub(crate) fn register_method_handles_constant_bridge(r: &mut NativeMethodRegist
 /// read — so `identity().invoke()` / `.bindTo()` fail (OOB field reads on
 /// slots 16–19). Groovy's `IndyInterface` and any `SwitchPoint`/dispatch chain
 /// that threads values through `identity` needs this.
-pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
@@ -4484,11 +4485,12 @@ pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegist
                 _ => DESC_OBJECT.to_string(),
             };
             let desc = format!("({ty}){ty}");
-            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_IDENTITY);
+            let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_IDENTITY)?;
             Ok(Some(Value::Object(Some(handle))))
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// `CallSite.dynamicInvoker()` (concrete on `MutableCallSite` /
@@ -4503,7 +4505,7 @@ pub(crate) fn register_method_handles_identity_bridge(r: &mut NativeMethodRegist
 /// `SwitchPoint.<init>` calls `mcs.dynamicInvoker()`, so without this shim
 /// every `new SwitchPoint()` — and therefore Apache Groovy's
 /// `IndyInterface.<clinit>` at runtime — hangs.
-pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     for cs in [
@@ -4521,13 +4523,14 @@ pub(crate) fn register_callsite_dynamic_invoker_bridge(r: &mut NativeMethodRegis
                 // nullary Object-returning type when the target is unreadable.
                 let desc =
                     callsite_target_desc(ctx, this).unwrap_or_else(|| format!("(){DESC_OBJECT}"));
-                let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER);
+                let handle = alloc_method_handle(ctx, "", "", &desc, MH_KIND_DYNAMIC_INVOKER)?;
                 ctx.set_field(handle, MH_BOUND, Value::Object(Some(this)));
                 Ok(Some(Value::Object(Some(handle))))
             },
         );
     }
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4567,7 +4570,7 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // and re-read the forwarded references before their next use.
     let orig_mh_pin = ctx.pin_native_root(orig_mh);
     let extra_classes_pin = ctx.pin_native_root(extra_classes);
-    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP);
+    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP)?;
     let orig_mh = ctx.read_native_pin(orig_mh_pin, orig_mh);
     let extra_classes = ctx.read_native_pin(extra_classes_pin, extra_classes);
     ctx.set_field(wrapper, MH_BOUND, Value::Object(Some(orig_mh)));
@@ -4603,12 +4606,12 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             // GC-safety: `alloc_concurrent_synthetic` below can trigger a
             // collection that relocates `new_ptypes` (fully populated above,
             // read again once the new MethodType wraps it).
-            let new_mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let new_mt = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             let new_ptypes = ctx.read_native_pin(new_ptypes_pin, new_ptypes);
             ctx.unpin_native_roots(orig_ptypes_pin);
             ctx.set_field(new_mt, 0, ret);
             ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
-            populate_method_type_form(ctx, new_mt);
+            populate_method_type_form(ctx, new_mt)?;
             ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
         }
     }
@@ -4638,7 +4641,7 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 ///   target's `MethodType` to the site's; synthetic `MethodType`s don't
 ///   `equals()` the JDK forms → `WrongMethodTypeException`. Shim it to store
 ///   the target field directly (dispatch ignores types anyway).
-pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
 
@@ -4658,12 +4661,12 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 _ => 0,
             };
             let values = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3);
+            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3)?;
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, values);
             ctx.set_field(wrapper, 2, Value::Int(pos));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             // type(): insertArguments at `pos` REMOVES `values.length` parameters
             // (the bound ones) from the target's type. Chain off the target's
@@ -4684,7 +4687,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                             params.drain(p..end);
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc)? {
                             ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -4705,12 +4708,12 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_wrapper__", 2);
+            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_collect_wrapper__", 2)?;
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter =
-                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
+                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             // type(): asCollector REPLACES the trailing array parameter with
             // `count` parameters of the array's component type (HotSpot:
@@ -4737,7 +4740,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                         params.push(comp.clone());
                     }
                     let new_desc = format!("({}){}", params.concat(), ret);
-                    if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                    if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc)? {
                         ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                     }
                 }
@@ -4757,11 +4760,11 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
                 Some(Value::Int(c)) => *c,
                 _ => 0,
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_spread_wrapper__", 2);
+            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_spread_wrapper__", 2)?;
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "spread", &desc, MH_KIND_SPREAD);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "spread", &desc, MH_KIND_SPREAD)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
@@ -4793,7 +4796,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
         "makeUninitializedCallSite",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let handle = alloc_method_handle(ctx, "", "uninit", "", MH_KIND_CONSTANT);
+            let handle = alloc_method_handle(ctx, "", "uninit", "", MH_KIND_CONSTANT)?;
             if let Some(Value::Object(Some(mt))) = args.get(1) {
                 ctx.set_field_by_name(handle, "type", Value::Object(Some(*mt)));
             }
@@ -4830,6 +4833,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
     }
 
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Read a call site's current target MethodHandle descriptor (real
@@ -4851,10 +4855,10 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
     // Functional `constant`/`identity` shims (shared with the real-JDK
     // essentials path).
     register_method_handles_constant_bridge(r);
-    register_method_handles_identity_bridge(r);
+    register_method_handles_identity_bridge(r)?;
     // Functional `insertArguments`/`asCollector` + CallSite-construction
     // natives (shared with the real-JDK essentials path).
-    register_method_handle_combinator_extras_bridge(r);
+    register_method_handle_combinator_extras_bridge(r)?;
     r.register(
         mh,
         "dropArguments",
@@ -4867,7 +4871,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
             // C19: empty(mt) takes a MethodType — thread it into `type`.
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(obj, "type", Value::Object(Some(*mt)));
             }
@@ -4879,8 +4883,8 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
         "zero",
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17)?;
+            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V")? {
                 ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
             }
             Ok(Some(Value::Object(Some(obj))))
@@ -4930,9 +4934,9 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // MethodHandle itself. Answer them consistently off that, so
     // `isWrapperInstance(asInterfaceInstance(...))` is true and the two
     // accessors return the target and its type instead of null.
-    fn mhp_wrapper_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    fn mhp_wrapper_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<ObjectRef>, MethodCallFailed> {
         let Some(Value::Object(Some(obj))) = args.first().copied() else {
-            return None;
+            return Ok(None);
         };
         let mh_class_id = ctx.class_id_by_name("java/lang/invoke/MethodHandle")?;
         let obj_class_id = ctx.class_id_of_object(obj);
@@ -4947,7 +4951,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         "isWrapperInstance",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
-            let present = mhp_wrapper_handle(ctx, args).is_some();
+            let present = mhp_wrapper_handle(ctx, args)?.is_some();
             Ok(Some(Value::Int(if present { 1 } else { 0 })))
         },
     );
@@ -4955,7 +4959,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         mhp,
         "wrapperInstanceTarget",
         "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, args| match mhp_wrapper_handle(ctx, args) {
+        |ctx, args| match mhp_wrapper_handle(ctx, args)? {
             // Real JDK throws IllegalArgumentException for a non-wrapper; we
             // keep the historical null there so an existing caller that never
             // checked `isWrapperInstance` first does not start throwing.
@@ -5060,7 +5064,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // whose abstract method runs the impl method.
             if let Some(ccs) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, false,
-            ) {
+            )? {
                 if key.impl_ != 0 {
                     lambda_callsite_cache().lock().insert(key, ccs);
                 }
@@ -5082,11 +5086,11 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
                 "()Ljava/lang/Object;",
                 MH_KIND_STATIC,
-            );
+            )?;
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)?))))
         });
     r.register(lmf, "altMetafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
@@ -5139,7 +5143,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             };
             if let Some(ccs) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, ser_flag,
-            ) {
+            )? {
                 if key.impl_ != 0 {
                     lambda_callsite_cache().lock().insert(key, ccs);
                 }
@@ -5156,11 +5160,11 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
                 "()Ljava/lang/Object;",
                 MH_KIND_STATIC,
-            );
+            )?;
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)?))))
         });
 
     // NB: an earlier draft added a short-circuit for
@@ -5638,12 +5642,12 @@ pub(crate) fn alloc_method_handle(
     name: &str,
     desc: &str,
     kind: i32,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     // C15: Allocate MH_BOUND+1 slots so our synthetic fields (at slots 16-20)
     // live PAST the real JDK's instance-field count (6). This prevents
     // `set_field_by_name(mh, "type", ...)` — which resolves to slot 0 — from
     // overwriting our class/name/desc/kind/bound data.
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1)?;
     // GC-safety: the `create_string` calls below (and `build_method_type_
     // from_descriptor` further down) can trigger a collection that
     // relocates `mh`; `cls`/`nm` are each also read again after a LATER
@@ -5703,8 +5707,8 @@ pub(crate) fn alloc_method_handle(
     } else {
         desc
     };
-    let mt_opt = build_method_type_from_descriptor(ctx, type_desc)
-        .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+    let mt_opt = build_method_type_from_descriptor(ctx, type_desc)?
+        .or_else(|| build_method_type_from_descriptor(ctx, "()V")?);
     // `build_method_type_from_descriptor` allocates too; re-read `mh` once
     // more before its final use, then release the whole pinned batch.
     let mh = ctx.read_native_pin(mh_pin, mh);
@@ -5712,7 +5716,7 @@ pub(crate) fn alloc_method_handle(
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     ctx.unpin_native_roots(mh_pin);
-    mh
+    Ok(mh)
 }
 
 /// Round-9 perf: render a `Value` into its Java `String.valueOf(...)`
@@ -5797,11 +5801,11 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx: &mut dyn NativeContext,
     recipe: &str,
     constants: Option<cratonvm_types::ObjectRef>,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     // Reuse the MethodHandle synthetic skeleton — same field layout as
     // alloc_method_handle, but the class slot carries the recipe string
     // instead of a class name.
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1);
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_BOUND + 1)?;
     // GC-safety: see `alloc_method_handle` above -- the same triple-
     // `create_string` + subsequent-allocation shape, on the same
     // MethodHandle-skeleton object. Pin everything and re-read the
@@ -5821,7 +5825,7 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx.set_field(mh, MH_KIND, Value::Int(MH_KIND_STRING_CONCAT));
     // Wrap the constants array in a 1-field holder so MH_BOUND is a single
     // ObjectRef (the rest of mh_dispatch assumes that shape).
-    let holder = alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1);
+    let holder = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/StringConcatFactory$Const", 1)?;
     let mh = ctx.read_native_pin(mh_pin, mh);
     ctx.set_field(
         holder,
@@ -5834,13 +5838,13 @@ pub(crate) fn alloc_string_concat_method_handle(
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(holder)));
     // Populate the real-JDK `type:MethodType` field at slot 0 so JDK-internal
     // `mh.type()` walks see a non-null MethodType.
-    let mt_opt = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;");
+    let mt_opt = build_method_type_from_descriptor(ctx, "()Ljava/lang/String;")?;
     let mh = ctx.read_native_pin(mh_pin, mh);
     if let Some(mt) = mt_opt {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
     ctx.unpin_native_roots(mh_pin);
-    mh
+    Ok(mh)
 }
 
 /// Read the class name string from a MethodHandle (field MH_CLASS).
@@ -5961,12 +5965,12 @@ fn mh_kind_to_ref_kind(mh_kind: i32) -> u8 {
 fn alloc_frozen_constant_call_site(
     ctx: &mut dyn NativeContext,
     target_mh: cratonvm_types::ObjectRef,
-) -> cratonvm_types::ObjectRef {
-    let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    let ccs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
     ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
     ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
     ctx.set_field_by_name(ccs, "isFrozen", Value::Int(1));
-    ccs
+    Ok(ccs)
 }
 
 /// Build a real lambda-factory `CallSite` from the reflective
@@ -5989,7 +5993,7 @@ fn build_reflective_lambda_callsite(
     // `LambdaMetafactory.FLAG_SERIALIZABLE`, as passed by a reflective
     // `altMetafactory`. Plain `metafactory` has no flags word: `false`.
     serializable: bool,
-) -> Option<cratonvm_types::ObjectRef> {
+) -> Result<Option<cratonvm_types::ObjectRef>, MethodCallFailed> {
     let invoked_mt = invoked_type?;
     let impl_mh = impl_method?;
 
@@ -6011,7 +6015,7 @@ fn build_reflective_lambda_callsite(
     // Implementation method coordinates from the impl MethodHandle object.
     let impl_class = mh_read_class(ctx, impl_mh)?;
     if impl_class.is_empty() {
-        return None;
+        return Ok(None);
     }
     let impl_member = mh_read_name(ctx, impl_mh).unwrap_or_default();
     let impl_desc = mh_read_desc(ctx, impl_mh).unwrap_or_default();
@@ -6035,7 +6039,7 @@ fn build_reflective_lambda_callsite(
         serializable,
         );
         if proxy_cid == 0 {
-        return None;
+        return Ok(None);
     }
 
     // Factory MethodHandle: MH_CLASS = proxy ClassId (decimal), MH_DESC = the
@@ -6046,8 +6050,8 @@ fn build_reflective_lambda_callsite(
         invoked_name,
         &invoked_desc,
         MH_KIND_LAMBDA_FACTORY,
-    );
-    Some(alloc_frozen_constant_call_site(ctx, factory_mh))
+    )?;
+    Ok(Some(alloc_frozen_constant_call_site(ctx, factory_mh)?))
 }
 
 /// Core dispatch: given a populated MethodHandle and argument list, invoke it.
@@ -6127,7 +6131,7 @@ fn make_fold_adapter(
     // before each use.
     let target_pin = ctx.pin_native_root(target);
     let combiner_pin = ctx.pin_native_root(combiner_ref);
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3);
+    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_fold_wrapper__", 3)?;
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let combiner_ref = ctx.read_native_pin(combiner_pin, combiner_ref);
@@ -6137,7 +6141,7 @@ fn make_fold_adapter(
     let desc = mh_type_descriptor(ctx, target)
         .or_else(|| mh_read_desc(ctx, target))
         .unwrap_or_default();
-    let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD);
+    let adapter = alloc_method_handle(ctx, "__adapter__", "fold", &desc, MH_KIND_FOLD)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -6221,7 +6225,7 @@ fn make_collect_args_adapter(
     // each use.
     let target_pin = ctx.pin_native_root(target);
     let filter_pin = ctx.pin_native_root(filter_ref);
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3);
+    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_collect_args_wrapper__", 3)?;
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target = ctx.read_native_pin(target_pin, target);
     let filter_ref = ctx.read_native_pin(filter_pin, filter_ref);
@@ -6237,7 +6241,7 @@ fn make_collect_args_adapter(
         "collectargs",
         &desc,
         MH_KIND_COLLECT_ARGS,
-    );
+    )?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -7321,7 +7325,7 @@ pub(crate) fn native_record_support_deserialization_ctr(
         "<init>",
         "([B[Ljava/lang/Object;)Ljava/lang/Object;",
         MH_KIND_RECORD_DESER,
-    );
+    )?;
     let desc = ctx.read_native_pin(desc_pin, desc);
     ctx.set_field(mh, MH_BOUND, Value::Object(Some(desc)));
     ctx.unpin_native_roots(desc_pin);
@@ -8099,7 +8103,7 @@ fn auto_box_return(
     }
 }
 
-pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
+pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandle";
@@ -8290,12 +8294,12 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             {
                 let values = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
                 ctx.set_array_element(values, 0, recv);
-                let wrapper = alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3);
+                let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_insert_wrapper__", 3)?;
                 ctx.set_field(wrapper, 0, Value::Object(Some(this)));
                 ctx.set_field(wrapper, 1, Value::Object(Some(values)));
                 ctx.set_field(wrapper, 2, Value::Int(0));
                 let adapter =
-                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT)?;
                 ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
                 // Binding one value REMOVES the leading parameter from `this`'s
                 // type. The adapter's `type()` must reflect that (e.g. a fully
@@ -8311,14 +8315,14 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                             params.remove(0); // one value inserted at pos 0
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc)? {
                             ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
                         }
                     }
                 }
                 return Ok(Some(Value::Object(Some(adapter))));
             }
-            let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
+            let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind)?;
             // `bindTo` captures the LEADING argument, so the bound handle's
             // `type()` must have that leading parameter REMOVED (HotSpot:
             // `(Recv,Object)int`.bindTo(r) -> `(Object)int`). For virtual/special
@@ -8328,7 +8332,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // classes[] of the right length (was AIOOBE: classes longer than the
             // runtime args). STATIC-handle leading-arg drop is a separate path.
             if kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL {
-                if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+                if let Some(mt) = build_method_type_from_descriptor(ctx, &desc)? {
                     ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                 }
             } else if kind == MH_KIND_STATIC {
@@ -8346,7 +8350,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                             params.remove(0);
                         }
                         let new_desc = format!("({}){}", params.concat(), ret);
-                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc) {
+                        if let Some(mt) = build_method_type_from_descriptor(ctx, &new_desc)? {
                             ctx.set_field_by_name(new_mh, "type", Value::Object(Some(mt)));
                         }
                     }
@@ -8440,10 +8444,10 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(mt))));
             }
             let desc = mh_read_desc(ctx, this).unwrap_or_default();
-            if let Some(mt) = build_method_type_from_descriptor(ctx, &desc) {
+            if let Some(mt) = build_method_type_from_descriptor(ctx, &desc)? {
                 return Ok(Some(Value::Object(Some(mt))));
             }
-            let mt = build_method_type_from_descriptor(ctx, "()V");
+            let mt = build_method_type_from_descriptor(ctx, "()V")?;
             Ok(Some(Value::Object(mt)))
         },
     );
@@ -8451,15 +8455,16 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
     // Lookup.find* are already registered in register_p63_method_handles_lookup
     // with full descriptor resolution. No duplicate registration needed here.
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 /// Build a MethodType object from a JVM method descriptor string.
 pub fn build_method_type_from_descriptor(
     ctx: &mut dyn NativeContext,
     desc: &str,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if desc.is_empty() || !desc.starts_with('(') {
-        return None;
+        return Ok(None);
     }
 
     let close = desc.find(')')?;
@@ -8506,15 +8511,15 @@ pub fn build_method_type_from_descriptor(
     // JDK MethodType field layout: rtype(0), ptypes(1), form(2), wrapAlt(3),
     // invokers(4), methodDescriptor(5). Allocate 6 slots so the JDK-resolved
     // `form` slot (2) lives within the synthetic object.
-    let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+    let mt = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
     let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(ret_mirror_pin);
     ctx.set_field(mt, 0, Value::Object(Some(ret_mirror)));
     ctx.set_field(mt, 1, Value::Object(Some(arr)));
 
-    populate_method_type_form(ctx, mt);
-    Some(mt)
+    populate_method_type_form(ctx, mt)?;
+    Ok(Some(mt))
 }
 
 /// C21: Build a synthetic MethodTypeForm and link it into `mt.form` so
@@ -8535,7 +8540,7 @@ pub fn build_method_type_from_descriptor(
 pub(crate) fn populate_method_type_form(
     ctx: &mut dyn NativeContext,
     mt: cratonvm_types::ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let mut slot_count: i32 = 0;
     let mut primitive_count: i32 = 0;
     if let Value::Object(Some(arr)) = ctx.get_field(mt, 1) {
@@ -8554,12 +8559,13 @@ pub(crate) fn populate_method_type_form(
             }
         }
     }
-    let form = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodTypeForm", 7);
+    let form = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodTypeForm", 7)?;
     ctx.set_field(form, 0, Value::Int(slot_count));
     ctx.set_field(form, 1, Value::Int(primitive_count));
     ctx.set_field(form, 2, Value::Object(Some(mt)));
     ctx.set_field(form, 3, Value::Object(Some(mt)));
     ctx.set_field(mt, 2, Value::Object(Some(form)));
+    Ok(())
 }
 
 /// Parse a sequence of JVM type descriptors from a parameter string.
@@ -8650,7 +8656,7 @@ fn parse_descriptor_types(desc: &str) -> Vec<Cow<'static, str>> {
 // T2.8: MethodHandle completeness — unreflect, permuteArguments, guardWithTest
 // =============================================================================
 
-pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
+pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFailed> {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // I2 follow-up: register `ClassLoader.{getDefinedPackage,
@@ -8767,7 +8773,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filters → behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_filter_wrapper__", 3);
+            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_filter_wrapper__", 3)?;
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filters)));
             ctx.set_field(wrapper, 2, Value::Int(pos));
@@ -8776,7 +8782,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             let desc = mh_type_descriptor(ctx, target)
                 .or_else(|| mh_read_desc(ctx, target))
                 .unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "filter", &desc, MH_KIND_FILTER);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "filter", &desc, MH_KIND_FILTER)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
@@ -8801,7 +8807,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 // No filter -> behaves like the identity wrapper over target.
                 _ => return Ok(Some(Value::Object(Some(target)))),
             };
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2);
+            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_retfilter_wrapper__", 2)?;
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, Value::Object(Some(filter)));
             // The adapter's parameter types match the target's; its return
@@ -8819,7 +8825,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
                 _ => target_desc,
             };
             let adapter =
-                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER);
+                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },
@@ -8867,14 +8873,14 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             };
             let catch_type = args.get(1).copied().unwrap_or(Value::Object(None));
             let handler = args.get(2).copied().unwrap_or(Value::Object(None));
-            let wrapper = alloc_concurrent_synthetic(ctx, "__mh_catch_wrapper__", 3);
+            let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_catch_wrapper__", 3)?;
             ctx.set_field(wrapper, 0, Value::Object(Some(target)));
             ctx.set_field(wrapper, 1, catch_type);
             ctx.set_field(wrapper, 2, handler);
             let desc = mh_type_descriptor(ctx, target)
                 .or_else(|| mh_read_desc(ctx, target))
                 .unwrap_or_default();
-            let adapter = alloc_method_handle(ctx, "__adapter__", "catch", &desc, MH_KIND_CATCH);
+            let adapter = alloc_method_handle(ctx, "__adapter__", "catch", &desc, MH_KIND_CATCH)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             if let Value::Object(Some(mt)) = ctx.get_field_by_name(target, "type") {
                 ctx.set_field_by_name(adapter, "type", Value::Object(Some(mt)));
@@ -8896,7 +8902,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "exactInvoker",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER)?;
             // C19: propagate the caller's MethodType into the real-JDK
             // `type` field so `mh.type()` / `parameterSlotCount` do not NPE.
             if let Some(Value::Object(Some(mt))) = args.first() {
@@ -8910,7 +8916,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "invoker",
         "(Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER)?;
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
             }
@@ -8922,7 +8928,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "spreadInvoker",
         "(Ljava/lang/invoke/MethodType;I)Ljava/lang/invoke/MethodHandle;",
         |ctx, args| {
-            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER);
+            let mh = alloc_method_handle(ctx, "", "", "", MH_KIND_INVOKER)?;
             if let Some(Value::Object(Some(mt))) = args.first() {
                 ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
             }
@@ -8939,6 +8945,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -8985,7 +8992,7 @@ fn lookup_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     let _ = ctx.ensure_class_initialized(&class_name);
-    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, kind);
+    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, kind)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9015,7 +9022,7 @@ fn lookup_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let descriptor = crate::lang_class::read_method_descriptor(ctx, method_obj).unwrap_or_default();
 
     let _ = ctx.ensure_class_initialized(&class_name);
-    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, MH_KIND_SPECIAL);
+    let mh = alloc_method_handle(ctx, &class_name, &method_name, &descriptor, MH_KIND_SPECIAL)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9088,7 +9095,7 @@ fn lookup_unreflect_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     } else {
         format!("(L{class_name};){field_desc}")
     };
-    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_GETTER);
+    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_GETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9123,7 +9130,7 @@ fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     } else {
         format!("(L{class_name};{field_desc})V")
     };
-    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_SETTER);
+    let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_SETTER)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9155,7 +9162,7 @@ fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return Err(no_such_field_error(&class_name, &field_name));
     }
     if (modifiers & ACC_STATIC) != 0 {
-        let vh = alloc_static_var_handle(ctx, &class_name, &field_name, &field_desc);
+        let vh = alloc_static_var_handle(ctx, &class_name, &field_name, &field_desc)?;
         return Ok(Some(Value::Object(Some(vh))));
     }
     let field_index = ctx.resolve_field_index(&class_name, &field_name).unwrap_or(0);
@@ -9176,7 +9183,7 @@ fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         &field_desc,
         field_index,
         class_id,
-    );
+    )?;
     Ok(Some(Value::Object(Some(vh))))
 }
 
@@ -9254,7 +9261,7 @@ fn varhandle_to_method_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             },
         ));
     };
-    let mh = alloc_method_handle(ctx, &class, &field, &desc, kind);
+    let mh = alloc_method_handle(ctx, &class, &field, &desc, kind)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9295,7 +9302,7 @@ fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let _ = ctx.ensure_class_initialized(&class_name);
-    let mh = alloc_method_handle(ctx, &class_name, "<init>", &desc, MH_KIND_CONSTRUCTOR);
+    let mh = alloc_method_handle(ctx, &class_name, "<init>", &desc, MH_KIND_CONSTRUCTOR)?;
     // See the matching comment in lookup_find_constructor: stash the
     // already-resolved class_id (from the Constructor reflection
     // object's own clazz mirror) so dispatch doesn't re-resolve class_name
@@ -9333,7 +9340,7 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let target_pin = ctx.pin_native_root(target_mh);
     let reorder_pin = ctx.pin_native_root(reorder_arr);
     // Create a wrapper synthetic to hold (target_mh, reorder_arr)
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_permute_wrapper__", 2);
+    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_permute_wrapper__", 2)?;
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
     let reorder_arr = ctx.read_native_pin(reorder_pin, reorder_arr);
@@ -9341,7 +9348,7 @@ fn mhs_permute_arguments(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(wrapper, 1, Value::Object(Some(reorder_arr)));
 
     // Create the adapter MH with kind=PERMUTE
-    let adapter = alloc_method_handle(ctx, "__adapter__", "permute", &new_desc, MH_KIND_PERMUTE);
+    let adapter = alloc_method_handle(ctx, "__adapter__", "permute", &new_desc, MH_KIND_PERMUTE)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -9422,7 +9429,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let target_pin = ctx.pin_native_root(target_mh);
     let fallback_pin = ctx.pin_native_root(fallback_mh);
     // Create a wrapper synthetic to hold (test, target, fallback)
-    let wrapper = alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3);
+    let wrapper = try_alloc_concurrent_synthetic(ctx, "__mh_guard_wrapper__", 3)?;
     let wrapper_pin = ctx.pin_native_root(wrapper);
     let test_mh = ctx.read_native_pin(test_pin, test_mh);
     let target_mh = ctx.read_native_pin(target_pin, target_mh);
@@ -9435,7 +9442,7 @@ fn mhs_guard_with_test(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // full (receiver-inclusive) param list, so alloc_method_handle installs a
     // `type` MethodType with the correct arity for the GUARD kind (which does
     // NOT itself prepend a receiver).
-    let adapter = alloc_method_handle(ctx, "__adapter__", "guard", &target_desc, MH_KIND_GUARD);
+    let adapter = alloc_method_handle(ctx, "__adapter__", "guard", &target_desc, MH_KIND_GUARD)?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(test_pin);
     ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
@@ -9779,13 +9786,13 @@ pub(crate) fn native_mhn_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             let ptypes_pin = ctx.pin_native_root(ptypes_ref);
             let void_mirror = ctx.primitive_class_mirror(NAME_VOID);
             let void_mirror_pin = ctx.pin_native_root(void_mirror);
-            let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            let mt = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6)?;
             let void_mirror = ctx.read_native_pin(void_mirror_pin, void_mirror);
             let ptypes_ref = ctx.read_native_pin(ptypes_pin, ptypes_ref);
             ctx.unpin_native_roots(ptypes_pin);
             ctx.set_field(mt, 0, Value::Object(Some(void_mirror)));
             ctx.set_field(mt, 1, Value::Object(Some(ptypes_ref)));
-            populate_method_type_form(ctx, mt);
+            populate_method_type_form(ctx, mt)?;
             let member_name = ctx.read_native_pin(member_name_pin, member_name);
             mn_set(ctx, member_name, "type", MN_TYPE, Value::Object(Some(mt)));
         }
@@ -9870,7 +9877,7 @@ pub(crate) fn native_mhn_link_method(
         _ => MH_KIND_VIRTUAL,
     };
 
-    let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind);
+    let mh = alloc_method_handle(ctx, &class_name, &name, &desc, mh_kind)?;
     Ok(Some(Value::Object(Some(mh))))
 }
 
@@ -9901,7 +9908,7 @@ pub(crate) fn native_mhn_link_call_site(
     };
 
     // Allocate a virtual MH as the linked target
-    let mh = alloc_method_handle(ctx, "", &name, &desc, MH_KIND_VIRTUAL);
+    let mh = alloc_method_handle(ctx, "", &name, &desc, MH_KIND_VIRTUAL)?;
 
     // If appendixResult array is provided, store the MH as appendix
     if let Some(Value::Object(Some(appendix_arr))) = args.get(5) {
@@ -9998,8 +10005,8 @@ fn alloc_resolved_member_name(
     host_class: &str,
     name: &str,
     desc: &str,
-) -> ObjectRef {
-    let mn = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let mn = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT)?;
 
     // clazz: use the host class mirror (must be a valid Class mirror for
     // downstream `mn.getDeclaringClass()` reads).
@@ -10009,7 +10016,7 @@ fn alloc_resolved_member_name(
         .unwrap_or_else(|| {
             // Fallback: allocate a synthetic Class stub — should not normally
             // happen since LambdaForm is always loaded before this path.
-            alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)
+            try_alloc_concurrent_synthetic(ctx, "java/lang/Class", 1)?
         });
     mn_set(
         ctx,
@@ -10024,8 +10031,8 @@ fn alloc_resolved_member_name(
     mn_set(ctx, mn, "name", MN_NAME, Value::Object(Some(name_str)));
 
     // type: MethodType built from desc (fall back to ()V if desc is garbage)
-    let mt = build_method_type_from_descriptor(ctx, desc)
-        .or_else(|| build_method_type_from_descriptor(ctx, "()V"));
+    let mt = build_method_type_from_descriptor(ctx, desc)?
+        .or_else(|| build_method_type_from_descriptor(ctx, "()V")?);
     if let Some(mt) = mt {
         mn_set(ctx, mn, "type", MN_TYPE, Value::Object(Some(mt)));
     }
@@ -10041,7 +10048,7 @@ fn alloc_resolved_member_name(
     // `resolution == null` is what the real `MemberName.isResolved()` reads.
     mn_set(ctx, mn, "resolution", MN_RESOLUTION, Value::Object(None));
 
-    mn
+    Ok(mn)
 }
 
 /// C33: Native bypass for
@@ -10067,7 +10074,7 @@ pub(crate) fn native_ibg_generate_interpreter_entry_point(
         .map(|(_, r)| r.chars().next().unwrap_or('V'))
         .unwrap_or('V');
     let name = format!("interpret_{}", ret_char);
-    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", &name, &desc);
+    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", &name, &desc)?;
     Ok(Some(Value::Object(Some(mn))))
 }
 
@@ -10087,7 +10094,7 @@ pub(crate) fn native_ibg_generate_customized_code(
         Some(Value::Object(Some(mt))) => descriptor_from_method_type(ctx, *mt),
         _ => DESC_DEFAULT_METHOD.to_string(),
     };
-    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "MH", &desc);
+    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "MH", &desc)?;
     Ok(Some(Value::Object(Some(mn))))
 }
 
@@ -10103,7 +10110,7 @@ pub(crate) fn native_ibg_generate_named_function_invoker(
     // args: LambdaForm.NamedFunction$Kind typeForm (0) OR MethodTypeForm (0)
     // We don't read it — just return a resolved MemberName with ()V type.
     let _ = args;
-    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "NFI", "()V");
+    let mn = alloc_resolved_member_name(ctx, "java/lang/invoke/LambdaForm", "NFI", "()V")?;
     Ok(Some(Value::Object(Some(mn))))
 }
 
@@ -10134,7 +10141,7 @@ mod tests {
             "identity",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             MH_KIND_IDENTITY,
-        );
+        )?;
         // Simulates `dropArguments(leaf, 1, [Object.class, Object.class])`:
         // a 3-param adapter where params[1..3] are dropped and param[0] is
         // the one forwarded to `leaf`. Built directly (bypassing
@@ -10146,15 +10153,15 @@ mod tests {
             "drop",
             "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             MH_KIND_DROP,
-        );
+        )?;
         ctx.set_field(adapter, MH_BOUND, Value::Object(Some(leaf)));
 
         // Three distinct sentinel objects so a wrong-position bug (e.g. a
         // dropped arg silently reaching `leaf` instead of the kept one)
         // is unmistakable rather than accidentally passing.
-        let kept = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
-        let dropped1 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
-        let dropped2 = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0);
+        let kept = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
+        let dropped1 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
+        let dropped2 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
         let args = [
             Value::Object(Some(kept)),
             Value::Object(Some(dropped1)),
@@ -10181,7 +10188,7 @@ mod tests {
             "parseInt",
             "(Ljava/lang/String;)I",
             MH_KIND_STATIC,
-        );
+        )?;
         // In the mock, `set_field_by_name("type", ...)` maps to slot 2
         // (see test_utils::mock_jdk_field_slot) — that's the same slot
         // the MH write-path targets, so reading it back yields the
@@ -10222,7 +10229,7 @@ mod tests {
     #[test]
     fn build_method_type_from_descriptor_non_null() {
         let mut ctx = MockNativeContext::new();
-        let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I");
+        let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I")?;
         assert!(
             mt.is_some(),
             "MethodType should be non-null for a valid descriptor"
@@ -10233,8 +10240,8 @@ mod tests {
     #[test]
     fn build_method_type_from_descriptor_rejects_garbage() {
         let mut ctx = MockNativeContext::new();
-        assert!(build_method_type_from_descriptor(&mut ctx, "").is_none());
-        assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor").is_none());
+        assert!(build_method_type_from_descriptor(&mut ctx, "")?.is_none());
+        assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor")?.is_none());
     }
 
     #[test]
@@ -10246,7 +10253,7 @@ mod tests {
             "containsKey",
             "(Ljava/lang/Object;)Z",
             MH_KIND_VIRTUAL,
-        );
+        )?;
         let effective_desc =
             ctx.create_string("(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
         ctx.set_field(mh, MH_DESC, Value::Object(Some(effective_desc)));
@@ -10278,7 +10285,7 @@ mod tests {
             "containsKey",
             "(Ljava/lang/Object;)Z",
             MH_KIND_VIRTUAL,
-        );
+        )?;
         let result = box_direct_primitive_return(
             &mut ctx,
             mh,
@@ -10348,7 +10355,7 @@ mod tests {
             "java/lang/invoke/LambdaForm",
             "interpret_V",
             "()V",
-        );
+        )?;
         match mn_get(&mut ctx, mn, "clazz", MN_CLAZZ) {
             Value::Object(Some(_)) => {}
             other => panic!("expected clazz to be non-null, got {:?}", other),
@@ -10391,7 +10398,7 @@ mod tests {
     #[test]
     fn mn_synthetic_layout_predicate_is_true_without_a_method_field() {
         let mut ctx = MockNativeContext::new();
-        let mn = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT);
+        let mn = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT)?;
         assert!(
             mn_has_synthetic_layout(&mut ctx, mn),
             "a class declaring no instance field named `method` is not a real MemberName"
@@ -10403,7 +10410,7 @@ mod tests {
     #[test]
     fn c33_ibg_interpreter_entry_point_returns_non_null() {
         let mut ctx = MockNativeContext::new();
-        let mt = build_method_type_from_descriptor(&mut ctx, "(I)J").expect("MethodType");
+        let mt = build_method_type_from_descriptor(&mut ctx, "(I)J")?.expect("MethodType");
         let result =
             native_ibg_generate_interpreter_entry_point(&mut ctx, &[Value::Object(Some(mt))]);
         match result {
@@ -10417,8 +10424,8 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         // A LambdaForm and MethodType. Synthetic alloc for the form is fine
         // since the native doesn't read its fields.
-        let form = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/LambdaForm", 8);
-        let mt = build_method_type_from_descriptor(&mut ctx, "()V").expect("MethodType");
+        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/LambdaForm", 8)?;
+        let mt = build_method_type_from_descriptor(&mut ctx, "()V")?.expect("MethodType");
         let result = native_ibg_generate_customized_code(
             &mut ctx,
             &[Value::Object(Some(form)), Value::Object(Some(mt))],
@@ -10432,7 +10439,7 @@ mod tests {
     #[test]
     fn c33_ibg_named_function_invoker_returns_non_null() {
         let mut ctx = MockNativeContext::new();
-        let form = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6);
+        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6)?;
         let result =
             native_ibg_generate_named_function_invoker(&mut ctx, &[Value::Object(Some(form))]);
         match result {
@@ -10545,11 +10552,11 @@ mod tests {
     #[test]
     fn p67_memory_segment_varhandle_access_mode_type_uses_segment_and_offset_coordinates() {
         let mut ctx = MockNativeContext::new();
-        let vh = alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3);
+        let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3)?;
         register_p67_memory_segment_var_handle(&mut ctx, vh, 4);
 
         let access_type =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2)?;
         ctx.set_field(access_type, 1, Value::Int(0));
         let get_mt = match varhandle_access_mode_type_uncached(
             &mut ctx,

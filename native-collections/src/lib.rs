@@ -2290,8 +2290,15 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
 
 // ===========================================================================
 // Helper: allocate a synthetic object with a well-known class name
-/// Create a snapshot-based iterator (2 fields: array=0, cursor=1) from an existing array.pub fn make_iterator_from_array(    ctx: &mut dyn NativeContext,    array: ObjectRef,    _count: usize,) -> MethodCallResult {    let itr = try_alloc_synthetic(ctx, "java/util/Iterator", 2)?;    ctx.set_field(itr, 0, Value::Object(Some(array)));    ctx.set_field(itr, 1, Value::Int(0));    Ok(Some(Value::Object(Some(itr))))}
 // ===========================================================================
+//
+// An entire second `make_iterator_from_array` used to sit on the line above,
+// collapsed onto ONE line behind a `///` by some batch edit, so the whole
+// definition was silently a doc comment. It described the pre-2026-08-06
+// behaviour (mint `java/util/Iterator` and fill two slots) that the live
+// implementation above deliberately no longer has, and it would have become a
+// duplicate definition the moment anyone "fixed" the missing newline.
+// Deleted 2026-08-06.
 
 /// Allocate a synthetic object, trying to load the real class first.
 ///

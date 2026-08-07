@@ -83,7 +83,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -601,7 +601,7 @@ pub fn build_http_response(
 // ---------------------------------------------------------------------------
 
 fn native_undertow_builder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_UNDERTOW_BUILDER, UND_NUM_SLOTS);
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_UNDERTOW_BUILDER, UND_NUM_SLOTS)?;
     // The real Undertow$Builder layout is not compatible with the native
     // bridge's compact fields. Keep all bridge state outside the Java object.
     undertow_builder_configs()
@@ -683,7 +683,7 @@ fn native_builder_set_io_threads(ctx: &mut dyn NativeContext, args: &[Value]) ->
 fn native_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let config = builder_config_of(ctx, this);
-    let undertow = alloc_concurrent_synthetic(ctx, CLS_UNDERTOW, UND_NUM_SLOTS);
+    let undertow = try_alloc_concurrent_synthetic(ctx, CLS_UNDERTOW, UND_NUM_SLOTS)?;
     let id = next_id();
     // See `undertow_instance_id_of`: real Undertow fields have incompatible
     // types, so the instance association lives in the identity side table.
@@ -1087,7 +1087,7 @@ fn alloc_header_map_for_exchange(
             })),
         }
     } else {
-        let map = alloc_concurrent_synthetic(ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
+        let map = try_alloc_concurrent_synthetic(ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
         native_header_map_init(ctx, &[Value::Object(Some(map))])?;
         Ok(map)
     }
@@ -1200,7 +1200,7 @@ fn native_exchange_get_response_sender(
     match existing {
         Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
         _ => {
-            let sender = alloc_concurrent_synthetic(ctx, CLS_SENDER, 1);
+            let sender = try_alloc_concurrent_synthetic(ctx, CLS_SENDER, 1)?;
             ctx.set_field(sender, 0, Value::Object(Some(this)));
             if exchange_uses_real_layout(ctx, this, "sender") {
                 ctx.set_field_by_name(this, "sender", Value::Object(Some(sender)));
@@ -1782,8 +1782,8 @@ mod tests {
         assert!(!inst.running);
         let guard = inst.listeners[0].listener.lock().unwrap();
         assert!(guard.is_none(), "listener dropped on stop");
-        drop(guard);
-        drop(map);
+        drop(guard)?;
+        drop(map)?;
         // Re-bind the same port to prove the OS released it.
         let rebound = TcpListener::bind(format!("127.0.0.1:{saved_port}"));
         assert!(
@@ -1807,7 +1807,7 @@ mod tests {
     #[test]
     fn t19_2_d_http_string_synthetic_init_round_trips_text() {
         let mut ctx = mock_ctx();
-        let hs = alloc_concurrent_synthetic(&mut ctx, CLS_HTTP_STRING, HS_NUM_SLOTS);
+        let hs = try_alloc_concurrent_synthetic(&mut ctx, CLS_HTTP_STRING, HS_NUM_SLOTS)?;
         let text = ctx.create_string("HTTP/1.1");
         native_http_string_init(
             &mut ctx,
@@ -1823,7 +1823,7 @@ mod tests {
     #[test]
     fn t19_2_d_header_map_put_get_round_trip() {
         let mut ctx = mock_ctx();
-        let hm = alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
+        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
         native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
         let k = ctx.create_string("Content-Type");
         let v = ctx.create_string("application/json");
@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn t19_2_d_header_map_get_first_string_round_trip_remoting_key() {
         let mut ctx = mock_ctx();
-        let hm = alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
+        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
         native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
         let k = ctx.create_string("Sec-JbossRemoting-Key");
         let v = ctx.create_string("2DDsEnGla2nNyCzrLngBkw==");
@@ -1905,7 +1905,7 @@ mod tests {
     #[test]
     fn t19_2_d_header_map_rejects_crlf_injection_value() {
         let mut ctx = mock_ctx();
-        let hm = alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS);
+        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
         native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
         let k = ctx.create_string("X-Foo");
         let v = ctx.create_string("ok\r\nInjected: yes");
@@ -1925,7 +1925,7 @@ mod tests {
         let mut ctx = mock_ctx();
         // Fabricate a populated exchange and confirm the natives read back
         // the method / uri / headers we populated.
-        let ex = alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS);
+        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS)?;
         let method = ctx.create_string("GET");
         let uri = ctx.create_string("/auth/realms/master");
         ctx.set_field(ex, EX_FIELD_METHOD, Value::Object(Some(method)));
@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     fn t19_2_d_response_sender_send_writes_body() {
         let mut ctx = mock_ctx();
-        let ex = alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS);
+        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS)?;
         let sender_v = native_exchange_get_response_sender(&mut ctx, &[Value::Object(Some(ex))])
             .unwrap()
             .unwrap();
@@ -2037,7 +2037,7 @@ mod tests {
     #[test]
     fn t19_2_d_listener_service_get_bound_address_after_start() {
         let mut ctx = mock_ctx();
-        let ls = alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SVC, LS_NUM_SLOTS);
+        let ls = try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SVC, LS_NUM_SLOTS)?;
         // Simulate the `start` step having populated the bound-address
         // InetSocketAddress mirror (in real flow T19.5's net_local_inet_address
         // fills this in).
@@ -2059,7 +2059,7 @@ mod tests {
     #[test]
     fn t19_2_d_handler_panic_yields_500() {
         let mut ctx = mock_ctx();
-        let ex = alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS);
+        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS)?;
         // We don't have a real Java handler in the mock, but the dispatcher
         // resolves the invoke through `invoke_virtual`; the mock returns
         // Ok(None) when no script is primed. To exercise the panic branch

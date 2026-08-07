@@ -113,7 +113,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::keystore;
 
 // ---------------------------------------------------------------------------
@@ -3815,8 +3815,8 @@ fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
 /// `sun.security.x509.X509CertImpl` (real bytecode, so `toString()` and
 /// friends work correctly) parsed from the DER first, only falling back to
 /// a bare synthetic mirror if that construction itself fails.
-fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> ObjectRef {
-    crate::keystore::make_x509_mirror(ctx, alias, der)
+fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(crate::keystore::make_x509_mirror(ctx, alias, der)?)
 }
 
 fn make_private_key_mirror(
@@ -3824,8 +3824,8 @@ fn make_private_key_mirror(
     key_der: &[u8],
     km_id: i32,
     alias: &str,
-) -> ObjectRef {
-    let pk = alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PrivateKey", 4)?;
     // Same packing convention keystore.rs uses so the TLS path can decode
     // the (km_id, alias_hash) pair.
     let alias_hash = fnv1a_32(alias.as_bytes());
@@ -3841,7 +3841,7 @@ fn make_private_key_mirror(
     ctx.set_field(pk, 1, Value::Int((key_der.len() as i32).saturating_mul(8)));
     ctx.set_field(pk, 2, Value::Int(key_der.len() as i32));
     ctx.set_field(pk, 3, Value::Long(composite));
-    pk
+    Ok(pk)
 }
 
 /// Decode the `km_id` half of the `(km_id, alias_hash)` composite
@@ -4000,7 +4000,7 @@ fn get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
-        let mirror = make_x509_mirror(ctx, &alias, der);
+        let mirror = make_x509_mirror(ctx, &alias, der)?;
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -4018,7 +4018,7 @@ fn get_private_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             None => return Ok(Some(Value::Object(None))),
         }
     };
-    let pk = make_private_key_mirror(ctx, &key_der, id, &alias);
+    let pk = make_private_key_mirror(ctx, &key_der, id, &alias)?;
     Ok(Some(Value::Object(Some(pk))))
 }
 
@@ -4098,7 +4098,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
                 // Fallback to a system-only trust state — better than denying
                 // everything when init() was bypassed (which real-JDK permits
                 // for the implicit default trust manager).
-                drop(registry);
+                drop(registry)?;
                 (build_trust_manager_state(0), false)
             }
         }
@@ -4129,7 +4129,7 @@ fn get_accepted_issuers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         match registry.get(&id) {
             Some(s) => s.anchor_ders.clone(),
             None => {
-                drop(registry);
+                drop(registry)?;
                 let s = build_trust_manager_state(0);
                 s.anchor_ders
             }
@@ -4141,7 +4141,7 @@ fn get_accepted_issuers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, ders.len());
     for (i, der) in ders.iter().enumerate() {
-        let mirror = make_x509_mirror(ctx, "trust-anchor", der);
+        let mirror = make_x509_mirror(ctx, "trust-anchor", der)?;
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -4220,7 +4220,7 @@ fn kmf_engine_get_key_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         .ensure_class_initialized("javax/net/ssl/KeyManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
-    let km = alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2);
+    let km = try_alloc_concurrent_synthetic(ctx, FQN_SUN_X509_KM, 2)?;
     set_km_id(ctx, km, id);
     ctx.set_array_element(arr, 0, Value::Object(Some(km)));
     Ok(Some(Value::Object(Some(arr))))
@@ -4262,7 +4262,7 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
         .ensure_class_initialized("javax/net/ssl/TrustManager")
         .unwrap_or(cratonvm_types::ClassId::new(0));
     let arr = ctx.new_ref_array(cls_id, 1);
-    let tm = alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2);
+    let tm = try_alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2)?;
     set_tm_id(ctx, tm, id);
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(

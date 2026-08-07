@@ -51,7 +51,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::crypto_impl;
 
 // `java.security.Signature` (JDK 25) extends `SignatureSpi` and declares
@@ -913,7 +913,7 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     )?;
     let idx = algo_idx(&alg);
     let base = synthetic_base_offset(ctx, "java/security/Signature");
-    let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS)?;
     // SigProbe fix: side-table is the authoritative store; the base-offset
     // slot writes remain for any synthetic-mode caller that goes through
     // slot indexing.  C15: keyed on identity hash code so GC compaction

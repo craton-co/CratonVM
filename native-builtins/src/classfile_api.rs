@@ -18,7 +18,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 /// Throw a clear `UnsupportedOperationException` from a Class-File API entry
 /// point that CratonVM cannot honestly implement (real parsing / bytecode
@@ -35,10 +35,10 @@ fn classfile_unsupported(method: &str) -> MethodCallResult {
 /// Build a synthetic `Optional.empty()`. Several model accessors declare an
 /// `Optional` return; handing back a bare null there NPEs at the call site the
 /// moment the caller does the obligatory `isPresent()`/`orElse(...)`.
-fn empty_optional(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+fn empty_optional(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     ctx.set_field(opt, 0, Value::Object(None));
-    opt
+    Ok(opt)
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +94,7 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
 
     // of() -> ClassFile (default options, latest version)
     r.register(cf, "of", "()Ljava/lang/classfile/ClassFile;", |ctx, _| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassFile", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassFile", 2)?;
         ctx.set_field(obj, 0, Value::Int(0));
         ctx.set_field(obj, 1, Value::Int(CLASSFILE_MAJOR_69 as i32));
         Ok(Some(Value::Object(Some(obj))))
@@ -106,7 +106,7 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
         "of",
         "([Ljava/lang/classfile/ClassFile$Option;)Ljava/lang/classfile/ClassFile;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassFile", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassFile", 2)?;
             ctx.set_field(obj, 0, Value::Int(1)); // has options
             ctx.set_field(obj, 1, Value::Int(CLASSFILE_MAJOR_69 as i32));
             Ok(Some(Value::Object(Some(obj))))
@@ -205,7 +205,7 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let flags = ctx.get_field(this, 2);
-            let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
+            let af = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1)?;
             ctx.set_field(af, 0, flags);
             Ok(Some(Value::Object(Some(af))))
         },
@@ -219,7 +219,7 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 3);
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1)?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -229,33 +229,33 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let idx = ctx.get_field(this, 4);
         let entry =
-            alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
+            try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1)?;
         ctx.set_field(entry, 0, idx);
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         ctx.set_field(opt, 0, Value::Object(Some(entry)));
         Ok(Some(Value::Object(Some(opt))))
     });
 
     r.register(cm, "interfaces", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
 
     r.register(cm, "fields", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
 
     r.register(cm, "methods", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
 
     r.register(cm, "attributes", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
@@ -266,7 +266,7 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/classfile/constantpool/ConstantPool;",
         |ctx, _args| {
             let cp =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ConstantPool", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ConstantPool", 2)?;
             ctx.set_field(cp, 0, Value::Int(0));
             ctx.set_field(cp, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(cp))))
@@ -299,9 +299,9 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 4);
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/ClassEntry", 1)?;
             ctx.set_field(entry, 0, idx);
-            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(opt, 0, Value::Object(Some(entry)));
             Ok(Some(Value::Object(Some(opt))))
         },
@@ -322,7 +322,7 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let flags = ctx.get_field(this, 0);
-            let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
+            let af = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1)?;
             ctx.set_field(af, 0, flags);
             Ok(Some(Value::Object(Some(af))))
         },
@@ -336,7 +336,7 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 1);
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -350,7 +350,7 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 2);
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -361,7 +361,7 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
         "methodTypeSymbol",
         "()Ljava/lang/constant/MethodTypeDesc;",
         |ctx, _args| {
-            let desc = alloc_concurrent_synthetic(ctx, "java/lang/constant/MethodTypeDesc", 1);
+            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/constant/MethodTypeDesc", 1)?;
             ctx.set_field(desc, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(desc))))
         },
@@ -375,23 +375,23 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
             _ => false,
         };
         if has_code {
-            let code = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeModel", 4);
+            let code = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeModel", 4)?;
             ctx.set_field(code, 0, Value::Int(0)); // max_stack
             ctx.set_field(code, 1, Value::Int(0)); // max_locals
             ctx.set_field(code, 2, code_len);
             ctx.set_field(code, 3, Value::Int(0)); // exception_handler_count
-            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(opt, 0, Value::Object(Some(code)));
             Ok(Some(Value::Object(Some(opt))))
         } else {
-            let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(opt, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(opt))))
         }
     });
 
     r.register(mm, "attributes", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
@@ -400,7 +400,7 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
     // fabricated standalone (no ClassModel owns them), so the honest answer is
     // Optional.empty() — never a bare null, which the declared type forbids.
     r.register(mm, "parent", "()Ljava/util/Optional;", |ctx, _args| {
-        let opt = empty_optional(ctx);
+        let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
 }
@@ -419,7 +419,7 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let flags = ctx.get_field(this, 0);
-            let af = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1);
+            let af = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/AccessFlags", 1)?;
             ctx.set_field(af, 0, flags);
             Ok(Some(Value::Object(Some(af))))
         },
@@ -433,7 +433,7 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 1);
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -447,7 +447,7 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let idx = ctx.get_field(this, 2);
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/constantpool/Utf8Entry", 1)?;
             ctx.set_field(entry, 0, idx);
             Ok(Some(Value::Object(Some(entry))))
         },
@@ -458,14 +458,14 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
         "fieldTypeSymbol",
         "()Ljava/lang/constant/ClassDesc;",
         |ctx, _args| {
-            let desc = alloc_concurrent_synthetic(ctx, "java/lang/constant/ClassDesc", 1);
+            let desc = try_alloc_concurrent_synthetic(ctx, "java/lang/constant/ClassDesc", 1)?;
             ctx.set_field(desc, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(desc))))
         },
     );
 
     r.register(fm, "attributes", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
@@ -473,7 +473,7 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
     // FieldModel.parent() -> Optional<ClassModel>; unattached synthetic model,
     // so Optional.empty() rather than a bare null (see MethodModel.parent).
     r.register(fm, "parent", "()Ljava/util/Optional;", |ctx, _args| {
-        let opt = empty_optional(ctx);
+        let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
 }
@@ -505,14 +505,14 @@ fn register_code_model(r: &mut NativeMethodRegistry) {
         "exceptionHandlers",
         "()Ljava/util/List;",
         |ctx, _args| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
             ctx.set_field(list, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(list))))
         },
     );
 
     r.register(code, "elements", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 1)?;
         ctx.set_field(list, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
@@ -520,7 +520,7 @@ fn register_code_model(r: &mut NativeMethodRegistry) {
     // CodeModel.parent() -> Optional<MethodModel>; unattached synthetic model,
     // so Optional.empty() rather than a bare null (see MethodModel.parent).
     r.register(code, "parent", "()Ljava/util/Optional;", |ctx, _args| {
-        let opt = empty_optional(ctx);
+        let opt = empty_optional(ctx)?;
         Ok(Some(Value::Object(Some(opt))))
     });
 }
@@ -869,7 +869,7 @@ fn register_code_builder(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             ctx.set_field(this, 1, Value::Int(label_count + 1));
-            let label = alloc_concurrent_synthetic(ctx, "java/lang/classfile/Label", 1);
+            let label = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/Label", 1)?;
             ctx.set_field(label, 0, Value::Int(label_count));
             Ok(Some(Value::Object(Some(label))))
         },
@@ -937,7 +937,7 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
         "ofStateful",
         "(Ljava/util/function/Supplier;)Ljava/lang/classfile/ClassTransform;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1)?;
             ctx.set_field(obj, 0, Value::Int(2)); // mapping
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -949,7 +949,7 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
         "dropping",
         "(Ljava/util/function/Predicate;)Ljava/lang/classfile/ClassTransform;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1)?;
             ctx.set_field(obj, 0, Value::Int(1)); // dropping
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -961,7 +961,7 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
         "ACCEPT_ALL",
         "()Ljava/lang/classfile/ClassTransform;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassTransform", 1)?;
             ctx.set_field(obj, 0, Value::Int(0)); // identity
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -989,7 +989,7 @@ fn register_code_transform(r: &mut NativeMethodRegistry) {
         "ofStateful",
         "(Ljava/util/function/Supplier;)Ljava/lang/classfile/CodeTransform;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1)?;
             ctx.set_field(obj, 0, Value::Int(2));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1001,7 +1001,7 @@ fn register_code_transform(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/classfile/CodeTransform;)Ljava/lang/classfile/CodeTransform;",
         |ctx, args| {
             let _this = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1)?;
             ctx.set_field(obj, 0, Value::Int(2));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1012,7 +1012,7 @@ fn register_code_transform(r: &mut NativeMethodRegistry) {
         "ACCEPT_ALL",
         "()Ljava/lang/classfile/CodeTransform;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/CodeTransform", 1)?;
             ctx.set_field(obj, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1043,7 +1043,7 @@ fn register_attribute(r: &mut NativeMethodRegistry) {
         "attributeMapper",
         "()Ljava/lang/classfile/AttributeMapper;",
         |ctx, _args| {
-            let mapper = alloc_concurrent_synthetic(ctx, "java/lang/classfile/AttributeMapper", 1);
+            let mapper = try_alloc_concurrent_synthetic(ctx, "java/lang/classfile/AttributeMapper", 1)?;
             ctx.set_field(mapper, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(mapper))))
         },

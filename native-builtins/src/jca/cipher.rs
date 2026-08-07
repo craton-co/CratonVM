@@ -86,7 +86,7 @@ use rustc_hash::FxHashMap;
 
 use crate::crypto_impl::{Aes, AesGcm};
 use crate::phases_early::CIPHER_IV;
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Cipher state — kept in a process-wide side-table keyed on the
@@ -686,8 +686,8 @@ fn check_transformation_supported(
     Ok(())
 }
 
-fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6);
+fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
     let algo_str = ctx.read_string(algo).unwrap_or_default();
     // Compute key outside the closure — `obj_key` borrows `ctx` and the
     // table write-guard must not depend on the ctx borrow.
@@ -701,7 +701,7 @@ fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {
             },
         );
     });
-    obj
+    Ok(obj)
 }
 
 /// Read the encoded key bytes out of a `SecretKeySpec`-shaped object.
@@ -1616,7 +1616,7 @@ fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(128)); // default key size
             Ok(Some(Value::Object(Some(obj))))
@@ -1628,7 +1628,7 @@ fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(128));
             Ok(Some(Value::Object(Some(obj))))
@@ -1656,7 +1656,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             check_transformation_supported(ctx, &algo_str)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1685,7 +1685,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             check_transformation_supported(ctx, &algo_str)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1705,7 +1705,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             check_transformation_supported(ctx, &algo_str)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );

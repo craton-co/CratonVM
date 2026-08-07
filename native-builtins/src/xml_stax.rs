@@ -2120,7 +2120,7 @@ fn native_get_location(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .unwrap_or((-1, -1, -1))
     })
     .unwrap_or((-1, -1, -1));
-    let loc = crate::alloc_concurrent_synthetic(ctx, "javax/xml/stream/Location", 4);
+    let loc = crate::try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/Location", 4)?;
     location_table().lock().insert(obj_key(ctx, loc), pos);
     Ok(Some(Value::Object(Some(loc))))
 }
@@ -2204,7 +2204,7 @@ fn native_get_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         None => (String::new(), String::new(), String::new()),
     })
     .unwrap_or_default();
-    let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
+    let qname = crate::try_alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3)?;
     let local_s = ctx.create_string(&local);
     let ns_s = ctx.create_string(&ns);
     // Carry the real element prefix (mirrors native_get_attr_qname): SAX qName
@@ -2240,7 +2240,7 @@ fn native_get_attr_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => (String::new(), String::new(), String::new()),
     })
     .unwrap_or_default();
-    let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
+    let qname = crate::try_alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3)?;
     let local_s = ctx.create_string(&local);
     let ns_s = ctx.create_string(&ns);
     // Carry the real prefix (not ""): a prefixed attribute in a non-empty

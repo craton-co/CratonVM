@@ -335,7 +335,7 @@ pub fn acquire(pool_id: i32) -> Result<i64, String> {
             if pool.size() < pool.config.max_size {
                 let url = pool.config.jdbc_url.clone();
                 // Drop the lock across the potentially-slow open.
-                drop(reg);
+                drop(reg)?;
                 let id = open_backing_connection(&url)?;
                 let mut reg = registry().lock();
                 let pool = reg

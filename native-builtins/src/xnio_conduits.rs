@@ -84,7 +84,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -1386,7 +1386,7 @@ fn notify_source_readable_with_delays(
             ch.wakeup_pending.store(false, Ordering::Release);
         }
         let fired = invoke_source_read_listener(ctx, source);
-        drop(guard);
+        drop(guard)?;
         xnio_tcp_dbg!("notify_source id={id} fired_listener={fired}");
         return;
     }
@@ -2258,59 +2258,59 @@ fn native_setter_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // Test-only helpers to inflate a source / sink channel as a Java object.
 // ---------------------------------------------------------------------------
 
-fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_STREAM_SOURCE_CONDUIT, SRC_NUM_SLOTS);
+fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_STREAM_SOURCE_CONDUIT, SRC_NUM_SLOTS)?;
     remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1));
-    obj
+    Ok(obj)
 }
 
-fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_STREAM_SINK_CONDUIT, SINK_NUM_SLOTS);
+fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_STREAM_SINK_CONDUIT, SINK_NUM_SLOTS)?;
     remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a Java-side `ConduitStreamSourceChannel` and bind it to the given
 /// channel id. Public (but `#[doc(hidden)]`) so integration tests in other
 /// crates can stand up a conduit without threading a full Selector in.
 #[doc(hidden)]
-pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS);
+pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS)?;
     // Family-1 fix (cce0079): the conduit alloc below can move the
     // still-unrooted `obj` — pin and refresh it, or `remember_source_obj`
     // registers the WRONG identity-hash key (every later
     // `source_id_by_obj` lookup then misses — lost wakeups) and the field
     // stores/return value hand out a stale address.
     let obj_pin = ctx.pin_native_root(obj);
-    let conduit = alloc_source_conduit_obj(ctx, id);
+    let conduit = alloc_source_conduit_obj(ctx, id)?;
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
     remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1)); // start suspended
     ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit)));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a Java-side `ConduitStreamSinkChannel` bound to the given id.
 #[doc(hidden)]
-pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS);
+pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS)?;
     // Family-1 fix (cce0079): same as `alloc_source_channel_obj` — refresh
     // `obj` across the conduit alloc before registry/field use.
     let obj_pin = ctx.pin_native_root(obj);
-    let conduit = alloc_sink_conduit_obj(ctx, id);
+    let conduit = alloc_sink_conduit_obj(ctx, id)?;
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
     remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
     ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit)));
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -2894,7 +2894,7 @@ mod tests {
         ctx: &mut crate::test_utils::MockNativeContext,
         capacity: i32,
     ) -> ObjectRef {
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 5);
+        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 5)?;
         let arr = ctx.new_array(ArrayElementType::Byte, capacity as usize);
         ctx.set_field(buf, BB_FIELD_ARRAY, Value::Object(Some(arr)));
         ctx.set_field(buf, BB_FIELD_POS, Value::Int(0));
@@ -3009,7 +3009,7 @@ mod tests {
         let pipe = Arc::new(Pipe::new(1024));
         pipe.push(b"hello");
         let id = register_source_channel(ConduitTransport::Pipe(pipe.clone()));
-        let ch = alloc_source_channel_obj(&mut ctx, id);
+        let ch = alloc_source_channel_obj(&mut ctx, id)?;
         // Must be resumed for reads (the registry-side suspend flag is
         // checked by dispatch, not by the direct read path, but we reset
         // the Java-side flag for clarity).
@@ -3029,7 +3029,7 @@ mod tests {
         let pipe = Arc::new(Pipe::new(1024));
         pipe.close_write(); // no data, writer done => EOF
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let _ch = alloc_source_channel_obj(&mut ctx, id);
+        let _ch = alloc_source_channel_obj(&mut ctx, id)?;
         let buf = make_byte_buffer(&mut ctx, 16);
 
         let n = source_channel_read(&mut ctx, id, buf).unwrap();
@@ -3043,7 +3043,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_sink_channel(ConduitTransport::Pipe(pipe.clone()));
-        let _ch = alloc_sink_channel_obj(&mut ctx, id);
+        let _ch = alloc_sink_channel_obj(&mut ctx, id)?;
         let buf = make_byte_buffer(&mut ctx, 8);
         // Seed the buffer with 'abcd' at position 0.
         let arr = match ctx.get_field(buf, BB_FIELD_ARRAY) {
@@ -3073,7 +3073,7 @@ mod tests {
         let pipe = Arc::new(Pipe::new(4));
         pipe.push(b"full");
         let id = register_sink_channel(ConduitTransport::Pipe(pipe.clone()));
-        let _ch = alloc_sink_channel_obj(&mut ctx, id);
+        let _ch = alloc_sink_channel_obj(&mut ctx, id)?;
         let buf = make_byte_buffer(&mut ctx, 8);
         let arr = match ctx.get_field(buf, BB_FIELD_ARRAY) {
             Value::Object(Some(o)) => o,
@@ -3101,7 +3101,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch = alloc_source_channel_obj(&mut ctx, id);
+        let ch = alloc_source_channel_obj(&mut ctx, id)?;
         let listener = ctx.create_string("listener");
 
         let r = native_source_set_read_listener(
@@ -3123,7 +3123,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_source_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_source_channel_obj(&mut ctx, id)?;
         // Resume reads so dispatch doesn't skip.
         ctx.set_field(ch_obj, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
         get_source_channel(id)
@@ -3159,7 +3159,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_source_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_source_channel_obj(&mut ctx, id)?;
         ctx.set_field(ch_obj, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
         get_source_channel(id)
             .unwrap()
@@ -3209,7 +3209,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_source_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_source_channel_obj(&mut ctx, id)?;
         let listener = ctx.create_string("listener");
         ctx.set_field(
             ch_obj,
@@ -3235,7 +3235,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_source_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_source_channel_obj(&mut ctx, id)?;
         let listener = ctx.create_string("listener");
         ctx.set_field(
             ch_obj,
@@ -3270,7 +3270,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_sink_channel(ConduitTransport::Pipe(pipe.clone()));
-        let ch_obj = alloc_sink_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_sink_channel_obj(&mut ctx, id)?;
         native_sink_shutdown_writes(&mut ctx, &[Value::Object(Some(ch_obj))]).unwrap();
 
         assert!(
@@ -3295,7 +3295,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_sink_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_sink_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_sink_channel_obj(&mut ctx, id)?;
         let r = native_sink_flush(&mut ctx, &[Value::Object(Some(ch_obj))])
             .unwrap()
             .unwrap();
@@ -3309,7 +3309,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_sink_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_sink_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_sink_channel_obj(&mut ctx, id)?;
         get_sink_channel(id)
             .unwrap()
             .buffered_bytes
@@ -3327,9 +3327,9 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_source_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_source_channel_obj(&mut ctx, id)?;
         // Build a Setter tied to SRC_FIELD_READ_LISTENER on ch_obj.
-        let setter = alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS);
+        let setter = try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS)?;
         ctx.set_field(
             setter,
             SETTER_FIELD_CHANNEL_HANDLE,
@@ -3359,7 +3359,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let pipe = Arc::new(Pipe::new(1024));
         let id = register_sink_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_sink_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_sink_channel_obj(&mut ctx, id)?;
         let listener = ctx.create_string("write-listener");
         native_sink_set_write_listener(
             &mut ctx,
@@ -3392,8 +3392,8 @@ mod tests {
         let sink_pipe = Arc::new(Pipe::new(1024));
         let source_id = register_source_channel(ConduitTransport::Pipe(source_pipe));
         let sink_id = register_sink_channel(ConduitTransport::Pipe(sink_pipe));
-        let source = alloc_source_channel_obj(&mut ctx, source_id);
-        let sink = alloc_sink_channel_obj(&mut ctx, sink_id);
+        let source = alloc_source_channel_obj(&mut ctx, source_id)?;
+        let sink = alloc_sink_channel_obj(&mut ctx, sink_id)?;
         remember_sink_paired_source(&mut ctx, sink, source);
 
         ctx.set_field(source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
@@ -3442,9 +3442,9 @@ mod tests {
         let own_source_id = register_source_channel(ConduitTransport::Pipe(own_pipe));
         let peer_source_id = register_source_channel(ConduitTransport::Pipe(peer_pipe.clone()));
         let sink_id = register_sink_channel(ConduitTransport::Pipe(peer_pipe));
-        let own_source = alloc_source_channel_obj(&mut ctx, own_source_id);
-        let peer_source = alloc_source_channel_obj(&mut ctx, peer_source_id);
-        let sink = alloc_sink_channel_obj(&mut ctx, sink_id);
+        let own_source = alloc_source_channel_obj(&mut ctx, own_source_id)?;
+        let peer_source = alloc_source_channel_obj(&mut ctx, peer_source_id)?;
+        let sink = alloc_sink_channel_obj(&mut ctx, sink_id)?;
         remember_sink_paired_source(&mut ctx, sink, own_source);
 
         ctx.set_field(own_source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
@@ -3502,8 +3502,8 @@ mod tests {
         let pipe = Arc::new(Pipe::new(1024));
         let source_id = register_source_channel(ConduitTransport::Pipe(pipe.clone()));
         let sink_id = register_sink_channel(ConduitTransport::Pipe(pipe));
-        let source = alloc_source_channel_obj(&mut ctx, source_id);
-        let sink = alloc_sink_channel_obj(&mut ctx, sink_id);
+        let source = alloc_source_channel_obj(&mut ctx, source_id)?;
+        let sink = alloc_sink_channel_obj(&mut ctx, sink_id)?;
         let io_thread = ctx.fresh_object_ref();
 
         remember_source_io_thread(&mut ctx, source, io_thread);
@@ -3526,8 +3526,8 @@ mod tests {
         // by name, so allocate raw conduit mirrors directly for this half of
         // the regression. Production channels still remember both surfaces
         // when the named field resolves.
-        let source_conduit = alloc_source_conduit_obj(&mut ctx, source_id);
-        let sink_conduit = alloc_sink_conduit_obj(&mut ctx, sink_id);
+        let source_conduit = alloc_source_conduit_obj(&mut ctx, source_id)?;
+        let sink_conduit = alloc_sink_conduit_obj(&mut ctx, sink_id)?;
         remember_source_io_thread(&mut ctx, source_conduit, io_thread);
         remember_sink_io_thread(&mut ctx, sink_conduit, io_thread);
         assert_eq!(
@@ -3554,7 +3554,7 @@ mod tests {
         let pipe = Arc::new(Pipe::new(1024));
         pipe.push(b"abcdef");
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let _ch = alloc_source_channel_obj(&mut ctx, id);
+        let _ch = alloc_source_channel_obj(&mut ctx, id)?;
 
         // Build a buffer with position > limit — remaining() returns 0 and the
         // read returns 0 rather than segfaulting.
@@ -3573,7 +3573,7 @@ mod tests {
         let pipe = Arc::new(Pipe::new(1024));
         pipe.push(b"hello world");
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let ch_obj = alloc_source_channel_obj(&mut ctx, id);
+        let ch_obj = alloc_source_channel_obj(&mut ctx, id)?;
 
         let b1 = make_byte_buffer(&mut ctx, 5);
         let b2 = make_byte_buffer(&mut ctx, 8);

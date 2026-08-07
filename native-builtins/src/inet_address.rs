@@ -107,7 +107,7 @@ fn resolve_addrs(host: &str) -> Result<Vec<IpAddr>, MethodCallFailed> {
     Ok(out)
 }
 
-fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAddr) -> ObjectRef {
+fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAddr) -> Result<ObjectRef, MethodCallFailed> {
     // `java.net.Inet4Address` / `Inet6Address` are real bootstrap classes:
     // their instance slots 0/1 are the inherited `holder` reference fields,
     // NOT `hostName` / `address` Strings. `alloc_inet_address_external`
@@ -122,7 +122,7 @@ fn alloc_inet_address_mirror(ctx: &mut dyn NativeContext, host: &str, ip: &IpAdd
     // `host` is whatever the caller passed to `getByName`/`getAllByName`: a
     // NAME to remember, or a numeric literal that the JDK remembers nothing
     // about (`getByName("127.0.0.1").toString()` is `/127.0.0.1`).
-    crate::net_phase_e::alloc_inet_address_for_input(ctx, host, &ip.to_string())
+    Ok(crate::net_phase_e::alloc_inet_address_for_input(ctx, host, &ip.to_string())?)
 }
 
 fn read_string_arg(
@@ -167,7 +167,7 @@ fn lookup_all_host_addr_impl(
     }
     let arr = ctx.new_ref_array(ClassId::new(0), filtered.len());
     for (i, ip) in filtered.iter().enumerate() {
-        let mirror = alloc_inet_address_mirror(ctx, &host, ip);
+        let mirror = alloc_inet_address_mirror(ctx, &host, ip)?;
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
     }
     Ok(Some(Value::Object(Some(arr))))

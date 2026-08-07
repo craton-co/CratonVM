@@ -164,7 +164,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             };
             let val_pin = pinned_object_value(ctx, val);
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let future_pin = ctx.pin_native_root(future);
             match result {
                 Ok(_) => {
@@ -210,7 +210,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             };
             let val_pin = pinned_object_value(ctx, val);
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let future_pin = ctx.pin_native_root(future);
             match result {
                 Ok(_) => {
@@ -259,7 +259,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 return Err(result.unwrap_err());
             }
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             // Pin across the create_string in the Err branch below — a moving
             // young GC there would relocate the fresh CF (native stale-local
             // family).
@@ -298,7 +298,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 return Err(result.unwrap_err());
             }
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             // Pin across the create_string in the Err branch below — a moving
             // young GC there would relocate the fresh CF (native stale-local
             // family).
@@ -360,7 +360,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             let mut future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let future_pin = ctx.pin_native_root(future);
             // Check if any constituent CF has an exception
             let mut has_exception = false;
@@ -406,11 +406,11 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                     // would relocate them (native stale-local family).
                     let result_pin = pinned_object_value(ctx, result);
                     let exc_pin = pinned_object_value(ctx, exc);
-                    let future = alloc_concurrent_synthetic(
+                    let future = try_alloc_concurrent_synthetic(
                         ctx,
                         "java/util/concurrent/CompletableFuture",
                         3,
-                    );
+                    )?;
                     let result = read_pinned_object_value(ctx, result_pin, result);
                     let exc = read_pinned_object_value(ctx, exc_pin, exc);
                     ctx.set_field(future, 0, result);
@@ -423,7 +423,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 }
             }
             let future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
             ctx.set_field(future, 2, Value::Object(None));
@@ -440,7 +440,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // relocate it (native stale-local family).
             let value_pin = pinned_object_value(ctx, value);
             let future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let value = read_pinned_object_value(ctx, value_pin, value);
             ctx.set_field(future, 0, value);
             ctx.set_field(future, 1, Value::Int(1));
@@ -461,7 +461,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // relocate it (native stale-local family).
             let exc_pin = pinned_object_value(ctx, exc);
             let future =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let exc = read_pinned_object_value(ctx, exc_pin, exc);
             ctx.set_field(future, 0, Value::Object(None));
             ctx.set_field(future, 1, Value::Int(1));
@@ -523,7 +523,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 // relocate `this` (native stale-local family).
                 let this_pin = ctx.pin_native_root(this);
                 let new_cf =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
                 let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(new_cf, 0, Value::Object(None));
                 ctx.set_field(new_cf, 1, Value::Int(1));
@@ -563,7 +563,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
                 let result = result.unwrap_or(Value::Object(None));
                 let result_pin = pinned_object_value(ctx, result);
                 let new_cf =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
                 let result = read_pinned_object_value(ctx, result_pin, result);
                 ctx.set_field(new_cf, 0, result);
                 ctx.set_field(new_cf, 1, Value::Int(1));
@@ -599,7 +599,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let result = result.unwrap_or(Value::Object(None));
             let result_pin = pinned_object_value(ctx, result);
             let new_cf =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3)?;
             let result = read_pinned_object_value(ctx, result_pin, result);
             ctx.set_field(new_cf, 0, result);
             ctx.set_field(new_cf, 1, Value::Int(1));
@@ -645,7 +645,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -665,7 +665,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(I)Ljava/util/concurrent/ExecutorService;",
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(4);
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -684,7 +684,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -703,7 +703,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newCachedThreadPool",
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -724,7 +724,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let pool_size = args.first().and_then(|v| v.as_int()).unwrap_or(1);
             let es =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -743,7 +743,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "newVirtualThreadPerTaskExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let es = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4);
+            let es = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ExecutorService", 4)?;
             // Pin across the queue alloc below — a moving young GC there would
             // relocate the fresh executor (native stale-local family).
             let es_pin = ctx.pin_native_root(es);
@@ -810,7 +810,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // Pin across the list alloc below — a moving young GC there would
             // relocate the fresh array (native stale-local family).
             let empty_pin = ctx.pin_native_root(empty);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(list, 0, Value::Object(Some(empty)));
             ctx.set_field(list, 1, Value::Int(0));
@@ -835,7 +835,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             }
         }
         ctx.set_field(this, 3, Value::Int(0));
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let pending = ctx.read_native_pin(pending_pin, pending);
         ctx.set_field(list, 0, Value::Object(Some(pending)));
         ctx.set_field(list, 1, Value::Int(task_count as i32));
@@ -911,7 +911,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let callable_pin = ctx.pin_native_root(callable);
             // Create a Future with the task stored for lazy execution
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
+            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4)?;
             let this = ctx.read_native_pin(this_pin, this);
             let callable = ctx.read_native_pin(callable_pin, callable);
             ctx.set_field(future, 0, Value::Object(None)); // result (not yet computed)
@@ -949,7 +949,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             // relocate `this`/`runnable` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let runnable_pin = ctx.pin_native_root(runnable);
-            let future = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4);
+            let future = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Future", 4)?;
             let this = ctx.read_native_pin(this_pin, this);
             let runnable = ctx.read_native_pin(runnable_pin, runnable);
             ctx.set_field(future, 0, Value::Object(None));
@@ -998,7 +998,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "NANOSECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1008,7 +1008,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "MICROSECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 1);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1018,7 +1018,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "MILLISECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 2);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1028,7 +1028,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "SECONDS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 3);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1038,7 +1038,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "MINUTES",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 4);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1048,7 +1048,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "HOURS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 5);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1058,7 +1058,7 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "DAYS",
         "Ljava/util/concurrent/TimeUnit;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             crate::phases_early::tu_set_ordinal(ctx, obj, 6);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1251,7 +1251,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let delay_ms = scheduled_convert_to_millis(ctx, delay, args.get(1));
-            let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1);
+            let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1)?;
             ctx.set_field(exec, 0, Value::Long(delay_ms));
             Ok(Some(Value::Object(Some(exec))))
         },
@@ -1267,7 +1267,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let delay_ms = scheduled_convert_to_millis(ctx, delay, args.get(1));
-            let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1);
+            let exec = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Executor", 1)?;
             ctx.set_field(exec, 0, Value::Long(delay_ms));
             Ok(Some(Value::Object(Some(exec))))
         },
@@ -1334,11 +1334,11 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> ObjectRef {
+pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> Result<ObjectRef, MethodCallFailed> {
     // Pin across the CF alloc below — a moving young GC there would relocate
     // the result value (native stale-local family).
     let result_pin = pinned_object_value(ctx, result);
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
     ctx.set_field(
         cf,
         FUT_FIELD_RESULT,
@@ -1348,7 +1348,7 @@ pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool)
     if let Some((h, _)) = result_pin {
         ctx.unpin_native_roots(h);
     }
-    cf
+    Ok(cf)
 }
 
 /// DF07: a COMPLETED `Future` for the synchronous async-channel ops. Returns a
@@ -1464,10 +1464,10 @@ pub(crate) fn p58_cf_then_compose(ctx: &mut dyn NativeContext, args: &[Value]) -
     if let Some(Value::Object(Some(inner_cf))) = inner {
         let inner_result = ctx.get_field(inner_cf, FUT_FIELD_RESULT);
         let inner_done = ctx.get_field(inner_cf, FUT_FIELD_DONE);
-        let cf = p58_new_cf(ctx, inner_result, inner_done == Value::Int(1));
+        let cf = p58_new_cf(ctx, inner_result, inner_done == Value::Int(1))?;
         Ok(Some(Value::Object(Some(cf))))
     } else {
-        let cf = p58_new_cf(ctx, Value::Object(None), true);
+        let cf = p58_new_cf(ctx, Value::Object(None), true)?;
         Ok(Some(Value::Object(Some(cf))))
     }
 }
@@ -1476,7 +1476,7 @@ pub(crate) fn p58_cf_then_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let _this = obj_arg(args, 0)?;
     let runnable = obj_arg(args, 1)?;
     let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1529,7 +1529,7 @@ pub(crate) fn p58_cf_when_complete(
         ctx.unpin_native_roots(h);
     }
     // Return new CF with same result
-    let cf = p58_new_cf(ctx, result, true);
+    let cf = p58_new_cf(ctx, result, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1559,7 +1559,7 @@ pub(crate) fn p58_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         &[result, Value::Object(None)],
     )?;
     let val = new_result.unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, val, true);
+    let cf = p58_new_cf(ctx, val, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1583,7 +1583,7 @@ pub(crate) fn p58_cf_exceptionally(
     }
     // No exception in our eager model — just pass through
     let result = ctx.get_field(this, FUT_FIELD_RESULT);
-    let cf = p58_new_cf(ctx, result, true);
+    let cf = p58_new_cf(ctx, result, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1620,7 +1620,7 @@ pub(crate) fn p58_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
     }
     // All futures are already complete in our eager model
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1630,12 +1630,12 @@ pub(crate) fn p58_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         if ctx.array_length(*arr) > 0 {
             if let Value::Object(Some(first)) = ctx.get_array_element(*arr, 0) {
                 let result = ctx.get_field(first, FUT_FIELD_RESULT);
-                let cf = p58_new_cf(ctx, result, true);
+                let cf = p58_new_cf(ctx, result, true)?;
                 return Ok(Some(Value::Object(Some(cf))));
             }
         }
     }
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1652,7 +1652,7 @@ pub(crate) fn p58_cf_then_combine(ctx: &mut dyn NativeContext, args: &[Value]) -
         &[r1, r2],
     )?;
     let val = combined.unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, val, true);
+    let cf = p58_new_cf(ctx, val, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1671,7 +1671,7 @@ pub(crate) fn p58_cf_apply_to_either(
         &[result],
     )?;
     let val = new_result.unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, val, true);
+    let cf = p58_new_cf(ctx, val, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1690,7 +1690,7 @@ pub(crate) fn p58_cf_then_accept_both(
         "(Ljava/lang/Object;Ljava/lang/Object;)V",
         &[r1, r2],
     );
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1701,7 +1701,7 @@ pub(crate) fn p58_cf_run_after_both(
     let _this = obj_arg(args, 0)?;
     let runnable = obj_arg(args, 2)?;
     let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1712,7 +1712,7 @@ pub(crate) fn p58_cf_run_after_either(
     let _this = obj_arg(args, 0)?;
     let runnable = obj_arg(args, 2)?;
     let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-    let cf = p58_new_cf(ctx, Value::Object(None), true);
+    let cf = p58_new_cf(ctx, Value::Object(None), true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1721,7 +1721,7 @@ pub(crate) fn p58_cf_failed_future(
     args: &[Value],
 ) -> MethodCallResult {
     let throwable = args.first().copied().unwrap_or(Value::Object(None));
-    let cf = p58_new_cf(ctx, throwable, true);
+    let cf = p58_new_cf(ctx, throwable, true)?;
     Ok(Some(Value::Object(Some(cf))))
 }
 
@@ -1852,7 +1852,7 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
         // Empty iterator
         use cratonvm_types::ArrayElementType;
         let arr = ctx.new_array(ArrayElementType::Reference, 0);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/SynchronousQueue$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -1944,7 +1944,7 @@ pub(crate) fn p58_sq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             consumer.item = Some(item);
             consumer.fulfilled = true;
             let waiter_thread = consumer.thread;
-            drop(t);
+            drop(t)?;
             ctx.unpark(waiter_thread);
             return Ok(None);
         }
@@ -1956,7 +1956,7 @@ pub(crate) fn p58_sq_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             item: Some(item),
             fulfilled: false,
         });
-        drop(t);
+        drop(t)?;
         // Park until a taker fulfils us. park() may return spuriously, so loop.
         loop {
             ctx.park(None);
@@ -1994,7 +1994,7 @@ pub(crate) fn p58_sq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         consumer.item = Some(item);
         consumer.fulfilled = true;
         let waiter_thread = consumer.thread;
-        drop(t);
+        drop(t)?;
         ctx.unpark(waiter_thread);
         Ok(Some(Value::Int(1)))
     } else {
@@ -2025,7 +2025,7 @@ pub(crate) fn p58_sq_offer_timed(ctx: &mut dyn NativeContext, args: &[Value]) ->
             consumer.item = Some(item);
             consumer.fulfilled = true;
             let waiter_thread = consumer.thread;
-            drop(t);
+            drop(t)?;
             ctx.unpark(waiter_thread);
             return Ok(Some(Value::Int(1)));
         }
@@ -2103,7 +2103,7 @@ pub(crate) fn p58_sq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             producer.fulfilled = true;
             let waiter_thread = producer.thread;
             entry.producers.remove(0);
-            drop(t);
+            drop(t)?;
             ctx.unpark(waiter_thread);
             return Ok(Some(item));
         }
@@ -2115,7 +2115,7 @@ pub(crate) fn p58_sq_take(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             item: None,
             fulfilled: false,
         });
-        drop(t);
+        drop(t)?;
         loop {
             ctx.park(None);
             let mut t = sq_table().lock();
@@ -2153,7 +2153,7 @@ pub(crate) fn p58_sq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         producer.fulfilled = true;
         let waiter_thread = producer.thread;
         entry.producers.remove(0);
-        drop(t);
+        drop(t)?;
         ctx.unpark(waiter_thread);
         Ok(Some(item))
     } else {
@@ -2180,7 +2180,7 @@ pub(crate) fn p58_sq_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             producer.fulfilled = true;
             let waiter_thread = producer.thread;
             entry.producers.remove(0);
-            drop(t);
+            drop(t)?;
             ctx.unpark(waiter_thread);
             return Ok(Some(item));
         }
@@ -2324,12 +2324,12 @@ pub(crate) fn p58_sq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// `ArrayList`-style 2-field synthetic: field 0 = ref array, field 1 = Int
 /// count) when the publisher's field 0 is null. `this` is pinned by the caller
 /// or pinned here across the allocation. Returns the (post-alloc) wrapper ref.
-pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     if let Value::Object(Some(w)) = ctx.get_field(this, 0) {
-        return w;
+        return Ok(w);
     }
     let this_pin = ctx.pin_native_root(this);
-    let wrapper = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let wrapper = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let w_pin = ctx.pin_native_root(wrapper);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
     let wrapper = ctx.read_native_pin(w_pin, wrapper);
@@ -2339,7 +2339,7 @@ pub(crate) fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) ->
     let wrapper = ctx.read_native_pin(w_pin, wrapper);
     ctx.set_field(this, 0, Value::Object(Some(wrapper)));
     ctx.unpin_native_roots(this_pin);
-    wrapper
+    Ok(wrapper)
 }
 
 /// Read `(backing_array, count)` from a publisher's subscriber-list wrapper, or
@@ -2373,10 +2373,10 @@ pub(crate) fn sp_append_subscriber(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     subscriber: ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let sub_pin = ctx.pin_native_root(subscriber);
-    let wrapper = sp_wrapper_ensure(ctx, this);
+    let wrapper = sp_wrapper_ensure(ctx, this)?;
     let w_pin = ctx.pin_native_root(wrapper);
     let (arr, cap, count) = match ctx.get_field(wrapper, 0) {
         Value::Object(Some(a)) => {
@@ -2413,6 +2413,7 @@ pub(crate) fn sp_append_subscriber(
     let wrapper = ctx.read_native_pin(w_pin, wrapper);
     ctx.set_field(wrapper, 1, Value::Int((count + 1) as i32));
     ctx.unpin_native_roots(this_pin);
+    Ok(())
 }
 
 /// Deliver one item to every registered subscriber via `onNext`. Returns the
@@ -2603,13 +2604,13 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
             // Build a Flow.Subscription (cancelled=0, demand=1) and hand it to
             // the subscriber so it can establish demand.
             let subscription =
-                alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
             let sub_pin = ctx.pin_native_root(subscription);
             ctx.set_field(subscription, 0, Value::Int(0));
             ctx.set_field(subscription, 1, Value::Long(0));
             let this = ctx.read_native_pin(pin, this);
             let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
-            sp_append_subscriber(ctx, this, subscriber);
+            sp_append_subscriber(ctx, this, subscriber)?;
             let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
             let subscription = ctx.read_native_pin(sub_pin, subscription);
             let _ = ctx.invoke_virtual(
@@ -3023,11 +3024,11 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
     fn build_sf(
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         id: u64,
-    ) -> cratonvm_types::ObjectRef {
-        let sf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2);
+    ) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+        let sf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2)?;
         ctx.set_field(sf, 0, Value::Long(id as i64));
         ctx.set_field(sf, 1, Value::Int(0));
-        sf
+        Ok(sf)
     }
 
     r.register(stpe, "schedule", "(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3048,7 +3049,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // sleep (e.g. zero-delay `schedule(r, 0, MILLIS)`) still get the
         // single fire they expect synchronously.
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // scheduleAtFixedRate — periodic firing driven by the pump.
     r.register(stpe, "scheduleAtFixedRate", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3074,7 +3075,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // Initial pump for zero-delay schedules so the first fire happens
         // before the caller's first `Thread.sleep`.
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // scheduleWithFixedDelay — pump-driven, fixed-delay variant.
     r.register(stpe, "scheduleWithFixedDelay", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3098,7 +3099,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         let period_ms = scheduled_convert_to_millis(ctx, period, args.get(4)).max(1) as u64;
         let task = crate::scheduled_pump::registry().register(runnable, initial_ms, period_ms, true);
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // ScheduledFuture.cancel(boolean) — flip the cancelled flag and
     // return whether this call performed the transition. The call is
@@ -3176,7 +3177,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // is empty in our synthetic model.
         crate::scheduled_pump::registry().cancel_all();
         crate::scheduled_pump::registry().gc();
-        let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         ctx.set_field(al, 0, Value::Object(None));
         ctx.set_field(al, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(al))))
@@ -3251,7 +3252,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             }
         }
         let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
-        let cf = p58_new_cf(ctx, Value::Object(None), true);
+        let cf = p58_new_cf(ctx, Value::Object(None), true)?;
         Ok(Some(Value::Object(Some(cf))))
     });
     r.register(ses, "shutdown", "()V", |ctx, args| {
@@ -3272,11 +3273,11 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
                 _ => 1,
             };
             let obj = stpe_new_executor(ctx, cores).unwrap_or_else(|| {
-                alloc_concurrent_synthetic(
+                try_alloc_concurrent_synthetic(
                     ctx,
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     2,
-                )
+                )?
             });
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3287,11 +3288,11 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
             let obj = stpe_new_executor(ctx, 1).unwrap_or_else(|| {
-                alloc_concurrent_synthetic(
+                try_alloc_concurrent_synthetic(
                     ctx,
                     "java/util/concurrent/ScheduledThreadPoolExecutor",
                     2,
-                )
+                )?
             });
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -3951,7 +3952,7 @@ fn ecs_run_and_record(
         _ => {
             ctx.unpin_native_roots(this_pin);
             let value = runnable_result.unwrap_or(Value::Object(None));
-            let cf = p58_new_cf(ctx, value, true);
+            let cf = p58_new_cf(ctx, value, true)?;
             return Ok(Some(Value::Object(Some(cf))));
         }
     };
@@ -3967,7 +3968,7 @@ fn ecs_run_and_record(
     // borrows `ctx` immutably (`read_pinned_object_value`) inside a call that
     // already borrows it mutably (`p58_new_cf`).
     let forwarded = read_pinned_object_value(ctx, value_pin, value);
-    let cf = p58_new_cf(ctx, forwarded, true);
+    let cf = p58_new_cf(ctx, forwarded, true)?;
     if let Some((h, _)) = value_pin {
         ctx.unpin_native_roots(h);
     }
@@ -4123,7 +4124,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
         "ofVirtual",
         "()Ljava/lang/Thread$Builder;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2)?;
             ctx.set_field(obj, 0, Value::Object(None)); // name
             ctx.set_field(obj, 1, Value::Int(1)); // virtual=true
             Ok(Some(Value::Object(Some(obj))))
@@ -4134,7 +4135,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
         "ofPlatform",
         "()Ljava/lang/Thread$Builder;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$Builder", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Int(0)); // virtual=false
             Ok(Some(Value::Object(Some(obj))))
@@ -4146,7 +4147,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
         |ctx, args| {
             let runnable = args.first().copied().unwrap_or(Value::Object(None));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name = ctx.create_string("virtual-thread");
             ctx.set_field(thr, 0, Value::Object(Some(name)));
             ctx.set_field(thr, 1, Value::Int(5)); // NORM_PRIORITY
@@ -4200,7 +4201,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
             let is_virtual = matches!(ctx.get_field(this, 1), Value::Int(1));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             // Use builder's stored name or default
             let name_val = ctx.get_field(this, 0);
             if matches!(name_val, Value::Object(Some(_))) {
@@ -4228,7 +4229,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
             let is_virtual = matches!(ctx.get_field(this, 1), Value::Int(1));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name_val = ctx.get_field(this, 0);
             if matches!(name_val, Value::Object(Some(_))) {
                 ctx.set_field(thr, 0, name_val);
@@ -4250,7 +4251,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             // Return a ThreadFactory that delegates to the builder.
             // The factory is a 1-field object: field 0 = the builder reference.
             let this = obj_arg(args, 0)?;
-            let factory = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1);
+            let factory = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1)?;
             ctx.set_field(factory, 0, Value::Object(Some(this)));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -4268,7 +4269,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(b)) => b,
                 _ => {
                     // No builder stored — create a default platform thread
-                    let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+                    let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
                     let name = ctx.create_string("factory-thread");
                     ctx.set_field(thr, 0, Value::Object(Some(name)));
                     ctx.set_field(thr, 1, Value::Int(5));
@@ -4278,7 +4279,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
                 }
             };
             let is_virtual = matches!(ctx.get_field(builder_ref, 1), Value::Int(1));
-            let thr = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
+            let thr = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5)?;
             let name_val = ctx.get_field(builder_ref, 0);
             if matches!(name_val, Value::Object(Some(_))) {
                 ctx.set_field(thr, 0, name_val);
@@ -4345,16 +4346,16 @@ const INCUBATOR_SUBTASK_FAILED: i32 = 3;
 /// Wrap `value` in a synthetic `java.util.Optional` (1 field; null == empty).
 /// `Optional`-returning methods must never hand back a bare null — callers
 /// immediately dereference the result with `isPresent()`/`orElse(..)`.
-fn sts_optional_of(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+fn sts_optional_of(ctx: &mut dyn NativeContext, value: Value) -> Result<ObjectRef, MethodCallFailed> {
     // Pin the payload across the Optional allocation (native stale-local family).
     let value_pin = pinned_object_value(ctx, value);
-    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     let value = read_pinned_object_value(ctx, value_pin, value);
     ctx.set_field(opt, 0, value);
     if let Some((h, _)) = value_pin {
         ctx.unpin_native_roots(h);
     }
-    opt
+    Ok(opt)
 }
 
 /// The Throwable behind a failed call, when the failure was a Java exception
@@ -4379,17 +4380,17 @@ fn incubator_fork_subtask(
     ctx: &mut dyn NativeContext,
     scope: Option<ObjectRef>,
     callable: Option<ObjectRef>,
-) -> (Option<ObjectRef>, ObjectRef) {
-    let subtask = alloc_concurrent_synthetic(
+) -> Result<(Option<ObjectRef>, ObjectRef), MethodCallFailed> {
+    let subtask = try_alloc_concurrent_synthetic(
         ctx,
         "jdk/incubator/concurrent/StructuredTaskScope$Subtask",
         3,
-    );
+    )?;
     ctx.set_field(subtask, 0, Value::Int(INCUBATOR_SUBTASK_UNAVAILABLE));
     ctx.set_field(subtask, 1, Value::Object(None));
     ctx.set_field(subtask, 2, Value::Object(None));
     let Some(callable) = callable else {
-        return (scope, subtask);
+        return Ok((scope, subtask));
     };
     let base = ctx.pin_native_root(subtask);
     let scope_pin = match scope {
@@ -4416,7 +4417,7 @@ fn incubator_fork_subtask(
         }
     }
     ctx.unpin_native_roots(base);
-    (scope, subtask)
+    Ok((scope, subtask))
 }
 
 pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
@@ -4452,7 +4453,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (_, subtask) = incubator_fork_subtask(ctx, None, callable);
+            let (_, subtask) = incubator_fork_subtask(ctx, None, callable)?;
             Ok(Some(Value::Object(Some(subtask))))
         },
     );
@@ -4570,7 +4571,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable)?;
             // ShutdownOnSuccess captures the first successful result.
             if let Some(this) = this {
                 let succeeded =
@@ -4620,7 +4621,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         } else {
             Value::Object(None)
         };
-        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)?))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         // If the scope captured an exception (field 2), wrap it in ExecutionException and throw.
@@ -4662,7 +4663,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable)?;
             if let Some(this) = this {
                 let failed =
                     matches!(ctx.get_field(subtask, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_FAILED);
@@ -4919,7 +4920,7 @@ pub(crate) fn j25_sts_fork_impl(
     let subtask_cls = "java/util/concurrent/StructuredTaskScope$Subtask";
     let state = j25_sts_state(ctx, this);
     if state != J25_STS_STATE_OPEN {
-        let subtask = alloc_concurrent_synthetic(ctx, subtask_cls, 2);
+        let subtask = try_alloc_concurrent_synthetic(ctx, subtask_cls, 2)?;
         ctx.set_field(subtask, 0, Value::Int(J25_SUBTASK_STATE_UNAVAILABLE));
         ctx.set_field(subtask, 1, Value::Object(None));
         if ctx.object_num_fields(this) > J25_STS_SUPPRESSED {
@@ -4930,7 +4931,7 @@ pub(crate) fn j25_sts_fork_impl(
     if ctx.object_num_fields(this) > J25_STS_TASK_COUNT {
         j25_sts_inc_field(ctx, this, J25_STS_TASK_COUNT);
     }
-    let subtask = alloc_concurrent_synthetic(ctx, subtask_cls, 2);
+    let subtask = try_alloc_concurrent_synthetic(ctx, subtask_cls, 2)?;
     let callable = match args.get(1) {
         Some(Value::Object(Some(c))) => Some(*c),
         _ => None,
@@ -5175,7 +5176,7 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
         } else {
             Value::Object(None)
         };
-        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)?))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5223,7 +5224,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljava/lang/ScopedValue;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue", 2)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, Value::Int(0)); // not bound
             Ok(Some(Value::Object(Some(obj))))
@@ -5285,7 +5286,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
         "where",
         "(Ljava/lang/ScopedValue;Ljava/lang/Object;)Ljava/lang/ScopedValue$Carrier;",
         |ctx, args| {
-            let carrier = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2);
+            let carrier = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2)?;
             ctx.set_field(
                 carrier,
                 0,
@@ -5308,7 +5309,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ScopedValue;Ljava/lang/Object;)Ljava/lang/ScopedValue$Carrier;",
         |ctx, args| {
             // Chain — for simplicity, create new carrier (overwrites)
-            let c = alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2);
+            let c = try_alloc_concurrent_synthetic(ctx, "java/lang/ScopedValue$Carrier", 2)?;
             ctx.set_field(c, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(c, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(c))))
@@ -6133,7 +6134,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         .iter()
         .enumerate()
         {
-            let e = alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2);
+            let e = try_alloc_concurrent_synthetic(ctx, "java/lang/Thread$State", 2)?;
             let e_pin = ctx.pin_native_root(e);
             let n = ctx.create_string(name);
             let e = ctx.read_native_pin(e_pin, e);
@@ -7122,11 +7123,11 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         "commonPool",
         "()Ljava/util/concurrent/ForkJoinPool;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(
+            let obj = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ForkJoinPool",
                 NEW15_FJP_FIELDS,
-            );
+            )?;
             // T16.7: the JDK formula is `max(1, availableProcessors() - 1)`,
             // but tests run in parallel on multi-core hosts, so the common-pool
             // proxy is clamped to 1 for determinism (`forkjoin_pool_basic`
@@ -7157,7 +7158,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
             //   "io.quarkus.bootstrap.forkjoin.QuarkusForkJoinWorkerThreadFactory"
             // before delegating to KeycloakMain.main, so we must populate
             // the field with an instance of that class.
-            populate_common_factory(ctx, obj);
+            populate_common_factory(ctx, obj)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -7226,7 +7227,7 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
                 }
             }
             // No factory yet — allocate one matching the system property.
-            let factory = alloc_common_factory(ctx);
+            let factory = alloc_common_factory(ctx)?;
             if let Some(Value::Object(Some(this))) = args.first() {
                 ctx.set_field_by_name(*this, "factory", Value::Object(Some(factory)));
             }
@@ -7292,14 +7293,14 @@ pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> S
 /// `getFactory()` registration to ensure
 /// `getFactory().getClass().getName()` round-trips to the system
 /// property's dot-form.
-pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
+pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let target = resolve_common_factory_internal_name(ctx);
     match ctx.ensure_class_initialized(&target) {
         Ok(cid) => {
             let nfields = ctx.class_num_total_fields(cid).max(1);
             ctx.alloc_object(cid, nfields)
         }
-        Err(_) => alloc_concurrent_synthetic(ctx, &target, 1),
+        Err(_) => try_alloc_concurrent_synthetic(ctx, &target, 1)?,
     }
 }
 
@@ -7309,13 +7310,14 @@ pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> cratonvm_type
 pub(crate) fn populate_common_factory(
     ctx: &mut dyn NativeContext,
     pool: cratonvm_types::ObjectRef,
-) {
-    let factory = alloc_common_factory(ctx);
+) -> Result<(), MethodCallFailed> {
+    let factory = alloc_common_factory(ctx)?;
     // Set by name so we work whether the class is the real JDK shape
     // (with `factory` at some non-zero index) or a synthetic placeholder
     // (where the field doesn't exist — set_field_by_name is silent on
     // missing fields).
     ctx.set_field_by_name(pool, "factory", Value::Object(Some(factory)));
+    Ok(())
 }
 
 #[cfg(test)]

@@ -430,7 +430,7 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u, "registerNatives", "()V", native_noop);
     r.register(u, "<clinit>", "()V", |ctx, _args| {
         let class_name = "sun/misc/Unsafe";
-        let unsafe_obj = alloc_concurrent_synthetic(ctx, class_name, 0);
+        let unsafe_obj = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
         ctx.set_static_field_by_name(class_name, "theUnsafe", Value::Object(Some(unsafe_obj)));
         // `theInternalUnsafe` (the real `<clinit>` seeds it with
         // `jdk.internal.misc.Unsafe.getUnsafe()`) must ALSO be populated by
@@ -471,14 +471,14 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         let class_id = match ctx.class_id_by_name(class_name) {
             Some(id) => id,
             None => {
-                return Ok(Some(Value::Object(Some(alloc_concurrent_synthetic(
+                return Ok(Some(Value::Object(Some(try_alloc_concurrent_synthetic(
                     ctx, class_name, 0,
-                )))))
+                )?))))
             }
         };
         let value = match ctx.static_field_index_by_name(class_id, "theUnsafe") {
             Some(idx) => ctx.get_static_field(class_id, idx),
-            None => Value::Object(Some(alloc_concurrent_synthetic(ctx, class_name, 0))),
+            None => Value::Object(Some(try_alloc_concurrent_synthetic(ctx, class_name, 0)?)),
         };
         Ok(Some(value))
     });
@@ -827,7 +827,7 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(u2, "<clinit>", "()V", |ctx, _args| {
         let class_name = "jdk/internal/misc/Unsafe";
-        let unsafe_obj = alloc_concurrent_synthetic(ctx, class_name, 0);
+        let unsafe_obj = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
         ctx.set_static_field_by_name(class_name, "theUnsafe", Value::Object(Some(unsafe_obj)));
         Ok(None)
     });
@@ -841,14 +841,14 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
             let class_id = match ctx.class_id_by_name(class_name) {
                 Some(id) => id,
                 None => {
-                    return Ok(Some(Value::Object(Some(alloc_concurrent_synthetic(
+                    return Ok(Some(Value::Object(Some(try_alloc_concurrent_synthetic(
                         ctx, class_name, 0,
-                    )))))
+                    )?))))
                 }
             };
             let value = match ctx.static_field_index_by_name(class_id, "theUnsafe") {
                 Some(idx) => ctx.get_static_field(class_id, idx),
-                None => Value::Object(Some(alloc_concurrent_synthetic(ctx, class_name, 0))),
+                None => Value::Object(Some(try_alloc_concurrent_synthetic(ctx, class_name, 0)?)),
             };
             Ok(Some(value))
         },

@@ -760,7 +760,7 @@ pub unsafe fn free_cached_cif(raw: u64) {
         return;
     }
     let ptr = raw as usize as *mut Cif;
-    drop(Box::from_raw(ptr));
+    drop(Box::from_raw(ptr))?;
 }
 
 // =============================================================================
@@ -842,7 +842,7 @@ impl Drop for ActiveContextGuard {
         // SAFETY: we created `owned` via `Box::into_raw` in `install`
         // and have not handed it out anywhere else.
         unsafe {
-            drop(Box::from_raw(self.owned));
+            drop(Box::from_raw(self.owned))?;
         }
     }
 }

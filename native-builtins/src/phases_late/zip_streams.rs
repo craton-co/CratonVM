@@ -514,7 +514,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             // the one that is actually read. A 2-field entry left
             // `getCompressedSize()`/`getCrc()` reading past the object, and
             // `getSize()` returning an `Int` from a `()J` accessor.
-            let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+            let ze = try_alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4)?;
             let name_val = read_pinned_object_value(ctx, name_pin, name_val);
             let this = ctx.read_native_pin(this_pin, this);
             if let Some((h, _)) = name_pin {
@@ -3852,8 +3852,8 @@ fn zip_entry_alloc(
     size: i64,
     csize: i64,
     crc: i64,
-) -> ObjectRef {
-    let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let ze = try_alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4)?;
     // Pin across `create_string` — a moving young GC there would relocate the
     // fresh entry (native stale-local family).
     let ze_pin = ctx.pin_native_root(ze);
@@ -3864,7 +3864,7 @@ fn zip_entry_alloc(
     ctx.set_field(ze, 2, Value::Long(csize));
     ctx.set_field(ze, 3, Value::Long(crc));
     ctx.unpin_native_roots(ze_pin);
-    ze
+    Ok(ze)
 }
 
 pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
@@ -3985,7 +3985,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
             match found {
                 Some((n, size, csize, crc)) => Ok(Some(Value::Object(Some(zip_entry_alloc(
                     ctx, &n, size, csize, crc,
-                ))))),
+                )?)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },
@@ -4012,7 +4012,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         // young GC there would relocate the array (native stale-local family).
         let arr_pin = ctx.pin_native_root(arr);
         for (i, (n, size, csize, crc)) in metas.iter().enumerate() {
-            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc);
+            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc)?;
             let arr = ctx.read_native_pin(arr_pin, arr);
             ctx.set_array_element(arr, i, Value::Object(Some(ze)));
         }
@@ -4021,7 +4021,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         // neither `hasMoreElements` nor `nextElement`. `Enumeration$Impl` is
         // the pre-registered (array=0, index=1) helper every other enumeration
         // site in this VM uses.
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2)?;
         let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));

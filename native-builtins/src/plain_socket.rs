@@ -1137,7 +1137,7 @@ mod tests {
             let g = registry().read();
             let s = g.sockets.get(&server_id).unwrap();
             let (mut accepted, _peer) = s.socket.accept().unwrap();
-            drop(g);
+            drop(g)?;
             // socket2 returns its own Socket for `accept`; convert to a
             // Read-capable handle.
             let mut buf = [0u8; 5];

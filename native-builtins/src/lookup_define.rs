@@ -269,7 +269,7 @@ fn resolve_lookup_supertypes(
 /// the given mirror. Mirrors `classloader.rs::alloc_lookup` but uses
 /// only the public `NativeContext` surface so this module stays
 /// independent of `classloader.rs`.
-fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> ObjectRef {
+fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // Synthetic Lookup is a 4-field allocation:
     //   slot 0: lookupClass (Class mirror)
     //   slot 1: allowedModes (int)
@@ -280,12 +280,12 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
     //            = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40
     //            = 0x5F
     const LK_FULL_POWER: i32 = 0x5F;
-    let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
+    let obj = crate::try_alloc_concurrent_synthetic(ctx, LK_CLASS, 4)?;
     ctx.set_field(obj, 0, Value::Object(Some(lookup_mirror)));
     ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
     ctx.set_field(obj, 2, Value::Object(None));
     ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +457,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
     // Return a fresh Lookup whose lookup class is the new hidden class.
     let mirror = ctx.get_class_mirror(cid);
-    let lookup = alloc_lookup_for(ctx, mirror);
+    let lookup = alloc_lookup_for(ctx, mirror)?;
     Ok(Some(Value::Object(Some(lookup))))
 }
 
@@ -621,7 +621,7 @@ fn lk_define_hidden_class_with_class_data(
     }
 
     let mirror = ctx.get_class_mirror(cid);
-    let lookup = alloc_lookup_for(ctx, mirror);
+    let lookup = alloc_lookup_for(ctx, mirror)?;
     Ok(Some(Value::Object(Some(lookup))))
 }
 

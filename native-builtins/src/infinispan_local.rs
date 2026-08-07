@@ -480,7 +480,7 @@ impl CacheInner {
                         store.lru.remove(pos);
                     }
                     store.total_evictions += 1;
-                    drop(store);
+                    drop(store)?;
                     self.dispatch(ListenerEventKind::Expired, key);
                     return None;
                 }
@@ -813,7 +813,7 @@ fn reap_cache(cache: &CacheInner) {
                     store.lru.remove(pos);
                 }
                 store.total_evictions += 1;
-                drop(store);
+                drop(store)?;
                 cache.dispatch(ListenerEventKind::Expired, &key);
             }
         }
