@@ -255,6 +255,20 @@ a separate question this bug did not need to answer, but it is adjacent.
 * **A general `FileChannelImpl` layout bug.** Every other field of the same
   object reads back correctly, before and after the failure.
 
+## The same merge has a SECOND regression, and this fix does NOT cover it
+
+`org.h2.test.unit.TestFileSystem`'s `nioMapped:` prefix fails on `6ba350cdd`
+with `IOException: Timeout (10000 ms) reached while trying to GC mapped buffer`
+(`FileNioMapped.unMap`), bisects to the same merge (`9ddbc9c61` clean), and
+survives **both** levers this page is about: `CRATONVM_COMPACT_REF_FIELDS=0`
+leaves it at 10.0 s, and so does the `try_thin_unlock` fix above — measured on
+`b7cbd0034`, where plain-disk `TestFileSystem` passes again at 0.7 s and
+`nioMapped:` still times out.
+
+So it is the other half of what `HEADER_SIZE 24 -> 16` changed, and this page
+being ✅ FIXED must not be read as the merge being clean. Filed separately as
+`docs/known-issues/h2/bug-h2-niomapped-unmap-gc-timeout-reopened-by-header-16-20260807.md`.
+
 ## Next steps
 
 1. Decide the contract: either every writer consults `is_compact_object(header)`
