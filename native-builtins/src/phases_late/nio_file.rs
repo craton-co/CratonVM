@@ -1154,6 +1154,90 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // --- Files.probeContentType, the Windows half ---
+    //
+    // `Files.probeContentType` walks the installed `FileTypeDetector`s and then
+    // the platform default, which on Windows is `sun.nio.fs.RegistryFileTypeDetector`
+    // — a `HKEY_CLASSES_ROOT\<ext>` "Content Type" lookup. Its
+    // `implProbeContentType` is pure JDK bytecode except for two things, and
+    // BOTH of them were missing:
+    //
+    //     at sun.nio.fs.WindowsNativeDispatcher.<clinit>(WindowsNativeDispatcher.java:1100)
+    //     at sun.nio.fs.RegistryFileTypeDetector.implProbeContentType(…:55)
+    //     at sun.nio.fs.AbstractFileTypeDetector.probeContentType(…:75)
+    //     at java.nio.file.Files.probeContentType(Files.java:1594)
+    //
+    // Registering these two rather than shadowing `implProbeContentType` is the
+    // point: the JDK's own detector body then runs, and with it
+    // `AbstractFileTypeDetector.probeContentType`'s fallback to
+    // `URLConnection.getFileNameMap()` and its `parse()` validation — which is
+    // where `.js` comes from (`text/javascript`), because the registry has no
+    // entry for it. Shadowing the detector would have needed a `check_override`
+    // entry, i.e. exactly the "prefer our native over real JDK bytecode"
+    // exception that chain's own banner says must stop growing.
+    //
+    // Measured against HotSpot on the same machine, all 13 lines of
+    // `probes/ProbeContentType.java`: registry for `.txt`/`.html`/`.png`/
+    // `.json`/`.pdf`/`.xml`/`.zip`/`.css`, JDK fallback for `.js`, `null` for
+    // an unknown extension, a name with no dot, and a directory.
+    #[cfg(windows)]
+    {
+        // `initIDs` caches jfieldIDs for the JNI layer. There is no JNI layer
+        // here and nothing to cache, so a no-op is the honest implementation,
+        // not a stub.
+        //
+        // Consequence worth stating: `WindowsNativeDispatcher`'s class
+        // initialiser now SUCCEEDS, so its ~80 other natives stop being
+        // unreachable behind a failing `<clinit>` and start failing
+        // individually. That is strictly more informative — the same
+        // `UnsatisfiedLinkError`, naming the native the caller actually
+        // wanted — but it does move where the error appears.
+        r.register(
+            "sun/nio/fs/WindowsNativeDispatcher",
+            "initIDs",
+            "()V",
+            |_ctx, _args| Ok(None),
+        );
+
+        // `private static native String queryStringValue(long subKey, long name)`.
+        // Both arguments are addresses of NUL-terminated UTF-16 strings in
+        // `NativeBuffer`s that `WindowsNativeDispatcher.asNativeBuffer` filled
+        // through `Unsafe` — so they may be arena handles or real pointers, and
+        // `ctx.copy_from_native_memory` is the bridge that already knows which.
+        //
+        // The JNI original returns NULL for a missing key or value and does not
+        // throw; `AbstractFileTypeDetector` reads that null as "no answer" and
+        // falls back. Do the same.
+        r.register(
+            "sun/nio/fs/RegistryFileTypeDetector",
+            "queryStringValue",
+            "(JJ)Ljava/lang/String;",
+            |ctx, args| {
+                let sub_key = match args.first() {
+                    Some(Value::Long(v)) => *v,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let value_name = match args.get(1) {
+                    Some(Value::Long(v)) => *v,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let (Some(key), Some(name)) = (
+                    read_native_utf16_c_string(ctx, sub_key),
+                    read_native_utf16_c_string(ctx, value_name),
+                ) else {
+                    return Ok(Some(Value::Object(None)));
+                };
+                match hkcr_string_value(&key, &name) {
+                    Some(v) => {
+                        let s = ctx.create_string(&v);
+                        Ok(Some(Value::Object(Some(s))))
+                    }
+                    None => Ok(Some(Value::Object(None))),
+                }
+            },
+        );
+    }
+
     // --- FileSystemProvider minimal methods ---
     let fsp = "java/nio/file/spi/FileSystemProvider";
     r.register(fsp, "getScheme", "()Ljava/lang/String;", |ctx, args| {
@@ -10516,6 +10600,134 @@ fn attr_view_flag_arg(args: &[Value]) -> bool {
     args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0
 }
 
+/// Read a NUL-terminated UTF-16 string out of native memory at `addr`.
+///
+/// `addr` comes from a JDK `NativeBuffer`, so it is whatever
+/// `Unsafe.allocateMemory` handed out — an arena handle or a real pointer.
+/// `copy_from_native_memory` is the bridge that classifies the two; going
+/// straight to a raw dereference would SIGSEGV on the handle form.
+///
+/// Two code units at a time rather than one bulk read: the bridge fails a range
+/// that is not wholly inside one live block, and the caller does not know the
+/// string's length in advance. The strings here are a file extension and the
+/// literal `"Content Type"`, so this is a couple of dozen reads.
+#[cfg(windows)]
+fn read_native_utf16_c_string(ctx: &dyn NativeContext, addr: i64) -> Option<String> {
+    // The JDK's own ceiling for a native-buffer string; a missing terminator
+    // must stop somewhere rather than walk the address space.
+    const MAX_CHARS: usize = 32 * 1024;
+    if addr == 0 {
+        return None;
+    }
+    let mut units: Vec<u16> = Vec::new();
+    for i in 0..MAX_CHARS {
+        let mut cell = [0u8; 2];
+        if !ctx.copy_from_native_memory(addr + (i as i64) * 2, &mut cell) {
+            return None;
+        }
+        let unit = u16::from_le_bytes(cell);
+        if unit == 0 {
+            return Some(String::from_utf16_lossy(&units));
+        }
+        units.push(unit);
+    }
+    None
+}
+
+/// `HKEY_CLASSES_ROOT\<sub_key>` → the named `REG_SZ` value, or `None`.
+///
+/// This is what the JDK's `RegistryFileTypeDetector` JNI does, and it has to be
+/// the same registry: the answers differ from the `content-types.properties`
+/// fallback in ways the HotSpot comparison shows — `.zip` is
+/// `application/x-zip-compressed` here and `application/zip` there, `.xml` is
+/// `text/xml` here and `application/xml` there.
+#[cfg(windows)]
+fn hkcr_string_value(sub_key: &str, value_name: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // `((HKEY)(ULONG_PTR)((LONG)0x80000000))` — sign-extended on 64-bit, which
+    // is why this goes through `i32` rather than being written as a `usize`.
+    const HKEY_CLASSES_ROOT: isize = 0x8000_0000u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+    const ERROR_SUCCESS: i32 = 0;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: isize,
+            sub_key: *const u16,
+            value: *const u16,
+            flags: u32,
+            value_type: *mut u32,
+            data: *mut u16,
+            data_bytes: *mut u32,
+        ) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    // A NUL inside either name would truncate the key silently; the registry
+    // has no such names, so refuse rather than query a different key.
+    if sub_key.contains('\0') || value_name.contains('\0') {
+        return None;
+    }
+    let key = wide(sub_key);
+    let name = wide(value_name);
+
+    // Size query first — the value is arbitrary user-writable registry data,
+    // so a fixed buffer would be a guess about someone else's content.
+    let mut bytes: u32 = 0;
+    // SAFETY: both name buffers are NUL-terminated and outlive the call, and
+    // this form asks only for the size (null data pointer), which is what the
+    // API documents for `pvData == NULL`.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CLASSES_ROOT,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if rc != ERROR_SUCCESS || bytes == 0 {
+        return None;
+    }
+    // `bytes` counts BYTES and includes the terminator. Round up so an odd
+    // (malformed) length still gets a whole last code unit to land in.
+    let mut buf: Vec<u16> = vec![0; (bytes as usize).div_ceil(2)];
+    let mut got = bytes;
+    // SAFETY: `buf` is sized from the length the same API just reported, and
+    // `got` tells it that size in bytes.
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CLASSES_ROOT,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            &mut got,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let units = ((got as usize) / 2).min(buf.len());
+    let end = buf[..units].iter().position(|&u| u == 0).unwrap_or(units);
+    let value = String::from_utf16_lossy(&buf[..end]);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
 /// Set (or clear) a path's read-only bit.
 ///
 /// Split out of `dos_view_set_read_only` so `FileSystemProvider.setAttribute`
@@ -16385,6 +16597,48 @@ fn fsp_delegate_two_path_copy(
         &[Value::Object(Some(src)), Value::Object(Some(dst)), options],
     )?;
     Ok(None)
+}
+
+#[cfg(all(test, windows))]
+mod registry_content_type_tests {
+    use super::hkcr_string_value;
+
+    /// A key that is not in the registry answers `None` rather than an empty
+    /// string or an error. `RegistryFileTypeDetector`'s JNI returns NULL here,
+    /// and `AbstractFileTypeDetector` reads that null as "no answer" and falls
+    /// back to `URLConnection.getFileNameMap()` — so turning it into `Some("")`
+    /// would suppress the fallback and make `Files.probeContentType` answer
+    /// null for every extension the registry happens not to carry.
+    ///
+    /// Deliberately not asserting that `.txt` IS `text/plain`: that is a fact
+    /// about the machine's registry, not about this code, and a test that
+    /// depends on it is a latent CI failure on a differently-configured box.
+    #[test]
+    fn an_absent_key_is_none_not_an_empty_string() {
+        assert_eq!(
+            hkcr_string_value(".cratonvm-no-such-extension-zz", "Content Type"),
+            None
+        );
+    }
+
+    /// A value name that is absent from a key that DOES exist is also `None` —
+    /// the two failure modes go through different `RegGetValueW` error codes
+    /// and must not diverge. `.txt` is present on every Windows install; the
+    /// value name is not.
+    #[test]
+    fn an_absent_value_under_a_present_key_is_none() {
+        assert_eq!(hkcr_string_value(".txt", "CratonVM No Such Value"), None);
+    }
+
+    /// An embedded NUL would silently truncate the key inside the Win32 call,
+    /// so the query would run against a DIFFERENT key than the caller named.
+    /// Refuse instead. (These strings arrive from guest-controlled native
+    /// memory via `read_native_utf16_c_string`, so this is reachable.)
+    #[test]
+    fn an_embedded_nul_is_refused_rather_than_truncated() {
+        assert_eq!(hkcr_string_value(".txt\0.exe", "Content Type"), None);
+        assert_eq!(hkcr_string_value(".txt", "Content\0Type"), None);
+    }
 }
 
 #[cfg(test)]
