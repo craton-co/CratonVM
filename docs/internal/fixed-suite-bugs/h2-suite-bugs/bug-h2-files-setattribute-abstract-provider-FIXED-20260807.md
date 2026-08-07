@@ -89,8 +89,29 @@ through to the target.
 `OK`, and the `unix:mode` readback is `33188`, byte-identical to HotSpot's. Not
 "no exception": the right value actually landed.
 
-Windows, same probe and the H2 `TestFileSystem` plain-disk / `nioMapped:` /
-`split:nioMapped:` prefixes: `AbstractMethodError` before, clean after.
+Windows, same probe: `AbstractMethodError` before; after, every step OK with
+`dos:readonly=true` read back. The H2 prefixes go from `AbstractMethodError` on
+all three to `DONE failed=0` — plain disk 6.4 s, `nioMapped:` 2.4 s,
+`split:nioMapped:` 7.0 s. (That is also the first cross-platform confirmation of
+the conservative-root fix in the retired `bug-h2-niomapped-unmap-gc-timeout`
+write-up; both mapped prefixes had only ever been measured on Linux.)
+
+`probes/ReadOnlyRoundTrip.java` runs the exact `testSetReadOnly` sequence with no
+H2 in it — create, mark read-only, assert `canWrite()` is false, delete — and is
+what established that H2 needs `Files.setAttribute` TWICE on Windows: deleting a
+read-only file there raises `AccessDeniedException`, and `FilePathDisk.delete`
+catches it and calls `Files.setAttribute(file, "dos:readonly", false)` before
+retrying. Both halves were the same missing registration.
+
+### One divergence this surfaced, not fixed here
+
+On HotSpot/Windows `Files.deleteIfExists` on a read-only file throws
+`AccessDeniedException`; on CratonVM/Windows it deletes the file. The DOS bit is
+genuinely set (`Files.getAttribute` reads back `true`, and `File.canWrite()` is
+`false`), so this is the delete path ignoring an attribute Windows enforces. It
+does not affect `testSetReadOnly` — H2 wants the file gone and it is — but it
+means H2's `AccessDeniedException` recovery branch never runs here, and a program
+relying on read-only protection would be surprised.
 
 `the_writable_attributes_are_the_ones_the_jdk_lets_you_write` pins the
 classification against the reader's tables, so a name added to
