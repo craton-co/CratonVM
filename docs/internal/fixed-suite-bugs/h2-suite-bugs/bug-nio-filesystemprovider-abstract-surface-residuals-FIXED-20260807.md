@@ -152,6 +152,9 @@ From the same HotSpot diff, three corrections to `write_named_attribute`:
 | Linux | 3 of 38 | **0 of 38 — byte-identical** |
 | Windows | 13 of 43 | 3 of 43 |
 
+(Linux measured at the branch tip; Windows at `f3e8d6118`, the merge of dev
+`cf4274fda`, and re-confirmed at the tip.)
+
 The three remaining Windows lines are known, and every one of them agrees with
 HotSpot on the exception **type** — what differs is a message or a separate
 defect:
@@ -208,15 +211,22 @@ java.lang.NullPointerException: Cannot invoke
     "sun.nio.ch.FileLockTable.add(java.nio.channels.FileLock)" because "flt" is null
 ```
 
-It is not this work. Built pristine `dev` at `cf4274fda` on the same host and it
-fails identically, then bisected it to a single merge with a pure-JDK probe
-(`probes/FileLockTableProbe.java`, no H2 in it): `9ddbc9c61` passes,
+It is not this work, and it is already filed: `dev` had it before this branch
+merged, and
+`docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md`
+(from another session, arriving in the same merge) has the deeper diagnosis —
+the compact reference-field layout, with `CRATONVM_COMPACT_REF_FIELDS=0` as a
+complete workaround for it. Independently bisected here to the same merge,
 `6ba350cdd Merge perf/header-16-and-field-packing-20260806: HEADER_SIZE 24 -> 16`
-fails. The probe's *suppressed* exception says what it really is —
-`"this.fd" is null` in `FileChannelImpl.implCloseChannel` — so
-`sun.nio.ch.FileChannelImpl`'s instance fields are not readable at the offsets
-its bytecode reads. Filed as
-`docs/known-issues/nio/bug-filechannelimpl-instance-fields-read-null-after-header-16-20260807.md`.
+(`9ddbc9c61` clean).
+
+What this branch added to that page: the same merge has a **second** regression
+the flag does *not* cover. `TestFileSystem`'s `nioMapped:` prefix fails with
+`IOException: Timeout (10000 ms) reached while trying to GC mapped buffer`,
+bisects to the same commit, and reproduces with `CRATONVM_COMPACT_REF_FIELDS`
+set either way — so it is the conservative-root half of the header change, not
+the field-packing half, and it re-opens what the retired
+`bug-h2-niomapped-unmap-gc-timeout` write-up closed. Measured on both platforms.
 
 So on this branch's merged tip, `TestFileSystem` gets past `testSetReadOnly` —
 which is what this doc and its parent are about — and stops at `testSimple` for

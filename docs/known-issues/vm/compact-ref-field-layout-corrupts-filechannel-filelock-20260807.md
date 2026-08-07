@@ -149,6 +149,42 @@ a separate question this bug did not need to answer, but it is adjacent.
 * **A general `FileChannelImpl` layout bug.** Every other field of the same
   object reads back correctly, before and after the failure.
 
+## The same merge has a SECOND regression, and the flag does NOT cover it
+
+`CRATONVM_COMPACT_REF_FIELDS=0` being a complete workaround is what this page
+concludes the defect from. It is complete for *this* probe. It is not complete
+for the merge.
+
+`org.h2.test.unit.TestFileSystem`'s `nioMapped:` prefix — H2's mapped-buffer
+filesystem, driven by `apps/h2database-suite-runner/probes/TfsProbe.java` —
+fails on the same commit with a different exception, and **fails with the flag
+either way**:
+
+```
+java.io.IOException: Timeout (10000 ms) reached while trying to GC mapped buffer
+        at org.h2.store.fs.niomapped.FileNioMapped.unMap(FileNioMapped.java:68)
+        at org.h2.store.fs.niomapped.FileNioMapped.setFileLength(FileNioMapped.java:164)
+```
+
+Measured on the Azure Linux host, `LTO=thin`, one build per commit:
+
+| | `9ddbc9c61` | `6ba350cdd` `CRF=1` | `6ba350cdd` `CRF=0` |
+|---|---|---|---|
+| `FileLockTableProbe` / `CompactLayoutFileLockProbe` | OK | `flt is null` | **OK** |
+| `TfsProbe nioMapped:` | OK 1.0 s | timeout 10.0 s | **timeout 10.0 s** |
+
+Same bisect (`9ddbc9c61` clean, `6ba350cdd` broken), same merge, different
+mechanism: `FileNioMapped.unMap` spins waiting for the `MappedByteBuffer` to
+become unreachable and be collected, so this is the conservative-root / mark-base
+half of the header change, not the reference-field-packing half. It re-opens what
+the retired `bug-h2-niomapped-unmap-gc-timeout` write-up closed.
+
+**What this means for the diagnosis above:** "the defect is in the compact
+reference-field layout" is right about the file-lock symptom and wrong as a
+statement about `6ba350cdd`. Whoever fixes the layout issue must re-run
+`TfsProbe nioMapped:` as well, or the merge will be declared clean while half of
+its damage is still there. Windows reproduces the `nioMapped:` timeout too.
+
 ## Next steps
 
 1. Decide the contract: either every writer consults `is_compact_object(header)`
