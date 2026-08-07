@@ -201,40 +201,41 @@ fourth sub-test on any prefix.
 Linux `TfsProbe` (plain disk) also passed at 1.2 s on that arm — it always did,
 because H2 takes the POSIX branch there.
 
-### A dev regression this ran into
+### Two dev regressions this ran into, neither of them this work
 
-Merging `origin/dev` (`cf4274fda`) made `TestFileSystem` fail again — one
-sub-test *later*, at `testSimple`'s `FileChannel.tryLock`:
+Merging `origin/dev` made `TestFileSystem` fail again — one sub-test *later*,
+at `testSimple`'s `FileChannel.tryLock`:
 
 ```
 java.lang.NullPointerException: Cannot invoke
     "sun.nio.ch.FileLockTable.add(java.nio.channels.FileLock)" because "flt" is null
 ```
 
-It is not this work, and it is already filed: `dev` had it before this branch
-merged, and
-`docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md`
-(from another session, arriving in the same merge) has the deeper diagnosis —
-the compact reference-field layout, with `CRATONVM_COMPACT_REF_FIELDS=0` as a
-complete workaround for it. Independently bisected here to the same merge,
+Pristine `dev` failed identically, and a pure-JDK bisect put it on
 `6ba350cdd Merge perf/header-16-and-field-packing-20260806: HEADER_SIZE 24 -> 16`
-(`9ddbc9c61` clean).
+(`9ddbc9c61` clean). Another session had it independently, with the deeper
+diagnosis and the fix — the retired
+`compact-ref-field-layout-corrupts-filechannel-filelock` write-up, one line in
+`try_thin_unlock`. **Fixed on dev; plain-disk `TestFileSystem` passes again**
+(Linux 0.8 s at this branch's tip, 0.7 s on pristine dev — the same).
 
-What this branch added to that page: the same merge has a **second** regression
-the flag does *not* cover. `TestFileSystem`'s `nioMapped:` prefix fails with
-`IOException: Timeout (10000 ms) reached while trying to GC mapped buffer`,
-bisects to the same commit, and reproduces with `CRATONVM_COMPACT_REF_FIELDS`
-set either way — so it is the conservative-root half of the header change, not
-the field-packing half, and it re-opens what the retired
-`bug-h2-niomapped-unmap-gc-timeout` write-up closed. Measured on both platforms.
+The second one is still open, and finding it is this branch's contribution to
+that page: **the same merge broke `nioMapped:` too, in a way neither that
+page's flag nor its fix touches.** `IOException: Timeout (10000 ms) reached
+while trying to GC mapped buffer` (`FileNioMapped.unMap`), same bisect,
+reproducing with `CRATONVM_COMPACT_REF_FIELDS` set either way *and* after the
+`try_thin_unlock` fix, on both platforms and on pristine dev. It re-opens what
+the retired `bug-h2-niomapped-unmap-gc-timeout` write-up closed, so it is the
+conservative-root half of the header change rather than the field-packing half.
+Filed as
+`docs/known-issues/h2/bug-h2-niomapped-unmap-gc-timeout-reopened-by-header-16-20260807.md`.
 
-So on this branch's merged tip, `TestFileSystem` gets past `testSetReadOnly` —
-which is what this doc and its parent are about — and stops at `testSimple` for
-a reason that stops it on pristine `dev` too. Confirmed on **both** platforms at
-the merged tip: the stack is `testSimple` → `FileChannel.tryLock` → `flt is
-null`, with no `AbstractMethodError` anywhere. The `setAttribute` verification
-above is quoted from `e3456d0e5` for that reason, and the `FilesSweep` diffs are
-quoted from the merged tip (they do not touch `FileChannel`).
+Net for the class this doc is about: at the current tip `TestFileSystem` clears
+`testSetReadOnly` — which is what this page and its parent are for — and clears
+plain disk end to end. `nioMapped:` is blocked by the second regression above,
+identically on pristine dev. The `setAttribute` prefix table is quoted from
+`e3456d0e5`, before either regression existed, because that is the arm where
+every prefix ran to completion.
 
 One consequence worth naming, because it changes what the probe prints: with
 `Files.delete` now reporting failure, `TfsProbe`'s own cleanup
