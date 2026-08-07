@@ -57,11 +57,60 @@ Each line is what a two-line probe shows in the feature build under
 
 | class | probe | HotSpot | feature build |
 |---|---|---|---|
-| `RStrings` | `"héllo".getBytes(UTF_8)` | `68 c3 a9 6c 6c 6f` | `00 00 00 00 00 00` — right LENGTH, zeroed content, so every decode round-trip fails |
-| `RCrypto` | `MessageDigest.getInstance("SHA-256").digest("abc")` | `ba7816bf…15ad` | `709e80c8…147c` |
+| `RStrings` + `RCrypto` | `"abc".getBytes(…)` | `61 62 63` | `00 00 00` — right LENGTH, zeroed content. **One bug, two classes** — see below |
 | `RChannelInterrupt` | `FileChannel.write(ByteBuffer, long)` | `3` | `AbstractMethodError: …FileChannel.write(Ljava/nio/ByteBuffer;J)I has no Code attribute` |
 | `RFileTimes` | writes a jar, reopens it | round-trips | `JarFile … is not a valid zip: Could not find EOCD` |
 | `RNioNoFollow` | `Files.writeString(symlink, …, NOFOLLOW_LINKS)` | refuses, target untouched | test asserts the target WAS touched |
+
+### `RStrings` and `RCrypto` are the same defect, and it is not crypto
+
+`RCrypto` fails a SHA-256 known-answer test, which reads as a crypto defect. It
+is not. The digest is **correct**; the input is wrong:
+
+```
+observed on the feature build : 709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c
+sha256(00 00 00) on HotSpot   : 709e80c88487a2411e1ee4dfb9f22a861492d20c4765150c0c794abd70f8147c
+```
+
+`RCrypto` digests `"abc".getBytes("UTF-8")`, and in this configuration every
+`String.getBytes` overload — no-arg, `(String)`, `(Charset)`, for UTF-8, ASCII
+and ISO-8859-1 alike — returns a correctly-sized, **zero-filled** array. So
+`RCrypto` and `RStrings` collapse into one bug. Fix `getBytes` and both classes
+should go green.
+
+What is *not* the cause, each measured rather than assumed:
+
+* **Not the store primitive.** `write_prim_element`'s `Byte` arm accepts
+  `Value::Int` (`gc/src/heap.rs`), and a bytecode `byte[]` store works
+  (`b[0]=97` reads back 97).
+* **Not a bogus array.** The result is a genuine `[B` of the right length whose
+  zeros are visible through indexing, `java.lang.reflect.Array.get` and
+  `System.arraycopy` alike.
+* **Not any of the four registered `getBytes` natives.** Marking all four
+  (`charset.rs`'s no-arg and `(Charset)` forms, `phases_early.rs`'s `(String)`
+  and `(Charset)` forms) with an `eprintln` and rebuilding produced **no output**
+  — none of them runs. `String.getBytes` is not force-listed, so in real-JDK
+  mode the real bytecode wins and the corruption happens underneath it.
+
+The stack is `String.getBytes` → `String.encode` → `String.encodeWithEncoder`
+→ `CharsetEncoder.encode`. `register_p58_charset_coder`
+(`native-builtins/src/phases_late/charset_buffers.rs`) models a coder as a
+3-slot object and reads `charset()` / `averageBytesPerChar()` /
+`maxBytesPerChar()` straight out of field indices 0/1/2. A real
+`sun.nio.cs.UTF_8$Encoder` has an entirely different layout, so those accessors
+answer with unrelated fields. `charset.rs` already carries a comment predicting
+exactly this — "a real-JDK HeapCharBuffer/HeapByteBuffer whose field layout does
+not match our synthetic 5-field Buffer overlay used by the encoder native — so
+the encode loop reads zero chars".
+
+**A drop-list entry is NOT the fix here, measured.** Adding
+`CharsetEncoder`/`CharsetDecoder` to `drop_real_layout_synthetic` does not
+restore correct bytes: it makes `getBytes` *throw* inside
+`CharsetEncoder.encode` instead of returning zeros, and the suite stays at five
+failures. Unlike `StringWriter` and the queue family, this surface is
+load-bearing in real-JDK mode — the real encoder path depends on it. The fix has
+to make the coder natives correct for a real receiver (resolve the fields by
+name, or detect a real encoder and defer), not delete them.
 
 `RFileTimes` and `RNioNoFollow` did **not** reproduce from the naive one-liner
 (a plain `JarOutputStream` round-trip and a plain symlink `writeString` both
