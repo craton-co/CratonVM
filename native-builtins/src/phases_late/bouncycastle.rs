@@ -10639,9 +10639,9 @@ pub(crate) fn bc_bcrypt_byte_array_arg(
         }
         .into()),
     }
-    .and_then(|arr| {
+    .map(|arr| {
         let _ = ctx.array_length(arr);
-        Ok(arr)
+        arr
     })
 }
 

@@ -2361,7 +2361,7 @@ fn reloc_emit_enabled() -> bool {
         //    {tag, half-pointer} word.
         self.buf.emit(&[0xF6, 0x80]); // TEST byte [RAX + disp32], imm8
         self.buf
-            .emit(&(cratonvm_types::GC_FLAGS_OFFSET as i32).to_le_bytes());
+            .emit(&(cratonvm_types::GC_FLAGS_BYTE_OFFSET as i32).to_le_bytes());
         self.buf.emit_byte(cratonvm_types::GC_FLAG_COMPACT);
         slow.push(self.emit_jcc_rel32(0x84)); // JZ → slow (legacy instance)
 
@@ -3304,11 +3304,11 @@ fn reloc_emit_enabled() -> bool {
         // guard word every cached entry below is compared against. Without the
         // `kind` check a `Foo[]` receiver is dispatched into `Foo`'s method
         // body. See the matching guard in `x64.rs`'s single-pass cascade.
-        //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+        //   CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
         self.buf.emit(&[
             0x80,
             0x78,
-            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8,
             cratonvm_types::ObjectKind::Object as u8,
         ]);
         slow_patches.push(self.emit_jcc_rel32(0x85)); // JNE .slow
@@ -10868,11 +10868,11 @@ mod tests {
         ic.insert(2usize, (MIC, PIC));
         let code = lower_virtual_call_with_ic(&ic);
 
-        // CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+        // CMP BYTE [RAX + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object
         let guard = [
             0x80u8,
             0x78,
-            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8,
             cratonvm_types::ObjectKind::Object as u8,
         ];
         assert!(

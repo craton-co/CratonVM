@@ -7444,12 +7444,23 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
                         _ => None,
                     })
                     .unwrap_or_default();
+                // Same one pass, for the same reason: `create_method_object`
+                // used to re-find this method by name+descriptor to read it.
+                let signature: Option<String> = m.attributes.iter().find_map(|a| {
+                    match a.as_decoded() {
+                        Some(cratonvm_reader::attribute::Attribute::Signature(sig)) => {
+                            Some(sig.to_string())
+                        }
+                        _ => None,
+                    }
+                });
                 MethodMetadata {
                     name: m.name.to_string(),
                     descriptor: m.descriptor.to_string(),
                     access_flags: m.access_flags.bits(),
                     declaring_class_id: class_id,
                     exceptions,
+                    signature,
                 }
             })
             .collect()
@@ -10450,7 +10461,7 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
                         "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
-                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots(), h.kind as u8, index, value, culprit, rva,
+                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots(), cratonvm_types::ObjectHeader::kind_tag(h.mark_word.load(std::sync::atomic::Ordering::Relaxed)), index, value, culprit, rva,
                     );
                     eprintln!("[straystack-native] Java stack (top first):");
                     for f in self.thread.frames.iter().rev().take(28) {
@@ -25348,7 +25359,7 @@ mod tests {
         );
 
         // --- a moving collection runs while the continuation is parked.
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old, new);
         shared
             .threads
@@ -25476,7 +25487,7 @@ mod tests {
         }
         .deposit_root_snapshot();
 
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old, new);
         shared
             .threads

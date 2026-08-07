@@ -18,7 +18,8 @@ use std::sync::OnceLock;
 
 use crate::arena::Arena;
 use crate::heap::{
-    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
+    array_data_size, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
+    HEADER_SIZE, REF_ELEMENT_SIZE,
     SLOT_SIZE,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
@@ -130,7 +131,7 @@ pub struct GcResult {
     pub stats: GcStats,
     /// Mapping from old pointer addresses to new pointer addresses.
     /// Used to remap monitor table keys and other external references.
-    pub pointer_map: HashMap<usize, usize>,
+    pub pointer_map: cratonvm_types::PointerMap,
 }
 
 /// Perform a semi-space garbage collection.
@@ -169,7 +170,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
     fire_gc_start();
     let bytes_before = from_space.used();
     let mut objects_copied: usize = 0;
-    let mut pointer_map = HashMap::new();
+    let mut pointer_map = cratonvm_types::PointerMap::default();
 
     // Phase 1: Forward all root objects
     for root in roots.iter_mut() {
@@ -223,7 +224,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                  size {} (kind=0x{:02x}, num_slots={}, array_len={}); to_space.used()={}",
                 scan_cursor,
                 total_size,
-                header.kind as u8,
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                 header.num_slots(),
                 header.array_length(),
                 to_space.used(),
@@ -232,13 +233,13 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
         }
 
         // Scan all reference-containing slots
-        if header.kind == ObjectKind::Array {
+        if header.kind() == ObjectKind::Array {
             // Reference arrays use compact 8-byte pointer storage (REF_ELEMENT_SIZE).
-            if header.element_type == ArrayElementType::Reference {
+            if header.element_type() == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, so HEADER_SIZE + i * the reference
                     // element width is within the allocated object bounds.
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     // SAFETY: s_ptr points to a valid 8-byte reference slot in the array.
                     let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                     if raw != 0 {
@@ -372,7 +373,7 @@ fn forward_object(
     to_space: &mut Arena,
     old_ptr: *mut u8,
     objects_copied: &mut usize,
-    pointer_map: &mut HashMap<usize, usize>,
+    pointer_map: &mut cratonvm_types::PointerMap,
 ) -> *mut u8 {
     match try_forward_object(from_space, to_space, old_ptr, objects_copied, pointer_map) {
         Ok(new_ptr) => new_ptr,
@@ -397,7 +398,7 @@ fn try_forward_object(
     to_space: &mut Arena,
     old_ptr: *mut u8,
     objects_copied: &mut usize,
-    pointer_map: &mut HashMap<usize, usize>,
+    pointer_map: &mut cratonvm_types::PointerMap,
 ) -> Result<*mut u8, GcError> {
     // SAFETY: old_ptr is a valid heap object in from_space (verified by caller's
     // from_space.contains() check). The header is readable for the duration of GC.
@@ -432,8 +433,8 @@ fn try_forward_object(
     // the two single-byte tag reads at the fixed header offsets are
     // in-bounds; reading a raw `u8` has no validity requirement beyond
     // in-bounds-and-readable.
-    let kind_tag = unsafe { *old_ptr.add(cratonvm_types::OBJECT_KIND_OFFSET) };
-    let elem_tag = unsafe { *old_ptr.add(cratonvm_types::ARRAY_ELEMENT_TYPE_OFFSET) };
+    let kind_tag = unsafe { cratonvm_types::kind_tag_at(old_ptr) };
+    let elem_tag = unsafe { cratonvm_types::element_type_tag_at(old_ptr) };
     if cratonvm_types::object_kind_from_tag(kind_tag).is_none()
         || cratonvm_types::array_element_type_from_tag(elem_tag).is_none()
     {
@@ -461,15 +462,14 @@ fn try_forward_object(
         let h = old_header_ptr;
         let mut owned = ObjectHeader::new(
             std::ptr::addr_of!((*h).class_id).read(),
-            std::ptr::addr_of!((*h).kind).read(),
-            std::ptr::addr_of!((*h).element_type).read(),
-            std::ptr::addr_of!((*h).identity_hash_code).read(),
+            (*h).kind(),
+            (*h).element_type(),
             0,
             0,
         );
         owned.shape = std::ptr::addr_of!((*h).shape).read();
-        owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
-        owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
+        owned.set_gc_age((*h).gc_age());
+        owned.set_gc_flags((*h).gc_flags());
         // `mark_word` is an `AtomicU64`: read it through an atomic load.
         owned.mark_word.store(
             (*h).mark_word.load(std::sync::atomic::Ordering::Relaxed),
@@ -491,7 +491,7 @@ fn try_forward_object(
                  num_slots={}, array_len={}) — corrupt header, refusing to copy",
                 total_size,
                 old_ptr,
-                header_copy.kind,
+                header_copy.kind(),
                 header_copy.num_slots(),
                 header_copy.array_length(),
             ),
@@ -596,9 +596,9 @@ fn try_forward_object(
 /// This does not mask genuine bugs silently — the corruption is logged — but
 /// it converts a hard process abort into a recoverable / fail-safe path.
 pub fn object_total_size(header: &ObjectHeader) -> usize {
-    if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length() as usize, header.element_type) {
-            Ok(data) => HEADER_SIZE + data,
+    if header.kind() == ObjectKind::Array {
+        match array_data_size(header.array_length() as usize, header.element_type()) {
+            Ok(data) => ARRAY_DATA_OFFSET + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
                 // caller's `total_size < HEADER_SIZE` guard fires (matching the
@@ -607,7 +607,7 @@ pub fn object_total_size(header: &ObjectHeader) -> usize {
                     "gc: implausible array_length {} (element_type={:?}) in moving-collector \
                      object header — treating as corrupt; caller will skip/stop the walk",
                     header.array_length(),
-                    header.element_type,
+                    header.element_type(),
                 );
                 0
             }
@@ -653,7 +653,7 @@ pub fn collect_with_finalizers(
     fire_gc_start();
     let bytes_before = from_space.used();
     let mut objects_copied: usize = 0;
-    let mut pointer_map = HashMap::new();
+    let mut pointer_map = cratonvm_types::PointerMap::default();
 
     // Phase 1: Forward all root objects (same as collect)
     for root in roots.iter_mut() {
@@ -696,7 +696,7 @@ pub fn collect_with_finalizers(
                  object size {} (kind=0x{:02x}, num_slots={}, array_len={}); to_space.used()={}",
                 scan_cursor,
                 total_size,
-                header.kind as u8,
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                 header.num_slots(),
                 header.array_length(),
                 to_space.used(),
@@ -704,10 +704,10 @@ pub fn collect_with_finalizers(
             break;
         }
 
-        if header.kind == ObjectKind::Array {
-            if header.element_type == ArrayElementType::Reference {
+        if header.kind() == ObjectKind::Array {
+            if header.element_type() == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                     let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
@@ -865,7 +865,7 @@ pub fn collect_with_finalizers(
                      to_space.used()={}",
                     scan_cursor,
                     total_size,
-                    header.kind as u8,
+                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
                     header.num_slots(),
                     header.array_length(),
                     to_space.used(),
@@ -874,10 +874,10 @@ pub fn collect_with_finalizers(
                 break;
             }
 
-            if header.kind == ObjectKind::Array {
-                if header.element_type == ArrayElementType::Reference {
+            if header.kind() == ObjectKind::Array {
+                if header.element_type() == ArrayElementType::Reference {
                     for i in 0..header.array_length() as usize {
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                        let s_ptr = unsafe { obj_ptr.add(ARRAY_DATA_OFFSET + i * ref_element_size()) };
                         let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
@@ -977,7 +977,7 @@ pub fn collect_with_finalizers(
 /// Update a Value's ObjectRef using the pointer map.
 /// If the value is `Object(Some(ref))` and the ref's address is in the map,
 /// update it to the new address.
-pub fn update_value_ref(value: &mut Value, pointer_map: &HashMap<usize, usize>) {
+pub fn update_value_ref(value: &mut Value, pointer_map: &cratonvm_types::PointerMap) {
     if let Value::Object(Some(ref mut obj_ref)) = value {
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -1192,7 +1192,7 @@ mod tests {
         // Check the array's first element points to the copied elem
         // Reference array elements are stored as compact 8-byte pointers (REF_ELEMENT_SIZE).
         let new_arr = roots[0];
-        let slot0_ptr = unsafe { new_arr.as_ptr().add(HEADER_SIZE) };
+        let slot0_ptr = unsafe { new_arr.as_ptr().add(ARRAY_DATA_OFFSET) };
         let raw: u64 = unsafe { std::ptr::read(slot0_ptr as *const u64) };
         assert_ne!(raw, 0, "Expected array[0] to be a non-null reference");
         let new_elem = unsafe { ObjectRef::from_raw(raw as usize as *mut u8) };
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_updates_known_ptr() {
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x1000usize, 0x2000usize);
 
         let obj_ref = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
@@ -1234,7 +1234,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_leaves_unknown_ptr() {
-        let map = HashMap::new();
+        let map = cratonvm_types::PointerMap::default();
         let obj_ref = unsafe { ObjectRef::from_raw(0x9998 as *mut u8) }; // 8-byte aligned
         let mut val = Value::Object(Some(obj_ref));
         update_value_ref(&mut val, &map);
@@ -1247,7 +1247,7 @@ mod tests {
 
     #[test]
     fn update_value_ref_ignores_non_object() {
-        let map = HashMap::new();
+        let map = cratonvm_types::PointerMap::default();
         let mut val = Value::Int(42);
         update_value_ref(&mut val, &map);
         assert_eq!(val.as_int(), Some(42));

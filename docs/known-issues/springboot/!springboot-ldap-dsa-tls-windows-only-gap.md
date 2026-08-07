@@ -3,6 +3,24 @@
 **Status: OPEN — accepted platform limitation, 2026-07-31.** Windows only; the
 class passes 17/17 on Linux.
 
+## Reconfirmed 2026-08-07, Windows full-suite (`craton-fullsuite-windows-20260806`)
+
+Triaging the 08-06/07 Windows full-suite run's non-passing classes turned this
+class up again: `module/spring-boot-ldap`'s
+`EmbeddedLdapAutoConfigurationTests` FAIL, 1/17, 27.449s
+(`craton-fullsuite-windows-20260806-s3/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedde-3c6a8c4df0c6.{out,err}.log`).
+
+Byte-for-byte the same signature this doc already documents — same failing
+test, same `SBRUNNER_RESULT tests=17 failed=1`, same `directoryServer` bean
+creation failure, same
+`IOException(ServerConfig with_single_cert failed: unexpected error: failed
+to parse private key as RSA, ECDSA, or EdDSA; platform TLS fallback: ...)`,
+same `os error -2146881269` (`CRYPT_E_ASN1_BADTAG`) — this run's console
+locale renders the OS message in Russian ("Встречено неверное значение тега
+ASN1", i.e. "an invalid ASN1 tag value was encountered") but the error code is
+identical. Confirms this is still the same accepted DSA/Windows-SChannel gap,
+not a new regression; no doc changes needed beyond this confirmation.
+
 ## Symptom
 
 `module/spring-boot-ldap`'s

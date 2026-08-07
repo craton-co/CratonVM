@@ -31,6 +31,19 @@ pub mod striped_counter;
 pub mod subsystem_config;
 mod value;
 
+
+/// One collection's `old address -> new address` relocation table.
+///
+/// Hashed with `FxHasher`, not the default `SipHash`. The keys are heap
+/// addresses produced by the collector itself, so there is no adversarial-input
+/// concern, and the table is both built and consumed once per collection at a
+/// size proportional to the live set — on a Spring workload that is ~756 000
+/// entries per young collection. The moving collector already accumulated into
+/// an `FxHashMap` for exactly that reason and then paid to convert it into a
+/// `HashMap` for this field: 43 ms of a 424 ms stop-the-world pause, to change
+/// a container type. Naming the hasher here is what removes that conversion.
+pub type PointerMap = rustc_hash::FxHashMap<usize, usize>;
+
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 // The JDK-only policy token. `types` is the only crate that `native-api`,
@@ -79,12 +92,15 @@ pub use handle::{HandleScope, HandleStorage, RootedHandle};
 // `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
-    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
+    element_type_tag_at, kind_tag_at,
+    object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
     FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK,
-    GC_AGE_OFFSET, GC_FLAGS_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
-    IDENTITY_HASH_CODE_OFFSET, INFLATED_PTR_MASK, MARK_FORWARDED, MARK_INFLATED, MARK_NEUTRAL,
-    MARK_STATE_MASK, MARK_THIN_LOCKED, MARK_WORD_OFFSET, NUM_SLOTS_OFFSET, OBJECT_KIND_OFFSET,
+    GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    GC_FLAGS_BYTE_OFFSET, KIND_TAGS_BYTE_OFFSET, KIND_TAG_BYTE_MASK,
+    MARK_HASH_MASK, MARK_HASH_SHIFT, MARK_QUARTET_MASK, MARK_QUARTET_SHIFT, MAX_GC_AGE,
+    INFLATED_PTR_MASK, MARK_FORWARDED, MARK_INFLATED, MARK_NEUTRAL,
+    MARK_STATE_MASK, MARK_THIN_LOCKED, MARK_WORD_OFFSET, NUM_SLOTS_OFFSET,
     REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
     THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
 };
@@ -221,12 +237,24 @@ mod tests {
              load; same failure mode as HEADER_SIZE above"
         );
         assert!(ARRAY_LENGTH_OFFSET > 0);
-        assert!(ARRAY_LENGTH_OFFSET + 4 <= HEADER_SIZE);
-        assert!(IDENTITY_HASH_CODE_OFFSET + 4 <= HEADER_SIZE);
+        // The length word bounds against the *data* offset, not the header
+        // size. They are the same today; they stop being the same at
+        // HEADER_SIZE = 16, where the length moves into an 8-byte prefix at the
+        // head of the array's body and only `ARRAY_DATA_OFFSET` still sits past
+        // it. Stating it against `HEADER_SIZE` would make this assert fail on a
+        // correct layout, which is the wrong way for an invariant to break.
+        assert!(ARRAY_LENGTH_OFFSET + 4 <= ARRAY_DATA_OFFSET);
+        assert!(
+            ARRAY_DATA_OFFSET >= HEADER_SIZE && ARRAY_DATA_OFFSET % 8 == 0,
+            "array data starts at or past the header end, on the 8-byte grid"
+        );
+        assert!(
+            ARRAY_DATA_OFFSET <= 127,
+            "ARRAY_DATA_OFFSET is the signed disp8 of the JIT's array element \
+             addressing; same failure mode as HEADER_SIZE above"
+        );
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
-        assert_eq!(OBJECT_KIND_OFFSET, 4);
-        assert_eq!(ARRAY_ELEMENT_TYPE_OFFSET, 5);
         assert_eq!(AUTOBOX_CLASS_ID.as_u32(), u32::MAX);
     }
 
@@ -261,8 +289,6 @@ mod tests {
         // The last header field that had no named constant. `jit/src/x64.rs`
         // derived its own via `offset_of!` and `vm/src/jit/helpers.rs` still
         // writes a bare `raw_ptr.add(8)`; both should use this.
-        assert_eq!(IDENTITY_HASH_CODE_OFFSET % 4, 0, "dword-addressable");
-        assert!(IDENTITY_HASH_CODE_OFFSET < HEADER_SIZE);
     }
 
     #[test]
@@ -292,7 +318,6 @@ mod tests {
             ClassId::new(0),
             ObjectKind::Object,
             ArrayElementType::Boolean,
-            0,
             0,
             0,
         );

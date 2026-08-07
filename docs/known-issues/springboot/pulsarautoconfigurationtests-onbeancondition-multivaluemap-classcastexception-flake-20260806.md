@@ -1,7 +1,120 @@
 # `PulsarAutoConfigurationTests` — intermittent `ClassCastException: Object cannot be cast to MultiValueMap` inside `OnBeanCondition$Spec`, 2026-08-06
 
-**Status: OPEN — reproduced once; 6 further attempts clean. The prescribed
-site-alias census has now been RUN, and it is not quiet.**
+**Status: the two symptoms on this class have diverged. The
+`ClassCastException` this page was opened for is ✅ FIXED (2026-08-07); the
+deterministic early HANG documented below is 🔴 OPEN, and is what keeps this
+page here.**
+
+**The `ClassCastException` was `Stream.collect(Collector)` holding unpinned
+references across a moving collection.** `collect_via_collector_protocol`'s
+ordinary-`Collector` path — the one
+`MergedAnnotationCollectors.toMultiValueMap` takes — held the accumulated
+container, the collector, the accumulator, the finisher and every element as
+raw `ObjectRef`s across five interpreter re-entries with no `pin_native_root`,
+while the same function's other arm pinned all of them. A young collection in
+that window handed the caller the container's pre-copy address, which reads
+back as an all-zero header, i.e. as `java.lang.Object`. Verified with a
+positive control (`probes/CollectorPinProbe.java`, A/B/B/A 296/300, 300/300,
+300/300, 296/300; HotSpot 300/300) and 3 clean 74/74 runs of this class. Full
+write-up:
+`pulsar-onbeancondition-multivaluemap-stream-collect-pin-FIXED-20260807`
+(retired).
+
+**This page's GC framing was right, and it talked itself out of it.** It
+recorded a `cratonvm::gc::guard` hit naming `MultiValueMap` and then set it
+aside under the standing "a reclaim-guard hit is about the address, not the
+object" caveat. That caveat is about *reused* addresses;
+`location=young TO-space (the inactive semispace)` with `span=…+0x0` is a
+different claim — nothing has been re-served there, so it is a reference that
+was never remapped. The companion guard lines said so outright: *"the holder
+is a frame local, a register, or a native side table — not a heap field"* and
+*"`in_published_snapshot=false` … a root COLLECTION gap"*. Read the guard's
+`location=` field before applying the caveat.
+
+Everything below about the site-alias census and the dispatch framing stands as
+a fact about the workload; it simply was not this bug.
+
+## 2026-08-07 update: a SECOND, unrelated symptom on the same class — a deterministic early HANG, GC-backend-independent
+
+The 2026-08-06/07 Windows full-suite runs (three separate `-Xmx 2g`, 300s/class
+runs on the same box, one per GC backend) all HANG on this class instead of
+producing the ClassCastException above:
+
+| Run | GC | Result |
+|---|---|---:|
+| `craton-fullsuite-windows-20260806-s4` | Generational | TIMEOUT/HANG, 300.071s |
+| `craton-fullsuite-g1-20260807-s4` | G1 | TIMEOUT/HANG, 300.101s |
+| `craton-fullsuite-zgc-20260807-s4` | ZGC (real) | TIMEOUT/HANG, 300.148s |
+
+This is **not** the ClassCastException flake re-manifesting as a hang — it is
+a different symptom on the same class, confirmed independently before
+assuming any connection (per this session's brief). Read on its own merits:
+
+**Zero JUnit output at all** (`.out.log` is 0 bytes in all three runs — not
+even the JUnit Platform launcher's "N containers found" banner) and the
+**identical last `.err.log` line, byte-for-byte, in all three runs**:
+
+```
+WARN cratonvm_jit::x64::driver: JIT compile bailed: code buffer estimate too small; retrying at the measured size method="net/bytebuddy/implementation/bind/annotation/Argument$Binder.bind:(Lnet/bytebuddy/description/annotation/AnnotationDescription$Loadable;Lnet/bytebuddy/description/method/MethodDescription;Lnet/bytebuddy/description/method/ParameterDescription;Lnet/bytebuddy/implementation/Implementation$Target;Lnet/bytebuddy/implementation/bytecode/assign/Assigner;Lnet/bytebuddy/implementation/bytecode/assign/Assigner$Typing;)Lnet/bytebuddy/implementation/bind/MethodDelegationBinder$ParameterBinding;" code_len=244 capacity=62336 wanted=68331
+```
+
+Same method, same `code_len=244 capacity=62336 wanted=68331` numbers, in
+all three runs — this is a deterministic stall point, not a random one. It
+fires early (~70-90s into each run, right after the "Mockito is currently
+self-attaching" banner and the `File fs/separator/pathSeparator` clinit-fixup
+warning, well before any test output would normally appear for a 74-test
+class), and then **total silence** for the remaining ~210-230s until the
+watchdog kills the process — no further JIT warnings, no GC warnings, no
+test progress of any kind. That absence of GC activity is itself informative:
+a process genuinely doing 74 tests' worth of Mockito/ByteBuddy mock-class
+generation for that long would be expected to allocate enough to trigger at
+least one young-gen collection, and none of the other HANGs found in this
+same triage batch (`QuartzEndpointWebIntegrationTests`,
+`WebFluxAutoConfigurationTests`) are this quiet — both of those keep emitting
+GC/JIT warnings most of the way to their own timeouts. This one goes
+completely dark 70-90s in.
+
+**Historical pattern**: this exact class has intermittently HANGed at 300s
+across many independent runs going back to 07-17 (`craton-rerun-20260717`
+shard4, `craton-rerun-20260723` shard7, `craton-fullsuite-20260731`,
+`craton-rerun-20260731`, and now the three 08-06/08-07 runs above), always
+interleaved with clean PASSes (08-02 azure, 07-28 rerun, 08-06
+`pulsar-recheck-r1`) and — once — the ClassCastException FAIL this doc was
+originally filed for. The HotSpot baseline has never hung on this class
+(29.3s clean, 07-17). Isolated single-class reruns (`pulsar-recheck-r1-20260806`,
+182s; `craton-hangverify-20260731`, 369s) always pass, which — per this
+codebase's established "isolation reruns understate cluster bugs 4:1" lesson
+(`docs/internal/fixed-suite-bugs/springboot/mockito-bytebuddy-classfile-metadata-cluster-FIXED-20260805.md`)
+— means this needs to be chased under the suite's own concurrency, not in
+isolation.
+
+**Ruled out**: the already-fixed recycled-`JitInvokeInfo` dispatch-aliasing
+bug (`383e7f5cf`, merged 08-05) that produced a whole cluster of
+Mockito/ByteBuddy symptoms including ones in this exact `Argument$Binder`
+neighborhood — the binary used for all three runs above (built from `dev` as
+of 08-06) contains that fix, and the symptom shape doesn't match anyway (that
+bug produced wrong *values* at specific crash sites; this is silence with no
+crash at all).
+
+**Not root-caused.** The `code_len=244 capacity=62336 wanted=68331` bail is,
+by itself, a normal and handled path (`jit/src/x64/driver.rs:1797-1829`) — it
+bails that one compile to the interpreter and records the shortfall for the
+next compile attempt at this method to size its buffer from
+(`crate::note_code_buffer_shortfall`, `jit/src/lib.rs:12329-12342`); nothing
+in that retry path holds a lock or loops. Whether the total silence
+afterward is this specific method's *interpreted* execution genuinely
+hanging (as opposed to just being slow with nothing else to log), a deadlock
+elsewhere in Mockito/ByteBuddy's mock-class generation that happens to be
+reached right after this bail, or something in the retry bookkeeping itself,
+was not determined this session — no `--stack-dump-on-timeout` capture exists
+for any of the three runs (the suite disables the watchdog by default and
+relies on its own per-class timeout instead, per
+`run-spring-boot-suite.ps1`'s `New-ProcessRecord`). Whoever picks this up
+next should rerun this one class alone with
+`--stack-dump-on-timeout <some-value-under-300>` (or `--stack-sample-ms`) to
+get a real frame at the stall point before guessing further.
+
+## Original entry (2026-08-06), retained below
 
 **2026-08-06 update.** Two things changed, neither of them a fix:
 
@@ -97,7 +210,7 @@ root-cause it live.
 resolved, and *not* as a GC defect: it was the recycled-`JitInvokeInfo`
 dispatch defect (`383e7f5cf`), where a site key freed with its `CompiledMethod`
 and re-issued let one call site return another's answer — see
-`fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`.
+[`spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`](../../internal/fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md).
 Two things follow for this page. First, its ~1030 instrumented hunt runs found
 nothing because both detectors watched the map and the map was innocent — a hit
 rate is not worth buying with runs while the instrument points at the wrong
@@ -119,7 +232,7 @@ this as new:
   empty-deduction/wrong-exception-message, tied to `@ClassPathExclusions`
   isolated classloaders). This class doesn't use classpath exclusion.
 - `spring-bean-attribute-type-null-flake` (now
-  `fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md`)
+  [`...-RESOLVED-20260806.md`](../../internal/fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md))
   — same general "rare, one-shot, Spring reflection/annotation-processing miss"
   family and same `OnBeanCondition.Spec` constructor neighborhood, but a
   different concrete failure: an `IdentityHashMap` primitive-wrapper lookup
@@ -144,56 +257,6 @@ this as new:
 
 Log:
 `apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-20260806-s5/all-jit/logs/module_spring-boot-pulsar.org.springframework.boot.pulsar.autoconfigure.PulsarAutoC-72a68e29781a.{out,err}.log`
-
-## The site-alias census has been run — NOT quiet (2026-08-07)
-
-Ran the class once under `CRATONVM_DBG_SITE_ALIAS=1` on a binary containing
-`383e7f5cf` (`cratonvm-ovlbatch0806`, dev + the overlay GC fixes).
-
-* **Verdict: `tests=74 failed=0 aborted=0 skipped=2`** — no repro. That makes it
-  **1 failure in 7 known attempts**.
-* **Census: loud.** 1007 site keys observed; the printer hit its 40-line cap and
-  emitted `(further hits are counted, not printed)`. Key recycling is pervasive
-  in this workload, not marginal.
-* **The aliased keys include the annotation-reading sites this bug runs on:**
-
-  | key | was | now |
-  |---|---|---|
-  | `…f1340` | `AnnotatedElement.getDeclaredAnnotations()` | `asm/ClassReader.readUnsignedShort(I)I` |
-  | `…f1740` | `AnnotatedElement.getDeclaredAnnotation(Class)` | `ConcurrentReferenceHashMap$Segment.getReference(…)` |
-  | `…f1e40` | `AnnotatedElement.getAnnotations()` | `ConcurrentReferenceHashMap$Reference.get()` |
-  | `…f6340` | `AnnotationTypeMappings.size()I` | `bytebuddy/utility/Invoker.invoke(…)` |
-
-**What this does and does not establish.** The fix is already on this binary, so
-per the caveat below a positive census says the workload **recycles keys**, not
-that it is still corrupting — the instrument measures the *precondition*. It is
-still the answer the page asked for: the census is not quiet, so by this page's
-own decision rule the **dispatch framing is the one to pursue and the GC framing
-can be deprioritised** without buying a hit rate. What is new is that the
-precondition is dense at *exactly* the annotation-reading sites
-`OnBeanCondition$Spec` uses to build the `MultiValueMap`.
-
-The next question is therefore narrow: is there a site-keyed structure that does
-**not** re-validate identity after `383e7f5cf`? That fix cleared the eight
-site-keyed dispatch memos; anything else keyed on a `JitInvokeInfo` address
-would still be exposed, and this workload would trigger it.
-
-**Answered the same day: no, not in `vm/`.** Every `JitSiteKey`-keyed structure
-is declared through the `site_keyed_memos!` macro, which *generates* the flush
-alongside the declaration — so coverage is structural, not a list someone has to
-remember to update. Enumerating `JitSiteKey`-keyed statics finds the eight memos
-plus `SITE_IDENTITY`, which is the `CRATONVM_DBG_SITE_ALIAS` diagnostic map
-itself and carries no dispatch decision. So the dense aliasing above is the
-precondition being satisfied against a defence that is, as far as `vm/` goes,
-complete — which makes "an uncovered site memo" the wrong place to look next and
-leaves this page genuinely open rather than nearly-solved.
-
-**Harness trap, cost one run of confusion.** The emitter writes `[site-alias]`
-(hyphen); a census grep for `site_alias` (underscore) matched nothing and
-reported "CENSUS QUIET", which reads exactly like the negative result that would
-have sent this investigation to the GC framing. **Grep the emitter's literal tag,
-and treat a clean negative as a harness bug until the instrument is shown to
-speak.**
 
 ## Suggested next step
 

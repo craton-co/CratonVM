@@ -3798,7 +3798,7 @@ pub(crate) mod input_cache {
     /// parked while holding it.
     pub fn remap_and_sweep(
         vm: usize,
-        pointer_map: &std::collections::HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         heap: &crate::memory::vm_heap::VmHeap,
     ) {
         let mut tables = map().lock();

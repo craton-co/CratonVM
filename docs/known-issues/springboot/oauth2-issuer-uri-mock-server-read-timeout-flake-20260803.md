@@ -443,6 +443,168 @@ sweep this workload never takes. `cheney_drain` is the one that decides whether
 the flake survives; `overlay_forward` alone cannot bring a 1538 ms pause under
 500 ms.
 
+## The pause is now FULLY accounted for (2026-08-07)
+
+This page's own next step was *"the phases do not sum to the total (1036 of
+1538 ms). The remainder is outside the instrumented span — lock acquisition,
+the young object-start bitmap build, and the post-drain finalizer/sweep/swap
+tail. Worth instrumenting next."* Done. Two blind spots are now instrumented:
+
+* **inside the collector** — `mv_phase!` was declared after the young
+  object-start walk and stopped at `cheney_drain`, so everything before
+  evacuation and the whole post-drain tail (finalizer resurrection, promotion
+  statistics, card clear + young reset, the `FxHashMap`→`HashMap` pointer_map
+  rebuild, the semispace swap, the major-GC check, the monitor remap, adaptive
+  expansion) was invisible. The stopwatch now starts at the top of
+  `collect_garbage_inner` and marks every one of them.
+* **outside the collector** — `CRATONVM_DBG_ROOTPROF=1` times each entry of
+  `native_roots::VM_ROOT_SOURCES` in `scan_all_roots` / `remap_all_roots`, plus
+  `collect_roots` and `update_all_roots` as wholes. That half contains a full
+  walk of every overlay collection in the process and had never been measured.
+
+6 lanes × 2 rounds on the Azure host, `--Xmx 2g`, default (goal-off) config, 26
+collections over the `[gcpause]` 100 ms print threshold:
+
+| phase | median | p90 | max | share |
+|---|---:|---:|---:|---:|
+| **TOTAL PAUSE** | **424 ms** | 506 | **628** | — |
+| `cheney_drain` | 253 | 303 | 408 | 60% |
+| `pointer_map_rebuild` *(new)* | 43 | 65 | 98 | 10% |
+| `overlay_forward` | 39 | 51 | 55 | 9% |
+| `promotion_stats` *(new)* | 29 | 35 | 43 | 7% |
+| `pre_evacuate` *(new)* | 27 | 42 | 65 | 6% |
+| `scan_dirty_cards` | 11 | 11 | 11 | 3% |
+| `root_forward` | 3 | 4 | 5 | <1% |
+| `cardclear+young_reset` | 3 | 3 | 4 | <1% |
+| — outside the collector — | | | | |
+| `update_all_roots` | 38 | 48 | 99 | — |
+| ↳ `remap_all_roots:collection-overlays` | 34 | 43 | 91 | — |
+| `collect_roots` | — | — | 26 | (over the 20 ms floor once in 12 runs) |
+
+Counters: `objects_copied` median **755 944**, `young_bytes_before` median
+**274 MB**. Phases sum to ~408 of the 424 ms median — the 500 ms gap this page
+opened with is closed.
+
+**The composition is stable, which is the durable result.** Re-measured with
+`CRATONVM_GC_YOUNG_PAUSE_MS=250`, every absolute number roughly halves but the
+shares barely move: `cheney_drain` 60%, `overlay_forward` 9.5%,
+`pointer_map_rebuild` 8%, `promotion_stats` 9%, `pre_evacuate` 8.6%. So the
+target list does not depend on the sizing policy: it is one 60% phase and four
+8–10% phases. (The two arms were consecutive blocks, not interleaved, so **no
+absolute comparison between them is claimed** — this page has already had one
+rate claim collapse under alternation. Only the within-run shares are used.)
+
+### FIXED: `promotion_stats` — 29 ms per pause to recompute a size the copy already had
+
+Phase H derived `bytes_promoted` / `objects_promoted` / `bytes_copied_young` /
+`objects_copied_young` by iterating all ~756 000 `pointer_map` entries after
+the copy phase and **dereferencing each destination header** to recompute
+`gen_object_total_size` — ~756 000 random header reads inside stop-the-world.
+The comment justified it as avoiding "an expensive counter plumbed through
+`forward_object`'s 12 call sites".
+
+The counter does not have to be plumbed. The copy phase is single-threaded *by
+construction* — every `forward_object_impl` destination parameter is
+`&mut Arena`, so the borrow checker enforces it; the parallel part of a young
+cycle is the mark closure, which is read-only and never forwards. A
+thread-local tally is therefore sound, and `forward_object_impl` already knows
+both the size and the destination arena at the point of the memcpy.
+
+The BUG-Z forward validation the walk also performed is kept behind
+`CRATONVM_DBG_FWDWALK=1` — it is a diagnostic and does not need to run on every
+collection. `gc` suite 979/979 green, including
+`phase_h_integration::rh1_promotion_stats_bump_across_cycles`, which is the
+test that covers exactly these counters.
+
+#### Measured A,B,B,A
+
+Four 6-lane blocks, binary flipped every block, `CRATONVM_DBG=gcpause`:
+
+| block | arm | n | median pause | p90 | `promotion_stats` |
+|---|---|---:|---:|---:|---:|
+| 1 | A before | 14 | 361 ms | 430 | 24 ms |
+| 2 | B after | 17 | **333 ms** | 373 | **0** |
+| 3 | B after | 15 | **300 ms** | 423 | **0** |
+| 4 | A before | 14 | 345 ms | 423 | 27 ms |
+
+The phase is gone, and both B blocks land below both A blocks, so the ~10%
+median improvement survives the ordering rather than reading as host drift.
+`cheney_drain` is unchanged (211/210 vs 210/184), which is the expected
+negative control — nothing here touched the copy phase. **No claim is made
+about the max**: it went 463/527 (A) vs 432/612 (B), i.e. the tail is dominated
+by something this fix does not address, which is the honest state of this page.
+
+### FIXED: `pointer_map_rebuild` — 43 ms per pause, pure container churn
+
+```rust
+let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
+```
+
+~756 000 SipHash inserts to convert the Cheney scan's `FxHashMap` into the
+`HashMap` that `GcResult.pointer_map` is declared as. Nothing about the data
+changes. Pre-sizing does not help — std's `FromIterator` already reserves the
+full size, so the cost is the hashing itself.
+
+The only fix is the declared type, and the blast radius was measured rather
+than guessed: **94 `&HashMap<usize, usize>` parameter positions** across `gc`,
+`vm`, `jit`, `native-builtins`, `native-collections`, `native-io` and
+`classloading` — and **not all of them are pointer maps**, which is why this
+was done with rustc rather than a regex. Retyping `GcResult::pointer_map` to
+`cratonvm_types::PointerMap` and repairing outward from there made every
+genuine boundary a type error, while the maps that merely share the shape were
+either never reached or surfaced as an error that had to be looked at:
+
+* `jit/src/x64.rs` — ~19 BCI / operand-index maps
+* `vm/src/native/jni.rs` — `JNI_STRING_BUFFERS`, pointer → element count
+* `native-collections` — `lhm_ptr_cache`, `ptr_to_index`
+* `classloading/src/verifier.rs` — `instruction_by_pc`
+* `old_gen::compact_with_drop_flags` — takes `HashMap<usize, u8>`
+
+A blanket sweep would have silently retyped all five.
+
+Changing the hasher cannot break correct code: `std`'s `RandomState` is seeded
+per process, so `HashMap` iteration order already differs run to run and
+nothing may depend on it. `FxHashMap`'s order is deterministic, which is if
+anything easier to reproduce.
+
+**Measured: the phase is 0 ms.** Confirmed in an instrumented 6-lane run
+alongside `promotion_stats`, also 0 ms — both phases removed outright rather
+than made smaller.
+
+### Still the 60%: `cheney_drain` — and one theory now refuted
+
+253 ms for 755 944 objects is ~335 ns per object, far too slow for a ~40-byte
+memcpy, which points at a hidden per-call cost.
+
+**The plausible candidate, measured and dead.** Every reference *slot* of every
+copied object is fed to `forward_object`, and its `is_forwarded()`
+early-return still does `pointer_map.entry(..).or_insert(..)` — a hash probe on
+a map with as many entries as there are survivors. If references outnumbered
+objects several to one, the drain would be a lookup cost, and the fix would be
+to trust the forwarded header instead of probing it. `CRATONVM_DBG=gcpause`
+now counts both arms:
+
+```
+fwd_copies         med 756 089
+fwd_reencounters   med 731 480
+```
+
+Roughly **1:1**. Re-encounters are about half the calls, so removing them
+entirely could not account for the phase. **Do not re-chase this.** (Caveat:
+the `young_object_starts.contains` early-return fires before either counter, so
+references to old-gen objects are in neither arm — the ratio between the two
+counted arms is still the answer to the question asked.)
+
+**What is left is inherent.** 756 000 objects copied out of a ~311 MB
+from-space is ~2–3 cache/TLB misses per object at essentially random
+addresses; at ~100 ns each that is the ~290 ns. A copying collector over a
+young gen that size cannot be made much cheaper *per object* — the lever is
+**how many objects it copies**, i.e. young sizing
+(`CRATONVM_GC_YOUNG_PAUSE_MS`, implemented, default OFF), not a micro-fix
+inside the loop. `perf` cannot check this on the Azure host:
+`/proc/sys/kernel/perf_event_paranoid` is 4, so even `-e cpu-clock` user-only
+recording is refused; in-tree counters are the only instrument.
+
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 
 Not the cause of this flake — MockWebServer reads through buffered Okio segments

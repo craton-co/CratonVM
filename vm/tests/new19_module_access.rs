@@ -30,6 +30,7 @@
 //! Java classes (`ModuleTarget.class`, `TckModule.class`).
 
 use cratonvm_vm::classloading::module::{ModuleDescriptor, UNNAMED_MODULE};
+use cratonvm_vm::classloading::ClassLoaderId;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::Vm;
@@ -97,13 +98,13 @@ fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
     // unnamed. Both mutations are no-ops if the classes happen to already
     // match the expected state.
     let target_cid = cm
-        .find_class_by_name("cratonvm/ModuleTarget")
+        .find_class_by_name_for_loader("cratonvm/ModuleTarget", ClassLoaderId::Application)
         .expect("ModuleTarget loaded above");
     if let Some(class) = cm.get_class_mut(target_cid) {
         class.module_name = Some("test.named".to_string());
     }
     let caller_cid = cm
-        .find_class_by_name("cratonvm/TckModule")
+        .find_class_by_name_for_loader("cratonvm/TckModule", ClassLoaderId::Application)
         .expect("TckModule loaded above");
     if let Some(class) = cm.get_class_mut(caller_cid) {
         class.module_name = None;
@@ -129,7 +130,7 @@ fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
 fn module_name_of(vm: &Vm, class_name: &str) -> String {
     let cm = vm.shared.classes.class_manager.read();
     let cid = cm
-        .find_class_by_name(class_name)
+        .find_class_by_name_for_loader(class_name, ClassLoaderId::Application)
         .expect("class must be loaded");
     let class = cm.get_class(cid).expect("class must exist");
     class

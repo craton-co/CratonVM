@@ -6557,6 +6557,110 @@ pub(crate) fn native_class_get_declared_field(
 ///   +2 в†’ Int    (accessible flag, 0 or 1)
 // The fourth tail slot marks metadata written by `create_method_object` as
 // immutable and safe to use without rebuilding the JDK field descriptor.
+
+// ---------------------------------------------------------------------------
+// getDeclaredMethods phase profiler (CRATONVM_DBG_GDM_PROF=1).
+//
+// `Class.getDeclaredMethods()` on a 1000-method class costs ~3.4 ms on
+// CratonVM against ~47 us on HotSpot, and the per-method cost GROWS with the
+// method count -- so there is a super-linear term on top of a large linear
+// one. This splits `create_method_object` into phases so the next fix is
+// aimed at a measured cost rather than a plausible one. Off by default; when
+// off, each boundary is one `Option` test.
+// ---------------------------------------------------------------------------
+pub(crate) mod gdmp {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const NBUCKETS: usize = 14;
+    pub const NAMES: [&str; NBUCKETS] = [
+        "alloc",
+        "mirror+name",
+        "ret_mirror",
+        "param_arr",
+        "method_exceptions",
+        "exc_arr+desc_str",
+        "pin_reread",
+        "set_field_by_name",
+        "named_layout",
+        "method_signature",
+        "extra_slots",
+        "declared_methods",
+        "filter+reorder",
+        "link_isolated",
+    ];
+
+    static ON: OnceLock<bool> = OnceLock::new();
+
+    pub fn on() -> bool {
+        *ON.get_or_init(|| {
+            std::env::var("CRATONVM_DBG_GDM_PROF")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    thread_local! {
+        static ACC: RefCell<[u64; NBUCKETS]> = const { RefCell::new([0u64; NBUCKETS]) };
+    }
+
+    pub fn reset() {
+        ACC.with(|a| *a.borrow_mut() = [0u64; NBUCKETS]);
+    }
+
+    pub fn add(bucket: usize, ns: u64) {
+        ACC.with(|a| a.borrow_mut()[bucket] += ns);
+    }
+
+    pub fn snapshot() -> [u64; NBUCKETS] {
+        ACC.with(|a| *a.borrow())
+    }
+
+    /// Stopwatch that attributes the time since its last mark to a bucket.
+    pub struct Lap {
+        last: Option<Instant>,
+    }
+
+    impl Lap {
+        pub fn new() -> Self {
+            Self {
+                last: if on() { Some(Instant::now()) } else { None },
+            }
+        }
+        pub fn mark(&mut self, bucket: usize) {
+            if let Some(last) = self.last {
+                let now = Instant::now();
+                add(bucket, now.duration_since(last).as_nanos() as u64);
+                self.last = Some(now);
+            }
+        }
+    }
+
+    pub fn report(tag: &str, n: usize, total_ns: u64) {
+        if !on() {
+            return;
+        }
+        let acc = snapshot();
+        let sum: u64 = acc.iter().sum();
+        let mut parts = String::new();
+        for (i, ns) in acc.iter().enumerate() {
+            if *ns == 0 {
+                continue;
+            }
+            parts.push_str(&format!(" {}={:.0}us", NAMES[i], *ns as f64 / 1000.0));
+        }
+        eprintln!(
+            "[gdmprof] class={} n={} total={:.0}us accounted={:.0}us{}",
+            tag,
+            n,
+            total_ns as f64 / 1000.0,
+            sum as f64 / 1000.0,
+            parts
+        );
+    }
+}
+
 const METHOD_EXTRA_SLOTS: usize = 4;
 const METHOD_EXTRA_OFFSET_DESC: usize = 0;
 const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
@@ -6632,6 +6736,7 @@ pub(crate) fn create_method_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
 ) -> cratonvm_types::ObjectRef {
+    let mut __lap = gdmp::Lap::new();
     let class_id = ctx
         .ensure_class_initialized("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
@@ -6658,6 +6763,7 @@ pub(crate) fn create_method_object(
     // Pin everything now and re-read the forwarded reference right before use.
     let obj_pin = ctx.pin_native_root(obj);
 
+    __lap.mark(0);
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
     let class_mirror_pin = ctx.pin_native_root(class_mirror);
     let name_str = ctx.create_string(&meta.name);
@@ -6667,6 +6773,7 @@ pub(crate) fn create_method_object(
     // through the declaring class's own loader (loader-faithful) so a method on a
     // bytecode-enhanced / child-loader class reports that loader's copy of the
     // return / parameter types (gated; see `descriptor_to_class_mirror_via_loader`).
+    __lap.mark(1);
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&meta.descriptor);
     let ret_mirror = descriptor_to_class_mirror_via_loader(ctx, &ret_desc, meta.declaring_class_id);
     let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
@@ -6674,6 +6781,7 @@ pub(crate) fn create_method_object(
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
     // (see `build_mirror_array` вЂ” WildFly bug-06).
+    __lap.mark(2);
     let class_comp = class_component_id(ctx);
     let decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
@@ -6695,12 +6803,16 @@ pub(crate) fn create_method_object(
     // attribute when present, so `Method.getExceptionTypes()` (which the
     // JDK Java code implements by `return exceptionTypes.clone();`)
     // returns the actual throws-clause types instead of always-empty.
-    let exception_names =
-        ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
+    __lap.mark(3);
+    // Already resolved by whoever built this metadata (see
+    // `MethodMetadata::exceptions`). Re-deriving it here meant an O(methods)
+    // search of the declaring class's method table per mirror.
+    let exception_names = meta.exceptions.clone();
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
     // Build a Class<T> mirror for each thrown checked exception via the L-form
     // so class loading + caching go through the same path as elsewhere.
+    __lap.mark(4);
     let exception_arr =
         build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
             let desc = format!("L{};", exception_names[i]);
@@ -6712,6 +6824,7 @@ pub(crate) fn create_method_object(
 
     // Re-read every pinned local's forwarded reference now that all the
     // classloading/allocation above has settled.
+    __lap.mark(5);
     let obj = ctx.read_native_pin(obj_pin, obj);
     let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
     let name_str = ctx.read_native_pin(name_str_pin, name_str);
@@ -6721,6 +6834,7 @@ pub(crate) fn create_method_object(
     let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
 
     // --- Real JDK Method layout (visible to Java bytecode via Getfield) ---
+    __lap.mark(6);
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(obj, "returnType", Value::Object(Some(ret_mirror)));
@@ -6777,6 +6891,7 @@ pub(crate) fn create_method_object(
     // write turned into `clazz` being overwritten with the RETURN TYPE (slot 2)
     // — Byte Buddy then reported `public abstract int int.value() does not
     // represent interface …Argument`. See `method_class_has_named_layout`.
+    __lap.mark(7);
     let has_named_layout = method_class_has_named_layout(ctx, class_id);
     let named_method_layout_landed = matches!(
         ctx.get_field_by_name(obj, "name"),
@@ -6848,14 +6963,16 @@ pub(crate) fn create_method_object(
     // JDK Java code recover the full `ParameterizedType`, matching real-JVM
     // behaviour. Mirrors how `create_field_object` relies on the field
     // Signature attribute for `Field.getGenericType()`.
-    if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
+    __lap.mark(8);
+    if let Some(sig) = meta.signature.clone() {
         let sig_obj = ctx.create_string(&sig);
-        // `method_signature`/`create_string` above can also allocate/classload —
+        // `create_string` above can allocate/classload —
         // re-read `obj` before writing into it.
         let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
     }
 
+    __lap.mark(9);
     // --- CratonVM extra metadata (append after JDK layout) ---
     let obj = ctx.read_native_pin(obj_pin, obj);
     let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
@@ -6876,6 +6993,7 @@ pub(crate) fn create_method_object(
         Value::Int(METHOD_EXTRA_TRUSTED_MARKER),
     );
 
+    __lap.mark(10);
     ctx.unpin_native_roots(obj_pin);
     obj
 }
@@ -7244,6 +7362,39 @@ pub(crate) fn method_modifiers_value(
     ctx: &dyn NativeContext,
     method_obj: cratonvm_types::ObjectRef,
 ) -> Value {
+    // A mirror THIS VM built already carries the declaring member's exact
+    // class-file `access_flags`: `create_method_object` writes `modifiers`
+    // from `MethodMetadata::access_flags`, which is the same
+    // `m.access_flags.bits()` the class-table search below would find. Taking
+    // the field is not a micro-optimisation — the search calls
+    // `ctx.declared_methods(class_id)`, which allocates a fresh
+    // `MethodMetadata` (two owned `String`s and two `Vec`s) for EVERY method
+    // the class declares, per call. That made `Method.getModifiers()` cost
+    // 4.2 us on a 125-method class and 39.0 us on jOOQ's 1003-method
+    // `DefaultDSLContext`, against HotSpot's 1 ns — linear in the declaring
+    // class's method count, for a value already sitting in a field.
+    //
+    // Spring's `AnnotationsScanner.isOverride` calls it once per candidate
+    // method pair: a native census of one `MethodIntrospector.selectMethods`
+    // pass over `DefaultDSLContext` counted 1 549 873 calls, which is the
+    // whole of the 65-75 s that pass took (retired write-up:
+    // `jooqautoconfigurationtests-timeout-regression-20260805`).
+    //
+    // The search stays for a mirror we did NOT build, which is what the
+    // comment below is about: a JDK-private `Method` copy is allocated by JDK
+    // bytecode at the real JDK width, so it has no post-layout metadata tail
+    // and fails `method_has_trusted_metadata` — the same marker
+    // `read_method_descriptor` already refuses to trust without.
+    if method_has_trusted_metadata(ctx, method_obj) {
+        if let v @ Value::Int(_) = method_int_field_value_or_legacy(
+            ctx,
+            method_obj,
+            "modifiers",
+            METHOD_LEGACY_SLOT_MODIFIERS,
+        ) {
+            return v;
+        }
+    }
     // JDK-private Method copies can retain a truncated `modifiers` field.
     // Prefer the loaded declaring member's exact class-file metadata.
     if let (Value::Object(Some(clazz)), Value::Object(Some(name))) = (
@@ -8617,6 +8768,7 @@ fn synthetic_method_meta(
         access_flags: decl.2,
         declaring_class_id,
         exceptions: Vec::new(),
+        signature: None,
     }
 }
 
@@ -8666,6 +8818,7 @@ fn declared_methods_with_synthetic(
                     access_flags: 0x0001, // ACC_PUBLIC
                     declaring_class_id: class_id,
                     exceptions: Vec::new(),
+                    signature: None,
                 });
             }
         }
@@ -8687,6 +8840,7 @@ fn declared_methods_with_synthetic(
                 access_flags: 0x0012,
                 declaring_class_id: class_id,
                 exceptions: Vec::new(),
+                signature: None,
             });
         }
         return methods;
@@ -8855,7 +9009,11 @@ pub(crate) fn native_class_get_declared_methods(
             }
         };
 
+        gdmp::reset();
+        let __gdm_all = std::time::Instant::now();
+        let mut __glap = gdmp::Lap::new();
         let methods = declared_methods_with_synthetic(ctx, class_id);
+        __glap.mark(11);
         if crate::vmflags().loader.dbg_obsreg {
             let __cname = ctx.class_name_of_id(class_id).unwrap_or_default();
             if __cname.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
@@ -8976,13 +9134,23 @@ pub(crate) fn native_class_get_declared_methods(
             visible = reordered;
         }
 
+        __glap.mark(12);
         link_isolated_method_signatures(ctx, class_id, &visible)?;
+        __glap.mark(13);
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
         let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
             create_method_object(ctx, visible[i])
         });
+        if gdmp::on() {
+            let __name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            gdmp::report(
+                &__name,
+                visible.len(),
+                __gdm_all.elapsed().as_nanos() as u64,
+            );
+        }
         Ok(Some(Value::Object(Some(arr))))
     })();
     // Restore depth on every exit path (success or error).
@@ -9281,6 +9449,7 @@ fn wf_shim_synth_main_method(
         access_flags: (ACC_PUBLIC | ACC_STATIC) as u16,
         declaring_class_id,
         exceptions: Vec::new(),
+        signature: None,
     };
     tracing::warn!(
         target: "wf-shim",
@@ -9486,8 +9655,10 @@ pub(crate) fn create_constructor_object(
     // Enhancer.emitConstructors calls this on every superclass constructor
     // during proxy class generation вЂ” see ReflectUtils.getExceptionTypes
     // (ReflectUtils.java:133/605).
-    let exception_names =
-        ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
+    // Already resolved by whoever built this metadata (see
+    // `MethodMetadata::exceptions`). Re-deriving it here meant an O(methods)
+    // search of the declaring class's method table per mirror.
+    let exception_names = meta.exceptions.clone();
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
     let exception_arr =
@@ -9521,9 +9692,9 @@ pub(crate) fn create_constructor_object(
     // constructor parameter (e.g. a record's canonical `List<Foo>` component) came
     // back as raw `List` from `Parameter.getParameterizedType()` while
     // `Constructor.getGenericParameterTypes()` (a registered native) was correct.
-    if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
+    if let Some(sig) = meta.signature.clone() {
         let sig_obj = ctx.create_string(&sig);
-        // `method_signature`/`create_string` above can also allocate/classload —
+        // `create_string` above can allocate/classload —
         // re-read `obj` before writing into it.
         let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
@@ -11574,7 +11745,7 @@ pub fn gc_scan_annotation_proxy_roots(vm_identity: usize, out: &mut Vec<ObjectRe
 /// new address after a moving collection.
 pub fn gc_update_annotation_proxy_refs(
     vm_identity: usize,
-    pointer_map: &HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;
@@ -20103,6 +20274,7 @@ mod tests {
             access_flags: 0x0001,
             declaring_class_id: owner,
             exceptions: Vec::new(),
+            signature: None,
         };
         let method = create_method_object(&mut ctx, &meta);
         ctx.set_method_return_type_annotations(
@@ -20137,6 +20309,7 @@ mod tests {
             access_flags: 0x0001,
             declaring_class_id: owner,
             exceptions: Vec::new(),
+            signature: None,
         };
         let method = create_method_object(&mut ctx, &meta);
         ctx.set_method_parameter_type_annotations(
@@ -21865,6 +22038,7 @@ mod tests {
             access_flags: 0x1,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
 
         let method_obj = create_method_object(&mut ctx, &meta);
@@ -22908,6 +23082,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x1, // ACC_PUBLIC, distinct from synthetic 0x14
             declaring_class_id: cl_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         ctx.set_declared_methods(cl_cid, vec![real_meta]);
 
@@ -23134,6 +23309,7 @@ Implementation-Title: opensaml-core-api\r\n\
                     access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
+                    signature: None,
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
@@ -23141,6 +23317,7 @@ Implementation-Title: opensaml-core-api\r\n\
                     access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
+                    signature: None,
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
@@ -23148,6 +23325,7 @@ Implementation-Title: opensaml-core-api\r\n\
                     access_flags: 0,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
+                    signature: None,
                 },
             ],
         );
@@ -23200,6 +23378,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -23231,6 +23410,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -23271,6 +23451,7 @@ Implementation-Title: opensaml-core-api\r\n\
                 access_flags: 0x00,
                 declaring_class_id: cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/WriteReplaceOnly");
@@ -23321,6 +23502,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -23562,6 +23744,7 @@ Implementation-Title: opensaml-core-api\r\n\
                 access_flags: 0x01,
                 declaring_class_id: object_cid,
                 exceptions: Vec::new(),
+                signature: None,
             },
             MethodMetadata {
                 name: "hashCode".to_string(),
@@ -23569,6 +23752,7 @@ Implementation-Title: opensaml-core-api\r\n\
                 access_flags: 0x01,
                 declaring_class_id: object_cid,
                 exceptions: Vec::new(),
+                signature: None,
             },
         ];
         ctx.set_declared_methods(object_cid, object_methods);
@@ -23583,6 +23767,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x401, // ACC_PUBLIC|ACC_ABSTRACT
             declaring_class_id: iface_cid,
             exceptions: Vec::new(),
+            signature: None,
         }];
         ctx.set_declared_methods(iface_cid, iface_methods);
         ctx.set_superclass(iface_cid, object_cid);
@@ -23624,6 +23809,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x0001,
             declaring_class_id,
             exceptions: Vec::new(),
+            signature: None,
         };
         ctx.set_declared_methods(
             parent,
@@ -23706,6 +23892,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x09, // ACC_PUBLIC|ACC_STATIC, distinct from synthetic 0x81
             declaring_class_id: m_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         ctx.set_declared_methods(m_cid, vec![real_meta]);
 

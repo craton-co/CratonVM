@@ -541,13 +541,53 @@ pub(crate) fn take_raw_socket_stream_for_tls(
     // legacy s2 registry.  Extract its FileDescriptor and hand the stream to
     // rustls before MockWebServer calls SSLSocketFactory.createSocket(Socket,
     // ...).
-    let implementation = match ctx.get_field_by_name(this, "impl") {
+    let mut implementation = match ctx.get_field_by_name(this, "impl") {
         Value::Object(Some(implementation)) => implementation,
         _ => return Err("wrapped Socket is not connected".to_string()),
     };
-    let descriptor = match ctx.get_field_by_name(implementation, "fd") {
-        Value::Object(Some(descriptor)) => descriptor,
-        _ => return Err("wrapped Socket has no FileDescriptor".to_string()),
+    // FIX (mysql-connector-j STARTTLS layered-socket handshake): a plain
+    // client-side `new Socket()` + `.connect(SocketAddress, timeout)` (the
+    // shape `com.mysql.cj.protocol.StandardSocketFactory` uses to build the
+    // socket it later upgrades to TLS) does NOT get a bare `NioSocketImpl` in
+    // `impl` the way `ServerSocket.accept()` does. Since (at least) JDK 13,
+    // `Socket.createImpl()` always wraps the real impl in
+    // `java.net.SocksSocketImpl` (a `DelegatingSocketImpl`) so a SOCKS proxy
+    // configured after construction is still honored — CONFIRMED via
+    // reflection on both HotSpot and CratonVM: `impl.getClass()` is
+    // `java.net.SocksSocketImpl` and `impl.fd` itself is null on BOTH VMs;
+    // the live `FileDescriptor` sits one level deeper, at
+    // `impl.delegate.fd`. This extraction only ever looked at `impl.fd`
+    // directly, so it always answered "wrapped Socket has no
+    // FileDescriptor" for this socket shape and silently fell back to
+    // `PendingLayeredStream::DialFresh` (a brand-new TCP connection to the
+    // same host:port). That fallback is invisible for a protocol that
+    // speaks TLS as the very first thing on the wire (a fresh dial looks
+    // identical to the caller's original connection), but MySQL's protocol
+    // upgrades an ALREADY-connected, already-used-for-plaintext socket to
+    // TLS mid-stream (the SSLRequest packet) — the fresh dial instead hands
+    // rustls the server's plaintext initial-handshake packet as if it were
+    // the first TLS record, which fails immediately with exactly the
+    // observed `SSLHandshakeException: handshake process: received corrupt
+    // message of type InvalidContentType` (rustls's `Display` for
+    // `InvalidMessage::InvalidContentType`, produced when the first bytes
+    // read aren't a valid TLS record). Unwrap `delegate` (bounded, in case a
+    // real SOCKS chain or a future JDK adds another layer) before giving up.
+    let mut descriptor = None;
+    for _ in 0..4 {
+        match ctx.get_field_by_name(implementation, "fd") {
+            Value::Object(Some(d)) => {
+                descriptor = Some(d);
+                break;
+            }
+            _ => match ctx.get_field_by_name(implementation, "delegate") {
+                Value::Object(Some(next)) => implementation = next,
+                _ => break,
+            },
+        }
+    }
+    let descriptor = match descriptor {
+        Some(descriptor) => descriptor,
+        None => return Err("wrapped Socket has no FileDescriptor".to_string()),
     };
     let fd = match ctx.get_field_by_name(descriptor, "fd") {
         Value::Int(fd) if fd >= 0 => fd,
@@ -737,6 +777,61 @@ fn ds_set_peer(this: ObjectRef, host: &str, port: i32) {
 
 fn ds_clear_peer(this: ObjectRef) {
     ds_peer_table().lock().remove(&this);
+}
+
+/// GC roots for the two `DatagramSocket`-keyed side tables.
+///
+/// Both are `HashMap<ObjectRef, _>`, so their keys ARE addresses: a moving
+/// collection that relocates a `DatagramSocket` strands its entry, and a dead
+/// entry later collides with whatever object the allocator places on that
+/// address — a silent wrong answer, not a lookup miss
+/// (`docs/threading/objectref-concurrency-contract.md` §7.3). Both tables carry
+/// state the JDK requires to survive `close()` (`getPort`/`getInetAddress` keep
+/// answering, same rule that keeps `isConnected()` true), so neither can be
+/// cleared on close to sidestep this.
+///
+/// Same scan+remap shape as [`gc_scan_inet_addr_roots`] /
+/// [`gc_update_inet_addr_refs`] two hundred lines below, and wired the same way
+/// from `vm/src/memory/native_roots.rs`.
+///
+/// Retention: publishing the keys as roots keeps a `DatagramSocket` alive for
+/// as long as its entry exists, and nothing removes from `ds_side_table` —
+/// deliberately, per the close rule above. That is the same characteristic the
+/// sibling `inet_addr_side_table` already has. The end state for both is
+/// `addr_keyed::remap_and_sweep`, which drops an entry whose object did not
+/// survive instead of rooting it; that needs an `is_live` predicate this crate
+/// cannot reach, so it is a follow-up rather than a thing to half-do here.
+pub fn gc_scan_ds_roots(out: &mut Vec<ObjectRef>) {
+    for k in ds_side_table().lock().keys() {
+        out.push(*k);
+    }
+    for k in ds_peer_table().lock().keys() {
+        out.push(*k);
+    }
+}
+
+/// Companion to [`gc_scan_ds_roots`]: re-key both tables through the
+/// collector's relocation map so a lookup on the relocated `DatagramSocket`
+/// still resolves.
+pub fn gc_update_ds_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    fn rekey<V>(
+        map: &mut std::collections::HashMap<ObjectRef, V>,
+        pointer_map: &std::collections::HashMap<usize, usize>,
+    ) {
+        let drained: Vec<_> = map.drain().collect();
+        for (k, v) in drained {
+            let nk = pointer_map
+                .get(&(k.as_ptr() as usize))
+                .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+                .unwrap_or(k);
+            map.insert(nk, v);
+        }
+    }
+    rekey(&mut ds_side_table().lock(), pointer_map);
+    rekey(&mut ds_peer_table().lock(), pointer_map);
 }
 
 /// `javax.net.ssl.SSLSessionContext` cache tuning, as configured through
@@ -1026,7 +1121,7 @@ pub fn gc_scan_inet_addr_roots(out: &mut Vec<ObjectRef>) {
 /// Companion to [`gc_scan_inet_addr_roots`]: after a moving collection,
 /// re-key the side table so lookups keyed on the OLD `ObjectRef` still
 /// resolve — the mirror's identity is now the relocated address.
-pub fn gc_update_inet_addr_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_inet_addr_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -12306,6 +12401,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
                 crate::t27_tls::set_pending_layered_socket_ciphers(pending_id, ciphers);
                 return Ok(None);
             }
+            // A connect-path socket has not handshaked yet (its `connect`
+            // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
+            // there is no established connection to tear down and redo. Accept
+            // and discard, which is what this registration already did for an
+            // already-handshaked socket.
+            if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+                && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            {
+                return Ok(None);
+            }
             if ciphers.is_empty() || !crate::t27_tls::any_cipher_mappable(&ciphers) {
                 return Ok(None);
             }
@@ -12439,6 +12544,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             {
                 let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
                 crate::t27_tls::set_pending_layered_socket_protocols(pending_id, protocols);
+                return Ok(None);
+            }
+            // A connect-path socket has not handshaked yet (its `connect`
+            // parked the endpoint -- see `PENDING_CONNECT_SOCK_ID_BASE`), so
+            // there is no established connection to tear down and redo. Accept
+            // and discard, which is what this registration already did for an
+            // already-handshaked socket.
+            if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+                && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+            {
                 return Ok(None);
             }
             // Otherwise the socket came from `createSocket(host, port)`, which
@@ -14676,7 +14791,7 @@ pub fn gc_scan_re10_handler_roots(out: &mut Vec<ObjectRef>) {
 /// the dispatcher invokes the live handler, not a vacated from-space slot. A
 /// no-op when nothing moved (empty `pointer_map`) or for handlers the collector
 /// left in place (absent from the map).
-pub fn gc_update_re10_handler_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_re10_handler_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

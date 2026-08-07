@@ -24,6 +24,16 @@ runs came back `rc=1` with `Timeout trying to lock table "TEST"` at
 its user time. The class is neither deterministically broken nor
 deterministically green, and it will stay that way until the gap closes.
 
+**And 10 s is the roomy case.** `TestAll.lockTimeout` defaults to **50 ms**
+(`TestAll.java:358`) and `TestDb.getURL` appends it to every test URL, so most
+of the suite runs on a budget 200x tighter than `TestMultiThread`'s. At 50 ms
+the gap stops flapping and simply fails: `TestTransaction` is **10 of 10 FAIL**
+and **10 of 10 PASS** at `lockTimeout=500`, nothing else in the class broken.
+That is the subject of the retired
+`bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807` write-up,
+which had been filed as a `MERGE ... USING` correctness bug before it was
+measured.
+
 ## The numbers
 
 `H2UpdateScaleProbe` models `testConcurrentUpdate` exactly: same `NUMBER(18,0)`
@@ -71,6 +81,51 @@ host under 10 % load or on a dedicated one. Everything smaller has been tried.
 Until then the honest statement is the first table: **~30x at 4 threads and
 ~60x at 25**, with the growth between them real-looking but unproven.
 
+## Interpreter against interpreter, the factor is ~10x — and it is flat
+
+The headline 30-87x above is measured against HotSpot **with C2**, which folds
+two different things together: what CratonVM's interpreter costs, and what
+CratonVM's JIT fails to recover. Splitting them (2026-08-07, from the
+`testMergeUsing` investigation) says where to aim and where not to.
+
+`apps/h2database-suite-runner/probes/MergeLockBudgetProbe.java bench 500 3`,
+single-threaded so wall clock is defensible, ABBA-interleaved arms (A B B A A B),
+median of 3, load 5-18:
+
+| 500 ops on a 500-row table | HotSpot `-Xint` | cratonvm `--nojit` | ratio |
+| --- | --- | --- | --- |
+| `MERGE ... USING` | 64.6 ms | 693.5 ms | **10.7x** |
+| `UPDATE ... WHERE id=?` | 50.2 ms | 495.6 ms | **9.9x** |
+| `SELECT ... WHERE id=?` | 32.8 ms | 325.1 ms | **9.9x** |
+| `INSERT VALUES (?, ?)` | 24.6 ms | 254.2 ms | **10.3x** |
+
+Two things follow.
+
+**The factor is flat across statement kinds.** MERGE, UPDATE, SELECT and INSERT
+all land within 10 % of each other, so no H2 statement path has its own
+pathology on top of the general one — which is what ruled out a MERGE-specific
+defect in the retired `…merge-using-lock-timeout…` write-up, and is worth
+re-using: a per-statement ratio that stands out from this band is a real lead,
+and one that sits inside it is this page.
+
+**The interpreter is only half the gap.** The same MERGE costs 6.7 ms under
+HotSpot C2, so HotSpot's own JIT is worth ~9.6x on this shape — almost exactly
+the size of CratonVM's interpreter deficit. cratonvm's JIT recovers ~1.3-1.7x of
+it (647 / 435 ms with the JIT against 757 / 706 ms `--nojit`, ABBA, n=2 each),
+not ~10x. That is consistent with the deliberate interpreter-first threshold in
+`vm/src/runtime/interpreter/dispatch_static.rs` ("rather than paying CratonVM's
+currently-slower JIT'd dispatch for code that never amortizes the switch") —
+H2's SQL execution is exactly the call-heavy, shallow, polymorphic code that
+comment is about. **So roughly half of the 30-87x is a JIT that does not reach
+this code, not an interpreter that is slow**, and the two halves want different
+work.
+
+A caution on scale, because it changes which half matters: the JIT needs 500
+invocations per method to warm up (`CRATONVM_JIT_THRESHOLD`), and a real H2 test
+statement runs 50-1000 times. The 500-op probe above is at the optimistic end.
+`testMergeUsing`'s 50 merges never warm up at all, which is why its failure is
+identical with and without the JIT.
+
 ## Where the CPU goes, and why no symbol on this list is the answer
 
 `perf record -F 199 -g --call-graph=dwarf`, 25 threads × 1000 updates, 27 K
@@ -115,6 +170,13 @@ back 29 / 36 / 43 / 50 CPU-s. A flat tax on every H2 run, and the reason a
 
 ## What is ruled out (do not redo)
 
+* **`MERGE ... USING` is not a defect and not a slow path.** Its row state is
+  byte-exact on both branches (9 of 9 checks, with and without the JIT), and its
+  ratio sits inside the flat band above. `TestTransaction`'s
+  `Expected: 100 actual: 50` is this page's constant factor tripping a 50 ms
+  `LOCK_TIMEOUT`; stock HotSpot produces the identical shortfall when its budget
+  is scaled down to 1-3 ms. See the retired
+  `bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807` write-up.
 * **There is no `org/h2/` JIT package ban to lift.** Measured 2026-08-02 with
   `CRATONVM_DBG_JIT_COMPILED=1`: **27** `org/h2/…` methods JIT-compile on the
   default build, **26** with `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/`. The flag is a
@@ -164,6 +226,17 @@ javac -cp <h2>/target/classes -d probe H2UpdateScaleProbe.java
   -Dprobe.dir=./h2updb H2UpdateScaleProbe <threads> <updates> 10000
 ```
 
+For the per-statement band, and for the lock-budget question the band exists to
+answer:
+
+```bash
+javac -cp <h2>/target/classes -d probe \
+    apps/h2database-suite-runner/probes/MergeLockBudgetProbe.java
+<cratonvm> --java-home <jdk25> --Xmx 1g -c "probe:<h2>/target/classes" \
+    MergeLockBudgetProbe bench 500 3          # per-statement cost
+<cratonvm> ... MergeLockBudgetProbe contend 50 4 <lockTimeoutMs>
+```
+
 Run `<threads> 0 10000` for the baseline of the same shape. The full class, when
 you need the real thing (~20 min of CPU):
 
@@ -183,5 +256,9 @@ cd <fresh writable dir>          # H2 writes ./data
   write-up — the INSERT half. Its flat ~25-30x across 1/2/4/8 threads is this
   page's constant factor, and its 4-thread arm was large enough to establish
   flatness where this page's was not.
+* the retired `bug-h2-testtransaction-merge-using-lock-timeout-RESOLVED-20260807`
+  write-up — the same wall at a **50 ms** budget instead of 10 s, where it stops
+  flapping and fails deterministically. Source of this page's
+  interpreter-against-interpreter table and of `MergeLockBudgetProbe`.
 * `bug-h2-classid0-stale-address-family.md` — the memory-safety family
   found in this class. Unrelated to throughput.

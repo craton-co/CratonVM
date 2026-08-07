@@ -284,7 +284,7 @@ pub fn gc_scan_loader_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRe
 /// addresses so subsequent `getClassLoader()` calls return the live object.
 pub fn gc_update_loader_singleton_refs(
     vm_identity: usize,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) {
     if pointer_map.is_empty() {
         return;
@@ -337,7 +337,7 @@ pub fn gc_update_loader_singleton_refs(
 pub fn gc_reconcile_defining_loaders(
     vm_identity: usize,
     is_marked: &dyn Fn(usize) -> bool,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) -> Vec<u32> {
     let dbg = crate::vmflags().gc.dbg_mirrorpin;
     let mut dead_class_ids = Vec::new();
@@ -10153,6 +10153,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: bsh_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(&mut ctx, "bsh/classpath/DiscreteFilesClassLoader");
@@ -10186,6 +10187,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: filtered_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(
@@ -10219,6 +10221,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: modified_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(
@@ -10322,7 +10325,7 @@ mod classloader_tests {
         // (`pointer_map.contains_key(addr) || heap.is_addr_live(addr)`) named in
         // `gc_reconcile_defining_loaders`' doc comment.
         let is_marked = move |addr: usize| addr != dead_addr;
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(from_addr, to_addr);
 
         gc_reconcile_defining_loaders(ctx.vm_identity(), &is_marked, &pointer_map);
@@ -10773,7 +10776,7 @@ mod classloader_tests {
         // address this test does not own as ALIVE, so nothing another test
         // registered can be pruned by this call.
         let is_marked = move |addr: usize| addr != dead_addr;
-        let mut pointer_map = std::collections::HashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(from_addr, to_addr);
 
         gc_reconcile_defining_loaders(ctx.vm_identity(), &is_marked, &pointer_map);
@@ -11894,6 +11897,7 @@ mod classloader_tests {
                 access_flags: method_flags,
                 declaring_class_id: cls_id,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         ctx.set_declared_fields(
@@ -12073,6 +12077,7 @@ mod classloader_tests {
                 access_flags: ACC_PUBLIC,
                 declaring_class_id: parent,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let child = ctx.ensure_class_initialized("p/Child").unwrap();

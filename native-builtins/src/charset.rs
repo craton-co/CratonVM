@@ -1509,7 +1509,7 @@ mod tests {
         // real-layout slot fallback is only for buffers whose state cannot be
         // read, not for a known empty remaining range.
         let mut ctx = mock_ctx();
-        let bb = alloc_byte_buffer(&mut ctx, &[b'A', b'B', b'C', b'D']);
+        let bb = alloc_byte_buffer(&mut ctx, b"ABCD");
         ctx.set_field(bb, BUF_FIELD_POS, Value::Int(2));
         ctx.set_field(bb, BUF_FIELD_LIMIT, Value::Int(2));
         assert!(read_and_consume_bytebuffer(&mut ctx, bb).is_empty());

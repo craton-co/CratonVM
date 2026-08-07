@@ -220,7 +220,7 @@ impl ShadowStack {
     /// *rewritable* root update that conservative scanning cannot do — every
     /// slot here is known to be an oop, so the rewrite is unconditionally safe.
     /// Returns the number of slots rewritten (for diagnostics).
-    pub fn remap(&self, pointer_map: &std::collections::HashMap<usize, usize>) -> usize {
+    pub fn remap(&self, pointer_map: &cratonvm_types::PointerMap) -> usize {
         if self.base == 0 || pointer_map.is_empty() {
             return 0;
         }
@@ -252,7 +252,7 @@ mod tests {
         let mut seen = 0;
         s.for_each_value(|_| seen += 1);
         assert_eq!(seen, 0);
-        assert_eq!(s.remap(&std::collections::HashMap::new()), 0);
+        assert_eq!(s.remap(&cratonvm_types::PointerMap::default()), 0);
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(collected, vec![0x1000, 0x2000, 0x3000]);
 
         // Relocate 0x2000 -> 0x9000.
-        let mut map = std::collections::HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x2000usize, 0x9000usize);
         assert_eq!(s.remap(&map), 1);
 
