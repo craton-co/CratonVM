@@ -840,6 +840,82 @@ pub(crate) fn take_pending_ssl_socket_connect_ctx(
 /// overloads) and populates the EXISTING socket object via
 /// `new13_finish_socket` rather than allocating a new one — Java already
 /// holds a reference to this exact object.
+/// Everything `new13_connect_and_handshake` will need, parked between
+/// `SSLSocket.connect()` and the first use of the socket.
+///
+/// See `servlet::PENDING_CONNECT_SOCK_ID_BASE` for why the handshake is not
+/// run at connect time.
+pub(crate) struct PendingConnectSocket {
+    host: String,
+    port: u16,
+    extra_roots: Vec<Vec<u8>>,
+    java_tm_key: Option<u64>,
+    max_protocol: Option<native_tls::Protocol>,
+}
+
+fn pending_connect_sockets(
+) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, PendingConnectSocket>> {
+    static T: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<i32, PendingConnectSocket>>,
+    > = std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn stash_pending_connect_socket(entry: PendingConnectSocket) -> i32 {
+    let mut pending = pending_connect_sockets().lock();
+    let mut id = 1i32;
+    while pending.contains_key(&id) {
+        id = id.checked_add(1).unwrap_or(1);
+    }
+    pending.insert(id, entry);
+    id
+}
+
+/// Consume the parked state for `pending_id`. `None` means it was already
+/// consumed -- a handshake is a once-only event, so a second attempt is an
+/// error, exactly as it is for the layered range.
+fn take_pending_connect_socket(pending_id: i32) -> Option<PendingConnectSocket> {
+    pending_connect_sockets().lock().remove(&pending_id)
+}
+
+/// `close()` on a socket that was connected but never used: drop the parked
+/// state so the entry (and its trust roots) is not retained for the life of
+/// the process. Silent no-op for any other id.
+pub(crate) fn drop_pending_connect_socket_if_any(tls_id: i32) {
+    if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+        && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+    {
+        let _ = take_pending_connect_socket(tls_id - crate::servlet::PENDING_CONNECT_SOCK_ID_BASE);
+    }
+}
+
+/// TCP-connect and immediately drop the connection -- `SSLSocket.connect` has
+/// to fail HERE for an unreachable peer (JSSE does the real TCP connect at
+/// this point), but the TLS handshake is deferred, so the connection this
+/// proves is not the one the handshake will use.
+///
+/// H2 `TcpServer.isRunning()` is the caller that makes the distinction
+/// visible: it needs "the port answers" to be decided by connect(), and it
+/// needs "the certificate is untrusted" NOT to be.
+fn new13_tcp_reachability_probe(host: &str, port: u16, timeout_ms: i32) -> std::io::Result<()> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    if timeout_ms <= 0 {
+        return TcpStream::connect((host, port)).map(|_| ());
+    }
+    let mut last = std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        format!("no address for {host}:{port}"),
+    );
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(timeout_ms as u64))
+        {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 pub(crate) fn new13_ssl_socket_connect(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -863,15 +939,47 @@ pub(crate) fn new13_ssl_socket_connect(
     };
     let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, sa)?;
     let (extra_roots, java_tm_key, max_protocol) = take_pending_ssl_socket_connect_ctx(ctx, this);
-    let tls_id = new13_connect_and_handshake(
-        ctx,
-        &host,
-        port as u16,
-        &extra_roots,
+    // JSSE: `connect` opens the TCP connection and stops. The handshake runs
+    // at the first read/write, at `startHandshake()`, or at `getSession()` --
+    // the four points `ensure_layered_handshake_started` is already wired to.
+    // Running it here instead made connect() inherit every handshake failure,
+    // which is what `TestTools.testSSL` reported as `Expected: 0 actual: 1`:
+    // H2's `TcpServer.isRunning()` connects and closes without any I/O, so on
+    // HotSpot it answers "the server is up" while here it answered "the
+    // certificate is untrusted" -- 60.8 s later. See
+    // `servlet::PENDING_CONNECT_SOCK_ID_BASE`.
+    let timeout_ms = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    // Real network I/O: announce the park so a concurrent STW GC knows this
+    // thread is in native code (same requirement as the handshake itself --
+    // see `new13_connect_and_handshake`'s T19.H1 comment).
+    ctx.begin_blocking_region();
+    let probe = new13_tcp_reachability_probe(&host, port as u16, timeout_ms);
+    ctx.end_blocking_region();
+    if let Err(e) = probe {
+        return Err(RuntimeError::IOException {
+            message: format!("Connection refused: {host}:{port}: {e}"),
+        }
+        .into());
+    }
+    let pending_id = stash_pending_connect_socket(PendingConnectSocket {
+        host: host.clone(),
+        port: port as u16,
+        extra_roots,
         java_tm_key,
         max_protocol,
-    )?;
-    let _ = new13_finish_socket(ctx, this, &host, port as u16, tls_id);
+    });
+    let pending_tls_id = crate::servlet::PENDING_CONNECT_SOCK_ID_BASE + pending_id;
+    // Same field/side-table bookkeeping as `new13_finish_socket`, minus the
+    // `SSLSession`: there is no session until a handshake has run, and
+    // `getSession()` builds one after driving it (real JSSE does exactly
+    // this). The side-table write is the authoritative one -- see
+    // `new13_finish_socket`'s comment on the dropped Int field write.
+    let host_obj = ctx.create_string(&host);
+    ctx.set_field(this, NEW13_SOCK_HOST, Value::Object(Some(host_obj)));
+    crate::net_phase_e::sock_set_for_create(ctx, this, port, pending_tls_id);
+    ctx.set_field(this, NEW13_SOCK_PORT, Value::Int(port));
+    ctx.set_field(this, NEW13_SOCK_TLSID, Value::Int(pending_tls_id));
+    ctx.set_field(this, NEW13_SOCK_CLOSED, Value::Int(0));
     Ok(None)
 }
 
@@ -1940,6 +2048,43 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         socket: ObjectRef,
     ) -> Result<i32, MethodCallFailed> {
         let tls_id = new13_resolve_tls_id(ctx, socket);
+        // The connect-path deferral (`SSLSocket.connect` parked the endpoint
+        // instead of handshaking -- see `new13_ssl_socket_connect`). Its
+        // handshake is the ORIGINAL eager one, `new13_connect_and_handshake`,
+        // run unchanged and simply later; only the moment moved.
+        if tls_id >= crate::servlet::PENDING_CONNECT_SOCK_ID_BASE
+            && tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+        {
+            let connect_id = tls_id - crate::servlet::PENDING_CONNECT_SOCK_ID_BASE;
+            let Some(p) = take_pending_connect_socket(connect_id) else {
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLHandshakeException",
+                    "connect-path socket handshake state missing",
+                ));
+            };
+            // Pin across the handshake for the reason the layered branch
+            // below documents: it parks in native code for a long time and a
+            // moving young collection there relocates `socket`.
+            let socket_pin = ctx.pin_native_root(socket);
+            let handshake = new13_connect_and_handshake(
+                ctx,
+                &p.host,
+                p.port,
+                &p.extra_roots,
+                p.java_tm_key,
+                p.max_protocol,
+            );
+            let socket = ctx.read_native_pin(socket_pin, socket);
+            ctx.unpin_native_roots(socket_pin);
+            let real_tls_id = handshake?;
+            let socket = new13_finish_socket(ctx, socket, &p.host, p.port, real_tls_id);
+            // A listener registered between `connect()` and the first I/O has
+            // NOT missed this handshake -- unlike the `createSocket(host,
+            // port)` path, which handshakes before it hands the socket back.
+            new13_fire_handshake_completed(ctx, socket);
+            return Ok(real_tls_id);
+        }
         if tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
             || tls_id >= crate::servlet::RUSTLS_SOCK_ID_BASE
         {
@@ -2792,6 +2937,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // handshaked, still releases them.
         new13_drop_handshake_listeners(ctx, this);
         let tls_id = new13_resolve_tls_id(ctx, this);
+        // Connected but never used (H2 `TcpServer.isRunning()` is exactly
+        // this): there is no TLS stream to close, only parked state to free.
+        drop_pending_connect_socket_if_any(tls_id);
         if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} JAVA_CALLED Socket.close() tls_id={}",
