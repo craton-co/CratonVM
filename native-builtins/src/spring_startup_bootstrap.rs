@@ -663,7 +663,7 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
                 Some(obj)
             })()
         })
-        .map(Ok)
+        .map(Ok::<_, MethodCallFailed>)
         .unwrap_or_else(|| {
             // Fallback: synthetic allocation with generous field count.
             crate::try_alloc_concurrent_synthetic(ctx, DLBF, 64)
@@ -952,7 +952,7 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Result<O
         ctx.unpin_native_roots(obj_pin);
         Some(obj)
     })()
-    .map(Ok)
+    .map(Ok::<_, MethodCallFailed>)
     .unwrap_or_else(|| {
         let obj = crate::try_alloc_concurrent_synthetic(ctx, data_class, 8)?;
         let mappings = ctx.read_native_pin(mappings_pin, mappings);

@@ -11922,10 +11922,10 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
             if xname == "java/lang/Class" && yname == "java/lang/Class" {
                 let xcid_field = ctx.get_field(x, 0);
                 let ycid_field = ctx.get_field(y, 0);
-                return matches!(
+                return Ok(matches!(
                     (xcid_field, ycid_field),
                     (Value::Int(a), Value::Int(b)) if a == b
-                );
+                ));
             }
             if ctx_wrapper_class_to_primitive(&xname).is_some()
                 && ctx_wrapper_class_to_primitive(&yname).is_some()
@@ -11941,7 +11941,7 @@ fn ctx_annotation_values_equal(ctx: &mut dyn NativeContext, a: Value, b: Value) 
                 let sx = ctx.read_string(xn).unwrap_or_default();
                 let sy = ctx.read_string(yn).unwrap_or_default();
                 if !sx.is_empty() && !sy.is_empty() {
-                    return sx == sy && xname == yname;
+                    return Ok(sx == sy && xname == yname);
                 }
             }
             Ok(x == y)
@@ -12040,13 +12040,13 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
             }
             if cname == "java/lang/String" {
                 if let Some(s) = ctx.read_string(obj) {
-                    return format!("\"{}\"", ctx_java_string_escape(&s));
+                    return Ok(format!("\"{}\"", ctx_java_string_escape(&s)));
                 }
             }
             if cname == "java/lang/Class" {
                 if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 1) {
                     if let Some(cls_name) = ctx.read_string(name_ref) {
-                        return format!("{}.class", cls_name.replace('/', "."));
+                        return Ok(format!("{}.class", cls_name.replace('/', ".")));
                     }
                 }
                 return Ok("<unknown>.class".to_string());
@@ -12870,8 +12870,9 @@ pub(crate) fn annotation_element_to_java_typed(
 ) -> Result<Value, MethodCallFailed> {
     use cratonvm_native_api::AnnotationElementValue;
     let container_loader_pin =
-        container_loader.map(|loader| ctx.pin_native_root(loader))?;
-    let result = (|| match val {
+        container_loader.map(|loader| ctx.pin_native_root(loader));
+    let result = (|| -> Result<Value, MethodCallFailed> {
+        match val {
         AnnotationElementValue::Int(v) => {
             // Round 18 fix: `AnnotationElementValue::Int` is overloaded for
             // boolean/byte/char/short/int (the `.class` AnnotationDefault
@@ -13011,7 +13012,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     );
                 }
                 if let Ok(Some(val)) = invoke_res {
-                    return val;
+                    return Ok(val);
                 }
             } else if iae_trace {
                 eprintln!("ANN-ENUM class={class_name} const={const_name} CLASS-NOT-FOUND");
@@ -13061,7 +13062,7 @@ pub(crate) fn annotation_element_to_java_typed(
                                     "ANN-CLASS desc={desc} class={owned} via-container-loader ok"
                                 );
                             }
-                            return Value::Object(Some(mirror));
+                            return Ok(Value::Object(Some(mirror)));
                         }
                         Err(Some(cnfe)) => {
                             if iae_trace_cls {
@@ -13073,7 +13074,7 @@ pub(crate) fn annotation_element_to_java_typed(
                                 Some(cnfe),
                                 true,
                             ) {
-                                return Value::Object(Some(tnpe));
+                                return Ok(Value::Object(Some(tnpe)));
                             }
                             // Could not build the sentinel вЂ” fall through to global.
                         }
@@ -13090,7 +13091,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     if iae_trace_cls {
                         eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
                     }
-                    return Value::Object(Some(mirror));
+                    return Ok(Value::Object(Some(mirror)));
                 }
                 let load_res = ctx.load_class(class_name);
                 if iae_trace_cls {
@@ -13100,7 +13101,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     );
                 }
                 if let Ok(Some(val)) = load_res {
-                    return val;
+                    return Ok(val);
                 }
                 // Genuinely unresolvable (no container_loader took the CNFE
                 // branch above, e.g. plain app/bootstrap-loaded classes, which
@@ -13124,14 +13125,14 @@ pub(crate) fn annotation_element_to_java_typed(
                             "ANN-CLASS desc={desc} class={class_name} unresolved -> TypeNotPresentException (shared)"
                         );
                     }
-                    return Value::Object(Some(tnpe));
+                    return Ok(Value::Object(Some(tnpe)));
                 }
                 if iae_trace_cls {
                     eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL");
                 }
                 // Could not even build the sentinel (e.g. TypeNotPresentException
                 // itself isn't loadable) вЂ” preserve the prior best-effort null.
-                return Value::Object(None);
+                return Ok(Value::Object(None));
             }
             // `annotation_desc_to_class_name` returned None: the descriptor is
             // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) вЂ”
@@ -13154,8 +13155,8 @@ pub(crate) fn annotation_element_to_java_typed(
                 (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
                 _ => None,
             };
-            Ok(match create_annotation_proxy(ctx, nested, container_class_id, loader_cur) {
-                Ok(Some(proxy)) => normalize_single_annotation_array(
+            Ok(match create_annotation_proxy(ctx, nested, container_class_id, loader_cur)? {
+                Some(proxy) => normalize_single_annotation_array(
                     ctx,
                     Value::Object(Some(proxy)),
                     return_type_desc,
@@ -13168,7 +13169,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 // (HotSpot fails harder still — `getDeclaredAnnotations()`
                 // itself raises NoClassDefFoundError for the unresolvable
                 // element type), and no null-typed annotation escapes.
-                Ok(None) => match unresolvable_nested_annotation_sentinel(ctx, nested) {
+                None => match unresolvable_nested_annotation_sentinel(ctx, nested) {
                     Some(sentinel) => Value::Object(Some(sentinel)),
                     None => Value::Object(None),
                 },
@@ -13265,7 +13266,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     }
                     let arr_cur = ctx.read_native_pin(arr_pin, arr);
                     ctx.unpin_native_roots(arr_pin);
-                    return Value::Object(Some(arr_cur));
+                    return Ok(Value::Object(Some(arr_cur)));
                 }
             }
             // S111r19 вЂ” when the array is **empty** (no first element to
@@ -13482,11 +13483,12 @@ pub(crate) fn annotation_element_to_java_typed(
             arr = ctx.read_native_pin(arr_pin, arr);
             ctx.unpin_native_roots(arr_pin);
             if let Some(idx) = sentinel_index {
-                return ctx.get_array_element(arr, idx);
+                return Ok(ctx.get_array_element(arr, idx));
             }
             Ok(Value::Object(Some(arr)))
         }
-    }?)();
+        }
+    })()?;
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
     }
