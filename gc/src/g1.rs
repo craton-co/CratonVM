@@ -222,6 +222,37 @@ fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
 }
 
+/// How many candidate references the evacuation ref-scan refused to
+/// dereference because they did not look like live object headers.
+///
+/// Expected to be ZERO. A non-zero value means some writer put a word into a
+/// reference slot that is inside the heap's address span but is not an object —
+/// which, before the guard, was a SIGSEGV inside `scan_and_evacuate_refs`.
+/// Reported by `G1Collector::print_gc_summary`.
+pub static EVAC_REF_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_REF_REJECTED`].
+pub fn evacuation_refs_rejected() -> usize {
+    EVAC_REF_REJECTED.load(Ordering::Relaxed)
+}
+
+/// How many objects the evacuation ref-scan refused to WALK because their own
+/// header did not look like a live object. Expected to be ZERO.
+pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders' element walks were clamped to their region's extent —
+/// i.e. how many headers claimed more reference slots than could physically be
+/// there. Expected to be ZERO.
+pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
+pub fn evacuation_holder_counts() -> (usize, usize) {
+    (
+        EVAC_HOLDER_REJECTED.load(Ordering::Relaxed),
+        EVAC_HOLDER_CLAMPED.load(Ordering::Relaxed),
+    )
+}
+
 // ===========================================================================
 // Step 9 — parallel STW evacuation (gated behind `CRATONVM_G1_PARALLEL_EVAC`)
 // ===========================================================================
@@ -4129,6 +4160,176 @@ impl G1Collector {
     /// no such API), so the invariant is enforced by the type-level
     /// `&mut Vec<G1Region>` parameter (only the lock holder can produce
     /// it) plus this contract comment.
+    /// Reject a candidate reference the evacuator is about to DEREFERENCE
+    /// when it does not look like a live object header, and say so once.
+    ///
+    /// `region_for_ptr` answers "is this word inside the region base table's
+    /// span?" — containment, nothing more. `evacuate_object` then reads the
+    /// candidate's `ObjectHeader`. A word that is in-span but is not an object
+    /// (a region base, an uncommitted page, a stale address whose region has
+    /// been recycled) therefore faults INSIDE THE COLLECTOR, with no
+    /// attribution and no chance for the pause to continue.
+    ///
+    /// `is_object_address` is the validator this collector already trusts for
+    /// conservative JIT roots and for the auto-box read: alignment, live-region
+    /// containment, and both header tag bytes, none of which requires trusting
+    /// the candidate. Using it here is the fail-safe the 2026-08-06 Hibernate
+    /// G1 comparison asked for by name — it observed that the default
+    /// collector's equivalent stale-coverage paths degrade to a controlled Java
+    /// error while G1's take a native SIGSEGV.
+    ///
+    /// Returns `true` when the reference may be evacuated.
+    ///
+    /// This does NOT explain where a rejected word came from. It makes the
+    /// event survivable and attributable; the producer is a separate question.
+    ///
+    /// Takes the caller's ALREADY-BORROWED `regions` slice and must not call
+    /// [`Self::is_object_address`]: that helper's `is_addr_in_live_region` half
+    /// re-acquires `self.regions`, which the evacuator is holding — a deadlock,
+    /// not a slow path.
+    fn evacuation_candidate_is_an_object(
+        &self,
+        regions: &[G1Region],
+        holder: *mut u8,
+        slot: usize,
+        raw: usize,
+    ) -> bool {
+        if self.candidate_header_is_plausible(regions, raw) {
+            return true;
+        }
+        let n = EVAC_REF_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        // Rate-limited like the other GC fail-safes: the first is always
+        // visible, then powers of two, so a pathological cycle cannot flood a
+        // suite log while a single occurrence still cannot hide.
+        if n <= 8 || n.is_power_of_two() {
+            // SAFETY: `holder` is the object currently being scanned; the
+            // evacuator owns it under the `regions` lock.
+            let (holder_class, holder_kind) = unsafe {
+                let h = &*(holder as *const ObjectHeader);
+                (h.class_id.as_u32(), h.kind())
+            };
+            tracing::warn!(
+                "[g1] evacuation ref-scan REJECTED a non-object candidate (#{n}):                  holder=0x{:x} class_id={holder_class} kind={holder_kind:?} slot={slot}                  candidate=0x{raw:x} — the word is inside the region span but is not a live                  object header, so evacuating it would have dereferenced it. The slot is left                  unchanged and the pause continues.",
+                holder as usize,
+            );
+        }
+        false
+    }
+
+    /// How many 8-byte reference slots of `obj_ptr` may safely be walked:
+    /// `declared`, clamped to what remains inside the holder's own region.
+    ///
+    /// Reports (rate-limited) when the clamp actually bites, because that means
+    /// a header claimed more elements than its region can hold — which is the
+    /// corrupt-header case, not a large-object case: a genuinely large array is
+    /// humongous and its continuation slices are physically contiguous, so the
+    /// span below covers them.
+    fn holder_walkable_slots(
+        &self,
+        regions: &[G1Region],
+        obj_ptr: *mut u8,
+        declared: usize,
+    ) -> usize {
+        let addr = obj_ptr as usize;
+        let region_size = self.config.region_size;
+        if region_size == 0 || addr < self.arena_base || addr >= self.arena_end {
+            return declared;
+        }
+        // The holder may be humongous: walk forward across continuation slices
+        // so a legitimately large array is not clamped.
+        let mut idx = (addr - self.arena_base) / region_size;
+        let Some(start) = regions.get(idx) else {
+            return declared;
+        };
+        let base = start.data.as_ptr() as usize;
+        let mut end = base + start.cursor;
+        while let Some(next) = regions.get(idx + 1) {
+            if next.region_type != RegionType::HumongousContinuation {
+                break;
+            }
+            idx += 1;
+            end = next.data.as_ptr() as usize + region_size;
+        }
+        if end <= addr + HEADER_SIZE {
+            return 0;
+        }
+        let room = (end - addr - HEADER_SIZE) / 8;
+        if room >= declared {
+            return declared;
+        }
+        let n = EVAC_HOLDER_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
+            );
+        }
+        room
+    }
+
+    /// [`Self::is_object_address`]'s checks, against a borrowed `regions` slice
+    /// instead of re-locking: alignment, arena bounds, the owning region being
+    /// live and the address being below its allocation cursor, and both header
+    /// tag bytes decoding to defined enum values.
+    ///
+    /// Deliberately does NOT consult `kept_unresolved_*` the way
+    /// `is_addr_in_live_region` does. Those sets are empty outside the rare
+    /// wedged-drain window, they are behind their own mutexes (the same
+    /// deadlock hazard), and erring towards ACCEPTING there is the safe
+    /// direction for this guard: a false accept is only the pre-guard
+    /// behaviour, whereas a false reject would drop a live reference.
+    fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
+        if addr == 0 || addr & 0x7 != 0 {
+            return false;
+        }
+        if addr < self.arena_base || addr >= self.arena_end {
+            return false;
+        }
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return false;
+        }
+        let idx = (addr - self.arena_base) / region_size;
+        let Some(r) = regions.get(idx) else {
+            return false;
+        };
+        match r.region_type {
+            RegionType::Free => return false,
+            // A humongous continuation slice is live in its entirety; only the
+            // start region carries the object's full `cursor`.
+            RegionType::HumongousContinuation => {}
+            _ => {
+                let base = r.data.as_ptr() as usize;
+                if addr < base || addr >= base + r.cursor {
+                    return false;
+                }
+            }
+        }
+        let ptr = addr as *const u8;
+        // SAFETY: the address is 8-aligned and inside a live region's committed
+        // span, so its first two tag bytes are readable. Both are validated as
+        // enum discriminants before any `ObjectHeader` borrow, exactly as
+        // `is_object_address` does — this is the step that rejects a word which
+        // is in-span but is not an object.
+        let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
+            return false;
+        };
+        if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
+        {
+            return false;
+        }
+        if kind == ObjectKind::HumongousFiller {
+            return false;
+        }
+        // SAFETY: tags validated above.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
+        if kind == ObjectKind::Array {
+            header.array_length() <= i32::MAX as u32
+        } else {
+            header.num_slots() <= MAX_PLAUSIBLE_SLOTS
+        }
+    }
+
     fn scan_and_evacuate_refs(
         &self,
         regions: &mut Vec<G1Region>,
@@ -4140,12 +4341,40 @@ impl G1Collector {
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
     ) {
+        // The HOLDER has to be an object too. It arrives from the worklist or
+        // from an rset source walk, and a wrong header here is what walks the
+        // loops below out of the region entirely — see
+        // `holder_walkable_slots`.
+        if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
+            let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
+                    obj_ptr as usize,
+                );
+            }
+            return;
+        }
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
-                for i in 0..header.array_length() as usize {
+                // Clamp to what the holder's own region actually holds. A
+                // reference array's element count is a u32 bounded only by
+                // `i32::MAX`, and `HEADER_SIZE + len * 8` is never checked
+                // against the region — so one wrong header walks into the next
+                // region's base. The collector knows the bound; use it.
+                let declared = header.array_length() as usize;
+                let len = self.holder_walkable_slots(regions, obj_ptr, declared);
+                for i in 0..len {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                    if raw != 0 {
+                    if raw != 0
+                        && self.evacuation_candidate_is_an_object(
+                            regions,
+                            obj_ptr,
+                            i,
+                            raw as usize,
+                        )
+                    {
                         let ref_ptr = raw as usize as *mut u8;
                         if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&region_idx) {
@@ -4191,6 +4420,9 @@ impl G1Collector {
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                if !self.evacuation_candidate_is_an_object(regions, obj_ptr, raw, raw) {
+                    return;
+                }
                 let ref_ptr = raw as *mut u8;
                 if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                     if cset.contains(&region_idx) {
@@ -6747,6 +6979,16 @@ impl G1Collector {
     /// no-op when no collection has run. Emitted at VM shutdown when GC stats
     /// are requested — see `VmHeap::print_gc_summary`.
     pub fn print_gc_summary(&self) {
+        // Unconditional, and BEFORE the early return below: a run with no
+        // recorded pause summary can still have rejected a candidate, and a
+        // counter that only prints alongside something else is a counter that
+        // reads as zero when it never ran.
+        let rejected = evacuation_refs_rejected();
+        let (holder_rejected, holder_clamped) = evacuation_holder_counts();
+        eprintln!(
+            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} \
+             evac_holder_clamped={holder_clamped}"
+        );
         let Some(s) = self.pause_summary() else {
             return;
         };
