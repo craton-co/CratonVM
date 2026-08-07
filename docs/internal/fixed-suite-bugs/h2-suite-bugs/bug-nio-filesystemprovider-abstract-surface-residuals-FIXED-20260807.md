@@ -245,27 +245,31 @@ and printing `DONE failed=1`. That is HotSpot's behaviour too (`Files.deleteIfEx
 on a non-empty directory is `DirectoryNotEmptyException` there); it only looks
 new because the delete used to lie.
 
-Rust gates re-run at the merged tip against pristine `dev` at the same commit:
+Rust gates, `cargo test --workspace --no-fail-fast`, this branch against
+pristine `dev` at the same commit — three times, as dev moved:
 
-* vs `cf4274fda`: 31 failing test names on each arm, ratchet counts identical to
-  the digit. Four names differ in each direction and all four are known flakes —
-  two wall-clock budgets (`t1_gc_pause_budget_100k_objects_under_200ms`,
-  `re5_http_request_timeout_bounds_delayed_response_headers`), one port-binding
-  test (`t4_8_1_jdwp_listening_transport`), and
-  `compact_header::tests::forwarding_ptr_inline_boundary`, which passes in
-  isolation on **both** arms and only fails under the suite's own parallelism.
-* vs `13d2e01b3` (the final merge base): 26 failing names on this branch, 27 on
-  pristine — **the same set, plus one on pristine only**
-  (`xnio_worker::tests::t19_7_b_java_mirror_round_trip_through_registry`).
-  Ratchets identical: 436 raw lock constructions, 323 test-only public API.
+| dev tip | failing names, this branch | pristine | ratchets |
+|---|---|---|---|
+| `7e754e1bc` (base) | 12 targets | 12 targets, same set | identical |
+| `cf4274fda` | 31 | 31 | identical |
+| `13d2e01b3` | 26 | 27 (same set + one) | identical |
+| `b7cbd0034` (final) | 28 | 27 (same set + one) | identical |
 
-Pristine `dev` at `13d2e01b3` does not compile at all — `remap_datagram_sockets`
-declared `&std::collections::HashMap<usize, usize>` where `root_source!` wants
-`&cratonvm_types::PointerMap` (`rustc_hash::FxHashMap`), so `cargo build -p
-cratonvm-vm` fails with `E0308: expected fn pointer, found fn item`. Repaired on
-this branch (signature only, both ends) because it blocks building it, and the
-pristine arm above is `13d2e01b3` **plus that one repair** so the two arms are
-comparable at all.
+Every difference in either direction is a known flake: two wall-clock budgets
+(`t1_gc_pause_budget_100k_objects_under_200ms`,
+`re5_http_request_timeout_bounds_delayed_response_headers`), one port binding
+(`t4_8_1_jdwp_listening_transport`), one XNIO registry round-trip, and
+`compact_header::tests::forwarding_ptr_inline_boundary`, which passes in
+isolation on **both** arms and only fails under the suite's own parallelism.
+Ratchet counts match to the digit at every tip (final: 436 raw lock
+constructions, 323 test-only public API).
+
+`dev` at `13d2e01b3` did not compile at all — `remap_datagram_sockets` declared
+`&std::collections::HashMap<usize, usize>` where `root_source!` wants
+`&cratonvm_types::PointerMap`, so `cargo build -p cratonvm-vm` failed with
+`E0308: expected fn pointer, found fn item`. Two branches, each right alone,
+merged into it. Repaired here to unblock building; `b7cbd0034` carries dev's own
+identical repair and this branch took that one.
 
 Rust gates at `e3456d0e5` against its own pristine base: failing-target sets
 **identical** (12 targets, red on dev) and ratchet counts identical to the digit
