@@ -214,10 +214,44 @@ One tooling trap worth repeating: the first cut attributed each disjunct's
 so it would have stripped the rationale off entries being kept — exactly what
 §13 of this page is about. Comments must attach forward.
 
-**Still open:** the remaining 205 disjuncts — this pass licenses nothing about
-them (140 name a class that does have a native, 44 name no class at all, and
-the rest need the app-suite census). Plus §3's Matcher-leaf residual and the
-`jit_entry_publishable` half of §2, which refuses nothing per §1.
+### Sixth pass — §11 second tranche: 205 -> 184
+
+The first tranche fell back to a source grep for feature-gated registrations,
+which was a co-location heuristic ("some file mentions this class and this
+method") and kept 21 of 24 candidates for no better reason than a comment.
+Replaced with a measurement: `--features` reaches a transitive dependency's
+features from the workspace root, so the maximal-registration binary can be
+built and dumped —
+
+    -p cratonvm-cli --features synthetic-jdk,      cratonvm-native-builtins/{app-stubs,legacy-synthetic-crypto,synthetic-quarkus-arc}
+
+| build | pairs | classes |
+|---|---:|---:|
+| default | 8,862 | 1,227 |
+| maximal | 9,064 | 1,224 |
+| **union** | **9,096** | **1,235** |
+
+The maximal build has three *fewer* classes than default, so neither dump alone
+is the answer — the union is. Against it, at **(class, method)** granularity,
+**21 of 205 disjuncts can never match a registered native in any build**; 182
+lines. The class×method cross product is a superset of what a disjunct can
+match, so the test errs toward keeping entries.
+
+Two are a shape the class-level pass could not see — the class IS registered
+and these methods never are: `java/security/Provider.getEngineName` (13 other
+methods registered) and `java/security/Security.getAlgorithms` (8 others).
+
+Verified the admitted set does not move: corpus `chain_true` 917 -> 917,
+20 -> 20 triples; H2 17 -> 17; both diffs empty; suite 30/30.
+
+**Cumulative for §11: 217 -> 184 disjuncts, 343 lines.**
+
+**Still open:** the remaining 184 — 138 name a (class, method) pair that IS
+registered, 2 are class-only, and 44 name no class literal. None of those is
+licensed by this method; they need either behavioural evidence (the app-suite
+census) or a per-family judgement about whether the compatibility exception is
+still wanted. Plus §3's Matcher-leaf residual and the `jit_entry_publishable`
+half of §2, which refuses nothing per §1.
 
 ## 2026-08-04 status
 
