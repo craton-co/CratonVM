@@ -36,8 +36,11 @@ reference is a `WeakReference` must become collectable within 10 s of repeated
 
 The original page said the retention needed "a long-running process, a large
 populated heap, thousands of prior mappings, and JIT-compiled H2 frames", and
-put the repro at ~784 s into a `TestFileSystem` run. Only the last of those is
-true, and one prior filesystem is enough to arrange it:
+put the repro at ~784 s into a `TestFileSystem` run. None of that is required.
+What is required is only that *something*, anywhere, has been JIT-compiled — one
+prior filesystem is enough to arrange it, and denying `org/h2/` compilation
+outright does not help, because the frame that opens the band has already
+returned by then:
 
 | sequence | result |
 |---|---|
@@ -127,16 +130,25 @@ Full prefix sequence in `TestFileSystem.test()` order — plain disk, `async:`,
 `DONE failed=0`. Before the fix the same run was `failed=1` at `nioMapped:` and
 again at `split:nioMapped:`.
 
+`BinTreesClassic` is the named witness for the case the probe exists for — the
+comment above it calls the symptom "the `main`-compiled bintrees corruption" —
+so it is the workload that would catch the filter dropping a live guardless
+frame. `-Xmx 512m`, depths 16 and 18, both arms: identical checksums
+(`14985902`, `68332206`) and 644/670 ms and 3158/3202 ms.
+
 60 H2 suite classes, both arms run concurrently on the same host from the same
 binary, 150 s cap: **one class differs, and it is an improvement** --
 `TestCluster` PASSes with the filter and FAILs without it. The other 59 are
 identical, including the three FAILs (`TestFunctions`, `TestLargeBlob`,
 `TestOutOfMemory`) and seven HANGs that both arms share.
 
-`cargo test -p cratonvm-gc -p cratonvm-vm -p cratonvm-jit -p cratonvm-native-io`
-matches the pristine `dev` baseline measured the same way on the same host:
-`cratonvm-vm --lib` 2449/2449 in both, and the same three pre-existing
-`jit_local_exception_handler_tests` failures in both.
+`cargo test` matches the pristine `dev` baseline measured the same way on the
+same host: `cratonvm-vm --lib` 2449 passed / 0 failed in both arms, the same
+three pre-existing `jit_local_exception_handler_tests` failures in both, and
+`cratonvm-jit` (2217) and `cratonvm-native-io` (407) green. `cratonvm-gc`'s lib
+suite is 979/979 green on this branch when it completes, but it hangs on both
+arms often enough that `dev` has its own record of that hang (`b21d782c9`) — it
+is not a signal about this change either way.
 
 ## What this does not fix
 
