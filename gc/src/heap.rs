@@ -395,7 +395,7 @@ impl Heap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference, // unused for objects
-            self.next_hash(),
+            0, // hash installed lazily in the mark word on first request
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
@@ -506,7 +506,7 @@ impl Heap {
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
-                self.next_hash(),
+                0, // hash installed lazily in the mark word on first request
                 0,
                 u32::try_from(num_fields).ok()?,
             );
@@ -547,7 +547,7 @@ impl Heap {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
+            0, // hash installed lazily in the mark word on first request
             u32::try_from(length).expect("array length exceeds u32::MAX"),
             u32::try_from(length).expect("array length exceeds u32::MAX"),
         );
@@ -587,7 +587,7 @@ impl Heap {
                 class_id,
                 ObjectKind::Array,
                 element_type,
-                self.next_hash(),
+                0, // hash installed lazily in the mark word on first request
                 u32::try_from(length).ok()?,
                 u32::try_from(length).ok()?,
             );
@@ -626,7 +626,21 @@ impl Heap {
 
     /// Get the identity hash code of a heap object.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        self.get_header(obj_ref).identity_hash_code
+        let header = self.get_header(obj_ref);
+        match header.mark_word_identity_hash(|| match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => {
+                // Not NEUTRAL: the object inflated, and the hash went with it
+                // into its Monitor. Never mint here -- see
+                // `collector::displaced_identity_hash`.
+                crate::collector::displaced_identity_hash(
+                    header.mark_word.load(Ordering::Relaxed),
+                )
+            }
+        }
     }
 
     // ----- Field access (for Objects) --------------------------------------
@@ -1267,7 +1281,7 @@ impl Heap {
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference, // unused for objects
-            self.next_hash(),
+            0, // hash installed lazily in the mark word on first request
             0,
             u32::try_from(num_fields).ok()?,
         );
@@ -1300,7 +1314,7 @@ impl Heap {
             class_id,
             ObjectKind::Array,
             element_type,
-            self.next_hash(),
+            0, // hash installed lazily in the mark word on first request
             u32::try_from(length).ok()?,
             u32::try_from(length).ok()?,
         );
@@ -1872,7 +1886,23 @@ mod tests {
         assert_eq!(header.class_id, class_id);
         assert_eq!(header.kind, ObjectKind::Object);
         assert_eq!(header.num_slots(), 3);
-        assert_ne!(header.identity_hash_code, 0);
+
+        // The identity hash is installed LAZILY, on first request, into the
+        // mark word -- not eagerly at allocation as it used to be.
+        //
+        // That change is not cosmetic. Minting at allocation would leave every
+        // object's mark word non-zero, and `try_thin_lock` CASes from the
+        // literal `MARK_NEUTRAL` -- so every `synchronized` block in the
+        // program would lose that CAS and inflate a `Monitor`. Eager hashing
+        // and a mark-word hash cannot coexist.
+        assert_eq!(
+            ObjectHeader::neutral_hash(header.mark_word.load(Ordering::Relaxed)),
+            0,
+            "a freshly allocated object must not carry a hash yet, or nothing              can ever thin-lock"
+        );
+        let hash = heap.identity_hash_code(obj);
+        assert_ne!(hash, 0);
+        assert_eq!(heap.identity_hash_code(obj), hash, "must be stable");
     }
 
     #[test]

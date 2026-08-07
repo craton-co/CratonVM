@@ -2860,11 +2860,26 @@ impl GenerationalHeap {
     /// stale the moment a moving GC relocates the object. See
     /// `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`.
     pub fn identity_hash_code(&self, obj_ref: ObjectRef) -> i32 {
-        let existing = self.get_header(obj_ref).identity_hash_code;
-        if existing != 0 {
-            return existing;
+        let header = self.get_header(obj_ref);
+        // The hash lives in the upper bits of a NEUTRAL mark word, installed
+        // lazily by one CAS. `Err` means the word is no longer NEUTRAL -- the
+        // object inflated (a hashed object cannot thin-lock, so inflation is
+        // the only way out of NEUTRAL that a hashed object can take), and the
+        // hash was displaced into its Monitor at that moment.
+        match header.mark_word_identity_hash(|| match self.next_hash() {
+            0 => i32::MAX,
+            h => h,
+        }) {
+            Ok(hash) => hash,
+            Err(()) => {
+                let mark = header.mark_word.load(Ordering::Relaxed);
+                // Deliberately no mint on this path. Minting for a non-NEUTRAL
+                // object would return a different value on every call, i.e. an
+                // identity hash that changes under a live object -- which a
+                // test calling it once cannot see.
+                crate::collector::displaced_identity_hash(mark)
+            }
         }
-        self.mint_identity_hash_code(obj_ref)
     }
 
     /// Lazily mint and durably install a non-zero identity hash for an

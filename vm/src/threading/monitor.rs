@@ -402,6 +402,21 @@ fn monitor_ptr_from_mark(mark: u64) -> Option<*const Monitor> {
 /// no possible mark-word reader. The returned lifetime is unconstrained, so
 /// callers must keep it within the scope in which they hold `obj_ref`.
 #[inline(always)]
+/// Resolve the identity hash of an object whose mark word is no longer
+/// NEUTRAL, by reading the hash displaced into its `Monitor` at inflation.
+///
+/// Installed into the `gc` crate at VM start-up (`set_displaced_hash_resolver`)
+/// because `gc` owns the `identity_hash_code` accessors but cannot name
+/// `Monitor`. Reaching the hash is a pointer dereference through the mark word,
+/// so this costs the same as any other inflated fast path -- no registry probe.
+///
+/// Answers `0` for a word that is not INFLATED (a THIN_LOCKED object that has
+/// never been hashed can reach here; it has no displaced hash because a hashed
+/// object cannot thin-lock in the first place).
+pub fn displaced_hash_from_mark(mark: u64) -> i32 {
+    monitor_from_mark(mark).map_or(0, |m| m.displaced_hash())
+}
+
 fn monitor_from_mark<'a>(mark: u64) -> Option<&'a Monitor> {
     // SAFETY: as argued above, the pointee is kept alive by the strong
     // reference the mark word itself owns.
@@ -1182,6 +1197,11 @@ pub struct MonitorTable {
 impl MonitorTable {
     /// Create an empty monitor table.
     pub fn new() -> Self {
+        // Registered here rather than at a VM init site because this is the
+        // earliest point that provably precedes any inflation: an object cannot
+        // inflate without a monitor table, so no displaced hash can exist
+        // before this runs. Idempotent -- the `OnceLock` keeps the first.
+        cratonvm_gc::collector::set_displaced_hash_resolver(displaced_hash_from_mark);
         Self {
             // Every shard of both registries lives at L6 (`monitors`).
             monitors: (0..MONITOR_SHARDS)
@@ -3080,6 +3100,40 @@ mod tests {
         let monitor = monitor_arc_from_mark(header.mark_word.load(Ordering::Acquire))
             .expect("still inflated after exit");
         assert_eq!(monitor.displaced_hash(), hash);
+    }
+
+    /// End to end, through the accessor the VM actually calls: an object's
+    /// identity hash must not change when it inflates.
+    ///
+    /// This is the property the whole two-sided design exists for, and the one
+    /// a single call can never catch. The hash is read BEFORE inflation (from
+    /// the mark word) and AFTER (resolved from the Monitor via the hook), and
+    /// the two must agree.
+    #[test]
+    fn the_identity_hash_does_not_change_when_the_object_inflates() {
+        let heap = leaked_heap();
+        let table = MonitorTable::new();
+        let obj = heap.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let tid = ThreadId(11);
+
+        let before = heap.identity_hash_code(obj);
+        assert_ne!(before, 0, "a fresh object must get a hash");
+        assert!(!is_inflated(obj));
+
+        // Not an explicit inflation: the hashed word loses the thin-lock CAS.
+        table.enter(obj, tid);
+        assert!(is_inflated(obj));
+        table.exit(obj, tid).unwrap();
+
+        let after = heap.identity_hash_code(obj);
+        assert_eq!(
+            before, after,
+            "identity hash changed across inflation: {before} -> {after}"
+        );
+        // ...and it is stable on repeat, i.e. the displaced path reads rather
+        // than mints.
+        assert_eq!(heap.identity_hash_code(obj), before);
+        assert_eq!(heap.identity_hash_code(obj), before);
     }
 
     /// An object that inflates *without* ever having been hashed displaces
