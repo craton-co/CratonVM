@@ -8271,6 +8271,33 @@ fn fjt_entry_point(ctx: &mut dyn NativeContext, task: ObjectRef) -> FjtEntry {
     }
 }
 
+/// Ask a task that has just run for its RAW RESULT, the way the real
+/// `ForkJoinTask.invoke()` does (`doInvoke(); return getRawResult();`).
+///
+/// `getRawResult()` is VIRTUAL and abstract on `ForkJoinTask`, so every
+/// concrete task overrides it over a DIFFERENT field: `RecursiveTask` keeps
+/// `result`, `java.util.stream.AbstractTask` keeps `localResult`, a user
+/// subclass keeps whatever it likes. So this INVOKES the receiver's method
+/// rather than reading a field by name -- a by-name field read is not
+/// descriptor-aware in this VM and silently answers `Int(0)`/null for a name it
+/// fails to match, which is the same class of silent wrong answer this function
+/// exists to remove.
+///
+/// A missing or failing `getRawResult()` degrades to null -- the value the
+/// caller returned unconditionally before -- so no task shape can regress.
+fn fjt_raw_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> Value {
+    let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(task)) else {
+        return Value::Object(None);
+    };
+    if !ctx.method_exists(&cls, "getRawResult", "()Ljava/lang/Object;") {
+        return Value::Object(None);
+    }
+    match ctx.invoke_virtual(task, "getRawResult", "()Ljava/lang/Object;", &[]) {
+        Ok(value) => value.unwrap_or(Value::Object(None)),
+        Err(_) => Value::Object(None),
+    }
+}
+
 /// Threads currently inside a task body, i.e. `ForkJoinPool.getActiveThread
 /// Count()`'s "threads stealing or executing tasks". This pool runs every task
 /// inline on the submitting thread, so a thread is an active pool thread for
@@ -8331,9 +8358,22 @@ fn fjp_compute_and_complete(
         FjtEntry::ComputeObject => ctx
             .invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[])
             .map(|v| v.unwrap_or(Value::Object(None))),
-        FjtEntry::ComputeVoid => ctx
-            .invoke_virtual(live_task, "compute", "()V", &[])
-            .map(|_| Value::Object(None)),
+        FjtEntry::ComputeVoid => match ctx.invoke_virtual(live_task, "compute", "()V", &[]) {
+            // `compute()` is VOID here, so its own value is always null. Right
+            // for `RecursiveAction`; WRONG for every `CountedCompleter`, whose
+            // value goes to the raw-result slot (`AbstractTask.compute()` ends
+            // `setLocalResult(doLeaf()); tryComplete();`). The real
+            // `ForkJoinTask.invoke()` is `doInvoke(); return getRawResult();`.
+            // Returning null instead handed every real parallel-stream terminal
+            // a null `Node`/sink -- `Nodes.collect` NPE'd at
+            // `node.getChildCount()`. Re-read the pin first: `compute()`
+            // allocates, so it can move the task.
+            Ok(_) => {
+                live_task = ctx.read_native_pin(task_pin, live_task);
+                Ok(fjt_raw_result(ctx, live_task))
+            }
+            Err(e) => Err(e),
+        },
         FjtEntry::Exec => {
             // `exec()` runs the task and leaves any value in the task's own
             // raw-result slot; `ForkJoinTask<Void>` subclasses answer null.
