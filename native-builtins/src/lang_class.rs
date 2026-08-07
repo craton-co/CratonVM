@@ -12026,7 +12026,7 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
         Value::Double(d) => Ok(d.to_string()),
         Value::Object(Some(obj)) => {
             if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-                return Ok(ctx_format_annotation_array(ctx, obj));
+                return Ok(ctx_format_annotation_array(ctx, obj)?);
             }
             let cname = ctx_class_name_of(ctx, obj);
             if cname == "java/lang/annotation/AnnotationProxy" {
@@ -12047,13 +12047,13 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
             }
             if let Some(prim_name) = ctx_wrapper_class_to_primitive(&cname) {
                 let inner = ctx.get_field(obj, 0);
-                let mut s = ctx_format_annotation_value(ctx, inner);
+                let mut s = ctx_format_annotation_value(ctx, inner)?;
                 if prim_name == "long" {
                     s.push('L');
                 } else if prim_name == "float" {
                     s.push('f');
                 }
-                return s;
+                return Ok(s);
             }
             if let Value::Object(Some(name_ref)) = ctx.get_field(obj, 0) {
                 if let Some(name) = ctx.read_string(name_ref) {
@@ -12069,7 +12069,7 @@ fn ctx_format_annotation_value(ctx: &mut dyn NativeContext, val: Value) -> Resul
     }
 }
 
-fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> String {
+fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Result<String, MethodCallFailed> {
     let n = ctx.array_length(arr);
     let mut s = String::from("[");
     for i in 0..n {
@@ -12077,10 +12077,10 @@ fn ctx_format_annotation_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> S
             s.push_str(", ");
         }
         let elem = ctx.get_array_element(arr, i);
-        s.push_str(&ctx_format_annotation_value(ctx, elem));
+        s.push_str(&ctx_format_annotation_value(ctx, elem)?);
     }
     s.push(']');
-    s
+    Ok(s)
 }
 
 /// Mirrors `annotation_proxy_to_string` in vm_exec.rs.
@@ -12115,7 +12115,7 @@ pub(crate) fn ctx_annotation_proxy_to_string(
         first = false;
         s.push_str(&name);
         s.push('=');
-        s.push_str(&ctx_format_annotation_value(ctx, val));
+        s.push_str(&ctx_format_annotation_value(ctx, val)?);
     }
     s.push(')');
     Ok(s)

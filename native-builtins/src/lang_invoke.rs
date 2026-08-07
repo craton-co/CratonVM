@@ -730,7 +730,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&simple_name(ctx, ctx.get_array_element(arr, i)));
+                out.push_str(&simple_name(ctx, ctx.get_array_element(arr, i))?);
             }
         }
         out.push(')');

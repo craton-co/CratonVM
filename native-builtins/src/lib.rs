@@ -19878,7 +19878,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
                 _ => Ok("UTC".to_string()),
             };
-            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+            Ok(Some(Value::Object(Some(ctx.create_string(&name?)))))
         },
     );
     registry.register(
@@ -19890,7 +19890,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
                 _ => Ok("UTC".to_string()),
             };
-            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+            Ok(Some(Value::Object(Some(ctx.create_string(&name?)))))
         },
     );
     // getDisplayName(boolean daylight, int style, Locale): style follows
@@ -19906,7 +19906,7 @@ pub fn register_essential_natives_with_shims(
                 Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, long_style),
                 _ => Ok("UTC".to_string()),
             };
-            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+            Ok(Some(Value::Object(Some(ctx.create_string(&name?)))))
         },
     );
     // W4: was an unconditional `null`, justified as "synthesizing a real

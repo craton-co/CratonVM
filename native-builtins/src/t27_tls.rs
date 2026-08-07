@@ -2582,7 +2582,7 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
         let had_key_managers = self.has_certs();
         let out = with_active_native_context(|ctx| {
             self.resolve_via_java(ctx, root_hint_subjects, sigschemes)
-        });
+        })?;
         if dbg && out.is_none() {
             eprintln!("[dbg-tls-auth] JavaKeyManagerResolver::resolve NO active native context");
         }

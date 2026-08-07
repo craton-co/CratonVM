@@ -2834,7 +2834,7 @@ fn uri_resolve_ref(base: &str, reference: &str) -> Result<String, MethodCallFail
         }
         t_query = r_query;
     }
-    Ok(uri_recompose(&b_scheme, &t_auth, &t_path, &t_query, &r_frag))
+    Ok(uri_recompose(&b_scheme, &t_auth, &t_path?, &t_query, &r_frag))
 }
 
 /// RFC 3986 §5.3 — recompose component parts into a URI string.

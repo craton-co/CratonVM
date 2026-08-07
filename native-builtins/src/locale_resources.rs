@@ -810,7 +810,7 @@ fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> 
     // application builds an isolated loader, and HotSpot resolves a bundle
     // through it. Classes owned by the built-in loaders report `null` here or
     // the app singleton, and both keep the established `-cp` path.
-    let app = crate::classloader::get_or_create_app_loader(ctx);
+    let app = crate::classloader::get_or_create_app_loader(ctx)?;
     if loader.as_ptr() == app.as_ptr() {
         return None;
     }
