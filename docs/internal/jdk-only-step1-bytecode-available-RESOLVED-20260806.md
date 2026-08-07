@@ -169,7 +169,7 @@ not a way around this: it meets the same objects one frame later.
    only has to be non-zero, and from step 1 it was exactly zero before.
 
 3. **The enforcement is a dial, off by default:
-   `CRATONVM_JDK_ONLY_ENFORCE_SHADOW=1`.** It exists so item 4 can re-take the
+   `CRATONVM_ENFORCE_NATIVE_SHADOW=1`.** It exists so item 4 can re-take the
    32/17-vs-3/46 measurement one subsystem at a time instead of arguing about it
    from a grep. Off, `resolve_native_dispatch_wave1` is passed `false` exactly as
    before, so the dispatch decision is byte-for-byte what it was.
@@ -192,6 +192,6 @@ Do not re-attempt the dispatch-order restructuring. Take `--jdk-only-report`'s
 `bridge-ran-over-bytecode` rows from the workload you care about, pick the
 subsystem with the most of them whose object model is already real, drop those
 registrations at `register` time, and re-run the corpus with
-`CRATONVM_JDK_ONLY_ENFORCE_SHADOW=1` to watch the number move. The charset
+`CRATONVM_ENFORCE_NATIVE_SHADOW=1` to watch the number move. The charset
 family is the loudest and is blocked on `Charset.forName` returning a real
 `sun.nio.cs.*` — its own wave, and `probes/CsShape` is its oracle.

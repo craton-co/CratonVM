@@ -6,7 +6,7 @@
 //! ## Why this exists
 //!
 //! The P0 "JIT correctness" lane of the C2 review
-//! (`docs/known-issues/c2/deep-research-vm-c2.md`) asks for *"a universal IR
+//! (`docs/feature-designs/c2/deep-research-vm-c2.md`) asks for *"a universal IR
 //! verifier … run after parsing and every mutating pass in stress builds; run
 //! before lowering in all builds"*, with the exit criterion that *"invalid IR
 //! or ABI state causes a deterministic compilation bailout, never silent wrong

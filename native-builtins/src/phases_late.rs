@@ -1258,7 +1258,7 @@ const PB_FIELD_ENVIRONMENT: usize = 2;
 // four extra slots did not exist, so every write to them was dropped and every
 // read of them returned nothing. The same shape on the `Runtime.exec` route is
 // what emptied Tomcat's CGI response body -- see
-// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
+// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md.
 // It was unreachable here only because `register_io_natives` registers over
 // these triples later, which is a property of boot ordering, not of this code.
 

@@ -104,7 +104,7 @@ along with `PreciseExceptionFrames` and `InvokedynamicPresent`, so arming is now
 sufficient and `CRATONVM_JIT=bytecode-loop-xform` alone reaches loops under the
 default configuration. On `core/spring-boot-autoconfigure` that is 95–98% of
 compiles eligible (it was 0%) and 10–58 methods per test class actually
-rewritten — see `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+rewritten — see `docs/feature-designs/c2/loop-02-planner-admission-gates.md`.
 
 `the_wired_compile_path_reaches_a_loop_under_the_default_configuration` pins it,
 by reading `crate::deopt_real_enabled()` rather than hard-coding it: the answer
@@ -376,7 +376,7 @@ This is the case for the flag existing. Every unit test passed throughout.
    `pc_is_protected` was already asking its question in the wrong space, the
    versioning guard's bytes had to stop being OSR-eligible, and the copies of
    one bytecode legitimately disagree about a slot's oop-ness. See
-   `docs/known-issues/c2/loop-02-planner-admission-gates.md`.
+   `docs/feature-designs/c2/loop-02-planner-admission-gates.md`.
 3. ~~`loop-transform-wiring.md` still describes the pre-wiring state~~ — it now
    carries a superseded banner pointing here.
 4. Versioning emits ONE guard. A transform needing a guard *set* (every

@@ -444,7 +444,7 @@ pub fn jdk_only_native_shadow_attempts() -> u64 {
 /// and pays for it on the hottest path in strict mode. The identities are what
 /// the migration needs; the magnitude only has to be non-zero.
 ///
-/// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement moves every
+/// Zero when `CRATONVM_ENFORCE_NATIVE_SHADOW` is set: enforcement moves every
 /// one of these into [`jdk_only_native_shadow_attempts`] instead, so the two
 /// counters never describe the same event twice.
 pub fn jdk_only_native_shadow_unenforced() -> u64 {
@@ -554,7 +554,7 @@ fn offer_native_shadow_observation(
 /// RAN" observation — §1.4's shadow, seen at the moment it actually dispatched.
 ///
 /// This is the census hole
-/// `docs/internal/jdk-only-step1-bytecode-available-*.md` was filed for:
+/// `jdk-only-step1-bytecode-available-*.md` was filed for:
 /// `resolve_step1_native` passed a hard-coded `bytecode_available: false`, so
 /// step 1 — which answers first for nearly every dispatch in the VM — recorded
 /// nothing at all, and the shadow lists could read as inert while the natives
@@ -4448,7 +4448,7 @@ impl<'a> NativeContextImpl<'a> {
     /// only for those. A process-wide probe budget bounds a workload that
     /// really does park with `Object` locals.
     ///
-    /// See `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`.
+    /// See `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
     fn audit_frames_for_reclaimed_slots(&self, site: &'static str) {
         crate::memory::reclaim_guard::audit_thread_frames(self.shared, self.thread, site);
     }
@@ -23234,8 +23234,8 @@ fn invoke_on_class_shared_inner(
                 // Witness: `NoSuchMethodError java/lang/Object.hasNext()Z` from
                 // `TestMultiThread.testConcurrentUpdate @pc=252` — the
                 // `for (Future<Void> job : jobs)` iterator, `num_fields=0`. See
-                // docs/known-issues/h2/
-                // bug-h2-classid0-stale-address-family.md.
+                // fixed-suite-bugs/h2-suite-bugs/
+                // bug-h2-classid0-stale-address-family-FIXED.md.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
                     let addr = recv.as_ptr() as usize;
                     if crate::memory::reclaim_guard::report_reclaimed_receiver(

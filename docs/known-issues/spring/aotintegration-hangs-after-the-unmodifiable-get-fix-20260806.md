@@ -97,7 +97,7 @@ sampler will finally name the Java frame.
 
 ## 2026-08-06, later: the hang is gone, and what is under it is now named
 
-Re-measured on `dev` @ `0bcbe2032` + `docs/internal/list-out-of-range-accessors-returned-null-FIXED-20260806.md`,
+Re-measured on `dev` @ `0bcbe2032` + `list-out-of-range-accessors-returned-null-FIXED-20260806.md`,
 Azure `20.83.144.174`, real JDK 25, repaired classpath (0 of 254 missing).
 **Do not budget 90 minutes any more — this is a 49-second failure.**
 
