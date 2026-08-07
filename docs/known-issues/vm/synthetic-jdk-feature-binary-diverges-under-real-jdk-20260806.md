@@ -112,6 +112,42 @@ load-bearing in real-JDK mode — the real encoder path depends on it. The fix h
 to make the coder natives correct for a real receiver (resolve the fields by
 name, or detect a real encoder and defer), not delete them.
 
+### `RChannelInterrupt`: the receiver is the ABSTRACT class
+
+`AbstractMethodError: java/nio/channels/FileChannel.write(Ljava/nio/ByteBuffer;J)I
+has no Code attribute` is not a missing native. It is a receiver whose runtime
+class IS the abstract class, so every method that has no native to intercept it
+resolves to an abstract declaration:
+
+| | `FileChannel.open(...).getClass()` |
+|---|---|
+| HotSpot 25 | `sun.nio.ch.FileChannelImpl` |
+| default build | `sun.nio.ch.FileChannelImpl` |
+| feature build | **`java.nio.channels.FileChannel`** (superclass `AbstractInterruptibleChannel`) |
+
+Even the one-arg `write(ByteBuffer)` fails on it, not just the positional
+overload the suite happens to report.
+
+Two things ruled out by measurement:
+
+* **Not class resolution.** `Class.forName("sun.nio.ch.FileChannelImpl")`
+  answers identically in both builds — the real class, 65 declared methods,
+  with the 7-arg `open` present. So the concrete class IS available to the
+  feature build.
+* **Not the `newFileChannel` fallback.** `register_phase57_nio_file`'s
+  `FileSystemProvider.newFileChannel` shim already tries to build a real
+  `FileChannelImpl` first (the RECONCILE-WITH-REAL block) and only falls back
+  to `alloc_concurrent_synthetic("java/nio/channels/FileChannel", 1)` if that
+  fails. Instrumenting that closure with `eprintln!` and rebuilding produced
+  **no output at all** — it never runs for `FileChannel.open`. The abstract
+  instance comes from a producer that is still unidentified.
+
+The other `alloc_concurrent_synthetic("java/nio/channels/FileChannel", 1)` site
+is `RandomAccessFile.getChannel`, which this path does not go through. **Next
+step: find the third producer** — instrument `alloc_concurrent_synthetic` itself
+for that class name, or breakpoint on the allocation, rather than auditing
+registration sites by eye (two rounds of that found the wrong two).
+
 `RFileTimes` and `RNioNoFollow` did **not** reproduce from the naive one-liner
 (a plain `JarOutputStream` round-trip and a plain symlink `writeString` both
 behave correctly), so their triggers are narrower than the table suggests —
