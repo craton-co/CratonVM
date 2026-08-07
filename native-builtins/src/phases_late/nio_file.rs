@@ -5328,6 +5328,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| fsp_new_output_stream(ctx, args),
     );
 
+    // `checkAccess` is `Files.isReadable`/`isWritable`/`isExecutable`'s only
+    // implementation — those three have no `Files`-level native, so their real
+    // JDK bytecode calls straight through to here. This used to answer "does
+    // the path exist?" and ignore the `AccessMode` array entirely, so
+    // `Files.isExecutable` said `true` for a plain 0644 file on Linux (HotSpot:
+    // `false`). `fs_check_access` is the same `access(2)` call `File.canWrite`
+    // already routes through — one implementation for both entry points.
     r.register(
         fsp,
         "checkAccess",
@@ -5344,6 +5351,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     message: format!("NoSuchFileException: {}", p),
                 }
                 .into());
+            }
+            // A jar-FS entry has no host permissions to consult; existence is
+            // the whole of what the archive can answer.
+            if vfs_classify(&p).is_some() {
+                return Ok(None);
+            }
+            for mode in access_modes_requested(ctx, args.get(2)) {
+                if !fs_check_access(&p, mode) {
+                    return Err(p57_access_denied(ctx, &p));
+                }
             }
             Ok(None)
         },
@@ -5447,6 +5464,77 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             set_named_attribute(ctx, path_obj, &spec, value)
         },
     );
+
+    // The rest of `FileSystemProvider`'s abstract surface. Every one of these
+    // has a working `java/nio/file/Files` native in front of it, which is why
+    // none of them showed up before `setAttribute` did — `Files.delete` never
+    // reaches the provider, so the missing provider method was invisible. It
+    // stops being invisible the moment anything holds a `FileSystemProvider`
+    // and calls it directly (`Files.walkFileTree`'s own internals, NIO code
+    // written against the SPI, and every `AbstractFileSystemProvider` caller
+    // in the JDK do exactly that), and the failure is the same
+    // `AbstractMethodError: ... has no Code attribute`.
+    //
+    // These delegate to the `Files` natives rather than re-implementing them:
+    // one body per operation is what keeps the two entry points from drifting
+    // (the `Files.move` native, for instance, carries a
+    // `FileAlreadyExistsException` contract that H2 depends on by type).
+    r.register(fsp, "delete", "(Ljava/nio/file/Path;)V", |ctx, args| {
+        let path = obj_arg(args, 1)?;
+        ctx.invoke(
+            "java/nio/file/Files",
+            "delete",
+            "(Ljava/nio/file/Path;)V",
+            &[Value::Object(Some(path))],
+        )?;
+        Ok(None)
+    });
+    r.register(
+        fsp,
+        "createDirectory",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V",
+        |ctx, args| {
+            let path = obj_arg(args, 1)?;
+            let attrs = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.invoke(
+                "java/nio/file/Files",
+                "createDirectory",
+                "(Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/file/Path;",
+                &[Value::Object(Some(path)), attrs],
+            )?;
+            Ok(None)
+        },
+    );
+    // `NativeCallback` is a plain `fn` pointer, so these two cannot share one
+    // capturing closure over the method name.
+    r.register(
+        fsp,
+        "copy",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)V",
+        |ctx, args| fsp_delegate_two_path_copy(ctx, args, "copy"),
+    );
+    r.register(
+        fsp,
+        "move",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)V",
+        |ctx, args| fsp_delegate_two_path_copy(ctx, args, "move"),
+    );
+    // `Files.isHidden` has NO `Files`-level native, so this one was reachable
+    // and did fail: `AbstractMethodError: FileSystemProvider.isHidden(Path)Z`.
+    // `dos_attr_flag` is the same rule the DOS view reads and writes — the real
+    // `FILE_ATTRIBUTE_HIDDEN` bit on Windows, the dot-file convention
+    // elsewhere.
+    r.register(fsp, "isHidden", "(Ljava/nio/file/Path;)Z", |ctx, args| {
+        let path_obj = obj_arg(args, 1)?;
+        let path = p57_read_path(ctx, path_obj);
+        if std::fs::symlink_metadata(&path).is_err() && jarfs_decode(&path).is_none() {
+            return Err(p57_no_such_file(ctx, &path));
+        }
+        Ok(Some(Value::Int(i32::from(dos_attr_flag(
+            &path,
+            DOS_ATTR_HIDDEN,
+        )))))
+    });
 
     r.register(
         fsp,
@@ -10538,6 +10626,46 @@ pub(crate) fn copy_options_replace_existing(
     found
 }
 
+/// The `FS_ACCESS_*` bits named by a `java.nio.file.AccessMode[]` argument.
+///
+/// An empty (or absent) array is the JDK's "existence only" request, which the
+/// caller has already answered — so this returns an empty vector for it rather
+/// than defaulting to some mode the caller never asked about.
+pub(crate) fn access_modes_requested(ctx: &mut dyn NativeContext, modes: Option<&Value>) -> Vec<i32> {
+    let arr = match modes {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Vec::new(),
+    };
+    // Pin: the `toString()` probe re-enters Java and a moving young GC there
+    // would relocate the mode array (native stale-local family) — the same
+    // hazard `copy_options_replace_existing` guards against.
+    let pin = ctx.pin_native_root(arr);
+    let len = ctx.array_length(arr);
+    let mut out = Vec::new();
+    for i in 0..len {
+        let arr_cur = ctx.read_native_pin(pin, arr);
+        let Value::Object(Some(mode)) = ctx.get_array_element(arr_cur, i) else {
+            continue;
+        };
+        let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(mode, "toString", "()Ljava/lang/String;", &[])
+        else {
+            continue;
+        };
+        let text = ctx.read_string(s).unwrap_or_default();
+        // `AccessMode` is an enum, so `toString()` is the constant name.
+        if text.contains("EXECUTE") {
+            out.push(FS_ACCESS_EXECUTE);
+        } else if text.contains("WRITE") {
+            out.push(FS_ACCESS_WRITE);
+        } else if text.contains("READ") {
+            out.push(FS_ACCESS_READ);
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    out
+}
+
 /// Build a REAL `java/nio/file/FileAlreadyExistsException` (same approach as
 /// the `Files.move` native): the exception is caught by real library bytecode
 /// and its `getFile()` may be read by real `Throwable` formatting, so it needs
@@ -13029,11 +13157,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "isHidden", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        // Cross-platform: treat files with leading '.' as hidden
-        let hidden = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().starts_with('.'))
-            .unwrap_or(false);
+        // This used to apply the leading-`.` rule on EVERY platform. On Windows
+        // that is wrong in both directions, measured against HotSpot: a
+        // `.dotfile` is NOT hidden, and a plain name carrying
+        // `FILE_ATTRIBUTE_HIDDEN` IS. `fs_boolean_attributes` is the same
+        // platform split `getBooleanAttributes` already encodes — and, since
+        // `Files.isHidden` and the `dos:hidden` attribute now read the real
+        // Windows bit, sharing it here is what stops two spellings of the same
+        // question from disagreeing.
+        let hidden = fs_boolean_attributes(&path) & FS_BA_HIDDEN != 0;
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
     r.register(file, "canRead", "()Z", |ctx, args| {
@@ -15469,6 +15601,8 @@ struct StatFacts {
     ctime_millis: i64,
     readonly: bool,
     hidden: bool,
+    system: bool,
+    archive: bool,
 }
 
 fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
@@ -15496,11 +15630,17 @@ fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
         rdev: 0,
         ctime_millis: 0,
         readonly: meta.permissions().readonly(),
-        // `isOther`/`hidden` are the two the JDK derives rather than stats.
-        hidden: std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.')),
+        // The three DOS flags read through the SAME `dos_attr_flag` the
+        // `DosFileAttributeView` setters and `setAttribute` write through: real
+        // `FILE_ATTRIBUTE_*` bits on Windows, the dot-file convention for
+        // `hidden` elsewhere. They used to be derived here from the filename
+        // alone (and `system`/`archive` were hardcoded `false` at the read
+        // site), so on Windows `setAttribute(p, "dos:hidden", true)` followed by
+        // `getAttribute(p, "dos:hidden")` answered `false` — a write that
+        // really happened, reported as if it had not.
+        hidden: dos_attr_flag(path, DOS_ATTR_HIDDEN),
+        system: dos_attr_flag(path, DOS_ATTR_SYSTEM),
+        archive: dos_attr_flag(path, DOS_ATTR_ARCHIVE),
     };
     #[cfg(unix)]
     {
@@ -15688,9 +15828,11 @@ pub(crate) fn read_named_attributes(
             "rdev" => box_long(ctx, facts.rdev),
             "readonly" => box_boolean(ctx, facts.readonly),
             "hidden" => box_boolean(ctx, facts.hidden),
-            // DOS-only flags with no Unix counterpart. `false` is what the JDK
+            // On Windows these are the real `FILE_ATTRIBUTE_*` bits; off
+            // Windows `dos_attr_flag` answers `false`, which is what the JDK
             // reports for them on a non-DOS filesystem.
-            "archive" | "system" => box_boolean(ctx, false),
+            "system" => box_boolean(ctx, facts.system),
+            "archive" => box_boolean(ctx, facts.archive),
             "permissions" => match posix_permission_set(ctx, facts.mode) {
                 Some(set) => Value::Object(Some(set)),
                 None => continue,
@@ -15742,6 +15884,27 @@ pub(crate) fn read_named_attributes(
     let map = ctx.read_native_pin(map_pin, map);
     ctx.unpin_native_roots(map_pin);
     Ok(Some(Value::Object(Some(map))))
+}
+
+/// Shared body for `FileSystemProvider.copy`/`move`: same argument shape, same
+/// delegation to the `java/nio/file/Files` native, only the method name
+/// differs. The provider overloads return `void`; the `Files` ones return the
+/// target `Path`, which is dropped here.
+fn fsp_delegate_two_path_copy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+) -> MethodCallResult {
+    let src = obj_arg(args, 1)?;
+    let dst = obj_arg(args, 2)?;
+    let options = args.get(3).copied().unwrap_or(Value::Object(None));
+    ctx.invoke(
+        "java/nio/file/Files",
+        method,
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)Ljava/nio/file/Path;",
+        &[Value::Object(Some(src)), Value::Object(Some(dst)), options],
+    )?;
+    Ok(None)
 }
 
 /// The attribute names a given view can *write*.
