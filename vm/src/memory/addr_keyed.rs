@@ -198,11 +198,22 @@ mod census {
         },
         AuditedFile {
             path: "native-builtins/src/net_phase_e.rs",
-            declarations: 4,
-            disposition: "inet_addr_side_table and ds_side_table: SCANNED + \
-                          REMAPPED — gc_scan_inet_addr_roots / \
-                          gc_update_inet_addr_refs and the re10 handler-root \
-                          pair in the same module.",
+            declarations: 7,
+            disposition: "inet_addr_side_table: SCANNED + REMAPPED — \
+                          gc_scan_inet_addr_roots / gc_update_inet_addr_refs. \
+                          ds_side_table and ds_peer_table: SCANNED + REMAPPED — \
+                          gc_scan_ds_roots / gc_update_ds_refs. (The previous \
+                          entry named ds_side_table as covered by the \
+                          inet_addr pair; it was not — that pair walks only \
+                          inet_addr_side_table, and ds_side_table had no GC \
+                          disposition at all until ds_peer_table's arrival \
+                          made the count wrong and surfaced it.) The re10 \
+                          handler roots live in this file too but are counted \
+                          under their own pair. Seven declarations, six tables: the 
+                          seventh is gc_update_ds_refs own rekey helper, which 
+                          takes a HashMap<ObjectRef, V> parameter and so is 
+                          counted by a matcher that reads declarations, not 
+                          tables.",
         },
         AuditedFile {
             path: "native-builtins/src/locale_bootstrap.rs",

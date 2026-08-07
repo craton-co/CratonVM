@@ -779,6 +779,61 @@ fn ds_clear_peer(this: ObjectRef) {
     ds_peer_table().lock().remove(&this);
 }
 
+/// GC roots for the two `DatagramSocket`-keyed side tables.
+///
+/// Both are `HashMap<ObjectRef, _>`, so their keys ARE addresses: a moving
+/// collection that relocates a `DatagramSocket` strands its entry, and a dead
+/// entry later collides with whatever object the allocator places on that
+/// address — a silent wrong answer, not a lookup miss
+/// (`docs/threading/objectref-concurrency-contract.md` §7.3). Both tables carry
+/// state the JDK requires to survive `close()` (`getPort`/`getInetAddress` keep
+/// answering, same rule that keeps `isConnected()` true), so neither can be
+/// cleared on close to sidestep this.
+///
+/// Same scan+remap shape as [`gc_scan_inet_addr_roots`] /
+/// [`gc_update_inet_addr_refs`] two hundred lines below, and wired the same way
+/// from `vm/src/memory/native_roots.rs`.
+///
+/// Retention: publishing the keys as roots keeps a `DatagramSocket` alive for
+/// as long as its entry exists, and nothing removes from `ds_side_table` —
+/// deliberately, per the close rule above. That is the same characteristic the
+/// sibling `inet_addr_side_table` already has. The end state for both is
+/// `addr_keyed::remap_and_sweep`, which drops an entry whose object did not
+/// survive instead of rooting it; that needs an `is_live` predicate this crate
+/// cannot reach, so it is a follow-up rather than a thing to half-do here.
+pub fn gc_scan_ds_roots(out: &mut Vec<ObjectRef>) {
+    for k in ds_side_table().lock().keys() {
+        out.push(*k);
+    }
+    for k in ds_peer_table().lock().keys() {
+        out.push(*k);
+    }
+}
+
+/// Companion to [`gc_scan_ds_roots`]: re-key both tables through the
+/// collector's relocation map so a lookup on the relocated `DatagramSocket`
+/// still resolves.
+pub fn gc_update_ds_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    fn rekey<V>(
+        map: &mut std::collections::HashMap<ObjectRef, V>,
+        pointer_map: &std::collections::HashMap<usize, usize>,
+    ) {
+        let drained: Vec<_> = map.drain().collect();
+        for (k, v) in drained {
+            let nk = pointer_map
+                .get(&(k.as_ptr() as usize))
+                .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+                .unwrap_or(k);
+            map.insert(nk, v);
+        }
+    }
+    rekey(&mut ds_side_table().lock(), pointer_map);
+    rekey(&mut ds_peer_table().lock(), pointer_map);
+}
+
 /// `javax.net.ssl.SSLSessionContext` cache tuning, as configured through
 /// `setSessionCacheSize`/`setSessionTimeout`. Side-tabled for the same reason
 /// as the socket state above, and one more: the carrier is an instance of the

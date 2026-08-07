@@ -273,6 +273,12 @@ fn scan_http_handlers(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
 fn remap_http_handlers(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
     cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(map);
 }
+fn scan_datagram_sockets(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::net_phase_e::gc_scan_ds_roots(roots);
+}
+fn remap_datagram_sockets(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::net_phase_e::gc_update_ds_refs(map);
+}
 fn scan_inet_addresses(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::net_phase_e::gc_scan_inet_addr_roots(roots);
 }
@@ -394,6 +400,11 @@ static VM_ROOT_SOURCES: &[VmRootSource] = &[
     root_source!("annotation-proxies", scan_annotations, remap_annotations),
     root_source!("http-handlers", scan_http_handlers, remap_http_handlers),
     root_source!("inet-addresses", scan_inet_addresses, remap_inet_addresses),
+    root_source!(
+        "datagram-sockets",
+        scan_datagram_sockets,
+        remap_datagram_sockets
+    ),
     root_source!("nio", scan_nio, remap_nio),
     root_source!("server-ports", scan_server_ports, remap_server_ports),
     root_source!("scheduled-pump", scan_scheduled, remap_scheduled),
@@ -490,6 +501,26 @@ mod tests {
     /// `register_native_root_source` fan-out; if this row is ever dropped, a
     /// moving collection reclaims or staleness-poisons every registered
     /// transformer with no compile error to show for it.
+    /// The two `DatagramSocket`-keyed side tables in `net_phase_e` hold state
+    /// the JDK requires to outlive `close()` — `getSoTimeout`, `getBroadcast`,
+    /// and the connected peer behind `getPort`/`getInetAddress`/`isConnected`.
+    /// Both are `HashMap<ObjectRef, _>`, so a moving young collection that
+    /// relocates a socket strands its entry and every one of those getters
+    /// silently reverts to its default.
+    ///
+    /// Measured with `probes/DsGcProbe`, 64 sockets across ~800k young-gen
+    /// allocations: with this row present, `DSGCPROBE OK`; with it removed and
+    /// nothing else changed, **288 failures** — `soTimeout 0`, `port -1`,
+    /// `peer null`, `isConnected false`. Not a lookup miss: a silent wrong
+    /// answer, which is why `addr_keyed`'s census exists.
+    #[test]
+    fn datagram_socket_side_tables_are_a_registered_root_source() {
+        assert!(
+            VM_ROOT_SOURCES.iter().any(|s| s.name == "datagram-sockets"),
+            "ds_side_table and ds_peer_table must be a VM root source"
+        );
+    }
+
     #[test]
     fn instrument_transformer_chain_is_a_registered_root_source() {
         assert!(
