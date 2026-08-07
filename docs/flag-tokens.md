@@ -486,7 +486,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-168 tokens.
+169 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -498,6 +498,7 @@ export inherited from a parent shell.
 | `sp-inline-mic` | `CRATONVM_JIT_SP_INLINE_MIC` |
 | `sp-inline-pic` | `CRATONVM_JIT_SP_INLINE_PIC` |
 | `unreg-memo-gc-reset` | `CRATONVM_JIT_UNREG_MEMO_GC_RESET` |
+| `unreg-accept-residue` | `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE` |
 | `activation-global-mutex` | `CRATONVM_JIT_ACTIVATION_GLOBAL_MUTEX` |
 | `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
 | `alloc-spill-sink` | `CRATONVM_JIT_NO_ALLOC_SPILL_SINK` |

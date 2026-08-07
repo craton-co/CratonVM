@@ -7585,6 +7585,12 @@ pub(crate) fn native_method_invoke(
             _ => false,
         };
         if !caller_entitled {
+        // NOTE: dev landed a NARROWER fix for the same defect while this was
+        // in flight — a same-class-only carve-out, motivated by HikariConfig's
+        // private-final AtomicReference and measured on Temurin 25 as legal for
+        // both private (0x0002) and package-private (0x0008). This rule SUBSUMES
+        // it: `caller_may_access_member`'s first arm is the declaring class
+        // itself. Kept the wider rule; dev's evidence recorded here.
             check_access(
                 modifiers,
                 false,

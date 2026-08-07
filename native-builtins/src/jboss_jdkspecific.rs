@@ -1958,7 +1958,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer)
-            .expect("Compatible mode never refuses a Module stand-in");
+            .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1993,7 +1993,7 @@ mod tests {
         // valid (non-null) Set, not null/panic.
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.sql", layer)
-            .expect("Compatible mode never refuses a Module stand-in");
+            .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -2008,7 +2008,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer)
-            .expect("Compatible mode never refuses a Module stand-in");
+            .expect("build_module must succeed for a synthetic layer");
         let result = native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -2055,7 +2055,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         let module = build_module(&mut ctx, "java.base", layer)
-            .expect("Compatible mode never refuses a Module stand-in");
+            .expect("build_module must succeed for a synthetic layer");
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -2089,7 +2089,7 @@ mod tests {
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         // Build a fully-populated module (java.base records the full JDK package list).
         let module = build_module(&mut ctx, "java.base", layer)
-            .expect("Compatible mode never refuses a Module stand-in");
+            .expect("build_module must succeed for a synthetic layer");
         // Sanity: getPackages() reflects the recorded data for this module.
         let pkgs = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()

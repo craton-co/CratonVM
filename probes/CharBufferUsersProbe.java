@@ -13,7 +13,7 @@ import java.util.regex.Pattern;
  *
  * <p>Companion to {@link CharBufferWrapProbe}, which covers the factories and
  * the range checks. This one exists because
- * {@code docs/internal/charbuffer-wrap-string-subsequence-does-not-bounds-check-FIXED-20260806.md}
+ * {@code charbuffer-wrap-string-subsequence-does-not-bounds-check-FIXED-20260806.md}
  * changed what {@code wrap(CharSequence)} returns — from a synthetic
  * array-backed buffer to the real {@code java.nio.StringCharBuffer} HotSpot
  * returns — and the whole risk of that change lives in these rows. The

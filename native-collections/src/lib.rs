@@ -58198,17 +58198,18 @@ mod tests {
             .expect("Compatible mode never refuses a comparator stand-in");
         for (tag_maker, expected) in [
             (
+                // Both makers became fallible when the collector stand-in
+                // learned to be refused under `--jdk-only`; the cast here still
+                // named the old infallible shape, so this file did not compile
+                // under `--all-targets` at all.
                 make_min_by_collector
-                    as fn(
-                        &mut dyn NativeContext,
-                        Value,
-                    ) -> Result<ObjectRef, MethodCallFailed>,
+                    as fn(&mut dyn NativeContext, Value) -> Result<ObjectRef, MethodCallFailed>,
                 Value::Int(1),
             ),
             (make_max_by_collector, Value::Int(3)),
         ] {
             let collector = tag_maker(&mut ctx, Value::Object(Some(natural)))
-                .expect("Compatible mode never refuses a min/max collector stand-in");
+                .expect("Compatible mode never refuses a collector stand-in");
             let result = native_stream_collect(
                 &mut ctx,
                 &[Value::Object(Some(stream)), Value::Object(Some(collector))],
