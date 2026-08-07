@@ -1,11 +1,12 @@
-# A `--features synthetic-jdk` binary run in real-JDK mode fails three suite classes the shipping build passes
+# FIXED — a `--features synthetic-jdk` binary run in real-JDK mode failed suite classes the shipping build passes
 
 | | |
 |---|---|
-| **Status** | OPEN — 4 of 7 closed; the remaining 3 are diagnosed below, each with its measured divergence |
+| **Status** | **FIXED 2026-08-07** — all 7 closed. The feature build now measures exactly what the shipping build measures |
 | **Severity** | high **for measurement** — this is the configuration the vm test gate and the regression suite are usually run with |
 | **Modes** | built `--features synthetic-jdk`, run `--real-jdk`. The default `cratonvm-cli` build is unaffected |
 | **Opened** | 2026-08-06 |
+| **Closed** | 2026-08-07 |
 
 ## The split
 
@@ -17,18 +18,36 @@ Same source tree, same JDK 25 image, same host, same `regression-suite/run.sh`
 | `cargo build --release -p cratonvm-cli` (the shipping default) | **31 passed, 0 failed** |
 | `cargo build --release -p cratonvm-cli --features synthetic-jdk` | 26 passed, **5 failed** |
 
-Remaining: `RChannelInterrupt`, `RFileTimes`, `RNioNoFollow`. Every one passes
-in the default build.
+Two more surfaced later (`RChannelInterrupt`'s second half, `RFileTimes`),
+making seven in all. All seven are now closed:
 
-Closed so far: `RExecutorShutdown` (the blocking-queue family — see the retired
-`threadpoolexecutor-drops-queued-tasks-and-never-terminates` write-up),
-`RSerial` (`java/io/StringWriter`), and `RStrings` + `RCrypto` together (the
-charset family, 2026-08-07).
+| class | root cause | closed |
+|---|---|---|
+| `RExecutorShutdown` | the blocking-queue family (retired `threadpoolexecutor-drops-queued-tasks-and-never-terminates`) | 2026-08-06 |
+| `RSerial` | `java/io/StringWriter` squatting `Writer.lock` | 2026-08-06 |
+| `RStrings` + `RCrypto` | the charset family fabricating ABSTRACT-class instances | 2026-08-07 |
+| `RChannelInterrupt` + `RNioNoFollow` | `native_fc_open` fabricating an abstract `FileChannel` | 2026-08-07 |
+| `RFileTimes` | two defects: the cfg-guarded `FileOutputStream` `<init>` block, and a jar bridge missing from this arm | 2026-08-07 |
+
+Final state, one dev tip (`51d68e1b7`), four binaries, ABBA-interleaved:
+
+| build | change | suite |
+|---|---|---|
+| feature | none | 25 passed, 6 failed |
+| feature | **all three fixes** | **28 passed, 3 failed** |
+| default | none | 28 passed, 3 failed |
+| default | all three fixes | 28 passed, 3 failed |
+
+The feature build and the shipping build now agree class for class. The three
+remaining failures — `RBlockingQueue`, `RSocketChannelInterrupt`,
+`RMapGcStress` — fail in BOTH builds and are therefore `dev`'s own, not this
+family. `--synthetic-jdk` MODE output is unchanged (11 passed / 20 failed on
+both arms, identical verdicts).
 
 **Not part of this family:** `RSocketChannelInterrupt` started failing on `dev`
-on 2026-08-07 and fails in the DEFAULT build too (30 passed / 1 failed), so it
-is a plain `dev` regression rather than a feature-vs-default divergence. Do not
-fold it into this page.
+on 2026-08-07 and fails in the DEFAULT build too, so it is a plain `dev`
+regression rather than a feature-vs-default divergence. Do not fold it into this
+page. The same now goes for `RBlockingQueue` and `RMapGcStress`.
 
 ## The mechanism
 
@@ -56,7 +75,7 @@ not — the Cargo feature only decides what is compiled. The runtime half is the
 drop-list entry. `StringWriter` carried exactly that comment and exactly that
 gap.
 
-## The remaining five, with measured divergence
+## The seven, with measured divergence
 
 Each line is what a two-line probe shows in the feature build under
 `--real-jdk`, next to HotSpot 25.
@@ -175,17 +194,124 @@ Two things ruled out by measurement:
   instance comes from a producer that is still unidentified.
 
 The other `alloc_concurrent_synthetic("java/nio/channels/FileChannel", 1)` site
-is `RandomAccessFile.getChannel`, which this path does not go through. **Next
-step: find the third producer** — instrument `alloc_concurrent_synthetic` itself
-for that class name, or breakpoint on the allocation, rather than auditing
-registration sites by eye (two rounds of that found the wrong two).
+is `RandomAccessFile.getChannel`, which this path does not go through.
+
+**FIXED 2026-08-07 — the third producer does not call
+`alloc_concurrent_synthetic` at all**, which is exactly why two rounds of
+grepping for that helper missed it. It is `native_fc_open` in
+`native-io/src/lib.rs`, registered on
+
+```
+java/nio/channels/FileChannel.open(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)…
+```
+
+— the precise overload the suite calls — and it fabricates with a bare
+`alloc_object(FileChannel, 2)`. It intercepted `FileChannel.open` *before the
+provider was ever consulted*, which is the whole reason instrumenting the
+`newFileChannel` closure printed nothing. The negative result was real; it was
+pointing one frame too low.
+
+Two defects in one registration, only the first of which the suite named:
+
+* the receiver is the abstract class, so `write(ByteBuffer, long)` — which has
+  no native, unlike the no-position `write(ByteBuffer)` — resolves to an
+  abstract declaration and throws `AbstractMethodError`. The same object also
+  has no `interruptor`, the field `AbstractInterruptibleChannel.begin()`
+  dereferences, so it could never have produced the
+  `ClosedByInterruptException` this vector exists to assert;
+* the body is documented "simplified" and calls `open_read`, **ignoring the
+  `OpenOption[]` entirely**. `FileChannel.open(p, WRITE)` returned a READ-ONLY
+  fd, and `FileChannel.open(link, …, NOFOLLOW_LINKS)` followed the link — the
+  defect `RNioNoFollow` gates, reached through a path that fix never touched.
+
+The fix is to drop it in real-JDK mode (`drop_real_layout_synthetic`, scoped to
+`open` by name). Nothing else has to be built: real `FileChannel.open` bytecode
+calls `FileSystemProvider.newFileChannel`, which is already force-listed in
+`native_override.rs` and already routed to the base-class registration, and that
+shim's RECONCILE-WITH-REAL block already constructs a genuine
+`sun.nio.ch.FileChannelImpl`. Its synthetic fallback is left in place, so a host
+where the real construction fails keeps today's behaviour rather than a new one.
+
+The instance natives on the class (`read`/`write`/`position`/`size`/`close`)
+stay registered: they still serve that fallback object, and they do not
+intercept a real `FileChannelImpl`, whose own declarations win because native
+dispatch keys on the resolved method's declaring class.
 
 `RFileTimes` and `RNioNoFollow` did **not** reproduce from the naive one-liner
 (a plain `JarOutputStream` round-trip and a plain symlink `writeString` both
 behave correctly), so their triggers are narrower than the table suggests —
 start from the test source, not from the summary line.
 
-## Why the remaining five are NOT a repeat of the last two
+### `RFileTimes`: two defects, and neither is about file times
+
+**1. The `FileOutputStream`/`FileInputStream` `<init>` block was guarded by the
+wrong thing** — and that guard silently un-did a fix that was already in the
+tree.
+
+`native-io/src/lib.rs` carries a comment block (FOS-FIX, 2026-05-20) explaining
+that native `<init>` overrides must NOT be registered for the real-JDK build:
+the real constructor allocates the `fd` `FileDescriptor` and calls `open0`, and
+overriding it puts the fd in instance slot 0 — the *reference*-typed `fd` field,
+where a `Value::Int` write is silently dropped — leaving every `write`/`flush`/
+`close` a no-op. The comment is exactly right. The guard under it was
+`#[cfg(feature = "synthetic-jdk")]`, which asks what was COMPILED when the
+question is which CLASS LIBRARY was LOADED. So the feature build reproduced the
+2026-05-20 defect in full:
+
+| | feature build | default build | HotSpot 25 |
+|---|---|---|---|
+| `new FileOutputStream(f)`, `write(5 bytes)`, `close()` | **0-byte file** | 5 | 5 |
+| `new FileOutputStream(path)` (String ctor) | **0** | 5 | 5 |
+| single-byte `write(int)` × 5 | **0** | 5 | 5 |
+| `fos.getFD()` | **throws** | ok | ok |
+| `Files.write` / `Files.newOutputStream` / `RandomAccessFile` | 5 | 5 | 5 |
+
+The last row is why this hid for so long: the three spellings most code uses
+were fine. `RFileTimes` reported it as `readAttributes.size` = 0 and then as an
+unreadable archive (`Could not find EOCD`) — the `JarOutputStream` it built on a
+`FileOutputStream` had written nothing.
+
+Fixed by making the guard the runtime one: a new
+`NativeMethodRegistry::drops_real_layout_synthetic()` getter, read at the
+registration site. The `cfg` stays as well — in a default build these natives
+should not even be compiled in. This is the general lesson of this whole page in
+one line: **`#[cfg(feature)]` is never the right guard for "is a real JDK on the
+other end".**
+
+**2. The jar/zip bridge was missing from this arm.** `vm_init.rs` has two
+real-JDK arms — one inside the feature build, one in the shipping build — and
+they had drifted. `register_p59_jar` (plus `register_p59_bulk_stream_transfer`
+and `register_p59_zip_output_primitives`) was registered only in the shipping
+one, so the feature build fell back to `native-io`'s `zip_real_jar` surface,
+which builds every entry with `alloc_zip_entry`:
+
+| | `JarFile.entries()` element | `getJarEntry` | `getEntry` |
+|---|---|---|---|
+| feature build | `java.util.zip.ZipEntry` | `ZipEntry` | `ZipEntry` |
+| default build | `java.util.jar.JarEntry` | `JarEntry` | `JarEntry` |
+| HotSpot 25 | `java.util.jar.JarFile$JarFileEntry` | same | same |
+
+`JarFile.entries()` is declared `Enumeration<JarEntry>`, so the implicit
+checkcast at the call site threw `ClassCastException: java.util.zip.ZipEntry
+cannot be cast to java.util.jar.JarEntry` — for any caller that iterates a jar,
+not just this test. Fixed by registering the three in the feature build's
+real-JDK arm, in the shipping arm's order (the registry is last-write-wins).
+
+**The residual worth knowing about.** Those three are not the only difference
+between the two real-JDK arms. Diffing the `register_*` calls in each:
+
+* in the shipping arm and NOT in the feature arm: `register_classvalue_natives`,
+  `register_essential_natives`, `register_p67_misc`, `register_phase57_file`,
+  `register_random_and_securerandom_natives`, `register_random_natives`,
+  `register_spring_boot_logback_apply` (and the three now fixed);
+* in the feature arm and not the shipping one: ~30, mostly the JMX/management
+  and MethodHandle clusters.
+
+Some of that asymmetry is deliberate. Some of it is the next `RFileTimes`. The
+structural fix is for the two arms to share one function; that was out of scope
+here and is not something to attempt without a suite run per step.
+
+## Why the remaining five were NOT a repeat of the last two
 
 The two closed cases were easy because the offending class had **exactly one
 production registration site, and it was feature-gated** — so a class-keyed drop
@@ -208,6 +334,12 @@ reaching for the same fix:
 * `java/nio/channels/FileChannel` — the "no Code attribute" shape says dispatch
   resolved to the ABSTRACT method rather than a concrete implementation, which
   is a different failure from a layout squat. Treat it as a dispatch bug first.
+  **This prediction was wrong, and worth keeping as a caution:** it was not a
+  dispatch bug. Dispatch was correct — it resolved on the receiver's real class,
+  which genuinely WAS the abstract one because a native had fabricated it. "No
+  Code attribute" says the resolved method is abstract; it does not say the
+  resolution was wrong. Check what the receiver's class actually is before
+  theorising about how it was reached.
 
 ## How to close one
 
@@ -222,6 +354,13 @@ reaching for the same fix:
 5. Add the drop rule, then re-run the class in BOTH builds and in
    `--synthetic-jdk` mode — the synthetic-mode output must be byte-identical,
    since the flag is only ever set in real-JDK arms.
+6. **Verify the A and B binaries actually differ.** `sha256sum` them. A build
+   script that stages arms by copying files can leave both arms holding the same
+   source after an early failure, and an A/B of a binary against itself reports
+   a clean, stable, completely meaningless "no change" — which reads as "the fix
+   does nothing" and will send you looking for a second root cause that is not
+   there. That happened on this page's `FileChannel` fix and cost a full
+   four-binary matrix.
 
 ## Why this matters beyond the five
 
@@ -231,5 +370,8 @@ failures to `dev`.** That happened in three consecutive sessions, each reporting
 project's baseline. The A/B conclusions held — both arms shared the instrument —
 but the baseline was the instrument's, not dev's, and `dev` was green.
 
-Until the five are closed: state which binary a suite number came from, and use
-the default build for any claim about `dev`'s health.
+Now that they are closed the two builds agree, but the habit still earns its
+keep: state which binary a suite number came from, and use the default build for
+any claim about `dev`'s health. The arms can drift again — see the residual
+`vm_init.rs` arm diff under `RFileTimes` — and the next drift will be just as
+invisible as this one was.

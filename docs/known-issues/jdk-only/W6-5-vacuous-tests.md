@@ -201,6 +201,16 @@ harnesses' `probe_source()` also accepts **`probes/FjpProbe.java`** — `probes/
 is tracked, with only `probes/*.class` ignored — so moving the file there needs
 no code change and is the durable home. **Recommended.**
 
+> **UPDATED 2026-08-07.** `probes/FjpProbe.java` still does not exist; the
+> fixture is still at `apps/fjp_probe/FjpProbe.java`, which **is** tracked
+> (force-added), so this section's premise — "it vanishes on the next clone" —
+> no longer applies to FJP. It does still apply, unfixed, to
+> `probes/BdProbe.java`, `regression-suite/src/RJdkPhaser.java` and
+> `regression-suite/src/RJdkFieldModule.java`, all three of which `git status`
+> reports as `??`. **A tracked *directory* is not a tracked *file*** — the
+> recommendation above is only half the work, and the missing half is the
+> `git add -f`.
+
 ---
 
 ## 3. Other tests shaped the same way — inventory
@@ -211,8 +221,18 @@ no code change and is the durable home. **Recommended.**
 `regression-suite/src/RTreeRangeGc.java` are each described in a FIXED-bug
 document as *the permanent regression gate* for a heap-corruption defect:
 
-* `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md:119`
-* `docs/internal/fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:102`
+Both are internal records, cited by their path relative to the internal tree's
+own root (they are not published, so a `docs/`-rooted path would be a link no
+public reader can follow):
+
+* `fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md:119`
+* `fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:102`
+
+The fact this section rests on does not depend on reaching either page: **both
+vectors pass on a broken VM without their extra argument**, for the two reasons
+spelled out under point 2 below (on the default heap no collection happens
+during the walk; with a live JIT frame the young generation falls back to a
+non-moving sweep under which a stale reference still resolves).
 
 Two things have since broken, and they compound:
 
@@ -221,7 +241,21 @@ Two things have since broken, and they compound:
    two vectors in `src/` that are in neither `CORE_CLASSES` nor
    `JDKONLY_CLASSES` other than `RConcurrent`, whose exclusion *is* documented
    in run.sh.
-2. **The `cv_extra_args` hook they depend on is gone from `run.sh`.** Both
+2. ~~**The `cv_extra_args` hook they depend on is gone from `run.sh`.**~~
+   **UPDATED 2026-08-07: partly fixed, and the residue is worth knowing.**
+   `run.sh` now carries `cv_extra_args` / `class_cv_args` (CratonVM-only
+   arguments, deliberately withheld from the HotSpot oracle — *"the oracle has
+   to stay the plain reference run"*) and an explicit `UNREGISTERED_CLASSES`
+   list naming `RConcurrent`, `RPriorityQueueGc` and `RTreeRangeGc`, each with
+   its reason — and `class_cv_args` supplies exactly the arguments this section
+   asked for: `RPriorityQueueGc` → `--nojit --Xmx 64m`, `RTreeRangeGc` →
+   `--Xmx 64m` (deliberately without `--nojit`, so the compiling configuration
+   stays under test). `run.sh`'s own comment now carries this section's warning
+   verbatim: *"With `--nojit` alone the vector PASSES ON A BROKEN VM."*
+   **Point 1 still stands**, and it is the whole residual: both classes remain
+   in `UNREGISTERED_CLASSES`, so neither runs at all until a lane that can build
+   and run the VM verifies them — which `run.sh` also says in place.
+   Both
    documents and both vectors' own headers say the suite runs them with
    `--nojit --Xmx 64m` and `--Xmx 64m` respectively. `run.sh` today has only
    `class_args()`, which handles `RJdkModule` and nothing else — and `class_args`
@@ -313,8 +347,27 @@ covers the adjacent case (javac ran and rejected the source) but not this one.
 A third `common::require_fixture(Option<PathBuf>)` would close it, and a
 source-level guard in the shape of `probe_compile_guard.rs` — "every test that
 gates on a fixture path must panic, not return, when it is absent" — would keep
-it closed. Not done here: `vm/tests/common/mod.rs` and `probe_compile_guard.rs`
+it closed. ~~Not done here~~: `vm/tests/common/mod.rs` and `probe_compile_guard.rs`
 are not this lane's files, and the fix in §2.3 is local to the two tests.
+
+> **UPDATED 2026-08-07 — `common::require_fixture` now exists in
+> `vm/tests/common/mod.rs`, and it changes nothing about CI.** The helper only
+> panics when `CRATONVM_REQUIRE_E2E` is set, and **no file under
+> `.github/workflows/` sets it** — CI runs plain `cargo test --workspace`.
+> `vm/tests/common/mod.rs` states the opposite in two comments (*"CI sets it to
+> assert that a green run was a real one"*); that claim is false and cannot be
+> corrected from `docs/`. Until a workflow exports it, every
+> `require_binary` / `require_jdk` / `require_fixture` skip is still a silent
+> green in CI, and §3.3's structural gap is open for the reason it was filed,
+> not for the reason it names.
+>
+> The live instance: `vm/tests/rbigdec1_arithmetic.rs` claims *"the gate is now
+> live in CI"*. It is not — the test opens with `None => return`, the fixture
+> `probes/BdProbe.java` is **untracked** (`?? probes/BdProbe.java`), and the
+> alternative path `apps/bigdecimal_probe/BdProbe.java` does not exist. The
+> adjacent claim in the same file that *"`probes/` IS tracked"* confuses the
+> tracked directory with the untracked file — which is exactly the confusion
+> §2.3 above warns about, arriving from the other side.
 
 ### 3.4 Java vectors — swept, clean
 
@@ -374,9 +427,9 @@ with
 # from class_args() because these are CratonVM spellings: HotSpot is the oracle
 # and must stay an unmodified reference run, so it never receives them.
 #
-# Both of these gates are INERT without their argument. See
-# docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md
-# and docs/internal/fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:
+# Both of these gates are INERT without their argument. See the internal records
+# fixed-suite-bugs/h2-suite-bugs/bug-h2-priorityblockingqueue-stale-objectref-classcastexception-FIXED.md
+# and fixed-suite-bugs/treemap-treeset-range-snapshot-stale-objectref-FIXED.md:
 # on the default heap no collection happens during the walk, and with a live JIT
 # frame on the stack the young generation falls back to a non-moving sweep under
 # which a stale reference still resolves. Either way the vector passes on a

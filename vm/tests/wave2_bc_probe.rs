@@ -135,11 +135,29 @@ fn java_home() -> Option<String> {
 
 fn classpath() -> Option<String> {
     let probe = probe_dir();
+    // Loud, and a failure under CRATONVM_REQUIRE_E2E — see `common::require_fixture`.
+    // Both of these were silent `return None`s, which made every test in this file
+    // report `ok` in 0.00 s.
     if !probe.join("BcProbe.class").exists() {
+        let _ = common::require_fixture(
+            "wave2_bc",
+            "the Wave 2 BouncyCastle fixture `BcProbe` (BcProbe.class, compiled from \
+             BcProbe.java)",
+            &[probe.join("BcProbe.class"), probe.join("BcProbe.java")],
+        );
         return None;
     }
     let bc_jar = probe.join("lib").join("bcprov-jdk18on-1.78.1.jar");
     if !bc_jar.exists() {
+        // NOTE: `.gitignore` line 14 is `**/*.jar`, so this jar can never be
+        // committed — it is a genuine download prerequisite, unlike the .java
+        // fixture above. It is still reported here rather than swallowed.
+        let _ = common::require_fixture(
+            "wave2_bc",
+            "the BouncyCastle provider jar `bcprov-jdk18on-1.78.1.jar` (a DOWNLOAD \
+             prerequisite: `**/*.jar` is gitignored, so it is staged, never committed)",
+            &[bc_jar.clone()],
+        );
         return None;
     }
     // Windows uses ';' as classpath separator; the cratonvm CLI accepts

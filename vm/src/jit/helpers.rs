@@ -1645,7 +1645,15 @@ unsafe fn virtual_dispatch_target_for_receiver(
     receiver: ObjectRef,
     info: &JitInvokeInfo,
 ) -> VirtualDispatchTarget {
-    if vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+    // An array-typed call site resolves against `java.lang.Object`'s method
+    // table by JVMS §4.4.1, whatever the receiver's header says — decide it from
+    // the SITE, above the header check below. See the matching comment in
+    // `runtime::interpreter::invoke`'s `execute_invoke_kind`: the header-driven
+    // form is correct only while the header is trustworthy, and a
+    // reclaimed-and-re-served block's is not.
+    if info.class_name.starts_with('[')
+        || vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array
+    {
         return VirtualDispatchTarget {
             class_name: std::sync::Arc::from("java/lang/Object"),
             cacheable_receiver: false,
@@ -2174,7 +2182,16 @@ unsafe fn virtual_dispatch_target_cached(
     // KC26: array receivers store their COMPONENT class id in the header, so
     // the `(site, class id)` key cannot tell `X[]` from `X`. Resolve them
     // directly — array classes inherit Object's method table (JVMS §4.4.1).
-    if vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+    //
+    // An array-typed call SITE gets the same answer without asking the header
+    // at all, which is the form that survives a header that lies: a block
+    // reclaimed while still referenced and then re-served reads back as a
+    // perfectly ordinary object of whatever now occupies it, and the
+    // receiver-driven form would then resolve `"[J".clone()` against that
+    // occupant's class.
+    if info.class_name.starts_with('[')
+        || vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array
+    {
         return CachedDispatchTarget {
             class_name: std::rc::Rc::from("java/lang/Object"),
             cacheable_receiver: false,
@@ -4864,6 +4881,167 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     crate::runtime::offload::input_cache::invalidate(cratonvm_types::ObjectRef::from_raw(ptr));
 }
 
+// ─── Reference-word decode chokepoint for the JIT read helpers ───────────────
+//
+// Six reference-returning read arms in this file (`jit_aaload`'s element read,
+// `jit_getfield`'s three arms, `jit_getstatic`'s two) ended commit 6a04b0e3c1
+// (2026-06-29, "degrade stale references to null at every decode boundary")
+// carrying the same three lines verbatim:
+//
+//     if plausible_heap_pointer(raw) { raw as i64 } else { 0 }
+//
+// That commit's own message records what they are: *defense-in-depth for an
+// unfixed GC defect* — "the underlying GC root-coverage gap (live blocked-thread
+// frame objects swept by the non-moving young sweep) remains and is the only
+// complete fix". They are a heuristic compensating for a known-live bug, not an
+// integrity guard on trusted data, and that distinction is why the shape below
+// is not just a de-duplication.
+//
+// WHY THIS FUNCTION EXISTS — two failure modes the copy-pasted idiom hides:
+//
+// (1) The JIT-side degrade is SILENT, and its interpreter twin is not. The same
+//     commit put the same filter on the interpreter's decode path, where it
+//     feeds `cratonvm_types::compact_value`'s process-wide degradation counter
+//     and a one-shot stderr line (`note_object_degradation`, types/src/
+//     compact_value.rs:330). These six JIT arms feed nothing. So
+//     `object_degradation_count()` reads 0 while compiled code is quietly
+//     handing Java `null` for live objects — the counter is not merely
+//     incomplete, it actively reports "clean" for the configuration where the
+//     root-coverage gap is *most* likely to bite (JIT'd frames are exactly the
+//     ones the deposited root snapshot misses). A root-coverage regression that
+//     only manifests under JIT is invisible to the instrument built to catch it.
+//     `JIT_REF_DEGRADATIONS` closes that, at the cost of one relaxed increment
+//     on a path that is already a broken state. This is a bug today,
+//     independent of ZGC.
+//
+//     TODO(zgc)/TODO(gc): `cratonvm_types::compact_value::note_object_degradation`
+//     is `pub(crate)`, so this counter cannot be merged into the interpreter's.
+//     Making it `pub` (types/src/compact_value.rs:330) and calling it here would
+//     give one number instead of two; that edit is outside this file.
+//
+// (2) A ZGC colored word is NOT corruption, and must never take the degrade.
+//     `gc/src/zgc/vaddr.rs` sets bit 63 (`Z_COLORED_TAG`) on every non-null
+//     colored word *precisely so* it fails `plausible_heap_pointer`'s 47-bit
+//     test and is caught loudly rather than dereferenced as a wild pointer. The
+//     idiom above does the exact opposite of loud: it converts "the load barrier
+//     has not run on this word" into a null reference handed to Java, i.e. a
+//     NullPointerException or a silently dropped store at an arbitrary point far
+//     from the cause. Under a relocating collector that is silent heap
+//     corruption, which the JIT-load-barrier study (docs/feature-designs/
+//     zgc-jit-load-barrier.md, risk J1) rates worse than a clean SIGSEGV.
+//
+//     The fix is NOT to weaken `plausible_heap_pointer` — the study says so
+//     explicitly — it is to make the caller barrier the word first. Until that
+//     lands (stage (a)), the colored-word case is an invariant violation and
+//     fails loudly instead of fabricating a null.
+
+/// Process-wide count of reference words a JIT read helper degraded to `null`
+/// because they failed [`cratonvm_types::plausible_heap_pointer`].
+///
+/// The JIT-side counterpart of `cratonvm_types::compact_value`'s
+/// `object_degradation_count`, which only sees the interpreter's decode path.
+/// Advisory and `Relaxed`: it carries no happens-before relationship with the
+/// slot it counts.
+static JIT_REF_DEGRADATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the running count of stale references the JIT read helpers degraded to
+/// `null`. A non-zero value means compiled code has been handed `null` for a
+/// slot that held bits — i.e. the GC root-coverage gap recorded in commit
+/// `6a04b0e3c1` is live in this run. Zero is the only good value.
+pub fn jit_ref_degradation_count() -> u64 {
+    JIT_REF_DEGRADATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decode a raw reference word read out of a heap slot into the `i64` the JIT
+/// expects, degrading a provably-impossible pointer to `0` (null).
+///
+/// The fast path is byte-for-byte the predicate the six call sites used before:
+/// `plausible_heap_pointer(raw)` and nothing else. Everything new lives in the
+/// `#[cold]`, `#[inline(never)]` callee, which is only reached once that
+/// predicate has *already* failed — so this costs nothing per field access on
+/// any build or any collector. See the block comment above for why.
+///
+/// `site` is only materialised inside the cold callee.
+#[inline(always)]
+fn jit_decode_ref_word(raw: u64, site: &'static str) -> i64 {
+    if cratonvm_types::plausible_heap_pointer(raw) {
+        raw as i64
+    } else {
+        jit_ref_word_implausible(raw, site)
+    }
+}
+
+/// Cold arm of [`jit_decode_ref_word`]: the word cannot be a live heap pointer.
+///
+/// Distinguishes the two reasons a word can land here, which the previous
+/// `else { 0 }` conflated:
+///
+/// * A **ZGC colored word** — legitimate data that simply has not been through
+///   the load barrier. Returning `0` for it is the silent-null corruption of
+///   §2.5 / J1 in `docs/feature-designs/zgc-jit-load-barrier.md`; returning the
+///   colored word itself is a wild-pointer deref in compiled code. Neither is
+///   acceptable, so this is a hard failure that names the missing barrier.
+/// * **Stale/garbage bits** (the `0x8D8D..` class from commit `6a04b0e3c1`) —
+///   genuinely not a pointer. Keeps the existing degrade-to-null contract, now
+///   counted.
+///
+/// The ZGC arm is `#[cfg(feature = "zgc")]`, so a default build is unaffected —
+/// not merely equivalent, but not compiled. It is additionally guarded by
+/// `is_well_formed`, which requires bits 62-46 clear and exactly one metadata
+/// bit set: a stale `0x8D8D8D8D8D8D8D8D` has bit 63 set but fails that, so a
+/// `--features zgc` build running Generational or G1 keeps the old degrade for
+/// real garbage. This bit-pattern test is used instead of "is ZGC the selected
+/// backend?" deliberately: `jit_aaload` receives no `vm_ptr` at all, and
+/// `cratonvm_gc::vm_heap::VmHeap` exposes no backend accessor — see the report
+/// accompanying this change.
+#[cold]
+#[inline(never)]
+fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
+    // `plausible_heap_pointer(0)` is FALSE (it requires `raw >= 0x1000`), so an
+    // ordinary null reference lands here on the way to returning 0. Without this
+    // early-out every null `aaload` / `getfield` / `getstatic` would bump
+    // `JIT_REF_DEGRADATIONS` — the counter would read in the millions on a
+    // perfectly clean run, falsifying its own contract that "zero is the only
+    // good value", and it would put an atomic RMW on the COMMON path for null
+    // field reads rather than on a cold one. A null is not a degradation: no
+    // reference was lost, because there was none to lose.
+    if raw == 0 {
+        return 0;
+    }
+
+    #[cfg(feature = "zgc")]
+    {
+        // TODO(zgc): once the load barrier is wired into this helper arm this
+        // branch becomes unreachable, because the word reaching here will
+        // already be a plain address. The barrier entry point is
+        // `cratonvm_gc::zgc::barrier::z_load(&AtomicU64, &ZBarrierContext)`
+        // (gc/src/zgc/barrier.rs, fn z_load); the intended plumbing is through the
+        // existing `VmHeap::load_and_forward` chokepoint this file already uses
+        // for moving collectors (`forward_jit_arg_at`), so that the JIT read
+        // helpers acquire the barrier by dispatching on the backend rather than
+        // by growing a ZGC special case per site. Keep this panic as the
+        // tripwire for a site that was missed.
+        if cratonvm_gc::zgc::vaddr::is_colored_word(raw)
+            && cratonvm_gc::zgc::vaddr::is_well_formed(raw)
+        {
+            panic!(
+                "ZGC colored word {raw:#018x} reached the JIT read helper `{site}` \
+                 with no load barrier: bit 63 (Z_COLORED_TAG) is set by \
+                 gc/src/zgc/vaddr.rs so this word is a legitimate reference that \
+                 has not been unmasked, not corruption. Barrier it via \
+                 cratonvm_gc::zgc::barrier::z_load and plausibility-check the \
+                 UNMASKED address; do not degrade it to null (that is the silent \
+                 heap corruption of zgc-jit-load-barrier.md J1) and do not weaken \
+                 plausible_heap_pointer to admit it."
+            );
+        }
+    }
+    let _ = site;
+    JIT_REF_DEGRADATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    0
+}
+
 // SAFETY: Called from JIT-compiled code. array_ptr must be 0 (null) or a valid heap
 // pointer to a reference array object. Null triggers a pending NPE + `i64::MIN`
 // deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
@@ -4898,12 +5076,15 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     // Degrade an implausible element reference to null instead of returning bits
     // the JIT will deref → SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
     // `read_prim_element`'s Reference arm; valid refs (or 0=null) pass through.
+    //
+    // TODO(zgc): this is a raw reference-array element load — Category A in
+    // `docs/feature-designs/zgc-jit-load-barrier.md` §2.3. Under `VmHeap::Zgc`
+    // the word must go through `cratonvm_gc::zgc::barrier::z_load`
+    // (gc/src/zgc/barrier.rs, fn z_load) BEFORE any plausibility test, and the test
+    // must then be applied to the barrier's unmasked address, not to the
+    // colored word. `jit_decode_ref_word` fails loudly meanwhile.
     let raw = read_ref_slot(elem_ptr);
-    if cratonvm_types::plausible_heap_pointer(raw) {
-        raw as i64
-    } else {
-        0
-    }
+    jit_decode_ref_word(raw, "jit_aaload/element")
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -5204,12 +5385,16 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
             // will later deref → SIGSEGV. Mirrors `read_prim_element`'s
             // Reference arm so interpreter and JIT decode a stale ref slot
             // identically. Valid refs (or 0=null) always pass through.
+            //
+            // TODO(zgc): this is THE compact-reference field load — the
+            // helper-arm site `docs/feature-designs/zgc-jit-load-barrier.md`
+            // §2.5 names, and the fallback every Category-A inline arm takes
+            // once `zgc_blocks_inline_ref_loads()` is on. Under `VmHeap::Zgc`
+            // the barrier (`cratonvm_gc::zgc::barrier::z_load`,
+            // gc/src/zgc/barrier.rs:994) goes between `read_ref_slot` and the
+            // plausibility test, which then asks about the unmasked address.
             let raw = read_ref_slot(ptr);
-            return if cratonvm_types::plausible_heap_pointer(raw) {
-                raw as i64
-            } else {
-                0
-            };
+            return jit_decode_ref_word(raw, "jit_getfield/compact-ref");
         }
         // PLAIN-SLOT TEARING FIX (2026-07-06): was `std::ptr::read(ptr as
         // *const Value)` -- a non-atomic 16-byte copy that can tear against a
@@ -5233,12 +5418,19 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
                 // Degrade an implausible (stale/garbage) object pointer to null
                 // rather than handing the JIT bits it will deref → SIGSEGV.
                 // Valid refs always pass the plausibility gate.
+                //
+                // UNREACHABLE, and kept only as a total `match`: control only
+                // gets here when `storage.is_reference()` was FALSE (the
+                // reference arm `return`s above), and `is_reference()` is
+                // `matches!(self, Self::Reference)` (types/src/field_layout.rs:82).
+                // `read_compact_field` (types/src/field_layout.rs:972) produces
+                // `Value::Object` from its `Reference` arm and from nowhere
+                // else — every other `FieldStorageKind` yields Int/Long/Float/
+                // Double. So this filter has never fired and cannot fire, and it
+                // is NOT a ZGC barrier site despite being counted as one in
+                // `zgc-jit-load-barrier.md` §2.2/§9.
                 let raw = r.as_ptr() as u64;
-                if cratonvm_types::plausible_heap_pointer(raw) {
-                    raw as i64
-                } else {
-                    0
-                }
+                jit_decode_ref_word(raw, "jit_getfield/compact-nonref-unreachable")
             }
             Value::Object(None) => 0,
             _ => 0,
@@ -5258,12 +5450,19 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
         Value::Object(Some(r)) => {
+            // Live filter, unlike the compact-layout twin above:
+            // `read_value_atomic` (types/src/value.rs:1570) is a raw
+            // `transmute` of two relaxed word loads and validates nothing, so
+            // this `ObjectRef` can hold arbitrary bits straight off the slot.
+            //
+            // TODO(zgc): legacy 16-byte reference field. Under `VmHeap::Zgc`
+            // the barrier belongs on the slot read, i.e. before the `Value` is
+            // reconstituted — a colored word must never be fabricated into an
+            // `ObjectRef` (`cratonvm_gc::zgc::vaddr::debug_assert_plain_word`
+            // is the tripwire for exactly that). Entry point:
+            // `cratonvm_gc::zgc::barrier::z_load`, gc/src/zgc/barrier.rs:994.
             let raw = r.as_ptr() as u64;
-            if cratonvm_types::plausible_heap_pointer(raw) {
-                raw as i64
-            } else {
-                0
-            }
+            jit_decode_ref_word(raw, "jit_getfield/legacy-value-slot")
         }
         Value::Object(None) => 0,
         _ => 0,
@@ -6116,12 +6315,13 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
             let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
             return match val {
                 Value::Object(Some(r)) => {
+                    // TODO(zgc): `System.in` is an ordinary static reference
+                    // slot; see the general `getstatic` arm below for the
+                    // barrier placement. `zgc-jit-load-barrier.md` §8 Q5 flags
+                    // statics as the one shape that is not atomic today, so
+                    // this slot may need the non-healing barrier variant.
                     let raw = r.as_ptr() as u64;
-                    if cratonvm_types::plausible_heap_pointer(raw) {
-                        raw as i64
-                    } else {
-                        0
-                    }
+                    jit_decode_ref_word(raw, "jit_getstatic/System.in")
                 }
                 _ => 0,
             };
@@ -6138,12 +6338,16 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
         Value::Float(f) => f.to_bits() as i64,
         Value::Double(d) => d.to_bits() as i64,
         Value::Object(Some(r)) => {
+            // TODO(zgc): the general `getstatic` reference arm. Under
+            // `VmHeap::Zgc` the barrier belongs inside the statics read
+            // (`crate::vm::get_static_shared`) so the interpreter and the JIT
+            // share one barriered path, not here where the `ObjectRef` has
+            // already been built. Entry point:
+            // `cratonvm_gc::zgc::barrier::z_load`, gc/src/zgc/barrier.rs:994.
+            // Open question `zgc-jit-load-barrier.md` §8 Q5: a static slot is
+            // not atomic today, so it may not be CAS-healable.
             let raw = r.as_ptr() as u64;
-            if cratonvm_types::plausible_heap_pointer(raw) {
-                raw as i64
-            } else {
-                0
-            }
+            jit_decode_ref_word(raw, "jit_getstatic/object")
         }
         Value::Object(None) => 0,
         _ => 0,

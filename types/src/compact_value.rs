@@ -267,40 +267,218 @@ fn is_nan_tagged(v: u64) -> bool {
 // degraded" in a crash report). A relaxed increment is a single `lock xadd`
 // with no ordering constraints — negligible on the cold degrade path and
 // never touched on the hot well-formed-reference path.
+//
+// THIS MODULE IS THE CANONICAL SINK FOR THE WHOLE VM, not just for the
+// interpreter. The same "refuse an implausible reference word rather than
+// dereference it" decision is taken on three paths, and for a long time only
+// this one was counted:
+//
+//   1. the NaN-box / SoA decoders in this crate               (Interpreter)
+//   2. the JIT read helpers in vm/src/jit/helpers.rs          (Jit)
+//   3. gc::heap::read_prim_element's reference arm            (ArrayElement)
+//
+// (2) and (3) grew private counters of their own precisely because
+// `note_object_degradation` was `pub(crate)` and neither crate could reach it —
+// which meant `object_degradation_count()` reported a reassuring 0 for the
+// configuration where a GC root-coverage gap is MOST likely to fire (a JIT'd
+// frame is the frame a deposited root snapshot misses). The sink is now `pub`
+// and source-tagged: one total, plus a per-source breakdown so "jit: 17" is
+// distinguishable from a harmless long↔object collision.
+//
+// THE ONE RULE A NEW SOURCE MUST NOT GET WRONG: an ordinary null is not a
+// degradation. `plausible_heap_pointer(0)` is false, so on a raw-word path a
+// null reference reaches the same cold arm as garbage; counting it puts the
+// counter in the millions on a clean run. Raw-word callers must therefore call
+// `note_ref_word_degradation`, which applies the filter for them. Callers
+// holding a TAGGED slot (this file, `crate::value`) are exempt and must not
+// filter: a null has its own tag there, so a zero payload under an object tag
+// is an impossible encoding and counting it is the point.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Once;
 
-/// Guards the one-time-per-process diagnostic emitted by
-/// [`note_object_degradation`] when the *first* long↔object collision is
-/// observed at runtime. A `Once` keeps the message to a single line no matter
-/// how many subsequent collisions the counter records — surfacing the danger
-/// early without spamming a hot crash log.
-static FIRST_DEGRADATION_DIAG: Once = Once::new();
-
-/// Process-wide count of NaN-box `SUB_OBJECT` slots that were degraded to a
-/// primitive `Value::Long` because their payload could not be a real heap
-/// reference (null, unaligned, or — for the `*_checked` decoders — not a live
-/// heap object). See [`object_degradation_count`].
-static OBJECT_DEGRADATION_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Read the running count of degraded `SUB_OBJECT` slots.
+/// The distinct code paths that can degrade a would-be reference, i.e. the
+/// sources that feed the single canonical sink [`note_object_degradation_at`].
 ///
-/// This counter is incremented (relaxed) every time a decode path
+/// All three mean the same thing — *a reference-shaped word was refused rather
+/// than dereferenced* — but they do NOT carry the same diagnostic weight, which
+/// is why the sink keeps a per-source breakdown alongside the total:
+///
+/// * [`Interpreter`](Self::Interpreter) — the NaN-box / SoA decoders in this
+///   crate (`CompactValue::to_value`, `to_value_checked`, `is_object_checked`,
+///   `decode_by_descriptor`, `from_value`, and `crate::value::decode_value`).
+///   Historically the only counted source, and the only one this file calls.
+/// * [`Jit`](Self::Jit) — the compiled-code read helpers in
+///   `vm/src/jit/helpers.rs` (`jit_getfield`, `jit_aaload`, `jit_getstatic`, …).
+///   **Diagnostically special, do not fold it into an opaque total.** A JIT'd
+///   frame is exactly the frame a deposited root snapshot can miss, so the GC
+///   root-coverage gap fires here first; a total that says "17" tells you
+///   nothing, a breakdown that says "jit: 17" names the configuration.
+/// * [`ArrayElement`](Self::ArrayElement) — `gc::heap::read_prim_element`'s
+///   reference arm, shared by all three collectors (Generational, G1, ZGC).
+///
+/// Adding a variant requires widening [`DEGRADATION_COUNTS`] and
+/// [`FIRST_DEGRADATION_DIAG`]; the `const` assertion below and the exhaustive
+/// matches in [`Self::index`] / [`Self::name`] make forgetting a compile error,
+/// not a silently-dropped source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DegradationSource {
+    /// This crate's NaN-box / SoA decode paths.
+    Interpreter,
+    /// The JIT read helpers (`vm::jit::helpers`).
+    Jit,
+    /// The array-element read path (`gc::heap::read_prim_element`).
+    ArrayElement,
+}
+
+impl DegradationSource {
+    /// Number of variants — the width of every per-source table below.
+    pub const COUNT: usize = 3;
+
+    /// Every variant in table order, for callers rendering the breakdown.
+    pub const ALL: [DegradationSource; Self::COUNT] = [
+        DegradationSource::Interpreter,
+        DegradationSource::Jit,
+        DegradationSource::ArrayElement,
+    ];
+
+    /// Index into the per-source counter table.
+    #[inline(always)]
+    pub const fn index(self) -> usize {
+        match self {
+            DegradationSource::Interpreter => 0,
+            DegradationSource::Jit => 1,
+            DegradationSource::ArrayElement => 2,
+        }
+    }
+
+    /// Short, stable, machine-greppable name used by the one-shot diagnostic
+    /// and by any caller rendering [`object_degradation_breakdown`].
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            DegradationSource::Interpreter => "interpreter",
+            DegradationSource::Jit => "jit",
+            DegradationSource::ArrayElement => "array-element",
+        }
+    }
+}
+
+/// Guards the one-time-per-process-**per-source** diagnostic emitted by
+/// [`note_object_degradation_at`] when a source records its *first*
+/// degradation. A `Once` keeps each source to a single line no matter how many
+/// subsequent events its counter records — surfacing the danger early without
+/// spamming a hot crash log.
+///
+/// **One line per source, not one per process.** The three sources are three
+/// independent failure stories, and the interpreter's is by far the most likely
+/// to fire first *and* the least alarming (a primitive long colliding with the
+/// tag space is harmless). A single process-wide `Once` would let one benign
+/// interpreter collision permanently mute the JIT line — silencing precisely
+/// the signal the JIT counter was added to surface. The bound is
+/// [`DegradationSource::COUNT`] lines per process (3 today), which is not spam.
+static FIRST_DEGRADATION_DIAG: [Once; DegradationSource::COUNT] =
+    [Once::new(), Once::new(), Once::new()];
+
+/// Per-source count of reference-shaped slots that were degraded rather than
+/// dereferenced. Indexed by [`DegradationSource::index`].
+///
+/// The process-wide total reported by [`object_degradation_count`] is *defined*
+/// as the sum of this table rather than kept as a fourth atomic: a separate
+/// total would be a second thing to keep in step with the breakdown, and any
+/// skew between them would be indistinguishable from a real miscount.
+static DEGRADATION_COUNTS: [AtomicU64; DegradationSource::COUNT] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+// Widening `DegradationSource` without widening the two tables above would
+// silently drop a source (index out of range at runtime is the *good* case);
+// make it a compile error instead.
+const _: () = assert!(
+    DegradationSource::COUNT == 3,
+    "DEGRADATION_COUNTS / FIRST_DEGRADATION_DIAG must be widened alongside DegradationSource"
+);
+
+/// Read the running **total** of degraded reference-shaped slots across every
+/// [`DegradationSource`].
+///
+/// The counter is incremented (relaxed) every time one of the registered
+/// sources refuses a reference-shaped word: this crate's decode paths
 /// ([`CompactValue::to_value`], [`CompactValue::to_value_checked`],
-/// [`CompactValue::is_object_checked`], and the SoA [`crate::decode_value`])
-/// reclassifies a slot that carries the `SUB_OBJECT` NaN-box pattern but
-/// whose payload cannot be a live heap reference. In a correct run on
-/// verifier-checked bytecode this should stay at — or very near — zero; a
-/// non-zero value indicates long↔object bit-pattern collisions are reaching
-/// context-free decoders and is a useful signal for fuzzing and crash
-/// diagnostics.
+/// [`CompactValue::is_object_checked`], [`CompactValue::decode_by_descriptor`],
+/// [`CompactValue::from_value`] and the SoA [`crate::decode_value`]), the JIT
+/// read helpers, and the array-element read path.
+///
+/// # What "zero is the only good value" does and does not mean
+///
+/// A non-zero total is always worth investigating, but it is not by itself a
+/// bug: an `Interpreter` count can be a primitive `long` whose verbatim bits
+/// collided into the `SUB_OBJECT` tag space, which is harmless and is exactly
+/// what the degrade exists to handle. Read
+/// [`object_degradation_breakdown`] before drawing a conclusion — a non-zero
+/// [`DegradationSource::Jit`] or [`DegradationSource::ArrayElement`] count is
+/// the alarming one, because those sources see *untagged* reference words that
+/// carry no long/object ambiguity, so a refusal there means a word that should
+/// have been a live pointer was handed to Java as `null`.
+///
+/// # What is NOT counted: an ordinary null
+///
+/// A null reference is **not** a degradation and must never reach this counter,
+/// because no reference was lost — there was none to lose. This is a real trap:
+/// [`crate::plausible_heap_pointer(0)`](crate::plausible_heap_pointer) is
+/// `false` (it requires `raw >= 0x1000`), so on any path that inspects a *raw,
+/// untagged* reference word an ordinary null falls into the same
+/// "implausible" arm as genuine garbage. Counting it would put this number in
+/// the millions on a perfectly clean run and falsify the contract above on
+/// first use. Two sibling counters had to rediscover this independently, so the
+/// rule now lives in the sink: raw-word callers must use
+/// [`note_ref_word_degradation`], which applies the filter for them. See that
+/// function for why this crate's own six call sites are exempt.
 ///
 /// Uses `Relaxed` ordering: the value is advisory and carries no
-/// happens-before relationship with the slot it counts.
+/// happens-before relationship with the slot it counts. Summing the per-source
+/// table is likewise non-atomic — a concurrent reader can miss an increment
+/// landing in a slot it has already read, so the total is a lower bound under
+/// concurrency, never an over-count. Tests that need an exact figure serialise
+/// on [`degrade_counter_test_lock`] and assert deltas.
 #[inline]
 pub fn object_degradation_count() -> u64 {
-    OBJECT_DEGRADATION_COUNT.load(Ordering::Relaxed)
+    let mut total: u64 = 0;
+    let mut i: usize = 0;
+    while i < DegradationSource::COUNT {
+        total = total.wrapping_add(DEGRADATION_COUNTS[i].load(Ordering::Relaxed));
+        i += 1;
+    }
+    total
+}
+
+/// Read the running count for a single [`DegradationSource`].
+///
+/// See [`object_degradation_count`] for the ordering and null-exclusion
+/// contract, which is identical.
+#[inline]
+pub fn object_degradation_count_from(source: DegradationSource) -> u64 {
+    DEGRADATION_COUNTS[source.index()].load(Ordering::Relaxed)
+}
+
+/// Snapshot every per-source count, indexed by [`DegradationSource::index`].
+///
+/// This is the accessor a crash report or `print_gc_summary` line should use:
+/// `interpreter=N jit=N array-element=N` distinguishes a benign long↔object
+/// collision from a live GC root-coverage failure, which a single total cannot.
+/// Pair with [`DegradationSource::ALL`] / [`DegradationSource::name`] to render
+/// it without hard-coding the order.
+///
+/// The snapshot is taken with three independent relaxed loads, so under
+/// concurrency it is a set of per-slot lower bounds rather than a consistent
+/// instant; that is adequate for diagnostics and avoids putting a lock on a
+/// path that exists to observe a failure.
+#[inline]
+pub fn object_degradation_breakdown() -> [u64; DegradationSource::COUNT] {
+    [
+        DEGRADATION_COUNTS[0].load(Ordering::Relaxed),
+        DEGRADATION_COUNTS[1].load(Ordering::Relaxed),
+        DEGRADATION_COUNTS[2].load(Ordering::Relaxed),
+    ]
 }
 
 /// Reset the degradation counter to zero, returning the previous value.
@@ -314,34 +492,141 @@ pub fn object_degradation_count() -> u64 {
 /// crate's own tests measured absolute counts after a reset and were flaky for
 /// exactly that reason; they now take
 /// [`degrade_counter_test_lock`] *and* assert deltas, and no longer call this.
+///
+/// Resets **every** per-source slot, so the total and the breakdown stay
+/// consistent. The one-shot diagnostics are deliberately NOT re-armed: they are
+/// once-per-process by contract, and a fuzzer resetting the counter in a loop
+/// must not turn them into a log flood.
 #[inline]
 pub fn reset_object_degradation_count() -> u64 {
-    OBJECT_DEGRADATION_COUNT.swap(0, Ordering::Relaxed)
+    let mut prev_total: u64 = 0;
+    let mut i: usize = 0;
+    while i < DegradationSource::COUNT {
+        prev_total = prev_total.wrapping_add(DEGRADATION_COUNTS[i].swap(0, Ordering::Relaxed));
+        i += 1;
+    }
+    prev_total
 }
 
-/// Record one degraded `SUB_OBJECT` slot. Cold: only reached when a slot that
-/// looks like an object reference is reclassified as a primitive long.
+/// Record one degraded reference-shaped slot from
+/// [`DegradationSource::Interpreter`].
 ///
-/// `pub(crate)` so the SoA decode path in `value.rs` (which performs the
-/// equivalent null/unaligned degrade for a `VTAG_OBJECT` slot) feeds the same
-/// process-wide counter exposed by [`object_degradation_count`].
+/// Convenience alias for
+/// `note_object_degradation_at(DegradationSource::Interpreter, "types::compact_value")`,
+/// kept because it is the name this crate's six decode sites and
+/// `crate::value::cold_decode_degraded_object_ptr` already call.
+///
+/// # This entry point does NOT filter null — and must not
+///
+/// Its callers hold a **tagged** slot, where "no reference here" has its own
+/// encoding (`SUB_NULL` / `VTAG_NULL`, both produced by
+/// [`CompactValue::null`] / `encode_value(Value::Object(None))`). A `SUB_OBJECT`
+/// slot whose payload is `0` is therefore *not* a Java null — it is an
+/// unconstructible encoding ([`CompactValue::object`] asserts `ptr != 0`,
+/// [`CompactValue::try_from_pointer`] returns `None` for it), so it can only
+/// have arrived as a colliding primitive long or as memory corruption, and
+/// counting it is correct. Raw-word callers are in the opposite position and
+/// must use [`note_ref_word_degradation`] instead.
 #[cold]
 #[inline]
-pub(crate) fn note_object_degradation() {
-    let prev = OBJECT_DEGRADATION_COUNT.fetch_add(1, Ordering::Relaxed);
-    // The very first collision (counter transitioning 0 -> 1) is the one worth
-    // shouting about: it means a long↔object bit-pattern collision has actually
-    // reached a context-free decoder at runtime. Emit a single diagnostic and
-    // never again — the counter itself tracks the rest.
+pub fn note_object_degradation() {
+    note_object_degradation_at(DegradationSource::Interpreter, "types::compact_value");
+}
+
+/// Record one degraded reference-shaped slot from `source`, without a site tag.
+///
+/// Use when the caller has no meaningful static site name to attach (the
+/// array-element path has one cold arm and does not need one).
+#[cold]
+#[inline]
+pub fn note_object_degradation_from(source: DegradationSource) {
+    note_object_degradation_at(source, "");
+}
+
+/// **The single canonical sink for reference-degradation events**, shared by
+/// the interpreter, the JIT and the array-element paths.
+///
+/// Bumps `source`'s slot in [`DEGRADATION_COUNTS`] (hence the total read by
+/// [`object_degradation_count`]) and, the first time that *source* records an
+/// event in this process, emits one advisory stderr line naming it. `site` is a
+/// static caller tag (e.g. `"jit_aaload"`) used only in that one-shot line;
+/// pass `""` when there is nothing useful to say.
+///
+/// Cold by construction: it is only reached once a decode has already decided
+/// the word cannot be a live reference.
+///
+/// # Counts
+///
+/// A word that is reference-*shaped* (an object tag, or a non-zero pointer-sized
+/// value in a reference slot) but provably cannot be a live heap pointer:
+/// unaligned, inside the null-guard page, above the 47-bit address range, not
+/// in the reference-provenance bitmap, or rejected by a caller-supplied
+/// live-heap predicate.
+///
+/// # Does not count
+///
+/// * **An ordinary null.** See [`note_ref_word_degradation`].
+/// * A slot correctly typed as a primitive, or a well-formed reference that
+///   merely moved — neither is a degradation.
+///
+/// `Relaxed` on the increment: the counter is advisory and establishes no
+/// happens-before relationship with the slot it describes, so any stronger
+/// ordering would buy a guarantee no reader needs and put a fence on a path
+/// that a stress run can take often.
+#[cold]
+#[inline]
+pub fn note_object_degradation_at(source: DegradationSource, site: &'static str) {
+    let prev = DEGRADATION_COUNTS[source.index()].fetch_add(1, Ordering::Relaxed);
+    // The first event *from this source* (its slot transitioning 0 -> 1) is the
+    // one worth shouting about. Subsequent events are tracked by the counter.
     if prev == 0 {
-        emit_first_degradation_diag();
+        emit_first_degradation_diag(source, site);
     }
+}
+
+/// Sink for callers holding a **raw, untagged reference word** — the JIT read
+/// helpers and the array-element read path.
+///
+/// Returns `true` if the event was counted, `false` if `raw` was an ordinary
+/// null and therefore ignored. The caller degrades to `null` either way; the
+/// boolean exists so a caller can skip further reporting for the null case.
+///
+/// # Why this exists instead of "just call [`note_object_degradation_at`]"
+///
+/// [`crate::plausible_heap_pointer(0)`](crate::plausible_heap_pointer) is
+/// **`false`** — it requires `raw >= 0x1000` — so on a raw-word path an
+/// ordinary null reference lands in the very same "implausible pointer" arm as
+/// genuine garbage. A caller that forwards that arm straight to the counter
+/// counts every null `aaload` / `getfield` / `getstatic` in the program: the
+/// counter reads in the millions on a clean run, its "non-zero means a live
+/// reference was lost" contract is false on first use, and an atomic RMW lands
+/// on the *common* path for null field reads rather than on a cold one.
+///
+/// A null is not a degradation: no reference was lost, because there was none
+/// to lose. Two sibling counters (`vm::jit::helpers::JIT_REF_DEGRADATIONS` and
+/// `gc::heap::REF_ELEMENT_DEGRADATIONS`) each had to discover this
+/// independently, which is one time too many — so the rule is encoded here,
+/// where it cannot be forgotten by the next path that needs a sink.
+///
+/// This crate's own six call sites deliberately do **not** route through here:
+/// they hold tagged slots in which a null has a distinct encoding, so for them
+/// a zero payload under an object tag is an impossible encoding and counting it
+/// is correct. See [`note_object_degradation`].
+#[inline]
+pub fn note_ref_word_degradation(raw: u64, source: DegradationSource, site: &'static str) -> bool {
+    // Kept out-of-#[cold] so this early-out stays a single predicted-taken
+    // compare even if a caller inlines it onto a warm path.
+    if raw == 0 {
+        return false;
+    }
+    note_object_degradation_at(source, site);
+    true
 }
 
 /// Test-only mutex serialising every test that exercises a **degrading**
 /// decode path.
 ///
-/// [`OBJECT_DEGRADATION_COUNT`] is one process-wide counter and `cargo test`
+/// [`DEGRADATION_COUNTS`] is one process-wide table and `cargo test`
 /// runs the whole crate's tests in one process, in parallel — so a test that
 /// merely *triggers* a degradation perturbs any concurrently-running test that
 /// *counts* them. Both kinds must hold this lock, and that includes the
@@ -357,12 +642,15 @@ pub(crate) fn degrade_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Cold one-shot diagnostic for the first observed long↔object collision.
+/// Cold one-shot diagnostic for a source's first observed degradation.
 ///
-/// Kept out-of-line and `#[cold]` so the branch in [`note_object_degradation`]
-/// stays a single predicted-not-taken compare on the (already cold) degrade
-/// path. The crate has no logging dependency, so this writes one line to
-/// stderr behind a `Once`.
+/// Kept out-of-line and `#[cold]` so the branch in
+/// [`note_object_degradation_at`] stays a single predicted-not-taken compare on
+/// the (already cold) degrade path. The crate has no logging dependency, so
+/// this writes one line to stderr behind that source's `Once` — at most
+/// [`DegradationSource::COUNT`] lines per process, one per source. See
+/// [`FIRST_DEGRADATION_DIAG`] for why the `Once` is per-source rather than
+/// per-process.
 ///
 /// This is purely advisory: a degradation is a deliberately-handled,
 /// *recoverable* fallback (a SUB_OBJECT-patterned primitive long, or a
@@ -379,24 +667,45 @@ pub(crate) fn degrade_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 /// [`to_value`]: CompactValue::to_value
 #[cold]
 #[inline(never)]
-fn emit_first_degradation_diag() {
+fn emit_first_degradation_diag(source: DegradationSource, site: &'static str) {
     // FIX: removed the always-false `debug_assert!(false, ...)` that aborted in
     // debug/test builds on the very first degradation. Degradation is a counted,
     // recoverable fallback (returns Value::Long / false rather than dereferencing
     // a bogus pointer), not UB — see note_object_degradation / object_degradation_count
     // and the to_value Safety contract. Keep only the one-shot non-fatal diagnostic.
-    FIRST_DEGRADATION_DIAG.call_once(|| {
-        eprintln!(
-            "CompactValue: first long↔object NaN-box collision degraded to \
-             Value::Long. The slot carries the SUB_OBJECT NaN-box pattern \
-             but its payload is not in the reference-provenance bitmap, which \
-             means EITHER a primitive long whose bits collide with the tag \
-             (harmless) OR a genuine reference whose payload was never \
-             recorded (NOT harmless: the degraded value takes LKIND_LONG, and \
-             Frame::scan_local_objects skips LONG slots, so the GC stops \
-             seeing the root). Subsequent collisions are counted by \
-             object_degradation_count() but not logged."
-        );
+    FIRST_DEGRADATION_DIAG[source.index()].call_once(|| {
+        match source {
+            // Unchanged text for the interpreter source: it is the only source
+            // reachable from this crate, so a default build's stderr is
+            // byte-identical to what it printed before the sink was widened.
+            DegradationSource::Interpreter => eprintln!(
+                "CompactValue: first long↔object NaN-box collision degraded to \
+                 Value::Long. The slot carries the SUB_OBJECT NaN-box pattern \
+                 but its payload is not in the reference-provenance bitmap, which \
+                 means EITHER a primitive long whose bits collide with the tag \
+                 (harmless) OR a genuine reference whose payload was never \
+                 recorded (NOT harmless: the degraded value takes LKIND_LONG, and \
+                 Frame::scan_local_objects skips LONG slots, so the GC stops \
+                 seeing the root). Subsequent collisions are counted by \
+                 object_degradation_count() but not logged."
+            ),
+            // The raw-word sources carry no long/object ambiguity: the word came
+            // out of a slot the JVM type system already says is a reference, and
+            // a null was filtered out before this point. There is no harmless
+            // reading of these two.
+            DegradationSource::Jit | DegradationSource::ArrayElement => eprintln!(
+                "CompactValue: first reference degradation from source '{}'{}{}. \
+                 A non-null reference word that cannot be a live heap pointer was \
+                 handed to Java as null. Unlike the interpreter source there is no \
+                 benign long↔object reading here — the word came from a slot the \
+                 JVM type system says is a reference — so this is a GC \
+                 root-coverage failure until proven otherwise. Subsequent events \
+                 are counted by object_degradation_count_from() but not logged.",
+                source.name(),
+                if site.is_empty() { "" } else { " at " },
+                site,
+            ),
+        }
     });
 }
 
@@ -3153,5 +3462,171 @@ mod tests {
                 other => panic!("known object {ptr:#x} must decode as Object; got {other:?}"),
             }
         }
+    }
+
+    // ── The shared degradation sink: null exclusion and per-source breakdown ──
+
+    /// **The headline contract.** An ordinary Java null must never reach the
+    /// counter from a *raw-word* source, because
+    /// `plausible_heap_pointer(0) == false` puts it in the same cold arm as
+    /// genuine garbage — counting it would read in the millions on a clean run.
+    ///
+    /// The asymmetry with the tagged sites below is deliberate and is the whole
+    /// reason there are two entry points; assert both halves in one test so
+    /// nobody "fixes" one of them into agreement with the other.
+    #[test]
+    fn null_ref_word_is_not_a_degradation_but_a_null_tagged_payload_is() {
+        let _guard = super::degrade_counter_test_lock();
+
+        // Raw-word source: null is ignored, non-null garbage is counted.
+        let base_total = object_degradation_count();
+        let base_jit = object_degradation_count_from(DegradationSource::Jit);
+        assert!(
+            !note_ref_word_degradation(0, DegradationSource::Jit, "test_null"),
+            "a null reference word must not be reported as a degradation",
+        );
+        assert_eq!(
+            object_degradation_count_from(DegradationSource::Jit) - base_jit,
+            0,
+            "note_ref_word_degradation counted an ordinary null",
+        );
+        assert!(
+            note_ref_word_degradation(0x8D8D_8D8D, DegradationSource::Jit, "test_garbage"),
+            "non-null implausible word must be reported as a degradation",
+        );
+        assert_eq!(
+            object_degradation_count_from(DegradationSource::Jit) - base_jit,
+            1,
+        );
+        assert_eq!(object_degradation_count() - base_total, 1);
+
+        // Tagged source: a zero payload under SUB_OBJECT is an *unconstructible*
+        // encoding (`object()` asserts non-null, `try_from_pointer` refuses it,
+        // and a real null is SUB_NULL), so it is a collision and MUST count.
+        let base_interp = object_degradation_count_from(DegradationSource::Interpreter);
+        let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0)).to_value();
+        assert_eq!(
+            object_degradation_count_from(DegradationSource::Interpreter) - base_interp,
+            1,
+            "SUB_OBJECT with a zero payload is a collision, not a Java null",
+        );
+    }
+
+    /// The six in-file call sites must not fire for an *ordinary* null, which
+    /// in this encoding is `SUB_NULL` and never reaches a `SUB_OBJECT` arm.
+    /// This is what keeps the interpreter's counter honest without needing the
+    /// `raw == 0` filter the raw-word sources require.
+    #[test]
+    fn interpreter_sites_do_not_count_an_ordinary_null() {
+        let _guard = super::degrade_counter_test_lock();
+        let base = object_degradation_count();
+
+        let null_slot = CompactValue::null();
+        assert!(matches!(null_slot.to_value(), Value::Object(None)));
+        assert!(matches!(
+            null_slot.decode_by_descriptor(b'L'),
+            Value::Object(None)
+        ));
+        assert!(matches!(
+            null_slot.decode_by_descriptor(b'['),
+            Value::Object(None)
+        ));
+        // The heap closure must never be consulted for a null slot either.
+        assert!(matches!(
+            null_slot.to_value_checked(|_| panic!("heap closure called for null slot")),
+            Value::Object(None)
+        ));
+        assert!(!null_slot.is_object_checked(|_| panic!("heap closure called for null slot")));
+        // `from_value(Object(None))` takes the dedicated null arm; `Object(Some)`
+        // carries a `NonNull`, so the degrading arm cannot see a null at all.
+        assert_eq!(
+            CompactValue::from_value(Value::Object(None)).raw_bits(),
+            null_slot.raw_bits(),
+        );
+
+        assert_eq!(
+            object_degradation_count() - base,
+            0,
+            "an ordinary null was counted as a reference degradation",
+        );
+    }
+
+    /// The total is *defined* as the sum of the per-source table, so a bump on
+    /// any source shows up in both, and the breakdown attributes it correctly.
+    #[test]
+    fn degradation_total_is_the_sum_of_the_per_source_breakdown() {
+        let _guard = super::degrade_counter_test_lock();
+        let before = object_degradation_breakdown();
+        let before_total = object_degradation_count();
+        assert_eq!(
+            before.iter().copied().sum::<u64>(),
+            before_total,
+            "total must equal the sum of the breakdown",
+        );
+
+        for source in DegradationSource::ALL {
+            note_object_degradation_from(source);
+        }
+
+        let after = object_degradation_breakdown();
+        for source in DegradationSource::ALL {
+            assert_eq!(
+                after[source.index()] - before[source.index()],
+                1,
+                "source '{}' did not record exactly one event",
+                source.name(),
+            );
+        }
+        assert_eq!(
+            object_degradation_count() - before_total,
+            DegradationSource::COUNT as u64,
+        );
+        assert_eq!(after.iter().copied().sum::<u64>(), object_degradation_count());
+    }
+
+    /// `note_object_degradation()` is the interpreter alias, so this crate's own
+    /// sites are attributed to `Interpreter` and never to a sibling source.
+    #[test]
+    fn in_file_sites_are_attributed_to_the_interpreter_source() {
+        let _guard = super::degrade_counter_test_lock();
+        let before = object_degradation_breakdown();
+
+        // A never-seen aligned payload: the `to_value` SUB_OBJECT degrade arm.
+        let cv = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0x0000_7EEE_1111_8000));
+        assert!(matches!(cv.to_value(), Value::Long(_)));
+        // The heap-denied arm of `is_object_checked`.
+        assert!(!cv.is_object_checked(|_| false));
+
+        let after = object_degradation_breakdown();
+        assert_eq!(
+            after[DegradationSource::Interpreter.index()]
+                - before[DegradationSource::Interpreter.index()],
+            2,
+        );
+        assert_eq!(
+            after[DegradationSource::Jit.index()] - before[DegradationSource::Jit.index()],
+            0,
+        );
+        assert_eq!(
+            after[DegradationSource::ArrayElement.index()]
+                - before[DegradationSource::ArrayElement.index()],
+            0,
+        );
+    }
+
+    /// `DegradationSource` table invariants: indices are dense, distinct, and
+    /// within the tables' bounds, and every variant has a distinct name.
+    #[test]
+    fn degradation_source_table_is_dense_and_named() {
+        for (i, source) in DegradationSource::ALL.into_iter().enumerate() {
+            assert_eq!(source.index(), i, "ALL must be in index order");
+            assert!(source.index() < DegradationSource::COUNT);
+            assert!(!source.name().is_empty());
+        }
+        assert_eq!(DegradationSource::ALL.len(), DegradationSource::COUNT);
+        assert_ne!(
+            DegradationSource::Jit.name(),
+            DegradationSource::ArrayElement.name(),
+        );
     }
 }

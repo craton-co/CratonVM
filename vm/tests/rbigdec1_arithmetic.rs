@@ -1,7 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! RBIGDEC.1 — `apps/bigdecimal_probe/BdProbe.java` regression test.
+//! RBIGDEC.1 — `probes/BdProbe.java` regression test.
+//!
+//! # This test was VACUOUS until 2026-08-07
+//!
+//! The fixture it drives was `apps/bigdecimal_probe/BdProbe.java`, and `apps/`
+//! is `.gitignore`d (line 12) — so the file was never tracked and was absent
+//! from every checkout. `run_bdprobe` found no `BdProbe.class`, returned `None`,
+//! both tests below returned early, and cargo reported `ok` in 0.00 s. Nothing
+//! here could fail.
+//!
+//! The fixture is restored at `probes/BdProbe.java` (`probes/` IS tracked) and
+//! is now compiled on demand into `target/bd-probe-classes/<tag>/`. A missing
+//! fixture reports loudly and fails under `CRATONVM_REQUIRE_E2E` — see
+//! `common::require_fixture`.
 //!
 //! Pin the round-trip of:
 //!   * `BigDecimal.ONE.add(BigDecimal.TEN)` → "11"
@@ -36,12 +49,146 @@ fn manifest_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Tag used in every diagnostic this file emits.
+const TAG: &str = "rbigdec1";
+
+fn workspace_root() -> PathBuf {
+    manifest_dir().parent().expect("vm/ has a parent").to_path_buf()
+}
+
 fn probe_dir() -> PathBuf {
-    manifest_dir()
-        .parent()
-        .unwrap()
-        .join("apps")
-        .join("bigdecimal_probe")
+    workspace_root().join("apps").join("bigdecimal_probe")
+}
+
+/// Locate the checked-in probe source.
+///
+/// `apps/` is gitignored (.gitignore line 12), which is how
+/// `apps/bigdecimal_probe/BdProbe.java` stayed missing from the tree long
+/// enough for both RBIGDEC.1 harnesses to report `ok` in 0.00 s while
+/// asserting nothing. The fixture now lives at `probes/BdProbe.java` —
+/// `probes/` is tracked — and the `apps/` path is kept only so an existing
+/// local staging still wins.
+fn probe_source() -> [PathBuf; 2] {
+    [
+        probe_dir().join("BdProbe.java"),
+        workspace_root().join("probes").join("BdProbe.java"),
+    ]
+}
+
+/// Per-test-binary output directory under `target/`, so the two RBIGDEC.1
+/// harnesses never write the same class files concurrently.
+fn probe_classes_dir() -> PathBuf {
+    workspace_root().join("target").join("bd-probe-classes").join(TAG)
+}
+
+/// Prefer a JDK-relative `javac` over whatever is on `PATH`, so the probe is
+/// compiled by the same toolchain the run below uses.
+fn javac_path() -> PathBuf {
+    let exe = if cfg!(windows) { "javac.exe" } else { "javac" };
+    for var in ["CRATONVM_TEST_JDK", "CRATONVM_JAVA_HOME", "JAVA_HOME"] {
+        if let Ok(home) = std::env::var(var) {
+            let candidate = PathBuf::from(home).join("bin").join(exe);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("javac")
+}
+
+/// Compile `BdProbe.java` into [`probe_classes_dir`]. Returns the classes
+/// directory, or `None` when a prerequisite is genuinely absent.
+///
+/// A missing FIXTURE is reported through `common::require_fixture` (loud, and a
+/// failure under `CRATONVM_REQUIRE_E2E`). A `javac` that cannot be LAUNCHED, or
+/// that is too old for `--release 21`, is the one legitimate skip. A javac that
+/// RAN and REJECTED the source is a hard failure — see `probe_compile_guard.rs`.
+fn ensure_probe_compiled() -> Option<PathBuf> {
+    let candidates = probe_source();
+    let src = common::require_fixture(
+        TAG,
+        "the RBIGDEC.1 fixture `BdProbe.java` (must print `11`, `20`, `OK` and exit 0)",
+        &candidates,
+    )?;
+    let classes = probe_classes_dir();
+    let main_class = classes.join("BdProbe.class");
+    if main_class.exists() {
+        // Recompile whenever the source is newer than the class, so an edit to
+        // the fixture is never masked by a stale artefact.
+        let fresh = match (main_class.metadata(), src.metadata()) {
+            (Ok(c), Ok(s)) => match (c.modified(), s.modified()) {
+                (Ok(c), Ok(s)) => c >= s,
+                _ => false,
+            },
+            _ => false,
+        };
+        if fresh {
+            return Some(classes);
+        }
+    }
+    let _ = std::fs::create_dir_all(&classes);
+    let javac = javac_path();
+    let out = match Command::new(&javac)
+        .arg("--release")
+        .arg("21")
+        .arg("-d")
+        .arg(&classes)
+        .arg(&src)
+        .output()
+    {
+        Ok(o) => o,
+        // javac cannot be launched at all — the one legitimate skip.
+        Err(e) => {
+            if common::require_e2e() {
+                panic!(
+                    "[{TAG}] {} is set, but `{}` could not be executed ({e}), so this test would \
+                     have skipped and still reported `ok`.",
+                    common::REQUIRE_VAR,
+                    javac.display()
+                );
+            }
+            eprintln!(
+                "[{TAG}] `{}` could not be executed ({e}); skipping.",
+                javac.display()
+            );
+            return None;
+        }
+    };
+    if !out.status.success() {
+        // javac REJECTED THE ARGUMENTS, not the source: an unsupported
+        // `--release` means this javac never opened the file. That is a
+        // missing-toolchain condition, not a broken probe.
+        let stderr_probe = String::from_utf8_lossy(&out.stderr);
+        if stderr_probe.contains("release version") && stderr_probe.contains("not supported") {
+            if common::require_e2e() {
+                panic!(
+                    "[{TAG}] {} is set, but javac cannot target --release 21 ({}), so this test \
+                     would have skipped and still reported `ok`.",
+                    common::REQUIRE_VAR,
+                    stderr_probe.lines().next().unwrap_or("").trim()
+                );
+            }
+            eprintln!(
+                "[{TAG}] javac cannot target --release 21 ({}); skipping.",
+                stderr_probe.lines().next().unwrap_or("").trim()
+            );
+            return None;
+        }
+    }
+    assert!(
+        out.status.success(),
+        "[{TAG}] the checked-in probe fixture {} failed to compile — fix the .java source. javac \
+         stderr:\n{}",
+        src.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        main_class.exists(),
+        "[{TAG}] javac reported success but {} is absent — the probe's class name changed; both \
+         RBIGDEC.1 harnesses run the class `BdProbe`.",
+        main_class.display()
+    );
+    Some(classes)
 }
 
 mod common;
@@ -90,11 +237,9 @@ fn java_home() -> Option<String> {
 
 fn run_bdprobe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
-    let probe = probe_dir();
-    if !probe.join("BdProbe.class").exists() {
-        eprintln!("[rbigdec1] BdProbe.class missing — run javac in apps/bigdecimal_probe");
-        return None;
-    }
+    // Compiles `probes/BdProbe.java` on demand; reports a MISSING fixture
+    // loudly and fails under CRATONVM_REQUIRE_E2E.
+    let probe = ensure_probe_compiled()?;
     let mut cmd = Command::new(&bin);
     if let Some(home) = java_home() {
         cmd.arg("--java-home").arg(&home);

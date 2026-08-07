@@ -67,6 +67,16 @@ fn ensure_probe_compiled() -> bool {
     }
     let src = dir.join("LmSubclass.java");
     if !src.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12),
+        // which is why this fixture was never tracked and is absent here.
+        let _ = common::require_fixture(
+            "block_2b_logmanager",
+            "the Block 2B fixture `LmSubclass.java` (a LogManager subclass; the test pins its \
+             LmSubclass / LmSubclass$MyLm class pair)",
+            &[src.clone()],
+        );
         return false;
     }
     let compile = Command::new("javac")

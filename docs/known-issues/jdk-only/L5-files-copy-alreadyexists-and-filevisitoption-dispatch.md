@@ -94,7 +94,7 @@ The sibling `Files.move` native, thirty lines below at `:4926-4988`, has the
 `std::fs::symlink_metadata(&dst_path).is_ok()` pre-check, a `src_path != dst_path`
 self-move exemption, and a REAL `FileAlreadyExistsException` built through its
 single-`String` constructor. It was added for H2's `FilePathDisk.moveTo`
-(`docs/internal/bug-h2-files-setposixfilepermissions-FIXED.md`). Both helpers it
+(internal record `bug-h2-files-setposixfilepermissions-FIXED.md`). Both helpers it
 needs are `pub(crate)` in the same file and already have a second caller:
 
 * `copy_options_replace_existing` — `nio_file.rs:10422`

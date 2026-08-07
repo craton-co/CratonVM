@@ -143,6 +143,63 @@ statement runs 50-1000 times. The 500-op probe above is at the optimistic end.
 `testMergeUsing`'s 50 merges never warm up at all, which is why its failure is
 identical with and without the JIT.
 
+## The INSERT loop lands in the same band, and its profile is flat (2026-08-07)
+
+Inherited from the retired
+`bug-h2-mvstore-insert-loop-perf-hang` write-up, which had filed the same
+constant as a separate, larger "cliff". It is not separate and it is not
+larger.
+
+`apps/h2database-suite-runner/probes/H2InsertLoopProbe.java` models
+`TestTempTables.testAnalyzeReuseObjectId` exactly — one connection, one local
+temporary IDENTITY table, one `PreparedStatement`, 10 000 autocommit
+`insert into test default values`, phases timed apart so the ~40 CPU-s
+start-up tax is not folded in. `--Xmx 1g`, real-JDK 25, single-threaded, warm
+rep, load 15-20:
+
+| 10 000-row insert loop | time | µs/row | vs C2 | vs `-Xint` |
+| --- | --- | --- | --- | --- |
+| HotSpot 25, C2 | 15.4 ms | 1.5 | 1x | 0.013x |
+| HotSpot 25, `-Xint` | 1 208 ms | 121 | 78x | 1x |
+| cratonvm, JIT | 8 565 ms | 857 | **556x** | **7.1x** |
+| cratonvm, `--nojit` | 12 649 ms | 1 265 | 821x | **10.5x** |
+
+**10.5x interpreter against interpreter** is dead centre of this page's flat
+9.9-10.7x band, so INSERT has no pathology of its own either. The 556x against
+a default HotSpot is the same two-halves story this page already tells, with
+the halves unusually lopsided: **C2 is worth 78x on this shape** (a tight, hot,
+monomorphic loop around one prepared statement is close to its best case) where
+cratonvm's JIT is worth 1.5x. That single number is why the insert page read
+its ratio as a distinct cliff.
+
+It is also a warning about which ratio to quote. The same four arms taken on
+the same host at load 15-20 instead of 8-16 read 74 / 1 919 / 10 449 / 16 615
+ms — the C2 column moves from 556x to 141x while the `-Xint` column barely
+moves (10.5x to 8.7x). **HotSpot's C2 arm is the load-sensitive one**, because
+it is the only arm short enough for scheduler noise to dominate. Compare
+interpreters.
+
+**The profile is flat, which is the answer to "find the dominant cost".**
+`--stack-sample-ms 20 --nojit`, 887 samples over one 10 000-row loop,
+aggregated by deepest interpreted frame: the heaviest leaf is
+`org.h2.mvstore.RootReference.<init>` at **4.1%**, then
+`tx.CommitDecisionMaker.decide` 3.5%, `Page.getKeyCount` 3.4%,
+`Page$Leaf.getValue` 3.2%, `tx.Transaction.markStatementEnd` 2.6%, and forty
+more entries none of which reaches 1.5%. Every one is H2's own bytecode. The
+insert page's four named suspects come out at:
+`Page.clone` **1.0%**, `MVMap.operate` **1.0%**, `TransactionMap` nowhere in
+the top 25, and boxing under 1%.
+
+**Natives are ~3%, not the wall.** `--dump-native-registry` over 20 000 rows:
+5 812 476 invocations, i.e. 290 per row, which at the in-tree funnel
+profilers' ~120 ns per compiled-code native call is ≈0.70 s of a ≈21 s
+two-rep loop. The top entries are the MVMap CAS loop exactly where H2 puts it
+— `AtomicReference.get` 544 288, `Enum.ordinal` 360 941, `AtomicLong.get`
+346 162, `AtomicReference.compareAndSet` 341 641.
+
+Read the two together, never the sampler alone: a native makes no interpreted
+frame, so `--stack-sample-ms` charges its cost to the calling Java method.
+
 ## Where the CPU goes, and why no symbol on this list is the answer
 
 `perf record -F 199 -g --call-graph=dwarf`, 25 threads × 1000 updates, 27 K
@@ -362,3 +419,7 @@ cd <fresh writable dir>          # H2 writes ./data
   interpreter-against-interpreter table and of `MergeLockBudgetProbe`.
 * `bug-h2-classid0-stale-address-family.md` — the memory-safety family
   found in this class. Unrelated to throughput.
+* the retired `bug-h2-mvstore-insert-loop-perf-hang` write-up
+  (`docs/internal/fixed-suite-bugs/h2-suite-bugs/…-RESOLVED-20260807.md`) —
+  source of the INSERT table and the flat profile above, plus the two mark-word
+  quartet defects found while reproducing it.

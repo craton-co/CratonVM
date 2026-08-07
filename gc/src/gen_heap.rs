@@ -3556,6 +3556,65 @@ impl GenerationalHeap {
             }
             return v;
         }
+        // HIB-DCAST-LATEPHASE.1 (mutator side). `compact_field_slot` answers
+        // `None` for TWO different reasons, and only the first licenses the
+        // fall-through below:
+        //
+        //   (1) "this is a legacy object" — its documented contract. The
+        //       uniform 16-byte `Value` cell read below is correct and this
+        //       arm is unchanged.
+        //   (2) "this IS a compact object (`GC_FLAG_COMPACT`, set at
+        //       allocation) but its `(class_id, num_slots)` no longer
+        //       resolves to a registered layout" — its `with_class_layout`
+        //       miss, e.g. a class redefinition racing the layout registry.
+        //
+        // Case (2) must NOT fall through. A compact object's body was sized
+        // by `compact_object_body_size` (see `plan_object_alloc`), and its
+        // `num_slots()` is the FIELD COUNT, not a legacy slot count — so the
+        // `index >= num_slots` screen above does not bound
+        // `HEADER_SIZE + index * SLOT_SIZE`, and an entirely in-range `index`
+        // still strides past the allocation for `read_slot` to dereference.
+        // That is the read half of the `SIGSEGV` observed against the real
+        // `DefaultCatalogAndSchemaTest` workload, whose Hibernate/ByteBuddy
+        // proxies churn redefinitions.
+        //
+        // Testing `is_compact_object(header)` — the per-object header bit,
+        // independent of the registry — is what tells the two cases apart; it
+        // is the same discriminator the GC walkers use, see the matching
+        // notes in `for_each_ref_slot`/`forward_ref_slots` below. Those
+        // walkers SKIP such an object ("no provably-safe reference slots to
+        // visit ... rather than guessing"). An accessor cannot skip, so it
+        // degrades the way this function's other unserviceable-access guards
+        // already do (suspect header, out-of-bounds index): a benign null
+        // read plus a loud `cratonvm::gc::guard` record. Deliberately not a
+        // panic — those guards' own comments give the reason (a corrupt
+        // receiver must let the Java side surface an error instead of
+        // aborting the JVM) — and deliberately not a silent fall-through,
+        // which is precisely what made the original `SIGSEGV` unattributable.
+        //
+        // TODO(types/src/field_layout.rs): the converse hazard is still open
+        // and cannot be closed from this file. `compact_object_body_size`
+        // refuses a FOREIGN `layout_domain`'s entry at allocation time, but
+        // the read path (`with_class_layout` / `compact_object_field_storage`)
+        // performs no domain check at all — so a same-numbered `class_id`
+        // registered by a different `ClassStore` resolves here and is read as
+        // if it described this class. Those two functions need the
+        // `layout_owner(class_id) != domain` screen that
+        // `compact_object_body_size` already applies.
+        if is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "gen_heap::get_field: compact receiver has no registered layout \
+                 for its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within
         // `num_slots` (checked above). `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
@@ -3824,6 +3883,34 @@ impl GenerationalHeap {
                     )
                 };
             }
+            return;
+        }
+        // HIB-DCAST-LATEPHASE.1 (mutator side, write half). See the long note
+        // on the matching guard in `get_field` above for why
+        // `compact_field_slot`'s `None` is two different states and why only
+        // the legacy one may fall through. This half is the more damaging of
+        // the two: `write_slot` at `HEADER_SIZE + index * SLOT_SIZE` on a
+        // compact-sized body does not merely read past the allocation, it
+        // *writes* a 16-byte `Value` cell over whatever follows the object —
+        // a neighbouring object's header, or unmapped memory. As in
+        // `get_field`, the walkers' answer to this state is "skip, do not
+        // guess"; the accessor's equivalent is this function's own
+        // established one for an unserviceable write (suspect header,
+        // out-of-bounds index): drop the store, record it loudly, do not
+        // panic.
+        if is_compact_object(header) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "gen_heap::set_field: compact receiver has no registered layout \
+                 for its (class_id, field_count) — dropping the write rather \
+                 than striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
             return;
         }
         // SAFETY: Same as `get_field` — `index` is within `num_slots` so the
@@ -16209,6 +16296,54 @@ mod tests {
         assert!(
             visited.is_empty(),
             "an unresolvable compact object must be skipped, not walked as legacy"
+        );
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side: the walkers were hardened
+    /// against a compact object whose layout no longer resolves, but
+    /// `get_field`/`set_field` were not. `compact_field_slot` answers `None`
+    /// for that object exactly as it does for a legacy one, and both
+    /// accessors read that `None` as "legacy" and fall through to
+    /// `slot_ptr` — `HEADER_SIZE + index * SLOT_SIZE`. On a real instance of
+    /// this state the body was sized by `compact_object_body_size` and
+    /// `num_slots()` is the FIELD COUNT, so the `index >= num_slots` screen
+    /// does not bound that stride: the read runs past the allocation and the
+    /// write puts a 16-byte `Value` cell past it.
+    ///
+    /// Both accessors must now degrade the way their sibling guards do —
+    /// null read, dropped write — rather than guessing a layout.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let heap = small_gen_heap();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY (`plan_object_alloc` falls through to `num_fields *
+        // SLOT_SIZE`) and the cells written below are real, readable cells.
+        // Flipping the bit afterwards is what reproduces the racing state
+        // without needing a live redefinition: the header claims compact, the
+        // registry cannot serve it.
+        let obj = heap.alloc_object(ClassId::new(999_997), 4);
+        heap.set_field(obj, 0, Value::Int(1));
+        heap.set_field(obj, 1, Value::Int(2));
+
+        // SAFETY: flips the per-object compact bit on a live, fully
+        // initialized allocation; `add_gc_flags`/`clear_gc_flags` take `&self`
+        // and drive the atomic mark word.
+        let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+        header.add_gc_flags(GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(heap.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        heap.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(GC_FLAG_COMPACT);
+        assert!(
+            matches!(heap.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
         );
     }
 

@@ -81,7 +81,7 @@ which entries you saw — a *new* name in the output is the signal.
 | `cuda-bridge` | Thin CUDA Driver API bridge for GPU offload |
 | `craton-gpu` | Build-time Java annotation sources (`@Parallel` etc.) for GPU offload |
 | `classloading` | Class loading & bytecode verification |
-| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); feature-gated `zgc` stub |
+| `gc` | Generational GC default (young/old; Cheney moving + non-moving sweep); opt-in G1 region collector (`-XX:+UseG1GC`, experimental); `ZgcRealHeap`, a real memory-backed STW non-moving mark-sweep that `-XX:+UseZGC` genuinely selects, but compiled in only behind the default-off `zgc` feature, so absent from a stock build |
 | `jfr` | Java Flight Recorder |
 | `vm` | VM runtime engine |
 | `vm-cli` | Command-line entry point |

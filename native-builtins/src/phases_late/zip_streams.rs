@@ -1597,7 +1597,29 @@ fn try_direct_file_to_stored_zip_output(
     let Value::Object(Some(entry)) = ctx.get_field_by_name(current, "entry") else {
         return Ok(None);
     };
-    if !matches!(ctx.get_field_by_name(entry, "method"), Value::Int(0)) {
+    // Take the raw-copy path ONLY on a positively-identified STORED entry.
+    // `ZipEntry.method` is `int` (javap: `int method`, JDK-initialized to -1
+    // until `setMethod`/the read path assigns it); `ZipEntry.STORED` is 0, so
+    // `Some(0)` is the only value for which copying the input bytes through
+    // verbatim -- no deflate -- reproduces what the JDK `ZipOutputStream.write`
+    // would have appended.
+    //
+    // The previous form was `!matches!(ctx.get_field_by_name(entry, "method"),
+    // Value::Int(0))`. Production and `MockNativeContext` disagree about the
+    // absent case and take OPPOSITE arms through it: production's by-name read
+    // answers `Object(None)` for an unresolvable name (vm_exec.rs:10613-10623),
+    // which does not match `Int(0)`, so production bailed out to the general
+    // virtual-dispatch path -- the SAFE arm, but only by accident. The mock
+    // answers `Int(0)`, so under test the guard fell THROUGH into the raw copy
+    // and a DEFLATED-or-unknown entry would have been written as stored bytes,
+    // corrupting the archive. A test of this fast path was therefore proving
+    // nothing about production. `int_field_strict` reads by resolved slot and
+    // yields `None` for absent/out-of-range/wrong-tag, so both agree on the
+    // safe arm and the test can actually exercise it.
+    if !matches!(
+        crate::field_read::int_field_strict(ctx, entry, "method"),
+        Some(0)
+    ) {
         return Ok(None);
     }
     let Value::Object(Some(underlying)) = ctx.get_field_by_name(output, "out") else {

@@ -87,13 +87,30 @@ fn java_home() -> Option<String> {
 fn run_probe(timeout: Duration) -> Option<(String, String, Option<i32>)> {
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
+    // Loud, and a failure under CRATONVM_REQUIRE_E2E — see `common::require_fixture`.
     if !probe.join("ByteBuddyProbe.class").exists() {
-        eprintln!("[wave2-bytebuddy] ByteBuddyProbe.class missing — run javac");
+        let _ = common::require_fixture(
+            "wave2-bytebuddy",
+            "the Wave 2 ByteBuddy fixture `ByteBuddyProbe` (ByteBuddyProbe.class, compiled from \
+             ByteBuddyProbe.java)",
+            &[
+                probe.join("ByteBuddyProbe.class"),
+                probe.join("ByteBuddyProbe.java"),
+            ],
+        );
         return None;
     }
     let bb_jar = probe.join("lib").join("byte-buddy-1.14.18.jar");
     if !bb_jar.exists() {
-        eprintln!("[wave2-bytebuddy] byte-buddy-1.14.18.jar missing under apps/bytebuddy_probe/lib/ — fetch jars first");
+        // NOTE: `.gitignore` line 14 is `**/*.jar`, so this jar can never be
+        // committed — it is a genuine download prerequisite, unlike the .java
+        // fixture above.
+        let _ = common::require_fixture(
+            "wave2-bytebuddy",
+            "the ByteBuddy jar `byte-buddy-1.14.18.jar` (a DOWNLOAD prerequisite: `**/*.jar` is \
+             gitignored, so it is staged, never committed)",
+            &[bb_jar.clone()],
+        );
         return None;
     }
     // Build the multi-segment classpath the failing real-JDK path needs.

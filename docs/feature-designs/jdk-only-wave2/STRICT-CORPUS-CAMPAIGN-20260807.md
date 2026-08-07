@@ -31,6 +31,29 @@ directory, and it stays the guide.
 > worse than the ambiguity. The mapping table below is the reconciliation: cite
 > the **full path** and the `SC-<n>` label together, every time.
 
+> **2026-08-07 — three citation corrections, all of them instances of this
+> document's own "latent flake" theme.**
+>
+> * **This file's `run.sh:<n>` citations are stale as written.** `JDKONLY_MODULE`
+>   is not at `:58`, the scheduling rule is not at `:83-86` (it is in the
+>   `case "${SUITE:-core}"` block near `:154-162`), and the `--module-path`
+>   argument build is in `class_args`, not at `:130`/`:143`. Anchor on the
+>   function or variable name.
+> * **`JDKONLY_CLASSES` holds 23 vectors, not 21.** Every "21" below undercounts;
+>   `regression-suite/src/` holds 57 `.java` files against 31 `CORE_CLASSES`,
+>   23 `JDKONLY_CLASSES` and 3 `UNREGISTERED_CLASSES`. Two of the 23
+>   (`RJdkPhaser`, `RJdkFieldModule`) are **untracked**, so a fresh clone
+>   schedules classes whose sources do not exist.
+> * **`run.sh` prints no per-class SKIP line.** Step 4's parenthetical and
+>   `regression-suite/jdk-only-coverage.txt` both say `RJdkStrict` is skipped in
+>   Compatible mode "with a printed reason". No such code exists in `run.sh`;
+>   the class is simply not in `CORE_CLASSES`. The claim is repeated in
+>   `regression-suite/README.md` and cannot be corrected from `docs/`.
+>
+> The general rule these three are instances of is
+> [§8 of *Natives over real JDK
+> classes*](../../architecture/natives-over-real-jdk-classes.md).
+
 ---
 
 ## The headline finding
@@ -344,9 +367,22 @@ Nothing below has been done. In order:
 7. **Diff the twelve unpaired traces against each other** before staffing
    anything further — SC-3's two vectors were one bug, and no other pair has been
    checked. Thirteen root causes is an upper bound.
-8. **Re-freeze the baselines the lanes named.** They disagree about which move,
-   and each lane says why in its own *Baselines* section: SC-2
-   (`bridge-ratchet`, +2), SC-3 (`kind-map` collapses a duplicate pair to one
+8. **Re-freeze the baselines the lanes named** — but adjudicate each against the
+   mode its census is taken in first. **SC-2's `+2` is wrong and has been
+   retracted in its own record**
+   ([`W6-1-varhandle-vartype-coordinatetypes.md`](../../known-issues/jdk-only/W6-1-varhandle-vartype-coordinatetypes.md)):
+   `varType`/`coordinateTypes` are registered by
+   `register_p59_varhandle`, reachable only through
+   `register_synthetic_overrides`, while `regression-suite/bridge-ratchet.sh`
+   boots `--real-jdk` and its frozen artefact records `"mode": "compatible"` —
+   so those rows never enter the registry the ratchet measures and the counters
+   move by **0**. Before accepting any other row here, ask the same question:
+   *which registrar, reachable in which mode, and is that the mode the census
+   runs in?* — [§7 of *Natives over real JDK
+   classes*](../../architecture/natives-over-real-jdk-classes.md).
+   They disagree about which move,
+   and each lane says why in its own *Baselines* section: ~~SC-2
+   (`bridge-ratchet`, +2)~~, SC-3 (`kind-map` collapses a duplicate pair to one
    row; bridge counts fall by 1), SC-4 (`bridge_without_acc_native` 9528 →
    9536), SC-5/SC-7/SC-8 (none). Re-take the census on a JDK-bearing host; do
    not hand-edit.

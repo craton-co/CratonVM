@@ -69,7 +69,7 @@ refuse every reflective `ArrayList.size()`.
 It is not a pure widening — the path had no refusal at all — so the safety
 argument is a measurement, not an argument from direction.
 
-1. `docs/internal/threadgroup-setmaxpriority-and-null-parent-FIXED-20260806.md`
+1. Internal record `threadgroup-setmaxpriority-and-null-parent-FIXED-20260806.md`
    §3 landed these same two registry queries on `setAccessible(true)` and
    measured `probes/SetAccessibleModuleProbe.java` — 23 paired questions —
    byte-identical to Temurin 25.0.3. That establishes that under `--real-jdk`

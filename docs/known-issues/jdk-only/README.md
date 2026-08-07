@@ -18,6 +18,17 @@ the pass note below the table.
 > to decide *what to work on*; read this to understand *what you are fixing*.
 >
 > Normative contract: [`docs/feature-designs/jdk-only-mode.md`](../../feature-designs/jdk-only-mode.md).
+>
+> **Read the mechanism facts first:**
+> [`docs/architecture/natives-over-real-jdk-classes.md`](../../architecture/natives-over-real-jdk-classes.md).
+> Eight facts every lane in this campaign rediscovered at cost — how a native
+> actually comes to run instead of real JDK bytecode (**not** the "four doors"
+> rule several records below still state), why a Cargo feature is not a runtime
+> mode, `register()`'s last-registration-wins semantics, what a by-name field
+> read cannot report, why a slot index against a real layout is heap corruption
+> rather than a wrong answer, what the registration censuses are scoped to, and
+> the measurement rules. Its §9 lists the records in this directory it corrected
+> and the claims it could not correct from `docs/`.
 
 ---
 

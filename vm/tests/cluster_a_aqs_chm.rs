@@ -77,6 +77,14 @@ fn ensure_probe_compiled() -> bool {
     // into apps/aqs_probe/classes/.
     let source = dir.parent().unwrap().join("AqsProbe.java");
     if !source.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "cluster_a_aqs_chm",
+            "the Cluster A fixture `AqsProbe.java`",
+            &[source.clone()],
+        );
         return false;
     }
     let _ = std::fs::create_dir_all(&dir);

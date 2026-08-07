@@ -6706,6 +6706,117 @@ fn set_current_os_thread_name(name: &str) {
     }
 }
 
+/// Normalize a `radix` argument the way `Integer`/`Long`/`BigInteger`
+/// `toString(…, int)` do.
+///
+/// JDK contract, measured against real JDK 25: a radix outside
+/// `Character.MIN_RADIX`(2)..`Character.MAX_RADIX`(36) is IGNORED and 10 is
+/// used instead — these methods do NOT throw. Verified for radix 0, 1, -1, 37,
+/// 40, `Integer.MIN_VALUE` and `Integer.MAX_VALUE`, at positive, negative and
+/// `MIN_VALUE` operands.
+///
+/// Returning 10 rather than clamping matters: `Integer.toUnsignedString(255, 0)`
+/// is "255" in the JDK, not the "11111111" a `clamp(2, 36)` would produce.
+/// Substituting also keeps the callers total — radix 1 would spin forever and
+/// radix 0 would divide by zero in a digit loop.
+pub(crate) fn java_radix_or_ten(radix: i32) -> u32 {
+    if (2..=36).contains(&radix) {
+        radix as u32
+    } else {
+        10
+    }
+}
+
+/// `Integer.toString(int, int)` — sign-magnitude, lowercase digits.
+pub(crate) fn java_int_to_string_radix(val: i32, radix: i32) -> String {
+    let radix = java_radix_or_ten(radix);
+    if radix == 10 {
+        return val.to_string();
+    }
+    if val == i32::MIN {
+        // `-i32::MIN` overflows; widen before taking the absolute value.
+        let mut s = String::from("-");
+        let mut v = (i32::MIN as i64).unsigned_abs();
+        let mut buf = Vec::new();
+        while v > 0 {
+            buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+            v /= radix as u64;
+        }
+        for c in buf.into_iter().rev() {
+            s.push(c);
+        }
+        return s;
+    }
+    if val < 0 {
+        let mut v = (-val) as u32;
+        let mut buf = Vec::new();
+        while v > 0 {
+            buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+            v /= radix;
+        }
+        let mut s = String::from("-");
+        for c in buf.into_iter().rev() {
+            s.push(c);
+        }
+        return s;
+    }
+    let mut v = val as u32;
+    if v == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::new();
+    while v > 0 {
+        buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
+        v /= radix;
+    }
+    buf.into_iter().rev().collect()
+}
+
+/// `Long.toString(long, int)` — sign-magnitude, lowercase digits.
+pub(crate) fn java_long_to_string_radix(val: i64, radix: i32) -> String {
+    let radix = java_radix_or_ten(radix);
+    if radix == 10 {
+        return val.to_string();
+    }
+    if val == i64::MIN {
+        // `-i64::MIN` overflows; widen before taking the absolute value.
+        let mut s = String::from("-");
+        let mut v = (i64::MIN as i128).unsigned_abs();
+        let mut buf = Vec::new();
+        while v > 0 {
+            buf.push(char::from_digit((v % radix as u128) as u32, radix).unwrap_or('?'));
+            v /= radix as u128;
+        }
+        for c in buf.into_iter().rev() {
+            s.push(c);
+        }
+        return s;
+    }
+    if val < 0 {
+        let mut v = (-val) as u64;
+        let mut buf = Vec::new();
+        while v > 0 {
+            buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+            v /= radix as u64;
+        }
+        let mut s = String::from("-");
+        for c in buf.into_iter().rev() {
+            s.push(c);
+        }
+        return s;
+    }
+    let mut v = val as u64;
+    if v == 0 {
+        return "0".to_string();
+    }
+    let mut buf = Vec::new();
+    while v > 0 {
+        buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
+        v /= radix as u64;
+    }
+    buf.into_iter().rev().collect()
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
 }
@@ -7411,7 +7522,32 @@ pub fn register_essential_natives_with_shims(
             // path, READ) silently truncates the real file instead of
             // rejecting the call (
             // bug-h2-files-setposixfilepermissions-FIXED.md residual).
-            let writable = !matches!(ctx.get_field_by_name(this, "writable"), Value::Int(0));
+            //
+            // FAIL CLOSED, and read by RESOLVED SLOT. The earlier form was
+            // `!matches!(ctx.get_field_by_name(this, "writable"), Value::Int(0))`,
+            // which asks the wrong question: production `get_field_by_name`
+            // answers `Value::Object(None)` for a name it cannot resolve
+            // (vm_exec.rs:10613-10623; trait contract at
+            // native-api/src/registry.rs:2351-2354), and `Object(None)` is not
+            // `Int(0)`, so an unresolvable `writable` made the guard read TRUE
+            // and truncate the file. Measured NOT reachable today -- real JDK 25
+            // declares `private final boolean writable` on FileChannelImpl
+            // itself (javap), and both construction paths assign it
+            // (native-io/src/file_channel.rs:487 for the hand-built channel,
+            // the real `FileChannelImpl.open` bytecode for the reconcile-with-
+            // real path at phases_late/nio_file.rs:5725) -- so this is a
+            // hardening, not a live-bug fix. It is worth doing anyway: the old
+            // form's safety was an accident of the field happening to resolve,
+            // and it failed CLOSED under MockNativeContext (whose absent answer
+            // is `Int(0)`), so any unit test of it read as protective while
+            // production took the opposite arm.
+            //
+            // `int_field_strict` returns `Some` only when the name resolves to
+            // an in-range slot on the receiver's own class AND the descriptor-
+            // decoded value is an `Int` -- `boolean`/`Z` decodes as `Int(0|1)`.
+            // Absent, out-of-range, or wrong-tag therefore all deny the write.
+            let writable =
+                matches!(field_read::int_field_strict(ctx, this, "writable"), Some(v) if v != 0);
             if !writable {
                 return Err(throw_non_writable_channel_exception(ctx));
             }
@@ -8351,27 +8487,19 @@ pub fn register_essential_natives_with_shims(
         },
     );
 
-    // Real-JDK `Module.getDescriptor()` is a field read, but Module mirrors
-    // produced by CratonVM do not carry the JDK's private descriptor field.
-    // The synthetic-JDK registration has a bridge for this already; install it
-    // here as well because this is the registration path used by the CLI.
-    registry.register(
-        "java/lang/Module",
-        "getDescriptor",
-        "()Ljava/lang/module/ModuleDescriptor;",
-        |ctx, args| {
-            let module = match args.first() {
-                Some(Value::Object(Some(module))) => *module,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let name = match ctx.get_field_by_name(module, "name") {
-                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let descriptor = build_synthetic_module_descriptor(ctx, &name)?;
-            Ok(Some(Value::Object(Some(descriptor))))
-        },
-    );
+    // `Module.getDescriptor()` is registered ~3,500 lines below, in this same
+    // function — the `Module.getResourceAsStream` shape exactly (instance 3 of
+    // the duplicate-registration species: same file, same function, thousands
+    // of lines apart). `register` is last-write-wins, so the copy that used to
+    // sit here never ran despite its comment claiming it was "the registration
+    // path used by the CLI"; the CLI reached the later one.
+    //
+    // It was also the weaker body: it fabricated a descriptor for EVERY
+    // module, including the unnamed one, where real `Module.getDescriptor()`
+    // answers null; and it re-built the descriptor on every call instead of
+    // memoising it onto the mirror's `descriptor` field, so two calls on one
+    // module handed back two different `ModuleDescriptor` objects. Deleted
+    // rather than reordered — the survivor covers this case.
 
     // `java/lang/Module.addUses(Class)` — companion to `canUse` above, same
     // null-descriptor gap (real bytecode reads `this.descriptor` to decide
@@ -10855,33 +10983,28 @@ pub fn register_essential_natives_with_shims(
             ))))
         },
     );
-    registry.register(
-        "java/lang/Integer",
-        "toString",
-        "(II)Ljava/lang/String;",
-        |ctx, args| {
-            let val = match args.first() {
-                Some(Value::Int(v)) => *v,
-                _ => 0,
-            };
-            let radix = match args.get(1) {
-                Some(Value::Int(r)) => *r,
-                _ => 10,
-            };
-            let s = if radix == 10 {
-                val.to_string()
-            } else if radix == 16 {
-                format!("{:x}", val)
-            } else if radix == 8 {
-                format!("{:o}", val)
-            } else if radix == 2 {
-                format!("{:b}", val)
-            } else {
-                val.to_string()
-            };
-            Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
-        },
-    );
+    // `Integer.toString(int, int)` is registered ~200 lines below, in this same
+    // function. `register` is last-write-wins, so the copy that used to sit
+    // here could never be dispatched — and it was the WRONG one: it handled
+    // only radix 2/8/10/16 (silently answering base 10 for the other 32 legal
+    // radices) and formatted negatives with `format!("{:x}")` on a signed
+    // `i32`, which prints the two's-complement bit pattern
+    // (`Integer.toString(-1, 16)` -> the JDK says "-1", that body said
+    // "ffffffff"). Deleted rather than reordered: reordering leaves two bodies
+    // to drift.
+    //
+    // COUNT THE REGISTRATIONS BEFORE BELIEVING EITHER BODY IS LIVE. There were
+    // THREE, not two, and neither of the ones in this file is the one that
+    // runs. `lang_math::register_wrapper_natives` is called further down THIS
+    // SAME function (search `register_wrapper_natives(registry)`), and it
+    // registers `Integer.toString(II)` and `Long.toString(JI)` again — so
+    // `lang_math::native_integer_to_string_radix` /
+    // `native_long_to_string_radix` win in essential/real-JDK mode, and win
+    // again in synthetic mode via `register_synthetic_overrides`. The bodies
+    // below are shadowed. They are kept correct (and unit-tested, see
+    // `radix_to_string_tests`) so that they are not a landmine if the
+    // registration order ever changes, but a fix aimed at the observable
+    // behaviour of `Integer.toString(int, int)` has to land in `lang_math.rs`.
     registry.register(
         "java/lang/Integer",
         "toHexString",
@@ -11006,54 +11129,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             let radix = match args.get(1) {
-                Some(Value::Int(v)) => *v as u32,
+                Some(Value::Int(v)) => *v,
                 _ => 10,
             };
-            let radix = if !(2..=36).contains(&radix) {
-                10
-            } else {
-                radix
-            };
-            let text = if radix == 10 {
-                val.to_string()
-            } else if val == i64::MIN {
-                // -i64::MIN overflows; build absolute value manually
-                let mut s = String::from("-");
-                let mut v = (i64::MIN as i128).unsigned_abs() as u128;
-                let mut buf = Vec::new();
-                while v > 0 {
-                    buf.push(char::from_digit((v % radix as u128) as u32, radix).unwrap_or('?'));
-                    v /= radix as u128;
-                }
-                for c in buf.into_iter().rev() {
-                    s.push(c);
-                }
-                s
-            } else if val < 0 {
-                let mut v = (-val) as u64;
-                let mut buf = Vec::new();
-                while v > 0 {
-                    buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
-                    v /= radix as u64;
-                }
-                let mut s = String::from("-");
-                for c in buf.into_iter().rev() {
-                    s.push(c);
-                }
-                s
-            } else {
-                let mut v = val as u64;
-                if v == 0 {
-                    "0".to_string()
-                } else {
-                    let mut buf = Vec::new();
-                    while v > 0 {
-                        buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
-                        v /= radix as u64;
-                    }
-                    buf.into_iter().rev().collect()
-                }
-            };
+            let text = java_long_to_string_radix(val, radix);
             Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
         },
     );
@@ -11067,53 +11146,10 @@ pub fn register_essential_natives_with_shims(
                 _ => 0,
             };
             let radix = match args.get(1) {
-                Some(Value::Int(v)) => *v as u32,
+                Some(Value::Int(v)) => *v,
                 _ => 10,
             };
-            let radix = if !(2..=36).contains(&radix) {
-                10
-            } else {
-                radix
-            };
-            let text = if radix == 10 {
-                val.to_string()
-            } else if val == i32::MIN {
-                let mut s = String::from("-");
-                let mut v = (i32::MIN as i64).unsigned_abs();
-                let mut buf = Vec::new();
-                while v > 0 {
-                    buf.push(char::from_digit((v % radix as u64) as u32, radix).unwrap_or('?'));
-                    v /= radix as u64;
-                }
-                for c in buf.into_iter().rev() {
-                    s.push(c);
-                }
-                s
-            } else if val < 0 {
-                let mut v = (-val) as u32;
-                let mut buf = Vec::new();
-                while v > 0 {
-                    buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
-                    v /= radix;
-                }
-                let mut s = String::from("-");
-                for c in buf.into_iter().rev() {
-                    s.push(c);
-                }
-                s
-            } else {
-                let mut v = val as u32;
-                if v == 0 {
-                    "0".to_string()
-                } else {
-                    let mut buf = Vec::new();
-                    while v > 0 {
-                        buf.push(char::from_digit(v % radix, radix).unwrap_or('?'));
-                        v /= radix;
-                    }
-                    buf.into_iter().rev().collect()
-                }
-            };
+            let text = java_int_to_string_radix(val, radix);
             Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
         },
     );
@@ -13886,7 +13922,7 @@ pub fn register_essential_natives_with_shims(
             //    `lang_system::is_vm_provided_jdk_library`, which is where the
             //    "this VM really does supply that library's natives" claim
             //    belongs and where `System.loadLibrary` reads it too.
-            if std::env::var("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK").as_deref() == Ok("1") {
+            if cratonvm_types::flags::runtime_var("CRATONVM_DBG_NATIVELIBRARIES_LOAD_OK").as_deref() == Ok("1") {
                 return Ok(Some(Value::Int(1)));
             }
             if throw_if_fail {
@@ -33871,7 +33907,7 @@ fn async_worker_pool_existing(ctx: &mut dyn NativeContext) -> Option<ObjectRef> 
     Some(ctx.read_var_handle_root(key).unwrap_or(cached))
 }
 
-/// `ForkJoinPool.awaitQuiescence(long, TimeUnit)`.
+/// `ForkJoinPool.awaitQuiescence(long, TimeUnit)` — THE implementation.
 ///
 /// IMPLEMENTED (was an unconditional `true`, i.e. a claim that could be false).
 /// `fork`/`invoke`/`submit`/`join` all run inline on the caller, but
@@ -33881,13 +33917,34 @@ fn async_worker_pool_existing(ctx: &mut dyn NativeContext) -> Option<ObjectRef> 
 /// This is registered from `native-builtins` rather than from
 /// `native-collections` (where the old constant lived) for one reason: the pool
 /// to observe is THIS crate's `ASYNC_POOL`, and `native-collections` cannot see
-/// it — the dependency runs the other way. `vm_init` installs this after
-/// `register_concurrent_natives`, so it is the registration that wins.
+/// it — the dependency runs the other way.
 ///
-/// Quiescent means the executor has no active worker and an empty queue. On
-/// timeout the answer is `false`, which is what the method is specified to
-/// return — and is only reachable now that it can also be true for a reason.
-fn native_forkjoin_await_quiescence(
+/// # Why this is `pub(crate)` and registered from TWO places
+///
+/// The triple has two registrars, and NEITHER is redundant, because they cover
+/// disjoint boot paths:
+///
+///   * `phases_early::register_real_jdk_forkjoin_essentials` (via
+///     `register_essential_natives`) is the ONLY one that runs under
+///     `--synthetic-jdk`: `vm_init`'s `if config.use_synthetic_jdk` arm calls
+///     `register_builtins` and never reaches `register_forkjoin_quiescence`.
+///   * [`register_forkjoin_quiescence`] runs on both real-JDK arms.
+///
+/// They therefore both must exist, and `register` is last-write-wins — so they
+/// must install the SAME callback or the answer depends on which arm booted.
+/// They used to be two independently-written bodies (one polling `ASYNC_POOL`,
+/// one polling the tracked `FutureTask` roots), which is the dup-fix shape:
+/// two lanes fixing one bug and neither seeing the other. Both signals are now
+/// consulted here, and both registrars point at this function.
+///
+/// Quiescent means BOTH that every `FutureTask` handed to a worker has
+/// completed AND that the executor has no active worker and an empty queue.
+/// Either alone can be stale: the roots list is empty before the first
+/// `execute`, and the pool can be momentarily idle between hand-off and
+/// dequeue. On timeout the answer is `false`, which is what the method is
+/// specified to return — and is only reachable now that it can also be true
+/// for a reason.
+pub(crate) fn native_forkjoin_await_quiescence(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
@@ -33916,29 +33973,43 @@ fn native_forkjoin_await_quiescence(
     );
     let start = std::time::Instant::now();
     loop {
-        let Some(pool) = async_worker_pool_existing(ctx) else {
-            // Nothing was ever handed to a worker thread.
-            return Ok(Some(Value::Int(1)));
+        // SIGNAL 1 — the `FutureTask` roots `spawn_runnable_on_real_thread`
+        // records for every `execute(Runnable)` it hands to a real worker.
+        // This is what the `FjpMatrixProbe` row `awaitQuiescence.waitsForExecute`
+        // measures: a pool that answers "quiescent" immediately loses the
+        // task's effect.
+        let tasks_idle = crate::util_concurrent_ext::async_tasks_quiescent(ctx);
+        // SIGNAL 2 — the executor itself, which also covers work that reached
+        // it by any other route. No pool at all means nothing was ever handed
+        // to a worker, which is quiescent by definition.
+        let existing_pool = async_worker_pool_existing(ctx);
+        let pool_idle = match existing_pool {
+            None => true,
+            Some(pool) => {
+                let active = match ctx.invoke_virtual(pool, "getActiveCount", "()I", &[]) {
+                    Ok(Some(Value::Int(n))) => n,
+                    // Cannot observe the pool — do not manufacture a timeout
+                    // callers would spin on; defer to signal 1.
+                    _ => 0,
+                };
+                let queued = match ctx.invoke_virtual(
+                    pool,
+                    "getQueue",
+                    "()Ljava/util/concurrent/BlockingQueue;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(q)))) => {
+                        match ctx.invoke_virtual(q, "size", "()I", &[]) {
+                            Ok(Some(Value::Int(n))) => n,
+                            _ => 0,
+                        }
+                    }
+                    _ => 0,
+                };
+                active <= 0 && queued <= 0
+            }
         };
-        let active = match ctx.invoke_virtual(pool, "getActiveCount", "()I", &[]) {
-            Ok(Some(Value::Int(n))) => n,
-            // Cannot observe the pool — fall back to the historical answer
-            // rather than reporting a timeout callers would spin on.
-            _ => return Ok(Some(Value::Int(1))),
-        };
-        let queued = match ctx.invoke_virtual(
-            pool,
-            "getQueue",
-            "()Ljava/util/concurrent/BlockingQueue;",
-            &[],
-        ) {
-            Ok(Some(Value::Object(Some(q)))) => match ctx.invoke_virtual(q, "size", "()I", &[]) {
-                Ok(Some(Value::Int(n))) => n,
-                _ => 0,
-            },
-            _ => 0,
-        };
-        if active <= 0 && queued <= 0 {
+        if tasks_idle && pool_idle {
             return Ok(Some(Value::Int(1)));
         }
         if start.elapsed() >= budget {
@@ -33953,16 +34024,37 @@ fn native_forkjoin_await_quiescence(
     }
 }
 
-/// Install the real `ForkJoinPool.awaitQuiescence`, overriding the constant
-/// `native-collections` registers. Must be called AFTER
-/// `register_concurrent_natives` — registration is last-write-wins.
+/// Install the real `ForkJoinPool.awaitQuiescence` on the real-JDK boot path.
+///
+/// # `NativeKind::Bridge` is load-bearing here, not decoration
+///
+/// This registration used to be made on the ambient category. `register`
+/// falls back to `SyntheticStub` when no `set_category`/`with_category` scope
+/// covers it, and the registry's real-ForkJoinPool arm drops every
+/// `java/util/concurrent/ForkJoinPool` native that is not a `Bridge` on the
+/// `keep_real_forkjoinpool_bridge` allow-list (native-api/src/registry.rs) —
+/// and `real_forkjoinpool` is ON unless `CRATONVM_SYNTHETIC_FORKJOINPOOL` is
+/// set, i.e. by DEFAULT. So this call registered nothing at all in the
+/// shipping configuration, and under `--jdk-only` it was refused outright and
+/// booked a phantom `SyntheticNativeRegistered` violation against a triple
+/// that is in fact a bridge.
+///
+/// Nothing broke, because `register_essential_natives` had already installed
+/// the same triple as a `Bridge` — which is exactly what made it invisible.
+/// The kind is stated now, and both registrars install the SAME callback (see
+/// [`native_forkjoin_await_quiescence`]), so last-write-wins has nothing left
+/// to decide.
+///
+/// Called after `register_concurrent_natives`; both are last-write-wins.
 pub fn register_forkjoin_quiescence(registry: &mut NativeMethodRegistry) {
-    registry.register(
-        "java/util/concurrent/ForkJoinPool",
-        "awaitQuiescence",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        native_forkjoin_await_quiescence,
-    );
+    registry.with_category(cratonvm_native_api::NativeKind::Bridge, |r| {
+        r.register(
+            "java/util/concurrent/ForkJoinPool",
+            "awaitQuiescence",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            native_forkjoin_await_quiescence,
+        );
+    });
 }
 
 /// Interrupt every worker thread of a (possibly delegate-wrapped) REAL
@@ -42253,4 +42345,169 @@ pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
 #[inline(always)]
 pub(crate) fn nbflags() -> &'static cratonvm_types::flags::NativeFlags {
     &cratonvm_types::flags().natives
+}
+
+/// `Integer.toString(int, int)` / `Long.toString(long, int)` conformance.
+///
+/// Every expectation here was read off real JDK 25.0.3, not derived from this
+/// implementation.
+#[cfg(test)]
+mod radix_to_string_tests {
+    use super::{java_int_to_string_radix, java_long_to_string_radix, java_radix_or_ten};
+
+    /// The JDK IGNORES an out-of-range radix and uses 10. It does NOT throw,
+    /// and it does NOT clamp into 2..=36 (a `clamp` would answer "11111111"
+    /// for `toString(255, 0)` where the JDK says "255").
+    #[test]
+    fn out_of_range_radix_substitutes_ten_and_never_clamps() {
+        for bad in [0, 1, -1, 37, 40, i32::MIN, i32::MAX] {
+            assert_eq!(java_radix_or_ten(bad), 10, "radix {bad}");
+            assert_eq!(java_int_to_string_radix(5, bad), "5", "radix {bad}");
+            assert_eq!(java_int_to_string_radix(-5, bad), "-5", "radix {bad}");
+            assert_eq!(java_int_to_string_radix(255, bad), "255", "radix {bad}");
+            assert_eq!(
+                java_int_to_string_radix(i32::MIN, bad),
+                "-2147483648",
+                "radix {bad}"
+            );
+            assert_eq!(
+                java_int_to_string_radix(i32::MAX, bad),
+                "2147483647",
+                "radix {bad}"
+            );
+            assert_eq!(java_long_to_string_radix(-5, bad), "-5", "radix {bad}");
+            assert_eq!(
+                java_long_to_string_radix(i64::MIN, bad),
+                "-9223372036854775808",
+                "radix {bad}"
+            );
+            assert_eq!(
+                java_long_to_string_radix(i64::MAX, bad),
+                "9223372036854775807",
+                "radix {bad}"
+            );
+        }
+        // Both boundary radices stay themselves.
+        assert_eq!(java_radix_or_ten(2), 2);
+        assert_eq!(java_radix_or_ten(36), 36);
+        assert_eq!(java_int_to_string_radix(255, 2), "11111111");
+        assert_eq!(java_int_to_string_radix(255, 36), "73");
+    }
+
+    /// Radix 0 divides by zero and radix 1 never terminates in an unguarded
+    /// digit loop, so this drives them on a worker thread against a deadline:
+    /// a regression FAILS the suite (hang -> timeout, panic -> disconnect)
+    /// instead of wedging it.
+    #[test]
+    fn radix_zero_and_one_terminate_within_a_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let out = vec![
+                java_int_to_string_radix(5, 0),
+                java_int_to_string_radix(5, 1),
+                java_int_to_string_radix(-5, 1),
+                java_int_to_string_radix(i32::MIN, 0),
+                java_long_to_string_radix(5, 0),
+                java_long_to_string_radix(5, 1),
+                java_long_to_string_radix(i64::MIN, 1),
+            ];
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("radix 0/1 must terminate and must not panic");
+        assert_eq!(
+            out,
+            vec![
+                "5",
+                "5",
+                "-5",
+                "-2147483648",
+                "5",
+                "5",
+                "-9223372036854775808",
+            ]
+        );
+        worker.join().expect("worker thread panicked");
+    }
+
+    /// `Integer.MIN_VALUE` has no positive counterpart — negating it overflows.
+    #[test]
+    fn integer_min_value_at_every_legal_radix() {
+        assert_eq!(
+            java_int_to_string_radix(i32::MIN, 2),
+            "-10000000000000000000000000000000"
+        );
+        assert_eq!(java_int_to_string_radix(i32::MIN, 8), "-20000000000");
+        assert_eq!(java_int_to_string_radix(i32::MIN, 10), "-2147483648");
+        assert_eq!(java_int_to_string_radix(i32::MIN, 16), "-80000000");
+        assert_eq!(java_int_to_string_radix(i32::MIN, 36), "-zik0zk");
+        assert_eq!(java_int_to_string_radix(i32::MAX, 36), "zik0zj");
+        assert_eq!(java_int_to_string_radix(i32::MAX, 16), "7fffffff");
+        // Every legal radix must at least round-trip through the magnitude.
+        for r in 2..=36i32 {
+            let s = java_int_to_string_radix(i32::MIN, r);
+            let mag = s.strip_prefix('-').expect("MIN_VALUE renders negative");
+            assert_eq!(
+                u32::from_str_radix(mag, r as u32),
+                Ok(2147483648u32),
+                "radix {r}"
+            );
+        }
+    }
+
+    /// `Long.MIN_VALUE`, same trap one width up.
+    #[test]
+    fn long_min_value_at_every_legal_radix() {
+        assert_eq!(java_long_to_string_radix(i64::MIN, 16), "-8000000000000000");
+        assert_eq!(java_long_to_string_radix(i64::MIN, 36), "-1y2p0ij32e8e8");
+        assert_eq!(
+            java_long_to_string_radix(i64::MIN, 8),
+            "-1000000000000000000000"
+        );
+        assert_eq!(
+            java_long_to_string_radix(i64::MIN, 2),
+            "-1000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(java_long_to_string_radix(i64::MAX, 36), "1y2p0ij32e8e7");
+        for r in 2..=36i32 {
+            let s = java_long_to_string_radix(i64::MIN, r);
+            let mag = s.strip_prefix('-').expect("MIN_VALUE renders negative");
+            assert_eq!(
+                u64::from_str_radix(mag, r as u32),
+                Ok(9223372036854775808u64),
+                "radix {r}"
+            );
+        }
+    }
+
+    /// Negatives are sign-magnitude, never a two's-complement bit pattern —
+    /// the defect in the (now deleted) duplicate `Integer.toString(II)` body,
+    /// which used `format!("{:x}", val)` on a signed `i32` and answered
+    /// "ffffffff" for `Integer.toString(-1, 16)`.
+    #[test]
+    fn negatives_are_sign_magnitude() {
+        assert_eq!(java_int_to_string_radix(-1, 16), "-1");
+        assert_eq!(java_int_to_string_radix(-1, 2), "-1");
+        assert_eq!(java_int_to_string_radix(-1, 8), "-1");
+        assert_eq!(java_int_to_string_radix(-255, 16), "-ff");
+        assert_eq!(java_int_to_string_radix(-5, 2), "-101");
+        assert_eq!(java_long_to_string_radix(-1, 16), "-1");
+        assert_eq!(java_long_to_string_radix(-255, 16), "-ff");
+        assert_ne!(java_int_to_string_radix(-1, 16), "ffffffff");
+        assert_ne!(java_long_to_string_radix(-1, 16), "ffffffffffffffff");
+    }
+
+    /// Zero and the small positives, at both boundaries and base 10.
+    #[test]
+    fn zero_and_small_positives() {
+        for r in 2..=36i32 {
+            assert_eq!(java_int_to_string_radix(0, r), "0", "radix {r}");
+            assert_eq!(java_long_to_string_radix(0, r), "0", "radix {r}");
+        }
+        assert_eq!(java_int_to_string_radix(5, 2), "101");
+        assert_eq!(java_int_to_string_radix(255, 16), "ff");
+        assert_eq!(java_int_to_string_radix(255, 8), "377");
+        assert_eq!(java_long_to_string_radix(255, 36), "73");
+    }
 }

@@ -96,7 +96,7 @@ unnamed short-circuit there is on the *target*), and
 ## Why this is safe under `--real-jdk` (the compat question)
 
 The measured precedent is one day old:
-`docs/internal/threadgroup-setmaxpriority-and-null-parent-FIXED-20260806.md`
+internal record `threadgroup-setmaxpriority-and-null-parent-FIXED-20260806.md`
 landed the same pair of queries on `setAccessible(true)` and measured it
 byte-identical to Temurin 25.0.3 over 23 paired questions. It establishes the
 two facts this fix rests on:

@@ -239,6 +239,8 @@ fn all_11_cases_have_unique_labels() {
     assert_eq!(labels.len(), 11);
 }
 
+mod common;
+
 #[test]
 fn constructor_probe_compiled_class_files_exist() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -247,11 +249,17 @@ fn constructor_probe_compiled_class_files_exist() {
         .unwrap()
         .join("apps")
         .join("constructor_probe");
-    if !probe_dir.exists() {
-        return; // Fixture not staged.
-    }
+    // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+    // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12), so
+    // this fixture was never tracked and is absent from the tree.
     let main_cls = probe_dir.join("ConstructorProbe.class");
-    if !main_cls.exists() {
+    if !probe_dir.exists() || !main_cls.exists() {
+        let _ = common::require_fixture(
+            "wp2_6_constructor_edges",
+            "the WP2.6 fixture `ConstructorProbe` (ConstructorProbe.class, compiled from \
+             ConstructorProbe.java; this test pins its 11 inner classes)",
+            &[main_cls.clone(), probe_dir.join("ConstructorProbe.java")],
+        );
         return;
     }
     // If the main class exists, the inner classes must too.
@@ -285,7 +293,15 @@ fn constructor_probe_loads_under_cratonvm_when_staged() {
         .join("apps")
         .join("constructor_probe");
     if !probe_dir.join("ConstructorProbe.class").exists() {
-        eprintln!("constructor_probe/ConstructorProbe.class not staged — skipping");
+        let _ = common::require_fixture(
+            "wp2_6_constructor_edges",
+            "the WP2.6 fixture `ConstructorProbe` (ConstructorProbe.class, compiled from \
+             ConstructorProbe.java)",
+            &[
+                probe_dir.join("ConstructorProbe.class"),
+                probe_dir.join("ConstructorProbe.java"),
+            ],
+        );
         return;
     }
     let cp = vec![probe_dir.to_string_lossy().to_string()];
