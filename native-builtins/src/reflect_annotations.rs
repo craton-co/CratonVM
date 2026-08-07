@@ -889,7 +889,7 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
                 // `concurrenthashmap-newkeyset-returns-a-plain-hashset`
                 // write-up.
                 if cname == "java/util/concurrent/ConcurrentHashMap" {
-                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m);
+                    let view = cratonvm_native_collections::make_concurrent_key_set_view(ctx, m)?;
                     return Ok(Some(Value::Object(Some(view))));
                 }
             }
@@ -1238,21 +1238,24 @@ fn module_builder_alloc_with_named_fields(
     obj
 }
 
-fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Value {
-    Value::Object(Some(
-        cratonvm_native_collections::make_hashset_with_elements(ctx, &[]),
-    ))
+fn module_builder_empty_set(ctx: &mut dyn NativeContext) -> Result<Value, MethodCallFailed> {
+    Ok(Value::Object(Some(
+        cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?,
+    )))
 }
 
-fn module_builder_set_or_empty(ctx: &mut dyn NativeContext, value: Value) -> Value {
+fn module_builder_set_or_empty(
+    ctx: &mut dyn NativeContext,
+    value: Value,
+) -> Result<Value, MethodCallFailed> {
     match value {
-        Value::Object(Some(_)) => value,
+        Value::Object(Some(_)) => Ok(value),
         _ => module_builder_empty_set(ctx),
     }
 }
 
-pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> ObjectRef {
-    cratonvm_native_collections::make_hashset_with_elements(ctx, &[])
+pub(crate) fn module_descriptor_empty_set(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(cratonvm_native_collections::make_hashset_with_elements(ctx, &[])?)
 }
 
 fn module_descriptor_set_field(
@@ -1262,13 +1265,13 @@ fn module_descriptor_set_field(
 ) -> MethodCallResult {
     let this = match args.first().copied() {
         Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx))))),
+        _ => return Ok(Some(Value::Object(Some(module_descriptor_empty_set(ctx)?)))),
     };
     if let Value::Object(Some(v)) = ctx.get_field_by_name(this, field) {
         return Ok(Some(Value::Object(Some(v))));
     }
     let this_pin = ctx.pin_native_root(this);
-    let empty = module_descriptor_empty_set(ctx);
+    let empty = module_descriptor_empty_set(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field_by_name(this, field, Value::Object(Some(empty)));
     ctx.unpin_native_roots(this_pin);
@@ -1397,10 +1400,10 @@ fn native_module_builder_new_exports_qualified(
 ) -> MethodCallResult {
     // (Set<Modifier>, String source, Set<String> targets) -> Exports
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets =
-        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)))?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -1415,9 +1418,9 @@ fn native_module_builder_new_exports_unqualified(
 ) -> MethodCallResult {
     // (Set<Modifier>, String source) -> Exports
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_empty_set(ctx);
+    let targets = module_builder_empty_set(ctx)?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Exports",
@@ -1431,10 +1434,10 @@ fn native_module_builder_new_opens_qualified(
     args: &[Value],
 ) -> MethodCallResult {
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
     let targets =
-        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.get(2).copied().unwrap_or(Value::Object(None)))?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -1448,9 +1451,9 @@ fn native_module_builder_new_opens_unqualified(
     args: &[Value],
 ) -> MethodCallResult {
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let source = args.get(1).copied().unwrap_or(Value::Object(None));
-    let targets = module_builder_empty_set(ctx);
+    let targets = module_builder_empty_set(ctx)?;
     let obj = module_builder_alloc_with_named_fields(
         ctx,
         "java/lang/module/ModuleDescriptor$Opens",
@@ -1465,7 +1468,7 @@ fn native_module_builder_new_requires_versioned(
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn, String compiledVersion) -> Requires
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let compiled = args.get(2).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
@@ -1482,7 +1485,7 @@ fn native_module_builder_new_requires_short(
 ) -> MethodCallResult {
     // (Set<Modifier>, String mn) -> Requires
     let mods =
-        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)));
+        module_builder_set_or_empty(ctx, args.first().copied().unwrap_or(Value::Object(None)))?;
     let mn = args.get(1).copied().unwrap_or(Value::Object(None));
     let obj = module_builder_alloc_with_named_fields(
         ctx,
@@ -1633,7 +1636,7 @@ fn native_module_builder_build(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             ctx.get_field_by_name(md_current, field),
             Value::Object(Some(_))
         ) {
-            let empty = module_builder_empty_set(ctx);
+            let empty = module_builder_empty_set(ctx)?;
             let md_current = ctx.read_native_pin(md_pin, md);
             ctx.set_field_by_name(md_current, field, empty);
         }
@@ -1875,7 +1878,7 @@ pub(crate) fn register_module_builder_overrides(registry: &mut NativeMethodRegis
                 .iter()
                 .map(|(pin, mref)| Value::Object(Some(ctx.read_native_pin(*pin, *mref))))
                 .collect();
-            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements);
+            let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elements)?;
             if let Some(pin) = first_pin {
                 ctx.unpin_native_roots(pin);
             }

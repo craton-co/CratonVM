@@ -351,6 +351,36 @@ mod socket2_raw {
 /// syscall would serialize every `close()` / `open_*()` / `insert_*()`
 /// against the longest-running I/O on any fd in the VM — a blocking
 /// stdin or TCP read could freeze fd-table mutations indefinitely.
+/// Bytes readable right now from a pipe, via `FIONREAD`.
+///
+/// Taking the entry's mutex can only block behind an in-flight read on the same
+/// pipe, and the only caller that matters — the JDK's process reaper draining a
+/// child that has already exited — is asking precisely because the write end is
+/// gone, so that read returns promptly. Blocking there is also the safer
+/// failure: returning 0 under contention would tell the drain "nothing left"
+/// and lose whatever the reader has not yet consumed.
+#[cfg(unix)]
+fn pipe_available<T: std::os::fd::AsRawFd>(pipe: &T) -> usize {
+    let mut pending: libc::c_int = 0;
+    // SAFETY: `FIONREAD` writes exactly one `c_int` through the pointer, which
+    // is a live local for the duration of the call.
+    let rc = unsafe { libc::ioctl(pipe.as_raw_fd(), libc::FIONREAD, &mut pending) };
+    if rc == 0 && pending > 0 {
+        pending as usize
+    } else {
+        0
+    }
+}
+
+/// No `FIONREAD` equivalent that is worth the Win32 surface here: `PeekNamedPipe`
+/// would be the call. 0 keeps the previous behaviour on this platform, and the
+/// caller that needs a real answer (`ProcessImpl`'s reaper) only exists on the
+/// Unix `forkAndExec` path.
+#[cfg(not(unix))]
+fn pipe_available<T>(_pipe: &T) -> usize {
+    0
+}
+
 pub struct FileDescriptorTable {
     entries: RwLock<FxHashMap<FdId, Arc<FileEntry>>>,
     next_fd: AtomicU32,
@@ -808,6 +838,22 @@ impl FileDescriptorTable {
                 };
                 Ok(buffered + file_remaining)
             }
+            // Subprocess pipes. Answering 0 here is not "no data" — it is a
+            // wrong answer that destroys data, because
+            // `ProcessImpl$ProcessPipeInputStream.processExited()` drains the
+            // pipe with `while ((j = in.available()) > 0)` and then CLOSES it,
+            // installing whatever it drained as the stream's new source. A 0
+            // makes the drain loop exit immediately, so the child's output is
+            // replaced by `ProcessBuilder.NullInputStream.INSTANCE` and the
+            // application reads EOF from a child that printed perfectly well.
+            //
+            // The reaper thread runs that method the moment the child exits, so
+            // the shorter the child, the likelier it wins the race against the
+            // application's first read. Measured on `sh -c 'echo out-line'`,
+            // which lost its output every time.
+            FileEntry::ChildStdoutPipe(p) => Ok(pipe_available(&*p.lock())),
+            FileEntry::ChildStderrPipe(p) => Ok(pipe_available(&*p.lock())),
+            FileEntry::ChildMergedPipe(p) => Ok(pipe_available(&*p.lock())),
             FileEntry::Stdin(_) => Ok(0),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
         }
