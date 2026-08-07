@@ -15231,6 +15231,9 @@ fn os_acquire_lock(
     } else {
         libc::F_SETLK
     };
+    // SAFETY: `raw_fd` is borrowed from the still-live `file`, and
+    // `&flock` points at a fully initialised `libc::flock` local that
+    // outlives the call. `fcntl` reads it and writes nothing back.
     let r = unsafe { libc::fcntl(raw_fd, cmd, &flock) };
     if r < 0 {
         Err(io::Error::last_os_error())
@@ -15253,6 +15256,9 @@ fn os_release_lock(file: &std::fs::File, pos: i64, size: i64) -> io::Result<()> 
         #[cfg(target_os = "freebsd")]
         l_sysid: 0,
     };
+    // SAFETY: `raw_fd` is borrowed from the still-live `file`, and
+    // `&flock` points at a fully initialised `libc::flock` local that
+    // outlives the call. `fcntl` reads it and writes nothing back.
     let r = unsafe { libc::fcntl(raw_fd, libc::F_SETLK, &flock) };
     if r < 0 {
         Err(io::Error::last_os_error())

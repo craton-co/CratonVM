@@ -6871,6 +6871,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 if let Ok(md) = std::fs::metadata(&path) {
                     let mut perms = md.permissions();
                     if perms.readonly() {
+                        // `set_readonly(false)` is right on Windows, where it
+                        // clears FILE_ATTRIBUTE_READONLY and that IS the whole
+                        // operation `allowDeleteReadOnlyFiles` asks for. On Unix
+                        // the same call writes mode 0o666 — it grants write to
+                        // group and other as well, which is a permission
+                        // widening nobody asked for (clippy::
+                        // permissions_set_readonly_false). Restore the owner
+                        // write bit only; that is the Unix reading of "make it
+                        // writable again", and deletion there depends on the
+                        // DIRECTORY's mode anyway.
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let mode = perms.mode();
+                            perms.set_mode(mode | 0o200);
+                        }
+                        #[cfg(not(unix))]
                         perms.set_readonly(false);
                         let _ = std::fs::set_permissions(&path, perms);
                     }
@@ -15449,6 +15466,84 @@ struct StatFacts {
     hidden: bool,
 }
 
+/// The attribute views a path's filesystem actually has.
+///
+/// A mounted archive is not the host filesystem: its entries have a size and a
+/// timestamp and nothing else, so `basic` is the only view HotSpot's zipfs
+/// offers for them either. Screening the two apart here is what stops
+/// `readAttributes(zipEntry, "unix:mode")` being answered out of the host's
+/// `stat` of a path that does not exist.
+pub(crate) fn attribute_view_names_for_path(path: &str) -> &'static [&'static str] {
+    if vfs_decode(path).is_some() {
+        &["basic"]
+    } else {
+        supported_attribute_view_names()
+    }
+}
+
+/// [`StatFacts`] for an entry inside a mounted archive (jar / jrt), or `None`
+/// when `p` is an ordinary host path and the caller should `stat` it.
+///
+/// TIMESTAMPS ARE THE ARCHIVE'S, NOT THE ENTRY'S. The zip central directory
+/// does carry a per-entry MS-DOS timestamp, but reading it needs the `zip`
+/// crate's `time` feature, which the workspace deliberately does not enable
+/// (see the `zip` pin in the root `Cargo.toml`). The container's own mtime is a
+/// real timestamp rather than a fabricated one, it is already computed for the
+/// index cache key, and it is what every entry of a rebuilt archive would get
+/// anyway. Callers that need per-entry precision should say so and the pin can
+/// be revisited.
+fn vfs_stat_facts(p: &str) -> Option<std::io::Result<StatFacts>> {
+    let (tag, container, entry) = vfs_decode(p)?;
+    let kind = match tag {
+        JARFS_TAG => jarfs_classify(&container, &entry),
+        _ => jrtfs_classify(&container, &entry),
+    };
+    if matches!(kind, JarFsKind::Absent) {
+        return Some(Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+    }
+    let is_dir = matches!(kind, JarFsKind::Dir);
+    let size = if is_dir {
+        0
+    } else {
+        let sized = match tag {
+            JARFS_TAG => jarfs_entry_size(&container, &entry),
+            _ => jrtfs_entry_size(&container, &entry),
+        };
+        match sized {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        }
+    };
+    // The jrt filesystem's container is `java.home`; the archive it actually
+    // reads from is the jimage under it.
+    let stamped = match tag {
+        JARFS_TAG => container.clone(),
+        _ => format!("{container}/lib/modules"),
+    };
+    let millis = (crate::net_phase_e::archive_stamp(&stamped).0 / 1_000_000) as i64;
+    Some(Ok(StatFacts {
+        is_dir,
+        is_regular: !is_dir,
+        is_symlink: false,
+        size,
+        modified_millis: millis,
+        access_millis: millis,
+        creation_millis: millis,
+        // r-xr-xr-x for a directory, r--r--r-- for an entry: an archive this VM
+        // has mounted is readable and never writable through these views.
+        mode: if is_dir { 0o040555 } else { 0o100444 },
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        dev: 0,
+        ino: 0,
+        rdev: 0,
+        ctime_millis: millis,
+        readonly: true,
+        hidden: false,
+    }))
+}
+
 fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
     let meta = if nofollow {
         std::fs::symlink_metadata(path)?
@@ -15610,9 +15705,22 @@ pub(crate) fn write_named_attribute(
         }
         .into());
     };
-    if !supported_attribute_view_names().contains(&view) {
+    let path = p57_read_path(ctx, path_obj);
+    if !attribute_view_names_for_path(&path).contains(&view) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: format!("View '{view}' not available"),
+        }
+        .into());
+    }
+    // Writing INTO a mounted archive means rewriting the archive, which this
+    // entry point does not do. Refuse by name rather than fall through to the
+    // host writes below, which would otherwise chmod or re-time whatever the
+    // sentinel-delimited path string happened to resolve to (nothing, today).
+    if vfs_decode(&path).is_some() {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!(
+                "setAttribute('{spec}'): the entries of a mounted archive are read-only"
+            ),
         }
         .into());
     }
@@ -15622,8 +15730,6 @@ pub(crate) fn write_named_attribute(
         }
         .into());
     }
-
-    let path = p57_read_path(ctx, path_obj);
 
     // Every write below follows symlinks. Rather than silently write through a
     // link the caller asked us not to follow, refuse — the call sites that
@@ -15782,7 +15888,7 @@ pub(crate) fn read_named_attributes(
         }
         .into());
     };
-    if !supported_attribute_view_names().contains(&view) {
+    if !attribute_view_names_for_path(&p57_read_path(ctx, path_obj)).contains(&view) {
         return Err(RuntimeError::UnsupportedOperationException {
             message: format!("View '{view}' not available"),
         }
@@ -15813,9 +15919,17 @@ pub(crate) fn read_named_attributes(
     };
 
     let path = p57_read_path(ctx, path_obj);
-    let facts = match stat_facts(&path, nofollow) {
-        Ok(f) => f,
-        Err(_) => return Err(p57_no_such_file(ctx, &path)),
+    // An entry inside a mounted archive is answered from the archive. Its path
+    // string is the sentinel-delimited `\x01JARFS\x01…` form, which names no
+    // host file at all, so `stat`ing it produced `NoSuchFileException` for every
+    // `Files.readAttributes` / `Files.getAttribute` on a zip or jrt entry.
+    let facts = match vfs_stat_facts(&path) {
+        Some(Ok(f)) => f,
+        Some(Err(_)) => return Err(p57_no_such_file(ctx, &path)),
+        None => match stat_facts(&path, nofollow) {
+            Ok(f) => f,
+            Err(_) => return Err(p57_no_such_file(ctx, &path)),
+        },
     };
 
     let map = match ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[]) {
@@ -15941,9 +16055,82 @@ pub(crate) fn read_named_attributes(
 #[cfg(test)]
 mod named_attribute_tests {
     use super::{
-        attribute_names_for_view, attribute_write_kind, split_attribute_spec,
-        supported_attribute_view_names, AttributeWrite,
+        attribute_names_for_view, attribute_view_names_for_path, attribute_write_kind,
+        jarfs_encode, split_attribute_spec, supported_attribute_view_names, vfs_stat_facts,
+        AttributeWrite,
     };
+
+    /// Write a two-entry zip to a unique temp path and return it.
+    fn write_probe_zip(tag: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "cratonvm-vfsattr-{tag}-{}.zip",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("create zip");
+        let mut zip = zip::ZipWriter::new(file);
+        let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        zip.start_file("hello.txt", opts).expect("start_file");
+        zip.write_all(b"hello").expect("write entry");
+        zip.add_directory("dir", opts).expect("add_directory");
+        zip.finish().expect("finish zip");
+        path
+    }
+
+    /// An entry inside a mounted archive must be answered FROM the archive.
+    /// Its path string is the sentinel-delimited jar-FS form, which names no
+    /// host file, so any code that reaches `stat` with it reports the entry as
+    /// missing — which is exactly what `Files.readAttributes` on a zip entry
+    /// did.
+    #[test]
+    fn a_jar_entry_is_stat_ed_out_of_the_archive_not_the_host() {
+        let zip = write_probe_zip("stat");
+        let jar = zip.to_string_lossy().into_owned();
+
+        let file = vfs_stat_facts(&jarfs_encode(&jar, "hello.txt"))
+            .expect("a jar-FS path must be recognised")
+            .expect("hello.txt is present");
+        assert!(file.is_regular, "a zip entry is a regular file");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 5, "size comes from the central directory");
+
+        let dir = vfs_stat_facts(&jarfs_encode(&jar, "dir"))
+            .expect("recognised")
+            .expect("dir is present");
+        assert!(dir.is_dir, "an explicit directory entry is a directory");
+        assert_eq!(dir.size, 0);
+
+        // A name the archive does not hold is NotFound, not a host lookup.
+        assert!(
+            vfs_stat_facts(&jarfs_encode(&jar, "nope.txt"))
+                .expect("recognised")
+                .is_err(),
+            "an absent entry must report NotFound"
+        );
+
+        // A plain host path is not ours to answer.
+        assert!(
+            vfs_stat_facts("/tmp").is_none(),
+            "an ordinary path must fall through to stat"
+        );
+
+        let _ = std::fs::remove_file(&zip);
+    }
+
+    /// A mounted archive offers `basic` and nothing else — HotSpot's zipfs does
+    /// not answer `posix`/`unix`/`dos` for an entry either, and answering them
+    /// here would mean answering them out of a host `stat` of a path string that
+    /// names no file.
+    #[test]
+    fn an_archive_entry_offers_only_the_basic_view() {
+        let jarfs_path = jarfs_encode("/tmp/whatever.jar", "a/b.txt");
+        assert_eq!(attribute_view_names_for_path(&jarfs_path), &["basic"]);
+        assert_eq!(
+            attribute_view_names_for_path("/tmp/whatever.jar"),
+            supported_attribute_view_names(),
+            "an ordinary host path keeps the host's view list"
+        );
+    }
 
     /// `Files` treats a spec with no colon as the `basic` view. Getting this
     /// wrong turns `readAttributes(p, "size")` into a request for a view named
@@ -16009,7 +16196,11 @@ mod named_attribute_tests {
             assert_eq!(attribute_write_kind(name), AttributeWrite::Time, "{name}");
         }
         for name in ["readonly", "hidden", "archive", "system"] {
-            assert_eq!(attribute_write_kind(name), AttributeWrite::DosFlag, "{name}");
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::DosFlag,
+                "{name}"
+            );
         }
         assert_eq!(
             attribute_write_kind("permissions"),

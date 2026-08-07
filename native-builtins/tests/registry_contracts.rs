@@ -50,9 +50,8 @@ fn essential_security_io_and_concurrency_bridges_are_real() {
     // unregistered so the real JDK bytecode executes. Registering the legacy
     // synthetic implementations here would restore the fake object layouts
     // that caused the RAF crash and ForkJoinPool semantic drift.
-    for (class, method, descriptor) in
-        [("java/io/RandomAccessFile", "read", "([BII)I")]
     {
+        let (class, method, descriptor) = ("java/io/RandomAccessFile", "read", "([BII)I");
         assert!(
             registry.find(class, method, descriptor).is_none(),
             "production mode must delegate {class}.{method}{descriptor} to real JDK bytecode"
