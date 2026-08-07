@@ -115,15 +115,18 @@ refused — including the `Function$Identity` / `UnaryOperator.identity` copies 
 the same day — item 7's nine dispatch sites are deleted. L12 — item 11's
 residuals — is what is left.)
 
-**A SECOND, separately numbered pool is in flight, and its lane numbers collide
-with this table's.** The strict-corpus campaign of 2026-08-06/07 staffed one
-lane per corpus failure and filed each under
-`docs/known-issues/jdk-only/L<n>-*.md`. Those numbers have **nothing** to do with
+**A SECOND pool is in flight. Its lanes are `SC-<n>`, and its FILENAMES collide
+with this table's lane numbers.** The strict-corpus campaign of 2026-08-06/07
+staffed one lane per corpus failure and filed each under
+`docs/known-issues/jdk-only/L<n>-*.md` — filenames that are kept as they are,
+because lanes are still writing them. Those numbers have **nothing** to do with
 the rows above: `L3-scanner-membername-residual.md` in *this* directory is the
 Scanner/MemberName layout lane, while
-`known-issues/jdk-only/L3-definehiddenclass-returns-null.md` is
-`Lookup.defineHiddenClass`. **Cite the full path, never the bare lane number.**
-Campaign record: [`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md).
+`known-issues/jdk-only/L3-definehiddenclass-returns-null.md` is **SC-3**,
+`Lookup.defineHiddenClass`. **Cite the full path AND the `SC-<n>` label; never a
+bare lane number.** The reconciliation table — `SC-<n>` → record → subsystem →
+the wave-2 lane it collides with — and the campaign record are
+[`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md).
 
 ## Conflict matrix — read before claiming a second lane
 
@@ -601,10 +604,15 @@ document:
   predicate on 2026-08-06 — or the zero is unfalsifiable.
 
 **Update, 2026-08-06/07 — the strict corpus was run properly for the first time,
-and it reported 14 failures.** A separate pool took one lane per failure. The
-campaign record, with the per-lane table and what still has to be measured, is
+and it reported 14 failures.** A separate pool, lanes `SC-1`…`SC-16`, took one
+lane per failure. On dev tip `84b85c624`: *37 passed, 14 failed — `RJdkStrict`
+`RJdkLambdas` `RJdkHandles` `RJdkReflect` `RJdkHidden` `RJdkModule`
+`RJdkForkJoin` `RJdkNio` `RJdkNet` `RJdkProcess` `RJdkSecurity` `RJdkJmx`
+`RJdkJni` `RJdkFailure`.* Thirteen vectors for fourteen failures, because
+`RJdkHidden` and `RJdkStrict` are one root cause. The campaign record, with the
+per-lane table, the `SC-<n>` reconciliation and what still has to be measured, is
 [`STRICT-CORPUS-CAMPAIGN-20260807.md`](STRICT-CORPUS-CAMPAIGN-20260807.md); the
-evidence is one `L<n>-*.md` per lane in
+evidence is one file per lane in
 [`docs/known-issues/jdk-only/`](../../known-issues/jdk-only/).
 
 **Nothing from that campaign has been built or re-measured.** No lane could run
@@ -612,9 +620,9 @@ evidence is one `L<n>-*.md` per lane in
 five lanes handed patches to files they did not own, which is the most likely
 thing to be missing from a merged tree. Read every "FIXED" in those records as
 *"fixed in source, unverified"* — most of them say so in their own headers. The
-one exception is L10, which changed a **Java vector** and measured it 26/26.
+one exception is SC-10, which changed a **Java vector** and measured it 26/26.
 
-Four things from it belong here rather than only in the campaign record:
+Five things from it belong here rather than only in the campaign record:
 
 * **The headline: of the 14 failures, 12 fail in `--real-jdk` too, and ZERO are
   strict-only.** `--jdk-only` is not rejecting legitimate things; it is
@@ -622,7 +630,10 @@ Four things from it belong here rather than only in the campaign record:
   the code underneath is wrong in both modes. The remaining work is ordinary
   subsystem bug-fixing that fixes BOTH modes, not `--jdk-only` contract work.
   This is L8's 2026-08-05 finding — "**Zero** were introduced by `--jdk-only`" —
-  at corpus scale.
+  at corpus scale. And it runs the other way too: SC-14 found `RJdkServices`
+  failing in the **default `--real-jdk`** arm while passing under `--jdk-only`,
+  so it is not in the 14 at all. The strict corpus is not merely free of
+  strict-only failures, it is **blind to a Compatible-only one**. Run both arms.
 * **The disease shape has a name now, and four lanes found it independently: a
   synthetic stub or placeholder shadowing real JDK bytecode that already works.**
   Registration is last-write-wins on the triple, so a placeholder registered
@@ -635,8 +646,21 @@ Four things from it belong here rather than only in the campaign record:
   `NullPointerException: Cannot invoke "java.lang.Class.isHidden()"`).
 * **`RJdkModule` had been written off as a bad vector and is not one.** The
   correction is in *Failure modes* above, because the lesson is about method.
-  It is a real CratonVM defect, in both modes, at `RJdkModule.java:57`; lane L9
-  has it and has filed no record yet.
+  It is a real CratonVM defect, in both modes, at `RJdkModule.java:57` — check 4
+  of 44, so no `CK` line is emitted and nothing about JPMS is exercised.
+  `--module-path` / `--add-modules` were **parsed and then read by nobody**
+  (SC-9, `known-issues/jdk-only/L9-module-not-in-boot-layer.md`).
+* **Two of the fourteen were only identified on 2026-08-07**, and both are
+  shapes this document has not carried before. `RJdkForkJoin` is a genuine
+  **hang** — rc=124 on a 300 s budget with zero output, one thread in the
+  watchdog dump, main recursed inline through `compute -> invokeAll -> doExec ->
+  exec` and parked at `ForkJoinTask.awaitDone(FJP,IZJ)I pc=218`, because a lazy
+  `fork()` `Bridge` leaves the real `invokeAll` bytecode waiting on a worker that
+  does not exist. **An rc=124 here is a hang, not a slow host — read the
+  watchdog dump, not the wall clock.** `RJdkFailure` is the opposite of a missing
+  feature: a wrong error **shape**, a `NoClassDefFoundError` escaping a
+  `catch (ClassNotFoundException)` in a negative test, because an `Error` is not
+  an `Exception`.
 * **Every pre-2026-08-06 `RJdkProcess` result is void.** The vector asserted
   three separate live-process-table snapshots against a child (`cmd.exe /c exit
   3`) chosen *because* it exits immediately — three coin flips, which HotSpot 25

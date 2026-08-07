@@ -292,19 +292,26 @@ Nothing below has been done. In order:
 
 1. **Build.** No lane in this campaign could run `cargo`. Nothing is compiled.
 2. **Apply the out-of-file patches, then verify they are in the merged tree.**
-   Five lanes handed patches to files they did not own. L2 and L3 each name the
-   exact observation that distinguishes an unapplied patch from a wrong
+   Six lanes handed patches to files they did not own. SC-2 and SC-3 each name
+   the exact observation that distinguishes an unapplied patch from a wrong
    diagnosis; use them rather than re-deriving.
 3. **Re-run the whole corpus in three arms** — `--jdk-only`, `--real-jdk`, and
    HotSpot 25 — with the module path passed the way `run.sh` passes it. A
-   divergence present in both CratonVM arms is not a strict-mode defect.
+   divergence present in both CratonVM arms is not a strict-mode defect, and a
+   pass in one arm is not a pass in the other (SC-14).
 4. **Re-measure `RJdkProcess` from zero.** Every result before 2026-08-06 is
    void.
-5. **Re-freeze the baselines the lanes named.** They disagree about which move,
-   and each lane says why in its own *Baselines* section: L2 (`bridge-ratchet`,
-   +2), L3 (`kind-map` collapses a duplicate pair to one row; bridge counts fall
-   by 1), L4 (`bridge_without_acc_native` 9528 → 9536), L5/L7/L8 (none).
-   Re-take the census on a JDK-bearing host; do not hand-edit.
-6. **Identify the two unnamed failures**, and file them like the rest.
-7. **Only then** restate criterion 6 — with both numbers, the probe gate's and
+5. **Expect `RJdkForkJoin` to still fail, and check *how*.** SC-12 removes the
+   hang; the class is then expected to fail fast on the `CountedCompleter`
+   section. rc=124 → a fast, loud failure is the fix working, not a regression.
+6. **Re-freeze the baselines the lanes named.** They disagree about which move,
+   and each lane says why in its own *Baselines* section: SC-2
+   (`bridge-ratchet`, +2), SC-3 (`kind-map` collapses a duplicate pair to one
+   row; bridge counts fall by 1), SC-4 (`bridge_without_acc_native` 9528 →
+   9536), SC-5/SC-7/SC-8 (none). Re-take the census on a JDK-bearing host; do
+   not hand-edit.
+7. **File SC-16's record** at
+   `docs/known-issues/jdk-only/L16-classnotfound-vs-noclassdeffound-shapes.md`,
+   and add it to the reconciliation table above.
+8. **Only then** restate criterion 6 — with both numbers, the probe gate's and
    the corpus's, side by side.

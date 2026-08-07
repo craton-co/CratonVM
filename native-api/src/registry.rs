@@ -5823,6 +5823,44 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the two `identity()` FACTORIES so `java.base`'s
+        // own bytecode runs and the VM spins a real lambda proxy.
+        //
+        // JDK-ONLY-WAVE2 L18 (`docs/known-issues/jdk-only/L18-function-identity-not-synthetic.md`).
+        // `Function.identity()` and `UnaryOperator.identity()` are each a single
+        // `invokedynamic` returning `t -> t` (verified with `javap -p -c` against
+        // the JDK 25 image), so the class HotSpot answers with is a generated
+        // `$$Lambda` hidden class: `isSynthetic()` true, name containing
+        // `$$Lambda`. CratonVM intercepted both with a native returning a
+        // hand-made `java/util/function/Function$Identity` stand-in — an
+        // ordinary named class that fails all three predicates
+        // (`RJdkLambdas.java:61,62,66`). `--jdk-only` already drops these
+        // (`SyntheticStub`) and passes that block; this makes real-JDK mode
+        // agree. The `invokedynamic` opcode is short-circuited in
+        // `vm/src/runtime/invokedynamic.rs` and never calls the
+        // `LambdaMetafactory` natives, so the proxy-spinning machinery is the
+        // same code in both modes and the strict arm's result transfers.
+        //
+        // Only the FACTORIES. `Function$Identity.{apply,andThen,compose}` keep
+        // their registrations and simply become unreachable — dropping the
+        // instance methods while one of the two factory copies survived is
+        // exactly the 2026-07-14 `d8092acb` regression
+        // (`UnsatisfiedLinkError: Function$Identity.andThen` on WildFly boot).
+        // Dropping by class+method here covers BOTH factory copies
+        // (`native-builtins/src/lib.rs`'s `register_function_identity_natives`
+        // and `native-builtins/src/phases_late/streams.rs`) at once, so that
+        // split cannot recur. And the synthetic-JDK build never sets this flag,
+        // so its stand-in — which has no real bytecode to fall back to — is
+        // untouched.
+        if self.drop_real_layout_synthetic
+            && matches!(
+                class_name,
+                "java/util/function/Function" | "java/util/function/UnaryOperator"
+            )
+            && method_name == "identity"
+        {
+            return;
+        }
         // Real-JDK mode: drop legacy regex natives. They were written for the
         // old synthetic two-field Pattern / six-field Matcher layout; on real
         // OpenJDK objects they corrupt slots and bypass constructors, so later
