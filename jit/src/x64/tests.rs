@@ -4294,8 +4294,11 @@ fn fake_compact_young_object() -> Box<[u64; 8]> {
 
 /// Read the 8-byte compact reference cell (body offset 0) of a fake object.
 fn fake_object_ref_cell(o: &[u64; 8]) -> usize {
-    // HEADER_SIZE == 32 == 4 * 8, so the cell is word 4.
-    o[4] as usize // Cast: raw stored pointer word
+    // Derived, never restated: this said "HEADER_SIZE == 32 == 4 * 8, so the
+    // cell is word 4" and silently read the WRONG WORD when the header shrank
+    // to 24 — the failure mode a hard-coded layout constant always has, an
+    // assertion comparing two unrelated words rather than a compile error.
+    o[cratonvm_types::HEADER_SIZE / 8] as usize // Cast: raw stored pointer word
 }
 
 /// `region_bounds_are_live` must read the TABLE, not its address.

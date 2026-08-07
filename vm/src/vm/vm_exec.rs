@@ -204,6 +204,153 @@ fn reject_missing_implementation(
 
 /// Times concrete bytecode was preferred over a registered non-intrinsic
 /// native under `JdkOnly`. Exact; never saturates.
+/// Reach counters for the §11 census, so "the site never runs" is
+/// distinguishable from "it runs and never admits a native". Without this a
+/// zero census reads as "the exception list is dead" when it may only mean the
+/// probe never got there.
+static CHECK_OVERRIDE_REACHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CHECK_OVERRIDE_TRUE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record a `--jdk-only` refusal of the §8 interface substitution.
+///
+/// The substitution runs a DIFFERENT class's native against a receiver that is
+/// not an instance of it (`java/util/Iterator` -> `java/util/HashMap$KeyItr` is
+/// the sharpest case). Under strict mode that is a compatibility substitution
+/// §1 forbids, and it is silent, so it earns a violation row rather than a
+/// counter: a reader of `--jdk-only-report` should see which interface was
+/// asked for and that a substitution would have answered it.
+///
+/// A free-text `native_kind` tag, the same mechanism the JIT's
+/// `"jit-thin-direct-helper"` rows use, so the row names the shape of the
+/// decision instead of borrowing a `NativeKind` that does not describe it.
+///
+/// Deliberately does NOT bump `JDK_ONLY_NATIVE_SHADOW_ATTEMPTS`: that counter
+/// surfaces as `interpreter_bytecode_preferred`, and nothing was preferred here
+/// — the substitution was refused and the call falls through to ordinary
+/// resolution failure. Counting it there would inflate a "bytecode won"
+/// statistic with cases where nothing won.
+pub fn record_interface_substitution_refusal(
+    interface: &str,
+    canonical: &str,
+    method_name: &str,
+    descriptor: &str,
+) {
+    let _ = canonical;
+    offer_native_shadow_observation(interface, method_name, descriptor, "interface-substitution");
+}
+
+/// JDK-ONLY-WAVE2 §8 census: which of the five hard-coded interface
+/// substitutions in `interpreter.rs` actually fires, and for what.
+fn canonical_census() -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>>
+{
+    static C: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), u64>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Record one interface->canonical-class substitution.
+pub fn record_canonical_substitution(interface: &str, canonical: &str, method_name: &str) {
+    if !check_override_census_on() {
+        return;
+    }
+    *canonical_census()
+        .lock()
+        .entry((
+            interface.to_string(),
+            canonical.to_string(),
+            method_name.to_string(),
+        ))
+        .or_insert(0) += 1;
+}
+
+/// Dump the §8 census as TSV on stderr.
+pub fn dump_canonical_census() {
+    if !check_override_census_on() {
+        return;
+    }
+    let c = canonical_census().lock();
+    eprintln!("[CANONICAL_CENSUS] rows={}", c.len());
+    for ((iface, canon, m), n) in c.iter() {
+        eprintln!("[CANONICAL] {}	{}	{}	{}", iface, canon, m, n);
+    }
+}
+
+/// JDK-ONLY-WAVE2 §11 census: which `check_override` disjuncts actually admit
+/// a native, keyed by the triple that reached the branch.
+///
+/// Off unless `CRATONVM_DBG_CHECK_OVERRIDE` is set, and then it is a `Mutex`
+/// around a map on a cold-ish path — this is a measurement instrument for the
+/// per-family deletion exercise, not something the fast path pays for.
+#[allow(clippy::type_complexity)]
+fn check_override_census(
+) -> &'static parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>> {
+    static C: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeMap<(String, String, String), (u64, bool)>>,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| parking_lot::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn check_override_census_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_CHECK_OVERRIDE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Record one `check_override`-admitted native. `abstract_only` marks the
+/// contract-§7-legal case so it can be subtracted from the name-list evidence.
+pub(crate) fn record_check_override_hit(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    is_abstract: bool,
+) {
+    if !check_override_census_on() {
+        return;
+    }
+    let mut c = check_override_census().lock();
+    let e = c
+        .entry((
+            class_name.to_string(),
+            method_name.to_string(),
+            descriptor.to_string(),
+        ))
+        .or_insert((0, true));
+    e.0 += 1;
+    // Sticky: if ANY hit for this triple was non-abstract, a name disjunct is
+    // doing real work for it.
+    e.1 &= is_abstract;
+}
+
+/// Dump the §11 census as TSV on stderr. Called from the VM shutdown path.
+pub fn dump_check_override_census() {
+    if !check_override_census_on() {
+        return;
+    }
+    let c = check_override_census().lock();
+    eprintln!(
+        "[CHECK_OVERRIDE_CENSUS] rows={} reached={} chain_true={}",
+        c.len(),
+        CHECK_OVERRIDE_REACHED.load(std::sync::atomic::Ordering::Relaxed),
+        CHECK_OVERRIDE_TRUE.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    for ((cls, m, d), (n, abstract_only)) in c.iter() {
+        eprintln!(
+            "[CHECK_OVERRIDE] {}	{}	{}	{}	{}",
+            cls,
+            m,
+            d,
+            n,
+            if *abstract_only { "abstract" } else { "NAME" }
+        );
+    }
+}
+
 static JDK_ONLY_NATIVE_SHADOW_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -20237,18 +20384,6 @@ fn invoke_on_class_shared_inner(
                         // native so getMethod returns our overlay value.
                         || (class_name == "java/beans/MethodDescriptor"
                             && method_name == "getMethod")
-                        // SPB.11: Spring's ExtendedBeanInfoFactory wraps our
-                        // delegate BeanInfo into `new ExtendedBeanInfo(...)`,
-                        // which re-creates each PropertyDescriptor as a
-                        // SimplePropertyDescriptor and loses readMethod/
-                        // writeMethod/propertyType (subclass fields never
-                        // populated; downstream Spring NPEs comparing). Our
-                        // native bypasses the wrapping and returns the
-                        // delegate directly.
-                        || (class_name == "org/springframework/beans/ExtendedBeanInfoFactory"
-                            && method_name == "getBeanInfo")
-                        || (class_name == "org/springframework/beans/SimpleBeanInfoFactory"
-                            && method_name == "getBeanInfo")
                         // SPB.11: Spring's GenericTypeAwarePropertyDescriptor
                         // (built by CachedIntrospectionResults) stores
                         // readMethod/writeMethod/propertyType in its own
@@ -20381,25 +20516,6 @@ fn invoke_on_class_shared_inner(
                             "jdk/internal/loader/URLClassPath" | "sun/misc/URLClassPath"
                         ) && method_name == "addURL"
                             && descriptor == "(Ljava/net/URL;)V")
-                        // ActiveMQ 5.18 / log4j-slf4j2 bridge: the bytecode
-                        // of `Log4jLoggerFactory.getContext` calls
-                        // `LogManager.getFactory().isClassLoaderDependent()`
-                        // without a null-check. We patched `getFactory()`
-                        // to return a synthetic Log4jContextFactory and
-                        // registered `isClassLoaderDependent()` natives on
-                        // every concrete factory class (and the interface
-                        // itself). Those methods have default-method
-                        // bytecode in the real jars; pin our natives ahead
-                        // so the synthetic receiver doesn't walk the
-                        // un-initialised `selector` / `shutdownCallbackRegistry`
-                        // fields the real impl reads. Same rationale for
-                        // `hasContext` which the default `shutdown`
-                        // dispatches to.
-                        || ((class_name == "org/apache/logging/log4j/core/impl/Log4jContextFactory"
-                                || class_name == "org/apache/logging/log4j/simple/SimpleLoggerContextFactory"
-                                || class_name == "org/apache/logging/log4j/spi/LoggerContextFactory")
-                            && (method_name == "isClassLoaderDependent"
-                                || method_name == "hasContext"))
                         // Insurance / Spring Boot 3: real-JDK `URL.getHost` resolves
                         // the host through `InetAddress.getByName` /
                         // `getHostName`, which re-enters `Class.initClassName` in a
@@ -20593,10 +20709,6 @@ fn invoke_on_class_shared_inner(
                                 "removeObject" | "putObject" | "getObject"
                                 | "putProperty" | "getProperty"
                             ))
-                        || (class_name == "ch/qos/logback/core/BasicStatusManager"
-                            && method_name == "clear")
-                        || (class_name == "ch/qos/logback/classic/spi/TurboFilterList"
-                            && method_name == "remove")
                         // EUREKA-RB-CANDIDATE: ResourceBundle$Control.getCandidateLocales
                         // — the real-JDK bytecode passes `locale.getBaseLocale()`
                         // as a key into `ReferencedKeyMap.computeIfAbsent`. Our
@@ -21509,92 +21621,6 @@ fn invoke_on_class_shared_inner(
                                 | "checkAccess"
                                 | "checkSecurityAccess"
                             ))
-                        // SPARK-LOG4J2: Spark `Logging.initializeLogging`
-                        // calls `core.LoggerContext.reconfigure()` on the
-                        // synthetic LoggerContext returned by our
-                        // `LogManager.getContext` shim. The real bytecode
-                        // derefs `this.configuration` at pc=11 and NPEs
-                        // because the synthetic was allocated via
-                        // `alloc_concurrent_synthetic` and never ran the
-                        // real ctor that would populate that field.
-                        //
-                        //   [WF-NPE-STK 4] org/apache/logging/log4j/core/LoggerContext
-                        //                  .reconfigure pc=11
-                        //   [WF-NPE-STK 3] org/apache/spark/internal/Logging
-                        //                  .initializeLogging pc=100
-                        //
-                        // Force the no-op natives registered in
-                        // `native-builtins/src/log4j_extras.rs` (via
-                        // `register_log4j_stubs`) to win for every
-                        // Configuration-touching surface on
-                        // `org/apache/logging/log4j/core/LoggerContext` so
-                        // the null `configuration` field is never
-                        // dereferenced. Same shape as the existing
-                        // `core.Logger.getAppenders` and
-                        // `DefaultLogbackConfiguration.apply` overrides.
-                        || (class_name == "org/apache/logging/log4j/core/LoggerContext"
-                            && matches!(
-                                method_name,
-                                "reconfigure"
-                                | "getConfiguration"
-                                | "setConfiguration"
-                                | "start"
-                                | "stop"
-                                | "terminate"
-                                | "close"
-                                | "isStarted"
-                                | "isStopped"
-                                | "setConfigLocation"
-                                | "getConfigLocation"
-                                | "updateLoggers"
-                                | "hasLogger"
-                                | "getLoggers"
-                                | "getName"
-                                | "getExternalContext"
-                                | "getLogger"
-                                | "getContext"
-                                // The ctor/clinit overrides are also
-                                // registered as no-ops in log4j_extras —
-                                // allowlist them so the native wins if
-                                // the synthetic-alloc path falls through
-                                // to <clinit> for the concrete class.
-                                | "<init>"
-                                | "<clinit>"
-                            ))
-                        // Same family of overrides on `core.Logger` (the
-                        // concrete log4j-core Logger class our `getLogger`
-                        // shim hands back). These are registered in
-                        // log4j_extras; allowlist so the natives win over
-                        // bytecode for the accessor surface that callers
-                        // touch immediately after `getLogger`.
-                        || (class_name == "org/apache/logging/log4j/core/Logger"
-                            && matches!(
-                                method_name,
-                                "getAppenders"
-                                | "getContext"
-                                | "getParent"
-                                | "getName"
-                                | "getLevel"
-                                | "getMessageFactory"
-                                // EJBCA / log4j-1.2-api bridge —
-                                // `org.apache.log4j.LogManager.<clinit>`
-                                // → `new Hierarchy(new RootLogger(DEBUG))`
-                                // → `RootLogger.setLevel(DEBUG)` → eventually
-                                // `core.Logger.setLevel(level)` on our
-                                // synthetic Logger. The real bytecode
-                                // builds a new `Logger$PrivateConfig` from
-                                // `this.privateConfig.config` and NPEs
-                                // because the synthetic was allocated
-                                // without a privateConfig. Force the no-op
-                                // native (registered in log4j_extras) to
-                                // win for the level/appender mutators that
-                                // touch privateConfig. See the existing
-                                // `getAppenders` rationale above.
-                                | "setLevel"
-                                | "addAppender"
-                                | "removeAppender"
-                                | "setAdditive"
-                            ))
                         // log4j 2.x LogManager surface: getContext /
                         // getLogger / getFormatterLogger / getRootLogger /
                         // getFactory / shutdown overloads. The `<clinit>`
@@ -21614,42 +21640,6 @@ fn invoke_on_class_shared_inner(
                                 | "getFactory"
                                 | "exists"
                                 | "shutdown"))
-                        // SimpleLoggerContext / SimpleLogger / core.Logger:
-                        // synthetic pipeline objects handed out by the
-                        // LogManager shims above. The receiver's real
-                        // bytecode (when it loads) would otherwise win
-                        // over our natives on getLogger / isXxxEnabled /
-                        // info / warn / etc.
-                        || (class_name
-                                == "org/apache/logging/log4j/simple/SimpleLoggerContext"
-                            && matches!(method_name,
-                                "getLogger" | "getContext" | "<init>" | "<clinit>"))
-                        || (matches!(class_name,
-                                "org/apache/logging/log4j/simple/SimpleLogger"
-                                | "org/apache/logging/log4j/spi/AbstractLogger")
-                            && matches!(method_name,
-                                "trace" | "debug" | "info" | "warn" | "error" | "fatal"
-                                | "isTraceEnabled" | "isDebugEnabled" | "isInfoEnabled"
-                                | "isWarnEnabled" | "isErrorEnabled" | "isFatalEnabled"
-                                | "isEnabled" | "logIfEnabled" | "logMessage"
-                                | "getName" | "getLevel" | "getMessageFactory"
-                                | "<init>"))
-                        // SB3-LOGBACK: STALE, no native override registered
-                        // here anymore (removed 2026-07-24 — see
-                        // `register_spring_boot_logback_apply` in
-                        // `native-builtins/src/lib.rs`; the premise, a
-                        // synthetic-allocated `LoggerContext` NPEing on
-                        // `monitorenter`, no longer holds — `LoggerContext`
-                        // construction is real bytecode). This allow-list
-                        // entry is now inert (no registration exists for this
-                        // triple, so dispatch falls through to real bytecode
-                        // either way) — left as a harmless historical marker
-                        // rather than risk touching unrelated dispatch logic.
-                        || (class_name
-                            == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
-                            && method_name == "apply"
-                            && descriptor
-                                == "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V")
                         // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()`
                         // (Charset.java:610) enumerates `CharsetProvider` SPI and calls
                         // `Charset.put` which dereferences a null name, NPEing during
@@ -21840,10 +21830,6 @@ fn invoke_on_class_shared_inner(
                         // roots directly.
                         || (class_name == "org/jboss/modules/ModuleClassLoader"
                             && matches!(method_name, "findClass" | "getResources" | "findResources" | "getResource" | "findResource"))
-                        || (class_name == "org/jboss/modules/PathFilter"
-                            && method_name == "accept")
-                        || (class_name == "org/jboss/modules/Resource"
-                            && method_name == "openStream")
                         // cglib_probe: defensive Unsafe.defineClass shim (null bytecode → null).
                         || (matches!(class_name, "sun/misc/Unsafe" | "jdk/internal/misc/Unsafe")
                             && method_name == "defineClass")
@@ -22482,6 +22468,14 @@ fn invoke_on_class_shared_inner(
                                     | ("flush", "()V")
                                     | ("close", "()V")
                             ));
+                    if check_override_census_on() {
+                        CHECK_OVERRIDE_REACHED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if check_override {
+                            CHECK_OVERRIDE_TRUE
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                     if check_override
                         && shared
                             .natives
@@ -22489,6 +22483,27 @@ fn invoke_on_class_shared_inner(
                             .find(class_name, method_name, descriptor)
                             .is_some()
                     {
+                        // JDK-ONLY-WAVE2 §11 census (`CRATONVM_DBG_CHECK_OVERRIDE=1`).
+                        //
+                        // The chain has ~302 disjuncts and the record calls
+                        // deleting them "a separate, per-family exercise; each
+                        // entry is load-bearing for a real boot today". That
+                        // second clause is an assumption nobody has measured:
+                        // a disjunct only does work when it ALSO finds a
+                        // registered native here, so the set that matters is
+                        // whatever this branch actually admits.
+                        //
+                        // `method.is_abstract()` is recorded separately because
+                        // it is the ONE disjunct that survives contract §7 (step
+                        // 3b — no `Code`, so the native is the only body there
+                        // is). A triple admitted only via `is_abstract` is not
+                        // evidence for any name entry.
+                        record_check_override_hit(
+                            class_name,
+                            method_name,
+                            descriptor,
+                            method.is_abstract(),
+                        );
                         native = true;
                     }
                     // C25: For abstract methods (e.g. Iterator.hasNext, Enumeration.hasMoreElements),

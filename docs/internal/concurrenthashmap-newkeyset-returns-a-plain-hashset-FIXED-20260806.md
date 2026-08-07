@@ -109,6 +109,8 @@ real one.
   `IdentityHashMap` and `LinkedCaseInsensitiveMap` branches (which need the real
   `Collections$SetFromMap` for their non-value-hash key semantics) are
   untouched, as is the plain-`HashMap`/`WeakHashMap` fallback.
+* `keySet()` with no argument returns a real `KeySetView` too, with the JDK's
+  null mapped value — see "The keySet() half" below.
 * The class identity is fixed as a consequence:
   `(ConcurrentHashMap.KeySetView<K,?>) set` no longer throws
   `ClassCastException`, and `getMappedValue()` / `getMap()` work.
@@ -167,6 +169,55 @@ next native that fabricates a class:
   (`map`, `value`) so `resolve_field_index_by_class_id` finds the same slots in
   synthetic mode that it finds against the real class.
 
+## The keySet() half, added 2026-08-06
+
+`ConcurrentHashMap.keySet()` (no argument) was left alone in the first pass and
+filed as residual 2, on the reading that it had "neither half of this bug": it
+was a `java/util/HashSet` carrying a view-backing that resynced on read and
+wrote through on `remove`, so only the class identity was wrong, and retargeting
+the `make_view_set_of` machinery that Felix, Spring and H2 depend on looked like
+a poor trade for a cast.
+
+Writing the probe for it disproved the premise. Against HotSpot 25 the old view
+failed **five** checks, not one:
+
+| check | HotSpot | CratonVM, before |
+|---|---|---|
+| `(KeySetView) map.keySet()` | works | `ClassCastException` |
+| `keySet().add(x)` | `UnsupportedOperationException` | **succeeded**, mutating a private snapshot and losing the element at the next resync |
+| `keySet().addAll(c)` | `UnsupportedOperationException` | **succeeded**, same |
+| `keySet().removeAll(c)` | `true` having removed | removed, then returned **`false`** |
+| `keySet().retainAll(c)` | drops the rest | **did not write through at all** — the map kept every element the caller asked to drop |
+
+`retainAll` silently keeping what it was told to drop is a data-visible defect,
+not a cosmetic one. So `keySet()` now returns `make_key_set_view(this, null)`:
+the same `KeySetView` natives, with the null mapped value that is precisely what
+makes the JDK's view read-only, so `add`/`addAll` throw for the right reason
+rather than by a special case.
+
+`Map.keySet()` reached polymorphically on a `ConcurrentHashMap` routes to the
+same place — otherwise the static receiver type would silently decide the
+class, the cast, and whether `add` throws.
+
+**Iteration order is unchanged, which is the thing that had to be proved.** The
+old view's reads went `collect_view_snapshot_ordered` → `collect_keys_any` →
+`map_collect_keys` → `chm_collect_all_keys`; the `KeySetView` natives read
+`chm_collect_all_keys` directly. Same function, so the HotSpot-faithful bucket
+order `chm_reorder_by_virtual_bucket` reconstructs — the order Spring's
+`SimpleAliasRegistry.getAliases` depends on, and the reason
+`native_chm_init_capacity` matches JDK's `tableSizeFor` — is byte-identical.
+Measured: `keySet()`, `forEach`, `entrySet()` and the iterator all yield
+`[thirdalias, myalias, youralias]` on HotSpot 25 and on all three CratonVM
+policies, before and after.
+
+Verified A/B/B/A against the pre-change binary: 5 failures → 0 in `--real-jdk`
+and `--jdk-only`; the full `regression-suite` CORE set is the identical
+22-passed/7-failed on both arms; twelve collection/CHM/Spring-shaped vm test
+binaries are green. Under `--synthetic-jdk` the probe's two bulk-op checks fail
+on BOTH arms for residual 3's reason — `Arrays.asList("a","b")` reports size 0
+there, so `removeAll`/`retainAll` are handed an empty argument. Re-run with a
+`new ArrayList<>()` argument instead, both arms match HotSpot exactly.
+
 ## Verification
 
 | probe | `--real-jdk` | `--jdk-only` | `--synthetic-jdk` |
@@ -196,6 +247,8 @@ fine in synthetic mode: three `add`s give `size=3`, iteration yields 3,
 * A bounded `awaitTermination(n, unit)` on those executors returns `true`.
 * `Collections.newSetFromMap(new ConcurrentHashMap<>())` survives the same
   balanced churn.
+* `chm.keySet().retainAll(c)` actually drops what it was told to drop, and
+  `chm.keySet().add(x)` throws instead of silently losing the element.
 
 ## Residuals, handed off
 
@@ -215,14 +268,11 @@ binaries either side of this work — none is a regression from it.
    hangs on the closing brace too — for its own, unrelated reason. Filed as
    `threadpoolexecutor-drops-queued-tasks-and-never-terminates-20260806.md`.
 
-2. **`ConcurrentHashMap.keySet()` (no argument) still returns a live-view
-   `HashSet`, not a `KeySetView`.** It is not add-able in the JDK either, and
-   its `remove` writes through to the source map's native (locked) `remove`, so
-   it has neither half of this bug. The only remaining gap is class identity:
-   `(ConcurrentHashMap.KeySetView<K,?>) chm.keySet()` still throws
-   `ClassCastException`. Closing it means retargeting the `make_view_set_of`
-   machinery that Felix, Spring and H2 paths depend on — a much larger blast
-   radius than the identity gap justifies on its own.
+2. ~~**`ConcurrentHashMap.keySet()` (no argument) still returns a live-view
+   `HashSet`, not a `KeySetView`.**~~ CLOSED 2026-08-06 — and the premise that
+   it was only a class-identity gap was wrong: `add`/`addAll` succeeded instead
+   of throwing, `removeAll` returned `false` having removed, and `retainAll`
+   did not write through at all. See "The keySet() half" above.
 
 3. **`Arrays.asList(...)` returns an empty list under `--synthetic-jdk`.**
    `Arrays.asList("a","b","c")` reports `size=0` and iterates nothing, so

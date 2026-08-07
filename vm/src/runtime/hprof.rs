@@ -1047,9 +1047,9 @@ mod tests {
     }
 
     /// CLASS_DUMP's instance-size slot must describe CratonVM's real object
-    /// footprint (32-byte header + one 16-byte cell per instance field), not
+    /// footprint (a `HEADER_SIZE` header + one 16-byte cell per instance field), not
     /// HotSpot's packed field-byte sum. Guards the fix for MAT reporting an
-    /// eight-`boolean` class as 8 bytes when it occupies 160.
+    /// eight-`boolean` class as 8 bytes when it occupies `HEADER_SIZE + 128`.
     #[test]
     fn obsaudit_instance_byte_size_uses_real_footprint() {
         // Direct arithmetic check of the size formula the dumper now writes.
@@ -1057,8 +1057,11 @@ mod tests {
         // regardless of the fields' Java widths.
         let header = cratonvm_types::HEADER_SIZE;
         let slot = cratonvm_types::SLOT_SIZE;
+        // 32 until the 2026-08-06 shrink folded `forwarding_ptr` into the mark
+        // word. The tripwire did its job — it named the doc that had to move
+        // with it — so it keeps its literal rather than becoming self-proving.
         assert_eq!(
-            header, 32,
+            header, 24,
             "object header size changed; update the dumper doc"
         );
         assert_eq!(slot, 16, "field slot size changed; update the dumper doc");
@@ -1068,7 +1071,7 @@ mod tests {
         let old_style: usize = (0..8).map(|_| hprof_type_size(HPROF_BOOLEAN)).sum();
         assert_eq!(old_style, 8);
         let new_style = header + 8 * slot;
-        assert_eq!(new_style, 160);
+        assert_eq!(new_style, header + 128);
         assert_ne!(old_style, new_style);
     }
 

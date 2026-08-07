@@ -2010,6 +2010,20 @@ pub(crate) fn native_shutdown_halt0(
 /// That bypass is not addressed here вЂ” gating it requires intercepting
 /// every Panama downcall, tracked as a separate task. See
 /// `native-builtins::panama` for the FFI entry points.
+/// Install `check_exec_or_throw` as `native-io`'s pre-spawn policy gate.
+///
+/// `native-io` owns every real spawn (`ProcessBuilder.start`, `Runtime.exec`,
+/// `ProcessImpl.create`, `forkAndExec` all funnel into `spawn_and_wrap`) but
+/// cannot reach the SecurityManager, which lives in this crate. This hands it
+/// the function pointer. Idempotent, so calling it from more than one
+/// registration path is safe.
+///
+/// Must be called from a path that runs in EVERY mode: the gate is a security
+/// control, and a mode that skips the install silently spawns ungated.
+pub(crate) fn install_spawn_policy_hook() {
+    cratonvm_native_io::process::set_spawn_policy_hook(check_exec_or_throw);
+}
+
 pub(crate) fn check_exec_or_throw(
     ctx: &mut dyn NativeContext,
     command_first: &str,
@@ -2037,6 +2051,10 @@ pub(crate) fn check_exec_or_throw(
 }
 
 /// Read a String[] from an object reference into a Vec<String>.
+///
+/// A null element is dropped. Callers that must distinguish "absent" from
+/// "null" (`Runtime.exec`'s cmdarray, where HotSpot throws
+/// `NullPointerException`) use `checked_cmdarray` instead.
 fn read_string_array(ctx: &mut dyn NativeContext, arr_val: &Value) -> Vec<String> {
     let arr = match arr_val {
         Value::Object(Some(a)) => *a,
@@ -2052,7 +2070,81 @@ fn read_string_array(ctx: &mut dyn NativeContext, arr_val: &Value) -> Vec<String
     result
 }
 
-/// Execute a command and build a Process synthetic with captured output.
+/// Validate and read a `Runtime.exec` cmdarray the way `ProcessBuilder.start`
+/// does: `NullPointerException` for a null array or any null element, then
+/// `ArrayIndexOutOfBoundsException` for an empty one (that is `cmdarray[0]`
+/// failing, which is why the reported index is 0).
+///
+/// `read_string_array` DROPS a null element, so `exec(["/bin/echo", null])`
+/// used to run a different command line than the caller wrote instead of
+/// throwing. Verified against HotSpot 25 in probes/ProcSurfaceProbe.java
+/// (T10/T11).
+fn checked_cmdarray(
+    ctx: &mut dyn NativeContext,
+    arr_val: &Value,
+) -> Result<Vec<String>, MethodCallFailed> {
+    let arr = match arr_val {
+        Value::Object(Some(a)) => *a,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Runtime.exec: null command array".to_string()),
+            }
+            .into())
+        }
+    };
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        match ctx.get_array_element(arr, i) {
+            Value::Object(Some(s)) => out.push(ctx.read_string(s).unwrap_or_default()),
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("Runtime.exec: null element in command array".to_string()),
+                }
+                .into())
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(RuntimeError::aioobe(0, 0).into());
+    }
+    Ok(out)
+}
+
+/// Execute a command and hand back a LIVE `Process`.
+///
+/// Delegates to `native-io`'s `spawn_and_wrap`, the SAME spawn the
+/// `ProcessBuilder.start` native uses. That keeps the `std::process::Child`
+/// alive in the process table, registers its three pipes in the `FdTable`, and
+/// wraps them in a `cratonvm/synthetic/Process` whose layout every
+/// `java.lang.Process` native in `native-io` already reads.
+///
+/// It used to run `Command::output()` here instead, storing the child's whole
+/// stdout and stderr as two Java Strings on a 3-slot object allocated under
+/// `java/lang/Process`. Three defects fell out of that, and the delegation
+/// fixes all three:
+///
+///   * **The object had nowhere to put those slots.** In real-JDK mode
+///     `java.lang.Process` is a REAL loaded class with six fields of its own,
+///     so `alloc_concurrent_synthetic("java/lang/Process", 3)` produced a
+///     real-layout six-slot object and slots 0..2 aliased `java.lang.Process`'s
+///     own reader/writer caches.
+///   * **Nothing downstream spoke that layout.** `getInputStream()` and its
+///     siblings are answered by `native-io::process`, which reads an
+///     fd-carrying layout offset PAST those six real fields. It found nothing,
+///     fell through to a pipe stream on fd -1, and every read returned EOF, so
+///     a `Runtime.exec` child's output was unreachable. That is what emptied
+///     Tomcat's CGI response body (`TestSecurity2019.testCVE_2019_0232`:
+///     `rc == 200`, body `null`).
+///   * **`exec` blocked until the child exited.** `Runtime.exec` must return
+///     immediately with a running child. Blocking meant `isAlive()` was never
+///     true and `exitValue()` never threw `IllegalThreadStateException` (the
+///     exact signal `CGIServlet` polls on), and a child that reads its stdin
+///     could never be fed, because the caller only receives the pipe once
+///     `exec` has returned.
+///
+/// `redirect_error_stream` is false: no `Runtime.exec` overload asks for a
+/// merged stream, so stdout and stderr stay separate pipes.
 fn runtime_spawn_process(
     ctx: &mut dyn NativeContext,
     cmd: &[String],
@@ -2060,59 +2152,61 @@ fn runtime_spawn_process(
     work_dir: Option<&str>,
 ) -> MethodCallResult {
     if cmd.is_empty() {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Runtime.exec: empty command".to_string(),
-        }
-        .into());
+        return Err(RuntimeError::aioobe(0, 0).into());
     }
-    let program = &cmd[0];
+    let program = cmd[0].clone();
 
-    // SECURITY: consult SecurityManager.checkExec(command[0]) BEFORE
-    // touching std::process::Command. A SecurityException here must
-    // prevent the spawn syscall entirely вЂ” see check_exec_or_throw doc.
-    check_exec_or_throw(ctx, program)?;
+    // SECURITY: `SecurityManager.checkExec(command[0])` is NOT called here.
+    // `spawn_and_wrap` runs it as its first act, via the policy hook installed
+    // by `install_spawn_policy_hook`, so that the gate covers every spawn
+    // route rather than only this one. Calling it here as well would consult
+    // the SecurityManager twice per `exec` -- observable to any policy that
+    // counts or logs checks, and not what HotSpot does.
 
-    let mut command = std::process::Command::new(program);
-    if cmd.len() > 1 {
-        command.args(&cmd[1..]);
-    }
+    // HotSpot: a null `envp` inherits this process's environment unchanged; a
+    // non-null one REPLACES it wholesale. `clear_env` carries that
+    // distinction, which is why it is derived from the presence of `env` and
+    // not from the pair count: an empty-but-present `envp` must give the child
+    // an empty environment, not an inherited one.
+    let env_pairs: Option<Vec<(String, String)>> = env.map(|vars| {
+        vars.iter()
+            .filter_map(|var| {
+                var.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect()
+    });
+    let clear_env = env_pairs.is_some();
 
-    // Apply environment variables (format "KEY=VALUE")
-    if let Some(env_vars) = env {
-        command.env_clear();
-        for var in env_vars {
-            if let Some(eq) = var.find('=') {
-                command.env(&var[..eq], &var[eq + 1..]);
-            }
-        }
-    }
+    cratonvm_native_io::process::spawn_and_wrap(
+        ctx,
+        &program,
+        &cmd[1..],
+        work_dir,
+        env_pairs.as_deref(),
+        clear_env,
+        false,
+    )
+}
 
-    if let Some(dir) = work_dir {
-        if !dir.is_empty() {
-            command.current_dir(dir);
-        }
-    }
-
-    command.stdout(std::process::Stdio::piped());
-    command.stderr(std::process::Stdio::piped());
-
-    match command.output() {
-        Ok(output) => {
-            let process = alloc_concurrent_synthetic(ctx, "java/lang/Process", 3);
-            let exit_code = output.status.code().unwrap_or(-1);
-            ctx.set_field(process, 0, Value::Int(exit_code));
-            let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr_str = String::from_utf8_lossy(&output.stderr).into_owned();
-            let stdout_ref = ctx.create_string(&stdout_str);
-            let stderr_ref = ctx.create_string(&stderr_str);
-            ctx.set_field(process, 1, Value::Object(Some(stdout_ref)));
-            ctx.set_field(process, 2, Value::Object(Some(stderr_ref)));
-            Ok(Some(Value::Object(Some(process))))
-        }
-        Err(e) => Err(RuntimeError::IOException {
-            message: format!("Runtime.exec failed: {}", e),
-        }
-        .into()),
+/// Read the `File` working-directory argument of the three-arg `exec`
+/// overloads.
+///
+/// Reads `path` BY NAME first: in real-JDK mode `java.io.File`'s slot 0 is not
+/// necessarily its `path` field, and the previous slot-0-only read then
+/// produced `None` -- a working directory the caller asked for, silently
+/// dropped. Same order `native-io::process::file_path_of` uses.
+fn exec_dir_path(ctx: &mut dyn NativeContext, arg: Option<&Value>) -> Option<String> {
+    let file_obj = match arg {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return None,
+    };
+    match ctx.get_field_by_name(file_obj, "path") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => match ctx.get_field(file_obj, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
     }
 }
 
@@ -2141,7 +2235,7 @@ pub(crate) fn native_runtime_exec_array(
     args: &[Value],
 ) -> MethodCallResult {
     let arg_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let cmd = read_string_array(ctx, &arg_val);
+    let cmd = checked_cmdarray(ctx, &arg_val)?;
     runtime_spawn_process(ctx, &cmd, None, None)
 }
 
@@ -2175,7 +2269,7 @@ pub(crate) fn native_runtime_exec_array_env(
     args: &[Value],
 ) -> MethodCallResult {
     let arg_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let cmd = read_string_array(ctx, &arg_val);
+    let cmd = checked_cmdarray(ctx, &arg_val)?;
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let env = if matches!(env_val, Value::Object(None)) {
         None
@@ -2206,13 +2300,7 @@ pub(crate) fn native_runtime_exec_string_env_dir(
     } else {
         Some(read_string_array(ctx, &env_val))
     };
-    let dir = match args.get(3) {
-        Some(Value::Object(Some(f))) => match ctx.get_field(*f, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        },
-        _ => None,
-    };
+    let dir = exec_dir_path(ctx, args.get(3));
     runtime_spawn_process(ctx, &parts, env.as_deref(), dir.as_deref())
 }
 
@@ -2222,20 +2310,14 @@ pub(crate) fn native_runtime_exec_array_env_dir(
     args: &[Value],
 ) -> MethodCallResult {
     let arg_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    let cmd = read_string_array(ctx, &arg_val);
+    let cmd = checked_cmdarray(ctx, &arg_val)?;
     let env_val = args.get(2).copied().unwrap_or(Value::Object(None));
     let env = if matches!(env_val, Value::Object(None)) {
         None
     } else {
         Some(read_string_array(ctx, &env_val))
     };
-    let dir = match args.get(3) {
-        Some(Value::Object(Some(f))) => match ctx.get_field(*f, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        },
-        _ => None,
-    };
+    let dir = exec_dir_path(ctx, args.get(3));
     runtime_spawn_process(ctx, &cmd, env.as_deref(), dir.as_deref())
 }
 
@@ -2621,84 +2703,14 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(ctx.get_field(this, 0)))
 }
 
-pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // SECURITY: this is the "simplified" ProcessBuilder.start stub that
-    // never actually spawns вЂ” it returns a dummy Process with exit_code=0.
-    // The real spawning path is `phases_late::register_phase57_process`,
-    // which last-write-wins overrides this registration. Even so we
-    // funnel through check_exec_or_throw as defense-in-depth: if a future
-    // refactor ever wires this stub up to std::process::Command, the
-    // SecurityManager gate stays in place.
-    //
-    // Best-effort extraction of command[0] from the ProcessBuilder's
-    // command field (slot 0). If we can't recover a program string we
-    // still consult the SM with an empty argument so a deny-all policy
-    // surfaces a SecurityException вЂ” matching the "empty argv is
-    // suspicious" stance taken in `check_exec_or_throw`.
-    let program: String = match args.first() {
-        Some(Value::Object(Some(this))) => {
-            let cmd_val = ctx.get_field(*this, 0);
-            match cmd_val {
-                Value::Object(Some(cmd_obj)) => {
-                    // `ProcessBuilder.command` is a `List<String>` (typically an
-                    // ArrayList), but `Runtime.exec`/legacy paths may hand us a
-                    // raw `String[]`. Decide which by the object's RUNTIME CLASS,
-                    // then read it layout-independently:
-                    //   * List: read `size` / `elementData` BY FIELD NAME (the
-                    //     real-JDK ArrayList carries `AbstractList.modCount` ahead
-                    //     of `elementData`/`size`, so the old hard-coded
-                    //     `size = field1` assumption failed and fell through to
-                    //     `array_length(list)` вЂ” illegal on a non-array, which
-                    //     tripped the array-length guard during picocli's
-                    //     `getTerminalWidth()` ProcessBuilder probe).
-                    //   * Array: only THEN is `array_length` legal.
-                    let cname = ctx
-                        .class_name_of_id(ctx.class_id_of_object(cmd_obj))
-                        .unwrap_or_default();
-                    let read_elem0 = |ctx: &mut dyn NativeContext, arr: ObjectRef| -> String {
-                        match ctx.get_array_element(arr, 0) {
-                            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                            _ => String::new(),
-                        }
-                    };
-                    if cname.starts_with('[') {
-                        // Genuine array (e.g. String[]): array_length is legal.
-                        if ctx.array_length(cmd_obj) > 0 {
-                            read_elem0(ctx, cmd_obj)
-                        } else {
-                            String::new()
-                        }
-                    } else {
-                        // A List: read `size` + `elementData` by name.
-                        let size = match ctx.get_field_by_name(cmd_obj, "size") {
-                            Value::Int(n) => n,
-                            _ => 0,
-                        };
-                        if size > 0 {
-                            if let Value::Object(Some(data_arr)) =
-                                ctx.get_field_by_name(cmd_obj, "elementData")
-                            {
-                                read_elem0(ctx, data_arr)
-                            } else {
-                                String::new()
-                            }
-                        } else {
-                            String::new()
-                        }
-                    }
-                }
-                _ => String::new(),
-            }
-        }
-        _ => String::new(),
-    };
-    check_exec_or_throw(ctx, &program)?;
-
-    // Return a dummy Process object (simplified вЂ” no actual process execution)
-    let proc = alloc_concurrent_synthetic(ctx, "java/lang/Process", 1);
-    ctx.set_field(proc, 0, Value::Int(0)); // exit code
-    Ok(Some(Value::Object(Some(proc))))
-}
+// `native_pb_start` lived here: a `ProcessBuilder.start` that ran
+// `check_exec_or_throw` and then handed back a one-slot dummy Process which had
+// spawned nothing. Its own comment called it "the simplified
+// ProcessBuilder.start stub that never actually spawns", kept as
+// defense-in-depth for the SecurityManager gate. That gate now lives in
+// `native-io`'s `spawn_and_wrap`, where every spawn route meets it, so the stub
+// had nothing left to defend -- and its dummy Process was the same
+// allocate-under-a-real-JDK-class-name truncation as the rest of this cluster.
 
 /// Materialize a `java/lang/StackTraceElement[]` from a captured frame trace
 /// (innermost frame first, as `getStackTrace()` expects index 0 = current
@@ -4693,13 +4705,139 @@ mod t15_tests {
 //      allowed paths reach the spawn syscall.
 //
 // We exercise the integration through `native_runtime_exec_string` and
-// `native_pb_start` so any future refactor that bypasses
-// `check_exec_or_throw` regresses these tests.
+// `native-io`'s `native_process_builder_start` -- the two Java-visible spawn
+// entry points -- so any future refactor that bypasses `check_exec_or_throw`
+// regresses these tests. `ProcessBuilder.start` reaches the gate only through
+// the hook `install_spawn_policy_hook` installs, which is why that test calls
+// it explicitly.
 //
 // MockNativeContext.invoke_virtual returns whatever's pre-armed in
 // `invoke_virtual_result` (taken once), defaulting to `Ok(None)` вЂ”
 // matching JDK's "no exception thrown == allowed" semantics. This lets us
 // simulate both deny (pre-arm an Err) and allow (default).
+/// `Runtime.exec` cmdarray validation, measured against HotSpot 25 in
+/// probes/ProcSurfaceProbe.java (T10/T11).
+#[cfg(test)]
+mod exec_cmdarray_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
+    use cratonvm_types::error::VmError;
+    use cratonvm_types::ArrayElementType;
+
+    /// Build a `String[]`; `None` becomes a genuine null element.
+    fn string_array(ctx: &mut dyn NativeContext, items: &[Option<&str>]) -> Value {
+        let arr = ctx.new_array(ArrayElementType::Reference, items.len());
+        for (i, item) in items.iter().enumerate() {
+            let v = match item {
+                Some(s) => {
+                    let obj = ctx.create_string(s);
+                    Value::Object(Some(obj))
+                }
+                None => Value::Object(None),
+            };
+            ctx.set_array_element(arr, i, v);
+        }
+        Value::Object(Some(arr))
+    }
+
+    fn assert_npe(err: &MethodCallFailed) {
+        match err {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException { .. },
+            )) => {}
+            other => panic!("expected NullPointerException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_null_command_array_is_a_null_pointer_exception() {
+        let mut ctx = mock_ctx();
+        let err = checked_cmdarray(&mut ctx, &Value::Object(None))
+            .expect_err("a null cmdarray must throw");
+        assert_npe(&err);
+    }
+
+    /// The old reader DROPPED a null element, so `exec(["/bin/echo", null])`
+    /// silently ran `/bin/echo` with no arguments -- a different command line
+    /// than the caller wrote. HotSpot throws.
+    #[test]
+    fn a_null_element_is_a_null_pointer_exception_not_a_shorter_command() {
+        let mut ctx = mock_ctx();
+        let arr = string_array(&mut ctx, &[Some("/bin/echo"), None]);
+        let err = checked_cmdarray(&mut ctx, &arr).expect_err("a null element must throw");
+        assert_npe(&err);
+    }
+
+    #[test]
+    fn an_empty_command_array_is_an_array_index_out_of_bounds() {
+        let mut ctx = mock_ctx();
+        let arr = string_array(&mut ctx, &[]);
+        let err = checked_cmdarray(&mut ctx, &arr).expect_err("an empty cmdarray must throw");
+        match err {
+            MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::ArrayIndexOutOfBoundsException { index, .. },
+            )) => assert_eq!(index, 0, "the failing read is cmdarray[0]"),
+            other => panic!("expected ArrayIndexOutOfBoundsException, got {other:?}"),
+        }
+    }
+
+    /// `Runtime.exec` must return with the child STILL RUNNING.
+    ///
+    /// This is the regression test for the defect itself. `exec` used to call
+    /// `Command::output()`, which runs the child to completion and buffers its
+    /// output -- so `exec` blocked for the child's whole lifetime, `isAlive()`
+    /// was never true, `exitValue()` never threw `IllegalThreadStateException`
+    /// (the signal Tomcat's `CGIServlet` polls on), and a child reading stdin
+    /// could never be fed, because the caller only gets the pipe once `exec`
+    /// has returned. Against the old code this test spends five seconds inside
+    /// `exec` and then fails.
+    ///
+    /// The bound is deliberately loose (2.5s against a 5s child): the claim is
+    /// "returned before the child finished", not a latency budget, and this
+    /// runs on a shared, heavily loaded host.
+    ///
+    /// The child is left to exit on its own. Reaping it would mean reaching
+    /// into `native-io`'s private Process layout for the handle, and a stray
+    /// `sleep 5` costs nothing.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn runtime_exec_returns_while_the_child_is_still_running() {
+        // Serialize against the checkexec tests: the spawn policy hook is
+        // process-global once installed, so a deny-all SecurityManager
+        // installed by one of those tests would refuse this spawn.
+        let _guard = crate::security_manager::security_state_test_lock();
+        let mut ctx = mock_ctx();
+        let arr = string_array(&mut ctx, &[Some("/bin/sleep"), Some("5")]);
+        let started = std::time::Instant::now();
+        let result = native_runtime_exec_array(
+            &mut ctx,
+            &[Value::Object(None), arr],
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            result.is_ok(),
+            "spawning /bin/sleep must succeed, got {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2500),
+            "Runtime.exec must not wait for the child: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_command_array_reads_back_in_order() {
+        let mut ctx = mock_ctx();
+        let arr = string_array(&mut ctx, &[Some("/bin/echo"), Some("a b"), Some("c")]);
+        let cmd = checked_cmdarray(&mut ctx, &arr).expect("a valid cmdarray must not throw");
+        assert_eq!(cmd, vec!["/bin/echo", "a b", "c"]);
+    }
+}
+
 #[cfg(test)]
 mod checkexec_security_tests {
     use super::*;
@@ -4813,12 +4951,18 @@ mod checkexec_security_tests {
     }
 
     #[test]
-    fn denying_sm_blocks_processbuilder_start_stub() {
+    fn denying_sm_blocks_processbuilder_start() {
         let _guard = security_state_test_lock();
-        // Same coverage for the simplified `native_pb_start` stub. Even
-        // though this stub doesn't actually spawn, the SM gate runs first
-        // so a future refactor that wires it to std::process::Command can
-        // not silently bypass policy.
+        // Drives the REAL `ProcessBuilder.start` -- `native-io`'s, the one this
+        // crate now registers. It used to drive `native_pb_start`, a stub that
+        // never spawned, so what it proved was that a stub asked permission
+        // before doing nothing.
+        //
+        // `install_spawn_policy_hook()` is the point: the gate reaches
+        // `native-io` only through that hook, and nothing else in a unit-test
+        // binary installs it. If the wiring regresses, the spawn goes through
+        // and this test fails.
+        install_spawn_policy_hook();
         let mut ctx = mock_ctx();
         let sm = alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0);
         let prev = set_security_manager_for_test(&ctx, Some(sm));
@@ -4831,15 +4975,20 @@ mod checkexec_security_tests {
         }
 
         // Build a ProcessBuilder synthetic with a 4-slot layout and a
-        // command list. The native_pb_start stub reads slot 0; we plant a
-        // String[] there with command[0] = "/bin/anything".
+        // command list. `start` reads slot 0; we plant a String[] there with
+        // command[0] = "/bin/anything", a path that does not exist -- so if the
+        // gate ever fails to refuse, the spawn fails with an IOException rather
+        // than running something, and the assertion below still catches it.
         let pb = alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4);
         let cmd_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         let prog = ctx.create_string("/bin/anything");
         ctx.set_array_element(cmd_arr, 0, Value::Object(Some(prog)));
         ctx.set_field(pb, 0, Value::Object(Some(cmd_arr)));
 
-        let result = native_pb_start(&mut ctx, &[Value::Object(Some(pb))]);
+        let result = cratonvm_native_io::process::native_process_builder_start(
+            &mut ctx,
+            &[Value::Object(Some(pb))],
+        );
         let err = result.expect_err("deny-all SM must block ProcessBuilder.start");
         assert_security_exception(&err);
 

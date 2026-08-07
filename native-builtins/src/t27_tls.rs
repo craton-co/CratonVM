@@ -2149,6 +2149,57 @@ fn with_active_native_context<R>(f: impl FnOnce(&mut dyn NativeContext) -> R) ->
     Some(f(unsafe { &mut *ptr }))
 }
 
+/// RAII: mark this thread GC-blocked for ONE blocking socket syscall, through
+/// the native context published by [`set_active_native_context`].
+///
+/// The TLS request path cannot open a blocking region around the whole
+/// exchange the way the plain-HTTP path does, because it has to run Java
+/// (`JavaKeyManagerResolver::resolve` -> `chooseClientAlias`) in the middle of
+/// the handshake, and a GC-blocked thread must not be executing bytecode. Its
+/// answer used to be to open no region at all — so an HTTPS request sat in
+/// `connect`/`recv`/`send` for up to the request timeout while the collector
+/// still counted it as a cooperative mutator, and a stop-the-world pause that
+/// began during a request waited for a thread that could not reach a
+/// safepoint. Under `CRATONVM_DBG_GC_STRESS=1048576` that wedges every time:
+/// `STW cross-thread JIT takeover is still waiting for cooperative mutators`,
+/// repeating forever, with `--nojit` too.
+///
+/// The split that resolves it: rustls does its socket I/O in `read_tls` /
+/// `write_tls` / `complete_io` and its protocol work — including every Java
+/// upcall — in `process_new_packets`, which touches no socket. So the region
+/// belongs around the SYSCALL, not around the exchange. Wrapping the socket
+/// (see `net_phase_e::GcBlockingSocket`) puts it there and nowhere else: no
+/// layer above can accidentally hold it across an upcall, the same reason
+/// `EintrIo` wraps the socket rather than patching each call site.
+///
+/// Returns an inert guard when no context is published — that is the
+/// pre-existing behaviour, not a new failure mode, and the paths this is used
+/// from all publish one.
+pub(crate) struct GcBlockedSyscall {
+    entered: bool,
+}
+
+/// Open a [`GcBlockedSyscall`] region for the duration of the returned guard.
+pub(crate) fn gc_blocked_syscall() -> GcBlockedSyscall {
+    // The reborrow ends before the caller's syscall runs, so this never holds
+    // a `&mut dyn NativeContext` across the blocking call — nor across the
+    // `resolve` upcall, which reborrows it again from `process_new_packets`.
+    let entered = with_active_native_context(|ctx| ctx.begin_blocking_region()).is_some();
+    GcBlockedSyscall { entered }
+}
+
+impl Drop for GcBlockedSyscall {
+    fn drop(&mut self) {
+        if self.entered {
+            // Symmetric on every path, including an `Err(...)?` out of the
+            // syscall and an unwind: an unbalanced enter leaves this thread
+            // counted as blocked forever, which is the same hang read from
+            // the other side.
+            let _ = with_active_native_context(|ctx| ctx.end_blocking_region());
+        }
+    }
+}
+
 /// Map the `SignatureScheme`s a server's `CertificateRequest` advertises to
 /// the JSSE-style `keyType` strings (`"RSA"`, `"EC"`, …)
 /// `X509KeyManager.chooseClientAlias`/`getClientAliases` expect. Order is
@@ -3225,16 +3276,33 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     tcp_listener
         .set_nonblocking(true)
         .map_err(|e| format!("listener set_nonblocking failed: {e}"))?;
-    let (tcp, _peer) = loop {
-        match tcp_listener.accept() {
-            Ok(pair) => break pair,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if closed.load(Ordering::SeqCst) {
-                    return Err("listener closed".to_string());
+    // STW-COOPERATION: this loop parks the calling thread for as long as no
+    // peer connects — unboundedly, in a native, never returning to the
+    // interpreter and so never reaching a safepoint poll. Left unmarked it is
+    // counted as a cooperative mutator that can never cooperate, and a
+    // concurrent stop-the-world pause waits on it forever: `rounds=64
+    // pending=1 taken=0`, repeating, with no further progress. Same bug shape
+    // and same fix as `SSLSocketInputStream.read`'s refill bracket
+    // (`tomcatservletwebserverfactorytests-stw-takeover-hang-FIXED`) — that
+    // pass fixed the READ on an accepted socket and left the ACCEPT itself.
+    //
+    // ONE region for the whole wait, not one per 20 ms tick: the body is pure
+    // Rust with no Java in it, and re-entering per tick would deposit a root
+    // snapshot and retire the TLAB 50 times a second for a thread that is
+    // doing nothing.
+    let (tcp, _peer) = {
+        let _blocked = gc_blocked_syscall();
+        loop {
+            match tcp_listener.accept() {
+                Ok(pair) => break pair,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if closed.load(Ordering::SeqCst) {
+                        return Err("listener closed".to_string());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err(e) => return Err(format!("accept failed: {}", e)),
             }
-            Err(e) => return Err(format!("accept failed: {}", e)),
         }
     };
     let _ = tcp.set_nonblocking(false);
@@ -3261,10 +3329,16 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                                 listener_id
                             );
                         }
-                        stream
-                            .conn
-                            .read_tls(&mut EintrIo::new(&mut stream.sock))
-                            .map_err(|e| format!("server handshake read: {e}"))?;
+                        // Blocked across the SYSCALL only. `process_new_packets`
+                        // below is the one place rustls can re-enter Java, and a
+                        // GC-blocked thread must not run bytecode — so the guard
+                        // ends before it. The socket carries a 30s timeout, so
+                        // an absent peer parks this thread for that long.
+                        {
+                            let _blocked = gc_blocked_syscall();
+                            stream.conn.read_tls(&mut EintrIo::new(&mut stream.sock))
+                        }
+                        .map_err(|e| format!("server handshake read: {e}"))?;
                         stream
                             .conn
                             .process_new_packets()
@@ -3277,10 +3351,11 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                                 listener_id
                             );
                         }
-                        stream
-                            .conn
-                            .write_tls(&mut EintrIo::new(&mut stream.sock))
-                            .map_err(|e| format!("server handshake write: {e}"))?;
+                        {
+                            let _blocked = gc_blocked_syscall();
+                            stream.conn.write_tls(&mut EintrIo::new(&mut stream.sock))
+                        }
+                        .map_err(|e| format!("server handshake write: {e}"))?;
                     }
                 }
                 if debug_hs {
@@ -4583,8 +4658,16 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let stream_id =
-            rustls_server_accept(id).map_err(|e| RuntimeError::IOException { message: e })?;
+        // `rustls_server_accept` parks this thread — unboundedly in its poll
+        // loop, then up to the socket's 30s timeout in the handshake — and
+        // marks itself GC-blocked across those waits via `gc_blocked_syscall`,
+        // which reads this thread-local. Publishing `ctx` here is what makes
+        // that guard live on the acceptor thread; without it the guard is
+        // inert and the thread is again a mutator that can never cooperate.
+        let stream_id = {
+            let _active_ctx = set_active_native_context(ctx);
+            rustls_server_accept(id).map_err(|e| RuntimeError::IOException { message: e })?
+        };
 
         // The id space the STREAM natives key on is the offset one:
         // `s2_tls_read`/`s2_tls_write` route to the rustls tables only for ids
