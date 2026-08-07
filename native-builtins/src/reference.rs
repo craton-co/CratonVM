@@ -611,6 +611,17 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             _ => Ok(Some(Value::Int(0))), // no queue attached
         }
     })();
+    // PGJDBC-PHANTOM-GHOST (2026-08-07): a successful explicit enqueue must
+    // retire this reference's entry in the GC's own registry, or the GC's
+    // weak/phantom processing can rediscover and re-deliver it a second time
+    // once its (possibly still-shared) referent later dies for real. See
+    // `ReferenceProcessor::mark_manually_enqueued`'s doc for the full
+    // mechanism. Read the pin ONE more time first: `invoke_special` above can
+    // run arbitrary bytecode (a GC-capable call), so `this` may have moved.
+    if matches!(&result, Ok(Some(Value::Int(1)))) {
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.mark_reference_manually_enqueued(this);
+    }
     ctx.unpin_native_roots(this_pin);
     result
 }
@@ -693,6 +704,29 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     let next_slot = ref_next_slot(ctx, ref_obj);
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     let next = ctx.get_field(ref_obj, next_slot);
+                    // PGJDBC-PHANTOM-DOUBLE-POLL (2026-08-07): the real JDK's
+                    // `ReferenceQueue.enqueue0` bytecode uses a SELF-
+                    // REFERENTIAL `next == r` sentinel (not null) to mark "r
+                    // was the only/last element enqueued into an otherwise-
+                    // empty queue" — `r.next = (head == null) ? r : head;`.
+                    // `native_ref_enqueue`'s real-JDK-layout path delegates
+                    // straight to that real bytecode (see its doc), so a
+                    // Reference enqueued while the queue was empty legitimately
+                    // arrives here with `next == ref_obj`. Blindly republishing
+                    // `next` as the new head — as this native override
+                    // previously did unconditionally — re-publishes `ref_obj`
+                    // ITSELF as the head right after popping it: the NEXT
+                    // `poll()` call finds the "same" head again and delivers
+                    // the already-fully-processed Reference a SECOND time (a
+                    // ghost redelivery) — exactly pgjdbc's
+                    // `parsedQueryMap.remove(ref)` returning null and feeding
+                    // `sendCloseStatement` a null `statementName`. Normalize the
+                    // sentinel to "queue now empty" here, matching real JDK
+                    // `poll0`: `if (next == r) head = null; else head = next;`.
+                    let next = match next {
+                        Value::Object(Some(n)) if n == ref_obj => Value::Object(None),
+                        other => other,
+                    };
                     let this = ctx.read_native_pin(this_pin, this);
                     ctx.set_field(this, RQ_FIELD_HEAD, next);
                     // Detach the popped reference from the list and clear its

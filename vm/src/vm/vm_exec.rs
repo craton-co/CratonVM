@@ -11004,6 +11004,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         );
     }
 
+    /// PGJDBC-PHANTOM-GHOST (2026-08-07): see the trait doc and
+    /// `ReferenceProcessor::mark_manually_enqueued`. Retires the registry
+    /// entry for a `Reference` the application just enqueued itself via
+    /// `Reference.enqueue()`, so the GC's own weak/phantom processing never
+    /// rediscovers and re-delivers it once its (possibly still-shared)
+    /// referent later dies for real.
+    fn mark_reference_manually_enqueued(&mut self, reference_obj: ObjectRef) {
+        let ref_addr = reference_obj.as_ptr() as usize;
+        self.shared
+            .mem
+            .ref_processor
+            .lock()
+            .mark_manually_enqueued(ref_addr);
+    }
+
     /// Round-5 fix (HIGH): wire native `Reference.get()` into the
     /// reference processor's SoftReference LRU so cached referents stay
     /// alive across major GCs proportional to how recently the

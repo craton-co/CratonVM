@@ -2888,6 +2888,27 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// test the referent WITHOUT keeping it alive. The default no-op keeps
     /// mock/test contexts compiling.
     fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+
+    /// Notify the GC's reference processor that a `Reference.enqueue()` call
+    /// just enqueued this reference itself (the application's own explicit
+    /// enqueue, as opposed to the GC discovering the referent dead).
+    ///
+    /// PGJDBC-PHANTOM-GHOST (2026-08-07): without this, a `Reference` that the
+    /// application manually retires while its referent is STILL reachable
+    /// (e.g. pgjdbc's `SimpleQuery.unprepare()`/`setCleanupRef()`, which
+    /// `clear()`s and `enqueue()`s the *previous* `PhantomReference` when a
+    /// long-lived, reused `SimpleQuery` gets re-prepared) leaves a stale
+    /// `enqueued: false` bookkeeping entry in the GC's registry. If that same
+    /// referent is later shared with a NEW Reference (as in the pgjdbc
+    /// pattern) and eventually dies for real, the GC's own weak/phantom
+    /// processing rediscovers the stale entry and delivers it a SECOND time —
+    /// a ghost the application already fully drained and forgot, so its own
+    /// removal bookkeeping (e.g. a `HashMap.remove(ref)`) returns null. See
+    /// `ReferenceProcessor::mark_manually_enqueued`'s doc for the full
+    /// mechanism. The VM overrides this to retire the registry entry so it is
+    /// never rediscovered; the default no-op keeps mock/test contexts
+    /// compiling.
+    fn mark_reference_manually_enqueued(&mut self, _reference_obj: ObjectRef) {}
 }
 
 pub trait NativeThreadAccess: NativeHeapAccess {
