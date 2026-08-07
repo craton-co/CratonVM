@@ -210,7 +210,34 @@ Same technique, same sweep. All fit the established signature:
   generation, not row iteration, but the same "genuinely working, just too
   slow for the timeout" shape.
 
-Everything examined in this sweep except `TestStringCache` (see
-[`bug-h2-teststringcache-thread-join-blocked-on-dead-threads-20260807.md`](bug-h2-teststringcache-thread-join-blocked-on-dead-threads-20260807.md)
-— that one shows a materially different and more concerning signature and
-is written up separately) fits this doc's throughput-cliff family.
+* **`TestStringCache`** — split out of this doc on 2026-08-07 as a suspected
+  `Thread.join()` lost wakeup, then **refuted and folded back in** the same
+  day (see
+  [`bug-h2-teststringcache-thread-join-REFUTED-20260807.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-teststringcache-thread-join-REFUTED-20260807.md)).
+  It belongs here, with one twist worth knowing: **the test is not the slow
+  part.** `TestStringCache.main` runs `testFromMain()` and *then*
+  `new TestStringCache().runBenchmark()`, and the suite runner invokes
+  `main`, so the benchmark is unavoidable.
+
+  | arm | test only | full `main()` |
+  |---|---|---|
+  | HotSpot | 0.38 s | 5.17 s |
+  | CratonVM, JIT | 1.78 s | **441.84 s** (≈85×) |
+  | CratonVM, `--nojit` | 3.39 s | ≫300 s |
+
+  The test half is 4.7–8.9×, i.e. ordinary. The benchmark half is 85×:
+  `runBenchmark → testToUpperCache → StringUtils.toUpperEnglish /
+  String.toUpperCase → StringUTF16.toUpperCase → Character.toUpperCaseEx`,
+  at varying bci across four captures. A **case-mapping / string-building**
+  hot spot rather than this doc's MVMap-and-commit one, but the same family:
+  progressing, far too slowly for any per-class timeout. The three
+  `Thread.join()`s in `testMultiThreads` return normally — 20/20 clean
+  test-only runs under `--nojit`.
+
+  Note for anyone reading a watchdog capture of this class: `main`'s summary
+  row shows `deposit=STALE` with a `java/lang/Thread.join@129` chain. That is
+  a *deposit* from the join that already returned; the live stack dump above
+  it is authoritative. The `deposit=` tag exists because this class is what
+  exposed the gap.
+
+Everything examined in this sweep fits this doc's throughput-cliff family.
