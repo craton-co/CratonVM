@@ -1787,7 +1787,7 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
     // `NativeMethodRegistry::register` (contract §1.4). This one is `Bridge`
     // by the ambient category here, so that drop took it — and DF05 came
     // straight back, in its quieter form: `new String(sb)` for a builder
-    // holding "abcd42Σ" returned `"a b c d"`. The real
+    // holding "abcd42Σ" returned `"a\0b\0c\0d"`. The real
     // ctor's `Arrays.copyOfRange` over the builder's `byte[]` reads
     // CratonVM's `char[]` one byte at a time, so every second byte is the
     // high half of a Latin-1 char — zero. Silent content corruption on an

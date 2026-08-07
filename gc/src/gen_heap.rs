@@ -3380,11 +3380,21 @@ impl GenerationalHeap {
                         class_name = %class_name,
                         real_field_count = ?real_fields,
                         "gen_heap::get_field: out-of-bounds field read dropped \
-                         (caller used slot index past receiver's layout — \
-                         class layout is correct; the bug is in the caller's \
-                         slot computation, typically a speculative \
-                         collection-layout probe dispatched on a non-matching \
-                         receiver type)",
+                         (caller used slot index past receiver's layout — the \
+                         class layout is correct, the caller's slot \
+                         computation is not). Two causes, and the fields above \
+                         tell them apart: if `class_name` is a fabricated or \
+                         collection class this is usually a speculative \
+                         collection-layout probe on a non-matching receiver, \
+                         which is benign. If `class_name` is a REAL JDK class \
+                         and `num_slots` equals `real_field_count`, it is not: \
+                         a native is reading a synthetic layout that this \
+                         class does not have, and the writer of that layout is \
+                         a different native writing a different one. That is \
+                         total, silent data loss — it emptied Tomcat's CGI \
+                         response body. Set CRATONVM_DBG_LAYOUT_ALIAS=1 to \
+                         list every class carrying a second layout, and \
+                         intersect with these warnings.",
                     );
                 }
                 if gc_flags().dbg_oobfield_value.is_some() {

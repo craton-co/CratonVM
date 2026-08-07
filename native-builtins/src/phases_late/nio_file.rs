@@ -16306,10 +16306,8 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
             // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
-            ctx.set_field(enum_obj, 1, Value::Int(0));
+            let enum_obj = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
             Ok(Some(Value::Object(Some(enum_obj))))
         },
     );
