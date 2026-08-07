@@ -361,8 +361,24 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
         }
         let recursion = ObjectHeader::thin_lock_recursion(cur);
         let (new, ret) = if recursion == 0 {
-            // Last release → return to NEUTRAL.
-            (types::MARK_NEUTRAL, None)
+            // Last release → return to NEUTRAL, CARRYING THE QUARTET.
+            //
+            // `kind` / `element_type` / `gc_flags` / `gc_age` live in mark-word
+            // bits 48..61 since the header shrink; they are not lock state and a
+            // state change must not consume them. This arm used to store the
+            // bare `types::MARK_NEUTRAL` literal, so the first `synchronized`
+            // block on an object erased all four — most visibly
+            // `GC_FLAG_COMPACT`, after which every reader that honours the
+            // per-object header (`gen_heap::compact_field_slot`, i.e. every
+            // native `get_field`) decodes the object's packed 8-byte reference
+            // fields as 16-byte legacy `Value` cells and the heap guard rejects
+            // the result.
+            //
+            // `try_thin_lock` above carries the same correction on the entry
+            // side, and `make_thin_locked` / `make_inflated` /
+            // `make_neutral_hashed` all open with `quartet_of(prev)`. This was
+            // the one transition left storing a literal.
+            (ObjectHeader::quartet_of(cur) | types::MARK_NEUTRAL, None)
         } else {
             (
                 ObjectHeader::make_thin_locked(cur, thread_id, recursion - 1),
@@ -3214,6 +3230,80 @@ mod tests {
             "release must restore NEUTRAL state"
         );
         assert_eq!(monitor_registry_len(&table), 0);
+    }
+
+    /// The quartet — `kind`, `element_type`, `gc_flags`, `gc_age` — lives in
+    /// mark-word bits 48..61 since the header shrink. It is NOT lock state, and
+    /// a lock/unlock round trip must return it unchanged.
+    ///
+    /// The final-release arm of `try_thin_unlock` used to store the bare
+    /// `types::MARK_NEUTRAL` literal, so one `synchronized` block erased all
+    /// four. Losing `GC_FLAG_COMPACT` is the loudest half: every reader that
+    /// honours the per-object header then decodes the object's packed 8-byte
+    /// reference fields as 16-byte legacy `Value` cells. On dev tip that made
+    /// `Collections.synchronizedSet(...).iterator()` return null after the
+    /// first `synchronized` on the set, which failed every Spring Boot test
+    /// class at JUnit discovery.
+    #[test]
+    fn lock_unlock_round_trip_preserves_the_header_quartet() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(11);
+        let header = header_of(obj);
+
+        // Give the object every quartet field a real one could carry.
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        header.set_gc_age(5);
+        let before = ObjectHeader::quartet_of(header.mark_word.load(Ordering::Acquire));
+        assert_ne!(before, 0, "the test must start with a non-empty quartet");
+
+        table.enter(obj, tid);
+        assert_eq!(
+            ObjectHeader::quartet_of(header.mark_word.load(Ordering::Acquire)),
+            before,
+            "monitorenter must carry the quartet"
+        );
+
+        table.exit(obj, tid).unwrap();
+        let after = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(
+            ObjectHeader::mark_state(after),
+            types::MARK_NEUTRAL,
+            "release must restore NEUTRAL state"
+        );
+        assert_eq!(
+            ObjectHeader::quartet_of(after),
+            before,
+            "the LAST release must carry the quartet too — kind/element_type/\
+             gc_flags/gc_age are not lock state"
+        );
+        assert_eq!(header.gc_flags() & cratonvm_types::GC_FLAG_COMPACT, cratonvm_types::GC_FLAG_COMPACT);
+        assert_eq!(header.gc_age(), 5);
+    }
+
+    /// Same obligation across a RECURSIVE acquisition: every intermediate
+    /// release goes through `make_thin_locked`, only the last through the arm
+    /// that was wrong.
+    #[test]
+    fn recursive_lock_unlock_preserves_the_header_quartet() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(12);
+        let header = header_of(obj);
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        let before = ObjectHeader::quartet_of(header.mark_word.load(Ordering::Acquire));
+
+        for _ in 0..4 {
+            table.enter(obj, tid);
+        }
+        for _ in 0..4 {
+            table.exit(obj, tid).unwrap();
+            assert_eq!(
+                ObjectHeader::quartet_of(header.mark_word.load(Ordering::Acquire)),
+                before,
+                "no release level may consume the quartet"
+            );
+        }
     }
 
     #[test]

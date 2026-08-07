@@ -708,19 +708,26 @@ pub struct GcFlags {
     pub g1_parallel_evac: bool,
     /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
     pub g1_no_evac_retry: bool,
-    /// `CRATONVM_G1_NO_COVERAGE_PIN` — opt **out** of the default-ON refusal to
-    /// evacuate while this collection's JIT root set is known to be
-    /// incomplete. Consumers want `!g1_no_coverage_pin`.
+    /// `CRATONVM_G1_COVERAGE_PIN` — **diagnostic bisection lever, default
+    /// OFF.** Make G1 refuse to evacuate on any pause whose JIT root set is
+    /// recorded as incomplete, by forcing an empty collection set.
     ///
-    /// Setting it reinstates the pre-2026-08-07 behaviour, in which G1
-    /// relocated objects whose only reference lived in a JIT frame the root
-    /// scan could not enumerate — a native SIGSEGV rather than a controlled
-    /// error. It stays declared (rather than becoming a bare `getenv`) so the
-    /// A/B that validated the fix remains reproducible; see
-    /// `G1Collector::root_coverage_incomplete_reason`, which is deliberately
-    /// NOT gated on this flag — the opt-out arm still counts every pause the
-    /// gate would have stopped.
-    pub g1_no_coverage_pin: bool,
+    /// This is NOT a shipped safety default, and the reason is measured: on
+    /// `probes/MovingYoungConcurrentProbe 6 400 2000` under `-XX:+UseG1GC`,
+    /// 330263 of 330264 pauses report incomplete coverage, because the flag
+    /// means "this collection's JIT roots are not REWRITABLE" — the normal
+    /// state whenever any thread is in compiled code — not "this collection's
+    /// JIT roots were not ENUMERATED". Refusing on it starves reclamation: the
+    /// same run needed ONE collection with the lever off and took 330264 no-op
+    /// pauses with it on.
+    ///
+    /// What it is for: deciding whether a G1-only crash is a root-coverage
+    /// defect at all. Under this lever G1 moves nothing, so a crash that
+    /// survives it is not caused by a relocation the root set failed to cover.
+    /// See `G1Collector::root_coverage_incomplete_reason`, whose DETECTION is
+    /// deliberately not gated on this flag — the counters report the rate in
+    /// both arms.
+    pub g1_coverage_pin: bool,
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].
     pub g1_workers: Option<usize>,
@@ -891,7 +898,7 @@ impl GcFlags {
             old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
             g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
-            g1_no_coverage_pin: present(src, "CRATONVM_G1_NO_COVERAGE_PIN"),
+            g1_coverage_pin: present(src, "CRATONVM_G1_COVERAGE_PIN"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
             gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
                 .filter(|&n| n >= 64)

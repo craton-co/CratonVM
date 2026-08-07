@@ -1,6 +1,43 @@
 # The compact reference-field layout corrupts `FileChannelImpl.fileLockTable`, so every file lock fails
 
 ## Status
+**FIXED 2026-08-07** — and *not* by anything in the compact reference-field
+layout. See the `monitorexit-erases-object-header-quartet-FIXED-20260807`
+write-up next to this file for the fix and its regression tests.
+
+The mechanism is one line in `vm/src/threading/monitor.rs`: `try_thin_unlock`'s
+final-release arm stored a bare `types::MARK_NEUTRAL`, which since the header
+shrink erases the object's `kind` / `element_type` / `gc_flags` / `gc_age`
+quartet from mark-word bits 48..63. `FileChannelImpl.fileLockTable()` is
+double-checked locking around `synchronized (this)`, so the `gc_flags=0x0` this
+page recorded is that store — the object was allocated **compact** and
+un-compacted by monitorexit. `probes/CompactLayoutFileLockProbe` goes from
+`PROBE-FAILURES=1` to `PROBE-OK` on the fix, `--nojit`, same binary otherwise.
+
+**This page's "leading hypothesis" below is refuted, and the refutation is worth
+keeping.** It argued "allocated legacy, written compact" — a per-class writer
+gate (`interpreter.rs`'s precomputed `compact_field_slot`, the two `jit_bridge`
+sites, `jit/helpers.rs`) racing `plan_object_alloc`'s per-allocation decision,
+and proposed closing that seam. `CRATONVM_DBG=compact-legacy` prints one line
+for **every** allocation that actually takes the legacy fallback, and prints
+nothing for `FileChannelImpl` or for the second victim found later
+(`java.util.Collections$SynchronizedSet`, which failed every Spring Boot test
+class at JUnit discovery). Both objects were allocated compact. The writers
+named below are not implicated and the `plan_object_alloc` seam is not what
+failed here — though "per-allocation decision, per-class consumption cannot be
+right either way" remains a fair design observation, now without a bug behind
+it.
+
+`CRATONVM_COMPACT_REF_FIELDS=0` worked as a workaround for the same reason it
+misled: with the compact layout off there is no `GC_FLAG_COMPACT` to lose.
+
+The original page follows unchanged from here.
+
+---
+
+# The compact reference-field layout corrupts `FileChannelImpl.fileLockTable`, so every file lock fails
+
+## Status (as originally filed)
 **OPEN, regression, deterministic (2026-08-07).** Bisected to
 `6ba350cdd` — *"Merge perf/header-16-and-field-packing-20260806: HEADER_SIZE 24
 -> 16"*. Its first parent `9ddbc9c61` is clean; `6ba350cdd` fails, and so does

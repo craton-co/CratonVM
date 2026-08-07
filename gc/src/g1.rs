@@ -3454,13 +3454,21 @@ impl G1Collector {
             // its header is intact and its region is held under the collection's
             // `regions` lock (Phase 5 has not run yet).
             unsafe {
-                // Retire the forward. These are from-space objects the cycle has
-                // abandoned, so NEUTRAL is the right resting state — there is no
-                // lock state left to preserve on a dead copy, and the live one
-                // carries the mark word this evacuation transferred to it.
-                (*(k as *const ObjectHeader))
-                    .mark_word
-                    .store(cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
+                // Retire the forward. These are from-space objects the cycle
+                // has abandoned, so NEUTRAL is the right resting *lock* state —
+                // the live copy carries the mark word this evacuation
+                // transferred to it.
+                //
+                // The QUARTET is not lock state and must survive: `kind` and
+                // `element_type` are what every linear region walker sizes a
+                // from-space object from, and this store runs while Phase 5 has
+                // not yet zeroed the region. Storing a bare `MARK_NEUTRAL` here
+                // left an abandoned copy claiming to be a zero-slot plain
+                // object.
+                let h = &*(k as *const ObjectHeader);
+                let quartet = ObjectHeader::quartet_of(h.mark_word.load(Ordering::Relaxed));
+                h.mark_word
+                    .store(quartet | cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
             }
         }
 
@@ -7359,37 +7367,51 @@ impl G1Collector {
     /// all). In each of those the pin set comes back *empty for that frame*,
     /// G1 sees no reason to exclude anything, and it evacuates an object whose
     /// only reference lives in a slot nothing will rewrite. The next
-    /// dereference is a native `SIGSEGV`, not a controlled Java error — which
-    /// is what
-    /// `docs/known-issues/hibernate/g1-collector-fullsuite-crashes-hangs-fails-20260806.md`
-    /// and
-    /// `docs/known-issues/springboot/g1-fullsuite-regression-20260807.md`
-    /// both recorded, from three and one crash sites respectively, with the
-    /// collector's own "last incomplete-coverage reason" field already naming
-    /// the obligation in every report.
+    /// dereference would be a native `SIGSEGV`, not a controlled Java error —
+    /// the shape the two retired 2026-08 full-suite G1 comparisons (the
+    /// `g1-collector-fullsuite-crashes-hangs-fails-20260806` and
+    /// `g1-fullsuite-regression-20260807` write-ups) recorded, from three and
+    /// one crash sites respectively, with the collector's own "last
+    /// incomplete-coverage reason" field already naming an obligation in every
+    /// report.
     ///
-    /// # The fail-safe
+    /// # Why this is a DIAGNOSTIC, not a fail-safe
     ///
-    /// The generational collector answers an incomplete proof by diverting to
-    /// its NON-MOVING young sweep. G1 has no non-moving young path to divert
-    /// to, so the equivalent conservative answer is an **empty collection
-    /// set**: this pause reclaims nothing and every object keeps its address.
-    /// That is strictly weaker than the generational diversion in what it
-    /// reclaims and strictly stronger in what it guarantees — the generational
-    /// sweep still *frees* on mark bits derived from the same incomplete root
-    /// set (the `ClassId(0)` family in `docs/known-issues/h2/`), whereas an
-    /// empty CSet cannot free or move anything.
+    /// Each of the reasons above is, on inspection, already backed by a
+    /// conservative scan whose roots G1 pins:
     ///
-    /// Reclamation is not starved: the flag is per-collection, cleared by
-    /// `begin_moving_young_coverage_cycle` at every initiator entry, so the
-    /// next pause taken with provable coverage collects normally.
+    /// * an unregistered frame is detected and its whole band is scanned by
+    ///   `conservative_roots::scan_active_jit_frames`, which pushes the band's
+    ///   oops into the same `roots` vector `memory::roots::collect_roots`
+    ///   then republishes through `gc_quiescence::add_pinned_jit_root`;
+    /// * a precise entry always ALSO gets a conservative band scan
+    ///   (`scan_compiled_frame_bands`, or the whole-band `scan_one_frame`
+    ///   fallback when its metadata is not trustworthy), so an unresolvable
+    ///   innermost RBP or a missing exact RBP still leaves the frame covered;
+    /// * a parked or blocked peer publishes its own conservative JIT roots via
+    ///   `interpreter::update_root_snapshot`'s `publish_pinned_jit_roots`;
+    /// * a forcibly-frozen peer and its helper window are pinned by
+    ///   `interpreter::pin_frozen_peer_roots_for_g1`, and its un-retired TLAB
+    ///   tail by [`Self::set_jit_tlab_skip_regions`].
     ///
-    /// This is the DETECTION only. It deliberately does not consult the
-    /// `CRATONVM_G1_NO_COVERAGE_PIN` opt-out: the caller gates the *refusal*
-    /// on that flag but counts the detection either way, so the arm that
-    /// reinstates the defect still reports how often the gate would have
-    /// fired. A kill switch that also switches off its own measurement cannot
-    /// be used to justify the default.
+    /// So "coverage incomplete" under G1 means *the roots are not REWRITABLE*,
+    /// which is the normal state whenever a thread is in compiled code — not
+    /// *the roots were not ENUMERATED*. Measured: 330263 of 330264 pauses on
+    /// `probes/MovingYoungConcurrentProbe 6 400 2000`. Refusing to evacuate on
+    /// it is therefore both unnecessary and ruinous — the same run needs ONE
+    /// collection with the lever off and takes 330264 no-op pauses with it on,
+    /// because a pause that frees nothing is immediately re-triggered by the
+    /// next allocation.
+    ///
+    /// The refusal is kept as an opt-IN bisection lever
+    /// (`CRATONVM_G1_COVERAGE_PIN`, [`crate::gc_flags`]`().g1_coverage_pin`):
+    /// under it G1 moves nothing, so a G1-only crash that survives it is not
+    /// caused by a relocation the root set failed to cover. That is the
+    /// experiment both 2026-08 full-suite G1 pages asked for and could not run.
+    ///
+    /// This function is the DETECTION only and is deliberately NOT gated on
+    /// that flag, so the counters report the rate in both arms. A lever that
+    /// also switches off its own measurement cannot settle anything.
     pub(crate) fn root_coverage_incomplete_reason() -> Option<usize> {
         // `force_non_moving_jit_roots` is the root gatherer's own OSR-shadow
         // verdict and does not always travel with a reason code; report the
@@ -7406,6 +7428,17 @@ impl G1Collector {
         } else {
             reason
         })
+    }
+
+    /// Whether this pause must decline to evacuate: the detection from
+    /// [`Self::root_coverage_incomplete_reason`] AND the opt-in
+    /// `CRATONVM_G1_COVERAGE_PIN` lever.
+    ///
+    /// A pure function of its two inputs so both arms are testable —
+    /// `gc_flags()` latches for the process, so a test cannot flip the lever
+    /// from inside one.
+    fn refuse_evacuation(coverage_incomplete: Option<usize>, lever_on: bool) -> Option<usize> {
+        coverage_incomplete.filter(|_| lever_on)
     }
 
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
@@ -8422,9 +8455,9 @@ impl GarbageCollector for G1Collector {
         let coverage_incomplete = Self::root_coverage_incomplete_reason();
         // Counted in BOTH arms — see `root_coverage_incomplete_reason`.
         crate::gc_metrics::record_g1_pause_coverage(coverage_incomplete.is_some());
-        // Only the REFUSAL is gated. `CRATONVM_G1_NO_COVERAGE_PIN` reinstates
-        // the pre-fix evacuation for A/B isolation.
-        let refuse = coverage_incomplete.filter(|_| !gc_flags().g1_no_coverage_pin);
+        // Only the REFUSAL is gated, and it is OFF by default — see
+        // `root_coverage_incomplete_reason` for the measurement that says why.
+        let refuse = Self::refuse_evacuation(coverage_incomplete, gc_flags().g1_coverage_pin);
         crate::gc_metrics::record_collector_decision(
             "g1",
             match refuse {
@@ -8452,7 +8485,7 @@ impl GarbageCollector for G1Collector {
                     bytes_copied: 0,
                     bytes_freed: 0,
                 },
-                pointer_map: HashMap::new(),
+                pointer_map: cratonvm_types::PointerMap::default(),
             };
         }
         let pause_start = std::time::Instant::now();
@@ -9926,15 +9959,40 @@ mod tests {
     /// cover that case — the frames in question are exactly the ones the
     /// conservative scan never reached, so they publish no address to pin.
     ///
-    /// Asserted from the outside, through `collect_garbage`, because that is
-    /// the single entry to G1's two object-moving paths and therefore the
-    /// only place the guarantee can be stated once.
+    /// The LEVER's two arms, stated on the pure decision function because
+    /// `gc_flags()` latches process-wide and a test cannot flip it from inside
+    /// one. Off (the shipped default) G1 evacuates regardless; on, it refuses.
     #[test]
-    fn incomplete_root_coverage_evacuates_nothing() {
+    fn the_coverage_lever_gates_only_the_refusal() {
+        let reason = Some(crate::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME);
+        assert_eq!(
+            G1Collector::refuse_evacuation(reason, false),
+            None,
+            "default: an incomplete root set is RECORDED, not acted on — the \
+             conservative scan that produced the pins already covered it"
+        );
+        assert_eq!(
+            G1Collector::refuse_evacuation(reason, true),
+            reason,
+            "lever on: this pause must not evacuate"
+        );
+        assert_eq!(
+            G1Collector::refuse_evacuation(None, true),
+            None,
+            "lever on but coverage complete: evacuate normally"
+        );
+    }
+
+    /// The default must still EVACUATE on an incomplete-coverage pause — the
+    /// measured alternative starves reclamation (330263 of 330264 pauses report
+    /// incomplete on `MovingYoungConcurrentProbe`). Stated through
+    /// `collect_garbage` because that is the single entry to G1's two
+    /// object-moving paths.
+    #[test]
+    fn incomplete_root_coverage_still_evacuates_by_default() {
         let gc = make_collector();
         let obj = gc.alloc_object(ClassId::new(1), 1);
         gc.set_field(obj, 0, Value::Int(77));
-        let before = obj.as_ptr();
 
         crate::gc_quiescence::begin_moving_young_coverage_cycle();
         crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
@@ -9949,32 +10007,21 @@ mod tests {
             &NoopMonitors,
         );
 
-        assert_eq!(
-            result.stats.objects_copied, 0,
-            "G1 must not evacuate while the JIT root set is known-incomplete"
-        );
-        assert!(
-            result.pointer_map.is_empty(),
-            "an empty collection set cannot have relocated anything"
-        );
-        assert_eq!(
-            roots[0].as_ptr(),
-            before,
-            "the object must keep its address: the reference that names it may \
-             live in a JIT slot nothing will rewrite"
-        );
+        assert!(result.stats.objects_copied >= 1);
         assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
 
         crate::gc_quiescence::begin_moving_young_coverage_cycle();
     }
 
-    /// The decision report must NAME the refusal. A collector that silently
-    /// declines to reclaim reads as "there was no garbage" — the exact
-    /// misreading `collector_decision_report` exists to prevent.
+    /// …but the pause must SAY that its root set was incomplete. A collector
+    /// that keeps that to itself is why both 2026-08 full-suite G1 pages had to
+    /// infer the mechanism from a crash dump.
     #[test]
-    fn incomplete_root_coverage_is_recorded_as_the_reason() {
+    fn incomplete_root_coverage_is_recorded_even_when_it_is_not_acted_on() {
         let gc = make_collector();
         let obj = gc.alloc_object(ClassId::new(1), 1);
+
+        let (pauses_before, incomplete_before) = crate::gc_metrics::g1_pause_coverage_counts();
 
         crate::gc_quiescence::begin_moving_young_coverage_cycle();
         crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
@@ -9992,20 +10039,16 @@ mod tests {
         let d = crate::gc_metrics::last_collector_decision().expect("a decision was recorded");
         assert_eq!(d.backend, "g1");
         assert_eq!(
-            d.reason,
-            crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE,
-        );
-        assert_eq!(
             d.incomplete_reason,
             crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+            "the obligation that failed must reach the decision record"
         );
-        assert!(!d.young_moving, "the refusal is not a moving cycle");
 
-        let facts = crate::gc_metrics::last_g1_cycle().expect("a G1 cycle was recorded");
+        let (pauses, incomplete) = crate::gc_metrics::g1_pause_coverage_counts();
+        assert!(pauses > pauses_before, "the pause must be counted");
         assert!(
-            facts.degraded & crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE != 0,
-            "the cycle record must distinguish 'not allowed to collect' from \
-             'nothing to collect'"
+            incomplete > incomplete_before,
+            "and counted as incomplete — the rate is the whole point of the counter"
         );
 
         crate::gc_quiescence::begin_moving_young_coverage_cycle();

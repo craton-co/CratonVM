@@ -813,13 +813,13 @@ pub fn gc_scan_ds_roots(out: &mut Vec<ObjectRef>) {
 /// Companion to [`gc_scan_ds_roots`]: re-key both tables through the
 /// collector's relocation map so a lookup on the relocated `DatagramSocket`
 /// still resolves.
-pub fn gc_update_ds_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_ds_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
     fn rekey<V>(
         map: &mut std::collections::HashMap<ObjectRef, V>,
-        pointer_map: &std::collections::HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
     ) {
         let drained: Vec<_> = map.drain().collect();
         for (k, v) in drained {

@@ -335,9 +335,21 @@ pub const NUM_SLOTS_OFFSET: usize = 4;
 // That last point is the load-bearing one and it is enforced, not assumed:
 // `make_inflated` and `make_forwarded` both assert `plausible_heap_pointer`.
 pub const MARK_QUARTET_SHIFT: u32 = 48;
-/// The 13 bits the quartet occupies. Everything outside it belongs to the
-/// state tag and its payload.
-pub const MARK_QUARTET_MASK: u64 = 0x3FFFu64 << MARK_QUARTET_SHIFT;
+/// The 16 bits the quartet occupies — bits 48..63, i.e. the whole of bytes 6
+/// and 7. Everything outside it belongs to the state tag and its payload.
+///
+/// It must cover the LAST quartet field, not merely most of them. This was
+/// `0x3FFF` (bits 48..61) while `gc_age` sits at bits 60..63, so an object
+/// whose age reached 4 had bit 62 set OUTSIDE the mask. Two things broke for
+/// exactly those objects: `try_thin_lock`'s `cur & !MARK_QUARTET_MASK ==
+/// MARK_NEUTRAL` test ("unlocked and unhashed") could never succeed, so every
+/// `synchronized` on an aged object inflated a `Monitor` on the uncontended
+/// fast path; and every `quartet_of(prev)` carry — `make_thin_locked`,
+/// `make_inflated`, `make_neutral_hashed` — silently dropped the top two age
+/// bits, resetting an age-12 survivor to 0 on its first lock or identity hash
+/// and restarting tenuring. `quartet_covers_every_quartet_field` pins the
+/// relationship so a later field cannot outgrow the mask again.
+pub const MARK_QUARTET_MASK: u64 = 0xFFFFu64 << MARK_QUARTET_SHIFT;
 
 // The sub-fields are placed for the BENEFIT OF THE JIT, not for tidiness.
 //
@@ -363,6 +375,75 @@ const FLAGS_SHIFT: u32 = MARK_QUARTET_SHIFT + 8; // 56: byte 7, bits 0..4
 const FLAGS_BITS: u64 = 0xF;
 const AGE_SHIFT: u32 = MARK_QUARTET_SHIFT + 12; // 60: byte 7, bits 4..8
 const AGE_BITS: u64 = 0xF;
+
+#[cfg(test)]
+mod quartet_layout_tests {
+    use super::*;
+
+    /// Every quartet sub-field must lie wholly inside [`MARK_QUARTET_MASK`].
+    ///
+    /// The mask is what `quartet_of` carries across a mark-word state change
+    /// and what `try_thin_lock` masks out to ask "is this word unlocked and
+    /// unhashed?". A field that pokes outside it is therefore lost on every
+    /// lock/inflate/hash and makes the unlocked test unsatisfiable — which is
+    /// precisely what `gc_age`'s top two bits did while the mask was `0x3FFF`.
+    #[test]
+    fn quartet_covers_every_quartet_field() {
+        for (name, shift, bits) in [
+            ("kind", KIND_SHIFT, KIND_BITS),
+            ("element_type", ELEM_SHIFT, ELEM_BITS),
+            ("gc_flags", FLAGS_SHIFT, FLAGS_BITS),
+            ("gc_age", AGE_SHIFT, AGE_BITS),
+        ] {
+            let field = bits << shift;
+            assert_eq!(
+                field & !MARK_QUARTET_MASK,
+                0,
+                "{name} occupies bits outside MARK_QUARTET_MASK, so quartet_of() \
+                 drops them and try_thin_lock() can never see the object unlocked"
+            );
+        }
+    }
+
+    /// The mask must not reach into any state payload. Stated from the other
+    /// side so widening it further cannot silently eat the hash, the thin-lock
+    /// owner, or a pointer payload.
+    #[test]
+    fn quartet_does_not_overlap_any_state_payload() {
+        assert_eq!(MARK_QUARTET_MASK & MARK_STATE_MASK, 0, "state tag");
+        assert_eq!(MARK_QUARTET_MASK & MARK_HASH_MASK, 0, "neutral identity hash");
+        assert_eq!(
+            MARK_QUARTET_MASK & THIN_LOCK_OWNER_MASK,
+            0,
+            "thin-lock owner"
+        );
+        assert_eq!(
+            MARK_QUARTET_MASK & THIN_LOCK_RECURSION_MASK,
+            0,
+            "thin-lock recursion"
+        );
+        // Pointer payloads are capped at 2^47 - 1 by `plausible_heap_pointer`,
+        // which `make_inflated` and `make_forwarded` both assert.
+        assert!(
+            MARK_QUARTET_SHIFT >= 47,
+            "the quartet must start at or above the pointer cap"
+        );
+    }
+
+    /// A full age round trip through the carry every state change uses.
+    #[test]
+    fn every_representable_age_survives_a_quartet_carry() {
+        for age in 0..=(AGE_BITS as u8) {
+            let word = (age as u64) << AGE_SHIFT;
+            let carried = ObjectHeader::quartet_of(word);
+            assert_eq!(
+                (carried >> AGE_SHIFT) & AGE_BITS,
+                age as u64,
+                "age {age} did not survive quartet_of()"
+            );
+        }
+    }
+}
 
 /// Byte offset, from the OBJECT BASE, of the byte holding [`GC_FLAG_OLD_GEN`]
 /// / [`GC_FLAG_MARKED`] / [`GC_FLAG_COMPACT`].
