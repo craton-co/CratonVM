@@ -50,7 +50,7 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 /// No-op monitor cleanup — the soak does not exercise monitors.
 struct NoMonitors;
 impl MonitorCleanup for NoMonitors {
-    fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+    fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
 }
 
 /// Soak parameters. Sized so the test wall-clock fits in 5 min on a

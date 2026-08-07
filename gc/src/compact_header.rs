@@ -522,7 +522,7 @@ impl HashCodeTable {
     /// old remap-only behaviour, and read the paragraph above first.
     pub fn update_after_gc(
         &self,
-        pointer_map: &HashMap<usize, usize>,
+        pointer_map: &cratonvm_types::PointerMap,
         survived: &dyn Fn(usize) -> bool,
     ) {
         let mut write = self.table.write();
@@ -1570,7 +1570,7 @@ mod tests {
     fn hash_table_update_after_gc() {
         let ht = HashCodeTable::new();
         let hash = ht.get_or_assign(0x1000);
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x1000usize, 0x5000usize);
         ht.update_after_gc(&map, &|_| false);
         // Old address gone, new address has the same hash.
@@ -1597,7 +1597,7 @@ mod tests {
         let died = ht.get_or_assign(0x3000);
         assert_ne!(stayed, died);
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0x1000usize, 0x5000usize);
         // Only 0x2000 is a stationary survivor; 0x3000 was reclaimed.
         ht.update_after_gc(&map, &|addr| addr == 0x2000);

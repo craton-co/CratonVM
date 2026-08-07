@@ -181,7 +181,7 @@ impl OscCache {
     }
 
     /// Rewrite cached descriptors after a moving collection.
-    pub fn remap_roots(&self, pointer_map: &HashMap<usize, usize>) {
+    pub fn remap_roots(&self, pointer_map: &cratonvm_types::PointerMap) {
         if pointer_map.is_empty() {
             return;
         }
@@ -358,7 +358,7 @@ mod tests {
         let cid = ClassId::new(6001);
         cache.insert_if_absent(cid, old_ref);
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_ref.as_ptr() as usize, new_ref.as_ptr() as usize);
         cache.remap_roots(&map);
 
@@ -384,7 +384,7 @@ mod tests {
         vm_b.insert_if_absent(cid, shared_addr);
 
         // VM B collects and moves the object at `shared_addr`.
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(shared_addr.as_ptr() as usize, relocated.as_ptr() as usize);
         vm_b.remap_roots(&map);
 
@@ -405,7 +405,7 @@ mod tests {
 
         // A remap table that mentions a *different* address must not
         // disturb our entry.
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(0xDEAD_0000usize, 0xBEEF_0000usize);
         cache.remap_roots(&map);
 

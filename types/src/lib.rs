@@ -31,6 +31,19 @@ pub mod striped_counter;
 pub mod subsystem_config;
 mod value;
 
+
+/// One collection's `old address -> new address` relocation table.
+///
+/// Hashed with `FxHasher`, not the default `SipHash`. The keys are heap
+/// addresses produced by the collector itself, so there is no adversarial-input
+/// concern, and the table is both built and consumed once per collection at a
+/// size proportional to the live set — on a Spring workload that is ~756 000
+/// entries per young collection. The moving collector already accumulated into
+/// an `FxHashMap` for exactly that reason and then paid to convert it into a
+/// `HashMap` for this field: 43 ms of a 424 ms stop-the-world pause, to change
+/// a container type. Naming the hasher here is what removes that conversion.
+pub type PointerMap = rustc_hash::FxHashMap<usize, usize>;
+
 pub use class_id::{ClassId, ClassLoaderId};
 pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 // The JDK-only policy token. `types` is the only crate that `native-api`,

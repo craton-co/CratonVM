@@ -3420,7 +3420,7 @@ fn flush_top_rbp_cache_to_chain(v: &mut [JitFrameChainEntry]) {
 /// Reads and writes aligned qwords on the calling thread's own stack between
 /// known-valid frame slots. The CompiledMethod is kept alive by the JIT cache
 /// for the duration of the call (same contract as [`scan_one_frame_precise`]).
-pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -3597,7 +3597,7 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
 fn remap_one_jit_frame(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
-    pointer_map: &std::collections::HashMap<usize, usize>,
+    pointer_map: &cratonvm_types::PointerMap,
 ) -> (bool, usize, usize) {
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
