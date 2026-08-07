@@ -1,6 +1,76 @@
 # The JIT arm exhausts the young heap since `HEADER_SIZE 24 -> 16`
 
 ## Status
+**FIXED 2026-08-07** in `0ea21c07a` (`gc/src/gen_heap.rs`). The record below is
+kept as written; this banner answers the question it left open.
+
+### Which of the two readings was right: the span IS a real object
+
+This page listed two readings and said they were "not yet distinguished". It is
+the first one, and the deciding evidence is that the discriminator's own
+invariant is written down in a comment that the shrink silently falsified.
+
+`gc/src/tlab.rs` still states it: a live `new Object()` is distinguishable from
+zeroed arena because **"identity_hash at offset 8"** is its one non-zero header
+word. The `HEADER_SIZE` 24 -> 16 shrink made offset 8 the **mark word**, and
+`jit/src/x64/objects.rs` deliberately leaves it zero -- *"identity_hash_code
+(offset 8) stays 0 (TLAB-zeroed); the lazy-mint contract ... handles it on
+demand"* -- then stores two explicit zero dwords there. `MARK_NEUTRAL` is
+`0b00` and `ObjectKind::Object` is `0`, so a JIT-allocated `new Object()` is
+`class_id 0 / shape 0 / mark_word 0`: an all-zero 16-byte header. The
+interpreter still stamps a hash eagerly (H1), which is exactly why `--nojit`
+passes and the JIT arm does not.
+
+### The damage was the response, not the detection
+
+One 16-byte span sent the walk from offset 7938816 to 241826160 -- **233 MB of
+a 256 MB young generation abandoned unswept**. With an empty free list there is
+no anchor to recover at, so the sweep reclaimed nothing. Under
+`CRATONVM_DBG_GC_OVERHEAD=1` the fingerprint is unambiguous:
+
+```
+young_used == young_cap   young_free_list=0   young_largest_free=0
+promoted=7529728  freed=7529728        <- freed EXACTLY equals promoted
+```
+
+`freed == promoted` every cycle means promotion is young's only exit; old
+headroom then bled 209 -> 186 MB until allocation failed with 68 MB live in a
+1 GB heap. `clear_all_mark_bits_in_arena` resynced past the stretch too, so
+mark bits stayed set behind it.
+
+This also corrects one claim above: promotion does **not** stop entirely. Over
+a longer run the same build reports `sp_evacuated=32787898`. Selective
+promotion works; it was the *sweep* that reclaimed nothing.
+
+### The fix, and the wrong version of it
+
+Step over the zero run and keep walking, instead of unwinding and re-anchoring.
+The span is still never parsed and never freed, so nothing live can be lost.
+The conservative half is kept: reclaim decisions taken since the last anchor
+are still dropped.
+
+Advance by **whole headers**, never to `run_end`. `run_end` is the first
+non-zero WORD, not an object start -- a 24-byte zero run is a 16-byte all-zero
+header plus the zero `class_id`/`shape` word of the NEXT object, whose mark
+word ended the run. The first revision of this fix jumped there, resumed 8
+bytes inside that object, and produced **3486 "implausible object size" aborts
+per run** on the 60k arm against **zero** on the unpatched build -- it passed
+the small arm and failed the large one. Offsets are 8-aligned, so a run length
+is 0 or 8 mod `HEADER_SIZE` and truncating to whole headers lands on an object
+start either way.
+
+### Measured
+
+| arm | before | after |
+|---|---|---|
+| `H2UpdateScaleProbe` 4t x 2500, `--Xmx 1g` | OOM (515 / 222 minor GCs) | **PASS** (4 / 4) |
+| `H2UpdateScaleProbe` 4t x 60000, `--Xmx 4g` | OOM 515 s, 5038 minor GCs | **PASS 163 s, 11** |
+| `org.h2.test.db.TestIndex`, `--Xmx 1g` | 117650 `OutOfMemoryError` | **0, RC=0** |
+
+ABBA-interleaved. `implausible object size` and `abandoning rest of arena` are
+0 in every fixed arm. gc 1023 tests and vm 2454 lib tests green.
+
+## Status (as filed)
 **OPEN (2026-08-07).** A/B'd against the merge's own first parent with two
 binaries built from this tree, so the attribution is not an inference. Not a
 throughput problem: the same class passes with `--nojit`, and passed on the

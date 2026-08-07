@@ -1,6 +1,16 @@
 # The H2 UPDATE path exhausts the heap under the JIT: every young collection is a non-moving sweep
 
 ## Status
+**FIXED 2026-08-07** in `0ea21c07a`. Root cause and measurements are in
+`docs/internal/fixed-suite-bugs/vm/jit-young-heap-exhaustion-after-header-16-FIXED-20260807.md`:
+a JIT-allocated `new Object()` has an all-zero 16-byte header since the
+`HEADER_SIZE` 24 -> 16 shrink, the young sweep read that as walk desync, and
+abandoned the rest of the arena. Both questions this page asked are answered
+there -- and the first ("why the fallback rate jumped 3 -> 361") was the wrong
+question: the fallback FRACTION barely moved (75% -> 99.4%), what exploded was
+the number of collections.
+
+## Status (as filed)
 **OPEN (2026-08-07).** A hard failure, not a slow one: `H2UpdateScaleProbe`'s
 `testConcurrentUpdate` shape dies with H2 `Out of memory` at `--Xmx 1g` and 2g
 where the pre-landing tip completes, and at 4g once the update count is raised.

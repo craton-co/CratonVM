@@ -57,6 +57,32 @@ already green. Whatever the remaining five are, they are not this.
 
 ### A caution for anyone A/B-ing this suite
 
+**What did NOT change: the constant factor.** ABBA-interleaved, `--Xmx 4g`, on a
+quiet host (load 6.7-8.8), work term for 10 000 updates after subtracting an
+interleaved 0-update baseline of the same shape:
+
+| build | baseline | with updates | work term |
+|---|---|---|---|
+| pre-landing `1082eb446` | 15.44 | 37.41 | **21.97 CPU-s** |
+| current dev | 16.19 | 38.64 | **22.45 CPU-s** |
+
++2%, inside noise. Against HotSpot's ~1.13 CPU-s on the same shape that is
+**~20x at 4 threads**, where the table below says ~31x — the difference is the
+host, not the VM: this page's setup figure of 36-54 CPU-s is 15-16 CPU-s on a
+quiet one. Quote the ratio, never the absolute, and record `uptime`.
+
+**The thread-scaling experiment was blocked on the OOM, and is not any more.**
+When this was written the arm size this page specifies (~100 000 updates)
+exhausted the heap before finishing. Fixed 2026-08-07 in `0ea21c07a` -- 4
+threads x 60 000 updates at `--Xmx 4g` now completes in 163 s. The experiment
+is runnable; see the scaling section below.
+
+**The probe is not missing, and it has moved.** `H2UpdateScaleProbe.java` was in
+`docs/internal/repros/h2-insert-scale-20260731/` — the Reproducing block below
+names no path, and `apps/` is gitignored, so it was invisible from the obvious
+place. It now lives at **`probes/H2UpdateScaleProbe.java`**, out of a directory
+slated for deletion. Its third argument is `objectCount`, not the lock timeout.
+
 A 40-class A/B of the enqueue fix, run 4-way parallel at a 180 s cap, showed
 30 PASS on both arms and three apparent changes: `TestAnalyzeTableTx`
 PASS->FAIL, `TestBigResult` HANG->PASS, `TestLargeBlob` HANG->FAIL. Re-run **in
@@ -270,7 +296,15 @@ and so are the next targets:
   falls back to the non-moving sweep — `reason=unregistered-jit-frame-on-stack`,
   `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-callee`
   — which is its own question and has its own pages.
-  **ESCALATED 2026-08-07: this is no longer a throughput tax, it is the OOM.**
+  **RESOLVED 2026-08-07 (`0ea21c07a`).** The escalation below was right that
+  this had stopped being a throughput tax, and wrong about which half was at
+  fault: the fallback FRACTION barely moved (75% -> 99.4%), the collection
+  COUNT exploded. The fallback is still pre-existing and still open; what was
+  new is that the non-moving sweep abandoned the arena on an all-zero span,
+  because a JIT-allocated `new Object()` now has an all-zero header. Fixed;
+  `H2UpdateScaleProbe` 4t x 60000 at `--Xmx 4g` goes from OOM to PASS in 163 s
+  and 5038 minor GCs to 11. The thread-scaling arm below is UNBLOCKED.
+  **Superseded 2026-08-07: this is no longer a throughput tax, it is the OOM.**
   The fallback rate against this exact workload went from 3 to 361, and with it
   the run stopped finishing. It is now the top item on this page, not a
   footnote to it — see the re-measurement above.
