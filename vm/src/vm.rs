@@ -76204,7 +76204,13 @@ public class SkippedTest {
         assert!(arr.is_some());
 
         assert_eq!(alloc.object_count(), 3);
-        assert_eq!(alloc.bytes_saved(), 72); // 3 * 24
+        // Derived, not a literal: the legacy header went 32 -> 24 on 2026-08-06
+        // and the saving per object went 24 -> 16 with it. `compact_header.rs`
+        // has the same expression as `LEGACY_MINUS_COMPACT_HEADER` and its own
+        // tests were updated; these three in `vm.rs` were the copies that were
+        // missed, so they are written to follow the constants from now on.
+        let saved_per_object = cratonvm_types::HEADER_SIZE - cratonvm_gc::CompactHeader::SIZE;
+        assert_eq!(alloc.bytes_saved(), 3 * saved_per_object);
 
         // Verify class resolution
         assert_eq!(alloc.class_id_at(obj.unwrap()), Some(object_cid));
@@ -76227,7 +76233,9 @@ public class SkippedTest {
         let header = vm.mem.heap.get_header(obj);
         let view = HeaderView::from_legacy(header);
         assert!(!view.is_array());
-        assert_eq!(view.header_size(), 32);
+        // The legacy header's size, from the constant that defines it — 24
+        // since the 2026-08-06 shrink, and whatever it is next.
+        assert_eq!(view.header_size(), cratonvm_types::HEADER_SIZE);
     }
 
     #[test]
@@ -76244,12 +76252,13 @@ public class SkippedTest {
 
         let report = alloc.savings_report();
         assert_eq!(report.object_count, 1000);
-        assert_eq!(report.header_bytes_saved, 24_000); // 1000 * 24
+        let saved_per_object = cratonvm_types::HEADER_SIZE - cratonvm_gc::CompactHeader::SIZE;
+        assert_eq!(report.header_bytes_saved, 1000 * saved_per_object);
         assert_eq!(report.klass_table_entries, 50);
 
         let formatted = report.format();
         assert!(formatted.contains("1000"));
-        assert!(formatted.contains("24000"));
+        assert!(formatted.contains(&(1000 * saved_per_object).to_string()));
     }
 
     #[test]
