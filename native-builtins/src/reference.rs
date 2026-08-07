@@ -611,6 +611,17 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             _ => Ok(Some(Value::Int(0))), // no queue attached
         }
     })();
+    // PGJDBC-PHANTOM-GHOST (2026-08-07): a successful explicit enqueue must
+    // retire this reference's entry in the GC's own registry, or the GC's
+    // weak/phantom processing can rediscover and re-deliver it a second time
+    // once its (possibly still-shared) referent later dies for real. See
+    // `ReferenceProcessor::mark_manually_enqueued`'s doc for the full
+    // mechanism. Read the pin ONE more time first: `invoke_special` above can
+    // run arbitrary bytecode (a GC-capable call), so `this` may have moved.
+    if matches!(&result, Ok(Some(Value::Int(1)))) {
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.mark_reference_manually_enqueued(this);
+    }
     ctx.unpin_native_roots(this_pin);
     result
 }
@@ -693,31 +704,39 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     let next_slot = ref_next_slot(ctx, ref_obj);
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     let next = ctx.get_field(ref_obj, next_slot);
-                    // The real JDK marks the LAST element of the queue by
-                    // SELF-LINKING it: `ReferenceQueue.enqueue` does
-                    // `r.next = (head == null) ? r : head`, and `reallyPoll`
-                    // undoes it with `head = (r.next == r) ? null : r.next`.
-                    // `native_ref_enqueue` delegates to that real bytecode
-                    // whenever the receiver has the real `Reference` layout, so
-                    // this native pops a list that can be linked either way and
-                    // has to honour both conventions. Taking `next` literally
-                    // left `head` pointing back at the reference just popped:
-                    // ONE `enqueue()` then yielded TWO successful `poll()`s.
+                    // PGJDBC-PHANTOM-DOUBLE-POLL (2026-08-07): the real JDK
+                    // marks the LAST element of the queue by SELF-LINKING it —
+                    // `ReferenceQueue.enqueue0` does
+                    // `r.next = (head == null) ? r : head;`, and `poll0` undoes
+                    // it with `head = (r.next == r) ? null : r.next;`.
+                    // `native_ref_enqueue`'s real-JDK-layout path delegates
+                    // straight to that real bytecode, so a Reference enqueued
+                    // while the queue was empty legitimately arrives here with
+                    // `next == ref_obj`. Taking `next` literally (as this
+                    // native override previously did unconditionally)
+                    // re-published `ref_obj` ITSELF as the new head right
+                    // after popping it: the NEXT `poll()` call finds the
+                    // "same" head again and delivers the already-fully-
+                    // processed Reference a SECOND time (a ghost redelivery).
                     //
-                    // pgjdbc is what this cost. `SimpleQuery.unprepare()` and
-                    // `setCleanupRef()` call `clear()` + `enqueue()` on their
-                    // own `PhantomReference`, and
-                    // `QueryExecutorImpl.processDeadParsedQueries` polls the
-                    // queue in a loop doing `parsedQueryMap.remove(polled)`
-                    // with no null check. The duplicate poll removed an entry
-                    // that was already gone, so `sendCloseStatement(null)`
-                    // raised `NullPointerException: ... because "statementName"
-                    // is null` from inside the driver -- H2
-                    // `TestPgServer.testDateTime`.
+                    // Independently converged on from two witnesses: H2's
+                    // embedded `TestPgServer.testDateTime` (a bare
+                    // `clear()`+`enqueue()` cycle with no null check on the
+                    // duplicate poll), and pgjdbc's real-Postgres
+                    // `SimpleQuery.unprepare()`/`setCleanupRef()`, where
+                    // `QueryExecutorImpl.processDeadParsedQueries`'s
+                    // `parsedQueryMap.remove(polled)` returned null for the
+                    // ghost and fed `sendCloseStatement` a null
+                    // `statementName`, raising `NullPointerException: ...
+                    // because "statementName" is null` from inside the
+                    // driver — the dominant failure signature in a real-
+                    // Postgres full Hibernate-suite run.
                     //
                     // The GC auto-enqueue path uses the synthetic convention
-                    // (`next` = old head, or null when the queue was empty) and
-                    // never self-links, so it is unaffected either way.
+                    // (`next` = old head, or null when the queue was empty)
+                    // and never self-links, so it is unaffected either way.
+                    // Normalize the sentinel to "queue now empty" here,
+                    // matching real JDK `poll0`.
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     let next = match next {
                         Value::Object(Some(n)) if n == ref_obj => Value::Object(None),

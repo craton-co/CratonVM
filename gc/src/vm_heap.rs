@@ -2573,21 +2573,12 @@ impl VmHeap {
     /// (clear/enqueue/finalize/cleaner) as their anti-corruption guard.
     ///
     /// Per backend:
-    /// - Generational: a young-space address absent from the pointer map has
-    ///   to be asked one more question before it is called dead, because
-    ///   "absent from the map" only means "did not move". After a MOVING
-    ///   young GC that is the same thing. After a NON-MOVING sweep it is not:
-    ///   nothing moves, so the map is empty except for the identity entries
-    ///   the sweep emits — and it emits those only for watched *referents*
-    ///   (`gc_quiescence::is_watched_referent`). A `Reference` object and its
-    ///   `ReferenceQueue` are neither, so the map-only rule declared every
-    ///   live one of them dead and this predicate's own consumers skipped
-    ///   every GC-driven clear and enqueue. `is_addr_live` already answers
-    ///   the real question for a kept-in-place survivor
-    ///   (`GenerationalHeap::is_live_young_survivor`, written for this bug
-    ///   class), and is what G1 and ZGC below have always used. Old-gen
-    ///   addresses are conservatively treated as surviving (they do not move
-    ///   in a minor GC; major relocations are merged into the map).
+    /// - Generational: a young-space address absent from the pointer map did
+    ///   not survive (a live young object is always in the map after a
+    ///   moving young GC, and non-moving sweeps emit identity entries for
+    ///   watched survivors). Old-gen addresses are conservatively treated
+    ///   as surviving (they do not move in a minor GC; major relocations
+    ///   are merged into the map).
     /// - G1: every live CSet object is in the pointer map (identity entries
     ///   for self-forwarded ones) and every live non-CSet address sits in a
     ///   live region — so "absent from the map AND not in a live region" is
@@ -2605,14 +2596,35 @@ impl VmHeap {
             return false;
         }
         match self {
-            // A young address that did not move is dead only if it is also not
-            // a kept-in-place survivor. Keeping the young-space test in front
-            // preserves the old rule's strictness for everything the moving
-            // collector governs (the `bc math-ec 0x4` writer this guard exists
-            // to stop is a young address that is neither mapped nor live, and
-            // still answers `true` here).
+            // "Young and unmapped" is NOT a death certificate. It proves death
+            // only for a MOVING young collection, where every survivor gets a
+            // `pointer_map` entry. The non-moving sweep keeps survivors in
+            // place and produces NO map entries at all, so this arm condemned
+            // every live young object the moment the moving collector fell
+            // back — and it falls back on every collection in any workload
+            // with a live JIT frame it cannot map
+            // (`reason=innermost-rbp-belongs-to-unguarded-callee`).
+            //
+            // What that cost: `process_references_after_gc` skips the enqueue
+            // when either the `Reference` or its `ReferenceQueue` "did not
+            // survive", so NO reference was ever enqueued — a `WeakReference`
+            // was cleared but never delivered, and no `Cleaner` action ever
+            // ran. `EnqProbe` reports `gc enqueued it = false` where HotSpot
+            // enqueues; H2 then grows without bound, and the UPDATE workload
+            // that used to run in `--Xmx 1g` dies with `Out of memory` at 4g.
+            //
+            // `is_live_young_survivor` is the discriminator built for exactly
+            // this (see its soundness argument: STW-window-only, zeroed-span
+            // discriminator, moving-collection compatible), and it is already
+            // what the strict sibling `watched_pre_gc_addr_survived` uses for
+            // its young arm — these two must not disagree about the same
+            // address. The conjunction keeps the original verdict everywhere
+            // it was right: a genuinely dead young address, and the abandoned
+            // old address of an object a moving collection relocated, both
+            // still answer "did not survive", which is the `bc math-ec 0x4`
+            // protection this predicate exists for.
             VmHeap::Generational(h) => {
-                h.is_in_young_either(addr as *const u8) && !self.is_addr_live(addr)
+                h.is_in_young_either(addr as *const u8) && !h.is_live_young_survivor(addr)
             }
             VmHeap::G1(_) => !self.is_addr_live(addr),
             #[cfg(feature = "zgc")]
