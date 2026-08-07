@@ -1364,7 +1364,8 @@ mod tests {
     fn module_get_packages_returns_populated_set_for_java_base() {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("Compatible mode never refuses a Module stand-in");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1398,7 +1399,8 @@ mod tests {
         // name (module_packages_table) — getPackages() must still return a
         // valid (non-null) Set, not null/panic.
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.sql", layer)?;
+        let module = build_module(&mut ctx, "java.sql", layer)
+            .expect("Compatible mode never refuses a Module stand-in");
         let result = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1412,7 +1414,8 @@ mod tests {
     fn module_get_name_returns_string() {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("Compatible mode never refuses a Module stand-in");
         let result = native_module_get_name(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1458,7 +1461,8 @@ mod tests {
             .expect("Module.getClassLoader must be registered");
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("Compatible mode never refuses a Module stand-in");
         let result = cb(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()
             .unwrap();
@@ -1491,7 +1495,8 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let layer = build_boot_layer(&mut ctx).expect("boot layer should build");
         // Build a fully-populated module (java.base records the full JDK package list).
-        let module = build_module(&mut ctx, "java.base", layer)?;
+        let module = build_module(&mut ctx, "java.base", layer)
+            .expect("Compatible mode never refuses a Module stand-in");
         // Sanity: getPackages() reflects the recorded data for this module.
         let pkgs = native_module_get_packages(&mut ctx, &[Value::Object(Some(module))])
             .unwrap()

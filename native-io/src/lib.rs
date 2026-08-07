@@ -21342,7 +21342,9 @@ mod io_tests {
             .expect("CompletedFuture timed get must be registered");
 
         let mut ctx = MockNativeContext::new();
-        let future = match wrap_completed_future(&mut ctx, Value::Int(123))? {
+        let future = match wrap_completed_future(&mut ctx, Value::Int(123))
+            .expect("Compatible mode never refuses a CompletedFuture stand-in")
+        {
             Value::Object(Some(o)) => o,
             other => panic!("expected future object, got {other:?}"),
         };
