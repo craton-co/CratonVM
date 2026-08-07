@@ -987,11 +987,52 @@ impl ModuleRegistry {
     ///
     /// Returns `Ok(())` if access is allowed, `Err(reason)` otherwise.
     ///
-    /// # Unnamed-module compatibility
+    /// # The unnamed-accessor arm is a deliberate escape hatch, not an oversight
     ///
-    /// * The unnamed module can always access any package.
-    /// * The unnamed module is always readable by named modules in classpath
-    ///   mode (same JVM instance).
+    /// JPMS (JEP 261/403) says classpath code may reach a named module's
+    /// package only if that package is `exports`ed — unqualified, or qualified
+    /// to `ALL-UNNAMED`. The `accessor_module == UNNAMED_MODULE` arm below is
+    /// deliberately *more* permissive than that. Do not delete it on the
+    /// strength of the spec alone; audit the callers first. As of 2026-08-07
+    /// they are:
+    ///
+    /// | caller | live? | what tightening would refuse |
+    /// |---|---|---|
+    /// | `access_control::check_module_access(&Class, &Class, &ModuleRegistry)` | the only wrapper | — |
+    /// | ↳ `check_class_access_with_modules` | **no production call site** | — |
+    /// | ↳ `check_field_access_with_modules` | **no production call site** | — |
+    /// | ↳ `check_method_access_with_modules` | **no production call site** | — |
+    /// | ↳ `check_module_access_by_id` | **live** | see below |
+    /// | ↳↳ `runtime/resolve/mod.rs` (`AccessPolicy::ModuleOnly`, the one implementation behind BOTH field and method resolution) | **live** | every classpath `invoke*` / `getfield` / `putfield` naming a non-exported package |
+    /// | ↳↳ `vm/vm_init.rs` (5 sites) | self-test/probe only | — |
+    ///
+    /// The two live rows are bytecode resolution, and under `--real-jdk` the
+    /// registry carries java.base's REAL descriptor (parsed from the jimage's
+    /// `module-info.class`; `CRATONVM_BOOT_MODULE_REGISTRY`, default on), which
+    /// exports `java.lang`/`java.util`/… but NOT `jdk.internal.*` / `sun.nio.*`.
+    /// Tightening this arm therefore turns every classpath reference to
+    /// `jdk.internal.misc.Unsafe` & friends into an `IllegalAccessError` at
+    /// resolution time — a broad break, on the hot path, that no measured
+    /// vector asks for. The arm stays.
+    ///
+    /// # This function is NOT the reflection gate
+    ///
+    /// `RJdkModule.java:172` (a public no-arg constructor on a public class in
+    /// the one package the module neither exports nor opens must be refused
+    /// with `IllegalAccessException`) does **not** route through here.
+    /// `Constructor.newInstance` is served by
+    /// `native-builtins/src/lang_class.rs::native_constructor_new_instance`,
+    /// and the exports question it asks reaches this registry through
+    /// [`Self::is_package_exported_to`] (via
+    /// `NativeContext::reflective_export_to_accessor`), which has no
+    /// unnamed-*accessor* arm and already answers correctly. See
+    /// `docs/known-issues/jdk-only/W4-2-unnamed-accessor-bypasses-encapsulation.md`.
+    ///
+    /// So the asymmetry with [`Self::check_deep_reflection_access`] (which does
+    /// refuse an unnamed accessor) is not an inconsistency to resolve: the two
+    /// serve different subsystems. Deep reflection is caller-sensitive and
+    /// JEP-403-governed; this one is bytecode linkage, where the hatch is what
+    /// keeps mixed classpath/module-path applications running.
     pub fn check_module_access(
         &self,
         accessor_module: &str,

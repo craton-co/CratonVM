@@ -820,6 +820,75 @@ fn check_reflection_module_access_with_target_id(
     ctx.check_deep_reflection_access(accessor_cid, target_cid)
 }
 
+/// The `exports` half of `Reflection.verifyMemberAccess`, for a reflective
+/// operation on a PUBLIC member that has NOT been `setAccessible(true)`.
+///
+/// JEP 261: a public constructor of a public class is still unreachable from
+/// the class path when its package is not `exports`ed to the caller's module.
+/// HotSpot 25 reaches this through `Constructor.newInstance` ->
+/// `AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
+/// `verifyModuleAccess` -> `memberModule.isExported(pkg, callerModule)`, and
+/// throws `IllegalAccessException`. `regression-suite/src/RJdkModule.java:172`
+/// is the witness: a public no-arg ctor on the public `EnGreeter`, in the one
+/// package `cratonvm.jdkonly.svc` neither exports nor opens.
+///
+/// Deliberately NOT folded into [`check_reflection_module_access_with_target_id`]:
+/// that one asks the `opens` question, which over-denies here — every public
+/// `java.util.ArrayList` construction would fail, because java.base exports
+/// java.util without opening it (the kafka `ListDeserializer` regression the
+/// caller's comment records).
+///
+/// Same three bypasses as its `opens` sibling, in the same order, so the two
+/// gates cannot disagree about WHO is asking:
+///   * `accessible_override == true` -> the check was paid at `setAccessible`;
+///   * no resolvable Java caller frame -> the VM itself is driving;
+///   * a Bootstrap/Platform-loader caller in a boot package -> HotSpot exempts
+///     java.base the same way (`checkCanSetAccessible`'s
+///     `callerModule == Object.class.getModule()` arm).
+///
+/// Unlike the `opens` sibling this fails OPEN when the target class cannot be
+/// resolved: this is a NEW refusal on a path that previously had none, so an
+/// unreadable input must not invent one.
+fn check_reflection_export_access_with_target_id(
+    ctx: &mut dyn NativeContext,
+    target_class_name: &str,
+    target_class_id: Option<ClassId>,
+    accessible_override: bool,
+) -> Result<(), String> {
+    if accessible_override {
+        return Ok(());
+    }
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return Ok(());
+    };
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
+        return Ok(());
+    }
+    let Some(target_cid) = target_class_id.or_else(|| ctx.class_id_by_name(target_class_name))
+    else {
+        return Ok(());
+    };
+    if accessor_cid == target_cid {
+        return Ok(());
+    }
+    // `reflective_export_to_accessor` is the `exports` edge;
+    // `check_deep_reflection_access` additionally accepts `opens`, the
+    // same-module case and an unnamed target, so either one passing is enough.
+    if ctx.reflective_export_to_accessor(accessor_cid, target_cid)
+        || ctx
+            .check_deep_reflection_access(accessor_cid, target_cid)
+            .is_ok()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "class {} is in a package its module does not export to the caller",
+        target_class_name.replace('/', ".")
+    ))
+}
+
 /// Read a declaring-class mirror from an AccessibleObject and enforce the
 /// NEW-19 module check. Returns `Err(IllegalAccessException)` on denial.
 ///
@@ -9866,6 +9935,21 @@ pub(crate) fn native_constructor_new_instance(
                 .into(),
             );
         }
+    } else if let Err(msg) = check_reflection_export_access_with_target_id(
+        ctx,
+        &class_name,
+        declaring_cid,
+        accessible,
+    ) {
+        // JEP 261: `exports`, not `opens`. A public ctor previously got NO
+        // module check at all -- the comment above got the exports/opens
+        // distinction right and the code then implemented "needs nothing".
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Constructor.newInstance: {class_name}: {msg}"),
+            }
+            .into(),
+        );
     }
 
     // Descriptor: extra slot / side table, or rebuild from `parameterTypes`

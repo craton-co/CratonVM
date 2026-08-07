@@ -6940,7 +6940,9 @@ pub(crate) const FJT_EAGER_FORK_ENV: &str = "CRATONVM_FJP_EAGER_FORK";
 /// What `ForkJoinTask.fork()` does in this VM.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum FjtForkMode {
-    /// Mark the task queued and return. Today's behaviour, and the default.
+    /// Mark the task queued and return. The historical behaviour; since
+    /// 2026-08-07 this is the OPT-OUT (`CRATONVM_FJP_EAGER_FORK=0`), not the
+    /// default — see `fjt_fork_mode` for the A/B that moved it.
     Lazy,
     /// Run the body inline when the receiver is a `CountedCompleter`, which is
     /// the only family with no intercepted consumer; lazy for everything else.
@@ -6972,7 +6974,36 @@ pub(crate) enum FjtForkMode {
 /// behaviour.
 pub(crate) fn fjt_fork_mode() -> FjtForkMode {
     let Some(raw) = cratonvm_types::flags::runtime_var_os(FJT_EAGER_FORK_ENV) else {
-        return FjtForkMode::Lazy;
+        // DEFAULT FLIPPED 2026-08-07, after the A/B its author specified.
+        //
+        // With lazy fork, `CountedCompleter` starves: it never calls `join()`,
+        // it forks children and drives `tryComplete()`, so nothing computes
+        // them and the pending count never reaches zero. `java.util.stream
+        // .AbstractTask` extends `CountedCompleter`, so EVERY real parallel
+        // stream that reaches it starves in the default configuration. Leaving
+        // this off shipped a known-broken path.
+        //
+        // Measured before flipping, all three of the author's conditions:
+        //   (1) `=1` reaches `PASS RJdkForkJoin (26 checks)` in BOTH
+        //       `--jdk-only` and `--real-jdk`;
+        //   (2) `probes/FjpMatrixProbe.java` and `RJdkExecutors` are
+        //       byte-identical A vs B (the only diff is the flag banner line
+        //       itself), and `vm/tests/{fjp_recursive,rfjp1_recursive}.rs` are
+        //       unchanged — though note those two are VACUOUS: their probe
+        //       source `apps/fjp_probe/FjpProbe.java` does not exist, so they
+        //       take a "skipping" branch and pass in 0.00s;
+        //   (3) `=all` passes too but buys nothing `=1` does not, so the
+        //       NARROWER gate is what ships.
+        //
+        // Still unverified: the Spring/H2 slice, which is the entire remaining
+        // blast radius (parallel streams are the only `CountedCompleter` users
+        // in it). Its pre-flip state was already broken, so this is expected to
+        // repair rather than regress it — but it has not been run.
+        //
+        // `CRATONVM_FJP_EAGER_FORK=0` / `CRATONVM_THREADS=-fjp-eager-fork`
+        // remains the escape hatch: `"0"` falls through the match below to
+        // `_ => FjtForkMode::Lazy`.
+        return FjtForkMode::CountedCompleterEager;
     };
     let raw = raw.to_string_lossy().trim().to_ascii_lowercase();
     match raw.as_str() {

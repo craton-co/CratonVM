@@ -3372,7 +3372,7 @@ fn lk_write_allowed_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i3
 
 /// Read a `Lookup`'s `allowedModes`, by name first (real layout slot 2),
 /// falling back to synthetic slot 1.
-fn lk_read_allowed_modes(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+fn lk_read_allowed_modes(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
     if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
         return m;
     }
@@ -3380,6 +3380,188 @@ fn lk_read_allowed_modes(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
         return m;
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// Lookup access control (`allowedModes`)
+// ---------------------------------------------------------------------------
+//
+// JDK 25 `java.lang.invoke.MethodHandles$Lookup` mode bits. Read off the
+// class itself, not from memory:
+//
+//   PUBLIC=1 PRIVATE=2 PROTECTED=4 PACKAGE=8 MODULE=16 UNCONDITIONAL=32
+//   ORIGINAL=64
+//
+// and the two factories we have to be exactly right about:
+//
+//   MethodHandles.lookup().lookupModes()       == 95  (0x5F, no UNCONDITIONAL)
+//   MethodHandles.publicLookup().lookupModes() == 32  (0x20, UNCONDITIONAL ONLY)
+//
+// `publicLookup()` is *not* `PUBLIC` — that surprise is the whole reason a
+// naive `modes & PUBLIC` test would have been wrong here.
+const LK_MODE_PUBLIC: i32 = 0x01;
+const LK_MODE_PRIVATE: i32 = 0x02;
+const LK_MODE_PROTECTED: i32 = 0x04;
+const LK_MODE_PACKAGE: i32 = 0x08;
+const LK_MODE_MODULE: i32 = 0x10;
+/// `FULL_POWER_MODES` = PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE (no ORIGINAL,
+/// no UNCONDITIONAL).
+const LK_MODE_FULL_POWER: i32 =
+    LK_MODE_PUBLIC | LK_MODE_PRIVATE | LK_MODE_PROTECTED | LK_MODE_PACKAGE | LK_MODE_MODULE;
+
+/// Access flags of `member_name` as seen from the class `target_mirror`
+/// denotes. Methods may be inherited, so walk the superclass chain for them;
+/// fields resolve on the declaring class only.
+///
+/// `None` means "we could not answer" — the caller must then ALLOW, so a
+/// class whose members we do not model (synthetic stub, native-registry-only
+/// class) is never spuriously refused.
+fn lk_member_access_flags(
+    ctx: &dyn NativeContext,
+    target_mirror: ObjectRef,
+    member_name: &str,
+    is_field: bool,
+) -> Option<u16> {
+    let mut cid = mirror_class_id(ctx, target_mirror)?;
+    loop {
+        if is_field {
+            return ctx
+                .declared_fields(cid)
+                .into_iter()
+                .find(|f| f.name == member_name)
+                .map(|f| f.access_flags);
+        }
+        if let Some(m) = ctx
+            .declared_methods(cid)
+            .into_iter()
+            .find(|m| m.name == member_name)
+        {
+            return Some(m.access_flags);
+        }
+        match ctx.superclass_of(cid) {
+            Some(parent) if parent != cid => cid = parent,
+            _ => return None,
+        }
+    }
+}
+
+/// Refuse a `Lookup.find*` resolution the Lookup's `allowedModes` does not
+/// permit.
+///
+/// `args` is the raw native argument slice: `args[0]` is the receiving
+/// `Lookup`, `args[1]` the `refc` Class mirror, `args[name_idx]` the member
+/// name String (pass `name_idx == usize::MAX` together with `literal` for
+/// `findConstructor`, whose member is always `<init>`).
+///
+/// ## Why this is narrow on purpose
+///
+/// An over-strict check here breaks every framework that legitimately uses
+/// `MethodHandles.lookup()` — Spring, Hibernate, Jackson, Groovy, ByteBuddy
+/// and the JDK's own `LambdaMetafactory` all reach their OWN private members
+/// through it. So the rule is **mode bits only**:
+///
+/// * `allowedModes == 0` — a Lookup nobody populated (or one whose modes we
+///   could not read). Allow, exactly as before this check existed.
+/// * `allowedModes & PRIVATE != 0` — a full-power lookup
+///   (`MethodHandles.lookup()` = 0x5F, `privateLookupIn` = 0x1F, the JDK's
+///   TRUSTED lookup = -1). Allow unconditionally, and short-circuit BEFORE
+///   the allocating `declared_methods` walk. This is the clause that keeps
+///   in-class private access working, and it does not consult `lookupClass`
+///   at all — deliberately, because our `lookupClass` comes from a stack walk
+///   and a wrong answer there must never turn into a refusal.
+/// * otherwise the member's own modifier decides which bit is required:
+///   `private` needs PRIVATE, `protected` needs PRIVATE|PROTECTED|PACKAGE,
+///   package-private needs PRIVATE|PACKAGE, and `public` needs nothing.
+///
+/// Everything the JLS §6.6 / `Lookup` contract additionally requires —
+/// nestmate relationships, `protected`-receiver rules, module `exports`/
+/// `opens`, and the `UNCONDITIONAL` "public member of a public exported type"
+/// rule — is NOT enforced. That residual is one-directional: it can only
+/// admit something HotSpot would refuse, never refuse something HotSpot
+/// admits.
+fn lk_enforce_find_access(
+    ctx: &dyn NativeContext,
+    args: &[Value],
+    name_idx: usize,
+    literal: Option<&str>,
+    is_field: bool,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    use cratonvm_types::access_flags::{ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC};
+
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(()),
+    };
+    let modes = lk_read_allowed_modes(ctx, this);
+    if modes == 0 || (modes & LK_MODE_PRIVATE) != 0 {
+        return Ok(());
+    }
+    let target = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(()),
+    };
+    let name: String = match literal {
+        Some(n) => n.to_string(),
+        None => match args.get(name_idx) {
+            Some(Value::Object(Some(o))) => match ctx.read_string(*o) {
+                Some(s) => s,
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        },
+    };
+    let flags = match lk_member_access_flags(ctx, target, &name, is_field) {
+        Some(f) => f,
+        None => return Ok(()),
+    };
+    if (flags & ACC_PUBLIC) != 0 {
+        return Ok(());
+    }
+    let required = if (flags & ACC_PRIVATE) != 0 {
+        LK_MODE_PRIVATE
+    } else if (flags & ACC_PROTECTED) != 0 {
+        LK_MODE_PRIVATE | LK_MODE_PROTECTED | LK_MODE_PACKAGE
+    } else {
+        LK_MODE_PRIVATE | LK_MODE_PACKAGE
+    };
+    if (modes & required) != 0 {
+        return Ok(());
+    }
+    let kind = if is_field { "field" } else { "method" };
+    let owner = mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
+    // A REAL `java.lang.IllegalAccessException` (checked), which is what
+    // `Lookup.find*` declares and what callers catch — not an `Error`, and
+    // not a `VmError::Internal` that merely spells the name.
+    Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+        message: format!(
+            "no access: {kind} {owner}.{name} (modifiers 0x{flags:04x}) \
+             from Lookup with modes 0x{modes:04x}"
+        ),
+    }
+    .into())
+}
+
+/// Do the two `Class` mirrors live in the same package?
+///
+/// A mirror we cannot name answers `true` — "cannot tell, so do not narrow".
+/// The only caller is `Lookup.in`, where a wrong `false` would silently strip
+/// PRIVATE from a legitimate same-package lookup.
+fn lk_same_package(ctx: &dyn NativeContext, a: Value, b: Value) -> bool {
+    fn package_of(ctx: &dyn NativeContext, v: Value) -> Option<String> {
+        let m = match v {
+            Value::Object(Some(m)) => m,
+            _ => return None,
+        };
+        let name = mirror_class_name(ctx, m)?;
+        Some(match name.rfind('/') {
+            Some(i) => name[..i].to_string(),
+            None => String::new(),
+        })
+    }
+    match (package_of(ctx, a), package_of(ctx, b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
 }
 
 pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
@@ -3563,14 +3745,43 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         "in",
         "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandles$Lookup;",
         |ctx, args| {
-            let _this = obj_arg(args, 0)?;
+            let this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
+            // JDK 25 `Lookup.in(requestedLookupClass)`:
+            //   newModes = (allowedModes & FULL_POWER_MODES) & ~ORIGINAL
+            //   newModes &= ~(PACKAGE|PRIVATE|PROTECTED)  if not same package
+            //   newModes &= ~MODULE                        if not same module
+            // UNCONDITIONAL is never *gained* by `in()`. Measured on JDK 25,
+            // `MethodHandles.lookup().in(String.class).lookupModes()` == 1
+            // (PUBLIC). The old constant here was PUBLIC|UNCONDITIONAL (0x21)
+            // — a combination the JDK treats as impossible (`Lookup.toString`
+            // has a `case UNCONDITIONAL` arm and no `PUBLIC|UNCONDITIONAL`
+            // arm) — and, worse, it dropped PRIVATE even for a same-package
+            // `in()`, which the access check added alongside this would then
+            // have turned into a spurious IllegalAccessException.
+            let prev = lk_read_allowed_modes(ctx, this);
+            let base = if prev == 0 {
+                LK_MODE_FULL_POWER
+            } else {
+                prev & LK_MODE_FULL_POWER
+            };
+            let lookup_class = ctx.get_field(this, 0);
+            let modes = if lk_same_package(ctx, lookup_class, target_class) {
+                base
+            } else {
+                LK_MODE_PUBLIC
+            };
+            // Never store a bare 0: `lk_enforce_find_access` reads 0 as "modes
+            // unknown, stay permissive", and a genuinely powerless lookup must
+            // not inherit that valve. PUBLIC-only refuses every non-public
+            // member, which is the behaviour a 0-mode JDK Lookup has for
+            // everything we model.
+            let modes = if modes == 0 { LK_MODE_PUBLIC } else { modes };
             let lookup =
                 alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
             ctx.set_field_by_name(lookup, "lookupClass", target_class);
             ctx.set_field(lookup, 0, target_class); // lookupClass = targetClass
-                                                    // Access reduced to PUBLIC + UNCONDITIONAL when crossing packages
-            lk_write_allowed_modes(ctx, lookup, 0x01 | 0x20);
+            lk_write_allowed_modes(ctx, lookup, modes);
             Ok(Some(Value::Object(Some(lookup))))
         },
     );
@@ -3678,6 +3889,9 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn lookup_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // FIRST statement on purpose: `args` still holds the ObjectRefs the VM
+    // handed us and nothing below has had a chance to allocate and move them.
+    lk_enforce_find_access(ctx, args, 2, None, false)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -3743,7 +3957,58 @@ fn lookup_require_method(
     Ok(())
 }
 
+/// `Lookup.findGetter`/`findSetter` must raise `NoSuchFieldException` — a
+/// *checked* exception — when the field is absent, for the same reason
+/// [`lookup_require_method`] must raise `NoSuchMethodException`: handing back
+/// a handle and failing at invoke time produces an `Error`, which sails
+/// through the `catch (Exception)` of every version-probing library.
+///
+/// The old code deliberately never threw, because `resolve_field_index` walks
+/// only the real class hierarchy and answers `None` for synthetic-stub classes
+/// whose fields we do not model — so a bare `None` is not evidence of absence.
+/// This keeps that escape hatch and adds the evidence the old code lacked:
+/// only refuse when we could actually enumerate declared fields somewhere on
+/// the chain (`saw_fields`) and the name was not among them. A class whose
+/// whole chain enumerates empty is still admitted.
+///
+/// Takes the ClassId (not the mirror `ObjectRef`) because the only callers
+/// have already run `ensure_class_initialized`, which can move an unpinned
+/// mirror out from under them.
+fn lookup_require_field(
+    ctx: &dyn NativeContext,
+    class_id: Option<cratonvm_types::ClassId>,
+    class: &str,
+    name: &str,
+) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    if ctx.resolve_field_index(class, name).is_some() {
+        return Ok(());
+    }
+    let mut cid = match class_id {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+    let mut saw_fields = false;
+    loop {
+        let fields = ctx.declared_fields(cid);
+        if !fields.is_empty() {
+            saw_fields = true;
+            if fields.iter().any(|f| f.name == name) {
+                return Ok(());
+            }
+        }
+        match ctx.superclass_of(cid) {
+            Some(parent) if parent != cid => cid = parent,
+            _ => break,
+        }
+    }
+    if saw_fields {
+        return Err(no_such_field_error(class, name));
+    }
+    Ok(())
+}
+
 fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, false)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Err(no_such_method_error("", "", "")),
@@ -3770,6 +4035,7 @@ fn lookup_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, usize::MAX, Some("<init>"), false)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -3809,6 +4075,10 @@ fn lookup_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn lookup_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Before the pin/`ensure_class_initialized` block below: `args[0]` (the
+    // Lookup) is NOT pinned across those calls, so the mode read has to happen
+    // while the raw refs are still current.
+    lk_enforce_find_access(ctx, args, 2, None, false)?;
     // WP2.9 — Lookup.findSpecial(refc, name, type, specialCaller)
     //   args[0] = lookup (this)
     //   args[1] = refc (Class on which to find the method)
@@ -3901,6 +4171,7 @@ fn no_such_field_error(class: &str, field: &str) -> cratonvm_types::error::Metho
 }
 
 fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -3922,22 +4193,20 @@ fn lookup_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
-    let _ = ctx.ensure_class_initialized(&class);
-    // Deliberately permissive, unlike `lookup_find_virtual`: HotSpot raises
-    // `NoSuchFieldException` here, but `resolve_field_index` walks only the
-    // real class hierarchy — it has no synthetic-stub / native-registry
-    // fallback the way `method_exists` does — so a `None` does not reliably
-    // mean "absent" and throwing on it would break getters on stub classes.
-    // Nothing observed so far needs the throw (H2's version probe needs
-    // `findGetter` to SUCCEED as its fallback); revisit if a field-exists
-    // predicate that understands stubs shows up.
-    let _ = ctx.resolve_field_index(&class, &name);
+    let target_cid = ctx.ensure_class_initialized(&class).ok();
+    // HotSpot raises `NoSuchFieldException` here. `lookup_require_field` only
+    // does so when it could enumerate declared fields and the name was not
+    // among them, which preserves the stub-class escape hatch this call site
+    // used to buy with a blanket `let _ = ...`. (H2's version probe needs
+    // `findGetter` to SUCCEED as its fallback — it does, the field is there.)
+    lookup_require_field(ctx, target_cid, &class, &name)?;
     let desc = format!("(L{class};){field_desc}");
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_GETTER);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -3959,15 +4228,16 @@ fn lookup_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let class = mirror_class_name(ctx, class_obj).unwrap_or_default();
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
-    let _ = ctx.ensure_class_initialized(&class);
-    // Permissive for the same reason as `lookup_find_getter` above.
-    let _ = ctx.resolve_field_index(&class, &name);
+    let target_cid = ctx.ensure_class_initialized(&class).ok();
+    // Same evidence rule as `lookup_find_getter` above.
+    lookup_require_field(ctx, target_cid, &class, &name)?;
     let desc = format!("(L{class};{field_desc})V");
     let mh = alloc_method_handle(ctx, &class, &name, &desc, MH_KIND_SETTER);
     Ok(Some(Value::Object(Some(mh))))
 }
 
 fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -4013,6 +4283,7 @@ fn lookup_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -4058,6 +4329,7 @@ fn lookup_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -4102,6 +4374,7 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 fn lookup_find_static_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    lk_enforce_find_access(ctx, args, 2, None, true)?;
     let class_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {

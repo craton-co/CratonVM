@@ -270,21 +270,52 @@ fn resolve_lookup_supertypes(
 /// only the public `NativeContext` surface so this module stays
 /// independent of `classloader.rs`.
 fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> ObjectRef {
-    // Synthetic Lookup is a 4-field allocation:
-    //   slot 0: lookupClass (Class mirror)
-    //   slot 1: allowedModes (int)
-    //   slot 2: previousLookupClass (Class mirror | null)
-    //   slot 3: lookupMode (int — duplicate, kept for layout parity)
-    //
     // FULL_POWER = PUBLIC | PRIVATE | PROTECTED | PACKAGE | MODULE | ORIGINAL
     //            = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40
     //            = 0x5F
+    // (Measured on JDK 25: `MethodHandles.lookup().lookupModes()` == 95.)
     const LK_FULL_POWER: i32 = 0x5F;
+    //
+    // TWO LAYOUTS share this allocation, and they do NOT agree past slot 0:
+    //
+    //   synthetic `MethodHandles$Lookup` (4 fields)
+    //     0 lookupClass (ref) | 1 allowedModes (int)
+    //     2 previousLookupClass (ref) | 3 lookupMode (int, duplicate)
+    //
+    //   real JDK 25 `java.lang.invoke.MethodHandles$Lookup`
+    //   (`javap -p java.lang.invoke.MethodHandles$Lookup`, instance fields in
+    //    declaration order)
+    //     0 lookupClass (ref) | 1 prevLookupClass (ref)
+    //     2 allowedModes (int) | 3 cachedProtectionDomain (ref)
+    //
+    // Writing slots 1/2/3 BY INDEX therefore type-confused the real layout:
+    // `Int(0x5F)` landed in the `prevLookupClass` REFERENCE slot, a null ref
+    // landed in `allowedModes` (which then reads back as 0 — "no access at
+    // all" in the JDK), and another `Int(0x5F)` landed in the
+    // `cachedProtectionDomain` reference slot. The failure was silent: the
+    // only consequence was a Lookup that reports zero modes, which every
+    // access check reads as powerless.
+    //
+    // Write by NAME on the real layout; keep the index writes as the
+    // synthetic-only fallback. The discriminator is the wave-3 one: an ABSENT
+    // field answers `Int(0)` from `get_field_by_name`, so a `Value::Object`
+    // answer for `prevLookupClass` means the real JDK class is what we
+    // allocated.
     let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
-    ctx.set_field(obj, 0, Value::Object(Some(lookup_mirror)));
-    ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
-    ctx.set_field(obj, 2, Value::Object(None));
-    ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+    // Slot 0 is `lookupClass` in BOTH layouts.
+    ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(lookup_mirror)));
+    ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(lookup_mirror)));
+    if matches!(
+        ctx.get_field_by_name(obj, "prevLookupClass"),
+        Value::Object(_)
+    ) {
+        ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
+        ctx.set_field_by_name(obj, "allowedModes", Value::Int(LK_FULL_POWER));
+    } else {
+        ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
+        ctx.set_field(obj, 2, Value::Object(None));
+        ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+    }
     obj
 }
 

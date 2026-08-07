@@ -3636,6 +3636,66 @@ fn read_byte_array_define_class_slice(
     Ok(bytes)
 }
 
+/// Where a `java.nio.ByteBuffer`'s backing array and cursors actually live.
+///
+/// The synthetic stub this crate fabricates puts the backing `byte[]` at slot
+/// 0 and `position`/`limit`/`capacity` at 1/2/3. A **real** JDK heap buffer
+/// does not: `java.nio.HeapByteBuffer` declares no instance fields of its
+/// own, so its layout is its ancestors' —
+/// `java.nio.Buffer{mark,position,limit,capacity,address,segment}` at 0..5 and
+/// `java.nio.ByteBuffer{hb,offset,isReadOnly,bigEndian,nativeByteOrder}` at
+/// 6..10 (`javap -p java.nio.Buffer java.nio.ByteBuffer`). Slot 0 on a real
+/// buffer is therefore `mark`, an `int` — the array branch below was skipped
+/// for every real heap buffer, execution fell into the direct-buffer path,
+/// `address` read back 0, and
+/// `ClassLoader.defineClass(String, ByteBuffer, ProtectionDomain)` threw
+/// "direct ByteBuffer has no native address" for a perfectly valid heap
+/// buffer. (`position`/`limit`/`capacity` at 1/2/3 happen to coincide with
+/// the real layout; `hb` does not, and neither does `offset`.)
+///
+/// `hb` is also the discriminator, and it needs no mode flag: a fabricated
+/// synthetic stub names its fields `_f0.._fN`, so the by-name resolve MISSES
+/// there and the synthetic slots are used unchanged. A real *direct* buffer
+/// still resolves `hb` (it is declared on `ByteBuffer`, not `HeapByteBuffer`)
+/// and simply reads back null, which correctly routes to the address path.
+struct BbDefineLayout {
+    /// Backing `byte[]`, or `None` for a direct buffer.
+    hb: usize,
+    /// `ByteBuffer.offset` — index of the buffer's element 0 inside `hb`.
+    /// Non-zero for anything produced by `slice()`. `None` on the synthetic
+    /// stub, which has no such field and always starts at 0.
+    offset: Option<usize>,
+    position: usize,
+    limit: usize,
+    capacity: usize,
+}
+
+fn bb_define_layout(ctx: &dyn NativeContext, bb: ObjectRef) -> BbDefineLayout {
+    let cid = ctx.class_id_of_object(bb);
+    let named = |n: &str| ctx.resolve_field_index_by_class_id(cid, n);
+    match (
+        named("hb"),
+        named("position"),
+        named("limit"),
+        named("capacity"),
+    ) {
+        (Some(hb), Some(position), Some(limit), Some(capacity)) => BbDefineLayout {
+            hb,
+            offset: named("offset"),
+            position,
+            limit,
+            capacity,
+        },
+        _ => BbDefineLayout {
+            hb: 0,
+            offset: None,
+            position: 1,
+            limit: 2,
+            capacity: 3,
+        },
+    }
+}
+
 fn read_byte_buffer_define_class_slice(
     ctx: &dyn NativeContext,
     bb: ObjectRef,
@@ -3643,28 +3703,41 @@ fn read_byte_buffer_define_class_slice(
     length: usize,
     class_name: &str,
 ) -> Result<Vec<u8>, MethodCallFailed> {
-    let pos_slot = 1;
-    let limit_slot = 2;
-    let capacity_slot = 3;
+    let layout = bb_define_layout(ctx, bb);
+    let pos_slot = layout.position;
+    let limit_slot = layout.limit;
+    let capacity_slot = layout.capacity;
 
-    if let Value::Object(Some(array)) = ctx.get_field(bb, 0) {
+    if let Value::Object(Some(array)) = ctx.get_field(bb, layout.hb) {
+        // `hb` is shared with every other view of the same array; the buffer's
+        // own element 0 sits at `hb_base`. Zero for the synthetic stub and for
+        // a whole-array `ByteBuffer.wrap`, non-zero for a `slice()`.
+        let hb_base = layout
+            .offset
+            .map(|s| ctx.get_field(bb, s).as_int().unwrap_or(0).max(0) as usize)
+            .unwrap_or(0);
+        let arr_len = ctx.array_length(array);
+        let cap = arr_len.saturating_sub(hb_base);
         let pos = ctx.get_field(bb, pos_slot).as_int().unwrap_or(0).max(0) as usize;
         let limit = ctx
             .get_field(bb, limit_slot)
             .as_int()
-            .unwrap_or_else(|| ctx.array_length(array) as i32)
+            .unwrap_or(cap as i32)
             .max(0) as usize;
-        let cap = ctx.array_length(array);
-        let absolute_off = pos
+        // Bounds are checked in buffer-relative coordinates, then translated.
+        let relative_off = pos
             .checked_add(offset)
             .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         let upper = limit.min(cap);
-        let end = absolute_off
+        let end = relative_off
             .checked_add(length)
             .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         if end > upper {
             return Err(RuntimeError::aioobe_index_only(end.min(i32::MAX as usize) as i32).into());
         }
+        let absolute_off = hb_base
+            .checked_add(relative_off)
+            .ok_or_else(|| RuntimeError::aioobe_index_only(i32::MAX))?;
         return read_byte_array_define_class_slice(ctx, array, absolute_off, length);
     }
 

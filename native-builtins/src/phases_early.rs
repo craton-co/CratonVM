@@ -15554,31 +15554,29 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("{} security provider", name));
         Ok(Some(Value::Object(Some(s))))
     });
-    // Provider.getService(String type, String algorithm) -> Provider.Service
-    r.register(
-        prov,
-        "getService",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;",
-        |ctx, args| {
-            // Return a 3-field Service synthetic: type=0, algorithm=1, provider=2
-            let svc_type = args.get(1).copied().unwrap_or(Value::Object(None));
-            let svc_algo = args.get(2).copied().unwrap_or(Value::Object(None));
-            let this = obj_arg(args, 0)?;
-            let svc = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 3);
-            ctx.set_field(svc, 0, svc_type);
-            ctx.set_field(svc, 1, svc_algo);
-            ctx.set_field(svc, 2, Value::Object(Some(this)));
-            Ok(Some(Value::Object(Some(svc))))
-        },
-    );
-    // Provider.getServices() -> Set<Service> (return as array-backed HashSet)
-    r.register(prov, "getServices", "()Ljava/util/Set;", |ctx, _args| {
-        // Return empty set
-        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        ctx.set_field(set, 0, Value::Object(Some(arr)));
-        Ok(Some(Value::Object(Some(set))))
-    });
+    // W4-3: `Provider.getService` and `Provider.getServices` are NOT registered
+    // here any more. Both were strictly-worse twins of the registry-backed
+    // natives in `jca::provider_chain` (`provider_get_service_native` /
+    // `provider_get_services_native`), which are wired through
+    // `register_essential_natives_with_shims` and are therefore live in EVERY
+    // mode. This file's registrations only ever ran under
+    // `register_synthetic_overrides` (`--synthetic-jdk`) — but that phase runs
+    // LAST, so where they ran they SHADOWED the registry-backed ones. Both were
+    // defective:
+    //
+    //   * `getService(type, algorithm)` fabricated a `Provider$Service` for
+    //     ANY pair, so `Security.getProvider("SUN").getService("MessageDigest",
+    //     "NO-SUCH-DIGEST")` answered a live Service. Measured on
+    //     jdk-25.0.3.9-hotspot: null. It also answered a Service for
+    //     `("Cipher","AES")` on SUN, which HotSpot likewise answers null for
+    //     because SUN registers no Cipher at all. That is "a fabricated success
+    //     where the spec mandates a failure" on the provider-lookup surface.
+    //   * `getServices()` returned the pre-W3-7 broken shape — a `String[]`
+    //     written into slot 0 of a `java/util/HashSet`, where real JDK 25
+    //     HashSet's only instance field is `transient HashMap<E,Object> map`.
+    //     Any real `HashSet` method on it invokes HashMap on a String[]
+    //     receiver. It was also unconditionally EMPTY, while the registry-backed
+    //     twin enumerates the provider's real service table.
 
     // Provider.Service methods
     let svc = "java/security/Provider$Service";
@@ -15782,67 +15780,75 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         },
     );
     // Security.getAlgorithms(String type) -> Set<String>
+    //
+    // W4-3: the hand-maintained per-type literal table that used to live here
+    // is gone. It was reachable ONLY from `register_synthetic_overrides`
+    // (`--synthetic-jdk`), so real-JDK and `--jdk-only` never saw it at all and
+    // fell through to the JDK's own `getAlgorithms` bytecode, which reads
+    // `provider.keys()` off the empty synthetic Providers and answered the
+    // EMPTY SET for every engine type — `RJdkSecurity.providers` (:311),
+    // "MessageDigest algorithms must include SHA-256". The literal table was
+    // also wrong on its own terms where it was live: measured against
+    // jdk-25.0.3.9-hotspot it advertised `Cipher` and `SecureRandom` names
+    // HotSpot does not answer, and answered mixed case where HotSpot
+    // ASCII-uppercases every name.
+    //
+    // Both modes now read the SAME provider service registry that decides
+    // `Provider.getService` / `Provider.getServices` / `find_service_provider`,
+    // so the two surfaces cannot drift: an algorithm is listed here exactly
+    // when some provider in the live chain registered a service for it. This
+    // registration stays because `register_synthetic_overrides` runs after
+    // `register_essential_natives`, i.e. it would otherwise SHADOW the
+    // registry-backed one with real-JDK `Security` bytecode under
+    // `--synthetic-jdk`.
     r.register(
         sec,
         "getAlgorithms",
         "(Ljava/lang/String;)Ljava/util/Set;",
         |ctx, args| {
-            let type_name = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            // Arg-index note: every other `java/security/Security` static in
+            // THIS file reads its first parameter from `args[1]`, while every
+            // one in `jca::provider_chain` reads it from `args[0]`. The two
+            // conventions cannot both be right, and this lane could not run the
+            // VM to settle it — so accept either. `args[1]` first keeps this
+            // file's existing behaviour where that is the live convention;
+            // the `args[0]` fallback makes the synthetic arm agree with the
+            // registry-backed twin where it is not.
+            let type_name = match (args.get(1), args.first()) {
+                (Some(Value::Object(Some(s))), _) => ctx.read_string(*s).unwrap_or_default(),
+                (_, Some(Value::Object(Some(s)))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let algos: &[&str] = match type_name.as_str() {
-                "MessageDigest" => &["MD5", "SHA-1", "SHA-256", "SHA-384", "SHA-512"],
-                "Cipher" => &[
-                    "AES",
-                    "AES/CBC/PKCS5Padding",
-                    "AES/CBC/NoPadding",
-                    "AES/ECB/PKCS5Padding",
-                    "AES/GCM/NoPadding",
-                ],
-                "Mac" => &[
-                    "HmacSHA1",
-                    "HmacSHA256",
-                    "HmacSHA384",
-                    "HmacSHA512",
-                    "HmacMD5",
-                ],
-                "Signature" => &[
-                    "SHA256withRSA",
-                    "SHA384withRSA",
-                    "SHA512withRSA",
-                    "SHA256withECDSA",
-                ],
-                "KeyPairGenerator" => &["RSA", "EC", "DSA"],
-                "KeyGenerator" => &["AES", "DESede", "HmacSHA256"],
-                // Tomcat `SessionIdGeneratorBase.<clinit>` — must be non-empty or
-                // `IllegalStateException` ("SecureRandom algorithm set not available").
-                "SecureRandom" => &[
-                    "NativePRNGNonBlocking",
-                    "NativePRNGBlocking",
-                    "SHA1PRNG",
-                    "Windows-PRNG",
-                ],
-                _ => &[],
-            };
-            // W3-7 (RJdkSecurity.java:311). This is the SYNTHETIC HashSet
-            // layout: a String[] in slot 0. In real-JDK mode
-            // `java.util.HashSet` has exactly one instance field —
-            // `transient HashMap<E,Object> map` (verified with javap) — so
-            // slot 0 IS `map`, and this wrote a String[] into it. The set
-            // answers every question until someone calls a HashSet method:
-            // `contains(Object)` is real JDK bytecode doing
-            // `map.containsKey(o)`, i.e. an invokevirtual of HashMap on a
-            // String[] receiver. `make_hashset_with_elements` builds the real
+            let names = crate::jca::provider_chain::algorithms_for_service(&type_name);
+            // W3-7 (RJdkSecurity.java:311) kept: the old code allocated the
+            // SYNTHETIC HashSet layout — a String[] in slot 0. In real-JDK mode
+            // `java.util.HashSet` has exactly one instance field,
+            // `transient HashMap<E,Object> map` (verified with javap), so slot
+            // 0 IS `map` and `contains(Object)` ran real bytecode doing
+            // `map.containsKey(o)` against a String[] receiver.
+            // `make_hashset_with_elements` builds the real
             // `HashSet -> HashMap -> Node[]` shape and falls back to the legacy
-            // synthetic layout when the real classes are not loaded, so this
-            // is correct in both modes. Same helper
-            // `jca::provider_chain::provider_get_services_native` already uses.
-            let elems: Vec<Value> = algos
-                .iter()
-                .map(|&algo| Value::Object(Some(ctx.create_string(algo))))
-                .collect();
+            // synthetic layout when the real classes are not loaded.
+            //
+            // GC-safety: `create_string` allocates, so collecting every string
+            // first would hand `make_hashset_with_elements` pre-move addresses
+            // for the earlier elements. Pin each one across its own creation.
+            let mut elems: Vec<Value> = Vec::with_capacity(names.len());
+            let mut pins: Vec<usize> = Vec::with_capacity(names.len());
+            for name in &names {
+                let s = ctx.create_string(name);
+                pins.push(ctx.pin_native_root(s));
+                elems.push(Value::Object(Some(s)));
+            }
+            for (i, pin) in pins.iter().enumerate() {
+                if let Value::Object(Some(obj)) = elems[i] {
+                    elems[i] = Value::Object(Some(ctx.read_native_pin(*pin, obj)));
+                }
+            }
             let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems)?;
+            if let Some(base) = pins.first() {
+                ctx.unpin_native_roots(*base);
+            }
             Ok(Some(Value::Object(Some(set))))
         },
     );

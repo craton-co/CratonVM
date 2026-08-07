@@ -1831,13 +1831,46 @@ pub(crate) fn p59_sf_get_method_type(
     // call throw on a default walker. The check that the JDK does mandate for
     // `getMethodType()` lives in `p59_sf_get_method_type_retain_checked`, which
     // is what the `getMethodType` registrations bind.
+    // TWO carriers reach this one function, and only one of them has the
+    // 8-slot layout the registrar above documents.
+    //
+    //   * `populate_stack_frame` (this file) — the synthetic
+    //     `java/lang/StackWalker$StackFrame`: slot 1 = methodName,
+    //     slot 5 = declaring class internal name.
+    //   * `lang_stackwalker::populate_sfi` — a REAL `java.lang.StackFrameInfo`,
+    //     whose hierarchy-wide layout is
+    //     `ClassFrameInfo{classOrMemberName(0), flags(1)}` then
+    //     `StackFrameInfo{name(2), type(3), bci(4), contScope(5), ste(6)}`
+    //     (`javap -p java.lang.StackFrameInfo java.lang.ClassFrameInfo`).
+    //
+    // Slot 5 is a deliberate alias that holds on BOTH: `populate_sfi` stashes
+    // the '/'-form internal name in `contScope` on purpose (see its comment).
+    // Slot 1 is NOT: on a real `StackFrameInfo` it is the `int flags` word, so
+    // `read_string` refuses it, `method_name` came back empty, and
+    // `getMethodType()` answered **null** / `getDescriptor()` threw
+    // "descriptor metadata is unavailable" for every real-JDK frame.
+    //
+    // This is reachable in real-JDK mode, not just synthetic: the interface
+    // registration in `register_real_jdk_stackwalker_frame_method_type` is on
+    // the essential path, and `native_override::force_native_over_real_jdk_bytecode`
+    // force-routes `("java/lang/StackWalker$StackFrame", "getMethodType"/
+    // "getDescriptor")` over the real bytecode.
+    //
+    // Resolve `name` BY NAME first — the same order the sibling
+    // `StackFrameInfo.getMethodType()` in `lang_stackwalker.rs` already uses.
+    // A fabricated stub names its fields `_f0.._fN`, so the by-name read
+    // misses there and the slot-1 fallback is taken automatically; no mode
+    // flag is involved.
     let internal = match ctx.get_field(this, 5) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
     };
-    let method_name = match ctx.get_field(this, 1) {
+    let method_name = match ctx.get_field_by_name(this, "name") {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
+        _ => match ctx.get_field(this, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
     };
     if internal.is_empty() || method_name.is_empty() {
         return Ok(Some(Value::Object(None)));

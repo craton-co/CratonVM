@@ -2301,7 +2301,14 @@ fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     }
     let parent = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
     ctx.set_field(parent, 0, Value::Long(parent_pid));
+    // GC-SAFETY (native stale-local family): `parent` is not yet reachable
+    // from any Java root, and the `Optional` allocation below is a collection
+    // point that can relocate it. Holding it in a bare local across that call
+    // and then storing it is the use-after-move that corrupts the heap.
+    let parent_pin = ctx.pin_native_root(parent);
     let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let parent = ctx.read_native_pin(parent_pin, parent);
+    ctx.unpin_native_roots(parent_pin);
     ctx.set_field(optional, 0, Value::Object(Some(parent)));
     Ok(Some(Value::Object(Some(optional))))
 }
@@ -2416,8 +2423,15 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         let Ok(exe) = std::env::current_exe() else {
             return p60_empty_optional(ctx, args);
         };
+        // GC-SAFETY (native stale-local family): `text` is freshly allocated
+        // and reachable from no Java root, and the `Optional` allocation below
+        // is a collection point that can relocate it. Pin across the alloc and
+        // re-read the forwarded ref before the (allocation-free) field write.
         let text = ctx.create_string(&exe.to_string_lossy());
+        let text_pin = ctx.pin_native_root(text);
         let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let text = ctx.read_native_pin(text_pin, text);
+        ctx.unpin_native_roots(text_pin);
         ctx.set_field(optional, 0, Value::Object(Some(text)));
         Ok(Some(Value::Object(Some(optional))))
     });
