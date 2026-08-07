@@ -10153,6 +10153,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: bsh_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(&mut ctx, "bsh/classpath/DiscreteFilesClassLoader");
@@ -10186,6 +10187,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: filtered_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(
@@ -10219,6 +10221,7 @@ mod classloader_tests {
                 access_flags: 0,
                 declaring_class_id: modified_cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let loader = new_object_ref(
@@ -11894,6 +11897,7 @@ mod classloader_tests {
                 access_flags: method_flags,
                 declaring_class_id: cls_id,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         ctx.set_declared_fields(
@@ -12073,6 +12077,7 @@ mod classloader_tests {
                 access_flags: ACC_PUBLIC,
                 declaring_class_id: parent,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let child = ctx.ensure_class_initialized("p/Child").unwrap();

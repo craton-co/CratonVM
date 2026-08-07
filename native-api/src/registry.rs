@@ -140,6 +140,19 @@ pub struct MethodMetadata {
     /// proxy class's `<clinit>` so that `wrap_undeclared_throwable`
     /// (WP2.5 v3 item 6) can match thrown exceptions against it.
     pub exceptions: Vec<String>,
+    /// The JVMS §4.7.9 `Signature` attribute of this method, i.e. its
+    /// generic signature, or `None` when the method is not generic.
+    ///
+    /// Carried here for the same reason as `exceptions`: whoever produced
+    /// this metadata already walked the declaring class's method table, and
+    /// `create_method_object` would otherwise search that table AGAIN, by
+    /// name+descriptor, once per mirror. In a `Class.getDeclaredMethods()`
+    /// call that loop already runs once per method, so the search made the
+    /// cost per method grow with the method count — 766 us of a 2440 us call
+    /// on a 1000-method class went to the exceptions lookup and 659 us to
+    /// this one. A fabricated method (a synthetic stub, a lambda-proxy SAM,
+    /// a shim) is not generic and correctly reports `None`.
+    pub signature: Option<String>,
 }
 
 /// WP2.3 — defineClass options carried through `NativeContext::define_class_full`.
