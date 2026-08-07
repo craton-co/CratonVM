@@ -1482,6 +1482,9 @@ impl ZgcRealHeap {
     pub fn with_capacity(total_bytes: usize) -> Self {
         let cap = total_bytes.max(4096);
         Self {
+            layout_domain: std::sync::atomic::AtomicU32::new(
+                cratonvm_types::FIRST_LAYOUT_DOMAIN,
+            ),
             arena: Mutex::new(Arena::new(cap)),
             registry: Mutex::new(FxHashSet::default()),
             next_hash_code: AtomicI32::new(1),

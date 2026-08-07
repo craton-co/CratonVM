@@ -65,10 +65,27 @@ public class ForeignHandleProbe {
         System.out.println(key + "=" + value);
     }
 
-    /** Launch a backgrounded `sleep` that outlives its shell, and return its pid. */
+    /**
+     * Launch a backgrounded `sleep` that outlives its shell, and return its pid.
+     *
+     * The `>/dev/null 2>&1` on the BACKGROUNDED command is load-bearing, and
+     * leaving it off is a race in every VM including HotSpot. Without it the
+     * grandchild inherits the shell's stdout pipe and holds the write end for
+     * its whole lifetime, so `readAllBytes()` here does not see EOF when the
+     * shell exits. It then either returns early, because the reader's
+     * `processExited()` hook drained and closed the stream first, or blocks for
+     * the full sleep, because the read was already parked in the kernel when
+     * that hook ran. Which one wins is a race, and when the second wins the
+     * subject is dead by the time its pid is used.
+     *
+     * Measured on real HotSpot 25, one binary, one run, only the duration
+     * changing: `sleep 8` returned in 2 ms, `sleep 30` in 30001 ms. A probe
+     * built on the un-redirected form reports on that race rather than on
+     * whatever it meant to ask.
+     */
     static long launchGrandchild(String seconds) throws Exception {
         Process launcher = new ProcessBuilder("/bin/sh", "-c",
-                "sleep " + seconds + " & echo $!").start();
+                "sleep " + seconds + " >/dev/null 2>&1 & echo $!").start();
         String printed = new String(launcher.getInputStream().readAllBytes()).trim();
         launcher.waitFor();
         return Long.parseLong(printed);

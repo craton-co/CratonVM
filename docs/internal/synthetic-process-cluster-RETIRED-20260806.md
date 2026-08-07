@@ -237,11 +237,16 @@ snapshotted before that rung and the source carries the ordering requirement.
   against a 30 s process, `--jdk-only` read `completed-while-alive` and HotSpot
   read `still-waiting`. Now identical. `probes/ForeignHandleProbe.java`.
 
-  Writing that probe turned up two more things about foreign handles, neither
-  caused by any of this work and both filed with measurements in
-  [`foreign-processhandle-residuals.md`](../known-issues/jdk-only/foreign-processhandle-residuals.md):
-  compatible mode cannot construct a foreign `ProcessHandle` at all, and
-  `ProcessHandle.destroy()` on one is a deliberate no-op.
+  Writing that probe turned up two more things about foreign handles, both since
+  closed — see
+  [`foreign-processhandle-CLOSED-20260807.md`](foreign-processhandle-CLOSED-20260807.md).
+  `ProcessHandle.destroy()` on a foreign handle really was a no-op and is fixed:
+  `isAlive0` now reports a real start time from `/proc/<pid>/stat`, so `destroy0`
+  can run the JDK's staleness check instead of refusing outright. The other —
+  "compatible mode cannot construct a foreign `ProcessHandle`" — was **wrong and
+  is retracted**: the fault was in that probe's own launcher, which let the
+  subject inherit the shell's stdout pipe. Real HotSpot 25 shows the same race,
+  30001 ms against 2 ms on one binary with only the sleep duration changed.
 * **`native-builtins/src/lib.rs`'s synthetic-mode `ProcessBuilder` block** —
   `<init>` ×2, `command`, `start` — still carries the ambient `Bridge`. That
   registrar is not on the default boot path, so no gate here measures it and the

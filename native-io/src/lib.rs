@@ -21342,15 +21342,16 @@ mod io_tests {
             .expect("CompletedFuture timed get must be registered");
 
         let mut ctx = MockNativeContext::new();
-        // `?` here would need the test to return `Result`; it does not, so the
-        // file did not compile under `--all-targets` at all. Unwrap the
-        // `MethodCallFailed` explicitly instead: a failure is a test failure,
-        // and saying so keeps the diagnostic (which `?` would have discarded
-        // into an unused `Err` return anyway).
-        let future = match wrap_completed_future(&mut ctx, Value::Int(123)) {
-            Ok(Value::Object(Some(o))) => o,
-            Ok(other) => panic!("expected future object, got {other:?}"),
-            Err(e) => panic!("wrap_completed_future failed: {e:?}"),
+        // `?` in a `-> ()` test does not compile, and `wrap_completed_future`
+        // returns `Result<Value, MethodCallFailed>` -- so unwrap the Result and
+        // match the `Value`. Landed broken in 1a07c0e54: `cargo test -p
+        // cratonvm-native-io` could not build the lib TEST TARGET at all, so
+        // every test in the crate was unrunnable and none of them said so.
+        let future = match wrap_completed_future(&mut ctx, Value::Int(123))
+            .expect("wrap_completed_future must not fail")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected future object, got {other:?}"),
         };
 
         assert_eq!(
