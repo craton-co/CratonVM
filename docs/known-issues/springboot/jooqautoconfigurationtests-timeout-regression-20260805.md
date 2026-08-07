@@ -164,8 +164,8 @@ reflection surface adding to the total), but a HANG kill leaves no thread
 dump, so a genuine deadlock distinct from (a) cannot be fully ruled out
 without a longer-timeout rerun with `--stack-sample-ms`.
 
-**On the G1/ZGC "timeout-boundary noise" framing:** `docs/gc/g1-fullsuite-regression-20260807.md`
-and `docs/gc/zgc-real-fullsuite-regression-20260807.md` both list these same
+**On the G1/ZGC "timeout-boundary noise" framing:** `g1-fullsuite-regression-20260807.md`
+and `zgc-real-fullsuite-regression-20260807.md` both list these same
 classes (3 of 4 in the G1 doc, all 4 in the ZGC doc) as flipping
 HANG-under-Generational -> PASS-under-G1/ZGC, tentatively dismissed as
 "timeout-boundary noise." The logs here argue against reading that literally

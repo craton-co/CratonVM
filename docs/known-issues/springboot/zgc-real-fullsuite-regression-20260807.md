@@ -94,14 +94,14 @@ module/spring-boot-webmvc                                     BasicErrorControll
 
 ## Working hypothesis, not confirmed
 
-`docs/GC.md` already documents ZGC-real as "a memory-backed, non-moving,
+`../../GC.md` already documents ZGC-real as "a memory-backed, non-moving,
 whole-heap stop-the-world mark-sweep over one arena... No colored pointers,
 no load barriers, no concurrency, no compaction." A full **stop-the-world,
 whole-arena** mark-sweep on every collection, with no generational
 short-lived-object fast path, is the textbook shape that turns "many short
 `ApplicationContext` lifecycles" into a throughput cliff — every collection
 scans the *entire* live set instead of just a small young generation.
-`gc_rearm`'s own doc comment in `gc/src/zgc.rs` independently describes a
+`gc_rearm`'s own doc comment in `../../../gc/src/zgc.rs` independently describes a
 previously-fixed livelock mode ("a live set that sits above the static 75%
 threshold... ran a full STW mark-sweep per allocation: a livelock-grade GC
 storm") — plausible that these 35 classes hit a related-but-different
@@ -169,7 +169,7 @@ module/spring-boot-jooq-test  JooqTestWithAutoConfigureTestDatabaseIntegrationTe
   above.
 - No re-run for reproducibility on either arm — this is one data point per
   class per collector, not an averaged/repeated measurement. Given
-  `docs/GC.md`'s and `docs/gc-tuning.md`'s own "experimental / research
+  `../../GC.md`'s and `../../gc-tuning.md`'s own "experimental / research
   vehicle, do not depend on in production" framing for this backend, that
   tradeoff (breadth over depth) seemed the right one for a first-ever
   characterization run.
