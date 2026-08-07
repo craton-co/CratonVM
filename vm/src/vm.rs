@@ -6139,7 +6139,10 @@ mod tests {
         // Single thread (just the initiator)
         assert!(barrier.request_stw(ThreadId(0), 1));
         barrier.wait_for_all();
-        barrier.complete_gc(std::collections::HashMap::new());
+        // `complete_gc` takes `cratonvm_types::PointerMap` (an `FxHashMap`),
+        // not a std `HashMap` — same synthetic-jdk-only blind spot as
+        // `s54_compact_header_migration_roundtrip` below.
+        barrier.complete_gc(cratonvm_types::PointerMap::default());
         assert!(!barrier
             .stw_requested
             .load(std::sync::atomic::Ordering::Relaxed));
@@ -6164,7 +6167,7 @@ mod tests {
         barrier.wait_for_all();
 
         // Complete GC with a pointer map
-        let mut pm = std::collections::HashMap::new();
+        let mut pm = cratonvm_types::PointerMap::default();
         pm.insert(0xAAAA, 0xBBBB);
         barrier.complete_gc(pm);
 
@@ -76159,10 +76162,15 @@ public class SkippedTest {
         use cratonvm_gc::compact_header::CompactHeader;
         use cratonvm_gc::heap::HEADER_SIZE;
         assert_eq!(std::mem::size_of::<CompactHeader>(), 8);
-        // 32 until the 2026-08-06 shrink folded `forwarding_ptr` into the mark
-        // word; the gap this type would still close is 16, not 24.
-        assert_eq!(HEADER_SIZE, 24);
-        assert_eq!(HEADER_SIZE - CompactHeader::SIZE, 16);
+        // Two shrinks, and this assertion was only updated for the first: 32
+        // until the 2026-08-06 change folded `forwarding_ptr` into the mark
+        // word (-> 24), then `d7965af6a` folded the kind/element_type/gc_age/
+        // gc_flags quartet in as well (-> 16). It read 24 here because this
+        // module is `cfg(all(test, feature = "synthetic-jdk"))` and did not
+        // compile at all between that commit and now. `types` and
+        // `compact_header` each assert 16 already.
+        assert_eq!(HEADER_SIZE, 16);
+        assert_eq!(HEADER_SIZE - CompactHeader::SIZE, 8);
     }
 
     #[test]
@@ -76297,15 +76305,36 @@ public class SkippedTest {
         use cratonvm_gc::compact_header::{migrate_to_compact, to_legacy_fields};
         use cratonvm_gc::HashCodeTable;
 
-        let mut old = cratonvm_gc::heap::ObjectHeader::new(
+        use std::sync::atomic::Ordering;
+        type Hdr = cratonvm_gc::heap::ObjectHeader;
+
+        // `gc_age` / `gc_flags` stopped being struct fields in `d7965af6a`
+        // (HEADER_SIZE 24 -> 16): the quartet now lives in bits 48..61 of the
+        // mark word, behind CAS-based accessors. This module is
+        // `cfg(all(test, feature = "synthetic-jdk"))`, so the two field
+        // assignments this replaces went unnoticed until the feature gate was
+        // run again — they had not compiled since.
+        let old = Hdr::new(
             cratonvm_types::ClassId::new(42),
             cratonvm_gc::heap::ObjectKind::Array,
             cratonvm_gc::heap::ArrayElementType::Long,
             10,
             0,
         );
-        old.gc_age = 3;
-        old.gc_flags = 0x01;
+        old.set_gc_age(3);
+        old.set_gc_flags(cratonvm_types::GC_FLAG_OLD_GEN);
+
+        // `migrate_to_compact` only moves an identity hash it can actually see
+        // (`neutral_hash(mark) != 0`), and a freshly constructed header carries
+        // none — so without planting one the `has_hash_code` / `ht.get` pair
+        // below asserts nothing. `make_neutral_hashed` preserves the quartet,
+        // hence after the two setters above.
+        old.mark_word.store(
+            Hdr::make_neutral_hashed(old.mark_word.load(Ordering::Relaxed), 777),
+            Ordering::Relaxed,
+        );
+        assert_eq!(old.gc_age(), 3, "the quartet must survive hash install");
+        assert_eq!(old.gc_flags(), cratonvm_types::GC_FLAG_OLD_GEN);
 
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 42, &ht, 0x2000);
@@ -76326,6 +76355,38 @@ public class SkippedTest {
         assert!(lf.is_array);
         assert_eq!(lf.narrow_klass, 42);
         assert_eq!(lf.gc_age, 3);
+        assert!(lf.has_hash);
+
+        // The gc FLAG half of this test is unobservable on the array path:
+        // `migrate_to_compact` packs flags into the low nibble only for
+        // non-arrays, because for an array that nibble is the element type.
+        // So carry the same header shape through the object path, where the
+        // flag is what the nibble holds — otherwise `set_gc_flags` above is
+        // decoration and a migration that dropped flags entirely would still
+        // pass this test.
+        let obj = Hdr::new(
+            cratonvm_types::ClassId::new(42),
+            cratonvm_gc::heap::ObjectKind::Object,
+            cratonvm_gc::heap::ArrayElementType::Reference,
+            0,
+            4,
+        );
+        obj.set_gc_age(3);
+        obj.set_gc_flags(cratonvm_types::GC_FLAG_OLD_GEN | cratonvm_types::GC_FLAG_MARKED);
+
+        let compact_obj = migrate_to_compact(&obj, 42, &HashCodeTable::new(), 0x3000);
+        assert!(!compact_obj.is_array());
+        assert_eq!(compact_obj.narrow_klass(), 42);
+        assert_eq!(compact_obj.gc_age(), 3);
+        assert_eq!(
+            compact_obj.element_type(),
+            cratonvm_types::GC_FLAG_OLD_GEN | cratonvm_types::GC_FLAG_MARKED,
+            "for a non-array the low nibble carries the migrated gc_flags"
+        );
+        assert!(
+            !compact_obj.has_hash_code(),
+            "no identity hash was installed on this one"
+        );
     }
 
     // =========================================================================
