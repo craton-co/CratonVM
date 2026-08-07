@@ -1902,7 +1902,7 @@ pub(crate) fn native_p64_lhm_seq_entry_set(
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, 0);
         let val = ctx.get_field(node, 1);
-        entries.push(p64_make_entry(ctx, key, val));
+        entries.push(p64_make_entry(ctx, key, val)?);
         cur = ctx.get_field(node, 5);
     }
     let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;

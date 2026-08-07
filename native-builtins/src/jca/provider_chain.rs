@@ -2247,7 +2247,7 @@ fn resolve_service(
     };
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
     let prov_obj = make_provider(ctx, provider, ver, coverage)?;
-    Ok(Some(make_service(ctx, &entry, prov_obj).ok()?))
+    Ok(Some(make_service(ctx, &entry, prov_obj)?))
 }
 
 /// `sun.security.jca.GetInstance.getService(String type, String algorithm,

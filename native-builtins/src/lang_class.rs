@@ -14798,9 +14798,11 @@ pub(crate) fn native_class_get_type_parameters(
         } else {
             crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
         };
-        let tv = cached.unwrap_or_else(|| {
-            crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))?
-        });
+        let tv = cached
+            .map(Ok)
+            .unwrap_or_else(|| {
+                crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
+            })?;
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }

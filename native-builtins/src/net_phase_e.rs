@@ -10670,7 +10670,7 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             Ok(out)
         }
     };
-    Ok(Some(Value::Object(Some(out))))
+    Ok(Some(Value::Object(Some(out?))))
 }
 
 /// Extract the full external-form string from a `java.net.URI` and return it as

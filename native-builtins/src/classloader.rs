@@ -7238,12 +7238,15 @@ pub(crate) fn ucl_try_define_local_class(
             if url_classloader_isolated_from_app(ctx, loader)
                 && !cratonvm_classloading::is_bootstrap_appended_class(internal_name)
             {
-                let exception = crate::jboss_module_loader::alloc_single_message_exception(
+                let exception = match crate::jboss_module_loader::alloc_single_message_exception(
                     ctx,
                     "java/lang/ClassNotFoundException",
                     1,
                     internal_name,
-                )?;
+                ) {
+                    Ok(e) => e,
+                    Err(err) => return Some(Err(err)),
+                };
                 return Some(Err(
                     cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception),
                 ));
@@ -7251,12 +7254,15 @@ pub(crate) fn ucl_try_define_local_class(
             return None;
         }
         None => {
-            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            let exc = match crate::jboss_module_loader::alloc_single_message_exception(
                 ctx,
                 "java/lang/ClassNotFoundException",
                 1,
                 internal_name,
-            )?;
+            ) {
+                Ok(e) => e,
+                Err(err) => return Some(Err(err)),
+            };
             return Some(Err(
                 cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
             ));

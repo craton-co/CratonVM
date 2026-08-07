@@ -594,9 +594,9 @@ fn select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let proxies = match chosen {
         Some((h, p, kind)) => {
             let isa = alloc_inet_socket_address(ctx, &h, p);
-            vec![alloc_proxy(ctx, kind, Some(isa?))]
+            vec![alloc_proxy(ctx, kind, Some(isa?))?]
         }
-        None => vec![alloc_proxy(ctx, PROXY_TYPE_DIRECT, None)],
+        None => vec![alloc_proxy(ctx, PROXY_TYPE_DIRECT, None)?],
     };
     let list = alloc_proxy_list(ctx, &proxies);
     Ok(Some(Value::Object(Some(list?))))

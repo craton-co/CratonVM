@@ -74,6 +74,7 @@
 //! End-to-end the probe must print `OK` on stdout and exit 0 with the
 //! shim registered.
 
+use cratonvm_types::error::MethodCallFailed;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
@@ -1740,7 +1741,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             check_transformation_supported(ctx, &algo_str)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1769,7 +1770,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             check_transformation_supported(ctx, &algo_str)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1789,7 +1790,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             check_transformation_supported(ctx, &algo_str)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2492,8 +2493,7 @@ mod tests {
         let key = key_with_handle(&mut ctx, 0);
         let err = cipher_init_record(&mut ctx, cipher_obj, 1, key, Vec::new())
             .expect_err("init must reject a key with no usable RSA components");
-        use cratonvm_types::error::MethodCallFailed;
-        match err {
+                match err {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(

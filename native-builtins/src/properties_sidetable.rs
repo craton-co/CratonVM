@@ -2949,7 +2949,7 @@ fn native_properties_keys(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let mut keys: Vec<String> = ordered_snapshot_kv(ctx, &mut this)
         .into_iter()
         .map(|(k, _v)| k)
-        .collect()?;
+        .collect();
     // Include String keys of CHM-exclusive (non-String-valued) entries.
     let side = side_key_set(ctx, this);
     for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {

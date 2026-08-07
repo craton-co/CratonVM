@@ -3341,7 +3341,9 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
     args: &[Value],
 ) -> MethodCallResult {
     let instantiate_factory =
-        |ctx: &mut dyn NativeContext, class_name: &str| -> Option<ObjectRef> {
+        |ctx: &mut dyn NativeContext,
+         class_name: &str|
+         -> Result<Option<ObjectRef>, MethodCallFailed> {
             let init_ok = ctx.ensure_class_initialized(class_name).is_ok();
             let obj = if init_ok {
                 match ctx.new_object(class_name) {
@@ -3354,7 +3356,7 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
             // Use real object allocation + constructor init so surefire's internal
             // processor/channel fields are materialized with the expected layout.
             let _ = ctx.invoke_special(class_name, "<init>", "()V", &[Value::Object(Some(obj))]);
-            Some(obj)
+            Ok(Some(obj))
         };
 
     let conn_val = args.first().copied().unwrap_or(Value::Object(None));
@@ -3379,7 +3381,7 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
         "org/apache/maven/surefire/booter/spi/LegacyMasterProcessChannelProcessorFactory",
     ];
     for class_name in candidates {
-        let Some(factory) = instantiate_factory(ctx, class_name) else {
+        let Some(factory) = instantiate_factory(ctx, class_name)? else {
             continue;
         };
         let can_use = ctx.invoke_virtual(
@@ -3404,7 +3406,7 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
     // If capability checks are unreliable, at least require connect() to accept
     // the normalized transport string before returning.
     for class_name in candidates {
-        let Some(factory) = instantiate_factory(ctx, class_name) else {
+        let Some(factory) = instantiate_factory(ctx, class_name)? else {
             continue;
         };
         let connect = ctx.invoke_virtual(
@@ -3418,7 +3420,7 @@ pub(crate) fn native_surefire_lookup_decoder_factory(
         }
     }
     for class_name in candidates {
-        if let Some(factory) = instantiate_factory(ctx, class_name) {
+        if let Some(factory) = instantiate_factory(ctx, class_name)? {
             return Ok(Some(Value::Object(Some(factory))));
         }
     }

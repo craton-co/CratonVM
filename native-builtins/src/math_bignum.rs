@@ -2417,7 +2417,7 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> Result<Obje
             // object — matches HotSpot's behaviour for `BigDecimal.ONE`
             // where `intVal != null` even though `intCompact == 1`.
             let bi = if bi_class_id.is_some() {
-                Some(bi_alloc(ctx, &unscaled_str))
+                Some(bi_alloc(ctx, &unscaled_str)?)
             } else {
                 None
             };

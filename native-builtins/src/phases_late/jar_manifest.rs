@@ -2757,9 +2757,9 @@ pub(crate) fn sb2_launcher_create_class_loader_bypass_archive_walk(
                          // Pin across the archive scan / URL[] alloc below — a moving young GC
                          // there would relocate them (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
-    let archives = sb2_launcher_build_archive_list(ctx, this);
-    let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives?.len());
-    let mut url_pins: Vec<usize> = Vec::with_capacity(archives?.len());
+    let archives = sb2_launcher_build_archive_list(ctx, this)?;
+    let mut urls: Vec<ObjectRef> = Vec::with_capacity(archives.len());
+    let mut url_pins: Vec<usize> = Vec::with_capacity(archives.len());
     for arch_val in archives {
         let Value::Object(Some(arch_obj)) = arch_val else {
             continue;
@@ -3640,15 +3640,15 @@ pub(crate) fn p59_manifest_init_from_input_stream_at(
         p59_attrs_populate_real(ctx, main_pin, main_attrs, &parsed.main)?;
 
         // Per-entry sections: name -> Attributes in a real LinkedHashMap.
-        let entries_map = p59_manifest_new_entries_map(ctx);
-        let entries_pin = ctx.pin_native_root(entries_map?);
+        let entries_map = p59_manifest_new_entries_map(ctx)?;
+        let entries_pin = ctx.pin_native_root(entries_map);
         for (name, pairs) in &parsed.entries {
             let entry_attrs = p59_manifest_new_attributes(ctx)?;
             let entry_pin = ctx.pin_native_root(entry_attrs);
             p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs)?;
             let ns = ctx.create_string(name);
             let ns_pin = ctx.pin_native_root(ns);
-            let entries_map = ctx.read_native_pin(entries_pin, entries_map?);
+            let entries_map = ctx.read_native_pin(entries_pin, entries_map);
             let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
             let ns = ctx.read_native_pin(ns_pin, ns);
             ctx.invoke(
