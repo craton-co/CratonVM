@@ -276,7 +276,7 @@ fn remap_http_handlers(_: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap
 fn scan_datagram_sockets(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
     cratonvm_native_builtins::net_phase_e::gc_scan_ds_roots(roots);
 }
-fn remap_datagram_sockets(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+fn remap_datagram_sockets(_: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     cratonvm_native_builtins::net_phase_e::gc_update_ds_refs(map);
 }
 fn scan_inet_addresses(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
