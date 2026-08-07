@@ -161,8 +161,11 @@ defect:
 
 1. `probeContentType` → `UnsatisfiedLinkError:
    sun/nio/fs/WindowsNativeDispatcher.initIDs()V`. A missing JNI native in the
-   Windows registry MIME lookup, not an abstract declaration. Filed as
-   `docs/known-issues/nio/bug-files-probecontenttype-windows-nativedispatcher-20260807.md`.
+   Windows registry MIME lookup, not an abstract declaration, so it got its own
+   page — and was **fixed later the same day**, taking this sweep to 2 of 43.
+   See the retired
+   `bug-files-probecontenttype-windows-nativedispatcher-FIXED-20260807`
+   write-up.
 2. The `ClassCastException` message. Both say `class java.lang.String cannot be
    cast to class java.lang.Boolean`; HotSpot then appends `(java.lang.String and
    java.lang.Boolean are in module java.base of loader 'bootstrap')` and

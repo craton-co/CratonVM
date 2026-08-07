@@ -380,8 +380,17 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
             // double-checked locking over a volatile field, so the assignment
             // landed inside the lock and the read after `monitorexit` came back
             // null: `NullPointerException ... because "flt" is null`, and no
-            // file-backed database could open. See
-            // docs/known-issues/vm/compact-ref-field-layout-corrupts-filechannel-filelock-20260807.md.
+            // file-backed database could open. See the retired
+            // `compact-ref-field-layout-corrupts-filechannel-filelock-20260807`
+            // write-up (cited by name: its tree is not published).
+            //
+            // The second victim, found from the other end the same day: every
+            // Spring Boot test class failed at JUnit discovery, because
+            // `AbstractTestDescriptor.children` is a `Collections.synchronizedSet`
+            // and `EngineDiscoveryResultValidator` walks
+            // `getChildren().iterator()` — the first `synchronized` inside that
+            // wrapper de-compacted it and the backing collection read back
+            // null. `probes/MonitorQuartetProbe.java` is that repro.
             (ObjectHeader::quartet_of(cur) | types::MARK_NEUTRAL, None)
         } else {
             (

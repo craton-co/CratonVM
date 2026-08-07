@@ -222,6 +222,37 @@ fn parallel_evac_enabled() -> bool {
     gc_flags().g1_parallel_evac
 }
 
+/// How many candidate references the evacuation ref-scan refused to
+/// dereference because they did not look like live object headers.
+///
+/// Expected to be ZERO. A non-zero value means some writer put a word into a
+/// reference slot that is inside the heap's address span but is not an object —
+/// which, before the guard, was a SIGSEGV inside `scan_and_evacuate_refs`.
+/// Reported by `G1Collector::print_gc_summary`.
+pub static EVAC_REF_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`EVAC_REF_REJECTED`].
+pub fn evacuation_refs_rejected() -> usize {
+    EVAC_REF_REJECTED.load(Ordering::Relaxed)
+}
+
+/// How many objects the evacuation ref-scan refused to WALK because their own
+/// header did not look like a live object. Expected to be ZERO.
+pub static EVAC_HOLDER_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// How many holders' element walks were clamped to their region's extent —
+/// i.e. how many headers claimed more reference slots than could physically be
+/// there. Expected to be ZERO.
+pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
+
+/// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
+pub fn evacuation_holder_counts() -> (usize, usize) {
+    (
+        EVAC_HOLDER_REJECTED.load(Ordering::Relaxed),
+        EVAC_HOLDER_CLAMPED.load(Ordering::Relaxed),
+    )
+}
+
 // ===========================================================================
 // Step 9 — parallel STW evacuation (gated behind `CRATONVM_G1_PARALLEL_EVAC`)
 // ===========================================================================
@@ -3454,13 +3485,21 @@ impl G1Collector {
             // its header is intact and its region is held under the collection's
             // `regions` lock (Phase 5 has not run yet).
             unsafe {
-                // Retire the forward. These are from-space objects the cycle has
-                // abandoned, so NEUTRAL is the right resting state — there is no
-                // lock state left to preserve on a dead copy, and the live one
-                // carries the mark word this evacuation transferred to it.
-                (*(k as *const ObjectHeader))
-                    .mark_word
-                    .store(cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
+                // Retire the forward. These are from-space objects the cycle
+                // has abandoned, so NEUTRAL is the right resting *lock* state —
+                // the live copy carries the mark word this evacuation
+                // transferred to it.
+                //
+                // The QUARTET is not lock state and must survive: `kind` and
+                // `element_type` are what every linear region walker sizes a
+                // from-space object from, and this store runs while Phase 5 has
+                // not yet zeroed the region. Storing a bare `MARK_NEUTRAL` here
+                // left an abandoned copy claiming to be a zero-slot plain
+                // object.
+                let h = &*(k as *const ObjectHeader);
+                let quartet = ObjectHeader::quartet_of(h.mark_word.load(Ordering::Relaxed));
+                h.mark_word
+                    .store(quartet | cratonvm_types::MARK_NEUTRAL, Ordering::Relaxed);
             }
         }
 
@@ -4121,6 +4160,176 @@ impl G1Collector {
     /// no such API), so the invariant is enforced by the type-level
     /// `&mut Vec<G1Region>` parameter (only the lock holder can produce
     /// it) plus this contract comment.
+    /// Reject a candidate reference the evacuator is about to DEREFERENCE
+    /// when it does not look like a live object header, and say so once.
+    ///
+    /// `region_for_ptr` answers "is this word inside the region base table's
+    /// span?" — containment, nothing more. `evacuate_object` then reads the
+    /// candidate's `ObjectHeader`. A word that is in-span but is not an object
+    /// (a region base, an uncommitted page, a stale address whose region has
+    /// been recycled) therefore faults INSIDE THE COLLECTOR, with no
+    /// attribution and no chance for the pause to continue.
+    ///
+    /// `is_object_address` is the validator this collector already trusts for
+    /// conservative JIT roots and for the auto-box read: alignment, live-region
+    /// containment, and both header tag bytes, none of which requires trusting
+    /// the candidate. Using it here is the fail-safe the 2026-08-06 Hibernate
+    /// G1 comparison asked for by name — it observed that the default
+    /// collector's equivalent stale-coverage paths degrade to a controlled Java
+    /// error while G1's take a native SIGSEGV.
+    ///
+    /// Returns `true` when the reference may be evacuated.
+    ///
+    /// This does NOT explain where a rejected word came from. It makes the
+    /// event survivable and attributable; the producer is a separate question.
+    ///
+    /// Takes the caller's ALREADY-BORROWED `regions` slice and must not call
+    /// [`Self::is_object_address`]: that helper's `is_addr_in_live_region` half
+    /// re-acquires `self.regions`, which the evacuator is holding — a deadlock,
+    /// not a slow path.
+    fn evacuation_candidate_is_an_object(
+        &self,
+        regions: &[G1Region],
+        holder: *mut u8,
+        slot: usize,
+        raw: usize,
+    ) -> bool {
+        if self.candidate_header_is_plausible(regions, raw) {
+            return true;
+        }
+        let n = EVAC_REF_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        // Rate-limited like the other GC fail-safes: the first is always
+        // visible, then powers of two, so a pathological cycle cannot flood a
+        // suite log while a single occurrence still cannot hide.
+        if n <= 8 || n.is_power_of_two() {
+            // SAFETY: `holder` is the object currently being scanned; the
+            // evacuator owns it under the `regions` lock.
+            let (holder_class, holder_kind) = unsafe {
+                let h = &*(holder as *const ObjectHeader);
+                (h.class_id.as_u32(), h.kind())
+            };
+            tracing::warn!(
+                "[g1] evacuation ref-scan REJECTED a non-object candidate (#{n}):                  holder=0x{:x} class_id={holder_class} kind={holder_kind:?} slot={slot}                  candidate=0x{raw:x} — the word is inside the region span but is not a live                  object header, so evacuating it would have dereferenced it. The slot is left                  unchanged and the pause continues.",
+                holder as usize,
+            );
+        }
+        false
+    }
+
+    /// How many 8-byte reference slots of `obj_ptr` may safely be walked:
+    /// `declared`, clamped to what remains inside the holder's own region.
+    ///
+    /// Reports (rate-limited) when the clamp actually bites, because that means
+    /// a header claimed more elements than its region can hold — which is the
+    /// corrupt-header case, not a large-object case: a genuinely large array is
+    /// humongous and its continuation slices are physically contiguous, so the
+    /// span below covers them.
+    fn holder_walkable_slots(
+        &self,
+        regions: &[G1Region],
+        obj_ptr: *mut u8,
+        declared: usize,
+    ) -> usize {
+        let addr = obj_ptr as usize;
+        let region_size = self.config.region_size;
+        if region_size == 0 || addr < self.arena_base || addr >= self.arena_end {
+            return declared;
+        }
+        // The holder may be humongous: walk forward across continuation slices
+        // so a legitimately large array is not clamped.
+        let mut idx = (addr - self.arena_base) / region_size;
+        let Some(start) = regions.get(idx) else {
+            return declared;
+        };
+        let base = start.data.as_ptr() as usize;
+        let mut end = base + start.cursor;
+        while let Some(next) = regions.get(idx + 1) {
+            if next.region_type != RegionType::HumongousContinuation {
+                break;
+            }
+            idx += 1;
+            end = next.data.as_ptr() as usize + region_size;
+        }
+        if end <= addr + HEADER_SIZE {
+            return 0;
+        }
+        let room = (end - addr - HEADER_SIZE) / 8;
+        if room >= declared {
+            return declared;
+        }
+        let n = EVAC_HOLDER_CLAMPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                "[g1] evacuation ref-scan CLAMPED a holder's element walk (#{n}):                  obj=0x{addr:x} declared={declared} room={room} — the header claims more                  reference slots than its region holds, so the walk would have read past                  the region. Walking {room}.",
+            );
+        }
+        room
+    }
+
+    /// [`Self::is_object_address`]'s checks, against a borrowed `regions` slice
+    /// instead of re-locking: alignment, arena bounds, the owning region being
+    /// live and the address being below its allocation cursor, and both header
+    /// tag bytes decoding to defined enum values.
+    ///
+    /// Deliberately does NOT consult `kept_unresolved_*` the way
+    /// `is_addr_in_live_region` does. Those sets are empty outside the rare
+    /// wedged-drain window, they are behind their own mutexes (the same
+    /// deadlock hazard), and erring towards ACCEPTING there is the safe
+    /// direction for this guard: a false accept is only the pre-guard
+    /// behaviour, whereas a false reject would drop a live reference.
+    fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
+        if addr == 0 || addr & 0x7 != 0 {
+            return false;
+        }
+        if addr < self.arena_base || addr >= self.arena_end {
+            return false;
+        }
+        let region_size = self.config.region_size;
+        if region_size == 0 {
+            return false;
+        }
+        let idx = (addr - self.arena_base) / region_size;
+        let Some(r) = regions.get(idx) else {
+            return false;
+        };
+        match r.region_type {
+            RegionType::Free => return false,
+            // A humongous continuation slice is live in its entirety; only the
+            // start region carries the object's full `cursor`.
+            RegionType::HumongousContinuation => {}
+            _ => {
+                let base = r.data.as_ptr() as usize;
+                if addr < base || addr >= base + r.cursor {
+                    return false;
+                }
+            }
+        }
+        let ptr = addr as *const u8;
+        // SAFETY: the address is 8-aligned and inside a live region's committed
+        // span, so its first two tag bytes are readable. Both are validated as
+        // enum discriminants before any `ObjectHeader` borrow, exactly as
+        // `is_object_address` does — this is the step that rejects a word which
+        // is in-span but is not an object.
+        let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
+            return false;
+        };
+        if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
+        {
+            return false;
+        }
+        if kind == ObjectKind::HumongousFiller {
+            return false;
+        }
+        // SAFETY: tags validated above.
+        let header = unsafe { &*(ptr as *const ObjectHeader) };
+        const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
+        if kind == ObjectKind::Array {
+            header.array_length() <= i32::MAX as u32
+        } else {
+            header.num_slots() <= MAX_PLAUSIBLE_SLOTS
+        }
+    }
+
     fn scan_and_evacuate_refs(
         &self,
         regions: &mut Vec<G1Region>,
@@ -4132,12 +4341,40 @@ impl G1Collector {
         bytes_copied: &mut usize,
         work_list: &mut Vec<*mut u8>,
     ) {
+        // The HOLDER has to be an object too. It arrives from the worklist or
+        // from an rset source walk, and a wrong header here is what walks the
+        // loops below out of the region entirely — see
+        // `holder_walkable_slots`.
+        if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
+            let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
+                    obj_ptr as usize,
+                );
+            }
+            return;
+        }
         if header.kind() == ObjectKind::Array {
             if header.element_type() == ArrayElementType::Reference {
-                for i in 0..header.array_length() as usize {
+                // Clamp to what the holder's own region actually holds. A
+                // reference array's element count is a u32 bounded only by
+                // `i32::MAX`, and `HEADER_SIZE + len * 8` is never checked
+                // against the region — so one wrong header walks into the next
+                // region's base. The collector knows the bound; use it.
+                let declared = header.array_length() as usize;
+                let len = self.holder_walkable_slots(regions, obj_ptr, declared);
+                for i in 0..len {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                    if raw != 0 {
+                    if raw != 0
+                        && self.evacuation_candidate_is_an_object(
+                            regions,
+                            obj_ptr,
+                            i,
+                            raw as usize,
+                        )
+                    {
                         let ref_ptr = raw as usize as *mut u8;
                         if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                             if cset.contains(&region_idx) {
@@ -4183,6 +4420,9 @@ impl G1Collector {
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                if !self.evacuation_candidate_is_an_object(regions, obj_ptr, raw, raw) {
+                    return;
+                }
                 let ref_ptr = raw as *mut u8;
                 if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
                     if cset.contains(&region_idx) {
@@ -6739,6 +6979,16 @@ impl G1Collector {
     /// no-op when no collection has run. Emitted at VM shutdown when GC stats
     /// are requested — see `VmHeap::print_gc_summary`.
     pub fn print_gc_summary(&self) {
+        // Unconditional, and BEFORE the early return below: a run with no
+        // recorded pause summary can still have rejected a candidate, and a
+        // counter that only prints alongside something else is a counter that
+        // reads as zero when it never ran.
+        let rejected = evacuation_refs_rejected();
+        let (holder_rejected, holder_clamped) = evacuation_holder_counts();
+        eprintln!(
+            "[GC] g1 evac_ref_rejected={rejected} evac_holder_rejected={holder_rejected} \
+             evac_holder_clamped={holder_clamped}"
+        );
         let Some(s) = self.pause_summary() else {
             return;
         };
@@ -7337,6 +7587,141 @@ impl G1Collector {
     /// twice. Deliberately NOT gated on `gc_quiescence::is_active()` — a
     /// blocked thread's un-retired tail can be published while no thread is
     /// in JIT at all.
+    /// The [`crate::gc_quiescence::incomplete_reason`] code when this
+    /// collection's JIT root set is known to be INCOMPLETE, or `None` when
+    /// every live compiled frame was enumerated.
+    ///
+    /// # Why G1 needs this and not only [`Self::jit_pinned_region_set`]
+    ///
+    /// `jit_pinned_region_set` is G1's stand-in for the generational
+    /// collector's non-moving-while-in-JIT sweep: the root gatherer publishes
+    /// each conservatively-discovered JIT-frame root, and the region holding
+    /// it is kept out of the collection set so the un-rewritable
+    /// register/spill slot that names it cannot go stale.
+    ///
+    /// That is only sound when the conservative scan actually *saw* the frame.
+    /// Several coverage obligations fail precisely because it did not:
+    /// `UNREGISTERED_JIT_FRAME` (a compiled frame sits above the entry chain's
+    /// cover, so the scan band never reaches it), `FOREIGN_INNERMOST_RBP` (the
+    /// innermost recorded RBP belongs to a deeper callee entered by a direct
+    /// JIT->JIT call, so the entry's map does not describe the frame that is
+    /// actually there), `MISSING_EXACT_RBP` (the frame cannot be bounded at
+    /// all). In each of those the pin set comes back *empty for that frame*,
+    /// G1 sees no reason to exclude anything, and it evacuates an object whose
+    /// only reference lives in a slot nothing will rewrite. The next
+    /// dereference would be a native `SIGSEGV`, not a controlled Java error —
+    /// the shape the two retired 2026-08 full-suite G1 comparisons (the
+    /// `g1-collector-fullsuite-crashes-hangs-fails-20260806` and
+    /// `g1-fullsuite-regression-20260807` write-ups) recorded, from three and
+    /// one crash sites respectively, with the collector's own "last
+    /// incomplete-coverage reason" field already naming an obligation in every
+    /// report.
+    ///
+    /// # Why this is a DIAGNOSTIC, not a fail-safe
+    ///
+    /// Each of the reasons above is, on inspection, already backed by a
+    /// conservative scan whose roots G1 pins:
+    ///
+    /// * an unregistered frame is detected and its whole band is scanned by
+    ///   `conservative_roots::scan_active_jit_frames`, which pushes the band's
+    ///   oops into the same `roots` vector `memory::roots::collect_roots`
+    ///   then republishes through `gc_quiescence::add_pinned_jit_root`;
+    /// * a precise entry always ALSO gets a conservative band scan
+    ///   (`scan_compiled_frame_bands`, or the whole-band `scan_one_frame`
+    ///   fallback when its metadata is not trustworthy), so an unresolvable
+    ///   innermost RBP or a missing exact RBP still leaves the frame covered;
+    /// * a parked or blocked peer publishes its own conservative JIT roots via
+    ///   `interpreter::update_root_snapshot`'s `publish_pinned_jit_roots`;
+    /// * a forcibly-frozen peer and its helper window are pinned by
+    ///   `interpreter::pin_frozen_peer_roots_for_g1`, and its un-retired TLAB
+    ///   tail by [`Self::set_jit_tlab_skip_regions`].
+    ///
+    /// So "coverage incomplete" under G1 means *the roots are not REWRITABLE*,
+    /// which is the normal state whenever a thread is in compiled code — not
+    /// *the roots were not ENUMERATED*. Measured: 330263 of 330264 pauses on
+    /// `probes/MovingYoungConcurrentProbe 6 400 2000`. Refusing to evacuate on
+    /// it is therefore both unnecessary and ruinous — the same run needs ONE
+    /// collection with the lever off and takes 330264 no-op pauses with it on,
+    /// because a pause that frees nothing is immediately re-triggered by the
+    /// next allocation.
+    ///
+    /// The refusal is kept as an opt-IN bisection lever
+    /// (`CRATONVM_G1_COVERAGE_PIN`, [`crate::gc_flags`]`().g1_coverage_pin`):
+    /// under it G1 moves nothing, so a G1-only crash that survives it is not
+    /// caused by a relocation the root set failed to cover. That is the
+    /// experiment both 2026-08 full-suite G1 pages asked for and could not run.
+    ///
+    /// This function is the DETECTION only and is deliberately NOT gated on
+    /// that flag, so the counters report the rate in both arms. A lever that
+    /// also switches off its own measurement cannot settle anything.
+    pub(crate) fn root_coverage_incomplete_reason() -> Option<usize> {
+        // `force_non_moving_jit_roots` is the root gatherer's own OSR-shadow
+        // verdict and does not always travel with a reason code; report the
+        // stored reason when there is one, and the OSR code when there is not,
+        // so the record never claims `NONE` while refusing to evacuate.
+        let flagged = crate::gc_quiescence::moving_young_coverage_incomplete();
+        let forced = crate::gc_quiescence::force_non_moving_jit_roots();
+        if !flagged && !forced {
+            return None;
+        }
+        let reason = crate::gc_quiescence::moving_young_incomplete_reason();
+        Some(if reason == crate::gc_quiescence::incomplete_reason::NONE {
+            crate::gc_quiescence::incomplete_reason::OSR_SHADOW
+        } else {
+            reason
+        })
+    }
+
+    /// Box a non-Object `Value` for storage in a REFERENCE array element, or
+    /// return it unchanged when it is already a reference (or the array is not
+    /// a reference array).
+    ///
+    /// The wrapper is a one-field `AUTOBOX_CLASS_ID` object, exactly as
+    /// `GenerationalHeap::set_array_element` and `Heap::set_array_element`
+    /// build it, so [`Self::autobox_payload`] and every other backend's reader
+    /// recognise it. Must be called BEFORE taking the `regions` lock — the
+    /// allocation needs it.
+    fn autobox_for_reference_array(&self, array: ObjectRef, value: Value) -> Value {
+        if matches!(value, Value::Object(_)) {
+            return value;
+        }
+        if self.get_header(array).element_type() != ArrayElementType::Reference {
+            return value;
+        }
+        let wrapper = self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+        self.set_field(wrapper, 0, value);
+        Value::Object(Some(wrapper))
+    }
+
+    /// The primitive inside an auto-box wrapper, or `None` when `candidate` is
+    /// an ordinary object.
+    ///
+    /// Validates the address before dereferencing its header: a reference array
+    /// element is a raw word and a stale or garbage one could point anywhere,
+    /// so an unchecked read here would be wild. Mirrors the same guard in
+    /// `GenerationalHeap::get_array_element`.
+    fn autobox_payload(&self, candidate: ObjectRef) -> Option<Value> {
+        self.is_object_address(candidate.as_ptr() as usize)?;
+        // SAFETY: `is_object_address` confirmed `candidate` points at a valid
+        // object header inside one of this collector's regions.
+        let header = unsafe { &*(candidate.as_ptr() as *const ObjectHeader) };
+        if header.class_id != crate::heap::AUTOBOX_CLASS_ID {
+            return None;
+        }
+        Some(self.get_field(candidate, 0))
+    }
+
+    /// Whether this pause must decline to evacuate: the detection from
+    /// [`Self::root_coverage_incomplete_reason`] AND the opt-in
+    /// `CRATONVM_G1_COVERAGE_PIN` lever.
+    ///
+    /// A pure function of its two inputs so both arms are testable —
+    /// `gc_flags()` latches for the process, so a test cannot flip the lever
+    /// from inside one.
+    fn refuse_evacuation(coverage_incomplete: Option<usize>, lever_on: bool) -> Option<usize> {
+        coverage_incomplete.filter(|_| lever_on)
+    }
+
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
         let mut set: std::collections::HashSet<usize> = if crate::gc_quiescence::is_active() {
             crate::gc_quiescence::pinned_jit_roots_snapshot()
@@ -8235,10 +8620,37 @@ impl GarbageCollector for G1Collector {
                 }
             }
         }
-        Ok(array_element_from_bytes(element_type, &raw))
+        let value = array_element_from_bytes(element_type, &raw);
+        // Un-box the auto-box wrapper the store side installs for a non-Object
+        // value — see `set_array_element`, and `GenerationalHeap::
+        // get_array_element` for the same read.
+        if element_type == ArrayElementType::Reference {
+            if let Value::Object(Some(boxed)) = value {
+                if let Some(inner) = self.autobox_payload(boxed) {
+                    return Ok(inner);
+                }
+            }
+        }
+        Ok(value)
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
+        // A reference array element is a raw 8-byte pointer, so a non-Object
+        // `Value` cannot be stored in one directly. Natives across the tree
+        // nonetheless use a reference array as a generic `Value` store (the
+        // stream pipeline collects `Value::Long`/`Value::Double` into one), and
+        // `GenerationalHeap::set_array_element` has always honoured that by
+        // auto-boxing into a one-field `AUTOBOX_CLASS_ID` wrapper.
+        //
+        // G1 did not: its encoder is `Value::Object(Some(r)) => r.as_ptr(),
+        // _ => 0`, so a `Value::Long(42)` was written as a null reference and
+        // read back as `Value::Object(None)`. `.mapToDouble(...).toArray()`
+        // therefore returned all zeros under `-XX:+UseG1GC` and was correct
+        // under the default collector, with no GC involved at all.
+        //
+        // Boxed BEFORE the `regions` lock below: `alloc_object` takes that same
+        // lock.
+        let value = self.autobox_for_reference_array(obj, value);
         let header = self.get_header(obj);
         let len = header.array_length() as usize;
         if index >= len {
@@ -8403,17 +8815,55 @@ impl GarbageCollector for G1Collector {
                 regions.len(), free, eden, survivor, old, pinned
             );
         }
-        // Name the backend in the process-wide decision report. G1 has no
+        // Name the backend in the process-wide decision report, AND whether
+        // this pause was allowed to evacuate at all. G1 normally has no
         // young-moving *choice* to record — its collection set is always
-        // evacuated — but a report that stays silent under `-XX:+UseG1GC` is
-        // exactly how the `docs/GC.md` drift went unnoticed for the
-        // generational path. Recording the constant answer makes "which
-        // collector produced this summary?" a question the runtime answers.
+        // evacuated — but it does have one refusal, and a report that stays
+        // silent under `-XX:+UseG1GC` is exactly how the `docs/GC.md` drift
+        // went unnoticed for the generational path.
+        //
+        // The refusal: this collection's JIT root set may be incomplete, so
+        // no region can be proven free of an object whose only reference the
+        // root scan never saw. See
+        // [`Self::root_coverage_incomplete_reason`] for why
+        // `jit_pinned_region_set` alone does not cover this and what the
+        // empty-CSet fail-safe costs.
+        let coverage_incomplete = Self::root_coverage_incomplete_reason();
+        // Counted in BOTH arms — see `root_coverage_incomplete_reason`.
+        crate::gc_metrics::record_g1_pause_coverage(coverage_incomplete.is_some());
+        // Only the REFUSAL is gated, and it is OFF by default — see
+        // `root_coverage_incomplete_reason` for the measurement that says why.
+        let refuse = Self::refuse_evacuation(coverage_incomplete, gc_flags().g1_coverage_pin);
         crate::gc_metrics::record_collector_decision(
             "g1",
-            crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
-            crate::gc_quiescence::incomplete_reason::NONE,
+            match refuse {
+                Some(_) => {
+                    crate::gc_metrics::decision_reason::NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE
+                }
+                None => crate::gc_metrics::decision_reason::MOVING_BACKEND_ALWAYS_EVACUATES,
+            },
+            coverage_incomplete.unwrap_or(crate::gc_quiescence::incomplete_reason::NONE),
         );
+        if refuse.is_some() {
+            crate::gc_metrics::record_g1_cycle(
+                crate::gc_metrics::g1_cycle_kind::YOUNG,
+                0,
+                0,
+                0,
+                0,
+                crate::gc_metrics::g1_degraded::EMPTY_COLLECTION_SET
+                    | crate::gc_metrics::g1_degraded::ROOT_COVERAGE_INCOMPLETE,
+            );
+            self.native_alloc_pressure.store(false, Ordering::Relaxed);
+            return GcResult {
+                stats: GcStats {
+                    objects_copied: 0,
+                    bytes_copied: 0,
+                    bytes_freed: 0,
+                },
+                pointer_map: cratonvm_types::PointerMap::default(),
+            };
+        }
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
@@ -9919,6 +10369,239 @@ mod tests {
         assert_eq!(result.stats.objects_copied, 0);
         // Object should still be at the same address
         assert_eq!(roots[0].as_ptr(), obj.as_ptr());
+    }
+
+    // -- Incomplete JIT root coverage must stop evacuation entirely --
+
+    /// The defect both G1 full-suite crash reports name: G1 evacuated while
+    /// the collection's own root scan had already recorded that it could not
+    /// enumerate every live compiled frame. `jit_pinned_region_set` cannot
+    /// cover that case — the frames in question are exactly the ones the
+    /// conservative scan never reached, so they publish no address to pin.
+    ///
+    /// The LEVER's two arms, stated on the pure decision function because
+    /// `gc_flags()` latches process-wide and a test cannot flip it from inside
+    /// one. Off (the shipped default) G1 evacuates regardless; on, it refuses.
+    #[test]
+    fn the_coverage_lever_gates_only_the_refusal() {
+        let reason = Some(crate::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME);
+        assert_eq!(
+            G1Collector::refuse_evacuation(reason, false),
+            None,
+            "default: an incomplete root set is RECORDED, not acted on — the \
+             conservative scan that produced the pins already covered it"
+        );
+        assert_eq!(
+            G1Collector::refuse_evacuation(reason, true),
+            reason,
+            "lever on: this pause must not evacuate"
+        );
+        assert_eq!(
+            G1Collector::refuse_evacuation(None, true),
+            None,
+            "lever on but coverage complete: evacuate normally"
+        );
+    }
+
+    /// The default must still EVACUATE on an incomplete-coverage pause — the
+    /// measured alternative starves reclamation (330263 of 330264 pauses report
+    /// incomplete on `MovingYoungConcurrentProbe`). Stated through
+    /// `collect_garbage` because that is the single entry to G1's two
+    /// object-moving paths.
+    #[test]
+    fn incomplete_root_coverage_still_evacuates_by_default() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+        );
+
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        assert!(result.stats.objects_copied >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// …but the pause must SAY that its root set was incomplete. A collector
+    /// that keeps that to itself is why both 2026-08 full-suite G1 pages had to
+    /// infer the mechanism from a crash dump.
+    #[test]
+    fn incomplete_root_coverage_is_recorded_even_when_it_is_not_acted_on() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+
+        let (pauses_before, incomplete_before) = crate::gc_metrics::g1_pause_coverage_counts();
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+        );
+
+        let mut roots = vec![obj];
+        let _ = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        let d = crate::gc_metrics::last_collector_decision().expect("a decision was recorded");
+        assert_eq!(d.backend, "g1");
+        assert_eq!(
+            d.incomplete_reason,
+            crate::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+            "the obligation that failed must reach the decision record"
+        );
+
+        let (pauses, incomplete) = crate::gc_metrics::g1_pause_coverage_counts();
+        assert!(pauses > pauses_before, "the pause must be counted");
+        assert!(
+            incomplete > incomplete_before,
+            "and counted as incomplete — the rate is the whole point of the counter"
+        );
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+    }
+
+    /// Complete coverage is the common case and must be untouched: the same
+    /// collection with the flag clear still evacuates.
+    #[test]
+    fn complete_root_coverage_still_evacuates() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(77));
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        assert!(G1Collector::root_coverage_incomplete_reason().is_none());
+
+        let mut roots = vec![obj];
+        let result = <G1Collector as crate::collector::GarbageCollector>::collect_garbage(
+            &gc,
+            &stw(),
+            &mut roots,
+            &NoopMonitors,
+        );
+
+        assert!(result.stats.objects_copied >= 1);
+        assert_eq!(gc.get_field(roots[0], 0).as_int(), Some(77));
+    }
+
+    /// `force_non_moving_jit_roots` is set by the root gatherer's OSR-shadow
+    /// fallback WITHOUT a reason code. It is a second, independent way for the
+    /// root set to be incomplete, and G1 must honour it too — with a reason
+    /// that is not `NONE`, so the record never claims a complete proof while
+    /// refusing to act on one.
+    #[test]
+    fn force_non_moving_jit_roots_alone_blocks_g1_evacuation() {
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        assert!(G1Collector::root_coverage_incomplete_reason().is_none());
+
+        crate::gc_quiescence::set_force_non_moving_jit_roots();
+        assert_eq!(
+            G1Collector::root_coverage_incomplete_reason(),
+            Some(crate::gc_quiescence::incomplete_reason::OSR_SHADOW),
+        );
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+    }
+
+    // -- Reference arrays as a generic Value store --
+
+    /// A REFERENCE array element is a raw 8-byte pointer, but every backend
+    /// must accept an arbitrary `Value` in one: natives across the tree use a
+    /// reference array as a generic `Value` store, and the generational heap
+    /// has always honoured that by auto-boxing into an `AUTOBOX_CLASS_ID`
+    /// wrapper.
+    ///
+    /// G1 had neither half. `Value::Long(42)` was encoded as `0u64` — the
+    /// `_ => 0u64` arm of `array_element_to_unaligned_ptr` — and read back as
+    /// `Value::Object(None)`. In Java that made
+    /// `stream.mapToDouble(Double::doubleValue).toArray()` return all zeros
+    /// under `-XX:+UseG1GC` and the right values under the default collector,
+    /// with no collection involved: deterministic, and identical with `--nojit`
+    /// and at a heap large enough that no GC runs.
+    #[test]
+    fn reference_array_round_trips_every_value_kind() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 6);
+        let obj = gc.alloc_object(ClassId::new(2), 1);
+
+        let cases = [
+            Value::Long(-42),
+            Value::Double(2.5),
+            Value::Int(7),
+            Value::Float(1.5),
+            Value::Object(Some(obj)),
+            Value::Object(None),
+        ];
+        for (i, v) in cases.iter().enumerate() {
+            <G1Collector as crate::collector::GarbageCollector>::set_array_element(&gc, arr, i, *v)
+                .expect("in bounds");
+        }
+        for (i, want) in cases.iter().enumerate() {
+            let got =
+                <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, i)
+                    .expect("in bounds");
+            match (want, got) {
+                (Value::Object(Some(w)), Value::Object(Some(g))) => {
+                    assert_eq!(w.as_ptr(), g.as_ptr(), "element {i}: reference identity")
+                }
+                (w, g) => assert_eq!(*w, g, "element {i} did not round-trip"),
+            }
+        }
+    }
+
+    /// The boxing must not leak into a PRIMITIVE array: those store the value
+    /// directly and a wrapper there would be a wrong-width write.
+    #[test]
+    fn primitive_arrays_are_not_auto_boxed() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Double, 2);
+        <G1Collector as crate::collector::GarbageCollector>::set_array_element(
+            &gc,
+            arr,
+            0,
+            Value::Double(3.25),
+        )
+        .expect("in bounds");
+        assert_eq!(
+            <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, 0),
+            Ok(Value::Double(3.25))
+        );
+    }
+
+    /// An ordinary object stored in a reference array must come back as
+    /// itself, not be mistaken for a wrapper. The un-box keys on
+    /// `AUTOBOX_CLASS_ID`, so this pins that a real object's class id cannot
+    /// collide with it.
+    #[test]
+    fn an_ordinary_object_is_not_mistaken_for_an_auto_box() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 1);
+        let obj = gc.alloc_object(ClassId::new(3), 1);
+        gc.set_field(obj, 0, Value::Int(99));
+        <G1Collector as crate::collector::GarbageCollector>::set_array_element(
+            &gc,
+            arr,
+            0,
+            Value::Object(Some(obj)),
+        )
+        .expect("in bounds");
+        match <G1Collector as crate::collector::GarbageCollector>::get_array_element(&gc, arr, 0) {
+            Ok(Value::Object(Some(got))) => assert_eq!(got.as_ptr(), obj.as_ptr()),
+            other => panic!("expected the object back, got {other:?}"),
+        }
     }
 
     #[test]
