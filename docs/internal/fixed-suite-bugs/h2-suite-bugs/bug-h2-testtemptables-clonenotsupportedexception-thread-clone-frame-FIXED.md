@@ -38,11 +38,14 @@ The fix is one term:
 class_id == ClassId::new(0) && *header == [0u8; cratonvm_types::HEADER_SIZE]
 ```
 
-Regression test:
-`runtime::interpreter::tests::stale_mirror_recovery_skips_a_live_primitive_array`.
-Differential-verified — restoring the old gate fails it with
-*"a live long[] must never be mistaken for a reclaimed span and replaced by a
-java.lang.Thread mirror"*.
+and a second term that closes the one window the header cannot — see
+[The second half of the gate](#the-second-half-of-the-gate-the-call-site).
+
+Regression tests, both differential-verified (each fails with its own term
+removed):
+`runtime::interpreter::tests::stale_mirror_recovery_skips_a_live_primitive_array`
+and
+`runtime::interpreter::tests::only_a_call_site_that_could_hold_a_thread_mirror_admits_the_recovery`.
 
 Landed alongside it, because both were needed to see the bug at all:
 
@@ -260,23 +263,55 @@ Three instrument gaps closed with it, each of which had cost a run:
   residual is withdrawn; the mirror substitution is the only mechanism this page
   ever had.
 
-## Known residual of the fix, stated
+## The second half of the gate: the call site
 
-The all-zero-header test is exact for a primitive array and for any object with
-a minted identity hash. It is **not** exact for a bare `new Object()` on the
-current 16-byte header: since the 2026-08-07 header shrink folded the identity
-hash into the mark word, a freshly allocated zero-field `java.lang.Object`
-whose hash has not been minted has an all-zero header too. So a `new Object()`
-receiver whose address is in `former_mirror_addrs` could still be substituted.
+The all-zero-header test is exact for a primitive array, and that closed the
+witnessed failure. It is **not** exact for a bare `new Object()` on the current
+16-byte header: the 2026-08-07 shrink folded the identity hash into the mark
+word, so a freshly allocated zero-field `java.lang.Object` — `class_id` 0,
+`shape` 0, `ObjectKind::Object` and `ArrayElementType::Reference` both
+discriminant 0, hash not yet minted — is header-identical to a reclaimed span.
+A `new Object()` on a vacated mirror address would still have been substituted.
 
-That is a far narrower window than "every primitive array" (it needs a
-zero-field `Object` receiver of a non-special invoke, on an address a thread
-mirror previously vacated), and closing it properly means asking the heap
-whether the address is still on a free list — `GenerationalHeap::reclaimed_hole_at`,
-which is the unambiguous discriminator but is generational-only and would
-silently disable the recovery on G1/ZGC. Left as-is deliberately rather than
-traded for a backend-dependent behaviour change; recorded here so the next
-reader does not have to re-derive it.
+The obvious closure is free-list membership (`reclaimed_hole_at`), the
+unambiguous discriminator — but it is generational-only, so requiring it would
+silently switch the recovery off on G1 and ZGC, where the mirror relocations
+that populate `former_mirror_addrs` happen just as much. That is a
+backend-dependent behaviour change hidden inside a bug fix, and it was not
+taken.
+
+What closes it instead is a question the header cannot answer and the call site
+can: **could this site be holding a thread mirror at all?**
+`mirror_is_plausible_at_call_site` refuses two constant-pool class names
+outright —
+
+* **an array type.** `[J` has no relationship to `java.lang.Thread` in either
+  direction; no heap state can make a mirror right there. (This is the witness's
+  own call site, now refused twice over.)
+* **bare `java/lang/Object`.** Every mirror is assignable to it, so it is no
+  evidence that the receiver was ever a mirror — and it is precisely the site
+  type at which a `new Object()` receiver is indistinguishable from a wipe.
+
+— and admits any other name only if the recovered mirror really is an instance
+of it, by `Class::is_assignable_to_name`, which walks supers *and* interfaces.
+So `Runnable.run()` on a `Thread` still recovers, and a site typed `MyThread`
+refuses a plain `java.lang.Thread` mirror — correctly: a vacated address
+identified ONE thread's mirror, and if that mirror is not of the site's type the
+substitution was going to be wrong anyway.
+
+Cost: the recovery is narrower. `Thread.currentThread().getThreadGroup()` in
+Tomcat's `TaskThreadFactory.<init>` — the case it exists for — names
+`java/lang/Thread` and is unaffected. An `Object`-typed use of a stale mirror
+now reads the zeroed object instead of being repaired, which degrades a
+`toString`; admitting it risks substituting a thread for a live object's
+identity. That trade is the right way round.
+
+Regression test:
+`runtime::interpreter::tests::only_a_call_site_that_could_hold_a_thread_mirror_admits_the_recovery`,
+differential-verified — relaxing the predicate to `true` fails it.
+
+No residual is known after this. The gate is now: all-zero header AND a call
+site whose named type the recovered mirror actually satisfies.
 
 ## Related
 

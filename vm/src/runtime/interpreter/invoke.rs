@@ -340,6 +340,59 @@ pub(super) fn stale_mirror_recovery_applies(
     class_id == ClassId::new(0) && *header == [0u8; cratonvm_types::HEADER_SIZE]
 }
 
+/// Can a call site whose constant pool names `cp_class_name` be holding a
+/// `java.lang.Thread` mirror at all?
+///
+/// The second half of the stale-mirror recovery's gate, and the half that does
+/// not depend on the header. Two names are refused outright:
+///
+/// * **an array type.** `[J` has no relationship to `java.lang.Thread` in
+///   either direction, so a mirror there is wrong by construction — no heap
+///   state can make it right;
+/// * **bare `java/lang/Object`.** Every mirror is assignable to it, so it
+///   carries no evidence that the receiver was ever a mirror. Admitting it is
+///   exactly what would leave the `new Object()` window open: a zero-field
+///   `Object` has an all-zero header, so the header test cannot separate it
+///   from a reclaimed span, and an `Object`-typed call site cannot either.
+///
+/// Everything else is admitted only if the recovered mirror really is an
+/// instance of the named type. The check is by NAME and walks supers *and*
+/// interfaces ([`Class::is_assignable_to_name`]), so a `Runnable.run()` site on
+/// a `Thread` still recovers, and a site typed `MyThread` refuses a plain
+/// `java.lang.Thread` mirror — correctly, because a vacated address identified
+/// ONE thread's mirror and if that mirror is not of the site's type the
+/// substitution was going to be wrong anyway.
+///
+/// This narrows the recovery. The case it exists for —
+/// `Thread.currentThread().getThreadGroup()` in Tomcat's
+/// `TaskThreadFactory.<init>`, see
+/// `fixed-suite-bugs/gc-blocked-thread-frame-stale-thread-mirror-RESOLVED.md`
+/// — names `java/lang/Thread` and is unaffected. An `Object`-typed use of a
+/// stale mirror now reads the zeroed object instead of being repaired; that
+/// degrades a `toString`, where admitting it risks corrupting a live object's
+/// identity.
+fn mirror_is_plausible_at_call_site(
+    shared: &SharedVm,
+    cp_class_name: &str,
+    mirror: ObjectRef,
+) -> bool {
+    if !call_site_type_can_hold_a_thread_mirror(cp_class_name) {
+        return false;
+    }
+    let mirror_cid = shared.mem.heap.class_id_of(mirror);
+    let cm = shared.classes.class_manager.read();
+    cm.get_class(mirror_cid)
+        .is_some_and(|c| c.is_assignable_to_name(cp_class_name, &cm.class_store))
+}
+
+/// The name-only half of [`mirror_is_plausible_at_call_site`] — the two
+/// call-site types that can never be evidence of a thread mirror, whatever the
+/// heap says.
+#[inline]
+pub(super) fn call_site_type_can_hold_a_thread_mirror(cp_class_name: &str) -> bool {
+    !cp_class_name.starts_with('[') && cp_class_name != "java/lang/Object"
+}
+
 /// [`stale_mirror_recovery_applies`] against a live receiver, reading its
 /// header only after confirming the address is inside a heap region.
 fn receiver_is_a_reclaimed_span(shared: &SharedVm, recv: ObjectRef) -> bool {
@@ -794,9 +847,19 @@ pub(super) fn execute_invoke_kind(
     // The all-zero test is exactly what the recovery was written for — the
     // Tomcat `TestDigestAuthenticator` case dispatches on a *zeroed* object —
     // and it is the same test the stale-pointer detector further down this
-    // function already applies. A live object cannot pass it: `init_object_header`
-    // mints a non-zero identity hash at allocation (H1), and an array carries a
-    // non-zero `kind`/`element_type`/`shape`.
+    // function already applies. An array cannot pass it: it carries a non-zero
+    // `kind`, `element_type` and `shape`.
+    //
+    // The header test alone still leaves one address-collision window, and the
+    // second filter below closes it. On the 16-byte header a bare
+    // `new Object()` IS all-zero — `class_id` 0, `shape` 0 (no fields),
+    // `ObjectKind::Object` and `ArrayElementType::Reference` both discriminant
+    // 0, and the identity hash is minted lazily into the mark word rather than
+    // stamped at allocation. So a zero-field `Object` sitting on a vacated
+    // mirror address would still be swapped for a thread. That is far narrower
+    // than "every primitive array", but it is the same defect, and it is closed
+    // here by asking a question the header cannot answer: **is the recovered
+    // mirror something this CALL SITE could legitimately be holding?**
     if !is_special {
         let recovered: Option<ObjectRef> = if let Value::Object(Some(recv)) = &args[0] {
             let recv = *recv;
@@ -808,6 +871,7 @@ pub(super) fn execute_invoke_kind(
                     .filter(|live| {
                         live.as_ptr() != recv.as_ptr()
                             && shared.mem.heap.class_id_of(*live) != ClassId::new(0)
+                            && mirror_is_plausible_at_call_site(shared, &method_class_name, *live)
                     })
             } else {
                 None

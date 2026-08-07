@@ -85,6 +85,49 @@ fn stale_mirror_recovery_skips_a_live_primitive_array() {
     );
 }
 
+/// The header test above cannot close the recovery's last address-collision
+/// window on its own. On the 16-byte header a bare `new Object()` is ALSO
+/// all-zero — `class_id` 0, `shape` 0, `ObjectKind::Object` and
+/// `ArrayElementType::Reference` both discriminant 0, and the identity hash
+/// minted lazily into the mark word rather than stamped at allocation. So the
+/// second half of the gate asks a question the header cannot answer: could this
+/// CALL SITE be holding a thread mirror at all?
+///
+/// Two names can never be evidence of one, whatever the heap says, and
+/// admitting the second is what would leave the `new Object()` window open.
+#[test]
+fn only_a_call_site_that_could_hold_a_thread_mirror_admits_the_recovery() {
+    use super::invoke::call_site_type_can_hold_a_thread_mirror;
+
+    // An array type has no relationship to `java.lang.Thread` in either
+    // direction. This is the `Arrays.copyOf(long[], int)` witness's call site.
+    assert!(
+        !call_site_type_can_hold_a_thread_mirror("[J"),
+        "an array-typed call site can never legitimately hold a thread mirror"
+    );
+    assert!(!call_site_type_can_hold_a_thread_mirror(
+        "[Ljava/lang/Object;"
+    ));
+
+    // Bare `java/lang/Object` admits every mirror, so it is no evidence at all
+    // — and a zero-field `Object` receiver is header-identical to a reclaimed
+    // span, so nothing else could refuse it.
+    assert!(
+        !call_site_type_can_hold_a_thread_mirror("java/lang/Object"),
+        "an Object-typed call site carries no evidence the receiver was a mirror"
+    );
+
+    // The case the recovery exists for — Tomcat's `TaskThreadFactory.<init>`
+    // calling `Thread.currentThread().getThreadGroup()` — and an
+    // interface-typed use, both still admitted (assignability is then checked
+    // against the recovered mirror's real class).
+    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Thread"));
+    assert!(call_site_type_can_hold_a_thread_mirror("java/lang/Runnable"));
+    assert!(call_site_type_can_hold_a_thread_mirror(
+        "jdk/internal/misc/InnocuousThread"
+    ));
+}
+
 #[test]
 fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
     // The guard never dereferences these values; aligned sentinel addresses
