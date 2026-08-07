@@ -3811,7 +3811,6 @@ mod tests {
             cratonvm_types::ClassId::new(99),
             ObjectKind::Array,
             ArrayElementType::Int,
-            42,
             array_length,
             array_length,
         );
@@ -3870,7 +3869,6 @@ mod tests {
             cratonvm_types::ClassId::new(50),
             ObjectKind::Array,
             ArrayElementType::Reference,
-            0,
             array_length,
             array_length,
         );
@@ -3963,7 +3961,6 @@ mod tests {
             cratonvm_types::ClassId::new(1),
             ObjectKind::Object,
             ArrayElementType::Boolean,
-            123,
             0,
             1,
         );
@@ -4106,7 +4103,6 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Boolean,
             0,
-            0,
             2,
         );
         unsafe {
@@ -4214,7 +4210,6 @@ mod tests {
             ObjectKind::Object,
             ArrayElementType::Boolean,
             0,
-            0,
             1,
         );
         unsafe {
@@ -4292,7 +4287,6 @@ mod tests {
             cratonvm_types::ClassId::new(CLASS_ID),
             ObjectKind::Object,
             ArrayElementType::Boolean,
-            0,
             0,
             1,
         );

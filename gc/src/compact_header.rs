@@ -613,18 +613,21 @@ pub fn migrate_to_compact(
     hash_table: &HashCodeTable,
     obj_addr: usize,
 ) -> CompactHeader {
-    let is_array = old.kind == crate::heap::ObjectKind::Array;
+    let is_array = old.kind() == crate::heap::ObjectKind::Array;
     let mut header = if is_array {
-        CompactHeader::new_array(narrow_klass, old.element_type as u8, old.gc_age)
+        CompactHeader::new_array(narrow_klass, old.element_type() as u8, old.gc_age())
     } else {
-        CompactHeader::new_object(narrow_klass, old.gc_age)
+        CompactHeader::new_object(narrow_klass, old.gc_age())
     };
 
     // Migrate identity hash code to side table if non-zero.
-    if old.identity_hash_code != 0 {
+    let old_hash = crate::heap::ObjectHeader::neutral_hash(
+        old.mark_word.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    if old_hash != 0 {
         // Force the same hash value into the table.
         let mut write = hash_table.table.write();
-        write.insert(obj_addr, old.identity_hash_code);
+        write.insert(obj_addr, old_hash);
         drop(write);
         header.set_has_hash_code();
     }
@@ -633,7 +636,7 @@ pub fn migrate_to_compact(
     // (For arrays the element_type already occupies those bits.)
     if !is_array {
         // Preserve gc_flags in the lowest nibble.
-        let flags = (old.gc_flags & 0xF) as u64;
+        let flags = (old.gc_flags() & 0xF) as u64;
         header.0 = (header.0 & !CompactHeader::ELEM_TYPE_MASK) | flags;
     }
 
@@ -822,7 +825,6 @@ pub enum HeaderView {
         element_type: u8,
         array_length: u32,
         num_slots: u32,
-        identity_hash_code: i32,
         gc_age: u8,
         gc_flags: u8,
         is_forwarded: bool,
@@ -844,13 +846,12 @@ impl HeaderView {
     pub fn from_legacy(h: &crate::heap::ObjectHeader) -> Self {
         HeaderView::Legacy {
             class_id: h.class_id,
-            is_array: h.kind == crate::heap::ObjectKind::Array,
-            element_type: h.element_type as u8,
+            is_array: h.kind() == crate::heap::ObjectKind::Array,
+            element_type: h.element_type() as u8,
             array_length: h.array_length(),
             num_slots: h.num_slots(),
-            identity_hash_code: h.identity_hash_code,
-            gc_age: h.gc_age,
-            gc_flags: h.gc_flags,
+            gc_age: h.gc_age(),
+            gc_flags: h.gc_flags(),
             is_forwarded: h.is_forwarded(),
         }
     }
@@ -1673,10 +1674,9 @@ mod tests {
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
             0,
-            0,
             2,
         );
-        old.gc_age = 9;
+        old.set_gc_age(9);
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 77, &ht, 0x4000);
         assert_eq!(compact.narrow_klass(), 77);
@@ -1691,7 +1691,6 @@ mod tests {
             cratonvm_types::ClassId::new(10),
             crate::heap::ObjectKind::Array,
             crate::heap::ArrayElementType::Int,
-            0,
             5,
             5,
         );
@@ -1710,9 +1709,14 @@ mod tests {
             cratonvm_types::ClassId::new(1),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
-            42,
             0,
             0,
+        );
+        // The hash rides in the mark word now, not in a header field, so the
+        // migration source has to be set up the way a real hashed object is.
+        old.mark_word.store(
+            crate::heap::ObjectHeader::make_neutral_hashed(cratonvm_types::MARK_NEUTRAL, 42),
+            std::sync::atomic::Ordering::Relaxed,
         );
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 1, &ht, 0x6000);
@@ -1970,11 +1974,10 @@ mod tests {
             cratonvm_types::ClassId::new(10),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
-            42,
             0,
             3,
         );
-        old.gc_age = 5;
+        old.set_gc_age(5);
         let view = HeaderView::from_legacy(&old);
         assert!(!view.is_array());
         assert_eq!(view.gc_age(), 5);
@@ -1999,7 +2002,6 @@ mod tests {
             cratonvm_types::ClassId::new(1),
             crate::heap::ObjectKind::Object,
             crate::heap::ArrayElementType::Reference,
-            0,
             0,
             0,
         );
@@ -2200,12 +2202,15 @@ mod tests {
     // -- 54.6: Integration with CompactHeader --
 
     #[test]
-    fn s54_compact_header_8_vs_legacy_24() {
+    fn s54_compact_header_8_vs_legacy_16() {
         assert_eq!(CompactHeader::SIZE, 8);
-        // 32 until the 2026-08-06 shrink folded `forwarding_ptr` into the mark
-        // word. The gap this type would still close is now 16, not 24.
-        assert_eq!(crate::heap::HEADER_SIZE, 24);
-        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 16);
+        // 32 -> 24 when `forwarding_ptr` folded into the mark word, 24 -> 16
+        // when the identity hash followed and the kind/element_type/gc_age/
+        // gc_flags quartet joined them in bits 48..62. The gap this type would
+        // still close is now 8, not 24 -- most of the reason it existed has
+        // been taken by the real header.
+        assert_eq!(crate::heap::HEADER_SIZE, 16);
+        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 8);
     }
 
     #[test]

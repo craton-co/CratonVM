@@ -106,6 +106,8 @@ pub(crate) fn push_off_frame_thread_roots(thread: &JvmThread, roots: &mut Vec<Ob
 /// - Class lock objects (synthetic monitors for static synchronized methods)
 /// - Thread printed values (test harness output)
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
+    let __rp_t0 = crate::memory::native_roots::rootprof::on()
+        .then(std::time::Instant::now);
     let mut roots = Vec::new();
 
     // Stage B (precise oop maps, B-K fix): reset the movable precise-JIT-root
@@ -795,6 +797,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // its matching relocation callback as one entry. The historical notes
     // below document why each registered source is a root.
     crate::memory::native_roots::scan_all_roots(shared, &mut roots);
+    if let Some(t0) = __rp_t0 {
+        let ns = t0.elapsed().as_nanos();
+        if ns >= 20_000_000 {
+            eprintln!(
+                "[rootprof] collect_roots took {}ms roots={}",
+                ns / 1_000_000,
+                roots.len()
+            );
+        }
+    }
 
     // 15. Round-9 CRIT GC-correctness fix: process-global Integer.valueOf
     //     (-128..=127) and Boolean.TRUE/FALSE caches. These live in

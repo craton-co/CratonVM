@@ -66,6 +66,50 @@
 use crate::types::ObjectRef;
 use std::collections::HashMap;
 
+
+// ---------------------------------------------------------------------------
+// CRATONVM_DBG_ROOTPROF=1 -- per-root-source timing.
+//
+// A generational young pause on a Spring workload was measured at 500-1538 ms
+// with only ~2/3 of it attributable to the collector's own phases. The root
+// fan-out here is one of the two unmeasured halves, and it contains a full
+// walk of every overlay-backed collection in the process
+// (`scan_collection_overlays` / `remap_collection_overlays`), which is
+// proportional to the whole heap rather than to the young set. Off by
+// default; when off this costs one `OnceLock` read per fan-out.
+// ---------------------------------------------------------------------------
+pub(crate) mod rootprof {
+    use std::sync::OnceLock;
+
+    static ON: OnceLock<bool> = OnceLock::new();
+
+    pub fn on() -> bool {
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTPROF").is_some()
+        })
+    }
+
+    /// Print `parts` as one line when `total_ms` clears the noise floor.
+    pub fn report(what: &str, total_ns: u128, parts: &[(&'static str, u128, usize)]) {
+        if total_ns < 20_000_000 {
+            return;
+        }
+        let mut detail = String::new();
+        for (name, ns, n) in parts {
+            if *ns < 1_000_000 {
+                continue;
+            }
+            detail.push_str(&format!(" {}={}ms/{}", name, ns / 1_000_000, n));
+        }
+        eprintln!(
+            "[rootprof] {} took {}ms{}",
+            what,
+            total_ns / 1_000_000,
+            detail
+        );
+    }
+}
+
 type VmScanFn = fn(&crate::vm::SharedVm, &mut Vec<ObjectRef>);
 type VmRemapFn = fn(&crate::vm::SharedVm, &HashMap<usize, usize>);
 
@@ -366,6 +410,18 @@ static VM_ROOT_SOURCES: &[VmRootSource] = &[
 ];
 
 pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    if rootprof::on() {
+        let t_all = std::time::Instant::now();
+        let mut parts: Vec<(&'static str, u128, usize)> = Vec::new();
+        for source in VM_ROOT_SOURCES {
+            let before = roots.len();
+            let t = std::time::Instant::now();
+            (source.scan)(shared, roots);
+            parts.push((source.name, t.elapsed().as_nanos(), roots.len() - before));
+        }
+        rootprof::report("scan_all_roots", t_all.elapsed().as_nanos(), &parts);
+        return;
+    }
     for source in VM_ROOT_SOURCES {
         debug_assert!(!source.name.is_empty());
         (source.scan)(shared, roots);
@@ -373,6 +429,17 @@ pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) 
 }
 
 pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
+    if rootprof::on() {
+        let t_all = std::time::Instant::now();
+        let mut parts: Vec<(&'static str, u128, usize)> = Vec::new();
+        for source in VM_ROOT_SOURCES {
+            let t = std::time::Instant::now();
+            (source.remap)(shared, pointer_map);
+            parts.push((source.name, t.elapsed().as_nanos(), 0));
+        }
+        rootprof::report("remap_all_roots", t_all.elapsed().as_nanos(), &parts);
+        return;
+    }
     for source in VM_ROOT_SOURCES {
         debug_assert!(!source.name.is_empty());
         (source.remap)(shared, pointer_map);
