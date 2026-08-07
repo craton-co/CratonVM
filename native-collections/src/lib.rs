@@ -694,7 +694,7 @@ mod overlay_owner_liveness_tests {
         register_overlay_owner_key(old_addr, key);
         assert!(overlay_owner_still_at(old_addr, key));
 
-        let mut pointer_map = StdHashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         gc_update_collection_overlay_refs(&pointer_map);
 
@@ -729,7 +729,7 @@ mod overlay_owner_liveness_tests {
             .entries
             .insert(1, (object(0x1000), Value::Int(7)));
 
-        let mut pointer_map = StdHashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         pointer_map.insert(old_addr, new_addr);
         gc_update_collection_overlay_refs(&pointer_map);
 
@@ -783,7 +783,7 @@ mod overlay_owner_liveness_tests {
         // neighbour just left. (The moving young phase alone cannot — its keys
         // are from-space and its values are to-space or old gen — which is why
         // this only ever bites on a compacting cycle.)
-        let mut pointer_map = StdHashMap::new();
+        let mut pointer_map = cratonvm_types::PointerMap::default();
         for i in 0..HOPS {
             register_overlay_owner_key(addr(i), key(i));
             pointer_map.insert(addr(i), addr(i + 1));
@@ -37092,7 +37092,7 @@ pub fn gc_overlay_roots_for_matching_owners(
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
 /// its relocated address after a moving GC. Mirror of
 /// `gc_scan_collection_overlay_roots`.
-pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>) {
+pub fn gc_update_collection_overlay_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }

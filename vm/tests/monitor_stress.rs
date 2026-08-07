@@ -121,7 +121,7 @@ fn monitor_stress_8_threads_no_imse_no_deadlock() {
                 // allocate a single throwaway object as sustained
                 // heap pressure.
                 if i % GC_TRIGGER_PERIOD == GC_TRIGGER_PERIOD - 1 {
-                    table.remap_after_gc(&HashMap::new());
+                    table.remap_after_gc(&cratonvm_types::PointerMap::default());
                     let _scratch = heap.alloc_object(ClassId::new(0), 0);
                 }
             }

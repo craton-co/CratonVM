@@ -1453,7 +1453,7 @@ impl ValueStack {
         }
     }
 
-    pub fn update_object_refs(&mut self, pointer_map: &HashMap<usize, usize>, heap: &VmHeap) {
+    pub fn update_object_refs(&mut self, pointer_map: &cratonvm_types::PointerMap, heap: &VmHeap) {
         for i in 0..self.len {
             let cv = self.slots[i];
             if cv.is_object() {
@@ -2011,7 +2011,7 @@ mod tests {
 
         // UPDATE: relocate A → B and assert the slot is rewritten — the half
         // that was missing for the `Long`-classified arm.
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_addr as usize, new_addr as usize);
         stack.update_object_refs(&map, &heap);
 
@@ -2062,7 +2062,7 @@ mod tests {
         crate::memory::smuggled_longs::record_minted_long(&heap, old_addr);
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_addr as usize, new_addr as usize);
         stack.update_object_refs(&map, &heap);
 
@@ -2107,7 +2107,7 @@ mod tests {
         let mut stack = ValueStack::new(4);
         stack.push_long(old_addr as i64).unwrap();
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_addr as usize, new_addr as usize);
         stack.update_object_refs(&map, &heap);
 
@@ -2289,7 +2289,7 @@ mod tests {
         let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let mut stack = ValueStack::new(5);
         stack.push(Value::Int(42)).unwrap();
-        let empty_map = HashMap::new();
+        let empty_map = cratonvm_types::PointerMap::default();
         stack.update_object_refs(&empty_map, &heap);
         // Stack should be unchanged
         assert_eq!(stack.pop_int().unwrap(), 42);
@@ -2643,7 +2643,7 @@ mod tests {
         let obj = unsafe { ObjectRef::from_raw(old_ptr as *mut u8) };
         stack.push(Value::Object(Some(obj))).unwrap();
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_ptr as usize, new_ptr as usize);
         stack.update_object_refs(&map, &heap);
 
@@ -2780,7 +2780,7 @@ mod tests {
         );
 
         // update: a pointer_map keyed off the collision payload must not rewrite it.
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(addr as usize, (addr as usize) + 64);
         stack.update_object_refs(&map, &heap);
         assert_eq!(
@@ -2844,7 +2844,7 @@ mod tests {
             "test setup must produce a CompactTag::Long slot"
         );
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         // A malicious pointer_map entry keyed off the Long's low pointer-shaped
         // bits — the fix must NOT remap because Long slots are never roots.
         map.insert(0x1000_usize, new_ptr);
@@ -2877,7 +2877,7 @@ mod tests {
         let mut stack = ValueStack::new(4);
         stack.push_compact(CompactValue::from_bits(old_ptr as u64));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_ptr, new_ptr);
         stack.update_object_refs(&map, &heap);
 
@@ -2902,7 +2902,7 @@ mod tests {
         let new_ptr: usize = 0x2000;
         stack.push_compact(CompactValue::from_bits(old_bits));
 
-        let mut map = HashMap::new();
+        let mut map = cratonvm_types::PointerMap::default();
         map.insert(old_bits as usize, new_ptr);
         stack.update_object_refs(&map, &heap);
 

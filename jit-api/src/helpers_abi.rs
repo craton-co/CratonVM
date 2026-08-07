@@ -918,7 +918,7 @@ const _: () = {
 /// Keyed by name and written as literals, so unlike every other check in this
 /// module it survives a coordinated reorder of the struct and all its
 /// descriptor tables — which is the one reorder every other check here misses.
-pub const GOLDEN_HELPER_OFFSETS: [(&'static str, usize); NUM_HELPER_FIELDS] = [
+pub const GOLDEN_HELPER_OFFSETS: [(&str, usize); NUM_HELPER_FIELDS] = [
     ("newarray", 0),
     ("new_object", 8),
     ("anewarray_object", 16),
