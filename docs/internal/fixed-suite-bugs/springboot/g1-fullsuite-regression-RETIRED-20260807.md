@@ -78,7 +78,7 @@ arm, ABBA-interleaved. `g1pin` is the new diagnostic lever described in §3.
 | `NettyReactiveWebServerFactoryTests` | PASS | FAIL | **PASS** |
 | `BindConverterTests` | PASS | PASS | PASS |
 | `TomcatReactiveWebServerFactoryTests` | FAIL | FAIL | FAIL |
-| `ConfigurationPropertiesReportEndpointSerializationTests` (the CRASH) | PASS | PASS | PASS |
+| `ConfigurationPropertiesReportEndpointSerializationTests` (the CRASH) | unstable | unstable | unstable |
 | `ChildManagementContextInitializerAotTests` | HANG | FAIL | FAIL |
 | 3 × `JooqTest*IntegrationTests` | PASS | PASS | PASS |
 | `WebFluxAutoConfigurationTests` | PASS | PASS | PASS |
@@ -105,9 +105,16 @@ what introduced it.
 
 ## 3. The CRASH, and both of the page's readings — REFUTED
 
-`ConfigurationPropertiesReportEndpointSerializationTests` PASSes on all three
-arms at dev tip, twice each. The page offered two readings of its
-`EXCEPTION_ACCESS_VIOLATION` and disambiguated neither.
+`ConfigurationPropertiesReportEndpointSerializationTests` **never crashed
+again** on any arm, in any run. What it does do is fail *unstably and
+symmetrically*: PASS on all three arms twice each mid-afternoon, then FAIL
+13/15 on **both** collectors on the final landing tree, and FAIL under the
+default collector on the earlier binary too when driven through a different
+harness. Whatever that instability is, it is not a collector asymmetry and it
+is not this page's `EXCEPTION_ACCESS_VIOLATION`. It wants its own page; it does
+not keep this one open.
+
+The page offered two readings of the crash and disambiguated neither.
 
 **Reading #1 — "the diversion fix is Generational-specific machinery and was
 never extended to G1's moving young-gen" — is wrong.** G1's analogue exists; it
