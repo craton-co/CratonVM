@@ -230,12 +230,13 @@ conservative-root half of the header change rather than the field-packing half.
 Filed as
 `docs/known-issues/h2/bug-h2-niomapped-unmap-gc-timeout-reopened-by-header-16-20260807.md`.
 
-Net for the class this doc is about: at the current tip `TestFileSystem` clears
-`testSetReadOnly` — which is what this page and its parent are for — and clears
-plain disk end to end. `nioMapped:` is blocked by the second regression above,
-identically on pristine dev. The `setAttribute` prefix table is quoted from
-`e3456d0e5`, before either regression existed, because that is the arm where
-every prefix ran to completion.
+Net for the class this doc is about, measured at the landing commit on both
+platforms: `TestFileSystem` clears `testSetReadOnly` — which is what this page
+and its parent are for — and runs **plain disk end to end**, Windows `OK 9.4 s`
+/ Linux `OK 0.8 s`, plus `memFS:` `OK 4.1 s`. `nioMapped:` is blocked by the
+second regression above, identically on pristine dev. The full twelve-prefix
+table is quoted from `e3456d0e5`, before either regression existed, because that
+is the arm where every prefix ran to completion.
 
 One consequence worth naming, because it changes what the probe prints: with
 `Files.delete` now reporting failure, `TfsProbe`'s own cleanup
