@@ -2260,8 +2260,8 @@ fn getinstance_get_service_provider(
     let algo = read_arg_string(ctx, args, 1);
     let provider = read_arg_string(ctx, args, 2);
     match resolve_service(ctx, &provider, &type_str, &algo) {
-        Some(svc) => Ok(Some(Value::Object(Some(svc)))),
-        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
+        Ok(Some(svc)) => Ok(Some(Value::Object(Some(svc)))),
+        Ok(None) => Err(cratonvm_types::error::RuntimeError::NotImplemented {
             feature: format!(
                 "no {type_str} {algo} implementation registered for provider {provider}"
             ),
@@ -2277,7 +2277,7 @@ fn getinstance_get_service_search(ctx: &mut dyn NativeContext, args: &[Value]) -
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     for (name, _, _) in snapshot() {
-        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(svc)) = resolve_service(ctx, &name, &type_str, &algo) {
             return Ok(Some(Value::Object(Some(svc))));
         }
     }
@@ -2745,7 +2745,7 @@ fn build_jca_instance(
     algo: &str,
 ) -> Result<Option<MethodCallResult>, MethodCallFailed> {
     let impl_result = build_jca_impl(ctx, provider, type_str, algo)?;
-    Some((|| {
+    Ok(Some((|| {
         let impl_ref = match impl_result? {
             Some(Value::Object(Some(o))) => o,
             _ => {
@@ -2770,7 +2770,7 @@ fn build_jca_instance(
         );
         ctx.unpin_native_roots(pin);
         inst
-    })())
+    })()))
 }
 
 fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2786,8 +2786,8 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
         ));
     }
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
-        Some(r) => r,
-        None => Err(throw_no_such_algorithm(
+        Ok(Some(r)) => r,
+        Ok(None) => Err(throw_no_such_algorithm(
             ctx,
             // Real `GetInstance.getInstance` reports
             // "no such algorithm: <algo> for provider <p>"; the engine type is
@@ -2811,8 +2811,8 @@ fn getinstance_instance_provider_obj(
         _ => String::new(),
     };
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
-        Some(r) => r,
-        None => Err(throw_no_such_algorithm(
+        Ok(Some(r)) => r,
+        Ok(None) => Err(throw_no_such_algorithm(
             ctx,
             &format!("no {type_str} {algo} implementation for provider {provider}"),
         )),
@@ -2839,7 +2839,7 @@ fn getinstance_get_services(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ctx.invoke(al, "<init>", "()V", &[Value::Object(Some(list))])?;
     let pin = ctx.pin_native_root(list);
     for (name, _, _) in snapshot() {
-        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(svc)) = resolve_service(ctx, &name, &type_str, &algo) {
             list = ctx.read_native_pin(pin, list);
             ctx.invoke(
                 al,
@@ -2865,7 +2865,7 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
     for (name, _, _) in snapshot() {
-        if let Some(r) = build_jca_instance(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(r)) = build_jca_instance(ctx, &name, &type_str, &algo) {
             return r;
         }
     }
@@ -2922,7 +2922,7 @@ pub(crate) fn try_build_real_certificate_factory(
     let provider = find_service_provider("CertificateFactory", &algo)?;
     let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo)? {
         Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
+        _ => return Ok(None),
     };
     let pin = ctx.pin_native_root(impl_ref);
     let provider_obj = resolve_or_make_provider(ctx, &provider);
@@ -2939,8 +2939,8 @@ pub(crate) fn try_build_real_certificate_factory(
     );
     ctx.unpin_native_roots(pin);
     match result {
-        Ok(Some(Value::Object(Some(o)))) => Some(o),
-        _ => None,
+        Ok(Some(Value::Object(Some(o)))) => Ok(Some(o)),
+        _ => Ok(None),
     }
 }
 
@@ -4274,8 +4274,8 @@ fn key_store_get_instance_with_provider(
         let provider_ref = if provider_name.is_empty() {
             resolve_or_make_provider(ctx, "SUN")
         } else {
-            provider_ref
-        };
+            Ok(provider_ref)
+        }?;
         ctx.new_object_initialized(
             "java/security/KeyStore",
             "(Ljava/security/KeyStoreSpi;Ljava/security/Provider;Ljava/lang/String;)V",

@@ -2378,12 +2378,12 @@ pub(crate) fn sp_append_subscriber(
 ) -> Result<(), MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let sub_pin = ctx.pin_native_root(subscriber);
-    let wrapper = sp_wrapper_ensure(ctx, this);
-    let w_pin = ctx.pin_native_root(wrapper?);
-    let (arr, cap, count) = match ctx.get_field(wrapper?, 0) {
+    let wrapper = sp_wrapper_ensure(ctx, this)?;
+    let w_pin = ctx.pin_native_root(wrapper);
+    let (arr, cap, count) = match ctx.get_field(wrapper, 0) {
         Value::Object(Some(a)) => {
             let cap = ctx.array_length(a);
-            let count = match ctx.get_field(wrapper?, 1) {
+            let count = match ctx.get_field(wrapper, 1) {
                 Value::Int(n) if n >= 0 => n as usize,
                 _ => 0,
             };
@@ -2396,7 +2396,7 @@ pub(crate) fn sp_append_subscriber(
         let new_cap = (cap.max(4)) * 2;
         let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
         let a_pin = ctx.pin_native_root(new_arr);
-        let wrapper = ctx.read_native_pin(w_pin, wrapper?);
+        let wrapper = ctx.read_native_pin(w_pin, wrapper);
         if let Value::Object(Some(old_arr)) = ctx.get_field(wrapper, 0) {
             for i in 0..count {
                 let elem = ctx.get_array_element(old_arr, i);
@@ -2412,7 +2412,7 @@ pub(crate) fn sp_append_subscriber(
     };
     let subscriber = ctx.read_native_pin(sub_pin, subscriber);
     ctx.set_array_element(arr, count, Value::Object(Some(subscriber)));
-    let wrapper = ctx.read_native_pin(w_pin, wrapper?);
+    let wrapper = ctx.read_native_pin(w_pin, wrapper);
     ctx.set_field(wrapper, 1, Value::Int((count + 1) as i32));
     ctx.unpin_native_roots(this_pin);
     Ok(())
@@ -3051,7 +3051,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // sleep (e.g. zero-delay `schedule(r, 0, MILLIS)`) still get the
         // single fire they expect synchronously.
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // scheduleAtFixedRate — periodic firing driven by the pump.
     r.register(stpe, "scheduleAtFixedRate", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3077,7 +3077,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         // Initial pump for zero-delay schedules so the first fire happens
         // before the caller's first `Thread.sleep`.
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // scheduleWithFixedDelay — pump-driven, fixed-delay variant.
     r.register(stpe, "scheduleWithFixedDelay", "(Ljava/lang/Runnable;JJLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;", |ctx, args| {
@@ -3101,7 +3101,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         let period_ms = scheduled_convert_to_millis(ctx, period, args.get(4)).max(1) as u64;
         let task = crate::scheduled_pump::registry().register(runnable, initial_ms, period_ms, true);
         crate::scheduled_pump::registry().pump(ctx);
-        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)))))
+        Ok(Some(Value::Object(Some(build_sf(ctx, task.id)?))))
     });
     // ScheduledFuture.cancel(boolean) — flip the cancelled flag and
     // return whether this call performed the transition. The call is
@@ -4455,7 +4455,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (_, subtask) = incubator_fork_subtask(ctx, None, callable);
+            let Ok((_, subtask)) = incubator_fork_subtask(ctx, None, callable);
             Ok(Some(Value::Object(Some(subtask))))
         },
     );
@@ -4573,7 +4573,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            let Ok((this, subtask)) = incubator_fork_subtask(ctx, Some(this), callable);
             // ShutdownOnSuccess captures the first successful result.
             if let Some(this) = this {
                 let succeeded =
@@ -4623,7 +4623,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
         } else {
             Value::Object(None)
         };
-        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)?))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         // If the scope captured an exception (field 2), wrap it in ExecutionException and throw.
@@ -4665,7 +4665,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) -
                 Some(Value::Object(Some(c))) => Some(*c),
                 _ => None,
             };
-            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            let Ok((this, subtask)) = incubator_fork_subtask(ctx, Some(this), callable);
             if let Some(this) = this {
                 let failed =
                     matches!(ctx.get_field(subtask, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_FAILED);
@@ -5179,7 +5179,7 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
         } else {
             Value::Object(None)
         };
-        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)?))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -7993,7 +7993,7 @@ pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> Result<craton
     match ctx.ensure_class_initialized(&target) {
         Ok(cid) => {
             let nfields = ctx.class_num_total_fields(cid).max(1);
-            ctx.alloc_object(cid, nfields)
+            Ok(ctx.alloc_object(cid, nfields))
         }
         Err(_) => try_alloc_concurrent_synthetic(ctx, &target, 1),
     }

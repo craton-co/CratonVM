@@ -684,7 +684,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..]));
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([BII)V", &args[1..])?);
         }
         if let Some(Value::Object(Some(src))) = args.get(1) {
             // Validate signed off/len against the array length BEFORE casting to
@@ -725,7 +725,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(zo, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..]));
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "(I)V", &args[1..])?);
         }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         if let Some(state) = zo_real_fast_state(ctx, this) {
@@ -736,7 +736,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(zo, "write", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..]));
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "write", "([B)V", &args[1..])?);
         }
         if let Some(Value::Object(Some(src))) = args.get(1) {
             let len = ctx.array_length(*src);
@@ -755,7 +755,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(zo, "closeEntry", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return Ok(ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[]));
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "closeEntry", "()V", &[])?);
         }
         zo_finalize_current_entry(ctx, this);
         Ok(None)
@@ -763,7 +763,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(zo, "finish", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return Ok(ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[]));
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "finish", "()V", &[])?);
         }
         // Finalize any open entry
         zo_finalize_current_entry(ctx, this);
@@ -774,7 +774,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) -> Result<
     r.register(zo, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if !zo_real_fast_active(ctx, this) {
-            return Ok(ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]));
+            return Ok(ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[])?);
         }
         zo_finalize_current_entry(ctx, this);
         zo_write_zip(ctx, this)?;
@@ -3987,7 +3987,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) -> Result<()
             match found {
                 Some((n, size, csize, crc)) => Ok(Some(Value::Object(Some(zip_entry_alloc(
                     ctx, &n, size, csize, crc,
-                ))))),
+                )?)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },

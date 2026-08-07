@@ -877,7 +877,7 @@ fn make_response_input_stream(
     if !truncated {
         return Ok(Some(head?));
     }
-    let Value::Object(Some(head_ref)) = head else {
+    let Ok(Value::Object(Some(head_ref))) = head else {
         return Ok(Some(head?));
     };
     // `head` must survive the two constructor up-calls below, both of which can

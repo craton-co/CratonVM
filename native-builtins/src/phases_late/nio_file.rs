@@ -897,7 +897,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 p57_alloc_path(ctx, &jrtfs_encode(&jrt, &first))
             } else {
                 p57_alloc_path(ctx, &first)
-            };
+            }?;
             // Record the FileSystem that produced this Path so
             // `Path.getFileSystem()` returns the *same* object — required by
             // identity checks like cassandra's `File(Path)` constructor
@@ -1134,7 +1134,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 }
                 _ => {
                     let root = if cfg!(windows) { "C:\\" } else { "/" };
-                    p57_alloc_path(ctx, root)
+                    p57_alloc_path(ctx, root)?
                 }
             };
             let root_path_pin = ctx.pin_native_root(root_path);
@@ -1708,7 +1708,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)))))
+            Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)?))))
         },
     );
 
@@ -2345,7 +2345,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         if let Value::Object(Some(data)) = ctx.get_field_by_name(list, "elementData") {
             if index < ctx.array_length(data) {
                 if let Value::Object(Some(o)) = ctx.get_array_element(data, index) {
-                    return Ok(Some(o));
+                    return Ok(Some(o))?;
                 }
             }
         }
@@ -2366,7 +2366,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         delta: i32,
     ) -> Vec<PicocliStyledSectionData> {
         let Some(list) = list else {
-            return Ok(Vec::new());
+            return Ok(Vec::new())?;
         };
         let count = picocli_list_size(ctx, list).min(100_000);
         let mut out = Vec::with_capacity(count);
@@ -2720,7 +2720,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
     ) -> bool {
         let from_prefix = picocli_string_field(ctx, mapper, "fromPrefix");
         if !from_prefix.is_empty() && key.starts_with(&from_prefix) {
-            return Ok(keycloak_wildcard_value_valid(&key[from_prefix.len()..]));
+            return Ok(keycloak_wildcard_value_valid(&key[from_prefix.len()..]))?;
         }
 
         let to_prefix = picocli_string_field(ctx, mapper, "toPrefix");
@@ -2730,7 +2730,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
             || !key.ends_with(&to_suffix)
             || key.len() < to_prefix.len().saturating_add(to_suffix.len())
         {
-            return Ok(false);
+            return Ok(false)?;
         }
         let end = key.len().saturating_sub(to_suffix.len());
         keycloak_wildcard_value_valid(&key[to_prefix.len()..end])
@@ -3198,7 +3198,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
     fn keycloak_cli_args(ctx: &mut dyn NativeContext) -> Vec<String> {
         let raw = keycloak_cli_args_property(ctx);
         if raw.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Vec::new())?;
         }
         let mut result = Vec::new();
         let mut escaped = false;
@@ -3426,7 +3426,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
 
     fn keycloak_cache_set_to_infinispan(ctx: &mut dyn NativeContext) -> bool {
         if keycloak_cli_value(ctx, "cache-remote-host").is_some() {
-            return Ok(false);
+            return Ok(false)?;
         }
         keycloak_cli_value(ctx, "cache")
             .map(|v| v.eq_ignore_ascii_case("ispn"))
@@ -3792,7 +3792,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         let units: Vec<u16> = s.encode_utf16().collect();
         let mut freq = rustc_hash::FxHashMap::default();
         if units.len() < 2 {
-            return Ok(freq);
+            return Ok(freq)?;
         }
         for pair in units.windows(2) {
             *freq.entry((pair[0], pair[1])).or_insert(0) += 1;
@@ -4095,7 +4095,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 if crate::nbflags().dbg_picocli_style {
                     eprintln!("[picocli-style] ensure_class_initialized failed");
                 }
-                return Ok(cratonvm_types::Value::Object(None));
+                return Ok(cratonvm_types::Value::Object(None))?;
             }
         };
         let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
@@ -4117,7 +4117,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
-                return Ok(v);
+                return Ok(v)?;
             }
         } else if dbg {
             eprintln!("[picocli-style] plain {} -> no static field", name);
@@ -4135,7 +4135,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 );
             }
             if !matches!(v, cratonvm_types::Value::Object(None)) {
-                return Ok(v);
+                return Ok(v)?;
             }
         } else if dbg {
             eprintln!("[picocli-style] prefixed {} -> no static field", prefixed);
@@ -4151,7 +4151,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     matches!(v, cratonvm_types::Value::Object(None))
                 );
             }
-            return Ok(v);
+            return Ok(v)?;
         }
         if dbg {
             eprintln!("[picocli-style] reset static field not found, returning null");
@@ -4214,16 +4214,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         } else if let Some(rest) = input.strip_prefix('-') {
             ("-", rest)
         } else {
-            return Ok(input.to_string());
+            return Ok(input.to_string())?;
         };
         let Some(colon) = rest.find(':') else {
-            return Ok(input.to_string());
+            return Ok(input.to_string())?;
         };
         if !rest[..colon]
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
         {
-            return Ok(input.to_string());
+            return Ok(input.to_string())?;
         }
         let after_colon = &rest[colon + 1..];
         let (replacement_sign, value) = if let Some(value) = after_colon.strip_prefix('+') {
@@ -4231,10 +4231,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
         } else if let Some(value) = after_colon.strip_prefix('-') {
             ('+', value)
         } else {
-            return Ok(input.to_string());
+            return Ok(input.to_string())?;
         };
         if !picocli_regex_word_hyphen(value) {
-            return Ok(input.to_string());
+            return Ok(input.to_string())?;
         }
         if synopsis {
             format!("{}{}:(+|-){}", prefix, &rest[..colon], value)
@@ -4650,7 +4650,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 // FileSystemResource.getContentAsString() catch
                 // NoSuchFileException and translate it to FileNotFoundException.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -4671,7 +4671,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     Ok(Some(Value::Object(Some(s))))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -4723,7 +4723,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 ctx.set_field(list, data_slot, Value::Object(Some(arr)));
                 ctx.set_field(list, size_slot, Value::Int(lines.len() as i32));
                 ctx.unpin_native_roots(list_pin);
-                Ok(Some(Value::Object(Some(list))))
+                Ok(Ok(Some(Value::Object(Some(list)))))
             }
             Err(e) => Err(p57_io_error(&e)),
         }
@@ -5040,10 +5040,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     Ok(Some(Value::Object(Some(path_obj))))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    Err(p57_access_denied(ctx, &p))
+                    Err(p57_access_denied(ctx, &p)?)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let exc = try_alloc_concurrent_synthetic(
@@ -5086,10 +5086,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
             match create_dir_with_mode(&p, mode) {
                 Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    Err(p57_access_denied(ctx, &p))
+                    Err(p57_access_denied(ctx, &p)?)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let exc = try_alloc_concurrent_synthetic(
@@ -5227,7 +5227,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     // profile-specific `keycloak-<profile>.conf`); a generic
                     // IOException escapes that catch and aborts boot (SRCFG00035).
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        Err(p57_no_such_file(ctx, &p))
+                        Err(p57_no_such_file(ctx, &p)?)
                     }
                     Err(e) => Err(p57_io_error(&e)),
                 };
@@ -5266,7 +5266,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     _ => false,
                 };
                 if !creates {
-                    return Err(p57_no_such_file(ctx, &p));
+                    return Err(p57_no_such_file(ctx, &p)?);
                 }
             }
             // Real file: return a working `FileChannel` (which implements
@@ -6243,7 +6243,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                 // NoSuchFileException and translate it to FileNotFoundException
                 // (ResourceTests#resourceCreateRelativeUnknown).
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -6298,7 +6298,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
             // it does not exist.
             if vfs_decode(&p).is_some() {
                 if matches!(vfs_classify(&p), Some(JarFsKind::Absent) | None) {
-                    return Err(p57_no_such_file(ctx, &p));
+                    return Err(p57_no_such_file(ctx, &p)?);
                 }
                 let result = p57_alloc_path(ctx, &p)?;
                 return Ok(Some(Value::Object(Some(result))));
@@ -6316,7 +6316,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) -> Result<(), Met
                     let result = p57_alloc_path(ctx, &real)?;
                     Ok(Some(Value::Object(Some(result))))
                 }
-                Err(_) => Err(p57_no_such_file(ctx, &p)),
+                Err(_) => Err(p57_no_such_file(ctx, &p)?),
             }
         },
     );
@@ -8689,7 +8689,7 @@ fn p57_link_io_error(
     other: Option<&str>,
 ) -> Result<MethodCallFailed, MethodCallFailed> {
     match e.kind() {
-        std::io::ErrorKind::AlreadyExists => p57_file_already_exists(ctx, link),
+        std::io::ErrorKind::AlreadyExists => Ok(p57_file_already_exists(ctx, link)),
         std::io::ErrorKind::NotFound => p57_no_such_file(ctx, link),
         std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, link),
         _ => {
@@ -8758,8 +8758,8 @@ pub(crate) fn p57_create_symbolic_link(
         }
     };
     match result {
-        Ok(()) => Ok(()),
-        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
+        Ok(())? => Ok(()),
+        Err(e)? => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
     }
 }
 
@@ -10676,7 +10676,7 @@ pub(crate) fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) 
         };
         ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
         ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
-        return;
+        return Ok(());
     }
     ctx.set_field(this, 0, Value::Int(fd as i32));
     Ok(())
@@ -12867,7 +12867,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
                 if pstr.is_empty() {
                     Ok(Some(Value::Object(None)))
                 } else {
-                    Ok(Some(Value::Object(Some(file_alloc(ctx, &pstr)))))
+                    Ok(Some(Value::Object(Some(file_alloc(ctx, &pstr)?))))
                 }
             }
             None => Ok(Some(Value::Object(None))),
@@ -12909,7 +12909,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
                 .unwrap_or(path)
         };
         let abs = p57_trim_file_trailing_separator(&abs);
-        Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)))))
+        Ok(Some(Value::Object(Some(file_alloc(ctx, &abs)?))))
     });
     // Strip the Windows `\\?\` extended-length prefix that
     // `std::fs::canonicalize` prepends. The real JDK's `getCanonicalPath`
@@ -12932,7 +12932,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let canonical = file_canonicalize_path(&path);
-        Ok(Some(Value::Object(Some(file_alloc(ctx, &canonical)))))
+        Ok(Some(Value::Object(Some(file_alloc(ctx, &canonical)?))))
     });
     r.register(file, "isAbsolute", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -13517,7 +13517,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
                 .into()),
             };
         }
-        Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &path)))))
+        Ok(Some(Value::Object(Some(p57_alloc_path(ctx, &path)?))))
     });
     r.register(file, "toURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -13626,7 +13626,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
             };
             let tmp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
             let full = jdk_create_temp_file(&tmp_dir, &prefix, &suffix)?;
-            Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
+            Ok(Some(Value::Object(Some(file_alloc(ctx, &full)?))))
         },
     );
     r.register(
@@ -13649,7 +13649,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) -> Result<(), MethodC
                 _ => jdk_temp_dir(ctx.get_system_property("java.io.tmpdir")),
             };
             let full = jdk_create_temp_file(&dir_path, &prefix, &suffix)?;
-            Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
+            Ok(Some(Value::Object(Some(file_alloc(ctx, &full)?))))
         },
     );
     // Was a documented "no actual tracking" no-op: the file was never deleted
@@ -14239,7 +14239,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Resu
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
                 let millis = basic_file_attributes_time_millis(ctx, this, "creation");
-                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)?))))
             },
         );
         r.register(
@@ -14249,7 +14249,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Resu
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
                 let millis = basic_file_attributes_time_millis(ctx, this, "access");
-                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)?))))
             },
         );
         r.register(
@@ -14259,7 +14259,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Resu
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
                 let millis = basic_file_attributes_time_millis(ctx, this, "modified");
-                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)))))
+                Ok(Some(Value::Object(Some(filetime_alloc(ctx, millis)?))))
             },
         );
         r.register(attrs_class, "isDirectory", "()Z", |ctx, args| {
@@ -14438,7 +14438,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) -> Resu
             let meta = match std::fs::metadata(&path_str) {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(p57_no_such_file(ctx, &path_str));
+                    return Err(p57_no_such_file(ctx, &path_str)?);
                 }
                 Err(e) => return Err(p57_io_error(&e)),
             };
@@ -15785,7 +15785,7 @@ pub(crate) fn p59_files_read_attributes(
     // sentinel string ENOENTs, which made the walker treat every mounted-jar
     // root as a zero-length regular file (JUnit5 jar scanning found nothing).
     if let Some((jar, entry)) = jarfs_decode(&path_str) {
-        let bfa = basic_file_attributes_alloc(ctx);
+        let bfa = basic_file_attributes_alloc(ctx)?;
         let (is_dir, size) = match jarfs_classify(&jar, &entry) {
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jarfs_entry_size(&jar, &entry).unwrap_or(0)),
@@ -15799,14 +15799,14 @@ pub(crate) fn p59_files_read_attributes(
                 .into());
             }
         };
-        basic_file_attributes_store(ctx, bfa?, is_dir != 0, size, 0, 0, 0, 0);
-        return Ok(Some(Value::Object(Some(bfa?))));
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
+        return Ok(Some(Value::Object(Some(bfa))));
     }
 
     // jrt-FS (runtime image) path — attributes come from the jimage, not the
     // host filesystem. javac's platform-class indexing walks `/modules/...`.
     if let Some((java_home, entry)) = jrtfs_decode(&path_str) {
-        let bfa = basic_file_attributes_alloc(ctx);
+        let bfa = basic_file_attributes_alloc(ctx)?;
         let (is_dir, size) = match jrtfs_classify(&java_home, &entry) {
             JarFsKind::Dir => (1, 0i64),
             JarFsKind::File => (0, jrtfs_entry_size(&java_home, &entry).unwrap_or(0)),
@@ -15817,8 +15817,8 @@ pub(crate) fn p59_files_read_attributes(
                 .into());
             }
         };
-        basic_file_attributes_store(ctx, bfa?, is_dir != 0, size, 0, 0, 0, 0);
-        return Ok(Some(Value::Object(Some(bfa?))));
+        basic_file_attributes_store(ctx, bfa, is_dir != 0, size, 0, 0, 0, 0);
+        return Ok(Some(Value::Object(Some(bfa))));
     }
 
     // NOFOLLOW_LINKS. `java.nio.file.LinkOption` is a single-constant enum, so
@@ -15838,7 +15838,7 @@ pub(crate) fn p59_files_read_attributes(
         std::fs::metadata(&path_str)
     };
 
-    let bfa = basic_file_attributes_alloc(ctx);
+    let bfa = basic_file_attributes_alloc(ctx)?;
 
     match meta_result {
         Ok(meta) => {
@@ -15857,7 +15857,7 @@ pub(crate) fn p59_files_read_attributes(
             let perm_bits = 0i32;
             basic_file_attributes_store(
                 ctx,
-                bfa?,
+                bfa,
                 meta.is_dir(),
                 meta.len() as i64,
                 creation_millis,
@@ -15870,31 +15870,31 @@ pub(crate) fn p59_files_read_attributes(
             // following read resolves the target (and the real JDK likewise
             // reports `isSymbolicLink() == false` there).
             if meta.file_type().is_symlink() {
-                if basic_file_attributes_is_synthetic(ctx, bfa?) {
+                if basic_file_attributes_is_synthetic(ctx, bfa) {
                     // Synthetic stub has no named fields — patch the slot.
-                    let cur = basic_file_attributes_syn_mode(ctx, bfa?);
+                    let cur = basic_file_attributes_syn_mode(ctx, bfa);
                     ctx.set_field(
-                        bfa?,
+                        bfa,
                         BFA_SYN_SLOT_MODE,
                         Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
                     );
-                } else if basic_file_attributes_is_windows(ctx, bfa?) {
-                    let cur = match ctx.get_field_by_name(bfa?, "fileAttrs") {
+                } else if basic_file_attributes_is_windows(ctx, bfa) {
+                    let cur = match ctx.get_field_by_name(bfa, "fileAttrs") {
                         Value::Int(v) => v,
                         _ => 0,
                     };
                     ctx.set_field_by_name(
-                        bfa?,
+                        bfa,
                         "fileAttrs",
                         Value::Int(cur | WIN_ATTR_REPARSE_POINT),
                     );
                 } else {
-                    let cur = match ctx.get_field_by_name(bfa?, "st_mode") {
+                    let cur = match ctx.get_field_by_name(bfa, "st_mode") {
                         Value::Int(v) => v,
                         _ => 0,
                     };
                     ctx.set_field_by_name(
-                        bfa?,
+                        bfa,
                         "st_mode",
                         Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
                     );
@@ -15911,15 +15911,15 @@ pub(crate) fn p59_files_read_attributes(
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                ctx.set_field_by_name(bfa?, "st_uid", Value::Int(meta.uid() as i32));
-                ctx.set_field_by_name(bfa?, "st_gid", Value::Int(meta.gid() as i32));
+                ctx.set_field_by_name(bfa, "st_uid", Value::Int(meta.uid() as i32));
+                ctx.set_field_by_name(bfa, "st_gid", Value::Int(meta.gid() as i32));
                 // `st_dev`/`st_ino` ARE the file's identity — both our
                 // `fileKey()` native and the real JDK's own
                 // `UnixFileAttributes.fileKey()` build a key out of them.
                 // Never populated before, which is why `fileKey()` had nothing
                 // to report and returned null for every file.
-                ctx.set_field_by_name(bfa?, "st_dev", Value::Long(meta.dev() as i64));
-                ctx.set_field_by_name(bfa?, "st_ino", Value::Long(meta.ino() as i64));
+                ctx.set_field_by_name(bfa, "st_dev", Value::Long(meta.dev() as i64));
+                ctx.set_field_by_name(bfa, "st_ino", Value::Long(meta.ino() as i64));
             }
             // Windows equivalent of the `st_dev`/`st_ino` identity above: the
             // `(volume serial, file index)` triple `WindowsFileAttributes`
@@ -15955,7 +15955,7 @@ pub(crate) fn p59_files_read_attributes(
         Err(e) => return Err(p57_io_error(&e)),
     }
 
-    Ok(Some(Value::Object(Some(bfa?))))
+    Ok(Some(Value::Object(Some(bfa))))
 }
 
 // =============================================================================
@@ -16691,7 +16691,7 @@ pub(crate) fn p98_invoke_file_visitor(
     second_arg: Value,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let args = [Value::Object(Some(path_obj)), second_arg];
-    let result = ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args)?;
+    let result = ctx.invoke_virtual(visitor, method_name, erased_descriptor, &args);
     let value = match result {
         Ok(value) => value,
         Err(err) if p98_is_missing_visitor_method(&err, method_name, erased_descriptor) => {
@@ -16731,9 +16731,9 @@ pub(crate) fn p98_alloc_basic_file_attributes(
     is_dir: bool,
     size: i64,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let attrs = basic_file_attributes_alloc(ctx);
-    basic_file_attributes_store(ctx, attrs?, is_dir, size, 0, 0, 0, 0);
-    Ok(attrs?)
+    let attrs = basic_file_attributes_alloc(ctx)?;
+    basic_file_attributes_store(ctx, attrs, is_dir, size, 0, 0, 0, 0);
+    Ok(attrs)
 }
 
 /// Fast-path the only callback implemented by javac's archive indexer.
@@ -17816,7 +17816,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<
                 // NIO contract: missing file → NoSuchFileException, not a bare
                 // IOException/IllegalStateException (see newByteChannel above).
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),
@@ -17868,7 +17868,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<
             match std::fs::write(&p, &bytes) {
                 Ok(()) => Ok(Some(Value::Long(bytes.len() as i64))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    Err(p57_no_such_file(ctx, &p))
+                    Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -17893,7 +17893,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<
             let bytes = match std::fs::read(&p) {
                 Ok(b) => b,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(p57_no_such_file(ctx, &p))
+                    return Err(p57_no_such_file(ctx, &p)?)
                 }
                 Err(e) => return Err(p57_io_error(&e)),
             };
@@ -18003,9 +18003,9 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) -> Result<
             let p = p57_read_path(ctx, path_obj);
             // NIO contract: the path must exist.
             if std::fs::symlink_metadata(&p).is_err() {
-                return Err(p57_no_such_file(ctx, &p));
+                return Err(p57_no_such_file(ctx, &p)?);
             }
-            Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)))))
+            Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)?))))
         },
     );
     // Was `null`. `Files.getOwner` is specified to return a principal or throw

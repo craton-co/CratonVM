@@ -458,7 +458,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
         "getDefault",
         "()Ljavax/net/ssl/SSLContext;",
         |ctx, _args| {
-            let obj = alloc_ssl_context(ctx, 2); // TLSv1.3
+            let obj = alloc_ssl_context(ctx, 2)?; // TLSv1.3
             ctx.set_field(obj, CTX_INITIALIZED, Value::Int(1));
             Ok(Some(Value::Object(Some(obj))))
         },

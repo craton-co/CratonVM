@@ -317,7 +317,7 @@ pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -
 
 pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.get_field(this, 0) {
-        Value::Object(Some(m)) => m,
+        Value::Object(Some(m)) => Ok(m),
         _ => {
             // Pin across the map alloc/init below — a moving young GC there
             // would relocate `this` (native stale-local family).
@@ -329,7 +329,7 @@ pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Res
             let map = ctx.read_native_pin(map_pin, map);
             ctx.set_field(this, 0, Value::Object(Some(map)));
             ctx.unpin_native_roots(this_pin);
-            map
+            Ok(map)
         }
     }
 }
@@ -1190,7 +1190,7 @@ fn vcs_fire(
     let prop_pin = pinned_object_value(ctx, prop_name);
     let old_pin = pinned_object_value(ctx, old_val);
     let new_pin = pinned_object_value(ctx, new_val);
-    let (fired_this, event) = vcs_event(ctx, this, prop_name, old_val, new_val);
+    let Ok((fired_this, event)) = vcs_event(ctx, this, prop_name, old_val, new_val);
     let result = match vcs_dispatch(ctx, fired_this, event) {
         Ok(()) => Ok(None),
         Err(failure) => {
@@ -1199,7 +1199,7 @@ fn vcs_fire(
                 let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
                 let old_val = read_pinned_object_value(ctx, old_pin, old_val);
                 let new_val = read_pinned_object_value(ctx, new_pin, new_val);
-                let (revert_this, revert) = vcs_event(ctx, this, prop_name, new_val, old_val);
+                let Ok((revert_this, revert)) = vcs_event(ctx, this, prop_name, new_val, old_val);
                 let _ = vcs_dispatch(ctx, revert_this, revert);
             }
             Err(failure)
@@ -2209,13 +2209,13 @@ pub(crate) fn introspector_get_bean_info(
     }
     fn prop_idx(props: &mut Vec<PropAcc>, name: &str) -> Result<usize, MethodCallFailed> {
         match props.iter().position(|p| p.name == name) {
-            Some(i) => i,
+            Some(i) => Ok(i),
             None => {
                 props.push(PropAcc {
                     name: name.to_string(),
                     ..Default::default()
                 });
-                props.len() - 1
+                Ok(props.len() - 1)
             }
         }
     }

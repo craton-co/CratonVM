@@ -1411,13 +1411,13 @@ fn do_send(
     let resp_obj = match result {
         Ok(resp) => alloc_response(ctx, &resp, req, &uri),
         Err(e) => alloc_error_response(ctx, req, &uri, &format!("HTTP error: {e}")),
-    };
+    }?;
     // If a BodyHandler was supplied, deliver the body via apply(ResponseInfo).
     if let Some(Value::Object(Some(handler))) = body_handler {
         let info = try_alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse$ResponseInfo", 3)?;
-        ctx.set_field(info, 0, ctx.get_field(resp_obj?, HRS_STATUS));
-        ctx.set_field(info, 1, ctx.get_field(resp_obj?, HRS_HEADERS_ARR));
-        ctx.set_field(info, 2, ctx.get_field(resp_obj?, HRS_VERSION));
+        ctx.set_field(info, 0, ctx.get_field(resp_obj, HRS_STATUS));
+        ctx.set_field(info, 1, ctx.get_field(resp_obj, HRS_HEADERS_ARR));
+        ctx.set_field(info, 2, ctx.get_field(resp_obj, HRS_VERSION));
         // Best-effort upcall — ignored on failure (synthetic Java types may
         // not be loaded, in which case the response body is delivered through
         // direct field access on the HttpResponse instead).
@@ -1428,7 +1428,7 @@ fn do_send(
             &[Value::Object(Some(info))],
         );
     }
-    Ok(Some(Value::Object(Some(resp_obj?))))
+    Ok(Some(Value::Object(Some(resp_obj))))
 }
 
 fn hrq_status_helpers_register(r: &mut NativeMethodRegistry) {

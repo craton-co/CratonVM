@@ -798,24 +798,24 @@ pub(crate) fn vh_auto_box(ctx: &mut dyn NativeContext, val: Value) -> Result<Val
         Value::Int(_) => {
             let wrapper = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
             ctx.set_field(wrapper, 0, val);
-            Value::Object(Some(wrapper))
+            Ok(Value::Object(Some(wrapper)))
         }
         Value::Long(_) => {
             let wrapper = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
             ctx.set_field(wrapper, 0, val);
-            Value::Object(Some(wrapper))
+            Ok(Value::Object(Some(wrapper)))
         }
         Value::Float(_) => {
             let wrapper = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/Float", 1)?;
             ctx.set_field(wrapper, 0, val);
-            Value::Object(Some(wrapper))
+            Ok(Value::Object(Some(wrapper)))
         }
         Value::Double(_) => {
             let wrapper = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
             ctx.set_field(wrapper, 0, val);
-            Value::Object(Some(wrapper))
+            Ok(Value::Object(Some(wrapper)))
         }
-        _ => val, // Already an object reference or null
+        _ => Ok(val), // Already an object reference or null
     }
 }
 

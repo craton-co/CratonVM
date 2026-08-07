@@ -11461,10 +11461,10 @@ fn cached_annotation_proxy_for_key(
         ann_class_id,
         Some(holder_class_id),
         container_loader,
-    );
+    )?;
     let cached = ANNOTATION_PROXY_CACHE.with(vm, |table| *table.entry(key).or_insert(proxy));
-    if cached.as_ptr() != proxy?.as_ptr() {
-        forget_annotation_proxy_child_roots(vm, proxy?);
+    if cached.as_ptr() != proxy.as_ptr() {
+        forget_annotation_proxy_child_roots(vm, proxy);
     }
     Ok(cached)
 }
@@ -11488,12 +11488,12 @@ fn cached_annotation_proxy_resolving(
         return Ok(Some(cached));
     }
     let ann_class_id = resolve_annotation_type_near(ctx, ann, Some(queried_class_id))?;
-    Some(cached_annotation_proxy(
+    Ok(Some(cached_annotation_proxy(
         ctx,
         queried_class_id,
         ann,
         ann_class_id,
-    ))
+    )?))
 }
 
 fn peek_annotation_proxy_cache(
@@ -11784,11 +11784,11 @@ fn ctx_annotation_proxy_elements(
 ) -> Result<Vec<(String, Value)>, MethodCallFailed> {
     let names_arr = match ctx.get_field(proxy, ANN_PROXY_ELEM_NAMES) {
         Value::Object(Some(a)) => a,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let values_arr = match ctx.get_field(proxy, ANN_PROXY_ELEM_VALUES) {
         Value::Object(Some(a)) => a,
-        _ => return Vec::new(),
+        _ => return Ok(Vec::new()),
     };
     let n = ctx.array_length(names_arr);
     let mut out = Vec::with_capacity(n);
@@ -12435,13 +12435,13 @@ fn create_annotation_proxy(
     let class_name = annotation_desc_to_class_name(&ann.type_descriptor)?;
     let owned = class_name.to_string();
     let cid = resolve_annotation_type_class_id(ctx, &owned, container_class_id)?;
-    Some(create_annotation_proxy_with_type(
+    Ok(Some(create_annotation_proxy_with_type(
         ctx,
         ann,
         cid,
         container_class_id,
         container_loader,
-    ))
+    )?))
 }
 
 /// Create an annotation proxy object from annotation data.
@@ -12894,7 +12894,7 @@ pub(crate) fn annotation_element_to_java_typed(
         }
         AnnotationElementValue::StringVal(s) => {
             let str_obj = ctx.create_string(s);
-            Value::Object(Some(str_obj))
+            Ok(Value::Object(Some(str_obj)))
         }
         AnnotationElementValue::Enum(type_desc, const_name) => {
             // Resolve the enum class from the type descriptor and create the constant.
@@ -13019,7 +13019,7 @@ pub(crate) fn annotation_element_to_java_typed(
             ctx.set_field(obj_cur, 1, Value::Int(0)); // ordinal
             let obj_cur = ctx.read_native_pin(obj_pin, obj);
             ctx.unpin_native_roots(obj_pin);
-            Value::Object(Some(obj_cur))
+            Ok(Value::Object(Some(obj_cur)))
         }
         AnnotationElementValue::Class(desc) => {
             // Return Class mirror. If the target class is not yet loaded
@@ -13135,15 +13135,15 @@ pub(crate) fn annotation_element_to_java_typed(
                     "ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"
                 );
             }
-            Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
+            Ok(Value::Object(Some(descriptor_to_class_mirror(ctx, desc))))
         }
         AnnotationElementValue::Annotation(nested) => {
             let loader_cur = match (container_loader, container_loader_pin) {
                 (Some(loader), Some(pin)) => Some(ctx.read_native_pin(pin, loader)),
                 _ => None,
             };
-            match create_annotation_proxy(ctx, nested, container_class_id, loader_cur) {
-                Some(proxy) => normalize_single_annotation_array(
+            Ok(match create_annotation_proxy(ctx, nested, container_class_id, loader_cur) {
+                Ok(Some(proxy)) => normalize_single_annotation_array(
                     ctx,
                     Value::Object(Some(proxy)),
                     return_type_desc,
@@ -13156,11 +13156,11 @@ pub(crate) fn annotation_element_to_java_typed(
                 // (HotSpot fails harder still — `getDeclaredAnnotations()`
                 // itself raises NoClassDefFoundError for the unresolvable
                 // element type), and no null-typed annotation escapes.
-                None => match unresolvable_nested_annotation_sentinel(ctx, nested) {
+                Ok(None) => match unresolvable_nested_annotation_sentinel(ctx, nested) {
                     Some(sentinel) => Value::Object(Some(sentinel)),
                     None => Value::Object(None),
                 },
-            }
+            })
         }
         AnnotationElementValue::Array(elems) => {
             // Pick a component class for the array based on the element kind so
@@ -13472,9 +13472,9 @@ pub(crate) fn annotation_element_to_java_typed(
             if let Some(idx) = sentinel_index {
                 return ctx.get_array_element(arr, idx);
             }
-            Value::Object(Some(arr))
+            Ok(Value::Object(Some(arr)))
         }
-    })();
+    }?)();
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
     }
@@ -13632,7 +13632,7 @@ fn build_annotation_array_for(
             _ => None,
         };
         let (ann, ann_cid) = resolvable[i];
-        create_annotation_proxy_with_type(ctx, ann, ann_cid, declaring_class_id, loader_cur)
+        create_annotation_proxy_with_type(ctx, ann, ann_cid, declaring_class_id, loader_cur)?
     });
     if let Some(pin) = container_loader_pin {
         ctx.unpin_native_roots(pin);
@@ -13662,10 +13662,10 @@ fn build_class_annotation_array(
     // `NoSuchMethodError: java.lang.Object.annotationType()`.
     let comp = annotation_component_class_id(ctx);
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
-    build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
+    Ok(build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        cached_annotation_proxy(ctx, queried_class_id, ann, ann_cid)
-    })
+        cached_annotation_proxy(ctx, queried_class_id, ann, ann_cid)?
+    }))
 }
 
 /// Equivalent to [`build_class_annotation_array`] for Method and Constructor.
@@ -13680,7 +13680,7 @@ fn build_method_annotation_array(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let resolvable = resolvable_annotations(ctx, Some(declaring_class_id), annotations);
     let component = annotation_component_class_id(ctx);
-    build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
+    Ok(build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
         cached_method_annotation_proxy(
             ctx,
@@ -13689,8 +13689,8 @@ fn build_method_annotation_array(
             method_desc,
             ann,
             ann_cid,
-        )
-    })
+        )?
+    }))
 }
 
 /// Class.getDeclaredAnnotations() вЂ” only this class's own annotations.
@@ -13835,7 +13835,7 @@ pub(crate) fn native_class_get_declared_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+            if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
         }
@@ -13874,7 +13874,7 @@ pub(crate) fn native_class_get_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+            if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
         }
@@ -13889,7 +13889,7 @@ pub(crate) fn native_class_get_annotation(
                 if ann.type_descriptor == target_desc {
                     // Key by the queried class (class_id), matching HotSpot's
                     // per-class annotationData for inherited annotations.
-                    if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+                    if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
                 }
@@ -14118,7 +14118,7 @@ fn class_annotations_by_type_impl(
     let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array_comp(ctx, ann_class_id, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)
+        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -14200,7 +14200,7 @@ pub(crate) fn native_method_get_annotations_by_type(
     let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array_comp(ctx, ann_class_id, resolvable.len(), |ctx, i| {
         let (ann, ann_cid) = resolvable[i];
-        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)
+        create_annotation_proxy_with_type(ctx, ann, ann_cid, Some(class_id), container_loader)?
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -14365,7 +14365,7 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = annotation_container_loader(ctx, class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Some(proxy) = create_annotation_proxy(ctx, ann, Some(class_id), container_loader)
+            if let Ok(Some(proxy)) = create_annotation_proxy(ctx, ann, Some(class_id), container_loader)
             {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
@@ -14586,7 +14586,7 @@ pub(crate) fn native_method_get_parameter_annotations(
         let anns = aligned_annotations
             .get(i)
             .map(|a| build_annotation_array_for(ctx, Some(class_id), a))
-            .unwrap_or_else(|| ctx.new_ref_array(inner_comp, 0));
+            .unwrap_or_else(|| Ok(ctx.new_ref_array(inner_comp, 0)));
         outer = ctx.read_native_pin(outer_pin, outer);
         ctx.set_array_element(outer, i, Value::Object(Some(anns?)));
     }
@@ -14787,7 +14787,7 @@ pub(crate) fn native_class_get_type_parameters(
             crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
         };
         let tv = cached.unwrap_or_else(|| {
-            crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
+            crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))?
         });
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
@@ -16575,13 +16575,13 @@ pub(crate) fn i2_classloader_get_defined_package(
     if !crate::classloader::package_class_files_visible_to_loader(ctx, loader, &class_glob) {
         return Ok(Some(Value::Object(None)));
     }
-    let package = i2_alloc_synthetic_package(ctx, &package_name);
-    let handle = ctx.add_global_root(package?);
+    let package = i2_alloc_synthetic_package(ctx, &package_name)?;
+    let handle = ctx.add_global_root(package);
     defined_package_memo()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((ns, package_name), (handle, false));
-    Ok(Some(Value::Object(Some(package?))))
+    Ok(Some(Value::Object(Some(package))))
 }
 
 /// `ClassLoader.getDefinedPackages() -> Package[]` — the packages this loader
@@ -16759,7 +16759,7 @@ pub(crate) fn unnamed_module_for_loader(
     };
     ctx.unpin_native_roots(loader_pin);
     if stored {
-        m
+        Ok(m)
     } else {
         canonical_unnamed_module(ctx)
     }
@@ -16820,15 +16820,15 @@ pub(crate) fn i2_classloader_get_named_package(
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
-    let pkg_pin = ctx.pin_native_root(pkg?);
+    let pkg = i2_alloc_synthetic_package(ctx, &pkg_name)?;
+    let pkg_pin = ctx.pin_native_root(pkg);
     // Persist the module reference too so `Package.module()` returns the
     // caller-supplied module if it does get queried later.
     if let Some(module_val) = args.get(2).copied() {
-        ctx.set_field_by_name(pkg?, "module", module_val);
+        ctx.set_field_by_name(pkg, "module", module_val);
     }
     ctx.unpin_native_roots(pkg_pin);
-    Ok(Some(Value::Object(Some(pkg?))))
+    Ok(Some(Value::Object(Some(pkg))))
 }
 
 /// `ClassLoader.definePackage(String name, Module m) -> Package` вЂ” same
@@ -16842,13 +16842,13 @@ pub(crate) fn i2_classloader_define_package_string_module(
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let pkg = i2_alloc_synthetic_package(ctx, &pkg_name);
-    let pkg_pin = ctx.pin_native_root(pkg?);
+    let pkg = i2_alloc_synthetic_package(ctx, &pkg_name)?;
+    let pkg_pin = ctx.pin_native_root(pkg);
     if let Some(module_val) = args.get(2).copied() {
-        ctx.set_field_by_name(pkg?, "module", module_val);
+        ctx.set_field_by_name(pkg, "module", module_val);
     }
     ctx.unpin_native_roots(pkg_pin);
-    Ok(Some(Value::Object(Some(pkg?))))
+    Ok(Some(Value::Object(Some(pkg))))
 }
 
 /// `ClassLoader.definePackage(Class<?>) -> Package` вЂ” derives the package
@@ -16929,12 +16929,12 @@ pub(crate) fn i2_classloader_define_package_class(
         if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
             let null_version_info = ctx.get_static_field(vi_cid, idx);
             if matches!(null_version_info, Value::Object(Some(_))) {
-                let pkg = ctx.read_native_pin(pkg_pin, pkg?);
+                let pkg = ctx.read_native_pin(pkg_pin, pkg);
                 ctx.set_field(pkg, 2, null_version_info);
             }
         }
     }
-    let pkg = ctx.read_native_pin(pkg_pin, pkg?);
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.unpin_native_roots(pkg_pin);
     Ok(Some(Value::Object(Some(pkg))))
 }
@@ -18695,11 +18695,11 @@ pub(crate) fn native_class_get_annotated_superclass(
     };
 
     let tree = ctx.class_extends_type_annotations(class_id, CLASS_EXTENDS_SUPERCLASS_INDEX);
-    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns, Some(class_id));
+    let at = make_annotated_type_with_anns(ctx, super_mirror, &tree.anns, Some(class_id))?;
     if !tree.children.is_empty() {
-        stash_annotated_type_argument_anns(at?, tree.children);
+        stash_annotated_type_argument_anns(at, tree.children);
     }
-    Ok(Some(Value::Object(Some(at?))))
+    Ok(Some(Value::Object(Some(at))))
 }
 
 /// `java/lang/Class.getAnnotatedInterfaces()[Ljava/lang/reflect/AnnotatedType;`
@@ -18767,11 +18767,11 @@ pub(crate) fn native_class_get_annotated_interfaces(
             let tree = class_id
                 .map(|cid| ctx.class_extends_type_annotations(cid, i as u16))
                 .unwrap_or_default();
-            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns, class_id);
+            let at = make_annotated_type_with_anns(ctx, iface_type, &tree.anns, class_id)?;
             if !tree.children.is_empty() {
-                stash_annotated_type_argument_anns(at?, tree.children);
+                stash_annotated_type_argument_anns(at, tree.children);
             }
-            ctx.set_array_element(arr, i, Value::Object(Some(at?)));
+            ctx.set_array_element(arr, i, Value::Object(Some(at)));
         }
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -19131,9 +19131,9 @@ pub(crate) fn native_method_get_annotated_return_type(
             _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
         },
     };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
-    stash_annotated_type_argument_anns(at?, type_arg_anns);
-    Ok(Some(Value::Object(Some(at?))))
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id)?;
+    stash_annotated_type_argument_anns(at, type_arg_anns);
+    Ok(Some(Value::Object(Some(at))))
 }
 
 /// `Parameter.getType()`, as a `Class` mirror вЂ” the fallback backing `Type`
@@ -19199,9 +19199,9 @@ pub(crate) fn native_parameter_get_annotated_type(
         }
         _ => parameter_erased_type_mirror(ctx, this),
     };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
-    stash_annotated_type_argument_anns(at?, type_arg_anns);
-    Ok(Some(Value::Object(Some(at?))))
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id)?;
+    stash_annotated_type_argument_anns(at, type_arg_anns);
+    Ok(Some(Value::Object(Some(at))))
 }
 
 /// `Executable.getAnnotatedParameterTypes()[Ljava/lang/reflect/AnnotatedType;`
@@ -19272,7 +19272,7 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
             .unwrap_or_else(|| ctx.get_class_mirror(cratonvm_types::ClassId::new(0)));
         let empty = Vec::new();
         let anns = per_param.get(i).unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, anns, declaring_class_id);
+        let at = make_annotated_type_with_anns(ctx, tm, anns, declaring_class_id)?;
         // Stash this parameter's TYPE_ARGUMENT-level annotations (e.g. the
         // `@Valid` in `List<@Valid Person>`) alongside the AnnotatedType we
         // just built, so a later `getAnnotatedActualTypeArguments()` call on
@@ -19280,9 +19280,9 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
         // attach them to the right type-argument `AnnotatedType` -- see
         // `native_annotated_parameterized_type_get_annotated_actual_type_arguments`.
         if let Some(type_arg_anns) = per_param_type_args.get(i) {
-            stash_annotated_type_argument_anns(at?, type_arg_anns.clone());
+            stash_annotated_type_argument_anns(at, type_arg_anns.clone());
         }
-        ctx.set_array_element(out, i, Value::Object(Some(at?)));
+        ctx.set_array_element(out, i, Value::Object(Some(at)));
     }
     Ok(Some(Value::Object(Some(out))))
 }
@@ -19314,9 +19314,9 @@ pub(crate) fn native_field_get_annotated_type(
                 _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
             },
         };
-    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id);
-    stash_annotated_type_argument_anns(at?, type_arg_anns);
-    Ok(Some(Value::Object(Some(at?))))
+    let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id)?;
+    stash_annotated_type_argument_anns(at, type_arg_anns);
+    Ok(Some(Value::Object(Some(at))))
 }
 
 /// `AnnotatedType.getDeclaredAnnotations()` / `getAnnotations()` override for
@@ -19507,11 +19507,11 @@ pub(crate) fn native_annotated_parameterized_type_get_annotated_actual_type_argu
             .as_ref()
             .and_then(|v| v.get(i))
             .unwrap_or(&empty);
-        let at = make_annotated_type_with_anns(ctx, tm, &node.anns, None);
+        let at = make_annotated_type_with_anns(ctx, tm, &node.anns, None)?;
         if !node.children.is_empty() {
-            stash_annotated_type_argument_anns(at?, node.children.clone());
+            stash_annotated_type_argument_anns(at, node.children.clone());
         }
-        ctx.set_array_element(out, i, Value::Object(Some(at?)));
+        ctx.set_array_element(out, i, Value::Object(Some(at)));
     }
     Ok(Some(Value::Object(Some(out))))
 }

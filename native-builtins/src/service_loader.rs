@@ -375,7 +375,7 @@ pub fn impl_jars_load_class(
     internal_name: &str,
 ) -> Option<cratonvm_types::ObjectRef> {
     let mut visited = std::collections::HashSet::new();
-    impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)
+    impl_jars_load_class_inner(ctx, defining_loader, internal_name, &mut visited)?
 }
 
 fn impl_jars_load_class_inner(

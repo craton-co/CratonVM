@@ -1108,10 +1108,10 @@ fn native_xnio_create_tcp_connection_server(
     let _ = listener.set_nonblocking(true);
     let listener_id = register_accepting_listener(listener);
     let channel =
-        alloc_accepting_channel_mirror(ctx, worker, bind_addr, accept_listener, listener_id);
-    let channel_pin = ctx.pin_native_root(channel?);
-    let _ = start_accept_pump(ctx, channel?, listener_id);
-    let channel = ctx.read_native_pin(channel_pin, channel?);
+        alloc_accepting_channel_mirror(ctx, worker, bind_addr, accept_listener, listener_id)?;
+    let channel_pin = ctx.pin_native_root(channel);
+    let _ = start_accept_pump(ctx, channel, listener_id);
+    let channel = ctx.read_native_pin(channel_pin, channel);
     ctx.unpin_native_roots(channel_pin);
     Ok(Some(Value::Object(Some(channel))))
 }
@@ -1210,7 +1210,7 @@ fn ensure_source_poller_started(ctx: &mut dyn NativeContext) -> Result<(), Metho
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if !started.insert(vm) {
-            return;
+            return Ok(());
         }
     }
 
@@ -1238,7 +1238,7 @@ fn ensure_source_poller_started(ctx: &mut dyn NativeContext) -> Result<(), Metho
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&vm);
-            return;
+            return Ok(());
         }
     };
     // `setDaemon` is a Java dispatch (GC-capable) — refresh `thread` before

@@ -2263,7 +2263,7 @@ fn walk_imports_recursive(
     depth: usize,
 ) -> Result<(), MethodCallFailed> {
     if depth > 16 {
-        return; // safety guard against pathological @Import cycles
+        return Ok(()); // safety guard against pathological @Import cycles
     }
     let cid = match ctx.class_id_by_name(class_name) {
         Some(c) => c,
@@ -2271,7 +2271,7 @@ fn walk_imports_recursive(
             // Try to load on demand so @Import targets that aren't yet
             // loaded still get walked.
             if ctx.load_class(class_name).is_err() {
-                return;
+                return Ok(());
             }
             match ctx.class_id_by_name(class_name) {
                 Some(c) => c,
@@ -3890,11 +3890,11 @@ fn throw_cannot_load_bean_class_exception(
                 ],
             );
             ctx.unpin_native_roots(cause_pin);
-            MethodCallFailed::ExceptionThrown(exc)
+            Ok(MethodCallFailed::ExceptionThrown(exc))
         }
         _ => {
             ctx.unpin_native_roots(cause_pin);
-            MethodCallFailed::ExceptionThrown(cause?)
+            Ok(MethodCallFailed::ExceptionThrown(cause))
         }
     }
 }

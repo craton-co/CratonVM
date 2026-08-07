@@ -2202,7 +2202,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     // then to Object, if the shape isn't modellable.
                     let reified = jdk_tree_to_typesig(ctx, node)
                         .map(|ts| crate::generics::typesig_to_real_type(ctx, &ts))
-                        .filter(|v| !matches!(v, Value::Object(None)))
+                        .filter(|v| !matches!(v, Ok(Value::Object(None))))
                         .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls))
                         .or_else(|| {
                             // Unresolvable exotic bound: degrade to Object
@@ -2211,7 +2211,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                             ctx.class_id_by_name("java/lang/Object")
                                 .map(|c| Value::Object(Some(ctx.get_class_mirror(c))))
                         })
-                        .unwrap_or(Value::Object(None));
+                        .unwrap_or(Ok(Value::Object(None)));
                     out.push(reified?);
                     continue;
                 }
@@ -2524,7 +2524,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "bounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "bounds")?))
         },
     );
     registry.register(
@@ -2559,7 +2559,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")?))
         },
     );
     registry.register(
@@ -2568,7 +2568,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")?))
         },
     );
     let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";

@@ -102,7 +102,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> Result<Objec
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
         ctx.unpin_native_roots(h);
-        obj
+        Ok(obj)
     } else {
         // Synthetic-stub fallback.
         let s = ctx.create_string(value);
@@ -110,7 +110,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> Result<Objec
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
         ctx.unpin_native_roots(h);
-        obj
+        Ok(obj)
     }
 }
 
@@ -182,14 +182,14 @@ pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigIn
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
         ctx.unpin_native_roots(h);
-        obj
+        Ok(obj)
     } else {
         let s = ctx.create_string(&v.to_decimal());
         let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
         ctx.unpin_native_roots(h);
-        obj
+        Ok(obj)
     }
 }
 
@@ -1393,16 +1393,16 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
 
     // Constants
     registry.register(bi, "ZERO", "()Ljava/math/BigInteger;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")?))))
     });
     registry.register(bi, "ONE", "()Ljava/math/BigInteger;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, "1")))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, "1")?))))
     });
     registry.register(bi, "TEN", "()Ljava/math/BigInteger;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, "10")))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, "10")?))))
     });
     registry.register(bi, "TWO", "()Ljava/math/BigInteger;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, "2")))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, "2")?))))
     });
 
     // --- BigInteger additional methods (Phase 47) ---
@@ -1418,17 +1418,17 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             let mut a = bi_read(ctx, this).trim_start_matches('-').to_string();
             let mut b = bi_read(ctx, other).trim_start_matches('-').to_string();
             if a == "0" {
-                return Ok(Some(Value::Object(Some(bi_alloc(ctx, &b)))));
+                return Ok(Some(Value::Object(Some(bi_alloc(ctx, &b)?))));
             }
             if b == "0" {
-                return Ok(Some(Value::Object(Some(bi_alloc(ctx, &a)))));
+                return Ok(Some(Value::Object(Some(bi_alloc(ctx, &a)?))));
             }
             while b != "0" {
                 let t = b.clone();
                 b = bi_mod_unsigned(&a, &t);
                 a = t;
             }
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &a)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &a)?))))
         },
     );
 
@@ -1513,7 +1513,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
         } else {
             result
         };
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)?))))
     });
 
     // shiftRight — divide by 2^n (string-based)
@@ -1544,7 +1544,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             } else {
                 result
             };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)?))))
         },
     );
 
@@ -1559,7 +1559,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             let a = bi_read(ctx, this).trim_start_matches('-').to_string();
             let b = bi_read(ctx, other).trim_start_matches('-').to_string();
             let result = bi_bitwise_and(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
         },
     );
     registry.register(
@@ -1572,7 +1572,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             let a = bi_read(ctx, this).trim_start_matches('-').to_string();
             let b = bi_read(ctx, other).trim_start_matches('-').to_string();
             let result = bi_bitwise_or(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
         },
     );
     registry.register(
@@ -1585,7 +1585,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             let a = bi_read(ctx, this).trim_start_matches('-').to_string();
             let b = bi_read(ctx, other).trim_start_matches('-').to_string();
             let result = bi_bitwise_xor(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
         },
     );
     registry.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
@@ -1600,7 +1600,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
         } else {
             format!("-{}", neg_result)
         };
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, &final_str)?))))
     });
 
     // toByteArray — convert to two's complement byte array
@@ -1650,7 +1650,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &val.to_string())))))
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, &val.to_string())?))))
     });
 
     // isProbablePrime — string-based trial division
@@ -1722,7 +1722,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
                 .into());
             }
             if modulus == "1" {
-                return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")))));
+                return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")?))));
             }
             // For a negative exponent, invert the (sign-reduced) base first and
             // raise the inverse to |exp|. bi_mod_inverse_str returns None when
@@ -1744,7 +1744,7 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
                 // negative) base into [0, m) internally.
                 bi_mod_pow_str(&base, &exp, &modulus)
             };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &result)?))))
         },
     );
 
@@ -1778,10 +1778,10 @@ pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) -
             // Modulus 1: every value is congruent to 0, and 0 is its own (only)
             // residue; the JDK returns 0 here (a^-1 mod 1 == 0).
             if m_str == "1" {
-                return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")))));
+                return Ok(Some(Value::Object(Some(bi_alloc(ctx, "0")?))));
             }
             match bi_mod_inverse_str(&a_str, &m_str) {
-                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc(ctx, &inv))))),
+                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc(ctx, &inv)?)))),
                 None => Err(RuntimeError::ArithmeticException {
                     message: "BigInteger not invertible.".to_string(),
                 }
@@ -2539,13 +2539,13 @@ pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) -
     );
     registry.register(bd, "hashCode", "()I", native_bd_hash_code);
     registry.register(bd, "ZERO", "()Ljava/math/BigDecimal;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bd_alloc(ctx, "0", 0)))))
+        Ok(Some(Value::Object(Some(bd_alloc(ctx, "0", 0)?))))
     });
     registry.register(bd, "ONE", "()Ljava/math/BigDecimal;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bd_alloc(ctx, "1", 0)))))
+        Ok(Some(Value::Object(Some(bd_alloc(ctx, "1", 0)?))))
     });
     registry.register(bd, "TEN", "()Ljava/math/BigDecimal;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(bd_alloc(ctx, "10", 0)))))
+        Ok(Some(Value::Object(Some(bd_alloc(ctx, "10", 0)?))))
     });
     registry.set_category(__prev_cat);
     Ok(())
@@ -2746,7 +2746,7 @@ fn bd_write_into_bigint(
             ctx.set_field(this, ic_i, Value::Long(ic));
             ctx.set_field(this, sc_i, Value::Int(scale));
             ctx.set_field(this, pr_i, Value::Int(precision));
-            return;
+            return Ok(());
         }
         // Inflated: pin `this` across the BigInteger allocation (GC-SAFETY —
         // see `bd_write_into`).
@@ -2758,7 +2758,7 @@ fn bd_write_into_bigint(
         ctx.set_field(this, sc_i, Value::Int(scale));
         ctx.set_field(this, pr_i, Value::Int(precision));
         ctx.unpin_native_roots(h);
-        return;
+        return Ok(());
     }
     let value = apply_scale(&unscaled.to_decimal(), scale);
     bd_write_into(ctx, this, &value, scale);

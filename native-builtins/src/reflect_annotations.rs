@@ -2282,7 +2282,7 @@ fn native_attrs_make_name(ctx: &mut dyn NativeContext, name: &str) -> Result<Obj
 fn native_attrs_key_for_value(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.read_string(key) {
         Some(name) => native_attrs_make_name(ctx, &name),
-        None => key,
+        None => Ok(key),
     }
 }
 

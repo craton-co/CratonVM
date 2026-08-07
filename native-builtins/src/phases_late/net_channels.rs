@@ -3038,7 +3038,7 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) -> Result<(), 
                 (src_str.as_str(), 0)
             };
             let src_addr =
-                crate::net_phase_e::alloc_inet_address_unnamed(ctx, src_ip_str);
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, src_ip_str)?;
             ctx.set_field(pkt, 3, Value::Object(Some(src_addr)));
             ctx.set_field(pkt, 4, Value::Int(src_port));
             Ok(None)
@@ -3158,14 +3158,14 @@ fn dc_box_option(ctx: &mut dyn NativeContext, name: &str, raw: i32) -> MethodCal
 fn p72_alloc_inet_socket_address(ctx: &mut dyn NativeContext, ip: &str, port: i32) -> Result<ObjectRef, MethodCallFailed> {
     let host0 = ctx.create_string(ip);
     let host_pin = ctx.pin_native_root(host0);
-    let addr0 = crate::net_phase_e::alloc_inet_address_unnamed(ctx, ip);
-    let addr_pin = ctx.pin_native_root(addr0?);
+    let addr0 = crate::net_phase_e::alloc_inet_address_unnamed(ctx, ip)?;
+    let addr_pin = ctx.pin_native_root(addr0);
     let holder0 =
         try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3)?;
     let holder_pin = ctx.pin_native_root(holder0);
     let isa = try_alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3)?;
     let host = ctx.read_native_pin(host_pin, host0);
-    let addr = ctx.read_native_pin(addr_pin, addr0?);
+    let addr = ctx.read_native_pin(addr_pin, addr0);
     let holder = ctx.read_native_pin(holder_pin, holder0);
     ctx.set_field(holder, 0, Value::Object(Some(host)));
     ctx.set_field(holder, 1, Value::Object(Some(addr)));
@@ -3293,12 +3293,12 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
             #[link(name = "ws2_32")]
             unsafe extern "system" {
                 fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
-                fn WSAGetLastError() -> Result<i32;
+                fn WSAGetLastError() -> i32;
             }
 
             // `sockaddr` is 16 bytes; all-zero gives sa_family = AF_UNSPEC (0).
             let addr = [0u8; 16]?;
-            let rc = unsafe, MethodCallFailed> { Ok(connect(sock.as_raw_socket() as usize, addr.as_ptr(), 16))};
+            let rc = unsafe { connect(sock.as_raw_socket() as usize, addr.as_ptr(), 16) };
             if rc == 0 {
                 return Ok(());
             }
@@ -3828,7 +3828,7 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
                     ctx,
                     &a.ip().to_string(),
                     a.port() as i32,
-                ))))),
+                )?)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },
@@ -4695,7 +4695,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) -> Result
     // net_phase_e::register_re1_socket/register_re2_server_socket). See
     // `reference_server_socket_gap`.
     if crate::vmflags().io.real_net_sockets {
-        return;
+        return Ok(());
     }
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -4929,7 +4929,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) -> Result
             };
             match local_ip {
                 Some(ip) => Ok(Some(Value::Object(Some(
-                    crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip),
+                    crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip)?,
                 )))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -5173,7 +5173,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) -> Result
             let this = obj_arg(args, 0)?;
             match p72_socket_stream_addr(ctx, this, true) {
                 Some((ip, _)) => Ok(Some(Value::Object(Some(
-                    crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip),
+                    crate::net_phase_e::alloc_inet_address_unnamed(ctx, &ip)?,
                 )))),
                 None => Ok(Some(Value::Object(None))),
             }
@@ -5188,7 +5188,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) -> Result
             match p72_socket_stream_addr(ctx, this, true) {
                 Some((ip, port)) => Ok(Some(Value::Object(Some(p72_alloc_inet_socket_address(
                     ctx, &ip, port,
-                ))))),
+                )?)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },
@@ -5202,7 +5202,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) -> Result
             match p72_socket_stream_addr(ctx, this, false) {
                 Some((ip, port)) => Ok(Some(Value::Object(Some(p72_alloc_inet_socket_address(
                     ctx, &ip, port,
-                ))))),
+                )?)))),
                 None => Ok(Some(Value::Object(None))),
             }
         },

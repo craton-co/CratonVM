@@ -1022,7 +1022,7 @@ fn http2_send_async(
                     let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
+                    return Ok(Ok(Some(Value::Object(Some(cf)))));
                 }
             };
             let method_idx = match ctx.get_field(req, REQ_METHOD) {
@@ -1037,7 +1037,7 @@ fn http2_send_async(
                     let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
+                    return Ok(Ok(Some(Value::Object(Some(cf)))));
                 }
             };
             let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
@@ -1047,7 +1047,7 @@ fn http2_send_async(
                     let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
                     ctx.set_field(cf, 0, Value::Object(Some(resp)));
                     ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
+                    return Ok(Ok(Some(Value::Object(Some(cf)))));
                 }
             };
             let use_tls = match ctx.get_field(uri_obj, URI_SCHEME) {
@@ -1067,17 +1067,17 @@ fn http2_send_async(
             };
             let resp = match result {
                 Ok((status, body)) => {
-                    let r = alloc_http_response(ctx, status);
+                    let r = alloc_http_response(ctx, status)?;
                     let body_str = ctx.create_string(&body);
-                    ctx.set_field(r?, RESP_BODY_OBJ, Value::Object(Some(body_str)));
+                    ctx.set_field(r, RESP_BODY_OBJ, Value::Object(Some(body_str)));
                     r
                 }
-                Err(_) => alloc_http_response(ctx, 0),
+                Err(_) => alloc_http_response(ctx, 0)?,
             };
             let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2)?;
-            ctx.set_field(cf, 0, Value::Object(Some(resp?)));
+            ctx.set_field(cf, 0, Value::Object(Some(resp)));
             ctx.set_field(cf, 1, Value::Int(1)); // completed
-            Ok(Some(Value::Object(Some(cf))))
+            Ok(Ok(Some(Value::Object(Some(cf)))))
 }
 
 /// `HttpClient.Version` for an ordinal, as a real enum object.
@@ -2325,7 +2325,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) -> Result<(), MethodCal
         "ofFile",
         "(Ljava/nio/file/Path;)Ljava/net/http/HttpRequest$BodyPublisher;",
         |ctx, _args| {
-            let bp = alloc_body_publisher(ctx, -1); // unknown length
+            let bp = alloc_body_publisher(ctx, -1)?; // unknown length
             Ok(Some(Value::Object(Some(bp))))
         },
     );

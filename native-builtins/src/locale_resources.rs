@@ -1809,7 +1809,7 @@ pub fn register(registry: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
                 return Ok(Some(Value::Object(Some(loc))));
             }
         }
-        Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
+        Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")?))))
     });
     // getBaseBundleName() — the real `ResourceBundle` returns its private
     // `name` field. The Javadoc permits null ("or null if unknown"), but we

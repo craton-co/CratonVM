@@ -711,9 +711,9 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
                 Some(name) => {
                     let name = name.replace('/', ".");
                     let tail = name.rsplit(['.', '$']).next().unwrap_or(&name);
-                    tail.to_string()
+                    Ok(tail.to_string())
                 }
-                None => "?".to_string(),
+                None => Ok("?".to_string()),
             }
         }
 
@@ -4907,10 +4907,10 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // and re-read the forwarded references before their next use.
     let orig_mh_pin = ctx.pin_native_root(orig_mh);
     let extra_classes_pin = ctx.pin_native_root(extra_classes);
-    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP);
+    let wrapper = alloc_method_handle(ctx, &pos_str, "drop", &widened_desc, MH_KIND_DROP)?;
     let orig_mh = ctx.read_native_pin(orig_mh_pin, orig_mh);
     let extra_classes = ctx.read_native_pin(extra_classes_pin, extra_classes);
-    ctx.set_field(wrapper?, MH_BOUND, Value::Object(Some(orig_mh)));
+    ctx.set_field(wrapper, MH_BOUND, Value::Object(Some(orig_mh)));
     // Also widen the `type:MethodType` field so JDK-internal code
     // that reads mh.type().parameterCount() sees the widened arity.
     let orig_type = ctx.get_field(orig_mh, 0);
@@ -4949,11 +4949,11 @@ fn make_drop_arguments_adapter(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             ctx.set_field(new_mt, 0, ret);
             ctx.set_field(new_mt, 1, Value::Object(Some(new_ptypes)));
             populate_method_type_form(ctx, new_mt);
-            ctx.set_field_by_name(wrapper?, "type", Value::Object(Some(new_mt)));
+            ctx.set_field_by_name(wrapper, "type", Value::Object(Some(new_mt)));
         }
     }
     ctx.unpin_native_roots(orig_mh_pin);
-    Ok(Some(Value::Object(Some(wrapper?))))
+    Ok(Some(Value::Object(Some(wrapper))))
 }
 
 /// Functional `MethodHandles.insertArguments` / `MethodHandle.asCollector`
@@ -5050,7 +5050,7 @@ pub(crate) fn register_method_handle_combinator_extras_bridge(r: &mut NativeMeth
             ctx.set_field(wrapper, 1, Value::Int(count));
             let desc = mh_read_desc(ctx, target).unwrap_or_default();
             let adapter =
-                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT);
+                alloc_method_handle(ctx, "__adapter__", "collect", &desc, MH_KIND_COLLECT)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             // type(): asCollector REPLACES the trailing array parameter with
             // `count` parameters of the array's component type (HotSpot:
@@ -5326,9 +5326,9 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
         let mh_class_id = ctx.class_id_by_name("java/lang/invoke/MethodHandle")?;
         let obj_class_id = ctx.class_id_of_object(obj);
         if obj_class_id == mh_class_id || ctx.is_subclass(obj_class_id, mh_class_id) {
-            Some(obj)
+            Ok(Some(obj))
         } else {
-            None
+            Ok(None)
         }
     }
     r.register(
@@ -5348,8 +5348,8 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // Real JDK throws IllegalArgumentException for a non-wrapper; we
             // keep the historical null there so an existing caller that never
             // checked `isWrapperInstance` first does not start throwing.
-            Some(mh) => Ok(Some(Value::Object(Some(mh)))),
-            None => Ok(Some(Value::Object(None))),
+            Ok(Some(mh)) => Ok(Some(Value::Object(Some(mh)))),
+            Ok(None) => Ok(Some(Value::Object(None))),
         },
     );
     // `wrapperInstanceType` is deliberately NOT registered. The registration
@@ -5447,7 +5447,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             // Preferred path: synthesise a genuine lambda proxy + factory MH so
             // `cs.getTarget().bindTo(..).invoke()` yields a working SAM instance
             // whose abstract method runs the impl method.
-            if let Some(ccs) = build_reflective_lambda_callsite(
+            if let Ok(Some(ccs)) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, false, &[],
             ) {
                 if key.impl_ != 0 {
@@ -5475,7 +5475,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)?))))
         });
     r.register(lmf, "altMetafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
@@ -5564,7 +5564,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            if let Some(ccs) = build_reflective_lambda_callsite(
+            if let Ok(Some(ccs)) = build_reflective_lambda_callsite(
                 ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type, ser_flag,
                 &marker_names,
             ) {
@@ -5588,7 +5588,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             if let Some(Value::Object(Some(mt))) = args.get(2) {
                 ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)?))))
         });
 
     // NB: an earlier draft added a short-circuit for
@@ -6701,11 +6701,11 @@ fn make_collect_args_adapter(
         "collectargs",
         &desc,
         MH_KIND_COLLECT_ARGS,
-    );
+    )?;
     let wrapper = ctx.read_native_pin(wrapper_pin, wrapper);
     ctx.unpin_native_roots(target_pin);
-    ctx.set_field(adapter?, MH_BOUND, Value::Object(Some(wrapper)));
-    Ok(Some(Value::Object(Some(adapter?))))
+    ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
+    Ok(Some(Value::Object(Some(adapter))))
 }
 
 /// `MethodHandles.collectArguments` dispatch (`MH_KIND_COLLECT_ARGS`). The
@@ -7852,11 +7852,11 @@ pub(crate) fn native_record_support_deserialization_ctr(
         "<init>",
         "([B[Ljava/lang/Object;)Ljava/lang/Object;",
         MH_KIND_RECORD_DESER,
-    );
+    )?;
     let desc = ctx.read_native_pin(desc_pin, desc);
-    ctx.set_field(mh?, MH_BOUND, Value::Object(Some(desc)));
+    ctx.set_field(mh, MH_BOUND, Value::Object(Some(desc)));
     ctx.unpin_native_roots(desc_pin);
-    Ok(Some(Value::Object(Some(mh?))))
+    Ok(Some(Value::Object(Some(mh))))
 }
 
 /// Body of the `MH_KIND_RECORD_DESER` dispatch arm: rebuild a record instance
@@ -8826,7 +8826,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) -> Result<
                 ctx.set_field(wrapper, 1, Value::Object(Some(values)));
                 ctx.set_field(wrapper, 2, Value::Int(0));
                 let adapter =
-                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT);
+                    alloc_method_handle(ctx, "__adapter__", "insert", &desc, MH_KIND_INSERT)?;
                 ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
                 // Binding one value REMOVES the leading parameter from `this`'s
                 // type. The adapter's `type()` must reflect that (e.g. a fully
@@ -9410,7 +9410,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) -> 
                 _ => target_desc,
             };
             let adapter =
-                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER);
+                alloc_method_handle(ctx, "__adapter__", "retfilter", &desc, MH_KIND_RETURN_FILTER)?;
             ctx.set_field(adapter, MH_BOUND, Value::Object(Some(wrapper)));
             Ok(Some(Value::Object(Some(adapter))))
         },

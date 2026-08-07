@@ -391,31 +391,31 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCa
         vl,
         "JAVA_BYTE",
         "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_BYTE))))),
+        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_BYTE)?)))),
     );
     r.register(
         vl,
         "JAVA_SHORT",
         "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_SHORT))))),
+        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_SHORT)?)))),
     );
     r.register(
         vl,
         "JAVA_INT",
         "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_INT))))),
+        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_INT)?)))),
     );
     r.register(
         vl,
         "JAVA_LONG",
         "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_LONG))))),
+        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_LONG)?)))),
     );
     r.register(
         vl,
         "JAVA_FLOAT",
         "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_FLOAT))))),
+        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_FLOAT)?)))),
     );
     r.register(
         vl,
@@ -425,7 +425,7 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCa
             Ok(Some(Value::Object(Some(pe_make_layout(
                 ctx,
                 LAYOUT_DOUBLE,
-            )))))
+            )?))))
         },
     );
     r.register(
@@ -436,14 +436,14 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCa
             Ok(Some(Value::Object(Some(pe_make_layout(
                 ctx,
                 LAYOUT_BOOLEAN,
-            )))))
+            )?))))
         },
     );
     r.register(
         vl,
         "JAVA_CHAR",
         "()Ljava/lang/foreign/ValueLayout;",
-        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_CHAR))))),
+        |ctx, _| Ok(Some(Value::Object(Some(pe_make_layout(ctx, LAYOUT_CHAR)?)))),
     );
     r.register(
         vl,
@@ -453,7 +453,7 @@ fn register_pe_value_layout(r: &mut NativeMethodRegistry) -> Result<(), MethodCa
             Ok(Some(Value::Object(Some(pe_make_layout(
                 ctx,
                 LAYOUT_ADDRESS,
-            )))))
+            )?))))
         },
     );
 
@@ -3491,13 +3491,13 @@ fn register_pe2_struct_layouts(r: &mut NativeMethodRegistry) {
                 let this = obj_arg(args, 0)?;
                 match ctx.get_field(this, 2) {
                     Value::Object(Some(members_arr)) => Ok(Some(Value::Object(Some(
-                        layout_members_as_list(ctx, members_arr),
+                        layout_members_as_list(ctx, members_arr)?,
                     )))),
                     _ => {
                         let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                         Ok(Some(Value::Object(Some(layout_members_as_list(
                             ctx, empty,
-                        )))))
+                        )?))))
                     }
                 }
             },

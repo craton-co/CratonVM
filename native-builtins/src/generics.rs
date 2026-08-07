@@ -451,10 +451,10 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Va
                 'S' => "short",
                 'Z' => "boolean",
                 'V' => "void",
-                _ => return Value::Object(None),
+                _ => return Ok(Value::Object(None)),
             };
             let mirror = ctx.primitive_class_mirror(prim_name);
-            Value::Object(Some(mirror))
+            Ok(Value::Object(Some(mirror)))
         }
         TypeSig::Class {
             name,
@@ -473,9 +473,9 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Va
             // initialization.
             if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let mirror = ctx.get_class_mirror(cid);
-                Value::Object(Some(mirror))
+                Ok(Value::Object(Some(mirror)))
             } else {
-                Value::Object(None)
+                Ok(Value::Object(None))
             }
         }
         TypeSig::Class {
@@ -547,12 +547,12 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Va
             // Owner type (field 2): reify the enclosing type node, or null.
             let owner_val = match owner {
                 Some(o) => type_sig_to_java(ctx, o),
-                None => Value::Object(None),
-            };
+                None => Ok(Value::Object(None)),
+            }?;
             let pt = ctx.read_native_pin(pt_pin, pt);
             ctx.set_field(pt, 2, owner_val);
             ctx.unpin_native_roots(pt_pin);
-            Value::Object(Some(pt))
+            Ok(Value::Object(Some(pt)))
         }
         TypeSig::TypeVar(name) => {
             // A type-variable USE (`T` inside `ConstraintValidator<Max, T>`)
@@ -655,7 +655,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Va
                 mark_placeholder_type_parameter(ctx, decl, name);
             }
             ctx.unpin_native_roots(tv_pin);
-            Value::Object(Some(tv))
+            Ok(Value::Object(Some(tv)))
         }
         TypeSig::Array(component) => {
             // For concrete component types (primitive or non-generic class), the
@@ -685,7 +685,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Result<Va
             let gat = ctx.read_native_pin(gat_pin, gat);
             ctx.set_field(gat, 0, comp_val?);
             ctx.unpin_native_roots(gat_pin);
-            Value::Object(Some(gat))
+            Ok(Value::Object(Some(gat)))
         }
     }
 }
@@ -722,10 +722,10 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value,
             // Type entry: callers dereference every argument. Erasure to
             // Object is the conservative non-null representation when the
             // referenced class cannot be resolved.
-            if matches!(value, Value::Object(None)) {
-                ctx.class_id_by_name("java/lang/Object")
+            if matches!(value, Ok(Value::Object(None))) {
+                Ok(ctx.class_id_by_name("java/lang/Object")
                     .map(|id| Value::Object(Some(ctx.get_class_mirror(id))))
-                    .unwrap_or(value?)
+                    .unwrap_or(value?))
             } else {
                 value
             }
@@ -753,7 +753,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value,
             let wt = ctx.read_native_pin(wt_pin, wt);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             ctx.unpin_native_roots(wt_pin);
-            Value::Object(Some(wt))
+            Ok(Value::Object(Some(wt)))
         }
         TypeArg::Super(sig) => {
             let wt = try_alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2)?;
@@ -777,7 +777,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value,
             let lower = ctx.read_native_pin(lower_pin, lower);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             ctx.unpin_native_roots(wt_pin);
-            Value::Object(Some(wt))
+            Ok(Value::Object(Some(wt)))
         }
         TypeArg::Unbounded => {
             // ? => WildcardType with upper=Object, lower=empty
@@ -797,7 +797,7 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Value,
             let wt = ctx.read_native_pin(wt_pin, wt);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             ctx.unpin_native_roots(wt_pin);
-            Value::Object(Some(wt))
+            Ok(Value::Object(Some(wt)))
         }
     }
 }
@@ -967,7 +967,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             // interface (Create.I versus Search.I).
             let owner_val = match owner {
                 Some(o) => typesig_to_real_type(ctx, o),
-                None => match slashed.rsplit_once('$') {
+                None => Ok(match slashed.rsplit_once('$') {
                     Some((outer, _)) => {
                         let owner_id = resolve_class_id_in_generic_scope(ctx, outer);
                         owner_id
@@ -975,10 +975,10 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                             .unwrap_or(Value::Object(None))
                     }
                     None => Value::Object(None),
-                },
+                }),
             };
             let owner_pin = match owner_val {
-                Value::Object(Some(owner)) => Some(ctx.pin_native_root(owner)),
+                Ok(Value::Object(Some(owner))) => Some(ctx.pin_native_root(owner)),
                 _ => None,
             };
             args = ctx.read_native_pin(args_pin, args);
@@ -986,16 +986,16 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             let nfields = ctx.class_num_total_fields(pti_cid).max(3);
             let pti = ctx.alloc_object(pti_cid, nfields);
             let owner_val = match (owner_val, owner_pin) {
-                (Value::Object(Some(owner)), Some(pin)) => {
+                (Ok(Value::Object(Some(owner))), Some(pin)) => {
                     Value::Object(Some(ctx.read_native_pin(pin, owner)))
                 }
                 _ => owner_val,
-            };
+            }?;
             ctx.set_field_by_name(pti, "rawType", Value::Object(Some(raw_mirror)));
             ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
             ctx.set_field_by_name(pti, "ownerType", owner_val);
             ctx.unpin_native_roots(raw_pin);
-            Value::Object(Some(pti))
+            Ok(Value::Object(Some(pti)))
         }
         _ => type_sig_to_java(ctx, sig),
     }
@@ -1008,15 +1008,15 @@ fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Va
             let value = typesig_to_real_type(ctx, sig);
             // Optional signature-only dependencies can be absent at runtime.
             // Real reflective Type arrays must contain a non-null entry.
-            if matches!(value, Value::Object(None)) {
-                object_class_mirror(ctx)
+            if matches!(value, Ok(Value::Object(None))) {
+                Ok(object_class_mirror(ctx))
             } else {
                 value
             }
         }
         TypeArg::Extends(sig) => {
             let b = typesig_to_real_type(ctx, sig);
-            real_wildcard_type(ctx, vec![b?], vec![])
+            Ok(real_wildcard_type(ctx, vec![b?], vec![]))
         }
         TypeArg::Super(sig) => {
             // GC-safety (2026-07-16): `b` is computed before `obj`
@@ -1025,21 +1025,21 @@ fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Result<Va
             // immediately and re-read the forwarded reference before use.
             let b = typesig_to_real_type(ctx, sig);
             let b_pin = match b {
-                Value::Object(Some(r)) => Some(ctx.pin_native_root(r)),
+                Ok(Value::Object(Some(r))) => Some(ctx.pin_native_root(r)),
                 _ => None,
             };
             let obj = object_class_mirror(ctx);
             let b = match (b, b_pin) {
-                (Value::Object(Some(r)), Some(pin)) => {
+                (Ok(Value::Object(Some(r))), Some(pin)) => {
                     Value::Object(Some(ctx.read_native_pin(pin, r)))
                 }
                 _ => b?,
             };
-            real_wildcard_type(ctx, vec![obj], vec![b])
+            Ok(real_wildcard_type(ctx, vec![obj], vec![b]))
         }
         TypeArg::Unbounded => {
             let obj = object_class_mirror(ctx);
-            real_wildcard_type(ctx, vec![obj], vec![])
+            Ok(real_wildcard_type(ctx, vec![obj], vec![]))
         }
     }
 }

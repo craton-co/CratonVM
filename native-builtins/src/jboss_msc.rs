@@ -3524,7 +3524,7 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
     // otherwise stale the raw `ctrl_obj` local (it is only rooted later).
     let sn_for_mirror = sn_pin
         .map(|(pin, original)| ctx.read_native_pin(pin, original))
-        .unwrap_or_else(|| alloc_java_service_name(ctx, &name));
+        .unwrap_or_else(|| alloc_java_service_name(ctx, &name)?);
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — the
     // controller-mirror allocation below can move `sn_for_mirror` (read from
     // its pin just above, or freshly allocated in the anonymous branch) before

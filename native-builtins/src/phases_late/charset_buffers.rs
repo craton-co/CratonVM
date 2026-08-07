@@ -1247,7 +1247,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) -> Result<(
     r.register(cb, "order", "()Ljava/nio/ByteOrder;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ord = cb_native_order(ctx, this);
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
     });
     fn cb_order_big(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         use crate::servlet::s2_byte_order_object;

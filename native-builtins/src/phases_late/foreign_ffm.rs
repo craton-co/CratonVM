@@ -96,7 +96,7 @@ pub(crate) fn p67_layout_carrier_name(class_name: &str) -> &'static str {
 pub(crate) fn p67_class_mirror(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     match class_name {
         "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void" => {
-            ctx.primitive_class_mirror(class_name)
+            Ok(ctx.primitive_class_mirror(class_name))
         }
         _ => {
             if let Some(cid) = ctx.class_id_by_name(class_name) {
@@ -549,11 +549,11 @@ fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> Result<ObjectRe
     // The session allocation below can move the fresh arena (native stale-local
     // family).
     let arena_pin = ctx.pin_native_root(arena);
-    let session_value = p67_memory_session(ctx);
+    let session_value = p67_memory_session(ctx)?;
     let arena = ctx.read_native_pin(arena_pin, arena);
     ctx.unpin_native_roots(arena_pin);
     ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
-    ctx.set_field(arena, P67_ARENA_SESSION, session_value?);
+    ctx.set_field(arena, P67_ARENA_SESSION, session_value);
     if confined {
         if let Value::Object(Some(session)) = session_value {
             let owner = ctx.current_thread_object();
@@ -1027,7 +1027,7 @@ pub(crate) fn p67_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Res
             ctx.set_field(vh, VH_CLASS_OR_TARGET, Value::Int(1));
             ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(1));
             ctx.set_field(vh, VH_IS_STATIC, Value::Int(VH_KIND_MEMORY_SEGMENT));
-            Value::Object(Some(vh))
+            Ok(Value::Object(Some(vh)))
         }
     }
 }
@@ -1581,25 +1581,25 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
         arena,
         "ofConfined",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true)?)))),
     );
     r.register(
         arena,
         "ofAuto",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
     r.register(
         arena,
         "ofShared",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false)?)))),
     );
     r.register(
         arena,
@@ -1641,7 +1641,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
                 }
                 _ => 1,
             };
-            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)))))
+            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)?))))
         },
     );
     r.register(arena, "close", "()V", |ctx, args| {
@@ -1662,7 +1662,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
         "()Ljava/lang/foreign/MemorySegment$Scope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)))
+            Ok(Some(p67_receiver_session(ctx, this)?))
         },
     );
     let session = "jdk/internal/foreign/MemorySessionImpl";
@@ -1673,7 +1673,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
         |ctx, args| {
             // Static: arg 0 is the Arena whose session is being unwrapped.
             let arena = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, arena)))
+            Ok(Some(p67_receiver_session(ctx, arena)?))
         },
     );
     r.register(
@@ -1710,19 +1710,19 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
         session,
         "createShared",
         "()Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
     );
     r.register(
         session,
         "createImplicit",
         "(Ljava/lang/ref/Cleaner;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
     );
     r.register(
         session,
         "createHeap",
         "(Ljava/lang/Object;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, _args| Ok(Some(p67_memory_session(ctx)?)),
     );
     r.register(
         session,
@@ -2061,7 +2061,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
         "()Ljava/lang/foreign/MemorySegment$Scope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(p67_receiver_session(ctx, this)))
+            Ok(Some(p67_receiver_session(ctx, this)?))
         },
     );
     r.register(
@@ -2123,7 +2123,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
             "()Ljava/lang/foreign/MemorySegment$Scope;",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                Ok(Some(p67_receiver_session(ctx, this)))
+                Ok(Some(p67_receiver_session(ctx, this)?))
             },
         );
     }
@@ -2233,7 +2233,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) -> Resul
             class,
             "varHandle",
             "()Ljava/lang/invoke/VarHandle;",
-            |ctx, args| Ok(Some(p67_var_handle(ctx, args))),
+            |ctx, args| Ok(Some(p67_var_handle(ctx, args)?)),
         );
     }
     for (class, specific_desc) in [

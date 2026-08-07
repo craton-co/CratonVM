@@ -481,9 +481,9 @@ fn native_introspector_get_methods(
                 &method_meta.name,
                 &method_meta.descriptor,
                 method_meta.access_flags,
-            );
-            let method_mirror_pin = ctx.pin_native_root(method_mirror?);
-            method_mirrors.push((method_mirror_pin, method_mirror?));
+            )?;
+            let method_mirror_pin = ctx.pin_native_root(method_mirror);
+            method_mirrors.push((method_mirror_pin, method_mirror));
         }
 
         // Enqueue superclass + superinterfaces.
@@ -832,15 +832,15 @@ fn converting_method_param_mappings(
             }
         };
         let preserve_original_open_class = primitive_or_primitive_array_class_mirror(ctx, type_obj);
-        let mapping = alloc_mapping_for_type_object(ctx, type_obj);
+        let mapping = alloc_mapping_for_type_object(ctx, type_obj)?;
         if preserve_original_open_class {
             param_types_arr = ctx.read_native_pin(param_types_pin, param_types_arr);
             if let Value::Object(Some(open_class)) = ctx.get_array_element(param_types_arr, i) {
-                ctx.set_field(mapping?, 2, Value::Object(Some(open_class)));
+                ctx.set_field(mapping, 2, Value::Object(Some(open_class)));
             }
         }
         out = ctx.read_native_pin(out_pin, out);
-        ctx.set_array_element(out, i, Value::Object(Some(mapping?)));
+        ctx.set_array_element(out, i, Value::Object(Some(mapping)));
     }
 
     out = ctx.read_native_pin(out_pin, out);

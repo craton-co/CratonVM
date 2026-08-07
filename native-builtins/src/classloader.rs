@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service_loader::impl_jars_load_class;
 use crate::util_concurrent_ext::try_alloc_concurrent_synthetic;
-use crate::{try_alloc_concurrent_synthetic, obj_arg};
+use crate::obj_arg;
 use cratonvm_types::error::MethodCallFailed;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
@@ -776,11 +776,11 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Resu
     if let Some(obj) = platform_loader_of(vm) {
         return Ok(obj);
     }
-    let mut obj = alloc_classloader(ctx, LOADER_PLATFORM);
-    let obj_pin = ctx.pin_native_root(obj?);
+    let mut obj = alloc_classloader(ctx, LOADER_PLATFORM)?;
+    let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("platform");
     let name_pin = ctx.pin_native_root(name);
-    obj = ctx.read_native_pin(obj_pin, obj?);
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
     let name = ctx.read_native_pin(name_pin, name);
     // L1: only on OUR layout. Slot 2 is `unnamedModule` on the real
     // `java.lang.ClassLoader`, NOT a second copy of `name` — a reference for a
@@ -788,19 +788,19 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Resu
     // the "platform" String there made `getUnnamedModule()` answer a String,
     // and (via `classloader_parent`'s slot-1 fallback) made the platform
     // loader's PARENT a String as well.
-    if cl_has_synthetic_layout(ctx, obj?) {
-        ctx.set_field(obj?, CL_NAME_REF, Value::Object(Some(name)));
+    if cl_has_synthetic_layout(ctx, obj) {
+        ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
     }
     // Also populate the REAL `name` field by name: the active getName native
     // (classloader_real) reads the real field slot, not CL_NAME_REF.
-    obj = ctx.read_native_pin(obj_pin, obj?);
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
     let name = ctx.read_native_pin(name_pin, name);
-    ctx.set_field_by_name(obj?, "name", Value::Object(Some(name)));
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     // Platform's parent is bootstrap (null); already set by alloc_classloader
-    obj = ctx.read_native_pin(obj_pin, obj?);
-    set_platform_loader(vm, Some(obj?));
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    set_platform_loader(vm, Some(obj));
     ctx.unpin_native_roots(obj_pin);
-    Ok(obj?)
+    Ok(obj)
 }
 
 /// Mirror of real HotSpot's `JVM_LatestUserDefinedLoader` / `jdk.internal
@@ -878,26 +878,26 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
     }
     let platform = get_or_create_platform_loader(ctx);
     let platform_pin = ctx.pin_native_root(platform?);
-    let mut obj = alloc_classloader(ctx, LOADER_APP);
-    let obj_pin = ctx.pin_native_root(obj?);
+    let mut obj = alloc_classloader(ctx, LOADER_APP)?;
+    let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("app");
     let name_pin = ctx.pin_native_root(name);
     let mut platform = ctx.read_native_pin(platform_pin, platform?);
-    obj = ctx.read_native_pin(obj_pin, obj?);
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
     let mut name = ctx.read_native_pin(name_pin, name);
     // L1: only on OUR layout — see the same guard in
     // `get_or_create_platform_loader`. On the real layout slots 2 and 1 are
     // `unnamedModule` and `name`, so these two writes put the "app" String in
     // `unnamedModule` and the platform LOADER in `name`. The by-name writes
     // below are the correct path there and already run unconditionally.
-    let synthetic_layout = cl_has_synthetic_layout(ctx, obj?);
+    let synthetic_layout = cl_has_synthetic_layout(ctx, obj);
     if synthetic_layout {
-        ctx.set_field(obj?, CL_NAME_REF, Value::Object(Some(name)));
+        ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
     }
-    obj = ctx.read_native_pin(obj_pin, obj?);
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
     platform = ctx.read_native_pin(platform_pin, platform);
     if synthetic_layout {
-        ctx.set_field(obj?, CL_PARENT_REF, Value::Object(Some(platform)));
+        ctx.set_field(obj, CL_PARENT_REF, Value::Object(Some(platform)));
     }
     // Also populate the REAL `name`/`parent` fields by name: the active
     // getName/getParent natives (classloader_real) read the real field slots,
@@ -905,24 +905,24 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef
     // loader's getParent() returned null and Tomcat's
     // WebappClassLoaderBase.<init> javase-loader walk
     // (`while (j.getParent() != null) j = j.getParent()`) misbehaved.
-    obj = ctx.read_native_pin(obj_pin, obj?);
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
     name = ctx.read_native_pin(name_pin, name);
-    ctx.set_field_by_name(obj?, "name", Value::Object(Some(name)));
-    obj = ctx.read_native_pin(obj_pin, obj?);
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
     platform = ctx.read_native_pin(platform_pin, platform);
-    ctx.set_field_by_name(obj?, "parent", Value::Object(Some(platform)));
+    ctx.set_field_by_name(obj, "parent", Value::Object(Some(platform)));
     // Populate the REAL static `java.lang.ClassLoader.scl` so the real-JDK
     // `ClassLoader.getSystemClassLoader()` bytecode (reached when a call site
     // does not resolve to our native; observed in
     // WebappClassLoaderBase.<init> at pc=174) returns this loader instead of
     // null. A null there made the subsequent `j.getParent()` NPE and aborted
     // every embedded-server webapp deploy ("Error starting the loader").
-    obj = ctx.read_native_pin(obj_pin, obj?);
-    ctx.set_static_field_by_name("java/lang/ClassLoader", "scl", Value::Object(Some(obj?)));
-    obj = ctx.read_native_pin(obj_pin, obj?);
-    set_app_loader(vm, Some(obj?));
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    ctx.set_static_field_by_name("java/lang/ClassLoader", "scl", Value::Object(Some(obj)));
+    obj = Ok(ctx.read_native_pin(obj_pin, obj))?;
+    set_app_loader(vm, Some(obj));
     ctx.unpin_native_roots(platform_pin);
-    Ok(obj?)
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -1590,11 +1590,11 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
     // WP2.3: build a non-null defaultDomain so JDK preDefineClass's
     // `pd.getCodeSource()` chain doesn't NPE on the no-PD defineClass path.
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     if synthetic_layout {
-        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd?)));
+        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }
-    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd?)));
+    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader — initialize `packages` CHM so
     // ClassLoader.packages() doesn't NPE on `getfield + values()`.
     let packages_map =
@@ -1620,11 +1620,11 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     } else {
         ctx.set_field_by_name(this, "parent", parent);
     }
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     if synthetic_layout {
-        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd?)));
+        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }
-    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd?)));
+    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
         try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
@@ -1656,11 +1656,11 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         ctx.set_field_by_name(this, "parent", parent);
         ctx.set_field_by_name(this, "name", name);
     }
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     if synthetic_layout {
-        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd?)));
+        ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }
-    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd?)));
+    ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
         try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
@@ -7806,7 +7806,7 @@ pub(crate) fn ucl_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let urls = args.first().copied().unwrap_or(Value::Object(None));
-    let obj = alloc_url_classloader(ctx);
+    let obj = alloc_url_classloader(ctx)?;
     // FIX: previously this only stored UCL_URL_COUNT and dropped the URL[]
     // entirely, so the returned loader couldn't search the supplied URLs.
     // Route through `ucl_setup` (the same code the `<init>` natives use) so
@@ -7816,9 +7816,9 @@ fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //
     // GC-safety: `ucl_setup` allocates/copies the URL array and can trigger a
     // moving GC; `obj` is returned afterward, unpinned otherwise.
-    let obj_pin = ctx.pin_native_root(obj?);
-    ucl_setup(ctx, obj?, urls, Value::Object(None));
-    let obj = ctx.read_native_pin(obj_pin, obj?);
+    let obj_pin = ctx.pin_native_root(obj);
+    ucl_setup(ctx, obj, urls, Value::Object(None));
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -7826,16 +7826,16 @@ fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn ucl_new_instance_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let urls = args.first().copied().unwrap_or(Value::Object(None));
     let parent = args.get(1).copied().unwrap_or(Value::Object(None));
-    let obj = alloc_url_classloader(ctx);
+    let obj = alloc_url_classloader(ctx)?;
     // FIX: mirror the `<init>(URL[], ClassLoader)` path — store the URL[] and
     // register its paths so the loader actually searches them (was dropping
     // the URLs and only recording their count). See `ucl_new_instance`.
     //
     // GC-safety: `ucl_setup` allocates/copies the URL array and can trigger a
     // moving GC; `obj` is returned afterward, unpinned otherwise.
-    let obj_pin = ctx.pin_native_root(obj?);
-    ucl_setup(ctx, obj?, urls, parent);
-    let obj = ctx.read_native_pin(obj_pin, obj?);
+    let obj_pin = ctx.pin_native_root(obj);
+    ucl_setup(ctx, obj, urls, parent);
+    let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -7851,9 +7851,9 @@ fn lk_lookup(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 
 fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let target_class = args.first().copied().unwrap_or(Value::Object(None));
-    let obj = alloc_lookup(ctx, LK_FULL_POWER);
-    ctx.set_field(obj?, LK_LOOKUP_CLASS_REF, target_class);
-    Ok(Some(Value::Object(Some(obj?))))
+    let obj = alloc_lookup(ctx, LK_FULL_POWER)?;
+    ctx.set_field(obj, LK_LOOKUP_CLASS_REF, target_class);
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 /// `publicLookup()`'s modes are **exactly** `UNCONDITIONAL` (0x20).
@@ -8340,9 +8340,9 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // gets the contractual return type. If the placeholder is null,
         // fall through to the normal path (which will fail cleanly).
         if let Value::Object(Some(mirror)) = v {
-            let obj = alloc_lookup(ctx, LK_FULL_POWER);
-            ctx.set_field(obj?, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
-            return Ok(Some(Value::Object(Some(obj?))));
+            let obj = alloc_lookup(ctx, LK_FULL_POWER)?;
+            ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
+            return Ok(Some(Value::Object(Some(obj))));
         }
     }
 
@@ -8386,9 +8386,9 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     //        is the hidden class's mirror. Full power mode lets the
     //        caller look up private members via the returned Lookup.
     let mirror = ctx.get_class_mirror(cid);
-    let obj = alloc_lookup(ctx, LK_FULL_POWER);
-    ctx.set_field(obj?, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
-    Ok(Some(Value::Object(Some(obj?))))
+    let obj = alloc_lookup(ctx, LK_FULL_POWER)?;
+    ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 // MethodHandle synthetic layout:
@@ -8838,9 +8838,9 @@ fn lk_in_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Value::Int(v) => v,
         _ => LK_PUBLIC,
     };
-    let new_lk = alloc_lookup(ctx, modes);
-    ctx.set_field(new_lk?, LK_LOOKUP_CLASS_REF, target);
-    Ok(Some(Value::Object(Some(new_lk?))))
+    let new_lk = alloc_lookup(ctx, modes)?;
+    ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, target);
+    Ok(Some(Value::Object(Some(new_lk))))
 }
 
 fn lk_drop_lookup_mode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8851,10 +8851,10 @@ fn lk_drop_lookup_mode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => LK_FULL_POWER,
     };
     let new_modes = modes & !drop_mode;
-    let new_lk = alloc_lookup(ctx, new_modes);
+    let new_lk = alloc_lookup(ctx, new_modes)?;
     let cls = ctx.get_field(this, LK_LOOKUP_CLASS_REF);
-    ctx.set_field(new_lk?, LK_LOOKUP_CLASS_REF, cls);
-    Ok(Some(Value::Object(Some(new_lk?))))
+    ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, cls);
+    Ok(Some(Value::Object(Some(new_lk))))
 }
 
 // ---------------------------------------------------------------------------

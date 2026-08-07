@@ -426,7 +426,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
             ctx.set_field(elem_cur, 3, Value::Int(children.len() as i32)); // child_count
             ctx.set_field(elem_cur, 4, Value::Object(None)); // parent (set later if needed)
             ctx.unpin_native_roots(elem_pin);
-            elem_cur
+            Ok(elem_cur)
         }
         XmlNode::Text(text) | XmlNode::CData(text) => {
             let t = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Text", 2)?;
@@ -438,7 +438,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
             ctx.set_field(t, 0, Value::Object(Some(s)));
             ctx.set_field(t, 1, Value::Object(None)); // parent
             ctx.unpin_native_roots(t_pin);
-            t
+            Ok(t)
         }
         XmlNode::Comment(text) => {
             let c = try_alloc_concurrent_synthetic(ctx, "org/w3c/dom/Comment", 2)?;
@@ -450,7 +450,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Resu
             ctx.set_field(c, 0, Value::Object(Some(s)));
             ctx.set_field(c, 1, Value::Object(None));
             ctx.unpin_native_roots(c_pin);
-            c
+            Ok(c)
         }
     }
 }
@@ -952,7 +952,7 @@ fn xslt_serialize_node(
     out: &mut String,
 ) -> Result<(), MethodCallFailed> {
     if depth > 256 {
-        return;
+        return Ok(());
     }
     let node_pin = ctx.pin_native_root(node);
     let node_type = xslt_dom_num(ctx, node, "getNodeType", "()S");
@@ -3078,7 +3078,7 @@ pub(crate) fn reflection_deserialize_from_json(
     json: &str,
     class_id: ClassId,
 ) -> Option<ObjectRef> {
-    reflection_deserialize_from_json_depth(ctx, json, class_id, 0)
+    reflection_deserialize_from_json_depth(ctx, json, class_id, 0)?
 }
 
 pub(crate) fn reflection_deserialize_from_json_depth(
@@ -3099,10 +3099,10 @@ pub(crate) fn reflection_deserialize_from_json_depth(
         // Match by field name or by @JsonProperty/@SerializedName alias
         let meta = instance_fields.iter().find(|f| {
             if f.name == *key {
-                return Ok(true);
+                return Ok(true)?;
             }
             if let Some(alias) = field_json_name(ctx, class_id, &f.name) {
-                return Ok(alias == *key);
+                return Ok(alias == *key)?;
             }
             false
         });
@@ -3138,65 +3138,65 @@ pub(crate) fn json_str_to_value_depth(
     let val_str = val_str.trim();
     if val_str == "null" {
         return match descriptor {
-            "I" | "B" | "S" | "C" | "Z" => Value::Int(0),
-            "J" => Value::Long(0),
-            "F" => Value::Float(0.0),
-            "D" => Value::Double(0.0),
-            _ => Value::Object(None),
+            "I" | "B" | "S" | "C" | "Z" => Ok(Value::Int(0)),
+            "J" => Ok(Value::Long(0)),
+            "F" => Ok(Value::Float(0.0)),
+            "D" => Ok(Value::Double(0.0)),
+            _ => Ok(Value::Object(None)),
         };
     }
     match descriptor {
-        "I" | "B" | "S" => Value::Int(val_str.parse::<i32>().unwrap_or(0)),
-        "J" => Value::Long(val_str.parse::<i64>().unwrap_or(0)),
-        "F" => Value::Float(val_str.parse::<f32>().unwrap_or(0.0)),
-        "D" => Value::Double(val_str.parse::<f64>().unwrap_or(0.0)),
-        "Z" => Value::Int(if val_str == "true" { 1 } else { 0 }),
+        "I" | "B" | "S" => Ok(Value::Int(val_str.parse::<i32>().unwrap_or(0))),
+        "J" => Ok(Value::Long(val_str.parse::<i64>().unwrap_or(0))),
+        "F" => Ok(Value::Float(val_str.parse::<f32>().unwrap_or(0.0))),
+        "D" => Ok(Value::Double(val_str.parse::<f64>().unwrap_or(0.0))),
+        "Z" => Ok(Value::Int(if val_str == "true" { 1 } else { 0 })),
         "C" => {
             let ch = val_str.chars().next().unwrap_or('\0') as i32;
-            Value::Int(ch)
+            Ok(Value::Int(ch))
         }
         desc if desc.starts_with("L") && desc.ends_with(";") => {
             let class_name = &desc[1..desc.len() - 1];
             if class_name == "java/lang/String" {
                 let s = ctx.create_string(val_str);
-                Value::Object(Some(s))
+                Ok(Value::Object(Some(s)))
             } else if class_name == "java/lang/Integer" {
                 let n = val_str.parse::<i32>().unwrap_or(0);
                 let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
                 ctx.set_field(boxed, 0, Value::Int(n));
-                Value::Object(Some(boxed))
+                Ok(Value::Object(Some(boxed)))
             } else if class_name == "java/lang/Long" {
                 let n = val_str.parse::<i64>().unwrap_or(0);
                 let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
                 ctx.set_field(boxed, 0, Value::Long(n));
-                Value::Object(Some(boxed))
+                Ok(Value::Object(Some(boxed)))
             } else if class_name == "java/lang/Float" {
                 let n = val_str.parse::<f32>().unwrap_or(0.0);
                 let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Float", 1)?;
                 ctx.set_field(boxed, 0, Value::Float(n));
-                Value::Object(Some(boxed))
+                Ok(Value::Object(Some(boxed)))
             } else if class_name == "java/lang/Double" {
                 let n = val_str.parse::<f64>().unwrap_or(0.0);
                 let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
                 ctx.set_field(boxed, 0, Value::Double(n));
-                Value::Object(Some(boxed))
+                Ok(Value::Object(Some(boxed)))
             } else if class_name == "java/lang/Boolean" {
                 let b = if val_str == "true" { 1 } else { 0 };
                 let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
                 ctx.set_field(boxed, 0, Value::Int(b));
-                Value::Object(Some(boxed))
+                Ok(Value::Object(Some(boxed)))
             } else if val_str.starts_with("{") {
                 // Nested object — depth-limited deserialization
                 if let Some(cid) = ctx.class_id_by_name(class_name) {
                     match reflection_deserialize_from_json_depth(ctx, val_str, cid, depth + 1) {
-                        Some(nested) => Value::Object(Some(nested)),
-                        None => Value::Object(None),
+                        Ok(Some(nested)) => Ok(Value::Object(Some(nested))),
+                        Ok(None) => Ok(Value::Object(None)),
                     }
                 } else {
-                    Value::Object(None)
+                    Ok(Value::Object(None))
                 }
             } else {
-                Value::Object(None)
+                Ok(Value::Object(None))
             }
         }
         desc if desc.starts_with("[") => {
@@ -3239,12 +3239,12 @@ pub(crate) fn json_str_to_value_depth(
                     let elem_val = json_str_to_value_depth(ctx, elem_str, elem_desc, depth + 1);
                     ctx.set_array_element(arr, idx, elem_val?);
                 }
-                Value::Object(Some(arr))
+                Ok(Value::Object(Some(arr)))
             } else {
-                Value::Object(None)
+                Ok(Value::Object(None))
             }
         }
-        _ => Value::Object(None),
+        _ => Ok(Value::Object(None)),
     }
 }
 
@@ -3378,11 +3378,11 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     /// Map a Jackson feature enum name to its config bit.
     fn om_feature_bit(name: &str) -> Result<Option<i32>, MethodCallFailed> {
         match name {
-            "FAIL_ON_UNKNOWN_PROPERTIES" => Some(OM_CFG_FAIL_UNKNOWN),
-            "INDENT_OUTPUT" | "WRITE_INDENTED" => Some(OM_CFG_INDENT),
-            "WRITE_DATES_AS_TIMESTAMPS" => Some(OM_CFG_DATES_TIMESTAMPS),
-            "FAIL_ON_NULL_FOR_PRIMITIVES" => Some(OM_CFG_FAIL_NULL_PRIM),
-            _ => None,
+            "FAIL_ON_UNKNOWN_PROPERTIES" => Ok(Some(OM_CFG_FAIL_UNKNOWN)),
+            "INDENT_OUTPUT" | "WRITE_INDENTED" => Ok(Some(OM_CFG_INDENT)),
+            "WRITE_DATES_AS_TIMESTAMPS" => Ok(Some(OM_CFG_DATES_TIMESTAMPS)),
+            "FAIL_ON_NULL_FOR_PRIMITIVES" => Ok(Some(OM_CFG_FAIL_NULL_PRIM)),
+            _ => Ok(None),
         }
     }
 
@@ -3399,7 +3399,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             let enabled = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
             if let Some(Value::Object(Some(enum_ref))) = args.get(1) {
                 if let Some(name) = om_enum_name(ctx, *enum_ref) {
-                    if let Some(bit) = om_feature_bit(&name) {
+                    if let Ok(Some(bit)) = om_feature_bit(&name) {
                         let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
                             Value::Int(v) => v,
                             _ => OM_DEFAULT_CFG,
@@ -3425,7 +3425,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             };
             if let Some(Value::Object(Some(enum_ref))) = args.get(1) {
                 if let Some(name) = om_enum_name(ctx, *enum_ref) {
-                    if let Some(bit) = om_feature_bit(&name) {
+                    if let Ok(Some(bit)) = om_feature_bit(&name) {
                         let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
                             Value::Int(v) => v,
                             _ => OM_DEFAULT_CFG,
@@ -3450,7 +3450,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
             };
             if let Some(Value::Object(Some(enum_ref))) = args.get(1) {
                 if let Some(name) = om_enum_name(ctx, *enum_ref) {
-                    if let Some(bit) = om_feature_bit(&name) {
+                    if let Ok(Some(bit)) = om_feature_bit(&name) {
                         let cfg = match ctx.get_field(this, OM_CFG_FIELD) {
                             Value::Int(v) => v,
                             _ => OM_DEFAULT_CFG,
@@ -4046,7 +4046,7 @@ pub(crate) fn build_json_tree_node_depth(
         ctx.set_field(node, 4, Value::Object(Some(children)));
         ctx.set_field(node, 5, Value::Object(Some(keys)));
         ctx.set_field(node, 6, Value::Int(count as i32));
-        node
+        Ok(node)
     } else if trimmed.starts_with('[') {
         // Array node
         let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
@@ -4092,38 +4092,38 @@ pub(crate) fn build_json_tree_node_depth(
         }
         ctx.set_field(node, 4, Value::Object(Some(children)));
         ctx.set_field(node, 6, Value::Int(count as i32));
-        node
+        Ok(node)
     } else if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
         // String node
         let inner_str = json_unescape(&trimmed[1..trimmed.len() - 1]);
         let node = alloc_json_node(ctx, 3)?;
         let s = ctx.create_string(&inner_str);
         ctx.set_field(node, 1, Value::Object(Some(s)));
-        node
+        Ok(node)
     } else if trimmed == "true" || trimmed == "false" {
         let node = alloc_json_node(ctx, 5)?;
         ctx.set_field(node, 3, Value::Int(if trimmed == "true" { 1 } else { 0 }));
-        node
+        Ok(node)
     } else if let Ok(n) = trimmed.parse::<i64>() {
         let node = alloc_json_node(ctx, 4)?;
         ctx.set_field(node, 2, Value::Long(n));
         ctx.set_field(node, 7, Value::Double(n as f64));
         let s = ctx.create_string(trimmed);
         ctx.set_field(node, 1, Value::Object(Some(s)));
-        node
+        Ok(node)
     } else if let Ok(f) = trimmed.parse::<f64>() {
         let node = alloc_json_node(ctx, 4)?;
         ctx.set_field(node, 2, Value::Long(f as i64)); // truncated for asInt()/asLong()
         ctx.set_field(node, 7, Value::Double(f)); // full precision for asDouble()
         let s = ctx.create_string(trimmed);
         ctx.set_field(node, 1, Value::Object(Some(s)));
-        node
+        Ok(node)
     } else {
         // Bare string (unquoted) — treat as string
         let node = alloc_json_node(ctx, 3)?;
         let s = ctx.create_string(trimmed);
         ctx.set_field(node, 1, Value::Object(Some(s)));
-        node
+        Ok(node)
     }
 }
 

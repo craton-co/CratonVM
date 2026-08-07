@@ -14043,7 +14043,7 @@ pub fn register_essential_natives_with_shims(
                         let trace = ctx.thread_stack_trace(t);
                         crate::lang_system::build_stack_trace_element_array(ctx, &trace)
                     }
-                    _ => ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
+                    _ => Ok(ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0)),
                 };
                 ctx.set_array_element(outer, i, Value::Object(Some(inner)));
             }
@@ -16698,7 +16698,7 @@ pub fn register_essential_natives_with_shims(
             let loader =
                 crate::classloader::latest_user_defined_loader_class(ctx).map(|class_id| {
                     crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
-                        .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx))
+                        .unwrap_or_else(|| crate::classloader::get_or_create_app_loader(ctx)?)
                 });
             Ok(Some(Value::Object(loader)))
         },
@@ -18743,25 +18743,25 @@ pub fn register_essential_natives_with_shims(
         "java/util/Locale",
         "ROOT",
         "Ljava/util/Locale;",
-        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "", ""))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "", "")?)))),
     );
     registry.register(
         "java/util/Locale",
         "ENGLISH",
         "Ljava/util/Locale;",
-        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", ""))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "")?)))),
     );
     registry.register(
         "java/util/Locale",
         "US",
         "Ljava/util/Locale;",
-        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "US"))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "US")?)))),
     );
     registry.register(
         "java/util/Locale",
         "CANADA",
         "Ljava/util/Locale;",
-        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "CA"))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(locale_alloc(ctx, "en", "CA")?)))),
     );
 
     // C22: ResourceBundle locale-data overrides — provide synthetic
@@ -19702,7 +19702,7 @@ pub fn register_essential_natives_with_shims(
             Ok(c) => c,
             Err(_) => match ctx.ensure_class_initialized("java/util/TimeZone") {
                 Ok(c) => c,
-                Err(_) => return cratonvm_types::Value::Object(None),
+                Err(_) => return Ok(cratonvm_types::Value::Object(None)),
             },
         };
         // Field count: be generous (16) to cover both TimeZone (ID) and
@@ -19745,11 +19745,11 @@ pub fn register_essential_natives_with_shims(
                 if matches!(current, Value::Object(Some(_))) {
                     return Ok(current);
                 }
-                let fallback = alloc_synth_timezone(ctx, &fallback_id);
+                let fallback = alloc_synth_timezone(ctx, &fallback_id)?;
                 if matches!(fallback, Value::Object(Some(_))) {
-                    ctx.set_static_field(class_id, field_index, fallback?);
+                    ctx.set_static_field(class_id, field_index, fallback);
                 }
-                return Ok(fallback?);
+                return Ok(fallback);
             }
         }
         Ok(alloc_synth_timezone(ctx, &fallback_id)?)
@@ -19771,7 +19771,7 @@ pub fn register_essential_natives_with_shims(
             Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
             _ => String::new(),
         };
-        match id.as_str() {
+        Ok(match id.as_str() {
             "GMT" => {
                 if long_style {
                     "Greenwich Mean Time"
@@ -19796,13 +19796,13 @@ pub fn register_essential_natives_with_shims(
                     return Ok(id);
                 }
                 return if long_style {
-                    "Coordinated Universal Time".to_string()
+                    Ok("Coordinated Universal Time".to_string())
                 } else {
-                    "UTC".to_string()
+                    Ok("UTC".to_string())
                 };
             }
         }
-        Ok(.to_string())
+        .to_string())
     }
 
     registry.register(
@@ -19847,26 +19847,26 @@ pub fn register_essential_natives_with_shims(
             } else {
                 "GMT".to_string()
             };
-            Ok(Some(alloc_synth_timezone(ctx, &id)))
+            Ok(Some(alloc_synth_timezone(ctx, &id)?))
         },
     );
     registry.register(
         "java/util/TimeZone",
         "getDefault",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx)?)),
     );
     registry.register(
         "java/util/TimeZone",
         "getDefaultRef",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx)?)),
     );
     registry.register(
         "java/util/TimeZone",
         "setDefaultZone",
         "()Ljava/util/TimeZone;",
-        |ctx, _args| Ok(Some(timezone_default_ref(ctx))),
+        |ctx, _args| Ok(Some(timezone_default_ref(ctx)?)),
     );
     // getDisplayName() and getDisplayName(Locale) default to the LONG style.
     registry.register(
@@ -19876,7 +19876,7 @@ pub fn register_essential_natives_with_shims(
         |ctx, args| {
             let name = match args.first() {
                 Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
-                _ => "UTC".to_string(),
+                _ => Ok("UTC".to_string()),
             };
             Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
         },
@@ -19888,7 +19888,7 @@ pub fn register_essential_natives_with_shims(
         |ctx, args| {
             let name = match args.first() {
                 Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, true),
-                _ => "UTC".to_string(),
+                _ => Ok("UTC".to_string()),
             };
             Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
         },
@@ -19904,7 +19904,7 @@ pub fn register_essential_natives_with_shims(
             let long_style = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
             let name = match args.first() {
                 Some(Value::Object(Some(o))) => tz_display_name(ctx, *o, long_style),
-                _ => "UTC".to_string(),
+                _ => Ok("UTC".to_string()),
             };
             Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
         },
@@ -19936,7 +19936,7 @@ pub fn register_essential_natives_with_shims(
             {
                 return Ok(Some(Value::Object(None)));
             }
-            Ok(Some(alloc_synth_timezone(ctx, &id)))
+            Ok(Some(alloc_synth_timezone(ctx, &id)?))
         },
     );
     // TZDB-OFFSET (2026-07-22): java.util.TimeZone offset queries backed by
@@ -20152,7 +20152,7 @@ pub fn register_essential_natives_with_shims(
                 }
                 _ => "UTC".to_string(),
             };
-            Ok(Some(alloc_synth_timezone(ctx, &id)))
+            Ok(Some(alloc_synth_timezone(ctx, &id)?))
         },
     );
 
@@ -32449,7 +32449,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), M
             let cid = ctx.class_id_of_object(this);
             let cname = ctx.class_name_of_id(cid).unwrap_or_default();
             if cname != "java/nio/StringCharBuffer" {
-                return Ok(None);
+                return Ok(None)?;
             }
             let str_obj = match ctx.get_field_by_name(this, "str") {
                 Value::Object(Some(o)) => o,
@@ -32488,7 +32488,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) -> Result<(), M
             let (chars, _pos, _lim, off) = string_cb_state(ctx, this)?;
             let real = absolute_index + off;
             if real < 0 || real as usize >= chars.len() {
-                return Ok(None);
+                return Ok(None)?;
             }
             Some(Value::Int(chars[real as usize] as i32))
         }
@@ -33182,13 +33182,13 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             return Ok(Some(Value::Object(Some(charset))));
         }
     }
-    let charset = charset_alloc(ctx, &normalized);
-    let handle = ctx.add_global_root(charset?);
+    let charset = charset_alloc(ctx, &normalized)?;
+    let handle = ctx.add_global_root(charset);
     real_charset_cache()
         .lock()
         .unwrap()
         .insert(normalized, handle);
-    Ok(Some(Value::Object(Some(charset?))))
+    Ok(Some(Value::Object(Some(charset))))
 }
 
 /// Construct and throw a real `java.nio.charset.UnsupportedCharsetException`
@@ -35556,24 +35556,24 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodC
     let upper = algo.to_uppercase().replace(['-', '/'], "");
     match upper.as_str() {
         "MD5" => real_md5(data),
-        "SHA1" | "SHA" => real_sha1(data),
+        "SHA1" | "SHA" => Ok(real_sha1(data)),
         "SHA224" => {
             // SHA-224: the hand-rolled `crypto_impl` SHA-256 code does not
             // cover the 224-bit variant, so use the `sha2` crate.
             let mut h = sha2::Sha224::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
-        "SHA256" => real_sha256(data),
-        "SHA384" => real_sha384(data),
-        "SHA512" => real_sha512(data),
+        "SHA256" => Ok(real_sha256(data)),
+        "SHA384" => Ok(real_sha384(data)),
+        "SHA512" => Ok(real_sha512(data)),
         "SHA512224" => {
             // SHA-512/224 (FIPS 180-4 §5.3.6): SHA-512 with the distinct
             // alternate IV derived from "SHA-512/224", truncated to 224 bits.
             // Distinct from SHA-224 and not a plain truncation of SHA-512.
             let mut h = sha2::Sha512_224::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
         "SHA512256" => {
             // SHA-512/256 (FIPS 180-4 §5.3.6): SHA-512 with the distinct
@@ -35581,29 +35581,29 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Result<Vec<u8>, MethodC
             // Distinct from SHA-256 and not a plain truncation of SHA-512.
             let mut h = sha2::Sha512_256::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
         "SHA3224" => {
             let mut h = sha3::Sha3_224::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
         "SHA3256" => {
             let mut h = sha3::Sha3_256::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
         "SHA3384" => {
             let mut h = sha3::Sha3_384::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
         "SHA3512" => {
             let mut h = sha3::Sha3_512::new();
             h.update(data);
-            h.finalize().to_vec()
+            Ok(h.finalize().to_vec())
         }
-        _ => real_sha256(data), // default to SHA-256
+        _ => Ok(real_sha256(data)), // default to SHA-256
     }
 }
 
@@ -38388,7 +38388,7 @@ fn iso_instant_string(sec: i64, nano: i32) -> String {
     // day rather than truncating toward zero.
     let days = sec.div_euclid(86_400);
     let secs_of_day = sec.rem_euclid(86_400);
-    let (y, m, d) = epoch_day_to_ymd(days);
+    let Ok((y, m, d)) = epoch_day_to_ymd(days);
     let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
     // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
     let mut s = if (0..=9999).contains(&y) {

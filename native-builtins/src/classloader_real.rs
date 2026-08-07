@@ -380,7 +380,7 @@ pub(crate) fn init_urlclassloader_constructor_with_default_parent(
     urls: Value,
 ) {
     let this_pin = ctx.pin_native_root(this);
-    let parent = get_or_create_system_cl(ctx);
+    let parent = get_or_create_system_cl(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
     init_urlclassloader_constructor_with_parent(ctx, this, urls, Value::Object(parent));
     ctx.unpin_native_roots(this_pin);
@@ -403,7 +403,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let sys = get_or_create_system_cl(ctx);
+        let sys = get_or_create_system_cl(ctx)?;
         ctx.set_field_by_name(this, "parent", Value::Object(sys));
         // Initialise defaultDomain / classes / packages etc. — see
         // `init_classloader_common_fields`. Without this a subclass that
@@ -490,7 +490,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
         "getSystemClassLoader",
         "()Ljava/lang/ClassLoader;",
         |ctx, _args| {
-            let sys = get_or_create_system_cl(ctx);
+            let sys = get_or_create_system_cl(ctx)?;
             Ok(Some(Value::Object(sys)))
         },
     );
@@ -501,7 +501,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
         "getPlatformClassLoader",
         "()Ljava/lang/ClassLoader;",
         |ctx, _args| {
-            let platform = get_or_create_platform_cl(ctx);
+            let platform = get_or_create_platform_cl(ctx)?;
             Ok(Some(Value::Object(platform)))
         },
     );
@@ -635,7 +635,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let parent = get_or_create_system_cl(ctx);
+        let parent = get_or_create_system_cl(ctx)?;
         ctx.set_field_by_name(this, "parent", Value::Object(parent));
         let urls = args.get(1).copied().unwrap_or(Value::Object(None));
         // URLClassLoader extends SecureClassLoader extends ClassLoader;
@@ -758,7 +758,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) -> Result
             };
             let urls = args.get(1).copied().unwrap_or(Value::Object(None));
             let acc = args.get(2).copied().unwrap_or(Value::Object(None));
-            let parent = get_or_create_system_cl(ctx);
+            let parent = get_or_create_system_cl(ctx)?;
             ctx.set_field_by_name(this, "parent", Value::Object(parent));
             ctx.set_field_by_name(this, "acc", acc);
             init_urlclassloader_constructor(ctx, this, urls);
@@ -887,11 +887,11 @@ fn cl_real_load_class(
 ) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Ok(Ok(Some(Value::Object(None)))),
     };
     let class_name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Ok(Ok(Some(Value::Object(None)))),
     };
 
     // `ClassLoader.loadClass(String)` is virtual too. Honor an override of
@@ -925,12 +925,12 @@ fn cl_real_load_class(
     // `loadClass(String,boolean)` native (→ `cl_real_load_class_base`), so there
     // is no recursion back here.
     if crate::classloader::receiver_overrides_load_class_resolve(ctx, this) {
-        return ctx.invoke_virtual(
+        return Ok(Ok(ctx.invoke_virtual(
             this,
             "loadClass",
             "(Ljava/lang/String;Z)Ljava/lang/Class;",
             &[Value::Object(Some(class_name_obj)), Value::Int(0)],
-        );
+        )?));
     }
 
     Ok(cl_real_load_class_base(ctx, this, class_name_obj)?)
@@ -1185,7 +1185,7 @@ fn cl_real_load_class_base_rooted(
     if crate::classloader::is_generated_proxy_name(&internal) {
         if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
         {
-            return Ok(Some(Value::Object(Some(mirror))));
+            return Ok(Ok(Some(Value::Object(Some(mirror)))));
         }
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
@@ -1222,7 +1222,7 @@ fn cl_real_load_class_base_rooted(
     if crate::classloader::is_user_defined_loader(ctx, this) {
         if let Some(mirror) = crate::classloader::find_loaded_class_for_loader(ctx, this, &internal)
         {
-            return Ok(Some(Value::Object(Some(mirror))));
+            return Ok(Ok(Some(Value::Object(Some(mirror)))));
         }
     }
 
@@ -1355,7 +1355,7 @@ fn cl_real_load_class_base_rooted(
             let _ = (this, class_name_obj);
             match delegated {
                 Ok(Some(Value::Object(Some(mirror)))) => {
-                    return Ok(Some(Value::Object(Some(mirror))));
+                    return Ok(Ok(Some(Value::Object(Some(mirror)))));
                 }
                 _ => {
                     parent_user_defined_authoritative_miss = true;
@@ -1398,7 +1398,7 @@ fn cl_real_load_class_base_rooted(
         && !stub_would_answer_delegation
     {
         match load_class_visible_to(ctx, this, &internal) {
-            ClassLookup::Found(mirror) => return Ok(Some(mirror)),
+            ClassLookup::Found(mirror) => return Ok(Ok(Some(mirror))),
             ClassLookup::DependencyMissing(missing) => {
                 let exc = no_class_def_found_error(ctx, &missing);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
@@ -1410,7 +1410,7 @@ fn cl_real_load_class_base_rooted(
         if let Some(mirror) =
             crate::jboss_module_loader::load_property_bridge_class(ctx, &class_name)
         {
-            return Ok(Some(mirror));
+            return Ok(Ok(Some(mirror)));
         }
     }
 
@@ -1467,7 +1467,7 @@ fn cl_real_load_class_base_rooted(
     //     whose override legitimately misses still resolves here.
     if defer_to_find_class && !scoped_user_chain {
         match load_class_visible_to(ctx, this, &internal) {
-            ClassLookup::Found(mirror) => return Ok(Some(mirror)),
+            ClassLookup::Found(mirror) => return Ok(Ok(Some(mirror))),
             ClassLookup::DependencyMissing(missing) => {
                 let exc = no_class_def_found_error(ctx, &missing);
                 return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
@@ -1498,11 +1498,11 @@ pub(crate) fn cl_real_load_class_base_from_args(
 ) -> Result<cratonvm_types::error::MethodCallResult, MethodCallFailed> {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Ok(Ok(Some(Value::Object(None)))),
     };
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
+        _ => return Ok(Ok(Some(Value::Object(None)))),
     };
     Ok(cl_real_load_class_base(ctx, this, name_obj)?)
 }
@@ -1650,9 +1650,9 @@ pub fn get_or_create_system_cl(
     // alias to whatever we hand out — it is NOT a GC root and is never
     // remapped, which is safe solely because it is never read back; the
     // canonical GC-tracked copy lives in classloader.rs's app-loader store.)
-    let obj = crate::classloader::get_or_create_app_loader(ctx);
-    *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj?);
-    Ok(Some(obj?))
+    let obj = crate::classloader::get_or_create_app_loader(ctx)?;
+    *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    Ok(Some(obj))
 }
 
 /// Get or create the platform class loader singleton.
@@ -1661,7 +1661,7 @@ fn get_or_create_platform_cl(
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
     // Identity-unified with classloader.rs::get_or_create_platform_loader —
     // same rationale as `get_or_create_system_cl` above.
-    let obj = crate::classloader::get_or_create_platform_loader(ctx);
-    *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj?);
-    Ok(Some(obj?))
+    let obj = crate::classloader::get_or_create_platform_loader(ctx)?;
+    *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    Ok(Some(obj))
 }

@@ -518,7 +518,7 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> Result<Obj
             if addr != 0 {
                 // SAFETY: the cached address was produced by `alloc_object`
                 // earlier in this process. Singleton lifetime == process lifetime.
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
@@ -529,11 +529,11 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> Result<Obj
     let chose_property_class = if class_name == CLS_JUL_LOG_MANAGER {
         try_allocate_property_log_manager(ctx)
     } else {
-        None
+        Ok(None)
     };
     let obj = match chose_property_class {
-        Some(o) => o,
-        None => allocate_log_manager(ctx, class_name),
+        Ok(Some(o)) => o,
+        Ok(None) => allocate_log_manager(ctx, class_name)?,
     };
     let mut guard = singleton_cell(vm).lock().unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *guard {
@@ -541,11 +541,11 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> Result<Obj
             // Another thread beat us; drop our allocation on the floor
             // (we have no external references to it yet) and adopt
             // theirs.
-            return unsafe { object_from_u64(addr) };
+            return unsafe { Ok(object_from_u64(addr)) };
         }
     }
-    *guard = Some(obj?.as_ptr() as u64);
-    Ok(obj?)
+    *guard = Some(obj.as_ptr() as u64);
+    Ok(obj)
 }
 
 /// Resolve one of the 9 standard `java.util.logging.Level` singletons
@@ -768,11 +768,11 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> R
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
                 // SAFETY: singleton-style lifetime.
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
-    let obj = allocate_logger(ctx, name);
+    let obj = allocate_logger(ctx, name)?;
     // Descendants that were parented to a HIGHER ancestor (or to the root)
     // before this node existed must now point at it -- JUL does the same in
     // `LogNode.walkAndSetParent` when `addLogger` inserts an intermediate node.
@@ -784,10 +784,10 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> R
         // no external references yet).
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
-        reg.insert(name.to_string(), obj?.as_ptr() as u64);
+        reg.insert(name.to_string(), obj.as_ptr() as u64);
         let prefix = format!("{name}.");
         for (other, &addr) in reg.iter() {
             if addr == 0 || !other.starts_with(&prefix) {
@@ -814,9 +814,9 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> R
     // read out of the registry above stay valid across this loop.
     for addr in reparent {
         let child = unsafe { object_from_u64(addr) };
-        ctx.set_field(child, LOGGER_FIELD_PARENT, Value::Object(Some(obj?)));
+        ctx.set_field(child, LOGGER_FIELD_PARENT, Value::Object(Some(obj)));
     }
-    Ok(obj?)
+    Ok(obj)
 }
 
 /// The one place that knows where a `java.util.logging.Logger` keeps its name.
@@ -936,17 +936,17 @@ fn tomcat_context_loader_key(ctx: &mut dyn NativeContext) -> i32 {
 /// and configures that root as part of its own class-loader-info bootstrap;
 /// unlike `addLogger(child)`, it does not recurse through parent logger names.
 fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
-    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
+    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager?))
+        .class_name_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         != Some("org/apache/juli/ClassLoaderLogManager")
     {
         return Ok(None);
     }
-    let manager_pin = ctx.pin_native_root(manager?);
+    let manager_pin = ctx.pin_native_root(manager);
     let root_name = ctx.create_string("");
-    let manager = ctx.read_native_pin(manager_pin, manager?);
+    let manager = ctx.read_native_pin(manager_pin, manager);
     let root = ctx
         .invoke_virtual_bytecode_only(
             manager,
@@ -958,8 +958,8 @@ fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectR
         .flatten();
     ctx.unpin_native_roots(manager_pin);
     match root {
-        Some(Value::Object(Some(root))) => Some(root),
-        _ => None,
+        Some(Value::Object(Some(root))) => Ok(Some(root)),
+        _ => Ok(None),
     }
 }
 
@@ -973,7 +973,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     // preserves the configured root level instead of manufacturing a second,
     // unconfigured synthetic root.
     if name.is_empty() {
-        if let Some(root) = tomcat_juli_root_logger(ctx) {
+        if let Ok(Some(root)) = tomcat_juli_root_logger(ctx) {
             return Ok(root);
         }
     }
@@ -985,7 +985,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
         .get(&key)
     {
         if address != 0 {
-            return unsafe { object_from_u64(address) };
+            return unsafe { Ok(object_from_u64(address)) };
         }
     }
     let logger = allocate_logger(ctx, name);
@@ -993,39 +993,39 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     // Keep its new Logger rooted throughout, refreshing it after every
     // GC-capable boundary before it is stored or returned.
     let logger_pin = ctx.pin_native_root(logger?);
-    let mut logger = logger;
+    let mut logger = logger?;
     // Do not merely cache the child: Tomcat's addLogger bytecode applies the
     // current context-class-loader configuration, wires its parent chain and
     // instantiates any per-logger handlers. Bypassing this path was why the
     // per-webapp FileHandler and root level disappeared.
-    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER);
-    logger = ctx.read_native_pin(logger_pin, logger?);
+    let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
+    logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager?))
+        .class_name_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         == Some("org/apache/juli/ClassLoaderLogManager")
     {
-        let manager_pin = ctx.pin_native_root(manager?);
-        let manager = ctx.read_native_pin(manager_pin, manager?);
-        let logger_arg = ctx.read_native_pin(logger_pin, logger?);
+        let manager_pin = ctx.pin_native_root(manager);
+        let manager = ctx.read_native_pin(manager_pin, manager);
+        let logger_arg = ctx.read_native_pin(logger_pin, logger);
         let _ = ctx.invoke_virtual_bytecode_only(
             manager,
             "addLogger",
             "(Ljava/util/logging/Logger;)Z",
             &[Value::Object(Some(logger_arg))],
         );
-        logger = ctx.read_native_pin(logger_pin, logger?);
+        logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
         ctx.unpin_native_roots(manager_pin);
     }
-    if let Some(root) = tomcat_juli_root_logger(ctx) {
-        logger = ctx.read_native_pin(logger_pin, logger?);
+    if let Ok(Some(root)) = tomcat_juli_root_logger(ctx) {
+        logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
         if let Some(handlers) = crate::jul_logger_handlers_get(ctx, root) {
             // `publish_to_jul_handlers` is intentionally compact and does not
             // walk a Java parent chain.  Share JULI's already-filtered root
             // handler list with the context-local child so it observes the
             // same per-webapp FileHandler configuration.
-            crate::jul_logger_handlers_set(ctx, logger?, handlers);
-            logger = ctx.read_native_pin(logger_pin, logger?);
+            crate::jul_logger_handlers_set(ctx, logger, handlers);
+            logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
         } else {
             // Older JULI setup paths register a root handler through the
             // name-keyed compatibility table. Snapshot that current root list
@@ -1048,25 +1048,25 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
                         &[Value::Object(Some(list)), Value::Object(Some(handler))],
                     );
                 }
-                logger = ctx.read_native_pin(logger_pin, logger?);
-                crate::jul_logger_handlers_set(ctx, logger?, list);
-                logger = ctx.read_native_pin(logger_pin, logger?);
+                logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
+                crate::jul_logger_handlers_set(ctx, logger, list);
+                logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
             }
         }
     }
-    logger = ctx.read_native_pin(logger_pin, logger?);
+    logger = Ok(ctx.read_native_pin(logger_pin, logger))?;
     let mut registry = tomcat_juli_logger_registry(vm)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&address) = registry.get(&key) {
         if address != 0 {
             ctx.unpin_native_roots(logger_pin);
-            return unsafe { object_from_u64(address) };
+            return unsafe { Ok(object_from_u64(address)) };
         }
     }
-    registry.insert(key, logger?.as_ptr() as u64);
+    registry.insert(key, logger.as_ptr() as u64);
     ctx.unpin_native_roots(logger_pin);
-    Ok(logger?)
+    Ok(logger)
 }
 
 fn tomcat_classloader_log_manager_requested(ctx: &dyn NativeContext) -> bool {
@@ -1599,20 +1599,20 @@ fn apply_jul_config_entries(
         })
         .unwrap_or_default();
 
-    let root = get_or_create_logger(ctx, "");
-    let root_pin = ctx.pin_native_root(root?);
+    let root = get_or_create_logger(ctx, "")?;
+    let root_pin = ctx.pin_native_root(root);
     // A fresh config replaces whatever handlers a previous
     // `readConfiguration` call (or explicit `addHandler`) installed on the
     // root logger -- otherwise repeated `beforeInitialize`/`initialize`
     // cycles (one per @Test method sharing this process) would stack up
     // duplicate `ConsoleHandler`s and double-print every message.
-    crate::jul_logger_handlers_clear(ctx, root?);
+    crate::jul_logger_handlers_clear(ctx, root);
 
     let mut created: Vec<(String, ObjectRef)> = Vec::new();
     for cls in &handler_class_names {
         if let Ok(Some(Value::Object(Some(handler)))) = ctx.new_object_initialized(cls, "()V", &[])
         {
-            let root = ctx.read_native_pin(root_pin, root?);
+            let root = ctx.read_native_pin(root_pin, root);
             let _ = native_jul_logger_add_handler(
                 ctx,
                 &[Value::Object(Some(root)), Value::Object(Some(handler))],
@@ -1900,7 +1900,7 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Me
             .unwrap_or_else(|e| e.into_inner());
         if let Some(addr) = *g {
             if addr != 0 {
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
@@ -1921,7 +1921,7 @@ fn ensure_jboss_log_context(ctx: &mut dyn NativeContext) -> Result<ObjectRef, Me
         .unwrap_or_else(|e| e.into_inner());
     if let Some(addr) = *g {
         if addr != 0 {
-            return unsafe { object_from_u64(addr) };
+            return unsafe { Ok(object_from_u64(addr)) };
         }
     }
     *g = Some(obj.as_ptr() as u64);
@@ -1992,7 +1992,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result
             .unwrap_or_else(|e| e.into_inner());
         if let Some(&addr) = reg.get(name) {
             if addr != 0 {
-                return unsafe { object_from_u64(addr) };
+                return unsafe { Ok(object_from_u64(addr)) };
             }
         }
     }
@@ -2007,7 +2007,7 @@ fn get_or_create_jboss_logger(ctx: &mut dyn NativeContext, name: &str) -> Result
         .unwrap_or_else(|e| e.into_inner());
     if let Some(&addr) = reg.get(name) {
         if addr != 0 {
-            return unsafe { object_from_u64(addr) };
+            return unsafe { Ok(object_from_u64(addr)) };
         }
     }
     reg.insert(name.to_string(), obj.as_ptr() as u64);
@@ -4125,7 +4125,7 @@ fn publish_existing_record_to_jul_handlers(
 ) -> bool {
     let logger_pin = ctx.pin_native_root(logger);
     let record_pin = ctx.pin_native_root(record);
-    let Some(handlers) = resolve_jul_handler_list(ctx, logger) else {
+    let Ok(Some(handlers)) = resolve_jul_handler_list(ctx, logger) else {
         ctx.unpin_native_roots(logger_pin);
         return false;
     };
@@ -4247,7 +4247,7 @@ fn publish_to_jul_handlers_full(
     let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
     let result: Result<bool, MethodCallFailed> = (|| {
         let logger = ctx.read_native_pin(base_pin, logger);
-        let Some(handlers) = resolve_jul_handler_list(ctx, logger) else {
+        let Ok(Some(handlers)) = resolve_jul_handler_list(ctx, logger) else {
             return Ok(false);
         };
         let handlers_pin = ctx.pin_native_root(handlers);

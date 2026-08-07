@@ -1373,7 +1373,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 |ctx, _args| {
                     Ok(Some(Value::Object(Some(crate::locale_alloc(
                         ctx, $lang, $country,
-                    )))))
+                    )?))))
                 },
             );
         };

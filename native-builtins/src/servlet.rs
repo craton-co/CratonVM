@@ -5374,7 +5374,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
         // fresh synthetic (printing as BIG_ENDIAN, failing identity
         // comparisons) when `order()` ran before any Java-side ByteOrder
         // access had triggered <clinit> (residual-doc item 6).
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
     });
     r.register(
         bb,
@@ -5456,7 +5456,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                 let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
                 let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
                 bb_write_hb(ctx, buf, new_arr, rem);
-                buf
+                Ok(buf)
             }
         };
         Ok(Some(Value::Object(Some(buf))))
@@ -5509,7 +5509,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                 let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
                 bb_write_hb(ctx, buf, new_arr, length);
                 s2_bb_set_order(ctx, buf, ord);
-                buf
+                Ok(buf)
             }
         };
         Ok(Some(Value::Object(Some(buf))))
@@ -5543,7 +5543,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                     ctx.set_field(buf, BB_MARK, Value::Int(mark));
                 }
                 ctx.set_field(buf, BB_ORDER, Value::Int(ord));
-                buf
+                Ok(buf)
             }
         };
         Ok(Some(Value::Object(Some(buf))))
@@ -5579,7 +5579,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) -> Result<(), MethodCall
                         ctx.set_field(buf, BB_MARK, Value::Int(mark));
                     }
                     ctx.set_field(buf, BB_ORDER, Value::Int(ord));
-                    buf
+                    Ok(buf)
                 }
             };
             Ok(Some(Value::Object(Some(buf))))
@@ -6403,13 +6403,13 @@ fn register_s2_byteorder(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
     // (residual-doc item 6).
     r.register(bo, "nativeOrder", "()Ljava/nio/ByteOrder;", |ctx, _| {
         let ord = if cfg!(target_endian = "big") { 0 } else { 1 };
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, ord)?))))
     });
     r.register(bo, "BIG_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 0)?))))
     });
     r.register(bo, "LITTLE_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _| {
-        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)))))
+        Ok(Some(Value::Object(Some(s2_byte_order_object(ctx, 1)?))))
     });
     // Layout-aware decode shared by toString/equals: real ByteOrder keeps
     // its `name` String at field 0; the synthetic stand-in keeps an order
@@ -7018,11 +7018,11 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
     });
     r.register(sel, "keys", "()Ljava/util/Set;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(s2_keys_as_set(ctx, this, false)))
+        Ok(Some(s2_keys_as_set(ctx, this, false)?))
     });
     r.register(sel, "selectedKeys", "()Ljava/util/Set;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(s2_keys_as_set(ctx, this, true)))
+        Ok(Some(s2_keys_as_set(ctx, this, true)?))
     });
 
     // SelectionKey — upgrade readyOps to field 3, add convenience predicates

@@ -5615,13 +5615,13 @@ fn aqls_state_slot(
 ) -> Result<std::sync::Arc<std::sync::atomic::AtomicI64>, MethodCallFailed> {
     let key = gc_stable_lock_key(ctx, synchronizer);
     let mut table = aqls_state_table().lock();
-    table
+    Ok(table
         .entry(key?)
         // AbstractQueuedLongSynchronizer initializes `state` to zero. Every
         // later Java-side transition goes through the three forced natives
         // registered below, including deserialization's `setState` path.
-        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)));
-        Ok(.clone())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)))
+        .clone())
 }
 
 fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5748,8 +5748,8 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     // pair would diverge, deadlocking the lock or corrupting a neighbour slot.
     fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<usize>, MethodCallFailed> {
         match ctx.get_field(this, 0) {
-            Value::Object(Some(parent)) => Some(gc_stable_lock_key(ctx, parent)),
-            _ => None,
+            Value::Object(Some(parent)) => Ok(Some(gc_stable_lock_key(ctx, parent)?)),
+            _ => Ok(None),
         }
     }
 
@@ -5758,7 +5758,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
             // rw_read_lock's internal contended wait is a raw
             // parking_lot::Condvar::wait with NO GC-blocking-region bracket
@@ -5778,7 +5778,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             crate::stamped_lock::rw_read_unlock(addr, ctx.thread_id());
         }
         Ok(None)
@@ -5789,8 +5789,8 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let ok = match rwl_parent_addr(ctx, this) {
-            Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
-            None => false,
+            Ok(Some(a)) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
+            Ok(None) => false,
         };
         Ok(Some(Value::Int(i32::from(ok))))
     });
@@ -5807,8 +5807,8 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Int(0))),
             };
             let ok = match rwl_parent_addr(ctx, this) {
-                Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
-                None => false,
+                Ok(Some(a)) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
+                Ok(None) => false,
             };
             Ok(Some(Value::Int(i32::from(ok))))
         },
@@ -5818,7 +5818,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit — see the plain `lock()` registration above.
             ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
@@ -5834,7 +5834,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
             // rw_write_lock's internal contended wait is a raw
             // parking_lot::Condvar::wait with NO GC-blocking-region bracket
@@ -5856,7 +5856,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             crate::stamped_lock::rw_write_unlock(addr, ctx.thread_id());
         }
         Ok(None)
@@ -5867,8 +5867,8 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let ok = match rwl_parent_addr(ctx, this) {
-            Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
-            None => false,
+            Ok(Some(a)) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
+            Ok(None) => false,
         };
         Ok(Some(Value::Int(i32::from(ok))))
     });
@@ -5882,8 +5882,8 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Int(0))),
             };
             let ok = match rwl_parent_addr(ctx, this) {
-                Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
-                None => false,
+                Ok(Some(a)) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
+                Ok(None) => false,
             };
             Ok(Some(Value::Int(i32::from(ok))))
         },
@@ -5893,7 +5893,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit — see the plain `lock()` registration above.
             ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
@@ -5907,8 +5907,8 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let held = match rwl_parent_addr(ctx, this) {
-            Some(a) => crate::stamped_lock::rw_write_is_held(a, ctx.thread_id()),
-            None => false,
+            Ok(Some(a)) => crate::stamped_lock::rw_write_is_held(a, ctx.thread_id()),
+            Ok(None) => false,
         };
         Ok(Some(Value::Int(i32::from(held))))
     });
@@ -6052,8 +6052,8 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
 // heap address that the lock/unlock pair could disagree on across a GC.
 fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<usize>, MethodCallFailed> {
     match args.first() {
-        Some(Value::Object(Some(o))) => Some(gc_stable_lock_key(ctx, *o)),
-        _ => None,
+        Some(Value::Object(Some(o))) => Ok(Some(gc_stable_lock_key(ctx, *o)?)),
+        _ => Ok(None),
     }
 }
 
@@ -6078,9 +6078,9 @@ fn stamped_view_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<Ob
 
 fn native_stamped_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_init(addr?);
-        mirror_stamped_state(ctx, obj, addr?);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
+        crate::stamped_lock::stamped_init(addr);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
@@ -6111,12 +6111,12 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
-    let stamp = crate::stamped_lock::stamped_read_lock(addr?);
+    let stamp = crate::stamped_lock::stamped_read_lock(addr);
     ctx.end_blocking_region();
-    mirror_stamped_state(ctx, obj, addr?);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
 
@@ -6125,9 +6125,9 @@ fn native_stamped_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let stamp = crate::stamped_lock::stamped_try_read_lock(addr?);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
 
@@ -6136,9 +6136,9 @@ fn native_stamped_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let stamp = crate::stamped_lock::stamped_try_write_lock(addr?);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
 
@@ -6146,12 +6146,12 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
-    crate::stamped_lock::stamped_write_lock(addr?);
+    crate::stamped_lock::stamped_write_lock(addr);
     ctx.end_blocking_region();
-    mirror_stamped_state(ctx, parent, addr?);
+    mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
 
@@ -6162,9 +6162,9 @@ fn native_stamped_write_view_try_lock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
-    let stamp = crate::stamped_lock::stamped_try_write_lock(addr?);
-    mirror_stamped_state(ctx, parent, addr?);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
+    let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
+    mirror_stamped_state(ctx, parent, addr);
     Ok(Some(Value::Int(i32::from(stamp != 0))))
 }
 
@@ -6175,14 +6175,14 @@ fn native_stamped_write_view_unlock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
-    if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr?) {
+    let addr = stamped_addr_for_obj(ctx, parent)?;
+    if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "StampedLock write lock not held".to_string(),
         }
         .into());
     }
-    mirror_stamped_state(ctx, parent, addr?);
+    mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
 
@@ -6190,12 +6190,12 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
-    crate::stamped_lock::stamped_read_lock(addr?);
+    crate::stamped_lock::stamped_read_lock(addr);
     ctx.end_blocking_region();
-    mirror_stamped_state(ctx, parent, addr?);
+    mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
 
@@ -6206,9 +6206,9 @@ fn native_stamped_read_view_try_lock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
-    let stamp = crate::stamped_lock::stamped_try_read_lock(addr?);
-    mirror_stamped_state(ctx, parent, addr?);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
+    let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
+    mirror_stamped_state(ctx, parent, addr);
     Ok(Some(Value::Int(i32::from(stamp != 0))))
 }
 
@@ -6219,21 +6219,21 @@ fn native_stamped_read_view_unlock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
-    if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr?) {
+    let addr = stamped_addr_for_obj(ctx, parent)?;
+    if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "StampedLock read lock not held".to_string(),
         }
         .into());
     }
-    mirror_stamped_state(ctx, parent, addr?);
+    mirror_stamped_state(ctx, parent, addr);
     Ok(None)
 }
 
 fn native_stamped_optimistic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
     };
     Ok(Some(Value::Long(
         crate::stamped_lock::stamped_try_optimistic_read(addr),
@@ -6246,8 +6246,8 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Int(0))),
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Some(Value::Int(0))),
     };
     let valid = crate::stamped_lock::stamped_validate(addr, stamp);
     Ok(Some(Value::Int(i32::from(valid))))
@@ -6255,18 +6255,18 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_unlock_read(addr?);
-        mirror_stamped_state(ctx, obj, addr?);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
+        crate::stamped_lock::stamped_unlock_read(addr);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
 
 fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_unlock_write(addr?);
-        mirror_stamped_state(ctx, obj, addr?);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
+        crate::stamped_lock::stamped_unlock_write(addr);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
@@ -6305,15 +6305,15 @@ fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -
             .into())
         }
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let released = if stamp == 0 {
         // Stamp 0 is the JDK's "acquisition failed" sentinel and can never
         // name a held lock.
         false
     } else if stamp & 1 != 0 {
-        crate::stamped_lock::stamped_try_unstamped_unlock_write(addr?)
+        crate::stamped_lock::stamped_try_unstamped_unlock_write(addr)
     } else if stamp & 2 != 0 {
-        crate::stamped_lock::stamped_try_unstamped_unlock_read(addr?)
+        crate::stamped_lock::stamped_try_unstamped_unlock_read(addr)
     } else {
         // Neither mode bit set: an OPTIMISTIC observation stamp, which holds
         // nothing. The JDK throws IllegalMonitorStateException for it too.
@@ -6325,7 +6325,7 @@ fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         .into());
     }
-    mirror_stamped_state(ctx, obj, addr?);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(None)
 }
 
@@ -6334,14 +6334,14 @@ fn native_stamped_unstamped_unlock_read(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr?) {
+        let addr = stamped_addr_for_obj(ctx, obj)?;
+        if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
             return Err(RuntimeError::IllegalMonitorStateException {
                 message: "StampedLock read lock not held".to_string(),
             }
             .into());
         }
-        mirror_stamped_state(ctx, obj, addr?);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
@@ -6351,14 +6351,14 @@ fn native_stamped_unstamped_unlock_write(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr?) {
+        let addr = stamped_addr_for_obj(ctx, obj)?;
+        if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
             return Err(RuntimeError::IllegalMonitorStateException {
                 message: "StampedLock write lock not held".to_string(),
             }
             .into());
         }
-        mirror_stamped_state(ctx, obj, addr?);
+        mirror_stamped_state(ctx, obj, addr);
     }
     Ok(None)
 }
@@ -6367,9 +6367,9 @@ fn native_stamped_try_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_read(addr?);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_read(addr);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Int(i32::from(unlocked))))
 }
 
@@ -6380,9 +6380,9 @@ fn native_stamped_try_unlock_write(
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_write(addr?);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_write(addr);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Int(i32::from(unlocked))))
 }
 
@@ -6398,9 +6398,9 @@ fn native_stamped_try_convert_to_write(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let converted = crate::stamped_lock::stamped_try_convert_to_write(addr?, stamp);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let converted = crate::stamped_lock::stamped_try_convert_to_write(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
 }
 
@@ -6416,9 +6416,9 @@ fn native_stamped_try_convert_to_read(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
-    let converted = crate::stamped_lock::stamped_try_convert_to_read(addr?, stamp);
-    mirror_stamped_state(ctx, obj, addr?);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
+    let converted = crate::stamped_lock::stamped_try_convert_to_read(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
 }
 
@@ -6492,11 +6492,11 @@ fn native_stamped_try_read_lock_timed(
         None => return Ok(Some(Value::Long(0))),
     };
     let nanos = stamped_timeout_nanos(ctx, args);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     ctx.begin_blocking_region();
-    let stamp = crate::stamped_lock::stamped_try_read_lock_timed(addr?, nanos);
+    let stamp = crate::stamped_lock::stamped_try_read_lock_timed(addr, nanos);
     ctx.end_blocking_region();
-    mirror_stamped_state(ctx, obj, addr?);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
 
@@ -6509,18 +6509,18 @@ fn native_stamped_try_write_lock_timed(
         None => return Ok(Some(Value::Long(0))),
     };
     let nanos = stamped_timeout_nanos(ctx, args);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     ctx.begin_blocking_region();
-    let stamp = crate::stamped_lock::stamped_try_write_lock_timed(addr?, nanos);
+    let stamp = crate::stamped_lock::stamped_try_write_lock_timed(addr, nanos);
     ctx.end_blocking_region();
-    mirror_stamped_state(ctx, obj, addr?);
+    mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
 }
 
 fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Int(0))),
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(i32::from(
         crate::stamped_lock::stamped_is_locked(addr),
@@ -6529,8 +6529,8 @@ fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Int(0))),
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Some(Value::Int(0))),
     };
     let held = crate::stamped_lock::stamped_is_write_locked(addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
@@ -6541,8 +6541,8 @@ fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Int(0))),
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(i32::from(
         crate::stamped_lock::stamped_is_read_locked(addr),
@@ -6554,8 +6554,8 @@ fn native_stamped_get_read_lock_count(
     args: &[Value],
 ) -> MethodCallResult {
     let addr = match stamped_addr(ctx, args) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Int(0))),
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Some(Value::Int(0))),
     };
     Ok(Some(Value::Int(
         crate::stamped_lock::stamped_get_read_lock_count(addr),

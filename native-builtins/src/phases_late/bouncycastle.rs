@@ -3344,8 +3344,8 @@ pub(crate) fn bc_fp_alloc(
         _ => None,
     };
 
-    let x_obj = bi_alloc_int(ctx, x);
-    let x_pin = ctx.pin_native_root(x_obj?);
+    let x_obj = bi_alloc_int(ctx, x)?;
+    let x_pin = ctx.pin_native_root(x_obj);
     let obj_result = ctx.new_object("org/bouncycastle/math/ec/ECFieldElement$Fp");
     let result = match obj_result {
         Ok(Some(Value::Object(Some(obj)))) => {
@@ -3359,7 +3359,7 @@ pub(crate) fn bc_fp_alloc(
             ctx.set_field_by_name(
                 obj,
                 "x",
-                Value::Object(Some(ctx.read_native_pin(x_pin, x_obj?))),
+                Value::Object(Some(ctx.read_native_pin(x_pin, x_obj))),
             );
             Ok(obj)
         }

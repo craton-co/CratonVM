@@ -2715,49 +2715,49 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) -> Resul
         bi,
         "getWordInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)?)))),
     );
     r.register(
         bi,
         "getWordInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)?)))),
     );
     r.register(
         bi,
         "getSentenceInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE)?)))),
     );
     r.register(
         bi,
         "getSentenceInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_SENTENCE)?)))),
     );
     r.register(
         bi,
         "getCharacterInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER)?)))),
     );
     r.register(
         bi,
         "getCharacterInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_CHARACTER)?)))),
     );
     r.register(
         bi,
         "getLineInstance",
         "()Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)?)))),
     );
     r.register(
         bi,
         "getLineInstance",
         "(Ljava/util/Locale;)Ljava/text/BreakIterator;",
-        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE))))),
+        |ctx, _args| Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_LINE)?)))),
     );
     r.register(bi, "setText", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;

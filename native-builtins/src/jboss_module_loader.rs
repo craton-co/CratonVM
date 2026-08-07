@@ -1100,18 +1100,18 @@ fn synthesize_platform_module(
             .entry(name.to_string())
             .or_insert_with(|| resolved.clone());
     }
-    let module = build_module_object(ctx, name, loader, &resolved);
+    let module = build_module_object(ctx, name, loader, &resolved)?;
     // Same keep-alive + race-loser discipline as the normal loadModule tail.
-    ctx.register_var_handle_root(module?);
-    let mkey = ctx.identity_hash_code(module?);
+    ctx.register_var_handle_root(module);
+    let mkey = ctx.identity_hash_code(module);
     let mut cache = module_cache().lock();
     if let Some(&(ekey, existing)) = cache.get(name) {
         return Ok(Some(Value::Object(Some(
             ctx.read_var_handle_root(ekey).unwrap_or(existing),
         ))));
     }
-    cache.insert(name.to_string(), (mkey, module?));
-    Ok(Some(Value::Object(Some(module?))))
+    cache.insert(name.to_string(), (mkey, module));
+    Ok(Some(Value::Object(Some(module))))
 }
 
 pub(crate) fn native_loader_load_module(
@@ -3075,11 +3075,11 @@ pub(crate) fn native_module_get_module_loader(
     // (it allocates the loader singleton on the first call); `this` is
     // reused in the following `set_field` unpinned otherwise.
     let this_pin = ctx.pin_native_root(this);
-    let l = build_local_module_loader(ctx);
+    let l = build_local_module_loader(ctx)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    ctx.set_field(this, MOD_SLOT_LOADER, Value::Object(Some(l?)));
-    Ok(Some(Value::Object(Some(l?))))
+    ctx.set_field(this, MOD_SLOT_LOADER, Value::Object(Some(l)));
+    Ok(Some(Value::Object(Some(l))))
 }
 
 /// `Module.getBootModuleLoader()` / `Module.getCallerModuleLoader()` /

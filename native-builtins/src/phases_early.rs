@@ -12464,7 +12464,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let mut scope = NativeHandleScope::new(ctx);
         let this_h = scope.root(this);
         let addr =
-            crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0");
+            crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0")?;
         let addr_h = scope.root(addr);
         let addr_cur = scope.get(&addr_h);
         let host = p52_isa_host_from_addr(&mut *scope, addr_cur);
@@ -12513,7 +12513,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
                 &mut *scope,
                 &host_str,
                 &ip,
-            ))),
+            )?)),
             None => Value::Object(None),
         };
         let this_cur = scope.get(&this_h);
@@ -12551,7 +12551,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
                 &mut *scope,
                 "0.0.0.0",
                 "0.0.0.0",
-            ),
+            )?,
         };
         let addr_h = scope.root(addr);
         let addr_cur = scope.get(&addr_h);
@@ -12793,7 +12793,7 @@ fn phase52_socket_connect(
     host_value: Value,
     port_value: Value,
 ) -> MethodCallResult {
-    let sock = phase52_alloc_socket(ctx);
+    let sock = phase52_alloc_socket(ctx)?;
     let host = match host_value {
         Value::Object(Some(s)) => ctx
             .read_string(s)
@@ -12802,15 +12802,15 @@ fn phase52_socket_connect(
     };
     let port = port_value.as_int().unwrap_or(0);
     let host_obj = ctx.create_string(&host);
-    ctx.set_field(sock?, SOCK_HOST, Value::Object(Some(host_obj)));
-    ctx.set_field(sock?, SOCK_PORT, Value::Int(port));
+    ctx.set_field(sock, SOCK_HOST, Value::Object(Some(host_obj)));
+    ctx.set_field(sock, SOCK_PORT, Value::Int(port));
 
     match std::net::TcpStream::connect(format!("{host}:{port}")) {
         Ok(stream) => {
             let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
             let id = crate::servlet::s2_alloc_stream(stream);
-            ctx.set_field(sock?, SOCK_STREAM_ID, Value::Int(id));
-            ctx.set_field(sock?, SOCK_LOCAL_PORT, Value::Int(local_port));
+            ctx.set_field(sock, SOCK_STREAM_ID, Value::Int(id));
+            ctx.set_field(sock, SOCK_LOCAL_PORT, Value::Int(local_port));
             // FIX (SocketFactory.createSocket "not connected" split-brain):
             // `Socket.getOutputStream`/`getInputStream`/`isConnected` (registered
             // in net_phase_e.rs) read connect state from an identity-keyed side
@@ -12822,9 +12822,9 @@ fn phase52_socket_connect(
             // for real but every later side-table-backed accessor saw the
             // default stream_id=-1 ("not connected"). Populate it here too.
             crate::net_phase_e::sock_set_for_create_with_local_port(
-                ctx, sock?, port, local_port, id,
+                ctx, sock, port, local_port, id,
             );
-            Ok(Some(Value::Object(Some(sock?))))
+            Ok(Some(Value::Object(Some(sock))))
         }
         Err(e) => Err(RuntimeError::IOException {
             message: format!("SocketFactory.createSocket failed: {host}:{port}: {e}"),
@@ -12847,7 +12847,7 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         },
     );
     r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)))))
+        Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)?))))
     });
     r.register(
         sf,
@@ -17419,7 +17419,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) -> Result<(
                 // instance slot 0 (the typed `holder` reference field) is what
                 // poisoned real-JDK InetAddress bytecode dispatch.
                 let addr =
-                    crate::net_phase_e::alloc_inet_address_for_input(ctx, &host_str, &host_str);
+                    crate::net_phase_e::alloc_inet_address_for_input(ctx, &host_str, &host_str)?;
                 Ok(Some(Value::Object(Some(addr))))
             } else {
                 Ok(Some(Value::Object(None)))

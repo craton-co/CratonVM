@@ -1521,7 +1521,7 @@ fn jar_entry_value_from_archive<R: std::io::Read + std::io::Seek>(
             let method = entry.compression().to_u16() as i32;
             (name, size, csize, method)
         }
-        Err(_) => return Value::Object(None),
+        Err(_) => return Ok(Value::Object(None)),
     };
     let je = try_alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4)?;
     let name_s = ctx.create_string(&name);
@@ -1691,16 +1691,16 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value,
         .or_else(|| ext.strip_prefix("jar:"))
     {
         Some(a) => a,
-        None => return Value::Object(None),
+        None => return Ok(Value::Object(None)),
     };
     let mut parts = after.splitn(2, "!/");
     let jar_raw = match parts.next() {
         Some(p) => p.trim_start_matches("file:"),
-        None => return Value::Object(None),
+        None => return Ok(Value::Object(None)),
     };
     let entry_name = match parts.next() {
         Some(e) if !e.is_empty() => e,
-        _ => return Value::Object(None),
+        _ => return Ok(Value::Object(None)),
     };
     // Tomcat `war:` nested-jar case (see `war_nested_jar_bytes`): the jar
     // component is packaged inside a WAR rather than sitting directly on
@@ -1709,7 +1709,7 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value,
         let cursor = std::io::Cursor::new(bytes.as_slice());
         let mut archive = match zip::ZipArchive::new(cursor) {
             Ok(a) => a,
-            Err(_) => return Value::Object(None),
+            Err(_) => return Ok(Value::Object(None)),
         };
         return Ok(jar_entry_value_from_archive(ctx, &mut archive, entry_name)?);
     }
@@ -1723,11 +1723,11 @@ fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Result<Value,
     };
     let file = match std::fs::File::open(&disk) {
         Ok(f) => f,
-        Err(_) => return Value::Object(None),
+        Err(_) => return Ok(Value::Object(None)),
     };
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
-        Err(_) => return Value::Object(None),
+        Err(_) => return Ok(Value::Object(None)),
     };
     // Extract the entry metadata into owned values, then drop the `archive`
     // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
@@ -2822,7 +2822,7 @@ fn uri_resolve_ref(base: &str, reference: &str) -> String {
         t_query = r_query;
     } else if r_path.is_empty() {
         t_auth = b_auth.clone();
-        t_path = b_path.clone();
+        t_path = Ok(b_path.clone());
         t_query = r_query.or(b_query);
     } else {
         t_auth = b_auth.clone();
@@ -3482,7 +3482,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
             return Ok(Some(Value::Object(Some(this))));
         }
         let recomposed = uri_recompose(&scheme, &authority, &norm, &query, &fragment);
-        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
+        Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
     });
 
     // resolve(URI) → RFC 3986 §5.2 reference resolution. The previous
@@ -3503,7 +3503,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
             let resolved = uri_resolve_ref(&base, &reference);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
         },
     );
 
@@ -3521,7 +3521,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
                 _ => return Ok(Some(Value::Object(Some(this)))),
             };
             let resolved = uri_resolve_ref(&base, &reference);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &resolved)?))))
         },
     );
 
@@ -3558,14 +3558,14 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
             }
             let rel = &t_norm[b_norm?.len()..];
             if rel.is_empty() {
-                return Ok(Some(Value::Object(Some(make_uri(ctx, "")))));
+                return Ok(Some(Value::Object(Some(make_uri(ctx, "")?))));
             }
             if !b_norm?.ends_with('/') && !rel.starts_with('/') {
                 return Ok(Some(Value::Object(Some(other))));
             }
             let rel = rel.strip_prefix('/').unwrap_or(rel);
             let recomposed = uri_recompose(&None, &None, rel, &t_query, &t_frag);
-            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &recomposed)?))))
         },
     );
 
@@ -3615,7 +3615,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFa
                     "Expected scheme-specific part at index {pos}: {s}"
                 )));
             }
-            Ok(Some(Value::Object(Some(make_uri(ctx, &s)))))
+            Ok(Some(Value::Object(Some(make_uri(ctx, &s)?))))
         },
     );
     Ok(())
@@ -4101,7 +4101,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return;
+        return Ok(());
     }
     let sock = "java/net/Socket";
 
@@ -4716,13 +4716,13 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) -> Result<(), MethodCallFai
             // over-reporting is not.
             let mut buf = [0u8; 8192];
             match stream.peek(&mut buf) {
-                Ok(n) => n as i32,
+                Ok(n) => Ok(n as i32),
                 // Readiness raced away (a concurrent reader drained the
                 // queue). A snapshot estimate of 0 is correct again.
-                Err(_) => 0,
+                Err(_) => Ok(0),
             }
         })
-        .unwrap_or(0);
+        .unwrap_or(Ok(0))?;
         Ok(Some(Value::Int(avail)))
     });
 
@@ -5172,7 +5172,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) -> Result<(), Method
     // surface so real bytecode drives sun/nio/ch/Net. See
     // register_phase53_socket_stubs.
     if crate::vmflags().io.real_net_sockets {
-        return;
+        return Ok(());
     }
     // Install the plain-`ServerSocket` handler set for native-io's winning
     // `ss_wrapper_*` natives to delegate to (BUG-04). Every method native-io
@@ -5505,7 +5505,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) -> Result<(), Method
                 alloc_inet_address(ctx, &ip, &ip)
             } else {
                 alloc_inet_address_unnamed(ctx, &ip)
-            };
+            }?;
             Ok(Some(Value::Object(Some(ia))))
         },
     );
@@ -8238,7 +8238,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) -> Result<(), MethodCallF
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let ext = jar_url_conn_ext(ctx, this);
-            Ok(Some(jar_url_lookup_entry(ctx, &ext)))
+            Ok(Some(jar_url_lookup_entry(ctx, &ext)?))
         },
     );
     // java/net/JarURLConnection.getEntryName() — the entry path inside the jar
@@ -9938,7 +9938,7 @@ fn re5_replay_subscription_request(
     ctx.set_field(this_now, RE5_SUB_SUBSCRIBER, Value::Object(None));
     ctx.set_field(this_now, RE5_SUB_BODY, Value::Object(None));
     ctx.unpin_native_roots(this_pin);
-    result
+    Ok(result)
 }
 
 /// `Flow.Subscription.cancel()` for the one-shot replay subscription: mark
@@ -10660,17 +10660,17 @@ fn re5_do_request(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 _ => None,
             };
             let out =
-                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED);
+                re5_build_response(ctx, resp.status, &resp.headers, &resp.body, RE5_TAG_HANDLED)?;
             let body_obj_now = match body_obj_pin {
                 Some((pin, o)) => Value::Object(Some(ctx.read_native_pin(pin, o))),
                 None => Value::Object(None),
             };
-            ctx.set_field(out?, RE5_RESP_BODY_OBJ, body_obj_now);
+            ctx.set_field(out, RE5_RESP_BODY_OBJ, body_obj_now);
             ctx.unpin_native_roots(handler_pin);
-            out
+            Ok(out)
         }
     };
-    Ok(Some(Value::Object(Some(out?))))
+    Ok(Some(Value::Object(Some(out))))
 }
 
 /// Extract the full external-form string from a `java.net.URI` and return it as
@@ -14156,7 +14156,7 @@ fn re8_all_interfaces(ctx: &mut dyn NativeContext) -> ObjectRef {
     let mut pinned: Vec<(usize, ObjectRef)> = Vec::new();
     let mut base_pin: Option<usize> = None;
     for host in &hosts {
-        if let Some(iface) = re8_make_interface(ctx, host) {
+        if let Ok(Some(iface)) = re8_make_interface(ctx, host) {
             let pin = ctx.pin_native_root(iface);
             if base_pin.is_none() {
                 base_pin = Some(pin);
@@ -14207,7 +14207,7 @@ fn re8_find_interface(
         };
     }
     let host = hosts.into_iter().find(select)?;
-    re8_make_interface(ctx, &host)
+    re8_make_interface(ctx, &host)?
 }
 
 /// Build the single REAL-layout loopback `NetworkInterface` ("lo", index 1,
@@ -15286,7 +15286,7 @@ fn re10_authenticate(
         &[],
     ) {
         Ok(Some(Value::Object(Some(a)))) => a,
-        _ => return AuthGate::Proceed,
+        _ => return Ok(AuthGate::Proceed),
     };
     // Pinned from here on; `unpin_native_roots(auth_pin)` at the end releases
     // this and the result (both pinned after the caller's batch, so the
@@ -15497,7 +15497,7 @@ fn re10_dispatch_pending(
                 let hctx = ctx.read_native_pin(hctx_pin, hctx0);
                 let gate = re10_authenticate(ctx, hctx, ex_pin, ex0);
                 match gate {
-                    AuthGate::Proceed => {
+                    Ok(AuthGate::Proceed) => {
                         // Re-read both pinned roots immediately before the invoke
                         // (the exchange-build allocations above, and any
                         // authenticator bytecode, may have relocated them).
@@ -15510,7 +15510,7 @@ fn re10_dispatch_pending(
                             &[Value::Object(Some(ex))],
                         );
                     }
-                    AuthGate::Reject(code) => {
+                    Ok(AuthGate::Reject(code)) => {
                         // Same idiom as the `HttpHandler.handle` backstop in
                         // `phases_late::net_channels`: report the status through
                         // the exchange's own natives (`-1` = no response body)

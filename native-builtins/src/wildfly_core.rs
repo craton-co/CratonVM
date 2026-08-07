@@ -1091,7 +1091,7 @@ fn native_services_deployment_unit_name(
     let sn = wildfly_deployment_unit_name(&name);
     // R80: must populate `name` + `hashCode` (not just `canonicalName`) so
     // JDK `ServiceName.equals` does not NPE on `this.name == null`.
-    let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
+    let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn)?;
     // FIX: `alloc_java_service_name` writes the full dotted name via
     // `set_field_by_name(obj, "canonicalName", ..)` and the leaf segment via
     // `set_field_by_name(obj, "name", ..)`. The canonical-state slot for a
@@ -1104,8 +1104,8 @@ fn native_services_deployment_unit_name(
     // dotted name into the canonical slot explicitly so the mirror always holds
     // the complete hierarchical service name.
     let canonical = ctx.create_string(sn.canonical());
-    ctx.set_field(obj?, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
-    Ok(Some(Value::Object(Some(obj?))))
+    ctx.set_field(obj, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 fn native_deployment_unit_get_name(
@@ -1138,15 +1138,15 @@ fn native_deployment_unit_get_service_name(
                 _ => String::new(),
             };
             let sn = wildfly_deployment_unit_name(&name);
-            let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
+            let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn)?;
             // FIX: same canonical-slot truncation as in
             // `native_services_deployment_unit_name` — anchor the full dotted
             // name into the canonical slot so readers of slot 1 see
             // `jboss.deployment.unit.<archive>` rather than just the leaf
             // segment.
             let canonical = ctx.create_string(sn.canonical());
-            ctx.set_field(obj?, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
-            Ok(Some(Value::Object(Some(obj?))))
+            ctx.set_field(obj, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
+            Ok(Some(Value::Object(Some(obj))))
         }
     }
 }

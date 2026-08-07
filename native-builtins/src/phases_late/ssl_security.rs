@@ -1864,7 +1864,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
                              SSLContext, falling back to the process default"
                         );
                     }
-                    crate::t27_tls::default_ssl_context_or_create(ctx)
+                    crate::t27_tls::default_ssl_context_or_create(ctx)?
                 }
             };
             // Same trust-anchor/TrustManager resolution `new13_do_create_socket`
@@ -2577,7 +2577,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         |ctx, _args| {
             Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
                 ctx,
-            )))))
+            )?))))
         },
     );
     r.register(
@@ -2587,7 +2587,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
         |ctx, _args| {
             Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
                 ctx,
-            )))))
+            )?))))
         },
     );
     r.register(
@@ -2658,7 +2658,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) -> Result<(), Metho
             // whatever the connection had actually negotiated, so it was a
             // guess presented as a fact, not merely an imprecise default.
             let negotiated =
-                if let Value::Object(Some(session)) = new13_resolve_socket_session(ctx, this) {
+                if let Ok(Value::Object(Some(session))) = new13_resolve_socket_session(ctx, this) {
                     match ctx.get_field(session, NEW13_SESS_PROTO) {
                         Value::Object(Some(s)) => ctx.read_string(s),
                         _ => None,
@@ -4921,7 +4921,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) -> Result
             // be resolved (e.g. pure-synthetic mode, or an exotic type
             // nothing seeds).
             if crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real() {
-                if let Some(real_cf) =
+                if let Ok(Some(real_cf)) =
                     crate::jca::provider_chain::try_build_real_certificate_factory(ctx, args)
                 {
                     return Ok(Some(Value::Object(Some(real_cf))));
@@ -5060,7 +5060,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) -> Result
                     .map(|(subject, _)| subject)
                     .unwrap_or_else(|| "CN=Unknown".into());
                 return Ok(Some(Value::Object(Some(
-                    crate::keystore::make_x509_mirror(ctx, &alias, &data),
+                    crate::keystore::make_x509_mirror(ctx, &alias, &data)?,
                 ))));
             }
 

@@ -1768,15 +1768,15 @@ fn p58_make_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(arr))) => Some(*arr),
         _ => None,
     };
-    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants);
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants)?;
     // Set the call-site type from the caller-supplied MethodType so JDK
     // arity-validation reads see the real shape.
     if let Some(Value::Object(Some(mt))) = args.get(2) {
-        ctx.set_field_by_name(mh?, "type", Value::Object(Some(*mt)));
+        ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
     let cs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
-    ctx.set_field(cs, 0, Value::Object(Some(mh?)));
-    ctx.set_field_by_name(cs, "target", Value::Object(Some(mh?)));
+    ctx.set_field(cs, 0, Value::Object(Some(mh)));
+    ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
 }
 
@@ -1799,13 +1799,13 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     let recipe: String = std::iter::repeat('\u{0001}').take(arity).collect();
-    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None);
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None)?;
     if let Some(Value::Object(Some(mt))) = args.get(2) {
-        ctx.set_field_by_name(mh?, "type", Value::Object(Some(*mt)));
+        ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
     let cs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
-    ctx.set_field(cs, 0, Value::Object(Some(mh?)));
-    ctx.set_field_by_name(cs, "target", Value::Object(Some(mh?)));
+    ctx.set_field(cs, 0, Value::Object(Some(mh)));
+    ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
 }
 
@@ -2448,7 +2448,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) -> Result<(), M
     // executable, the way the real `ProcessHandleImpl.Info` does.
     r.register(phi, "command", "()Ljava/util/Optional;", |ctx, args| {
         let Ok(exe) = std::env::current_exe() else {
-            return Ok(p60_empty_optional(ctx, args));
+            return Ok(p60_empty_optional(ctx, args)?);
         };
         // GC-SAFETY (native stale-local family): `text` is freshly allocated
         // and reachable from no Java root, and the `Optional` allocation below
@@ -3018,7 +3018,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) -> Result<(
             match ctx.find_resource(resource_name) {
                 None => Ok(Some(Value::Object(None))),
                 Some(bytes) => Ok(Some(Value::Object(Some(
-                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes),
+                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes)?,
                 )))),
             }
         },
@@ -6735,7 +6735,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
             let a = bi_read(ctx, obj_arg(args, 0)?);
             let b = bi_read(ctx, obj_arg(args, 1)?);
             let g = bi_gcd_str(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)?))))
         },
     );
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
@@ -6758,7 +6758,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         } else {
             v.shr(n.unsigned_abs())
         };
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
     });
     r.register(
         bi,
@@ -6775,7 +6775,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
             } else {
                 v.shl(n.unsigned_abs())
             };
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
     );
     // Bitwise and/or/xor/not via limb BigInt with FULL two's-complement
@@ -6791,7 +6791,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))?))))
         },
     );
     r.register(
@@ -6801,7 +6801,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))?))))
         },
     );
     r.register(
@@ -6811,12 +6811,12 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))?))))
         },
     );
     r.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
         let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())?))))
     });
     r.register(bi, "testBit", "(I)Z", |ctx, args| {
         let v = bi_read_int(ctx, obj_arg(args, 0)?);
@@ -6970,7 +6970,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
             if !exp_int.is_neg() {
                 let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
                 let res = base_int.modpow(&exp_int, &m_int);
-                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))));
+                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))));
             }
             // Negative exponent is rare (modInverse-based); keep the decimal
             // path until step 5 lands a limb modInverse.
@@ -6984,7 +6984,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
             })?;
             let pos_exp = exp.trim_start_matches('-');
             let res = bi_mod_pow_str(&inv, pos_exp, &m);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)?))))
         },
     );
     r.register(
@@ -7001,7 +7001,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
                 .into());
             }
             match a.mod_inverse(&m) {
-                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv))))),
+                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv)?)))),
                 None => Err(RuntimeError::ArithmeticException {
                     message: "BigInteger not invertible.".into(),
                 }
@@ -7026,7 +7026,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))?))))
         },
     );
     r.register(
@@ -7036,7 +7036,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))?))))
         },
     );
     r.register(
@@ -7046,7 +7046,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))?))))
         },
     );
     r.register(
@@ -7062,7 +7062,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))?))))
         },
     );
     r.register(
@@ -7078,7 +7078,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))?))))
         },
     );
     r.register(
@@ -7094,7 +7094,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) -> Re
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))?))))
         },
     );
 

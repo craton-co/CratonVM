@@ -1932,9 +1932,9 @@ fn native_future_result_set_result(
     inner.cv.notify_all();
 
     // Rebuild a JVM-facing IoFuture object for the fire path.
-    let fut_obj = alloc_io_future(ctx, inner.clone());
+    let fut_obj = alloc_io_future(ctx, inner.clone())?;
     for e in &notifiers {
-        IoFutureInner::fire_notifier(ctx, fut_obj?, e);
+        IoFutureInner::fire_notifier(ctx, fut_obj, e);
     }
     Ok(Some(Value::Int(1)))
 }
@@ -1983,9 +1983,9 @@ fn native_future_result_set_exception(
     }
     let notifiers = inner.drain_notifiers();
     inner.cv.notify_all();
-    let fut_obj = alloc_io_future(ctx, inner.clone());
+    let fut_obj = alloc_io_future(ctx, inner.clone())?;
     for e in &notifiers {
-        IoFutureInner::fire_notifier(ctx, fut_obj?, e);
+        IoFutureInner::fire_notifier(ctx, fut_obj, e);
     }
     Ok(Some(Value::Int(1)))
 }
@@ -2011,9 +2011,9 @@ fn native_future_result_set_cancelled(
     }
     let notifiers = inner.drain_notifiers();
     inner.cv.notify_all();
-    let fut_obj = alloc_io_future(ctx, inner.clone());
+    let fut_obj = alloc_io_future(ctx, inner.clone())?;
     for e in &notifiers {
-        IoFutureInner::fire_notifier(ctx, fut_obj?, e);
+        IoFutureInner::fire_notifier(ctx, fut_obj, e);
     }
     Ok(Some(Value::Int(1)))
 }
