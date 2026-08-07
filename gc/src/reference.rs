@@ -1064,6 +1064,69 @@ impl ReferenceProcessor {
         }
     }
 
+    /// Retire the registry's bookkeeping entry for a `Reference` the
+    /// application just enqueued *itself*, via an explicit `Reference.enqueue()`
+    /// call (as opposed to the GC discovering the referent dead).
+    ///
+    /// PGJDBC-PHANTOM-GHOST (2026-08-07). `Reference.enqueue()` is a public,
+    /// unconditional JDK API: it queues the `Reference` regardless of whether
+    /// its referent is still reachable. Real code uses this — e.g. pgjdbc's
+    /// `SimpleQuery.setCleanupRef`/`unprepare()` retire the *previous*
+    /// `PhantomReference` wrapping a still-alive, about-to-be-reprepared
+    /// `SimpleQuery` by calling `oldRef.clear(); oldRef.enqueue();` before
+    /// installing a *new* `PhantomReference` around the SAME referent. Both
+    /// the old and new `PhantomReference` objects are registered with this
+    /// processor at construction time (`discover_reference`), and both share
+    /// the same `referent` address.
+    ///
+    /// The native `Reference.enqueue()` path (`native_ref_enqueue` in
+    /// `native-builtins/src/reference.rs`) physically links the Reference onto
+    /// its `ReferenceQueue`'s Java-visible linked list directly (or, for a
+    /// real-JDK-layout Reference, by invoking the JDK's own
+    /// `ReferenceQueue.enqueue()` bytecode) — but until this fix, it never told
+    /// *this* registry that the reference had been handled. The stale entry
+    /// (`enqueued: false`) sat in `phantom_refs` (or `weak_refs`) until its own
+    /// `Reference` object was later collected. If the shared referent (the
+    /// `SimpleQuery`) outlived that window — entirely realistic for a
+    /// long-lived, repeatedly-reprepared statement — the GC's own
+    /// `process_phantom_refs` would eventually discover the referent dead and
+    /// enqueue EVERY still-registered entry pointing at it, including the
+    /// STALE one the application had already drained, removed from its own
+    /// bookkeeping (e.g. `parsedQueryMap.remove(ref)`), and forgotten about. A
+    /// second, unsolicited queue delivery of an already-fully-processed
+    /// `Reference` is a ghost: `ReferenceQueue.poll()` legitimately returns
+    /// non-null, but nothing recognises it any more — pgjdbc's
+    /// `QueryExecutorImpl.processDeadParsedQueries()` observed exactly this as
+    /// `parsedQueryMap.remove(ref)` returning `null`, feeding a `null`
+    /// statement name into `sendCloseStatement` and NPEing on
+    /// `statementName.getBytes(...)`.
+    ///
+    /// Marking the entry `cleared = true` and `enqueued = true` here (without
+    /// touching `pending_queues` — the application already performed the real
+    /// enqueue itself) makes every processing phase's re-entry guard
+    /// (`process_weak_refs` gates on `cleared`; `process_phantom_refs` gates on
+    /// `enqueued`) skip it on every subsequent cycle, so it is never
+    /// rediscovered and delivered a second time. Returns whether a matching
+    /// entry was found (informational only; a caller with no matching entry —
+    /// e.g. `Reference.enqueue()` on a `Reference` this processor never saw
+    /// `discover_reference`d, such as one constructed with a null referent —
+    /// has nothing to retire and that is not an error).
+    pub fn mark_manually_enqueued(&mut self, reference_obj: usize) -> bool {
+        for list in [
+            &mut self.weak_refs,
+            &mut self.soft_refs,
+            &mut self.phantom_refs,
+            &mut self.cleaner_refs,
+        ] {
+            if let Some(entry) = list.iter_mut().find(|e| e.reference_obj == reference_obj) {
+                entry.cleared = true;
+                entry.enqueued = true;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Return reference_obj addresses of all entries whose referent was cleared.
     /// The caller should null the referent field (field 0) on each of these objects.
     pub fn cleared_ref_objects(&self) -> Vec<usize> {
