@@ -36536,85 +36536,150 @@ pub fn gc_overlay_roots_for_collection_with_keys(
     }
 
     let mut roots = Vec::new();
-    for key in keys {
-        if let Some(state) = hm_int_fast_shard_for(key)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            for (entry_key, value) in state.entries.values() {
-                roots.push(entry_key);
-                if let Value::Object(Some(object)) = value {
-                    roots.push(object);
-                }
+    push_overlay_roots_for_keys(&keys, &mut roots);
+    roots
+}
+
+/// Append every overlay reference registered under `keys` to `roots`.
+///
+/// PERF (overlay-root-batch). Each overlay table is locked ONCE for the whole
+/// key list rather than once per key. The per-key form cost `7 * K` mutex
+/// acquisitions, and `gc_overlay_roots_for_matching_owners` drives `K` to the
+/// key count of the entire index on every minor GC — thousands, for a Spring
+/// context. Batched, the acquisition count is bounded by the number of TABLES
+/// (six global, plus at most `HM_INT_FAST_SHARDS` shards) and no longer grows
+/// with `K`. This is the same batching shape `gc_prune_dead_collection_overlays`
+/// already uses for its removals.
+///
+/// DEADLOCK. Only one table's guard is ever held at a time, exactly as in the
+/// per-key form — the hoist widens each guard's lifetime but never nests two,
+/// so it introduces no lock ORDER to violate.
+///
+/// ORDER. Roots now arrive grouped by table rather than interleaved per key.
+/// That is safe: the collector forwards each root independently, forwarding is
+/// idempotent, and duplicates were already possible whenever two owners shared
+/// a key.
+fn push_overlay_roots_for_keys(keys: &[usize], roots: &mut Vec<ObjectRef>) {
+    if keys.is_empty() {
+        return;
+    }
+
+    fn push_hm_int_fast_roots(state: &HmIntFastState, roots: &mut Vec<ObjectRef>) {
+        for (entry_key, value) in state.entries.values() {
+            roots.push(entry_key);
+            if let Value::Object(Some(object)) = value {
+                roots.push(object);
             }
-        }
-        if let Some(inner) = ll_overlay()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            for value in inner.values() {
-                if let Value::Object(Some(object)) = value {
-                    roots.push(*object);
-                }
-            }
-        }
-        if let Some(inner) = lhm_overlay()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            for value in inner.values() {
-                if let Value::Object(Some(object)) = value {
-                    roots.push(*object);
-                }
-            }
-        }
-        if let Some(state) = tm_array_table()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            if let Some(data) = state.data {
-                roots.push(data);
-            }
-            if let Value::Object(Some(comparator)) = state.comparator {
-                roots.push(comparator);
-            }
-        }
-        if let Some(entries) = tm_fast_table()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            for value in entries.values() {
-                if let Value::Object(Some(object)) = value {
-                    roots.push(*object);
-                }
-            }
-        }
-        if let Some(state) = ts_array_table()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            if let Some(data) = state.data {
-                roots.push(data);
-            }
-            if let Value::Object(Some(comparator)) = state.comparator {
-                roots.push(comparator);
-            }
-        }
-        if let Some(comparator) = cslm_comparator_table()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            roots.push(*comparator);
         }
     }
-    roots
+
+    // `hm_int_fast` is sharded BY KEY, so it cannot collapse to one
+    // acquisition — group the keys by shard instead and lock each shard that
+    // has any (a shard with no keys is never locked), the same grouping
+    // `gc_prune_dead_collection_overlays` does for its dead keys. Short key
+    // lists skip the grouping: `gc_overlay_roots_for_collection` runs per owner
+    // inside the major marker's BFS, typically with a single key, where
+    // building 64 buckets would cost more than the acquisitions it saves.
+    if keys.len() <= 4 {
+        for key in keys {
+            if let Some(state) = hm_int_fast_shard_for(*key)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(key)
+            {
+                push_hm_int_fast_roots(state, roots);
+            }
+        }
+    } else {
+        let mut by_shard: [Vec<usize>; HM_INT_FAST_SHARDS] = std::array::from_fn(|_| Vec::new());
+        for key in keys {
+            by_shard[hm_int_fast_shard_index(*key)].push(*key);
+        }
+        for (shard, shard_keys) in hm_int_fast_shards().iter().zip(by_shard.iter()) {
+            if shard_keys.is_empty() {
+                continue;
+            }
+            let table = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for key in shard_keys {
+                if let Some(state) = table.get(key) {
+                    push_hm_int_fast_roots(state, roots);
+                }
+            }
+        }
+    }
+
+    {
+        let table = ll_overlay().lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(inner) = table.get(key) {
+                for value in inner.values() {
+                    if let Value::Object(Some(object)) = value {
+                        roots.push(*object);
+                    }
+                }
+            }
+        }
+    }
+    {
+        let table = lhm_overlay().lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(inner) = table.get(key) {
+                for value in inner.values() {
+                    if let Value::Object(Some(object)) = value {
+                        roots.push(*object);
+                    }
+                }
+            }
+        }
+    }
+    {
+        let table = tm_array_table().lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(state) = table.get(key) {
+                if let Some(data) = state.data {
+                    roots.push(data);
+                }
+                if let Value::Object(Some(comparator)) = state.comparator {
+                    roots.push(comparator);
+                }
+            }
+        }
+    }
+    {
+        let table = tm_fast_table().lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(entries) = table.get(key) {
+                for value in entries.values() {
+                    if let Value::Object(Some(object)) = value {
+                        roots.push(*object);
+                    }
+                }
+            }
+        }
+    }
+    {
+        let table = ts_array_table().lock().unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(state) = table.get(key) {
+                if let Some(data) = state.data {
+                    roots.push(data);
+                }
+                if let Value::Object(Some(comparator)) = state.comparator {
+                    roots.push(comparator);
+                }
+            }
+        }
+    }
+    {
+        let table = cslm_comparator_table()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for key in keys {
+            if let Some(comparator) = table.get(key) {
+                roots.push(*comparator);
+            }
+        }
+    }
 }
 
 /// Return overlay references whose owners satisfy `owner_matches`.
@@ -36627,31 +36692,37 @@ pub fn gc_overlay_roots_for_collection_with_keys(
 pub fn gc_overlay_roots_for_matching_owners(
     owner_matches: &dyn Fn(usize) -> bool,
 ) -> Vec<ObjectRef> {
-    // ONE acquisition of `overlay_owner_keys`, taking each matching owner's key
-    // list in the same pass that selects it. This previously locked here to
-    // list the owners and then re-locked once per owner inside
+    // ONE acquisition of `overlay_owner_keys`, collecting every matching
+    // owner's keys in the same pass that selects them. This previously locked
+    // here to list the owners and then re-locked once per owner inside
     // `gc_overlay_roots_for_collection` — `1 + N` acquisitions of one global
     // mutex, plus `N` clones of the same key lists, on every minor GC.
-    let selected: Vec<(usize, Vec<usize>)> = {
+    //
+    // The keys are FLATTENED rather than kept per owner because no per-owner
+    // work survives the collection: this path passes no class id (see below),
+    // so nothing downstream distinguishes one owner's keys from another's. One
+    // flat list is what lets `push_overlay_roots_for_keys` sweep each overlay
+    // table once for the whole GC instead of once per owner — with per-owner
+    // batching alone the table lock count would still be `6 * N`.
+    //
+    // No class id: this seed is address-based by construction — the predicate
+    // selects owners by generation/range, and no class id is available for
+    // them. It is already a deliberate over-approximation ("retain the edges of
+    // every current owner"), so skipping the recycled-owner check here only
+    // over-retains, which is this path's existing contract. The precise
+    // per-owner rule runs in the BFS, which does pass a class id.
+    let keys: Vec<usize> = {
         let index = overlay_owner_keys()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         index
             .iter()
             .filter(|(owner, _)| owner_matches(**owner))
-            .map(|(owner, keys)| (*owner, keys.clone()))
+            .flat_map(|(_, keys)| keys.iter().copied())
             .collect()
     };
     let mut roots = Vec::new();
-    for (owner, keys) in selected {
-        // `None`: this seed is address-based by construction — the predicate
-        // selects owners by generation/range, and no class id is available for
-        // them. It is already a deliberate over-approximation ("retain the
-        // edges of every current owner"), so skipping the recycled-owner check
-        // here only over-retains, which is this path's existing contract. The
-        // precise per-owner rule runs in the BFS, which does pass a class id.
-        roots.extend(gc_overlay_roots_for_collection_with_keys(owner, None, keys));
-    }
+    push_overlay_roots_for_keys(&keys, &mut roots);
     roots
 }
 
