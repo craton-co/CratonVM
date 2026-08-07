@@ -2257,6 +2257,15 @@ impl VmHeap {
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
         // ("per-cycle coverage proof, moving is possible") disagreement for
         // THIS run — see `docs/gc/tlab-and-card-audit.md` §3.
+        //
+        // Under G1 this used to be uninformative by construction:
+        // `G1Collector::collect_garbage` passed the constant
+        // `incomplete_reason::NONE`, so the record said "the backend always
+        // evacuates" and nothing else, whatever the root scan had found. It now
+        // carries the obligation that actually failed, and
+        // `collector_decision_report` appends the `[GC] g1 root coverage:` rate
+        // — which is what makes "was this pause's root set complete?" a
+        // question a log answers instead of a crash dump.
         eprintln!("{}", crate::gc_metrics::collector_decision_report());
         // Card / remembered-set costs, raw and normalized per allocated object
         // and per live byte.

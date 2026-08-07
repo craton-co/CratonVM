@@ -547,9 +547,20 @@ pub mod decision_reason {
     pub const NON_MOVING_BACKEND_HAS_NO_YOUNG_COPY: u8 = 8;
     /// The backend always evacuates its collection set (G1).
     pub const MOVING_BACKEND_ALWAYS_EVACUATES: u8 = 9;
+    /// G1 declined to evacuate anything this pause because this collection's
+    /// JIT root set is known to be incomplete, so the collector cannot know
+    /// which regions hold an object whose only reference it failed to
+    /// enumerate. The [`crate::gc_quiescence::incomplete_reason`] code on the
+    /// record names the obligation that failed.
+    ///
+    /// This is G1's analogue of the generational collector's
+    /// [`NON_MOVING_COVERAGE_INCOMPLETE`] diversion — G1 has no non-moving
+    /// young sweep to divert *to*, so the fail-safe is an empty collection
+    /// set: the pause reclaims nothing and every object stays at its address.
+    pub const NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE: u8 = 10;
 
     /// One past the highest defined code.
-    pub const COUNT: u8 = 10;
+    pub const COUNT: u8 = 11;
 
     /// Human-readable label.
     pub fn label(code: u8) -> &'static str {
@@ -564,6 +575,7 @@ pub mod decision_reason {
             NON_MOVING_EXPLICIT_FULL_GC => "nonmoving-explicit-full-gc",
             NON_MOVING_BACKEND_HAS_NO_YOUNG_COPY => "nonmoving-backend-has-no-young-copy",
             MOVING_BACKEND_ALWAYS_EVACUATES => "moving-backend-always-evacuates",
+            NON_MOVING_G1_ROOT_COVERAGE_INCOMPLETE => "g1-no-evacuation-root-coverage-incomplete",
             _ => "unknown",
         }
     }
@@ -879,6 +891,18 @@ pub fn collector_decision_report() -> String {
         s.push('\n');
         s.push_str(&g1.to_string());
     }
+    // How often G1 found this collection's JIT root set incomplete. A rate
+    // near zero says the empty-CSet fail-safe costs nothing; a high rate says
+    // reclamation is being throttled by an unproven coverage obligation and
+    // the histogram row names which one.
+    let (g1_pauses, g1_incomplete) = g1_pause_coverage_counts();
+    if g1_pauses > 0 {
+        s.push('\n');
+        s.push_str(&format!(
+            "[GC] g1 root coverage: pauses={g1_pauses} incomplete={g1_incomplete}              ({:.2}%)",
+            100.0 * g1_incomplete as f64 / g1_pauses as f64,
+        ));
+    }
     s
 }
 
@@ -932,6 +956,13 @@ pub mod g1_degraded {
     pub const PARALLEL_EVACUATOR: u32 = 1 << 7;
     /// The collection set came out empty, so the pause did nothing.
     pub const EMPTY_COLLECTION_SET: u32 = 1 << 8;
+    /// The collection set was forced empty because this collection's JIT root
+    /// set is known-incomplete: at least one live compiled frame could not be
+    /// enumerated, so no region can be proven free of an object whose only
+    /// reference the collector never saw. Always accompanies
+    /// [`EMPTY_COLLECTION_SET`]; it distinguishes "there was nothing to
+    /// collect" from "the collector was not allowed to collect".
+    pub const ROOT_COVERAGE_INCOMPLETE: u32 = 1 << 9;
 
     /// Every defined bit. A flag outside this mask is a programming error and
     /// is rejected by `record_g1_cycle`'s `debug_assert!`.
@@ -943,7 +974,8 @@ pub mod g1_degraded {
         | JNI_PINNED_REGIONS_EXCLUDED
         | JIT_PINNED_REGIONS_EXCLUDED
         | PARALLEL_EVACUATOR
-        | EMPTY_COLLECTION_SET;
+        | EMPTY_COLLECTION_SET
+        | ROOT_COVERAGE_INCOMPLETE;
 
     /// Stable labels, lowest bit first. A new flag cannot be added without a
     /// label — `every_g1_degraded_flag_has_a_label` pins that.
@@ -964,6 +996,7 @@ pub mod g1_degraded {
             (JIT_PINNED_REGIONS_EXCLUDED, "jit-pinned-regions-excluded"),
             (PARALLEL_EVACUATOR, "experimental-parallel-evacuator"),
             (EMPTY_COLLECTION_SET, "empty-collection-set"),
+            (ROOT_COVERAGE_INCOMPLETE, "root-coverage-incomplete-no-evacuation"),
         ];
         TABLE
             .iter()
@@ -1084,6 +1117,37 @@ fn with_g1_cycle<R>(f: impl FnOnce(&G1CycleSlot) -> R) -> R {
 /// Called from inside the pause, with the regions lock held, so the numbers
 /// describe the collection set that actually ran rather than a later
 /// re-derivation. `degraded` is a bitmask of [`g1_degraded`] flags.
+/// Total G1 STW collections that reached the dispatch point, and how many of
+/// those found this collection's JIT root set incomplete.
+///
+/// Counted on BOTH sides of the `CRATONVM_G1_NO_COVERAGE_PIN` opt-out, so the
+/// arm that reinstates the pre-fix evacuation still reports how often the gate
+/// would have fired — see `g1::G1Collector::root_coverage_incomplete_reason`.
+///
+/// Deliberately NOT folded into the generational
+/// [`crate::gc_quiescence::record_moving_young_coverage_fallback`] counters:
+/// that function's warn line says the cycle "runs the NON-MOVING sweep", which
+/// G1 does not have. Sharing the counter would also merge two different
+/// denominators into one number.
+static G1_PAUSES: AtomicU64 = AtomicU64::new(0);
+static G1_PAUSES_COVERAGE_INCOMPLETE: AtomicU64 = AtomicU64::new(0);
+
+/// Count one G1 STW collection and whether its root set was incomplete.
+pub fn record_g1_pause_coverage(incomplete: bool) {
+    G1_PAUSES.fetch_add(1, Ordering::Relaxed);
+    if incomplete {
+        G1_PAUSES_COVERAGE_INCOMPLETE.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(total G1 pauses, pauses with an incomplete root set)`.
+pub fn g1_pause_coverage_counts() -> (u64, u64) {
+    (
+        G1_PAUSES.load(Ordering::Relaxed),
+        G1_PAUSES_COVERAGE_INCOMPLETE.load(Ordering::Relaxed),
+    )
+}
+
 pub fn record_g1_cycle(
     kind: u8,
     cset_young: u32,
