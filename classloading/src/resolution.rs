@@ -520,7 +520,7 @@ impl ResolutionCache {
     }
 
     /// Update cached CONSTANT_Dynamic ObjectRefs after GC relocation.
-    pub fn update_condy_refs(&mut self, pointer_map: &std::collections::HashMap<usize, usize>) {
+    pub fn update_condy_refs(&mut self, pointer_map: &cratonvm_types::PointerMap) {
         for val in self.condy.values_mut() {
             if let Value::Object(Some(ref mut obj_ref)) = val {
                 let old_addr = obj_ref.as_ptr() as usize;

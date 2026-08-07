@@ -534,7 +534,7 @@ negative control — nothing here touched the copy phase. **No claim is made
 about the max**: it went 463/527 (A) vs 432/612 (B), i.e. the tail is dominated
 by something this fix does not address, which is the honest state of this page.
 
-### SCOPED, NOT LANDED: `pointer_map_rebuild` — 43 ms per pause, pure container churn
+### FIXED: `pointer_map_rebuild` — 43 ms per pause, pure container churn
 
 ```rust
 let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
@@ -545,22 +545,65 @@ let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
 changes. Pre-sizing does not help — std's `FromIterator` already reserves the
 full size, so the cost is the hashing itself.
 
-The only fix is the declared type, and the blast radius is now measured rather
+The only fix is the declared type, and the blast radius was measured rather
 than guessed: **94 `&HashMap<usize, usize>` parameter positions** across `gc`,
 `vm`, `jit`, `native-builtins`, `native-collections`, `native-io` and
-`classloading`, and not all of them are pointer maps — a blind regex over that
-set would silently retype unrelated `usize→usize` maps. It needs a deliberate
-pass with a `PointerMap` alias, not a sweep. Left as a sized hand-off: 10% of
-every young pause, no behaviour change, one afternoon of mechanical work.
+`classloading` — and **not all of them are pointer maps**, which is why this
+was done with rustc rather than a regex. Retyping `GcResult::pointer_map` to
+`cratonvm_types::PointerMap` and repairing outward from there made every
+genuine boundary a type error, while the maps that merely share the shape were
+either never reached or surfaced as an error that had to be looked at:
 
-### Still the 60%: `cheney_drain`
+* `jit/src/x64.rs` — ~19 BCI / operand-index maps
+* `vm/src/native/jni.rs` — `JNI_STRING_BUFFERS`, pointer → element count
+* `native-collections` — `lhm_ptr_cache`, `ptr_to_index`
+* `classloading/src/verifier.rs` — `instruction_by_pc`
+* `old_gen::compact_with_drop_flags` — takes `HashMap<usize, u8>`
 
-253 ms for 755 944 objects is ~335 ns per object — copy, forwarding install,
-`pointer_map` insert and reference-slot scan. There is no single removable
-item in it; the levers remain the two this page already names (fewer surviving
-objects via young sizing, or a cheaper per-object copy). `perf` cannot help
-narrow it on the Azure host: `/proc/sys/kernel/perf_event_paranoid` is 4, so
-even `-e cpu-clock` user-only recording is refused.
+A blanket sweep would have silently retyped all five.
+
+Changing the hasher cannot break correct code: `std`'s `RandomState` is seeded
+per process, so `HashMap` iteration order already differs run to run and
+nothing may depend on it. `FxHashMap`'s order is deterministic, which is if
+anything easier to reproduce.
+
+**Measured: the phase is 0 ms.** Confirmed in an instrumented 6-lane run
+alongside `promotion_stats`, also 0 ms — both phases removed outright rather
+than made smaller.
+
+### Still the 60%: `cheney_drain` — and one theory now refuted
+
+253 ms for 755 944 objects is ~335 ns per object, far too slow for a ~40-byte
+memcpy, which points at a hidden per-call cost.
+
+**The plausible candidate, measured and dead.** Every reference *slot* of every
+copied object is fed to `forward_object`, and its `is_forwarded()`
+early-return still does `pointer_map.entry(..).or_insert(..)` — a hash probe on
+a map with as many entries as there are survivors. If references outnumbered
+objects several to one, the drain would be a lookup cost, and the fix would be
+to trust the forwarded header instead of probing it. `CRATONVM_DBG=gcpause`
+now counts both arms:
+
+```
+fwd_copies         med 756 089
+fwd_reencounters   med 731 480
+```
+
+Roughly **1:1**. Re-encounters are about half the calls, so removing them
+entirely could not account for the phase. **Do not re-chase this.** (Caveat:
+the `young_object_starts.contains` early-return fires before either counter, so
+references to old-gen objects are in neither arm — the ratio between the two
+counted arms is still the answer to the question asked.)
+
+**What is left is inherent.** 756 000 objects copied out of a ~311 MB
+from-space is ~2–3 cache/TLB misses per object at essentially random
+addresses; at ~100 ns each that is the ~290 ns. A copying collector over a
+young gen that size cannot be made much cheaper *per object* — the lever is
+**how many objects it copies**, i.e. young sizing
+(`CRATONVM_GC_YOUNG_PAUSE_MS`, implemented, default OFF), not a micro-fix
+inside the loop. `perf` cannot check this on the Azure host:
+`/proc/sys/kernel/perf_event_paranoid` is 4, so even `-e cpu-clock` user-only
+recording is refused; in-tree counters are the only instrument.
 
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 

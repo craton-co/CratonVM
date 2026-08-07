@@ -350,7 +350,7 @@ impl MockCtx {
         // native is perfectly rooted — and, worse, would hide a native that
         // wrongly relies on the overlay staying pointer-stable.
         if !moved.is_empty() {
-            let pointer_map: std::collections::HashMap<usize, usize> = moved
+            let pointer_map: cratonvm_types::PointerMap = moved
                 .iter()
                 .map(|(old, new)| (*old, new.as_ptr() as usize))
                 .collect();

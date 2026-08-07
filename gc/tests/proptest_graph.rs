@@ -50,7 +50,7 @@ const FIELDS_PER_OBJ: usize = 4;
 /// No-op monitor cleanup — proptest cases do not exercise monitors.
 struct NoMonitors;
 impl MonitorCleanup for NoMonitors {
-    fn remap_after_gc(&self, _pointer_map: &HashMap<usize, usize>) {}
+    fn remap_after_gc(&self, _pointer_map: &cratonvm_types::PointerMap) {}
 }
 
 /// Operation in the generated trace. Indexes are over `[0, N)` for

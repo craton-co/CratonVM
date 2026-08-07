@@ -779,6 +779,68 @@ fn ds_clear_peer(this: ObjectRef) {
     ds_peer_table().lock().remove(&this);
 }
 
+/// GC roots for the two `DatagramSocket`-keyed side tables.
+///
+/// Both are `HashMap<ObjectRef, _>`, so their keys ARE addresses: a moving
+/// collection that relocates a `DatagramSocket` strands its entry, and a dead
+/// entry later collides with whatever object the allocator places on that
+/// address — a silent wrong answer, not a lookup miss
+/// (`docs/threading/objectref-concurrency-contract.md` §7.3). Both tables carry
+/// state the JDK requires to survive `close()` (`getPort`/`getInetAddress` keep
+/// answering, same rule that keeps `isConnected()` true), so neither can be
+/// cleared on close to sidestep this.
+///
+/// Same scan+remap shape as [`gc_scan_inet_addr_roots`] /
+/// [`gc_update_inet_addr_refs`] two hundred lines below, and wired the same way
+/// from `vm/src/memory/native_roots.rs`.
+///
+/// Retention: publishing the keys as roots keeps a `DatagramSocket` alive for
+/// as long as its entry exists, and nothing removes from `ds_side_table` —
+/// deliberately, per the close rule above. That is the same characteristic the
+/// sibling `inet_addr_side_table` already has. The end state for both is
+/// `addr_keyed::remap_and_sweep`, which drops an entry whose object did not
+/// survive instead of rooting it; that needs an `is_live` predicate this crate
+/// cannot reach, so it is a follow-up rather than a thing to half-do here.
+pub fn gc_scan_ds_roots(out: &mut Vec<ObjectRef>) {
+    for k in ds_side_table().lock().keys() {
+        out.push(*k);
+    }
+    for k in ds_peer_table().lock().keys() {
+        out.push(*k);
+    }
+}
+
+/// Companion to [`gc_scan_ds_roots`]: re-key both tables through the
+/// collector's relocation map so a lookup on the relocated `DatagramSocket`
+/// still resolves.
+/// Takes `cratonvm_types::PointerMap` (an `FxHashMap`), not a std `HashMap`:
+/// that is what `native_roots::VmRemapFn` is typed as. This landed as a plain
+/// `HashMap<usize, usize>` in `addrkeyed-20260807`, concurrently with the
+/// change that retyped `VmRemapFn`, and the two merged into a `dev` on which
+/// `cargo test -p cratonvm-vm --lib` did not compile at all (E0308 at the
+/// `root_source!("datagram-sockets", ...)` row — `RandomState` vs
+/// `BuildHasherDefault<FxHasher>`). Neither branch was wrong alone.
+pub fn gc_update_ds_refs(pointer_map: &cratonvm_types::PointerMap) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    fn rekey<V>(
+        map: &mut std::collections::HashMap<ObjectRef, V>,
+        pointer_map: &cratonvm_types::PointerMap,
+    ) {
+        let drained: Vec<_> = map.drain().collect();
+        for (k, v) in drained {
+            let nk = pointer_map
+                .get(&(k.as_ptr() as usize))
+                .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+                .unwrap_or(k);
+            map.insert(nk, v);
+        }
+    }
+    rekey(&mut ds_side_table().lock(), pointer_map);
+    rekey(&mut ds_peer_table().lock(), pointer_map);
+}
+
 /// `javax.net.ssl.SSLSessionContext` cache tuning, as configured through
 /// `setSessionCacheSize`/`setSessionTimeout`. Side-tabled for the same reason
 /// as the socket state above, and one more: the carrier is an instance of the
@@ -1066,7 +1128,7 @@ pub fn gc_scan_inet_addr_roots(out: &mut Vec<ObjectRef>) {
 /// Companion to [`gc_scan_inet_addr_roots`]: after a moving collection,
 /// re-key the side table so lookups keyed on the OLD `ObjectRef` still
 /// resolve — the mirror's identity is now the relocated address.
-pub fn gc_update_inet_addr_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_inet_addr_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -14736,7 +14798,7 @@ pub fn gc_scan_re10_handler_roots(out: &mut Vec<ObjectRef>) {
 /// the dispatcher invokes the live handler, not a vacated from-space slot. A
 /// no-op when nothing moved (empty `pointer_map`) or for handlers the collector
 /// left in place (absent from the map).
-pub fn gc_update_re10_handler_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+pub fn gc_update_re10_handler_refs(pointer_map: &cratonvm_types::PointerMap) {
     if pointer_map.is_empty() {
         return;
     }
@@ -16605,6 +16667,88 @@ mod tests {
         NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
         NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
     };
+
+    /// Behavioural cover for [`gc_scan_ds_roots`] / [`gc_update_ds_refs`].
+    ///
+    /// `native_roots`' `datagram_socket_side_tables_are_a_registered_root_source`
+    /// asserts the row is *present in the inventory*, which is the half that
+    /// catches deletion. It cannot catch the pair being WRONG — a `rekey` that
+    /// re-keyed only `ds_side_table`, or dropped entries whose key was absent
+    /// from the pointer map, would leave that test green and put the socket
+    /// state back exactly where it was before the fix: `ds_get` missing and
+    /// answering `ds_default()`, so a live connected socket reports `fd = -1`
+    /// and `send()` fails with "DatagramSocket: closed".
+    ///
+    /// Addresses are fabricated and never dereferenced — the remap only reads
+    /// `as_ptr()`, the scan only copies the key — and the test removes what it
+    /// inserted, since both tables are process-global.
+    #[test]
+    fn gc_update_ds_refs_rekeys_both_tables_and_keeps_their_values() {
+        // SAFETY: used purely as map keys / `as_ptr()` operands, never read.
+        let at = |a: usize| unsafe { ObjectRef::from_raw(a as *mut u8) };
+        let (old, new) = (at(0x51_0000), at(0x52_0000));
+
+        ds_set(old, |d| {
+            d.fd = 7;
+            d.timeout = 4321;
+            d.connected = 1;
+            d.port = 53498;
+        });
+        ds_set_peer(old, "127.0.0.1", 9999);
+
+        let mut roots = Vec::new();
+        gc_scan_ds_roots(&mut roots);
+        assert_eq!(
+            roots.iter().filter(|r| r.as_ptr() == old.as_ptr()).count(),
+            2,
+            "both tables must root the mirror — rooting is what stops a dead \
+             socket's entry colliding with the next object on its address"
+        );
+
+        let mut pointer_map = cratonvm_types::PointerMap::default();
+        pointer_map.insert(old.as_ptr() as usize, new.as_ptr() as usize);
+        gc_update_ds_refs(&pointer_map);
+
+        let moved = ds_get(new);
+        assert_eq!(moved.fd, 7, "fd must follow the mirror, not reset to -1");
+        assert_eq!(moved.timeout, 4321);
+        assert_eq!(moved.connected, 1);
+        assert_eq!(moved.port, 53498);
+        assert_eq!(
+            ds_peer(new),
+            Some(("127.0.0.1".to_string(), 9999)),
+            "ds_peer_table must be re-keyed too, not just ds_side_table"
+        );
+        assert_eq!(
+            ds_get(old).fd,
+            -1,
+            "the from-space key must be gone, not duplicated"
+        );
+        assert_eq!(ds_peer(old), None);
+
+        ds_side_table().lock().remove(&new);
+        ds_peer_table().lock().remove(&new);
+    }
+
+    /// A non-moving collection publishes an empty pointer map, and must leave
+    /// both tables exactly as they were — an unconditional drain-and-reinsert
+    /// that mishandled the empty case would silently clear live socket state.
+    #[test]
+    fn gc_update_ds_refs_is_a_no_op_when_nothing_moved() {
+        // SAFETY: key-only, as above.
+        let at = |a: usize| unsafe { ObjectRef::from_raw(a as *mut u8) };
+        let sock = at(0x53_0000);
+        ds_set(sock, |d| d.fd = 11);
+        ds_set_peer(sock, "10.0.0.1", 1234);
+
+        gc_update_ds_refs(&cratonvm_types::PointerMap::default());
+
+        assert_eq!(ds_get(sock).fd, 11);
+        assert_eq!(ds_peer(sock), Some(("10.0.0.1".to_string(), 1234)));
+
+        ds_side_table().lock().remove(&sock);
+        ds_peer_table().lock().remove(&sock);
+    }
 
     #[test]
     fn re1_http_parse_url_plain() {
