@@ -33,7 +33,7 @@ method, so `--jdk-only` admits it on a claim nobody has checked.
 >   override, so dispatch walks up to `java/lang/Process` and the native wins —
 >   returning `isAlive()==false` for a live process and `pid()==0` where the spec
 >   requires `UnsupportedOperationException`. Filed with a committed repro:
->   [`process-natives-answer-for-user-subclasses-FIXED-20260806.md`](../../internal/process-natives-answer-for-user-subclasses-FIXED-20260806.md).
+>   `process-natives-answer-for-user-subclasses-FIXED-20260806.md`.
 >   Item 5 below has the model backwards.
 > * **The row counts in this file are ~11 % too large.** The census emits one row
 >   per *registration*, not per slot, so a triple registered twice appears twice
@@ -45,16 +45,29 @@ method, so `--jdk-only` admits it on a claim nobody has checked.
 >   row count. `owns_slot` is now a census column and
 >   `scripts/jdk-only-adjudicate.py` prints the split.
 >
-> **Item 1 is now adjudicated** —
-> [`synthetic-process-cluster-and-the-supertype-lie.md`](synthetic-process-cluster-and-the-supertype-lie.md).
-> The cluster is **37 rows and not 25** (the count below omits
+> **Item 1 is CLOSED 2026-08-06** —
+> `synthetic-process-cluster-RETIRED-20260806.md`.
+> The cluster was **37 rows and not 25** (the count below omits
 > `cratonvm/synthetic/AnonymousObject$2`, 4 rows, and miscounts the pipe
-> streams); the `Bridge` tag is wrong by §1.5's own definition since no image on
-> either platform declares these classes at all; and retagging them cannot come
-> first, because `--jdk-only` **fabricates the receiver anyway** and subprocess
-> spawning currently depends on it. That record also carries a second, mode-
-> independent defect found on the way: the class is not in its own
-> `getSuperclass()` chain while `isAssignableFrom` says it is.
+> streams), and the `Bridge` tag was wrong by §1.5's own definition since no
+> image on either platform declares these classes at all. All 37 are
+> `SyntheticStub` now, and `--jdk-only` returns a real `java.lang.ProcessImpl`
+> from `ProcessBuilder.start()`, byte-identical to HotSpot 25 across a 21-line
+> surface probe. Classes fabricated in strict mode on a subprocess workload: 4
+> before, **0** after.
+>
+> Retagging alone would not have done it, and the retired record is worth
+> reading for what else it took: `ProcessImpl.forkAndExec` had to be written
+> (the registration that existed was on the pre-JDK-9 `UNIXProcess`, unreachable
+> and off by one), the VM's process handle is not a pid, `destroy()` had been
+> silently losing to the JDK's reaper thread, and three `java.io` constructor
+> shims skip the real `closeLock` initializer so every stream built through them
+> throws NPE — not IOException — on its first close. Four of those five were
+> found by running it.
+>
+> The mode-independent supertype defect that record also carried — the class not
+> being in its own `getSuperclass()` chain while `isAssignableFrom` said it was —
+> was fixed earlier the same day and still governs what compatible mode returns.
 >
 > **Still open from this file:** nothing else. Item 5's model was wrong (see
 > above), items 2-4 are answered, and item 1 now has a verdict and an ordered

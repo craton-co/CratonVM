@@ -13,7 +13,7 @@ use crate::g1::{G1Collector, G1CollectorConfig};
 use crate::g1_concurrent::ConcurrentMarkController;
 use crate::gc::GcResult;
 use crate::gen_heap::GenerationalHeap;
-use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
+use crate::heap::{ArrayElementType, ObjectHeader, ObjectKind, ARRAY_DATA_OFFSET, HEADER_SIZE};
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
 #[cfg(feature = "zgc")]
@@ -951,8 +951,8 @@ impl VmHeap {
     /// For non-array objects the returned value is meaningless.
     pub fn array_element_type(&self, obj: ObjectRef) -> Option<ArrayElementType> {
         let header = self.get_header(obj);
-        if header.kind == ObjectKind::Array {
-            Some(header.element_type)
+        if header.kind() == ObjectKind::Array {
+            Some(header.element_type())
         } else {
             None
         }
@@ -1095,7 +1095,7 @@ impl VmHeap {
         // Contiguous from `obj + HEADER_SIZE` for every array: generational and
         // single-region G1 trivially, and G1 humongous because all regions are
         // adjacent slices of one arena (so a humongous span is one block).
-        Some(unsafe { obj.as_ptr().add(HEADER_SIZE) })
+        Some(unsafe { obj.as_ptr().add(ARRAY_DATA_OFFSET) })
     }
 
     // =====================================================================
@@ -2855,16 +2855,34 @@ mod concurrent_mark_controller_tests {
 
         // Simulate a mutator overwrite: barrier sees the old value.
         heap.satb_barrier(Value::Object(Some(obj)));
-        // The pre-barrier writes through the thread-local SATB buffer,
-        // so the global queue may not see it yet. Flush this thread's
-        // buffer so the assertion is deterministic.
+        // The pre-barrier writes through the thread-local SATB buffer, so the
+        // global queue may not see it yet. Flush this thread's buffer.
         heap.flush_thread_satb();
 
+        // FLAKE FIX: `after > before` alone is a race, and it is the same
+        // under-approximation `g1_concurrent::satb_captures_mutator_writes_during_concurrent_mark`
+        // already documents. `g1_start_concurrent_mark()` above spawns a real
+        // background marker, and since G1MARK-6 `concurrent_mark_step` drains
+        // the queue shards on every step — so the worker can consume the entry
+        // between the flush and this read, leaving `after == before == 0` on a
+        // queue that did exactly what it was supposed to. Measured at roughly
+        // one failure in twenty full-suite runs on a loaded host; it needs the
+        // worker scheduled inside a sub-millisecond window.
+        //
+        // Assert the SATB *guarantee* instead of the transient: the overwritten
+        // reference reached the marker either by still being queued, or by
+        // already having been pulled into the gray set / marked. Both routes
+        // are the barrier working; only neither is a bug.
         let after = satb_queue.len();
+        let grayed_or_marked = g1_state(&heap)
+            .unwrap()
+            .collector
+            .dbg_is_grayed_or_marked(obj.as_ptr() as usize);
         assert!(
-            after > before,
-            "satb_barrier during concurrent mark must enqueue the old reference \
-             (before={before}, after={after})",
+            after > before || grayed_or_marked,
+            "satb_barrier during concurrent mark must deliver the old reference \
+             to the marker (before={before}, after={after}, \
+             grayed_or_marked={grayed_or_marked})",
         );
 
         // Cleanup so we don't strand the worker.
@@ -2957,7 +2975,7 @@ mod concurrent_mark_controller_tests {
             .expect("ordinary array must have a flat pointer");
         assert_eq!(
             sptr,
-            unsafe { small.as_ptr().add(HEADER_SIZE) },
+            unsafe { small.as_ptr().add(ARRAY_DATA_OFFSET) },
             "flat pointer must be obj + HEADER_SIZE",
         );
 
@@ -2970,7 +2988,7 @@ mod concurrent_mark_controller_tests {
             as *mut i32;
         assert_eq!(
             lptr as *mut u8,
-            unsafe { large.as_ptr().add(HEADER_SIZE) },
+            unsafe { large.as_ptr().add(ARRAY_DATA_OFFSET) },
             "humongous flat pointer must be obj + HEADER_SIZE",
         );
 

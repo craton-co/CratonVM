@@ -138,7 +138,7 @@ pub(crate) fn dotted_class_name(vm: usize, class_id: ClassId, slashed: &str) -> 
     let dotted: Arc<str> = if let Some(primitive) = primitive_descriptor_name(slashed) {
         Arc::from(primitive)
     } else if slashed.contains('/') {
-        Arc::from(slashed.replace('/', "."))
+        Arc::from(dotted_binary_name(slashed))
     } else {
         Arc::from(slashed)
     };
@@ -540,8 +540,19 @@ fn check_access(
     )
 }
 
+/// `read_field_meta` collapses an unreadable `clazz` mirror onto
+/// `ClassId::new(0)`, which is also a perfectly valid id (ids are handed out
+/// from `classes.len()`, so the first class loaded *is* 0). The two cases are
+/// indistinguishable by the time [`check_field_access`] sees the value, so the
+/// caller-entitlement step below refuses to run on it: on the sentinel reading
+/// it as a real declaring class would answer JLS questions about the wrong
+/// class (notably `caller_is_subclass_of(_, java/lang/Object)`, which is true
+/// for every caller). Skipping keeps this degenerate input at exactly today's
+/// behaviour.
+const UNRESOLVED_DECLARING_CLASS_ID: u32 = 0;
+
 /// Check a reflective field access using the caller-sensitive part of the
-/// ordinary Java member-access rules.
+/// ordinary Java member-access rules (JLS §6.6.1, JEP 181).
 ///
 /// `Field.get` is not intrinsically a deep-reflection operation.  In
 /// particular, code may reflectively read a private field it declares itself
@@ -550,10 +561,22 @@ fn check_access(
 /// state.  The old blanket non-public rejection incorrectly treated that
 /// legal same-class read as an access violation.
 ///
-/// Keep the existing conservative rule for callers outside the declaring
-/// class: those still need a public member or the explicit accessible
-/// override.  JPMS/open-package validation remains in the caller after this
-/// check and continues to govern cross-class deep reflection.
+/// L15: the same rule reaches further than the declaring class itself. A
+/// **nestmate** may read a `private` field of its nest sibling, and a
+/// same-runtime-package or subclass caller may read a package-private /
+/// `protected` one — all without `setAccessible(true)`. That is the field
+/// shaped twin of the `Method.invoke` gap L1 fixed (see
+/// `native_method_invoke`, and `docs/known-issues/jdk-only/
+/// L15-nestmate-access-field-and-constructor.md`); it is routed through the
+/// same `lang_reflect::caller_may_access_member` predicate so the two paths
+/// cannot drift.
+///
+/// This is **pure widening**: the step is only consulted after the old rule
+/// has already answered "not public and not overridden", it only ever returns
+/// an *allow*, and when the caller cannot be resolved (`resolve_caller_class_id
+/// == None`) the fallback below is reached unchanged.  JPMS/open-package
+/// validation remains in the caller after this check and continues to govern
+/// cross-module deep reflection.
 fn check_field_access(
     ctx: &mut dyn NativeContext,
     modifiers: i32,
@@ -564,8 +587,28 @@ fn check_field_access(
     if accessible || (modifiers & ACC_PUBLIC) != 0 {
         return Ok(());
     }
-    if resolve_caller_class_id(ctx) == Some(declaring_class_id) {
+    // Resolved once and reused: `resolve_caller_class_id` walks the frame
+    // stack, and both arms below ask the same question of it.
+    let caller_cid = resolve_caller_class_id(ctx);
+    if caller_cid == Some(declaring_class_id) {
         return Ok(());
+    }
+    if declaring_class_id.as_u32() != UNRESOLVED_DECLARING_CLASS_ID {
+        if let Some(caller) = caller_cid {
+            // No `ObjectRef` crosses this call, and every `NativeContext`
+            // method it reaches is a `&self` metadata lookup (`class_name_of_id`
+            // / `loader_id_of_class` / `nest_host_name` / `nest_member_names` /
+            // `class_id_by_name_near` / `superclass_of`) — none of them
+            // re-enters Java, so no moving-GC pin is required here.
+            if crate::lang_reflect::caller_may_access_member(
+                ctx,
+                caller,
+                declaring_class_id,
+                modifiers,
+            ) {
+                return Ok(());
+            }
+        }
     }
     check_access(modifiers, false, member_desc)
 }
@@ -777,6 +820,83 @@ fn check_reflection_module_access_with_target_id(
     ctx.check_deep_reflection_access(accessor_cid, target_cid)
 }
 
+/// The `exports` half of `Reflection.verifyMemberAccess`, for a reflective
+/// operation on a PUBLIC member that has NOT been `setAccessible(true)`.
+///
+/// JEP 261: a public member of a public class is still unreachable from the
+/// class path when its package is not `exports`ed to the caller's module.
+/// HotSpot 25 reaches this through `Constructor.newInstance` / `Method.invoke`
+/// -> `AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
+/// `verifyModuleAccess` -> `memberModule.isExported(pkg, callerModule)`, and
+/// throws `IllegalAccessException`. `verifyMemberAccess` runs that module test
+/// BEFORE its `Modifier.isPublic(modifiers)` shortcut, which is why a public
+/// member does not skip it. `regression-suite/src/RJdkModule.java:172`
+/// is the witness: a public no-arg ctor on the public `EnGreeter`, in the one
+/// package `cratonvm.jdkonly.svc` neither exports nor opens.
+///
+/// Both reflective entry points are the SAME shape here — `Constructor` passes
+/// `clazz` as both `memberClass` and `targetClass`, `Method` passes
+/// `isStatic ? null : obj.getClass()` as `targetClass`, and that argument only
+/// steers the `protected` sub-rule, never the module test. So the two call
+/// sites read identically.
+///
+/// Deliberately NOT folded into [`check_reflection_module_access_with_target_id`]:
+/// that one asks the `opens` question, which over-denies here — every public
+/// `java.util.ArrayList` construction would fail, because java.base exports
+/// java.util without opening it (the kafka `ListDeserializer` regression the
+/// caller's comment records).
+///
+/// Same three bypasses as its `opens` sibling, in the same order, so the two
+/// gates cannot disagree about WHO is asking:
+///   * `accessible_override == true` -> the check was paid at `setAccessible`;
+///   * no resolvable Java caller frame -> the VM itself is driving;
+///   * a Bootstrap/Platform-loader caller in a boot package -> HotSpot exempts
+///     java.base the same way (`checkCanSetAccessible`'s
+///     `callerModule == Object.class.getModule()` arm).
+///
+/// Unlike the `opens` sibling this fails OPEN when the target class cannot be
+/// resolved: this is a NEW refusal on a path that previously had none, so an
+/// unreadable input must not invent one.
+fn check_reflection_export_access_with_target_id(
+    ctx: &mut dyn NativeContext,
+    target_class_name: &str,
+    target_class_id: Option<ClassId>,
+    accessible_override: bool,
+) -> Result<(), String> {
+    if accessible_override {
+        return Ok(());
+    }
+    let Some(accessor_cid) = resolve_caller_class_id(ctx) else {
+        return Ok(());
+    };
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
+        return Ok(());
+    }
+    let Some(target_cid) = target_class_id.or_else(|| ctx.class_id_by_name(target_class_name))
+    else {
+        return Ok(());
+    };
+    if accessor_cid == target_cid {
+        return Ok(());
+    }
+    // `reflective_export_to_accessor` is the `exports` edge;
+    // `check_deep_reflection_access` additionally accepts `opens`, the
+    // same-module case and an unnamed target, so either one passing is enough.
+    if ctx.reflective_export_to_accessor(accessor_cid, target_cid)
+        || ctx
+            .check_deep_reflection_access(accessor_cid, target_cid)
+            .is_ok()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "class {} is in a package its module does not export to the caller",
+        target_class_name.replace('/', ".")
+    ))
+}
+
 /// Read a declaring-class mirror from an AccessibleObject and enforce the
 /// NEW-19 module check. Returns `Err(IllegalAccessException)` on denial.
 ///
@@ -863,6 +983,45 @@ fn lambda_proxy_class_name(ctx: &dyn NativeContext, class_id: ClassId) -> Option
     let host = ctx.lambda_proxy_host(class_id)?;
     let host_dotted = host.replace('/', ".");
     Some(format!("{host_dotted}$$Lambda/0x{:x}", class_id.as_u32()))
+}
+
+/// Split a hidden class's mangled internal name at its `/0x<hex>` tail.
+///
+/// The class store registers a hidden class under `<this_class>/0x<n>` — both
+/// `lookup_define.rs`'s pre-mangled `override_name` and `class_manager.rs`'s
+/// collision suffix build that shape. HotSpot reports it verbatim from
+/// `Class.getName()`: the `/` is part of the NAME, not a package separator, so
+/// the usual internal->binary `/`->`.` rewrite must not touch it. Measured
+/// before this fix: `getName()` answered `RJdkHidden$Payload.0x0`, failing
+/// `regression-suite/src/RJdkHidden.java:93`'s `getName().contains("/0x")`.
+///
+/// Returns `(base, suffix)` with the suffix still carrying its leading `/`, or
+/// `None` when there is no such tail. No legal Java package or class segment
+/// begins with a digit, so `0x...` after a `/` is unambiguous.
+fn hidden_name_suffix_split(internal: &str) -> Option<(&str, &str)> {
+    let at = internal.rfind("/0x")?;
+    let hex = &internal[at + 3..];
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((&internal[..at], &internal[at..]))
+}
+
+/// Internal (`/`-separated) name -> the binary name `Class.getName()` reports,
+/// preserving a hidden class's `/0x<hex>` suffix verbatim.
+///
+///   `RJdkHidden$Payload/0x3` -> `RJdkHidden$Payload/0x3`
+///   `com/acme/P/0x3`         -> `com.acme.P/0x3`
+///   `com/acme/P`             -> `com.acme.P`
+pub(crate) fn dotted_binary_name(internal: &str) -> String {
+    match hidden_name_suffix_split(internal) {
+        Some((base, suffix)) => {
+            let mut out = base.replace('/', ".");
+            out.push_str(suffix);
+            out
+        }
+        None => internal.replace('/', "."),
+    }
 }
 
 const SPRING_ENHANCED_CONFIGURATION_IFACE: &str =
@@ -972,7 +1131,7 @@ pub(crate) fn native_class_get_name(
                 .unwrap_or(strict_name);
             let dotted = primitive_descriptor_name(&display_name)
                 .map(str::to_string)
-                .unwrap_or_else(|| display_name.replace('/', "."));
+                .unwrap_or_else(|| dotted_binary_name(&display_name));
             if dbg_bb {
                 eprintln!("[bb-dbg] getName(strict) -> {:?}", dotted);
             }
@@ -1022,7 +1181,7 @@ pub(crate) fn native_class_get_name(
             let dotted_name = if let Some(primitive) = primitive_descriptor_name(&display_name) {
                 primitive.to_string()
             } else if display_name.contains('/') {
-                display_name.replace('/', ".")
+                dotted_binary_name(&display_name)
             } else {
                 display_name
             };
@@ -2704,6 +2863,32 @@ pub(crate) fn native_class_is_instance(
     };
     let target_class_id = ctx.class_id_of_object(target);
 
+    // PERF (webapp-deploy annotation scan): answer the ordinary "the object's
+    // class IS, or extends/implements, this mirror's class" shape from class
+    // ids alone, before anything below materialises a class NAME.
+    //
+    // Every `class_name_of_id` / `mirror_class_name` call takes the class-
+    // manager read lock and clones the name into a fresh `String`, and the
+    // AnnotationProxy and `Proxy$Instance` probes below each do one on EVERY
+    // call just to compare against a fixed literal. Tomcat's BCEL scanner
+    // reaches this through `ConstantPool.getConstant(int, Class)`, which runs
+    // `castTo.isAssignableFrom(...)` + `castTo.cast(...)` once per constant-
+    // pool access of every class in every scanned jar: a `--stack-sample-ms`
+    // profile of `TestHostConfigAutomaticDeploymentCopyXML` put 55% of all
+    // interpreted time in that one method.
+    //
+    // This is the FIRST TWO DISJUNCTS OF THIS FUNCTION'S OWN TAIL, evaluated
+    // earlier. Every branch between here and there returns `1` or falls
+    // through -- none returns `0` -- so hoisting a `true` cannot change an
+    // answer. Arrays are excluded: `class_id_of_object` reports an array's
+    // COMPONENT class id, so the id comparison is not meaningful for them and
+    // they keep taking the descriptor-based path above and the tail below.
+    if !target_is_array
+        && (target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id))
+    {
+        return Ok(Some(Value::Int(1)));
+    }
+
     // Annotation proxy special case: our `create_annotation_proxy` allocates
     // objects of class `java/lang/annotation/AnnotationProxy`, not of the
     // actual annotation interface. JDK reflection and Spring's
@@ -3069,6 +3254,29 @@ pub(crate) fn native_class_is_assignable_from(
         // вЂ” it throws `IllegalArgumentException` from
         // `assignableCheckFailed` when this returns false, masking the
         // underlying type-system gap.
+        // PERF (webapp-deploy annotation scan): same hoist as
+        // `native_class_is_instance` above, and the same reason -- the two
+        // `mirror_class_name` calls immediately below each take the class-
+        // manager read lock and clone the name into a fresh `String`, on a path
+        // Tomcat's BCEL scanner walks once per constant-pool access
+        // (`ConstantPool.getConstant(int, Class)` -> `castTo.isAssignableFrom`).
+        //
+        // These are the first two disjuncts of this function's own tail. Every
+        // branch between here and there returns `1` or falls through, and the
+        // two `mirror_class_id` `None` arms cannot be reached once BOTH ids
+        // have resolved -- so hoisting a `true` cannot change an answer.
+        // Skipped when the ObservationRegistry trace is armed, so that
+        // diagnostic still sees every call.
+        if !crate::vmflags().loader.dbg_obsreg {
+            if let (Some(this_cid), Some(other_cid)) =
+                (mirror_class_id(ctx, this), mirror_class_id(ctx, other))
+            {
+                if this_cid == other_cid || ctx.is_subclass(other_cid, this_cid) {
+                    return Ok(Some(Value::Int(1)));
+                }
+            }
+        }
+
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
         if crate::vmflags().loader.dbg_obsreg
@@ -3223,7 +3431,7 @@ pub(crate) fn native_class_is_primitive(
     // that that's where THIS JDK build's compiled `java/lang/Class` happens
     // to place the `primitive` field — the exact "answering true for a
     // class that is not primitive" hazard flagged in
-    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-FIXED-20260803.md.
+    // fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md.
     // Resolve it the same way the writer does (`resolve_class_mirror_slots`
     // in `vm/src/vm/vm_object.rs`, i.e. by field name against the loaded
     // `java/lang/Class`), so reader and writer agree by construction instead
@@ -6349,6 +6557,110 @@ pub(crate) fn native_class_get_declared_field(
 ///   +2 в†’ Int    (accessible flag, 0 or 1)
 // The fourth tail slot marks metadata written by `create_method_object` as
 // immutable and safe to use without rebuilding the JDK field descriptor.
+
+// ---------------------------------------------------------------------------
+// getDeclaredMethods phase profiler (CRATONVM_DBG_GDM_PROF=1).
+//
+// `Class.getDeclaredMethods()` on a 1000-method class costs ~3.4 ms on
+// CratonVM against ~47 us on HotSpot, and the per-method cost GROWS with the
+// method count -- so there is a super-linear term on top of a large linear
+// one. This splits `create_method_object` into phases so the next fix is
+// aimed at a measured cost rather than a plausible one. Off by default; when
+// off, each boundary is one `Option` test.
+// ---------------------------------------------------------------------------
+pub(crate) mod gdmp {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const NBUCKETS: usize = 14;
+    pub const NAMES: [&str; NBUCKETS] = [
+        "alloc",
+        "mirror+name",
+        "ret_mirror",
+        "param_arr",
+        "method_exceptions",
+        "exc_arr+desc_str",
+        "pin_reread",
+        "set_field_by_name",
+        "named_layout",
+        "method_signature",
+        "extra_slots",
+        "declared_methods",
+        "filter+reorder",
+        "link_isolated",
+    ];
+
+    static ON: OnceLock<bool> = OnceLock::new();
+
+    pub fn on() -> bool {
+        *ON.get_or_init(|| {
+            std::env::var("CRATONVM_DBG_GDM_PROF")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    thread_local! {
+        static ACC: RefCell<[u64; NBUCKETS]> = const { RefCell::new([0u64; NBUCKETS]) };
+    }
+
+    pub fn reset() {
+        ACC.with(|a| *a.borrow_mut() = [0u64; NBUCKETS]);
+    }
+
+    pub fn add(bucket: usize, ns: u64) {
+        ACC.with(|a| a.borrow_mut()[bucket] += ns);
+    }
+
+    pub fn snapshot() -> [u64; NBUCKETS] {
+        ACC.with(|a| *a.borrow())
+    }
+
+    /// Stopwatch that attributes the time since its last mark to a bucket.
+    pub struct Lap {
+        last: Option<Instant>,
+    }
+
+    impl Lap {
+        pub fn new() -> Self {
+            Self {
+                last: if on() { Some(Instant::now()) } else { None },
+            }
+        }
+        pub fn mark(&mut self, bucket: usize) {
+            if let Some(last) = self.last {
+                let now = Instant::now();
+                add(bucket, now.duration_since(last).as_nanos() as u64);
+                self.last = Some(now);
+            }
+        }
+    }
+
+    pub fn report(tag: &str, n: usize, total_ns: u64) {
+        if !on() {
+            return;
+        }
+        let acc = snapshot();
+        let sum: u64 = acc.iter().sum();
+        let mut parts = String::new();
+        for (i, ns) in acc.iter().enumerate() {
+            if *ns == 0 {
+                continue;
+            }
+            parts.push_str(&format!(" {}={:.0}us", NAMES[i], *ns as f64 / 1000.0));
+        }
+        eprintln!(
+            "[gdmprof] class={} n={} total={:.0}us accounted={:.0}us{}",
+            tag,
+            n,
+            total_ns as f64 / 1000.0,
+            sum as f64 / 1000.0,
+            parts
+        );
+    }
+}
+
 const METHOD_EXTRA_SLOTS: usize = 4;
 const METHOD_EXTRA_OFFSET_DESC: usize = 0;
 const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
@@ -6424,6 +6736,7 @@ pub(crate) fn create_method_object(
     ctx: &mut dyn NativeContext,
     meta: &MethodMetadata,
 ) -> cratonvm_types::ObjectRef {
+    let mut __lap = gdmp::Lap::new();
     let class_id = ctx
         .ensure_class_initialized("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
@@ -6450,6 +6763,7 @@ pub(crate) fn create_method_object(
     // Pin everything now and re-read the forwarded reference right before use.
     let obj_pin = ctx.pin_native_root(obj);
 
+    __lap.mark(0);
     let class_mirror = ctx.get_class_mirror(meta.declaring_class_id);
     let class_mirror_pin = ctx.pin_native_root(class_mirror);
     let name_str = ctx.create_string(&meta.name);
@@ -6459,6 +6773,7 @@ pub(crate) fn create_method_object(
     // through the declaring class's own loader (loader-faithful) so a method on a
     // bytecode-enhanced / child-loader class reports that loader's copy of the
     // return / parameter types (gated; see `descriptor_to_class_mirror_via_loader`).
+    __lap.mark(1);
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&meta.descriptor);
     let ret_mirror = descriptor_to_class_mirror_via_loader(ctx, &ret_desc, meta.declaring_class_id);
     let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
@@ -6466,6 +6781,7 @@ pub(crate) fn create_method_object(
     // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop
     // (see `build_mirror_array` вЂ” WildFly bug-06).
+    __lap.mark(2);
     let class_comp = class_component_id(ctx);
     let decl_cid = meta.declaring_class_id;
     let param_arr = build_mirror_array_comp(ctx, class_comp, param_descs.len(), |ctx, i| {
@@ -6487,12 +6803,16 @@ pub(crate) fn create_method_object(
     // attribute when present, so `Method.getExceptionTypes()` (which the
     // JDK Java code implements by `return exceptionTypes.clone();`)
     // returns the actual throws-clause types instead of always-empty.
-    let exception_names =
-        ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
+    __lap.mark(3);
+    // Already resolved by whoever built this metadata (see
+    // `MethodMetadata::exceptions`). Re-deriving it here meant an O(methods)
+    // search of the declaring class's method table per mirror.
+    let exception_names = meta.exceptions.clone();
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
     // Build a Class<T> mirror for each thrown checked exception via the L-form
     // so class loading + caching go through the same path as elsewhere.
+    __lap.mark(4);
     let exception_arr =
         build_mirror_array_comp(ctx, class_comp, exception_names.len(), |ctx, i| {
             let desc = format!("L{};", exception_names[i]);
@@ -6504,6 +6824,7 @@ pub(crate) fn create_method_object(
 
     // Re-read every pinned local's forwarded reference now that all the
     // classloading/allocation above has settled.
+    __lap.mark(5);
     let obj = ctx.read_native_pin(obj_pin, obj);
     let class_mirror = ctx.read_native_pin(class_mirror_pin, class_mirror);
     let name_str = ctx.read_native_pin(name_str_pin, name_str);
@@ -6513,6 +6834,7 @@ pub(crate) fn create_method_object(
     let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
 
     // --- Real JDK Method layout (visible to Java bytecode via Getfield) ---
+    __lap.mark(6);
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
     ctx.set_field_by_name(obj, "name", Value::Object(Some(name_str)));
     ctx.set_field_by_name(obj, "returnType", Value::Object(Some(ret_mirror)));
@@ -6569,6 +6891,7 @@ pub(crate) fn create_method_object(
     // write turned into `clazz` being overwritten with the RETURN TYPE (slot 2)
     // — Byte Buddy then reported `public abstract int int.value() does not
     // represent interface …Argument`. See `method_class_has_named_layout`.
+    __lap.mark(7);
     let has_named_layout = method_class_has_named_layout(ctx, class_id);
     let named_method_layout_landed = matches!(
         ctx.get_field_by_name(obj, "name"),
@@ -6640,14 +6963,16 @@ pub(crate) fn create_method_object(
     // JDK Java code recover the full `ParameterizedType`, matching real-JVM
     // behaviour. Mirrors how `create_field_object` relies on the field
     // Signature attribute for `Field.getGenericType()`.
-    if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
+    __lap.mark(8);
+    if let Some(sig) = meta.signature.clone() {
         let sig_obj = ctx.create_string(&sig);
-        // `method_signature`/`create_string` above can also allocate/classload —
+        // `create_string` above can allocate/classload —
         // re-read `obj` before writing into it.
         let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
     }
 
+    __lap.mark(9);
     // --- CratonVM extra metadata (append after JDK layout) ---
     let obj = ctx.read_native_pin(obj_pin, obj);
     let desc_str = ctx.read_native_pin(desc_str_pin, desc_str);
@@ -6668,6 +6993,7 @@ pub(crate) fn create_method_object(
         Value::Int(METHOD_EXTRA_TRUSTED_MARKER),
     );
 
+    __lap.mark(10);
     ctx.unpin_native_roots(obj_pin);
     obj
 }
@@ -7036,6 +7362,39 @@ pub(crate) fn method_modifiers_value(
     ctx: &dyn NativeContext,
     method_obj: cratonvm_types::ObjectRef,
 ) -> Value {
+    // A mirror THIS VM built already carries the declaring member's exact
+    // class-file `access_flags`: `create_method_object` writes `modifiers`
+    // from `MethodMetadata::access_flags`, which is the same
+    // `m.access_flags.bits()` the class-table search below would find. Taking
+    // the field is not a micro-optimisation — the search calls
+    // `ctx.declared_methods(class_id)`, which allocates a fresh
+    // `MethodMetadata` (two owned `String`s and two `Vec`s) for EVERY method
+    // the class declares, per call. That made `Method.getModifiers()` cost
+    // 4.2 us on a 125-method class and 39.0 us on jOOQ's 1003-method
+    // `DefaultDSLContext`, against HotSpot's 1 ns — linear in the declaring
+    // class's method count, for a value already sitting in a field.
+    //
+    // Spring's `AnnotationsScanner.isOverride` calls it once per candidate
+    // method pair: a native census of one `MethodIntrospector.selectMethods`
+    // pass over `DefaultDSLContext` counted 1 549 873 calls, which is the
+    // whole of the 65-75 s that pass took (retired write-up:
+    // `jooqautoconfigurationtests-timeout-regression-20260805`).
+    //
+    // The search stays for a mirror we did NOT build, which is what the
+    // comment below is about: a JDK-private `Method` copy is allocated by JDK
+    // bytecode at the real JDK width, so it has no post-layout metadata tail
+    // and fails `method_has_trusted_metadata` — the same marker
+    // `read_method_descriptor` already refuses to trust without.
+    if method_has_trusted_metadata(ctx, method_obj) {
+        if let v @ Value::Int(_) = method_int_field_value_or_legacy(
+            ctx,
+            method_obj,
+            "modifiers",
+            METHOD_LEGACY_SLOT_MODIFIERS,
+        ) {
+            return v;
+        }
+    }
     // JDK-private Method copies can retain a truncated `modifiers` field.
     // Prefer the loaded declaring member's exact class-file metadata.
     if let (Value::Object(Some(clazz)), Value::Object(Some(name))) = (
@@ -7360,25 +7719,71 @@ pub(crate) fn native_method_invoke(
         }
     }
 
+    // Capture the declaring class's EXACT id from the mirror once, before the
+    // access checks. Both the caller-entitlement step and the JPMS step want
+    // it, and resolving it by binary name instead is ambiguous when two child
+    // loaders define the same name (see
+    // `check_reflection_module_access_with_target_id`'s doc comment and
+    // `regression-suite/src/RFieldSiteCache.java` `twoLoadersOneName`).
+    let declaring_cid = mirror_class_id(ctx, declaring_mirror);
+
     // Access control: accessible flag lives in a CratonVM extra slot.
     let accessible = read_method_accessible(ctx, this);
     let is_public = (modifiers & ACC_PUBLIC) != 0;
     // Most framework reflection invokes public methods. Do not format an
     // exception-only diagnostic string on that successful hot path.
     if !accessible && !is_public {
-        check_access(
-            modifiers,
-            false,
-            &format!("Method.invoke: {}.{}", class_name, method_name),
-        )?;
+        // JLS 6.6.1 / JEP 181: a non-public method is still reachable without
+        // `setAccessible(true)` when the CALLER is entitled to it — the
+        // declaring class itself, a confirmed nestmate (private), or a
+        // same-runtime-package / subclass caller (package-private, protected).
+        // `check_access` takes no `ctx` and so cannot ask that question; it
+        // rejected `RJdkReflect$Subject.secret` invoked from its own nest host
+        // (regression-suite/src/RJdkReflect.java:160), which HotSpot 25 allows.
+        // `check_field_access` is the field-shaped half of the same rule.
+        // Pure widening: the fallback below is unchanged for every input the
+        // caller step does not accept.
+        let caller_cid = resolve_caller_class_id(ctx);
+        let caller_entitled = match (caller_cid, declaring_cid) {
+            (Some(caller), Some(declaring)) => {
+                crate::lang_reflect::caller_may_access_member(ctx, caller, declaring, modifiers)
+            }
+            _ => false,
+        };
+        if !caller_entitled {
+        // NOTE: dev landed a NARROWER fix for the same defect while this was
+        // in flight — a same-class-only carve-out, motivated by HikariConfig's
+        // private-final AtomicReference and measured on Temurin 25 as legal for
+        // both private (0x0002) and package-private (0x0008). This rule SUBSUMES
+        // it: `caller_may_access_member`'s first arm is the declaring class
+        // itself. Kept the wider rule; dev's evidence recorded here.
+            check_access(
+                modifiers,
+                false,
+                &format!("Method.invoke: {}.{}", class_name, method_name),
+            )?;
+        }
     }
-    // NEW-19: module-level opens check (JPMS). When `accessible == true`
-    // the override flag short-circuits the deep check (JEP 403).
+    // NEW-19: module-level JPMS check. When `accessible == true` the override
+    // flag short-circuits it (JEP 403).
     //
-    // JEP 403/261 distinction: PUBLIC methods of EXPORTED packages need
-    // only `exports`, not `opens`. Only enforce the deep check when the
-    // method is non-public (ACC_PUBLIC = 0x0001) вЂ” that's the case where
-    // setAccessible / opens is required.
+    // JEP 403/261 distinction: a PUBLIC method of an EXPORTED package needs
+    // only `exports`, not `opens` — `ArrayList.size()` must invoke without any
+    // --add-opens, because java.base exports java.util WITHOUT opening it.
+    // Only a non-public method requires the opens/deep check.
+    //
+    // But "needs only exports" is not "needs nothing", and the public arm used
+    // to have NO check at all. `Method.invoke` is the exact shape of
+    // `Constructor.newInstance`: both call `AccessibleObject.checkAccess` ->
+    // `Reflection.verifyMemberAccess` -> `verifyModuleAccess` ->
+    // `memberModule.isExported(pkg, callerModule)`, and `verifyMemberAccess`
+    // runs that module test BEFORE the `Modifier.isPublic(modifiers)` shortcut,
+    // so public members do not skip it. Measured on Temurin 25.0.3:
+    // `jdk.internal.misc.VM.isBooted()` is public+static on a public class, and
+    // `Method.invoke` throws IllegalAccessException ("module java.base does not
+    // export jdk.internal.misc to unnamed module"), while
+    // `ArrayList.size()` invokes normally. Without this arm CratonVM
+    // fabricated a success where the spec mandates a failure.
     if !is_public {
         if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
             return Err(
@@ -7388,6 +7793,18 @@ pub(crate) fn native_method_invoke(
                 .into(),
             );
         }
+    } else if let Err(msg) = check_reflection_export_access_with_target_id(
+        ctx,
+        &class_name,
+        declaring_cid,
+        accessible,
+    ) {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),
+            }
+            .into(),
+        );
     }
 
     // Get descriptor вЂ” stored in CratonVM extra slot (not a real JDK field).
@@ -8351,6 +8768,7 @@ fn synthetic_method_meta(
         access_flags: decl.2,
         declaring_class_id,
         exceptions: Vec::new(),
+        signature: None,
     }
 }
 
@@ -8400,6 +8818,7 @@ fn declared_methods_with_synthetic(
                     access_flags: 0x0001, // ACC_PUBLIC
                     declaring_class_id: class_id,
                     exceptions: Vec::new(),
+                    signature: None,
                 });
             }
         }
@@ -8421,6 +8840,7 @@ fn declared_methods_with_synthetic(
                 access_flags: 0x0012,
                 declaring_class_id: class_id,
                 exceptions: Vec::new(),
+                signature: None,
             });
         }
         return methods;
@@ -8589,7 +9009,11 @@ pub(crate) fn native_class_get_declared_methods(
             }
         };
 
+        gdmp::reset();
+        let __gdm_all = std::time::Instant::now();
+        let mut __glap = gdmp::Lap::new();
         let methods = declared_methods_with_synthetic(ctx, class_id);
+        __glap.mark(11);
         if crate::vmflags().loader.dbg_obsreg {
             let __cname = ctx.class_name_of_id(class_id).unwrap_or_default();
             if __cname.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
@@ -8710,13 +9134,23 @@ pub(crate) fn native_class_get_declared_methods(
             visible = reordered;
         }
 
+        __glap.mark(12);
         link_isolated_method_signatures(ctx, class_id, &visible)?;
+        __glap.mark(13);
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
         let arr = build_mirror_array_comp(ctx, method_component, visible.len(), |ctx, i| {
             create_method_object(ctx, visible[i])
         });
+        if gdmp::on() {
+            let __name = ctx.class_name_of_id(class_id).unwrap_or_default();
+            gdmp::report(
+                &__name,
+                visible.len(),
+                __gdm_all.elapsed().as_nanos() as u64,
+            );
+        }
         Ok(Some(Value::Object(Some(arr))))
     })();
     // Restore depth on every exit path (success or error).
@@ -9015,6 +9449,7 @@ fn wf_shim_synth_main_method(
         access_flags: (ACC_PUBLIC | ACC_STATIC) as u16,
         declaring_class_id,
         exceptions: Vec::new(),
+        signature: None,
     };
     tracing::warn!(
         target: "wf-shim",
@@ -9220,8 +9655,10 @@ pub(crate) fn create_constructor_object(
     // Enhancer.emitConstructors calls this on every superclass constructor
     // during proxy class generation вЂ” see ReflectUtils.getExceptionTypes
     // (ReflectUtils.java:133/605).
-    let exception_names =
-        ctx.method_exceptions(meta.declaring_class_id, &meta.name, &meta.descriptor);
+    // Already resolved by whoever built this metadata (see
+    // `MethodMetadata::exceptions`). Re-deriving it here meant an O(methods)
+    // search of the declaring class's method table per mirror.
+    let exception_names = meta.exceptions.clone();
     // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
     // allocates/loads classes, so the array is pinned across the fill loop.
     let exception_arr =
@@ -9255,9 +9692,9 @@ pub(crate) fn create_constructor_object(
     // constructor parameter (e.g. a record's canonical `List<Foo>` component) came
     // back as raw `List` from `Parameter.getParameterizedType()` while
     // `Constructor.getGenericParameterTypes()` (a registered native) was correct.
-    if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
+    if let Some(sig) = meta.signature.clone() {
         let sig_obj = ctx.create_string(&sig);
-        // `method_signature`/`create_string` above can also allocate/classload —
+        // `create_string` above can allocate/classload —
         // re-read `obj` before writing into it.
         let obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
@@ -9715,6 +10152,21 @@ pub(crate) fn native_constructor_new_instance(
                 .into(),
             );
         }
+    } else if let Err(msg) = check_reflection_export_access_with_target_id(
+        ctx,
+        &class_name,
+        declaring_cid,
+        accessible,
+    ) {
+        // JEP 261: `exports`, not `opens`. A public ctor previously got NO
+        // module check at all -- the comment above got the exports/opens
+        // distinction right and the code then implemented "needs nothing".
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Constructor.newInstance: {class_name}: {msg}"),
+            }
+            .into(),
+        );
     }
 
     // Descriptor: extra slot / side table, or rebuild from `parameterTypes`
@@ -19822,6 +20274,7 @@ mod tests {
             access_flags: 0x0001,
             declaring_class_id: owner,
             exceptions: Vec::new(),
+            signature: None,
         };
         let method = create_method_object(&mut ctx, &meta);
         ctx.set_method_return_type_annotations(
@@ -19856,6 +20309,7 @@ mod tests {
             access_flags: 0x0001,
             declaring_class_id: owner,
             exceptions: Vec::new(),
+            signature: None,
         };
         let method = create_method_object(&mut ctx, &meta);
         ctx.set_method_parameter_type_annotations(
@@ -21197,6 +21651,126 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // L15 - check_field_access consults the caller (JLS 6.6.1 / JEP 181),
+    // the field-shaped twin of the Method.invoke widening.
+    // -----------------------------------------------------------------------
+
+    /// A package-private field is reachable from another class in the SAME
+    /// runtime package with no `setAccessible(true)`. Before L15 this was
+    /// rejected (only the declaring class itself was admitted).
+    #[test]
+    fn field_access_allows_package_private_field_from_same_runtime_package() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/PkgPeer")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            "Field.get(pkgValue)"
+        )
+        .is_ok());
+    }
+
+    /// The widening stops at the package boundary: a foreign-package caller
+    /// still needs the accessible override.
+    #[test]
+    fn field_access_rejects_package_private_field_from_a_foreign_package() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PkgOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/Foreign")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0000, // package-private
+            false,
+            declaring,
+            "Field.get(pkgValue)"
+        )
+        .is_err());
+    }
+
+    /// A `protected` field is reachable from a subclass in a foreign package
+    /// (JLS 6.6.2).
+    #[test]
+    fn field_access_allows_protected_field_from_a_foreign_package_subclass() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/ProtOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/other/ProtChild")
+            .expect("caller class");
+        ctx.set_superclass(caller, declaring);
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0004, // protected
+            false,
+            declaring,
+            "Field.get(protValue)"
+        )
+        .is_ok());
+    }
+
+    /// Fail CLOSED when there is no resolvable Java caller frame: the
+    /// entitlement step must never be reached, so the old blanket rule stands.
+    #[test]
+    fn field_access_rejects_private_field_when_no_caller_frame_resolves() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/PrivateFieldOwner")
+            .expect("declaring class");
+        ctx.set_frame_class_ids(Vec::new());
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002,
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    /// A private field of a class in the same package is still NOT reachable
+    /// without a confirmed nest relationship - `private` is nest-scoped, never
+    /// package-scoped (JEP 181). This pins the one arm that must not widen.
+    #[test]
+    fn field_access_rejects_private_field_from_a_same_package_non_nestmate() {
+        let mut ctx = mock_ctx();
+        let declaring = ctx
+            .ensure_class_initialized("cratonvm/test/NestlessOwner")
+            .expect("declaring class");
+        let caller = ctx
+            .ensure_class_initialized("cratonvm/test/NestlessPeer")
+            .expect("caller class");
+        ctx.set_frame_class_ids(vec![caller]);
+
+        assert!(check_field_access(
+            &mut ctx,
+            0x0002, // private
+            false,
+            declaring,
+            "Field.get(privateValue)"
+        )
+        .is_err());
+    }
+
+    // -----------------------------------------------------------------------
     // Phase C вЂ” typed Field setters narrow via storage-size mask
     // -----------------------------------------------------------------------
 
@@ -21464,6 +22038,7 @@ mod tests {
             access_flags: 0x1,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
 
         let method_obj = create_method_object(&mut ctx, &meta);
@@ -22507,6 +23082,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x1, // ACC_PUBLIC, distinct from synthetic 0x14
             declaring_class_id: cl_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         ctx.set_declared_methods(cl_cid, vec![real_meta]);
 
@@ -22733,6 +23309,7 @@ Implementation-Title: opensaml-core-api\r\n\
                     access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
+                    signature: None,
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
@@ -22740,6 +23317,7 @@ Implementation-Title: opensaml-core-api\r\n\
                     access_flags: ACC_PUBLIC as u16,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
+                    signature: None,
                 },
                 MethodMetadata {
                     name: "<init>".to_string(),
@@ -22747,6 +23325,7 @@ Implementation-Title: opensaml-core-api\r\n\
                     access_flags: 0,
                     declaring_class_id: cid,
                     exceptions: Vec::new(),
+                    signature: None,
                 },
             ],
         );
@@ -22799,6 +23378,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -22830,6 +23410,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -22870,6 +23451,7 @@ Implementation-Title: opensaml-core-api\r\n\
                 access_flags: 0x00,
                 declaring_class_id: cid,
                 exceptions: Vec::new(),
+                signature: None,
             }],
         );
         let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "com/example/WriteReplaceOnly");
@@ -22920,6 +23502,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x01,
             declaring_class_id: declaring_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         let m = create_method_object(&mut ctx, &meta);
 
@@ -23161,6 +23744,7 @@ Implementation-Title: opensaml-core-api\r\n\
                 access_flags: 0x01,
                 declaring_class_id: object_cid,
                 exceptions: Vec::new(),
+                signature: None,
             },
             MethodMetadata {
                 name: "hashCode".to_string(),
@@ -23168,6 +23752,7 @@ Implementation-Title: opensaml-core-api\r\n\
                 access_flags: 0x01,
                 declaring_class_id: object_cid,
                 exceptions: Vec::new(),
+                signature: None,
             },
         ];
         ctx.set_declared_methods(object_cid, object_methods);
@@ -23182,6 +23767,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x401, // ACC_PUBLIC|ACC_ABSTRACT
             declaring_class_id: iface_cid,
             exceptions: Vec::new(),
+            signature: None,
         }];
         ctx.set_declared_methods(iface_cid, iface_methods);
         ctx.set_superclass(iface_cid, object_cid);
@@ -23223,6 +23809,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x0001,
             declaring_class_id,
             exceptions: Vec::new(),
+            signature: None,
         };
         ctx.set_declared_methods(
             parent,
@@ -23305,6 +23892,7 @@ Implementation-Title: opensaml-core-api\r\n\
             access_flags: 0x09, // ACC_PUBLIC|ACC_STATIC, distinct from synthetic 0x81
             declaring_class_id: m_cid,
             exceptions: Vec::new(),
+            signature: None,
         };
         ctx.set_declared_methods(m_cid, vec![real_meta]);
 

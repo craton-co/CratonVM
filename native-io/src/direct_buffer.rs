@@ -1215,6 +1215,17 @@ fn temporary_direct_buffer_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         .into());
     }
     let vm_identity = ctx.vm_identity();
+    // Root handle of a pooled entry that is being handed back out. The pool
+    // stops tracking it the moment it leaves `entries`, so its handle has to be
+    // released — but only after the writes below, so the buffer stays rooted
+    // for the whole hand-off. Leaving it registered leaked one JNI global
+    // reference per pool hit, i.e. per NIO transfer: `TEMPORARY_BUFFER_POOL_LIMIT`
+    // bounds the pool at three entries per thread, but nothing bounds the root
+    // table behind it. Measured on three H2 `TestFileSystem` filesystems (~4.5 s,
+    // 23 collections): section 9 of `roots.rs` contributed **57 036** roots at
+    // the last GC without this release and **7** with it, and every GC root scan
+    // walked all of them.
+    let mut handed_out_root = 0usize;
     let mut reusable = None;
     TEMPORARY_BUFFERS.with(|entries| {
         let mut entries = entries.borrow_mut();
@@ -1223,16 +1234,23 @@ fn temporary_direct_buffer_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             .position(|entry| entry.vm_identity == vm_identity && entry.capacity >= size)
         {
             let entry = entries.remove(index);
-            reusable = ctx
-                .resolve_global_root(entry.root)
-                .map(|buffer| (entry, buffer));
-            if reusable.is_none() {
-                ctx.remove_global_root(entry.root);
+            match ctx.resolve_global_root(entry.root) {
+                Some(buffer) => {
+                    handed_out_root = entry.root;
+                    reusable = Some(buffer);
+                }
+                // Already collected out from under the pool: the entry is dead,
+                // so drop its handle here and fall through to a fresh buffer.
+                None => {
+                    ctx.remove_global_root(entry.root);
+                }
             }
         }
     });
     let buffer = match reusable {
-        Some((_entry, buffer)) => buffer,
+        Some(buffer) => buffer,
+        // Only reached with `handed_out_root == 0`, so the early return below
+        // cannot strand a handle.
         None => match ctx.new_object_initialized(
             "java/nio/DirectByteBuffer",
             "(I)V",
@@ -1245,6 +1263,12 @@ fn temporary_direct_buffer_get(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     ctx.set_field_by_name(buffer, "mark", Value::Int(-1));
     ctx.set_field_by_name(buffer, "position", Value::Int(0));
     ctx.set_field_by_name(buffer, "limit", Value::Int(size));
+    // The buffer is now on its way back to the caller, which publishes it
+    // through the native-return handoff (`native_pending_return`), so the pool's
+    // root has nothing left to protect.
+    if handed_out_root != 0 {
+        ctx.remove_global_root(handed_out_root);
+    }
     Ok(Some(Value::Object(Some(buffer))))
 }
 
@@ -1960,6 +1984,52 @@ mod tests {
         M.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A pooled temporary direct buffer must not leak its global root when it
+    /// is handed back out. `TEMPORARY_BUFFER_POOL_LIMIT` bounds the pool at
+    /// three entries per thread; the JNI global-ref table backing those entries
+    /// is not bounded, so a `get` that reused an entry without releasing its
+    /// handle leaked one root per NIO transfer — 57 036 unreclaimable roots
+    /// against 7, over three H2 `TestFileSystem` filesystems in ~4.5 s. Without
+    /// the release this test sees exactly one leaked root per cycle.
+    #[test]
+    fn temporary_direct_buffer_reuse_releases_the_pooled_root() {
+        // The pool is thread-local and outlives any one test; start from empty
+        // so the baseline below describes only this test's roots.
+        TEMPORARY_BUFFERS.with(|e| e.borrow_mut().clear());
+        let mut ctx = MockNativeContext::new();
+        let baseline = ctx.global_root_count();
+
+        const CYCLES: usize = 50;
+        let mut first = None;
+        let mut last = None;
+        for _ in 0..CYCLES {
+            let Ok(Some(Value::Object(Some(buffer)))) =
+                temporary_direct_buffer_get(&mut ctx, &[Value::Int(4096)])
+            else {
+                panic!("getTemporaryDirectBuffer returned no buffer");
+            };
+            // `capacity` is what the release path screens on; the mock's
+            // constructor does not populate it.
+            ctx.set_field_by_name(buffer, "capacity", Value::Int(4096));
+            first.get_or_insert(buffer);
+            last = Some(buffer);
+            temporary_direct_buffer_release(&mut ctx, &[Value::Object(Some(buffer))])
+                .expect("releaseTemporaryDirectBuffer");
+        }
+
+        // If the pool never hit, the leak this guards could not arise and the
+        // count assertion below would pass for the wrong reason.
+        assert_eq!(first, last, "the pooled buffer was never reused");
+        let leaked = ctx.global_root_count();
+        assert!(
+            leaked <= baseline + TEMPORARY_BUFFER_POOL_LIMIT,
+            "{CYCLES} get/release cycles left {leaked} global roots \
+             (baseline {baseline}); the pool holds at most \
+             {TEMPORARY_BUFFER_POOL_LIMIT}"
+        );
+        TEMPORARY_BUFFERS.with(|e| e.borrow_mut().clear());
     }
 
     #[test]

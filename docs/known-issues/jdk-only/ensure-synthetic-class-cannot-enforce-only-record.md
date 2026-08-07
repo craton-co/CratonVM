@@ -7,6 +7,18 @@ replaced this record's "52 call sites" with a measured 10. What remains is
 step 3 — deleting the infallible entry point — and the reason it is still open
 is not the call sites. See *What is still open*.
 
+> **2026-08-06.** Item 4's last shape is closed: `java/util/Enumeration$Impl`
+> now has somewhere for its refusal to land (a real
+> `Collections.enumeration(Arrays$ArrayList)`), so every class this record ever
+> listed as "refused with nowhere to go" is answered. Item 5 is **two thirds
+> done**: `native-io` and `native-collections` allocation funnels are fallible,
+> `native-builtins::alloc_concurrent_synthetic` is not, and the reason is
+> measured rather than estimated — see *Why `alloc_concurrent_synthetic` was
+> abandoned rather than finished*, now carrying a fourth attempt that leaves
+> **758** errors on a preserved, non-compiling branch and names the two rules
+> that got it there. `ensure_synthetic_class` therefore still exists and this
+> record stays here.
+
 The original defect: under `--jdk-only` this API recorded the violation and
 then fabricated the class anyway, so the run reported a violation while
 continuing in the exact state the contract forbids. That is now false for every
@@ -79,9 +91,9 @@ own adjudication"* was counting tests.
 **Step 3 — deleting `ensure_synthetic_class` — and the blocker is not the call
 sites.** Three of the 39 *are* the infallible allocation funnels themselves:
 
-* `native-collections::alloc_synthetic`
-* `native-io::alloc_synthetic`
-* `native-builtins::alloc_concurrent_synthetic`
+* `native-collections::alloc_synthetic` — **migrated 2026-08-06**
+* `native-io::alloc_synthetic` — **migrated 2026-08-06**
+* `native-builtins::alloc_concurrent_synthetic` — **not migrated; see below**
 
 Between them they have roughly **2,300 callers**, none of which returns a
 `Result`. Deleting `ensure_synthetic_class` means making those three fallible,
@@ -90,9 +102,197 @@ that sizes this work off a grep of `.ensure_synthetic_class(` is sizing the
 wrong thing.
 
 The fallible siblings those funnels need already exist and now have real
-callers: `try_alloc_synthetic` (native-collections) and
-`try_alloc_concurrent_synthetic` (native-builtins), added by L7 alongside the
-infallible ones.
+callers: `try_alloc_synthetic` (native-collections and, since 2026-08-06,
+native-io) and `try_alloc_concurrent_synthetic` (native-builtins).
+
+### Two of the three are done, and the unit above is still wrong
+
+**"~2,300 call sites" is not the size of this work, and neither is 39.** The
+call sites are MECHANICAL — a paren-matching rewrite to the `try_` spelling
+with `?`, plus the `use` lines. What costs is the cascade: every helper that
+returned a bare `ObjectRef`/`Value`/`()` and therefore had nowhere to put a
+refusal has to gain an error channel, and so does everything that calls it.
+The compiler enumerates that set exactly, so it drives the work rather than a
+grep. Measured on 2026-08-06:
+
+| funnel | call sites | functions needing an error channel | outcome |
+|---|---:|---:|---|
+| `native-io::alloc_synthetic` | 23 | **6** | done, 2 rounds |
+| `native-collections::alloc_synthetic` | 146 | **44** | done, 4 rounds + 11 by hand |
+| `native-builtins::alloc_concurrent_synthetic` | 1,932 | **≥340** | **abandoned — see below** |
+
+Landing the first two also forced **34 cross-crate call sites** in
+native-builtins, because `make_hashset_with_elements`, the collector factories
+and the view builders are `pub` and became fallible. That is part of the cost of
+each funnel and is easy to forget when sizing one in isolation.
+
+### Why `alloc_concurrent_synthetic` was abandoned rather than finished
+
+Not because it is big. Because the cascade **stopped converging**: rounds of
+"give the reported functions an error channel, then re-ask the compiler" went
+277 → 160 → 134 → 106 → 105 → 155 → 137, and a second loop that also repaired
+the mechanical fallout (a stray `?`, a bare `return;`, an unwrapped tail) went
+315 → 317 → 322. A loop whose error count RISES is repairing less than it
+breaks, and the honest reading is that the remaining sites need per-site
+judgement, not another pass.
+
+Three tooling faults found on the way, all of which produce a PARSE error rather
+than a type error — which matters, because rustc stops at the first parse error
+per file and hides everything behind it:
+
+* a parameter that is itself a closure (`&dyn Fn(usize) -> bool`) makes "the
+  last `->` in the signature" pick the CLOSURE's return type; `str.replace` then
+  splits `Result<..>` across two parameters;
+* `(?<![\w.])get\(` matches inside `$get(`, so a `macro_rules!`-defined function
+  gets a `?` appended to its PARAMETER LIST;
+* a unit fn whose last line is a tail expression needs a `;` before the appended
+  `Ok(())`, and a tail that merely closes a multi-line call (`})`) is not an
+  expression to wrap at all — wrapping it yields the literal text `Ok(}))`.
+
+And one structural flaw worth knowing before anyone tries again: **the
+`?`-appender matches by NAME across every file**, so converting `alloc_foo` in
+one module also stamps a `?` on an unrelated `alloc_foo` in another. rustc
+reports each as "`?` operator has incompatible types" and the repair is to
+delete that `?` — but a name-based rewriter over a 112-file crate will keep
+generating them.
+
+**If you pick this up:** not with a textual rewriter. See the next section —
+that advice was tried and is not sufficient.
+
+### Attempt 3, 2026-08-07 — rustc's own suggestions, and where they stop
+
+The 2026-08-06 note above blamed the name-based `?`-appender and prescribed a
+per-module loop. The appender WAS a real fault, but fixing it is not enough.
+Three strategies, each run to its own stopping point on the same 1,908 sites:
+
+| strategy | from | to | why it stopped |
+|---|---:|---:|---|
+| name-based `?` appender | 277 | 137, rising | matches by NAME across 112 files; stamps `?` on same-named functions it never converted |
+| span-precise regex on rustc's `line:col` | 2,072 | ~1,630, flat | the span often points at a PATTERN (`if let Some(v) = f(..)`); text cannot tell which paren belongs to the failing expression |
+| **rustc's own suggestions** | **2,072** | **775, flat** | best by far — rustc knows the expression tree — but its `?` suggestion is `MaybeIncorrect`, and 494 more are `HasPlaceholders`, i.e. not applicable at all |
+
+Two things the third attempt established that the others could not:
+
+* **Apply rustc's suggestions, not your own regex.** `cargo check
+  --message-format json` carries a byte-exact `suggested_replacement` per span.
+  Accept `MachineApplicable`, plus `MaybeIncorrect` entries whose replacement is
+  the original text with a `?` appended — that is the "use `?` to unwrap"
+  suggestion, and rustc chose the span. One round applied **556**.
+* **The residue looked like SEMANTICS, and was not.** At the stopping point:
+  631 `E0308 mismatched types` and — read at the time as the signal that
+  mattered — **104 `E0382` "use of moved value"**, which this record concluded
+  was ownership damage no textual tool could see. **Attempt 4 showed that
+  reading was wrong**; see below. The E0382s were an artefact of repairing the
+  right error in the wrong PLACE.
+
+Nothing from these three attempts was committed; `dev` has never carried a
+half-migrated `native-builtins`.
+
+### Attempt 4, 2026-08-07 — two real findings, and a hard floor at 758
+
+Same 1,904 sites, driven by rustc's suggestions again, plus two rules the
+earlier attempts did not have. Both are worth keeping; neither was enough.
+
+**Finding 1 — rustc will not suggest `?` until the enclosing function already
+returns `Result`.** Until then the same expression gets an `.expect(..)`
+suggestion instead, which is not the edit anyone wants and which the driver was
+correctly refusing. So the order matters: *widen the function first, then ask
+rustc again.* The trigger is an `E0308` whose expected/found pair is
+`expected T, found Result<T, MethodCallFailed>` — and that text lives on the
+span's **`label`**, not on `message`, which is only the string `"mismatched
+types"`. A first version of the rule matched on `message` and widened nothing.
+With the rule reading `label`, one run went **736 → 4**.
+
+**Finding 2 — the `?` belongs on the `let` BINDING, not on the uses, and that
+is where the E0382s came from.** When a `let` binds a now-fallible call, rustc
+reports the type error at *every use* of that local and suggests `?` at each
+one. Applying all of them unwraps the same value repeatedly:
+
+```rust
+let package = i2_alloc_synthetic_package(ctx, &name);   // Result
+let handle = ctx.add_global_root(package?);             // use 1
+Ok(Some(Value::Object(Some(package?))))                 // use 2 -> E0382
+```
+
+The repair is one edit above, and it fixes every use at once:
+
+```rust
+let package = i2_alloc_synthetic_package(ctx, &name)?;
+```
+
+That accounts for the "use of moved value" wall attempt 3 read as semantic
+damage. **It is not ownership damage — it is the correct fix applied at the
+wrong site.** A pass that moves the `?` to the binding fixed 719 of them.
+
+One trap inside that repair: stripping `name?` at *file* scope to clean up the
+uses also strips `?` from same-named locals in other functions that legitimately
+need it, so a pass can fix 342 bindings and leave the error count flat. Drop
+only the `?`s rustc itself flags (`` `?` operator has incompatible types ``),
+span-precise.
+
+**Where it stopped: 758, flat over six rounds** (528 `E0308`, 132 `E0382`,
+16 incompatible `match` arms, 14 `?`-on-`Option`, 12 `return;` in a non-unit
+fn, 8 `?`-in-a-closure). Concentrated in
+`phases_late/nio_file.rs` (73), `util_concurrent_ext.rs` (54),
+`lang_class.rs` (49), `lib.rs` (43), `lang_invoke.rs` (35),
+`phases_late/xml_json.rs` (34).
+
+The floor is where it is because the last errors are each a *shape* rather than
+an instance: a `match` whose arms must all be widened together, a closure that
+must become fallible along with the iterator adapter that takes it, an `Option`
+chain that has to choose between `ok_or` and a different return type. Each needs
+a decision, and 758 decisions is hand work.
+
+**This attempt WAS preserved,** unlike the first three, because starting from
+758 is worth more than starting from 2,072:
+
+    wip/jdk-only-concurrent-funnel-758-DO-NOT-MERGE   (532925266)
+
+It does **not compile** and must never be merged. It is a starting point for
+whoever does the hand pass, and nothing else. `dev` is unchanged.
+
+**Recommendation for attempt 5:** stop trying to converge the whole crate.
+Take the branch above, pick one file, finish it by hand until
+`cargo check` reports nothing in that file, commit, and repeat. The two findings
+above make the mechanical majority of each file free; the per-file residue is
+small enough to read. Six files carry 40% of what is left.
+
+### What making a funnel fallible actually FINDS — the reason to do it at all
+
+Two mint sites the earlier waves had missed, both surfaced the moment the
+funnel stopped fabricating silently, and neither would have been found by
+reading:
+
+* **`java/util/ServiceLoader$Itr`** (`native_stream_iterator`). Refusing it
+  broke `ServiceLoader`, and `ServiceLoader` is how the CLDR locale provider is
+  discovered — so ONE unlanded refusal produced
+  `ServiceConfigurationError: Locale provider adapter "CLDR" cannot be
+  instantiated` in the probe's `textformat` section *and*
+  `attach=throw-NoClassDefFoundError` in `JdkOnlyPlatformProbe`'s `agent`
+  section. Two gate sections, one cause, neither naming the class. It now lands
+  on a real `Arrays$ArrayItr` like its siblings.
+* **`java/util/HashMap$KeyItr` on the `ConcurrentHashMap` key-set path**
+  (`native_ksv_iterator`). The 2026-08-05 wave routed the four `HashSet`-side
+  mint sites through the refusal and left this one on the infallible funnel, so
+  `for (String x : ConcurrentHashMap.newKeySet())` died outright. `RChmKeySetView`
+  caught it.
+
+**And the second one is the exception that proves the rule about landings.** It
+is deliberately left on the infallible funnel. Every other snapshot iterator
+lands on a real `Arrays$ArrayItr`, and that trade was argued as free — "on the
+strict path the alternative was never a working `remove()`, it was an iteration
+that did not reach `next()`". That argument does not hold here: HotSpot's
+`ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
+`remove()` writes through, `RChmKeySetView` exercises exactly that, and a
+fixed-size list's iterator answers `UnsupportedOperationException: remove`.
+Landing it would trade a WORKING capability for a fidelity gain.
+
+So `counts.compatibility_classes` is **1**, not 0, on any workload that iterates
+a `ConcurrentHashMap` key set — and that number is the honest reading, not a
+regression to paper over. It goes to zero when CratonVM's `ConcurrentHashMap`
+carries a real `table[]` its own `KeyIterator` can walk, which is the
+collections reclassification wave. **Do not "fix" it by landing that site**
+without checking `RChmKeySetView` first.
 
 **The unmodifiable/factory/comparator family is closed — and the order was the
 whole lesson.** After the bootstrap migration, `JdkOnlyCensusLoadProbe` still
@@ -130,7 +330,7 @@ error.
 > iterator class, hand back the snapshot through a real `Arrays$ArrayList`'s
 > own iterator, which reads only the `Object[]` it was given. All six sections
 > are fixed; see
-> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
+> `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
 > (retired from this directory 2026-08-06, once its fifth class — the
 > `System.Logger` one, which had taken out every `ObjectInputStream`
 > construction — landed on a real `jdk.internal.logger.SimpleConsoleLogger`).
@@ -209,7 +409,7 @@ Reclassifying them is the dangerous direction in *Blast radius* — it silences
 the violation, keeps fabricating, and makes the zero-stub census green while
 the substitution continues. L7 acted on that verdict: the bootstrap site
 **refuses** them rather than relabelling them. See
-[VM-internal classes are mislabelled `CompatibilityStub`](../../internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md)
+VM-internal classes are mislabelled `CompatibilityStub` (`jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`)
 (RETIRED 2026-08-06).
 
 ## What specifically must change
@@ -229,13 +429,18 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
    That last one was reached from `ObjectInputFilter$Config.<clinit>`, so
    refusing it had been costing every `ObjectInputStream` construction in the
    VM. See
-   `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
+   `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
    **Still open here:** `java/util/Enumeration$Impl` in `classloader.rs`'s
    `getResources` helpers, which has no such landing yet. And the refusals are
    landings, not removals — the natives themselves are still registered, which
    is item 5's business.
-5. Make the three allocation funnels fallible (~2,300 call sites), then delete
-   `ensure_synthetic_class`.
+5. Make the three allocation funnels fallible, then delete
+   `ensure_synthetic_class`. **Two of three done 2026-08-06** —
+   `native-io::alloc_synthetic` and `native-collections::alloc_synthetic`, plus
+   the 34 cross-crate callers that forced. `native-builtins::alloc_concurrent_synthetic`
+   is not done and the reason is measured, not estimated; see *Why
+   `alloc_concurrent_synthetic` was abandoned rather than finished* above. Until
+   it is, `ensure_synthetic_class` cannot be deleted and this record stays open.
 
 ## How to verify a fix
 

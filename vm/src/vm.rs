@@ -34665,19 +34665,45 @@ mod tests {
         assert_eq!(v2, Value::Int(99));
     }
 
+    /// `Array.newInstance` allocates for a real component type, and REFUSES a
+    /// null one.
+    ///
+    /// This test read `Array.newInstance(null, 5) creates a 5-element reference
+    /// array` until 2026-08-06, and that was the defect rather than the
+    /// contract: `ce20bdd20` measured Temurin 25 and HotSpot dereferences the
+    /// `Class` argument, so a null component type is a `NullPointerException`
+    /// with a null message — it does not quietly become `Object[]`. Asserting
+    /// the old behaviour froze a fabricated value in place, which is exactly
+    /// what the fix removed.
+    ///
+    /// Both halves are here on purpose. A test that only checked the refusal
+    /// would pass against a `newInstance` that refuses everything.
     #[test]
     fn reflect_array_new_instance() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        // Array.newInstance(null, 5) creates a 5-element reference array
+        // The positive case. `int.class` comes from `Class.getPrimitiveClass`,
+        // the way the JDK itself constructs a primitive mirror — primitives are
+        // not loadable through `Class.forName`.
+        let type_name = create_java_string(&shared, "int");
+        let int_cls = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/Class",
+            "getPrimitiveClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(type_name))],
+        )
+        .unwrap()
+        .unwrap();
         let arr = call_native(
             &shared,
             &mut thread,
             "java/lang/reflect/Array",
             "newInstance",
             "(Ljava/lang/Class;I)Ljava/lang/Object;",
-            &[Value::Object(None), Value::Int(5)],
+            &[int_cls, Value::Int(5)],
         )
         .unwrap()
         .unwrap();
@@ -34685,7 +34711,6 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("expected array"),
         };
-
         let len = call_native(
             &shared,
             &mut thread,
@@ -34697,6 +34722,29 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(len, Value::Int(5));
+
+        // The refusal, and it must be the JDK's: NPE, and `getMessage()` null.
+        let err = call_native(
+            &shared,
+            &mut thread,
+            "java/lang/reflect/Array",
+            "newInstance",
+            "(Ljava/lang/Class;I)Ljava/lang/Object;",
+            &[Value::Object(None), Value::Int(5)],
+        )
+        .expect_err("a null component type must not allocate anything");
+        assert!(
+            matches!(
+                err,
+                crate::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::NullPointerException { message: None }
+                    )
+                )
+            ),
+            "HotSpot dereferences the Class argument: NullPointerException with \
+             no detail message, not an Object[5] — got {err:?}"
+        );
     }
 
     // ========================================================================
@@ -54384,21 +54432,34 @@ mod tests {
         assert_eq!(ms, "name not found");
     }
 
+    /// A child node knows its own name and renders its absolute path.
+    ///
+    /// The parent comes from `Preferences.userRoot()`, the production entry
+    /// point, and not from a hand-rolled `alloc_object(.., 2)`. That fixture is
+    /// what made this test fail: `Preferences` grew from 2 slots to 6 (parent
+    /// link, child registry, removed flag, user/system tree), every native that
+    /// writes past slot 1 is guarded on `object_num_fields`, and the guards did
+    /// their job -- so the 2-field parent silently could not hold the back-link
+    /// that `absolutePath()` walks, and `toString()` rendered a path with no
+    /// node in it. Building the receiver the way the VM does keeps the fixture
+    /// from drifting behind the layout again.
     #[test]
     fn preferences_name_and_path() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let prefs_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
-        call_native(
+        let prefs_ref = call_native(
             &shared,
             &mut thread,
             "java/util/prefs/Preferences",
-            "<init>",
-            "()V",
-            &[Value::Object(Some(prefs_ref))],
+            "userRoot",
+            "()Ljava/util/prefs/Preferences;",
+            &[],
         )
-        .unwrap();
+        .unwrap()
+        .unwrap()
+        .as_object()
+        .expect("userRoot() must return a node");
 
         let child_name = create_java_string(&shared, "myNode");
         let child = call_native(
@@ -54449,7 +54510,12 @@ mod tests {
             Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
-        assert!(tss.contains("myNode"));
+        // `AbstractPreferences.toString()` is defined as
+        // `(isUserNode() ? "User" : "System") + " Preference Node: " +
+        // absolutePath()`, so this pins the name, the tree and the path
+        // together -- `contains("myNode")` alone passed while the path was
+        // wrong.
+        assert_eq!(tss, "User Preference Node: /myNode");
     }
 
     // ---- Compact reference array tests (Phase 5 Round 20) --------------------
@@ -76138,7 +76204,13 @@ public class SkippedTest {
         assert!(arr.is_some());
 
         assert_eq!(alloc.object_count(), 3);
-        assert_eq!(alloc.bytes_saved(), 72); // 3 * 24
+        // Derived, not a literal: the legacy header went 32 -> 24 on 2026-08-06
+        // and the saving per object went 24 -> 16 with it. `compact_header.rs`
+        // has the same expression as `LEGACY_MINUS_COMPACT_HEADER` and its own
+        // tests were updated; these three in `vm.rs` were the copies that were
+        // missed, so they are written to follow the constants from now on.
+        let saved_per_object = cratonvm_types::HEADER_SIZE - cratonvm_gc::CompactHeader::SIZE;
+        assert_eq!(alloc.bytes_saved(), 3 * saved_per_object);
 
         // Verify class resolution
         assert_eq!(alloc.class_id_at(obj.unwrap()), Some(object_cid));
@@ -76161,7 +76233,9 @@ public class SkippedTest {
         let header = vm.mem.heap.get_header(obj);
         let view = HeaderView::from_legacy(header);
         assert!(!view.is_array());
-        assert_eq!(view.header_size(), 32);
+        // The legacy header's size, from the constant that defines it — 24
+        // since the 2026-08-06 shrink, and whatever it is next.
+        assert_eq!(view.header_size(), cratonvm_types::HEADER_SIZE);
     }
 
     #[test]
@@ -76178,12 +76252,13 @@ public class SkippedTest {
 
         let report = alloc.savings_report();
         assert_eq!(report.object_count, 1000);
-        assert_eq!(report.header_bytes_saved, 24_000); // 1000 * 24
+        let saved_per_object = cratonvm_types::HEADER_SIZE - cratonvm_gc::CompactHeader::SIZE;
+        assert_eq!(report.header_bytes_saved, 1000 * saved_per_object);
         assert_eq!(report.klass_table_entries, 50);
 
         let formatted = report.format();
         assert!(formatted.contains("1000"));
-        assert!(formatted.contains("24000"));
+        assert!(formatted.contains(&(1000 * saved_per_object).to_string()));
     }
 
     #[test]
@@ -76226,7 +76301,6 @@ public class SkippedTest {
             cratonvm_types::ClassId::new(42),
             cratonvm_gc::heap::ObjectKind::Array,
             cratonvm_gc::heap::ArrayElementType::Long,
-            777,
             10,
             0,
         );

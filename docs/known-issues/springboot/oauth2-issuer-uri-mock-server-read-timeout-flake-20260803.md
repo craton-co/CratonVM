@@ -192,6 +192,73 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
      removing it means teaching that pass to chase forwarding pointers instead
      — a contained change, ~1M hash inserts and one large map per cycle saved.
 
+1a. **TRIED AND REVERTED — filtering the overlay walk is NOT the remaining cost.**
+
+   The obvious next move after the lock batching was to stop materialising
+   roots the collector throws away: push the young-span test *into* the
+   provider's walk so only young-pointing refs are collected. Implemented
+   (provider contract grew a `RefPredicate`, all three call sites updated,
+   977/977 gc lib tests and every native-collections target green) and then
+   **measured, interleaved A,B,B,A** against the batched binary:
+
+   | | pooled median | pooled mean |
+   |---|---|---|
+   | A (batched only) | 43 ms | 43.3 |
+   | B (batched + filtered) | 43 ms | 43.9 |
+
+   No difference. The block means run 38.1 → 41.8 → 45.8 → 47.9 in *time*
+   order regardless of arm, i.e. the host drifted ~3–4 ms per block over the
+   run; fitting that drift out gives A ≈ 38.1 and B ≈ 37.8–38.5. Failures also
+   went 12/24 to 20/24 versus the earlier session on the same box, so this run
+   was measured under worse conditions than the one before it — the
+   interleaving is the only reason that is visible rather than being read as a
+   regression.
+
+   **The premise was wrong, and it was inherited from this page rather than
+   checked.** The claim that the phase materialises "millions of `ObjectRef`s
+   per pause" was never measured. If building the `Vec` were the cost, removing
+   nearly all of it would have moved the number. It did not, so the remaining
+   ~43 ms is the **walk itself** — visiting every element of every overlay
+   collection and doing the per-key table lookups.
+
+   Reverted rather than carried: it is a cross-crate provider API change for an
+   unmeasured benefit. **Do not re-attempt this.** The only lever left on this
+   phase is the dirty flag below, which shortens the walk instead of shrinking
+   its output; anything that keeps visiting every element will land in the same
+   place.
+
+1b. **CORRECTION — `pointer_map` is NOT simply redundant. Do not delete it.**
+
+   An earlier note on this page framed `pointer_map` as ~1M `FxHashMap` inserts
+   per cycle duplicating forwarding pointers the headers already hold, removable
+   by teaching the remap to chase them. **Scoped 2026-08-07; that framing is
+   wrong**, and acting on it would have broken two unrelated things:
+
+   * It is a **public `GcResult` field consumed by a different collector.**
+     `g1.rs` composes forward maps across evacuation rounds
+     (`compose_forward_maps`, `identities(&acc.pointer_map)`) and asserts on its
+     contents. Header forwarding pointers cannot serve that: composition needs
+     the accumulated old→new mapping across rounds, not a single hop.
+   * It is a **survivor oracle whose consumers outlive forwarding pointers.**
+     Post-GC reference processing tests
+     `pointer_map.contains_key(addr) || is_addr_live(addr)`, and the non-moving
+     sweep keeps survivors in place with no entry at all — the gap behind the
+     2026-07-07 RRWL / `ThreadLocalMap$Entry` IMSE/hang family. Chasing a
+     forwarding pointer answers "where did it move", never "did it survive".
+
+   The map is load-bearing for consumers that have nothing to do with
+   forwarding. **The 82 references in `gen_heap.rs` are not 82 copies of one
+   idea**, which is what made this look like a contained cleanup from the
+   outside.
+
+   What does survive scoping: the `FxHashMap`→`HashMap` rebuild at the end of
+   the moving path (`pointer_map.into_iter().collect()`) pays ~1M SipHash
+   inserts purely to satisfy the public field's type. The existing comment
+   already argues this is the cheap end of a deliberate trade — the Cheney scan
+   was moved to `FxHashMap` precisely to avoid SipHash per insert — so the
+   remaining win is changing the *public field* to `FxHashMap`, which touches
+   `g1.rs` and the VM consumers. Real, but an API change, not a local cleanup.
+
 2. **`overlay_forward` is O(every overlay in the process), per minor GC** —
    68–125 ms and growing with heap population. `gen_heap.rs` seeds it with
    `external_roots_for_matching_owners(&|_| true)`: an always-true predicate
@@ -218,16 +285,49 @@ build, and the post-drain finalizer/sweep/swap tail. Worth instrumenting next.
    and then walks every element of every overlay collection. All of it to
    discover which handful of refs happen to be in young.
 
-   Three fixes, cheapest first, none of them started:
-   * hold the mutex **once** and gather owner→keys in a single pass (removes N
-     locks and N clones; local to `native-collections`, no cross-crate API
-     change);
-   * append into one caller-owned buffer instead of returning a fresh `Vec` per
-     owner (removes N allocations);
-   * the real one — a **dirty/card flag on overlay side-table writes**, so a
-     minor GC visits only owners mutated since the last cycle. That is what
-     makes the phase proportional to the young set instead of to the heap, and
-     it mirrors what the card table already does for ordinary object fields.
+   Three fixes, cheapest first:
+   * ~~hold the mutex **once** and gather owner→keys in a single pass~~ —
+     **LANDED** `828f8a68b`. 102 → 59 ms per collection (~42%).
+   * ~~batch the per-key table locks~~ — **LANDED** `8e8446104`. The owner-index
+     fix above left the *dominant* half untouched: the per-key loop still took
+     **7 more global mutexes per key**, and with the key count being the whole
+     index that is thousands of acquisitions inside the pause. Each table is now
+     locked once for a whole key list (`hm_int_fast` is sharded *by key*, so its
+     keys are grouped by shard instead — bounded by 64, never locking an empty
+     shard). Critically, this only pays off together with **flattening**
+     `gc_overlay_roots_for_matching_owners`: batching the per-owner helper alone
+     would still run one full set of acquisitions per owner (`6 * N`), which
+     would have read as a fix and moved almost nothing.
+
+     Measured interleaved **A,B,B,A**, 6 lanes, `CRATONVM_DBG=gcpause`:
+
+     | arm | n | median | mean | p90 | max |
+     |---|---|---|---|---|---|
+     | A (before) | 33 | 57 ms | 59.9 | 76 | 107 |
+     | B (after)  | 34 | **40 ms** | 41.7 | 61 | **62** |
+
+     −30% median, −42% max; every B sample lands ≤62 ms while A reaches 107 ms,
+     and *both* A rounds are worse than *both* B rounds, so the separation
+     survives the ordering. **The `[gcpause]` line only prints when the TOTAL
+     pause is ≥100 ms**, so as collections shrink they drop out of the sample and
+     the survivors skew slow — this understates the fix rather than flattering
+     it. No pass/fail rate is claimed: the arms alternated 6/12 and 4/12
+     failures with the same config landing on both sides, the same pattern that
+     already refuted one rate claim on this page.
+
+   * **still open, and now the whole remaining cost** — the phase still walks
+     every element of every overlay collection and materialises them all into a
+     `Vec` the collector immediately discards. Two levels:
+     - *cheap:* push a young-span **predicate** down into `native-collections`
+       so only young-pointing refs are collected. It must be a predicate, **not
+       a callback** — a callback would run with a table guard held and calls
+       `forward_object`, which mutates the heap and could re-enter
+       `native-collections`; a pure span read cannot. This shrinks the `Vec`
+       from millions to a handful but keeps the walk.
+     - *the real one:* a **dirty/card flag on overlay side-table writes**, so a
+       minor GC visits only owners mutated since the last cycle. That is what
+       makes the phase proportional to the young set instead of to the heap, and
+       it mirrors what the card table already does for ordinary object fields.
 
 ### Fix 1 landed (default OFF): pause-goal feedback on the young trigger
 
@@ -324,9 +424,17 @@ investigated:
   while the tail was worse in the one arm where it was sampled (679 vs 550 ms).
   Whether card-table-only helps, hurts, or is neutral end-to-end is **open**,
   and needs a quiet host — not another run on this one.
-* `overlay_forward` barely moves (57→40 ms) because it is proportional to the
-  whole heap's overlay population, not to young — the 1+N global-mutex defect
-  below. Its *share* of the pause is now much larger.
+* `overlay_forward` barely moves under the pause goal (57→40 ms) because it is
+  proportional to the whole heap's overlay population, not to young. Its *share*
+  of the pause is therefore much larger once the copying phases come down.
+
+  **Do not read those two numbers as the lock fix.** `8e8446104` independently
+  moved `overlay_forward` 57→40 ms median — the same figures, from a different
+  comparison (batched vs per-key locking, pause goal off in both arms). The
+  coincidence is unfortunate; the two results are unrelated and do not compound
+  into 57→40→23. The mutex defect this bullet used to point at is now fixed
+  (`828f8a68b` + `8e8446104`); what survives is the *walk*, which is what keeps
+  the phase proportional to the heap rather than to young.
 
 **Neither of the two defects below is fixed.** The moving-Cheney phase breakdown is new
 (`CRATONVM_DBG=gcpause` now reports it) — before this, a slow collection on this
@@ -334,6 +442,125 @@ arm printed a bare total, because `gcphase` instruments only the non-moving
 sweep this workload never takes. `cheney_drain` is the one that decides whether
 the flake survives; `overlay_forward` alone cannot bring a 1538 ms pause under
 500 ms.
+
+## The pause is now FULLY accounted for (2026-08-07)
+
+This page's own next step was *"the phases do not sum to the total (1036 of
+1538 ms). The remainder is outside the instrumented span — lock acquisition,
+the young object-start bitmap build, and the post-drain finalizer/sweep/swap
+tail. Worth instrumenting next."* Done. Two blind spots are now instrumented:
+
+* **inside the collector** — `mv_phase!` was declared after the young
+  object-start walk and stopped at `cheney_drain`, so everything before
+  evacuation and the whole post-drain tail (finalizer resurrection, promotion
+  statistics, card clear + young reset, the `FxHashMap`→`HashMap` pointer_map
+  rebuild, the semispace swap, the major-GC check, the monitor remap, adaptive
+  expansion) was invisible. The stopwatch now starts at the top of
+  `collect_garbage_inner` and marks every one of them.
+* **outside the collector** — `CRATONVM_DBG_ROOTPROF=1` times each entry of
+  `native_roots::VM_ROOT_SOURCES` in `scan_all_roots` / `remap_all_roots`, plus
+  `collect_roots` and `update_all_roots` as wholes. That half contains a full
+  walk of every overlay collection in the process and had never been measured.
+
+6 lanes × 2 rounds on the Azure host, `--Xmx 2g`, default (goal-off) config, 26
+collections over the `[gcpause]` 100 ms print threshold:
+
+| phase | median | p90 | max | share |
+|---|---:|---:|---:|---:|
+| **TOTAL PAUSE** | **424 ms** | 506 | **628** | — |
+| `cheney_drain` | 253 | 303 | 408 | 60% |
+| `pointer_map_rebuild` *(new)* | 43 | 65 | 98 | 10% |
+| `overlay_forward` | 39 | 51 | 55 | 9% |
+| `promotion_stats` *(new)* | 29 | 35 | 43 | 7% |
+| `pre_evacuate` *(new)* | 27 | 42 | 65 | 6% |
+| `scan_dirty_cards` | 11 | 11 | 11 | 3% |
+| `root_forward` | 3 | 4 | 5 | <1% |
+| `cardclear+young_reset` | 3 | 3 | 4 | <1% |
+| — outside the collector — | | | | |
+| `update_all_roots` | 38 | 48 | 99 | — |
+| ↳ `remap_all_roots:collection-overlays` | 34 | 43 | 91 | — |
+| `collect_roots` | — | — | 26 | (over the 20 ms floor once in 12 runs) |
+
+Counters: `objects_copied` median **755 944**, `young_bytes_before` median
+**274 MB**. Phases sum to ~408 of the 424 ms median — the 500 ms gap this page
+opened with is closed.
+
+**The composition is stable, which is the durable result.** Re-measured with
+`CRATONVM_GC_YOUNG_PAUSE_MS=250`, every absolute number roughly halves but the
+shares barely move: `cheney_drain` 60%, `overlay_forward` 9.5%,
+`pointer_map_rebuild` 8%, `promotion_stats` 9%, `pre_evacuate` 8.6%. So the
+target list does not depend on the sizing policy: it is one 60% phase and four
+8–10% phases. (The two arms were consecutive blocks, not interleaved, so **no
+absolute comparison between them is claimed** — this page has already had one
+rate claim collapse under alternation. Only the within-run shares are used.)
+
+### FIXED: `promotion_stats` — 29 ms per pause to recompute a size the copy already had
+
+Phase H derived `bytes_promoted` / `objects_promoted` / `bytes_copied_young` /
+`objects_copied_young` by iterating all ~756 000 `pointer_map` entries after
+the copy phase and **dereferencing each destination header** to recompute
+`gen_object_total_size` — ~756 000 random header reads inside stop-the-world.
+The comment justified it as avoiding "an expensive counter plumbed through
+`forward_object`'s 12 call sites".
+
+The counter does not have to be plumbed. The copy phase is single-threaded *by
+construction* — every `forward_object_impl` destination parameter is
+`&mut Arena`, so the borrow checker enforces it; the parallel part of a young
+cycle is the mark closure, which is read-only and never forwards. A
+thread-local tally is therefore sound, and `forward_object_impl` already knows
+both the size and the destination arena at the point of the memcpy.
+
+The BUG-Z forward validation the walk also performed is kept behind
+`CRATONVM_DBG_FWDWALK=1` — it is a diagnostic and does not need to run on every
+collection. `gc` suite 979/979 green, including
+`phase_h_integration::rh1_promotion_stats_bump_across_cycles`, which is the
+test that covers exactly these counters.
+
+#### Measured A,B,B,A
+
+Four 6-lane blocks, binary flipped every block, `CRATONVM_DBG=gcpause`:
+
+| block | arm | n | median pause | p90 | `promotion_stats` |
+|---|---|---:|---:|---:|---:|
+| 1 | A before | 14 | 361 ms | 430 | 24 ms |
+| 2 | B after | 17 | **333 ms** | 373 | **0** |
+| 3 | B after | 15 | **300 ms** | 423 | **0** |
+| 4 | A before | 14 | 345 ms | 423 | 27 ms |
+
+The phase is gone, and both B blocks land below both A blocks, so the ~10%
+median improvement survives the ordering rather than reading as host drift.
+`cheney_drain` is unchanged (211/210 vs 210/184), which is the expected
+negative control — nothing here touched the copy phase. **No claim is made
+about the max**: it went 463/527 (A) vs 432/612 (B), i.e. the tail is dominated
+by something this fix does not address, which is the honest state of this page.
+
+### SCOPED, NOT LANDED: `pointer_map_rebuild` — 43 ms per pause, pure container churn
+
+```rust
+let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
+```
+
+~756 000 SipHash inserts to convert the Cheney scan's `FxHashMap` into the
+`HashMap` that `GcResult.pointer_map` is declared as. Nothing about the data
+changes. Pre-sizing does not help — std's `FromIterator` already reserves the
+full size, so the cost is the hashing itself.
+
+The only fix is the declared type, and the blast radius is now measured rather
+than guessed: **94 `&HashMap<usize, usize>` parameter positions** across `gc`,
+`vm`, `jit`, `native-builtins`, `native-collections`, `native-io` and
+`classloading`, and not all of them are pointer maps — a blind regex over that
+set would silently retype unrelated `usize→usize` maps. It needs a deliberate
+pass with a `PointerMap` alias, not a sweep. Left as a sized hand-off: 10% of
+every young pause, no behaviour change, one afternoon of mechanical work.
+
+### Still the 60%: `cheney_drain`
+
+253 ms for 755 944 objects is ~335 ns per object — copy, forwarding install,
+`pointer_map` insert and reference-slot scan. There is no single removable
+item in it; the levers remain the two this page already names (fewer surviving
+objects via young sizing, or a cheaper per-object copy). `perf` cannot help
+narrow it on the Azure host: `/proc/sys/kernel/perf_event_paranoid` is 4, so
+even `-e cpu-clock` user-only recording is refused.
 
 ## A separate, real defect found on the way: single-byte socket reads are ~35x
 

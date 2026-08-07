@@ -37,12 +37,17 @@ pub fn register_letsgo_compat_natives(registry: &mut NativeMethodRegistry) {
     // synthetic-stub removed: `register_wrapper_unbox` — wrapper `primValue()`
     // unboxers have real JDK bytecode + real natives; letsgo duplicate removed.
     // synthetic-stub removed: `register_security_fallbacks` — the hardcoded
-    // algorithm lists + no-op AccessController.checkPermission were fakes. Real
-    // `java.security` bytecode runs now, and `Security.getAlgorithms` is covered
-    // by the identical essential-path native in
-    // `phases_early::register_real_jdk_forkjoin_essentials` (wired via
-    // `register_essential_natives`, the registration `vm_exec`'s forced-native
-    // dispatch actually targets).
+    // algorithm lists + no-op AccessController.checkPermission were fakes.
+    // W4-3 correction: the claim that used to follow — that
+    // `Security.getAlgorithms` was "covered by the identical essential-path
+    // native in `phases_early::register_real_jdk_forkjoin_essentials`" — was
+    // FALSE. No such registration exists. The only `getAlgorithms` native lived
+    // in `phases_early::register_phase53_security`, which only
+    // `register_synthetic_overrides` reaches, so real-JDK and `--jdk-only` ran
+    // the JDK's own bytecode over empty synthetic Providers and answered the
+    // EMPTY SET for every engine type. It is now registered from
+    // `jca::provider_chain::register` (live in every mode) and answers from the
+    // provider service registry.
     // `drainTo` synthetic overrides assume slot 0=array, 1=size — that's the
     // synthetic-jdk LBQ/ABQ layout.  On real JDK 25 LBQ those slots are
     // head/last (Node refs), so the synthetic native silently misreads.  More
@@ -98,16 +103,20 @@ pub fn register_wrapper_value_of(_r: &mut NativeMethodRegistry) {
 /// `register_essential_natives` in lib.rs) — but no longer registers anything.
 ///
 /// synthetic-stub removed: the no-op `AccessController.checkPermission` and the
-/// hardcoded `Security.getAlgorithms` algorithm lists were fakes. Real
-/// `java.security` bytecode runs now, and `Security.getAlgorithms` is covered by
-/// the identical essential-path native in
-/// `phases_early::register_real_jdk_forkjoin_essentials` (wired through
-/// `register_essential_natives`) — which is exactly the registration that
-/// `vm_exec`'s forced-native dispatch for `Security.getAlgorithms` targets. Real
-/// crypto is wired elsewhere (jca/* + phases_early JCA block).
+/// hardcoded `Security.getAlgorithms` algorithm lists were fakes. Real crypto is
+/// wired elsewhere (jca/* + phases_early JCA block).
+///
+/// W4-3 correction: this comment used to say `getAlgorithms` was "covered by the
+/// identical essential-path native in
+/// `phases_early::register_real_jdk_forkjoin_essentials`", and that `vm_exec`'s
+/// forced-native dispatch targeted it. Neither is true — there is no
+/// `getAlgorithms` registration in that function, and no `java/security/*`
+/// triple in `force_native_over_real_jdk_bytecode`. The live registration is now
+/// `jca::provider_chain::register`, reached from
+/// `register_essential_natives_with_shims` in every mode.
 pub fn register_security_fallbacks(_r: &mut NativeMethodRegistry) {
-    // intentionally empty — real java.security bytecode + essential-path
-    // Security.getAlgorithms native cover this.
+    // intentionally empty — `jca::provider_chain` owns the live
+    // `java.security.Security` surface, including `getAlgorithms`.
 }
 
 /// `BlockingQueue.drainTo(Collection, int)` overload — required by SLF4J's

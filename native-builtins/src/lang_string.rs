@@ -2251,6 +2251,18 @@ fn invoke_to_string_opt(
         }
     }
 
+    // A `java/nio/*CharBuffer*` special case used to sit here, reading the
+    // buffer's text directly instead of asking it, because
+    // `java.nio.StringCharBuffer.toString()` answered an EMPTY string through
+    // this route. It is DELETED rather than kept as an optimisation: the cause
+    // was a duplicate `java/nio/CharBuffer.toString()` registration shadowing
+    // the correct one (see `phases_late::charset_buffers`), and a workaround
+    // that keeps a fixed route unexercised is how the next regression there
+    // goes unnoticed. `probes/CharBufferUsersProbe` and the route matrix in
+    // fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md
+    // are byte-identical to HotSpot with
+    // this gone.
+
     // Call obj.toString() via virtual dispatch. A Java exception from the
     // override is observable and must reach the caller; only an absent or
     // malformed return value uses the historical identity fallback.
@@ -2307,6 +2319,95 @@ pub(crate) fn native_sb_append_object(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// The characters a `CharSequence` exposes over `[start, end)`, read the way
+/// `AbstractStringBuilder.append(CharSequence)` reads them.
+///
+/// The JDK fast-paths exactly two types -- `String` and `AbstractStringBuilder`
+/// -- and reads **everything else through `charAt`**, never `toString()`. So a
+/// sequence whose `toString()` disagrees with its characters appends its
+/// CHARACTERS. CratonVM asked `toString()`, which is the same answer for the
+/// common types and the wrong one for any other implementation: a `CharSequence`
+/// over `"Hello, World"` whose `toString()` returns `"CUSTOM"` appended
+/// `"CUSTOM"` where HotSpot appends `"Hello, World"`.
+///
+/// The Rust fast paths are limited to classes whose `charAt` is the JDK's own
+/// and provably agrees with `toString()`: `java.lang.String`, the two
+/// `AbstractStringBuilder`s, and the `java.nio` CharBuffer family (whose
+/// constructors are package-private, so nothing outside `java.nio` can override
+/// `charAt`). Everything else walks `charAt`, at JDK parity by construction.
+///
+/// `range` is `None` for the 1-arg form (the whole sequence). An exception from
+/// `length()` or `charAt` propagates, as it does on HotSpot.
+fn charsequence_chars(
+    ctx: &mut dyn NativeContext,
+    cs: cratonvm_types::ObjectRef,
+    range: Option<(i32, i32)>,
+) -> Result<Vec<u16>, MethodCallFailed> {
+    if let Some(text) = charsequence_fast_text(ctx, cs)? {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let n = units.len() as i32;
+        let (lo, hi) = match range {
+            None => (0, n),
+            Some((s, e)) => {
+                let lo = s.clamp(0, n);
+                (lo, e.clamp(lo, n))
+            }
+        };
+        return Ok(units[lo as usize..hi as usize].to_vec());
+    }
+    // GC safety: `invoke_virtual` re-enters Java and can move `cs`, so re-read
+    // it through its handle on every iteration -- the same obligation the
+    // `invoke_to_string` call sites in this file discharge.
+    let mut scope = NativeHandleScope::new(ctx);
+    let cs_handle = scope.root(cs);
+    let len = {
+        let cs_now = scope.get(&cs_handle);
+        match (*scope).invoke_virtual(cs_now, "length", "()I", &[])? {
+            Some(Value::Int(n)) => n,
+            _ => 0,
+        }
+    };
+    // Clamp rather than throw, matching what this native already did for an
+    // out-of-range request: the comment on `native_sb_append_charsequence_off_len`
+    // records why (a JUnit error-reporting path that must not die here).
+    let (lo, hi) = match range {
+        None => (0, len),
+        Some((s, e)) => {
+            let lo = s.clamp(0, len);
+            (lo, e.clamp(lo, len))
+        }
+    };
+    let mut out: Vec<u16> = Vec::with_capacity((hi - lo).max(0) as usize);
+    for i in lo..hi {
+        let cs_now = scope.get(&cs_handle);
+        match (*scope).invoke_virtual(cs_now, "charAt", "(I)C", &[Value::Int(i)])? {
+            Some(Value::Int(c)) => out.push(c as u16),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The three shapes whose text can be read in Rust without changing the answer
+/// -- see [`charsequence_chars`]. `Ok(None)` means "walk `charAt`".
+fn charsequence_fast_text(
+    ctx: &mut dyn NativeContext,
+    cs: cratonvm_types::ObjectRef,
+) -> Result<Option<String>, MethodCallFailed> {
+    let cid = ctx.class_id_of_object(cs);
+    let name = ctx.class_name_of_id(cid).unwrap_or_default();
+    if name == "java/lang/String" {
+        return Ok(ctx.read_string(cs));
+    }
+    if name == "java/lang/StringBuilder" || name == "java/lang/StringBuffer" {
+        return Ok(Some(invoke_to_string(ctx, cs)?));
+    }
+    if name.starts_with("java/nio/") && name.contains("CharBuffer") {
+        return Ok(crate::phases_late::charset_buffers::cb_read_text(ctx, cs));
+    }
+    Ok(None)
+}
+
 /// C36: `AbstractStringBuilder.append(CharSequence)` — same JDK-layout
 /// mismatch as the 3-arg variant below; intercept to append the whole
 /// sequence natively.
@@ -2318,20 +2419,18 @@ pub(crate) fn native_sb_append_charsequence(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // Producer-#12 fix: same re-entrant `invoke_to_string` hazard as
-    // `native_sb_append_object` just above — pin + re-read `this`.
+    // Producer-#12 fix: same re-entrant hazard as `native_sb_append_object`
+    // just above (`charsequence_chars` calls back into Java for anything but
+    // the three fast-path shapes) — pin + re-read `this`.
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => match invoke_to_string(&mut *scope, *obj) {
-            Ok(s) => s,
-            Err(_) => String::new(),
-        },
-        Some(Value::Object(None)) => "null".to_string(),
-        _ => "null".to_string(),
+    let chars = match args.get(1) {
+        Some(Value::Object(Some(obj))) => charsequence_chars(&mut *scope, *obj, None)?,
+        // `AbstractStringBuilder.appendNull`.
+        _ => "null".encode_utf16().collect(),
     };
     let this = scope.get(&this_handle);
-    let this = sb_append_str(&mut *scope, this, &text);
+    let this = sb_append_chars(&mut *scope, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2370,33 +2469,18 @@ pub(crate) fn native_sb_append_charsequence_off_len(
         return Ok(Some(Value::Object(Some(this))));
     };
 
-    // Coerce CharSequence to its UTF-16 text:
-    //  - java.lang.String: read_string.
-    //  - Any CharSequence with a toString()Ljava/lang/String;: invoke_to_string.
-    // Both paths already handle StringBuilder/StringBuffer/String/CharBuffer.
-    // Producer-#12 fix: re-entrant `invoke_to_string` can move `this`.
+    // Read the sequence's CHARACTERS over [start, end) — `charsequence_chars`
+    // states why `toString()` is the wrong question here, and does the clamping
+    // this native has always done rather than the JDK's
+    // IndexOutOfBoundsException (the comment that used to sit here: silently
+    // clamping keeps JUnit's error-reporting path alive, and every real caller
+    // inside JDK internals passes in-bounds indices).
+    // Producer-#12 fix: the charAt walk re-enters Java and can move `this`.
     let mut scope = NativeHandleScope::new(ctx);
     let this_handle = scope.root(this);
-    let text = match invoke_to_string(&mut *scope, cs_obj) {
-        Ok(s) => s,
-        Err(_) => String::new(),
-    };
+    let chars = charsequence_chars(&mut *scope, cs_obj, Some((start, end)))?;
     let this = scope.get(&this_handle);
-    let chars: Vec<u16> = text.encode_utf16().collect();
-
-    // Clamp [start, end] to the CharSequence's length; real JDK throws
-    // IndexOutOfBoundsException, but silently clamping keeps JUnit's
-    // error-reporting path alive — the segfault/OOM we're fixing is far worse
-    // than an off-by-one in diagnostic output, and every real-world caller
-    // inside JDK internals passes in-bounds indices.
-    let len = chars.len();
-    let s = (start.max(0) as usize).min(len);
-    let e = (end.max(0) as usize).min(len);
-    let this = if e > s {
-        sb_append_chars(&mut *scope, this, &chars[s..e])
-    } else {
-        this
-    };
+    let this = sb_append_chars(&mut *scope, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 

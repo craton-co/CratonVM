@@ -7,7 +7,10 @@ and it is **not** the dispatch bug that took out the four sibling
 
 **Scope note (2026-08-07):** this page now covers the whole jOOQ family, not
 just this one class — four more classes confirmed as the same mechanism, see
-"Four sibling classes" section below.
+"Four sibling classes" section below. It also now covers one
+non-jOOQ class, `SpringApplicationTests`, filed as the same underlying
+`Class.getDeclaredMethods()` cost at a much smaller per-cycle scale — see
+"`SpringApplicationTests`" section below.
 
 ## Reconfirmed 2026-08-06, Windows box, longer timeout
 

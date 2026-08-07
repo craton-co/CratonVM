@@ -791,6 +791,102 @@ fn native_lock_support_get_blocker(
     Ok(Some(Value::Object(None)))
 }
 
+/// Report a caller that imposes its own small field layout on a class which
+/// already has a bigger one.
+///
+/// `alloc_concurrent_synthetic` does NOT truncate: both it and
+/// `NativeContext::alloc_object` clamp the slot count UP to the resolved
+/// class's real field count. That clamp is what keeps a `getfield` at a real
+/// inherited index in bounds, and it is load-bearing. What it cannot fix is
+/// the caller's intent: an object allocated as `("java/lang/Process", 3)` comes
+/// back with the REAL six-slot `java.lang.Process` layout, and the caller's
+/// three writes at slots 0..2 then land on `java.lang.Process`'s own
+/// `outputWriter`/`outputCharset`/`inputReader` fields. Meanwhile any OTHER
+/// native that reads a different synthetic layout for the same class name --
+/// one offset past those six -- runs off the end of the object and its reads
+/// are dropped by the heap guard.
+///
+/// That is two layouts on one class, and it is how Tomcat's CGI response body
+/// came back empty (see
+/// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
+///
+/// `num_fields < real` is a self-discriminating test for it: a class this call
+/// FABRICATED would declare exactly `num_fields` fields, so `real == num_fields`
+/// and nothing is reported. A smaller request means somebody else -- the real
+/// class file, or another native fabricating a wider shape -- already owns the
+/// layout.
+///
+/// Deduplicated by (class, requested, caller) so a hot allocation loop reports
+/// once, not once per object.
+///
+/// `#[track_caller]` so the site reported is the NATIVE that asked for the
+/// shape: `alloc_concurrent_synthetic` is itself `#[track_caller]`, so the
+/// attribute chains through it to the original call site. Without it every
+/// report would name this file.
+#[track_caller]
+fn report_layout_alias(class_name: &str, num_fields: usize, real: usize) {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+
+    // OFF by default, and deliberately so. Measured over a 30-class random
+    // sample of the real Tomcat suite this fires for 49 distinct JDK classes
+    // from 75 call sites, and the SAME runs produced zero out-of-bounds field
+    // reads -- so the shape is pervasive and, on that corpus, harmless: the
+    // clamp keeps every access in bounds, and no second native reads a wider
+    // layout for any of those classes. An always-on warning would be 75 lines
+    // of boot noise for a risk register, not a bug list.
+    //
+    // It becomes a BUG when a class has two layouts and someone reads the
+    // wider one. That is `java.lang.Process`, and the discriminator is cheap:
+    // a class appearing in BOTH this census and the `cratonvm::gc::guard`
+    // out-of-bounds reads has a live defect. Turn this on, run the failing
+    // workload, and intersect the two lists.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAYOUT_ALIAS").is_some()
+    }) {
+        return;
+    }
+    // `OrderedPlMutex`, not a raw `parking_lot::Mutex`: `native-builtins` runs
+    // a lock-discipline ratchet over this crate and a raw construction fails
+    // it. `LockLevel::Scratch` (L0, "acquires nothing") is the honest level —
+    // the guard below lives for exactly one `insert` and nothing is taken while
+    // it is held, which is what makes a future violation a checker failure
+    // rather than a hang. This census re-enters the VM through `tracing::warn!`
+    // right after, so that property is worth stating rather than assuming.
+    static SEEN: OnceLock<
+        cratonvm_types::lock_order::OrderedPlMutex<
+            HashSet<(String, usize, &'static str, u32)>,
+        >,
+    > = OnceLock::new();
+    let site = std::panic::Location::caller();
+    let key = (
+        class_name.to_string(),
+        num_fields,
+        site.file(),
+        site.line(),
+    );
+    let seen = SEEN.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            HashSet::new(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    });
+    if !seen.lock().insert(key) {
+        return;
+    }
+    tracing::warn!(
+        class = class_name,
+        requested_fields = num_fields,
+        real_fields = real,
+        site = %site,
+        "native allocated a class under its own SMALLER field layout; the slot \
+         count is clamped up to the real one, so these writes alias the real \
+         class's own fields and any native reading a wider layout for this \
+         class reads past the object"
+    );
+}
+
 /// `#[track_caller]` so the class-origin census's `requested_by` names the
 /// native that wanted the shape, not this one forwarding line — see the
 /// matching note on `NativeContext::ensure_synthetic_class`. This is the
@@ -823,6 +919,9 @@ pub(crate) fn alloc_concurrent_synthetic(
             // the two so both paths have enough room.  0 means the class
             // isn't loaded yet — keep the caller's requested size.
             let real = ctx.class_num_total_fields(cid);
+            if num_fields > 0 && num_fields < real {
+                report_layout_alias(class_name, num_fields, real);
+            }
             let n = num_fields.max(real);
             // `try_alloc_object_gc_safe` first (proactively collects, then
             // walks young -> old gen without aborting): this is the shared
@@ -888,6 +987,9 @@ pub(crate) fn try_alloc_concurrent_synthetic(
                 }
             };
             let real = ctx.class_num_total_fields(cid);
+            if num_fields > 0 && num_fields < real {
+                report_layout_alias(class_name, num_fields, real);
+            }
             let n = num_fields.max(real);
             Ok(ctx
                 .try_alloc_object_gc_safe(cid, n)
@@ -4492,7 +4594,7 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     // `real_protected_stub_class` yield it to the real `execute()` bytecode
     // structurally, for every receiver, which is what replaced the eight
     // hand-written receiver-shape probes in `vm`. See
-    // `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+    // `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
     registry.register_with_kind(
         es,
         "execute",

@@ -961,6 +961,24 @@ impl Compiler {
         self.buf.emit(&imm.to_le_bytes());
     }
 
+    /// Emit `MOV BYTE [base + disp32], imm8`.
+    ///
+    /// Needed because the `gc_flags` bits now live inside a byte of the mark
+    /// word rather than owning a dword of their own. A dword store at that
+    /// offset would span past `HEADER_SIZE` into the object body -- which is
+    /// precisely what `inline_tlab_header_writes_stay_inside_the_header`
+    /// caught when the offsets were swept mechanically.
+    pub(super) fn emit_mov_byte_mem_disp32_imm8(&mut self, base: u8, disp: i32, imm: u8) {
+        // REX.B only when the base needs it; no .W (byte op).
+        if base >= 8 {
+            self.buf.emit_byte(0x41);
+        }
+        self.buf.emit_byte(0xC6); // MOV r/m8, imm8 (with /0)
+        self.buf.emit_byte(0x80 | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+        self.buf.emit_byte(imm);
+    }
+
     /// Emit `LEA r64, [base + imm32]` — compute new cursor without
     /// touching the source register.
     pub(super) fn emit_lea_r64_mem_disp32(&mut self, dst: u8, base: u8, disp: i32) {

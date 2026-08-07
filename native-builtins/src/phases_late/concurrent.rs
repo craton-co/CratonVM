@@ -6617,12 +6617,689 @@ pub(crate) const NEW15_FJP_ACTIVE: usize = 1;
 /// `ForkJoinPool.getCommonPoolParallelism()`, which the JDK specifies as equal.
 pub(crate) const NEW15_COMMON_POOL_PARALLELISM: i32 = 1;
 
+// ---------------------------------------------------------------------------
+// L12 — the STATIC `ForkJoinTask.invokeAll` family
+// ---------------------------------------------------------------------------
+//
+// `regression-suite/src/RJdkForkJoin.java` hung forever (300 s budget, ZERO
+// checkpoint output) in BOTH `--real-jdk` and `--jdk-only`. The VM's own
+// watchdog dumped ONE thread, 34 frames: seven nested
+// `FillAction.compute -> ForkJoinTask.invokeAll(pc=25) -> doExec ->
+// RecursiveAction.exec` cycles above a final `invokeAll(pc=83) ->
+// awaitDone(ZJ)I -> awaitDone(FJP,IZJ)I`, parked.
+//
+// The cause is a hole in the eager-inline pool model, NOT a missing worker
+// thread. JDK 25's `ForkJoinTask.invokeAll(t1, t2)` is
+//
+//     t2.fork(); t1.doExec(); t2.awaitDone(...)
+//
+// — it runs one task inline on the caller and WAITS for the forked sibling.
+// Our `ForkJoinTask.fork()` Bridge is deliberately lazy: it only marks the
+// task queued, and `join()` / `get()` / `invoke()` are what actually drive
+// `compute()`. `invokeAll` calls none of those. It goes straight to
+// `awaitDone`, real JDK bytecode that blocks until some OTHER thread completes
+// the task — and this pool runs everything on the calling thread, so no other
+// thread will ever exist. pc=25 is the inline `doExec()` arm; pc=83 is the
+// wait-for-the-fork arm, and that is exactly where the dump is parked.
+//
+// Every other entry point into the model is already an inline Bridge:
+// `ForkJoinPool.invoke` / `submit` / `execute` / `invokeAll(Collection)` /
+// `invokeAny` / `lazySubmit`, and `ForkJoinTask.join` / `get` / `invoke`. The
+// three STATIC `ForkJoinTask.invokeAll` overloads were simply never
+// registered, so they were the last real-bytecode route from a lazy `fork()`
+// to an `awaitDone()` that nothing can satisfy.
+//
+// THREE lists must agree entry-for-entry or a registration here is silently
+// inert (the `awaitQuiescence` bug documented in `registry.rs` is the
+// precedent):
+//   1. this registration;
+//   2. `keep_real_forkjointask_bridge` in `native-api/src/registry.rs` — an
+//      unlisted `ForkJoinTask` native is DROPPED at registration in real-JDK
+//      mode;
+//   3. `is_forkjoin_native_override` in
+//      `vm/src/runtime/interpreter/native_override.rs` — what forces the
+//      native to win over the real JDK bytecode.
+
+/// A set of `ForkJoinTask`s kept GC-rooted for the whole of one `invokeAll`.
+///
+/// Running one task body allocates freely, so a sibling held as a bare address
+/// would be stale by the next iteration (the native stale-local family). Every
+/// task is pinned as it is collected and re-read through its own handle before
+/// use; `release` truncates the pin stack back to the first handle taken.
+struct FjtPinnedTasks {
+    /// Pin-stack watermark to truncate back to; `None` until the first pin.
+    base: Option<usize>,
+    handles: Vec<(usize, ObjectRef)>,
+}
+
+impl FjtPinnedTasks {
+    fn new() -> Self {
+        Self {
+            base: None,
+            handles: Vec::new(),
+        }
+    }
+
+    /// Pin `obj` as an extra GC root that is NOT a task — the source array or
+    /// collection. Must be called before any [`Self::push_task`] so the
+    /// watermark covers it too.
+    fn pin_extra(&mut self, ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
+        let handle = ctx.pin_native_root(obj);
+        if self.base.is_none() {
+            self.base = Some(handle);
+        }
+        handle
+    }
+
+    fn push_task(&mut self, ctx: &mut dyn NativeContext, task: ObjectRef) {
+        let handle = ctx.pin_native_root(task);
+        if self.base.is_none() {
+            self.base = Some(handle);
+        }
+        self.handles.push((handle, task));
+    }
+
+    fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// The current address of task `i`, re-read through its pin.
+    fn element(&self, ctx: &dyn NativeContext, i: usize) -> ObjectRef {
+        let (handle, obj) = self.handles[i];
+        ctx.read_native_pin(handle, obj)
+    }
+
+    fn release(self, ctx: &mut dyn NativeContext) {
+        if let Some(base) = self.base {
+            ctx.unpin_native_roots(base);
+        }
+    }
+}
+
+/// `invokeAll` is specified to raise `NullPointerException` for a null task
+/// (confirmed against the host JDK: `invokeAll(t, null)` throws before running
+/// anything). Skipping the element instead would silently run a SHORTER batch
+/// than the caller submitted.
+fn fjt_null_task() -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some("null ForkJoinTask passed to invokeAll".to_string()),
+    }
+    .into()
+}
+
+/// Run every task in `batch` to completion, in submission order.
+///
+/// `join()` is the entry point rather than a direct `compute()` invoke because
+/// it IS the coherent model: the side-table-backed Bridge native computes a
+/// task that has not run yet, hands back the memoised result for one that has
+/// (so a task already driven by an enclosing `join()` is not run twice), and
+/// rethrows the task's own throwable UNWRAPPED — which is exactly what the
+/// real `invokeAll` does via `reportExecutionException`. The first failure
+/// aborts the batch, again matching the JDK: `invokeAll(t1, t2)` never reaches
+/// `t2`'s wait if `t1` completed abnormally.
+fn fjt_invoke_all_inline(
+    ctx: &mut dyn NativeContext,
+    batch: &FjtPinnedTasks,
+) -> Result<(), MethodCallFailed> {
+    for i in 0..batch.len() {
+        let task = batch.element(ctx, i);
+        let _ = ctx.invoke_virtual(task, "join", "()Ljava/lang/Object;", &[])?;
+    }
+    Ok(())
+}
+
+/// Drain a `Collection` receiver into a pinned batch.
+///
+/// Iterates through the real `Iterator` bytecode rather than assuming a
+/// concrete container: `invokeAll(Collection)` accepts any `Collection`, and a
+/// `Set` or an unmodifiable view has to work identically. Each element is
+/// pinned as it is seen because `hasNext`/`next` can both allocate.
+///
+/// `live_coll` must already be pinned by the caller (its handle is the batch
+/// watermark) and re-read through that pin — this helper never touches it
+/// again after the `iterator()` call.
+fn fjt_collect_collection(
+    ctx: &mut dyn NativeContext,
+    batch: &mut FjtPinnedTasks,
+    live_coll: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let iter = match ctx.invoke_virtual(live_coll, "iterator", "()Ljava/util/Iterator;", &[])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => return Ok(()),
+    };
+    let iter_pin = batch.pin_extra(ctx, iter);
+    let mut live_iter = iter;
+    loop {
+        live_iter = ctx.read_native_pin(iter_pin, live_iter);
+        match ctx.invoke_virtual(live_iter, "hasNext", "()Z", &[])? {
+            Some(Value::Int(v)) if v != 0 => {}
+            _ => break,
+        }
+        live_iter = ctx.read_native_pin(iter_pin, live_iter);
+        match ctx.invoke_virtual(live_iter, "next", "()Ljava/lang/Object;", &[])? {
+            Some(Value::Object(Some(element))) => batch.push_task(ctx, element),
+            _ => return Err(fjt_null_task()),
+        }
+    }
+    Ok(())
+}
+
+/// Register the static `ForkJoinTask.invokeAll` overloads as eager-inline
+/// Bridges. See the block comment above for why they are load-bearing.
+pub(crate) fn register_forkjointask_invoke_all_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let fjt = "java/util/concurrent/ForkJoinTask";
+
+    // invokeAll(ForkJoinTask, ForkJoinTask) — the overload `RecursiveAction`
+    // divide-and-conquer bodies use, and the one RJdkForkJoin hangs on.
+    r.register_with_kind(
+        fjt,
+        "invokeAll",
+        "(Ljava/util/concurrent/ForkJoinTask;Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            // STATIC: no receiver slot, so args[0]/args[1] are t1/t2.
+            let t1 = obj_arg(args, 0)?;
+            let t2 = obj_arg(args, 1)?;
+            let mut batch = FjtPinnedTasks::new();
+            batch.push_task(ctx, t1);
+            batch.push_task(ctx, t2);
+            let outcome = fjt_invoke_all_inline(ctx, &batch);
+            batch.release(ctx);
+            outcome?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // invokeAll(ForkJoinTask...) — the varargs overload. The array is pinned
+    // before the first task runs; `get_array_element` does not allocate, so
+    // the whole batch can be collected up front.
+    r.register_with_kind(
+        fjt,
+        "invokeAll",
+        "([Ljava/util/concurrent/ForkJoinTask;)V",
+        |ctx, args| {
+            let array = obj_arg(args, 0)?;
+            let mut batch = FjtPinnedTasks::new();
+            let array_pin = batch.pin_extra(ctx, array);
+            let live_array = ctx.read_native_pin(array_pin, array);
+            let len = ctx.array_length(live_array);
+            for idx in 0..len {
+                match ctx.get_array_element(live_array, idx) {
+                    Value::Object(Some(task)) => batch.push_task(ctx, task),
+                    _ => {
+                        batch.release(ctx);
+                        return Err(fjt_null_task());
+                    }
+                }
+            }
+            let outcome = fjt_invoke_all_inline(ctx, &batch);
+            batch.release(ctx);
+            outcome?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // invokeAll(Collection) — returns the SAME collection it was handed, per
+    // the JDK contract (the tasks are completed in place, not re-wrapped).
+    r.register_with_kind(
+        fjt,
+        "invokeAll",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        |ctx, args| {
+            let collection = obj_arg(args, 0)?;
+            let mut batch = FjtPinnedTasks::new();
+            let coll_pin = batch.pin_extra(ctx, collection);
+            let entry_coll = ctx.read_native_pin(coll_pin, collection);
+            let mut outcome = fjt_collect_collection(ctx, &mut batch, entry_coll);
+            if outcome.is_ok() {
+                outcome = fjt_invoke_all_inline(ctx, &batch);
+            }
+            let live_coll = ctx.read_native_pin(coll_pin, collection);
+            batch.release(ctx);
+            outcome?;
+            Ok(Some(Value::Object(Some(live_coll))))
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// W6-7 — the `quietly*` family
+// ---------------------------------------------------------------------------
+//
+// Same defect shape as the static `invokeAll` overloads above, one step later:
+// `quietlyJoin()` is `if (status >= 0) awaitDone(false, 0L);` and
+// `quietlyInvoke()` is `doExec(); if (status >= 0) awaitDone(false, 0L);`
+// (verified against `javap -c java.util.concurrent.ForkJoinTask` on JDK 25).
+// This VM runs NO ForkJoin worker threads — `NativeContext` is not `Send`, so
+// there is nobody to hand a forked task to — and completions live in the
+// `fjp_state` side table, never in the real `status` field. So real bytecode
+// reads `status == 0`, enters `awaitDone`, and blocks forever waiting for a
+// completion that nothing will ever publish: the same 300-second hang L12 fixed
+// for `invokeAll`, not a null.
+//
+// It was LATENT rather than live when this landed — a disassembly of
+// `ReduceOps`/`ForEachOps`/`MatchOps`/`FindOps`/`Nodes` found 17 `invoke()`
+// call sites and ZERO `quietly*`, and `RJdkForkJoin` uses none — but the
+// methods are `public final` on `ForkJoinTask`, so any user code or third-party
+// library that calls one hangs the VM.
+//
+// The whole family goes in as ONE unit on purpose. A partial surface is the
+// recorded `StampedLock` failure mode: a half-covered API is worse than an
+// uncovered one, because the covered half makes the gap look closed.
+//
+// Registered on `java/util/concurrent/ForkJoinTask` ONLY. All six are declared
+// there and all the public ones are `final`, and both dispatch gates key on the
+// RESOLVED declaring class (`dispatch_virtual.rs` passes `declaring_name` into
+// `force_native_over_real_jdk_bytecode`), so a `RecursiveTask` /
+// `CountedCompleter` / user-subclass receiver still lands here — the same
+// argument W3-4 made for `isCompletedAbnormally`. This matters for
+// `CountedCompleter.quietlyCompleteRoot()`, whose constant-pool ref is
+// `CountedCompleter.quietlyComplete:()V`, not `ForkJoinTask.quietlyComplete`.
+//
+// NOT registered, deliberately: `CountedCompleter.quietlyCompleteRoot()V`. Its
+// entire body is a `getfield completer` walk to the root followed by
+// `quietlyComplete()` — no `awaitDone`, no `doExec`. Once `quietlyComplete()`
+// is the native below, running that bytecode is correct, and it is the ONLY
+// member of the family whose real body needs the `completer` chain this VM does
+// not model. Registering it would also mean adding `CountedCompleter` to both
+// allow-lists' class sets, which changes what gets dropped for every OTHER
+// method on that class under the real-ForkJoinPool opt-in — an unmeasured
+// widening this lane has no evidence for.
+
+/// Register the `quietly*` family as swallow-and-complete Bridges.
+///
+/// Called from BOTH boot paths, exactly like
+/// [`register_forkjointask_invoke_all_bridge`]: `register_new15_loom`
+/// (synthetic) and `register_t19_k3_forkjoinpool_common` (real-JDK
+/// essentials). One registration site, two modes — which is why the
+/// entry-for-entry grep against the two allow-lists is 3 hits per triple here
+/// rather than W3-4's 4.
+pub(crate) fn register_forkjointask_quietly_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let fjt = "java/util/concurrent/ForkJoinTask";
+
+    // quietlyJoin()V — `if (status >= 0) awaitDone(false, 0L);`.
+    r.register_with_kind(
+        fjt,
+        "quietlyJoin",
+        "()V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            crate::phases_early::fjp_quietly_body(ctx, this)?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // quietlyInvoke()V — `doExec(); if (status >= 0) awaitDone(false, 0L);`.
+    //
+    // Shares one body with `quietlyJoin()` for the same reason `invoke()` and
+    // `join()` already share `fjp_join_body`: this model memoises completion in
+    // the side table, so "run it if it has not run" and "wait until it has run"
+    // are the same operation. `fjp_quietly_body`'s done-check is what stops a
+    // `fork(); quietlyInvoke()` pair from double-executing the body.
+    r.register_with_kind(
+        fjt,
+        "quietlyInvoke",
+        "()V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            crate::phases_early::fjp_quietly_body(ctx, this)?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // quietlyJoin(long, TimeUnit)Z and quietlyJoinUninterruptibly(long,
+    // TimeUnit)Z — both `return status < 0`, i.e. "is the task done".
+    //
+    // The timeout is ignored and the answer is always `true`, for the same
+    // reason the existing `get(J,TimeUnit)` registration ignores its timeout:
+    // every task this Bridge touches is computed INLINE on the calling thread,
+    // so by the time control returns the task is done and no deadline can have
+    // elapsed. The real `quietlyJoin(0, unit)` answers `false` for a
+    // not-yet-done task; that divergence is inherent to the inline model (the
+    // same one `get(J,TimeUnit)` already carries) and is the honest report of
+    // what this VM did, not a guess.
+    //
+    // Neither can raise `InterruptedException` here: nothing blocks, so
+    // `Thread.interrupted()` is never consulted.
+    for quietly_timed in ["quietlyJoin", "quietlyJoinUninterruptibly"] {
+        r.register_with_kind(
+            fjt,
+            quietly_timed,
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                crate::phases_early::fjp_quietly_body(ctx, this)?;
+                Ok(Some(Value::Int(1)))
+            },
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+    }
+
+    // quietlyJoinPoolInvokeAllTask(long)V — package-private, and the last
+    // `awaitDone` route in the family. Its only caller is `ForkJoinPool`'s own
+    // `invokeAll(Collection)`, which is itself a Bridge here, so it is
+    // unreachable today; it is covered anyway because it costs one entry and
+    // because "unreachable via the current bridge set" is exactly the
+    // assumption that made `awaitQuiescence` silently dead.
+    r.register_with_kind(
+        fjt,
+        "quietlyJoinPoolInvokeAllTask",
+        "(J)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            crate::phases_early::fjp_quietly_body(ctx, this)?;
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    // quietlyComplete()V — the one member that is NOT mechanical.
+    //
+    // Its real body is a bare `setDone()`, which ORs `DONE` into a write-once
+    // status word and LEAVES `ABNORMAL` set. The obvious implementation,
+    // `fjp_state_set_done(this, Value::Object(None))`, does
+    // `e.thrown = Value::Object(None)` — it would ERASE the abnormal record
+    // that W3-4 just made observable through `isCompletedAbnormally()` /
+    // `getException()`, so `t.quietlyComplete()` on a task that had thrown
+    // would flip it to "completed normally". It would also null out a raw
+    // result a `CountedCompleter` had stashed via `setRawResult` before
+    // `tryComplete()`. `fjp_state_set_done_preserving_thrown` sets the done bit
+    // and touches nothing else, which is what `setDone()` actually does.
+    r.register_with_kind(
+        fjt,
+        "quietlyComplete",
+        "()V",
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            crate::phases_early::fjp_state_set_done_preserving_thrown(this);
+            Ok(None)
+        },
+        cratonvm_native_api::NativeKind::Bridge,
+    );
+
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// L19 — `CountedCompleter` starves under a lazy `fork()`; the gated eager fork
+// ---------------------------------------------------------------------------
+//
+// The eager-inline pool model above works by intercepting the CONSUMER of a
+// forked task: `fork()` only marks the task queued, and `join()` / `get()` /
+// `invoke()` / (since L12) the static `invokeAll` overloads are what actually
+// drive `compute()` and memoise the outcome.
+//
+// `java.util.concurrent.CountedCompleter` has no consumer. Its protocol is
+//
+//     setPendingCount(2);
+//     child1.fork();
+//     child2.fork();
+//     tryComplete();          // decrement pending; at zero call onCompletion()
+//
+// and the parent never touches a child again — completion flows UP from the
+// child, driven by the child's own `tryComplete()`. So there is no method on
+// the parent side to intercept: every one of `tryComplete` /
+// `propagateCompletion` / `complete` / `helpComplete` is real JDK bytecode
+// that only reads a pending counter, and the counter can only fall if the
+// CHILD ran. Under the lazy fork the children never run, the count never
+// reaches zero, `onCompletion` never fires — and, unlike the L12 `awaitDone`
+// hang, nothing blocks: the task tree quietly does a fraction of the work and
+// reports success. `regression-suite/src/RJdkForkJoin.java:175`
+// (`check(leaves.get() == 64, "CountedCompleter leaves: " + ...)`) is that
+// failure written down.
+//
+// Bridging the protocol methods was considered and rejected: none of them can
+// reach the children. The side table is keyed by task address and holds no
+// parent->child edge, so a Bridge on `tryComplete()` would have to enumerate
+// every queued-not-done entry in a process-global map and read a `completer`
+// field off each raw address to find its own children — nondeterministic in
+// order, and a stale key would be dereferenced as an object. The producer side
+// is where the work has to happen.
+//
+// Hence: run the body AT `fork()`. `ForkJoinPool.execute(ForkJoinTask)V`
+// already does exactly this via `fjp_compute_for_submit`
+// (`native-builtins/src/lib.rs`), which RECORDS the completion in the side
+// table, so a later `join()` returns the memoised result instead of running
+// `compute()` a second time. Running the child inside the parent's `fork()` is
+// a legal fork-join schedule — it is what a worker that steals the child
+// immediately produces — so the completion protocol observes an interleaving
+// the JDK can also produce.
+//
+// It is nevertheless an ORDERING change for every workload that forks, so it
+// is OFF by default and selected per run by `CRATONVM_FJP_EAGER_FORK`
+// (grouped spelling `CRATONVM_THREADS=fjp-eager-fork=...`):
+//
+//   unset / `0` / anything unrecognised  today's lazy fork (DEFAULT)
+//   `1` / `cc` / `counted`               eager ONLY for a CountedCompleter
+//                                        receiver — the narrow cure
+//   `all`                                eager for every ForkJoinTask — the
+//                                        broad variant, for measuring the
+//                                        ordering blast radius
+//
+// NO out-of-file list edits are needed for this one, which is the other reason
+// to prefer it: `("fork", "()Ljava/util/concurrent/ForkJoinTask;")` is ALREADY
+// on both `keep_real_forkjointask_bridge` (`native-api/src/registry.rs`) and
+// `is_forkjoin_native_override`
+// (`vm/src/runtime/interpreter/native_override.rs`) for all three task
+// classes. Registering a `CountedCompleter` native instead would have needed
+// both lists extended — and `registry.rs` drops the whole `CountedCompleter`
+// class under `CRATONVM_REAL_FORKJOINPOOL` while its keep-list does not even
+// name the class.
+
+/// The env var that selects [`fjt_fork_mode`].
+pub(crate) const FJT_EAGER_FORK_ENV: &str = "CRATONVM_FJP_EAGER_FORK";
+
+/// What `ForkJoinTask.fork()` does in this VM.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FjtForkMode {
+    /// Mark the task queued and return. The historical behaviour; since
+    /// 2026-08-07 this is the OPT-OUT (`CRATONVM_FJP_EAGER_FORK=0`), not the
+    /// default — see `fjt_fork_mode` for the A/B that moved it.
+    Lazy,
+    /// Run the body inline when the receiver is a `CountedCompleter`, which is
+    /// the only family with no intercepted consumer; lazy for everything else.
+    CountedCompleterEager,
+    /// Run the body inline for every task. Ordering-perturbing; measurement
+    /// arm only.
+    AlwaysEager,
+}
+
+/// Read [`FJT_EAGER_FORK_ENV`].
+///
+/// Called ONCE per registry build (i.e. once per `Vm`), not per `fork()`, so
+/// there is no per-call env cost and no `OnceLock` memo of its own here.
+///
+/// **It does latch, one level down, and that is unavoidable.** The name is a
+/// DECLARED flag (`CRATONVM_THREADS=fjp-eager-fork`, `flag_groups::INVENTORY`),
+/// because `tools/flag-census/check-surface.sh` fails CI on any
+/// `"CRATONVM_*"` literal that is not declared. `runtime_var_os` therefore
+/// serves it from the immutable process-wide `VmFlags` snapshot, which latches
+/// on its first read anywhere in the process. So: **set it in the environment
+/// before launching the process.** A `std::env::set_var` executed after the
+/// snapshot has been taken — which for an in-process test means after almost
+/// any VM code has run — is invisible, the failure mode recorded as "declared
+/// flags latch, so set-var is invisible to tests". An in-process test must use
+/// `flags::with_process_overrides(&[("CRATONVM_FJP_EAGER_FORK", Some("1"))], ..)`
+/// *and* build its `Vm` inside that guard.
+///
+/// An unrecognised value means LAZY, so a typo cannot silently change
+/// behaviour.
+pub(crate) fn fjt_fork_mode() -> FjtForkMode {
+    let Some(raw) = cratonvm_types::flags::runtime_var_os(FJT_EAGER_FORK_ENV) else {
+        // DEFAULT FLIPPED 2026-08-07, after the A/B its author specified.
+        //
+        // With lazy fork, `CountedCompleter` starves: it never calls `join()`,
+        // it forks children and drives `tryComplete()`, so nothing computes
+        // them and the pending count never reaches zero. `java.util.stream
+        // .AbstractTask` extends `CountedCompleter`, so EVERY real parallel
+        // stream that reaches it starves in the default configuration. Leaving
+        // this off shipped a known-broken path.
+        //
+        // Measured before flipping, all three of the author's conditions:
+        //   (1) `=1` reaches `PASS RJdkForkJoin (26 checks)` in BOTH
+        //       `--jdk-only` and `--real-jdk`;
+        //   (2) `probes/FjpMatrixProbe.java` and `RJdkExecutors` are
+        //       byte-identical A vs B (the only diff is the flag banner line
+        //       itself), and `vm/tests/{fjp_recursive,rfjp1_recursive}.rs` are
+        //       unchanged — though note those two are VACUOUS: their probe
+        //       source `apps/fjp_probe/FjpProbe.java` does not exist, so they
+        //       take a "skipping" branch and pass in 0.00s;
+        //   (3) `=all` passes too but buys nothing `=1` does not, so the
+        //       NARROWER gate is what ships.
+        //
+        // Still unverified: the Spring/H2 slice, which is the entire remaining
+        // blast radius (parallel streams are the only `CountedCompleter` users
+        // in it). Its pre-flip state was already broken, so this is expected to
+        // repair rather than regress it — but it has not been run.
+        //
+        // `CRATONVM_FJP_EAGER_FORK=0` / `CRATONVM_THREADS=-fjp-eager-fork`
+        // remains the escape hatch: `"0"` falls through the match below to
+        // `_ => FjtForkMode::Lazy`.
+        return FjtForkMode::CountedCompleterEager;
+    };
+    let raw = raw.to_string_lossy().trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "1" | "on" | "true" | "yes" | "cc" | "counted" | "countedcompleter" => {
+            FjtForkMode::CountedCompleterEager
+        }
+        "all" | "always" | "2" => FjtForkMode::AlwaysEager,
+        _ => FjtForkMode::Lazy,
+    }
+}
+
+/// Does `task`'s runtime class transitively extend
+/// `java.util.concurrent.CountedCompleter`?
+///
+/// Walks the superclass chain rather than testing the exact class, because the
+/// classes that matter are always subclasses: the user's own completer, and
+/// `java.util.stream.AbstractTask` (which every parallel-stream leaf task
+/// extends). The walk is bounded so a corrupt or self-referential hierarchy
+/// cannot loop — the same shape as `is_fjp_subclass_blocklisted` in
+/// `vm/src/runtime/interpreter/jit_bridge.rs`.
+fn fjt_is_counted_completer(ctx: &dyn NativeContext, task: ObjectRef) -> bool {
+    let mut cid = ctx.class_id_of_object(task);
+    for _ in 0..64 {
+        match ctx.class_name_of_id(cid) {
+            Some(name) if name == "java/util/concurrent/CountedCompleter" => return true,
+            Some(_) => {}
+            None => return false,
+        }
+        match ctx.superclass_of(cid) {
+            Some(parent) if parent != cid => cid = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Run `this` now and record the completion, then hand back the (possibly
+/// relocated) task — `fork()` is specified to return the receiver.
+///
+/// `fjp_compute_for_submit` is the SUBMIT-shaped entry point on purpose: the
+/// real `fork()` does not raise the task's exception at the forking site, it
+/// records it for the eventual join / completion. An internal VM error still
+/// propagates.
+fn fjt_fork_run_now(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let (done, _) = crate::phases_early::fjp_state_get(this);
+    if done {
+        // Already driven by an enclosing join()/invoke(). Re-running would
+        // double-execute the body — the bug `fjp_compute_for_submit`'s own
+        // comment records for the bare `exec()` invoke it replaced.
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    let live = crate::phases_early::fjp_compute_for_submit(ctx, this)?;
+    Ok(Some(Value::Object(Some(live))))
+}
+
+/// `fork()` under `CRATONVM_FJP_EAGER_FORK=1`: eager for a `CountedCompleter`
+/// receiver, byte-identical to the lazy Bridge for everything else.
+fn fjt_fork_counted_completer_eager(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if !fjt_is_counted_completer(ctx, this) {
+        crate::phases_early::fjp_state_mark_queued(this);
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    fjt_fork_run_now(ctx, this)
+}
+
+/// `fork()` under `CRATONVM_FJP_EAGER_FORK=all`: eager for every task.
+fn fjt_fork_always_eager(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    fjt_fork_run_now(ctx, this)
+}
+
+/// Re-register `fork()` over the lazy Bridge installed by
+/// `phases_early::register_forkjoin_natives` /
+/// `register_real_jdk_forkjoin_essentials`, when the gate asks for it.
+///
+/// Re-registering a triple UPDATES THE EXISTING SLOT IN PLACE (see the
+/// `match prior_slot` arm of `NativeMethodRegistry::register`), and both call
+/// sites of this function run after the `phases_early` ones on their
+/// respective boot paths (`register_phase51_natives` precedes
+/// `register_new15_loom` inside `register_builtins`;
+/// `register_real_jdk_forkjoin_essentials` precedes
+/// `register_t19_k3_forkjoinpool_common` inside `register_essential_natives`),
+/// so this wins in both.
+///
+/// In `Lazy` mode it returns without touching the registry at all — the
+/// default path is not merely equivalent to today's, it is untouched, kind and
+/// slot included.
+pub(crate) fn register_forkjointask_eager_fork_gate(r: &mut NativeMethodRegistry) {
+    let mode = fjt_fork_mode();
+    let callback: cratonvm_native_api::NativeCallback = match mode {
+        FjtForkMode::Lazy => return,
+        FjtForkMode::CountedCompleterEager => fjt_fork_counted_completer_eager,
+        FjtForkMode::AlwaysEager => fjt_fork_always_eager,
+    };
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // All three classes, because which of them a given dispatch route resolves
+    // `fork()` against differs between the synthetic and real-JDK paths, and a
+    // gate that covered only one would be mode-dependent.
+    for task_class in [
+        "java/util/concurrent/ForkJoinTask",
+        "java/util/concurrent/RecursiveTask",
+        "java/util/concurrent/RecursiveAction",
+    ] {
+        r.register_with_kind(
+            task_class,
+            "fork",
+            "()Ljava/util/concurrent/ForkJoinTask;",
+            callback,
+            cratonvm_native_api::NativeKind::Bridge,
+        );
+    }
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_new15_continuation(r);
     register_new15_continuation_scope(r);
     register_new15_forkjoinpool_common(r);
+    register_forkjointask_invoke_all_bridge(r);
+    // W6-7: the `quietly*` family — the remaining real-bytecode routes into
+    // `doExec()` + `awaitDone()`. Rides the same hook as the static
+    // `invokeAll` overloads for the same reason.
+    register_forkjointask_quietly_bridge(r);
+    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
+    // `phases_early::register_forkjoin_natives`, which it is —
+    // `register_phase51_natives` runs earlier in `register_builtins`.
+    register_forkjointask_eager_fork_gate(r);
     register_wp4_8_continuation_support(r);
     register_wp4_8_virtual_thread_natives(r);
     r.set_category(__prev_cat);
@@ -6639,6 +7316,19 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_new15_forkjoinpool_common(r);
+    // L12: the static `ForkJoinTask.invokeAll` overloads ride the same
+    // real-JDK essentials hook. They are the last real-bytecode route from a
+    // lazy `fork()` to an `awaitDone()` that no worker thread can satisfy —
+    // see the block comment on `register_forkjointask_invoke_all_bridge`.
+    register_forkjointask_invoke_all_bridge(r);
+    // W6-7: the `quietly*` family, on the same real-JDK essentials hook. These
+    // are the LAST real-bytecode routes from this VM's side-table completion
+    // model into `awaitDone()`, which no worker thread exists to satisfy.
+    register_forkjointask_quietly_bridge(r);
+    // L19: no-op unless CRATONVM_FJP_EAGER_FORK is set. Must stay AFTER
+    // `phases_early::register_real_jdk_forkjoin_essentials`, which it is —
+    // `register_essential_natives` calls that first (native-builtins/src/lib.rs).
+    register_forkjointask_eager_fork_gate(r);
     r.set_category(__prev_cat);
 }
 

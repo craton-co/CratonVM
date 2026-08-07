@@ -629,6 +629,35 @@ fn current_thread_stack_high_uncached() -> usize {
     }
 }
 
+thread_local! {
+    /// Highest `entry_sp` among the JIT entries that have RETURNED on this
+    /// thread -- an upper bound on the stack addresses whose current contents
+    /// may be a returned frame's leftovers rather than anything live.
+    ///
+    /// A compiled frame writes only below its own `entry_sp`, so once it
+    /// returns, every return address it left into JIT code lies below that
+    /// mark. `scan_active_jit_frames`'s unregistered-frame probe uses this to
+    /// tell residue from a genuinely live guardless frame; see its call site.
+    ///
+    /// Monotonic. A frame entered at `sp` writes only below `sp`, so it never
+    /// overwrites residue at or above `sp`; resetting the mark on a push would
+    /// discard exactly the higher-addressed leftovers of an earlier, shallower
+    /// frame. The one live guardless frame the probe exists for is the process
+    /// entry point, which sits above every JIT entry the run ever makes.
+    static JIT_RESIDUE_HI: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Record that a JIT entry with this `entry_sp` has returned.
+fn note_jit_residue(entry_sp: usize) {
+    JIT_RESIDUE_HI.with(|c| c.set(c.get().max(entry_sp)));
+}
+
+/// Upper bound on this thread's returned-JIT-frame residue, or 0 when no JIT
+/// frame has returned yet.
+fn jit_residue_hi() -> usize {
+    JIT_RESIDUE_HI.with(|c| c.get())
+}
+
 /// Record that JIT execution is about to begin on the current thread.
 ///
 /// Captures the current stack pointer at the instant of the call and pushes
@@ -774,6 +803,7 @@ pub fn pop_jit_entry() -> Option<usize> {
         if crate::jit::code_cache_lifecycle::pending_retirements() != 0 {
             crate::jit::code_cache_lifecycle::sweep_if_quiescent();
         }
+        note_jit_residue(entry.entry_sp);
         Some(entry.entry_sp)
     } else {
         None
@@ -814,6 +844,9 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         let before = v.len();
         // Keep only entries that could still be live (spill region at or
         // above the scanner SP). Entries below it have provably returned.
+        for e in v.iter().filter(|e| e.entry_sp < scanner_sp) {
+            note_jit_residue(e.entry_sp);
+        }
         v.retain(|e| e.entry_sp >= scanner_sp);
         let pruned = before - v.len();
         // Mirror tracks whatever entry is top after pruning — but ONLY when
@@ -1641,6 +1674,17 @@ fn return_pc_validation_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_RETPC_VALIDATE").is_none()
+    })
+}
+
+/// Kill switch for the residue filter on the unregistered-JIT-frame probe --
+/// see its call site in `scan_active_jit_frames`. Set it to accept every hit
+/// again, as before the filter existed.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn unreg_jit_accept_residue() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE").is_some()
     })
 }
 
@@ -3132,7 +3176,44 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         UnregScan::Detect { hi: Some(floor) } if floor <= high => floor,
                         _ => high,
                     };
-                    if native_stack_has_jit_frame(search_lo, scan_hi).is_some() {
+                    let probe = native_stack_has_jit_frame(search_lo, scan_hi);
+                    // RESIDUE FILTER. With entries on the chain, `search_lo` is
+                    // already `cover_hi`, so anything found above it is a frame
+                    // the chain does not cover and must be marked. With an EMPTY
+                    // chain the probe searches the whole native stack, and a
+                    // compiled method that has already returned left a return
+                    // address into JIT code behind it at every depth below its
+                    // own `entry_sp` -- indistinguishable, by inspection, from a
+                    // live guardless frame. Accepting it marked
+                    // `[scanner_sp, stack_high)`: the collector's own frames,
+                    // every interpreter and native Rust frame, and the leftovers
+                    // of everything this thread has run. Any heap address still
+                    // lying in that band then became a root on every collection.
+                    //
+                    // H2's `FileNioMapped.unMap` spins on `System.gc()` until a
+                    // `WeakReference<MappedByteBuffer>` clears; 15 dead stack
+                    // words still held the buffer, and the return address that
+                    // opened the band was itself residue --
+                    // `FileChannelImpl.implWrite`, long since returned. The
+                    // 10 s timeout therefore always fired. See the retired
+                    // bug-h2-niomapped-unmap-gc-timeout write-up.
+                    //
+                    // The canonical live guardless frame this probe exists for
+                    // is the process entry point (`Vm::invoke` -> compiled
+                    // `main`), which sits ABOVE every JIT entry the run has ever
+                    // made -- every one of those was entered deeper than main's
+                    // own call site -- so the filter keeps it.
+                    let accept = match probe {
+                        None => false,
+                        Some((hit_slot, _)) => {
+                            let residue_hi = jit_residue_hi();
+                            chain_len > 0
+                                || residue_hi == 0
+                                || hit_slot >= residue_hi
+                                || unreg_jit_accept_residue()
+                        }
+                    };
+                    if accept {
                         // A hit anywhere in the checked band still conservatively
                         // marks (and flags) the FULL `[search_lo, high)` span —
                         // unchanged from pre-fix behavior. Only the detection
@@ -3145,7 +3226,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                             cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
                         );
-                    } else {
+                    } else if probe.is_none() {
                         UNREG_JIT_MEMO.with(|c| {
                             let mut m = c.get();
                             m.mark_clean(search_lo, code_ranges);

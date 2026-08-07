@@ -967,6 +967,67 @@ pub(crate) fn read_wrapped_char_sequence(ctx: &mut dyn NativeContext, seq: Objec
     }
 }
 
+/// The text a CharBuffer currently exposes (`position..limit`), read straight
+/// off the receiver rather than obtained by calling `toString()` on it.
+///
+/// Introduced as a workaround: a real `java.nio.StringCharBuffer` answered an
+/// EMPTY string through `ctx.invoke_virtual` / `Method.invoke` while a direct
+/// bytecode `cb.toString()` was correct. That defect is FIXED — a duplicate
+/// `java/nio/CharBuffer.toString()` registration was shadowing the correct one
+/// (fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md)
+/// — and the `invoke_to_string_opt` caller that needed the workaround is gone.
+///
+/// It stays because it is still the right primitive for a caller that must read
+/// a buffer's characters WITHOUT calling back into Java: `charsequence_chars`
+/// uses it as the `AbstractStringBuilder.append(CharSequence)` fast path,
+/// where the JDK is `charAt`-driven and re-entering for one virtual call per
+/// character would be the only alternative.
+///
+/// Returns `None` for a receiver with neither a `str` nor an `hb`, so the
+/// caller can fall back to ordinary dispatch.
+pub(crate) fn cb_read_text(ctx: &mut dyn NativeContext, buf: ObjectRef) -> Option<String> {
+    // A by-name read answers `Int(0)` for a field the receiver does not have,
+    // indistinguishable from a real zero, so a named 0 means "ask the indexed
+    // slot too". Safe for position/limit specifically: both layouts agree on 0
+    // when it is genuinely 0, so they cannot disagree in the direction that
+    // matters. NOT safe for `mark`, whose unset value is -1.
+    fn coord(ctx: &dyn NativeContext, buf: ObjectRef, name: &str, slot: usize) -> i32 {
+        if let Value::Int(v) = ctx.get_field_by_name(buf, name) {
+            if v != 0 {
+                return v;
+            }
+        }
+        match ctx.get_field(buf, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    }
+    let pos = coord(ctx, buf, "position", CB_FIELD_POS);
+    let lim = coord(ctx, buf, "limit", CB_FIELD_LIMIT);
+    let off = match ctx.get_field_by_name(buf, "offset") {
+        Value::Int(v) => v.max(0),
+        _ => 0,
+    };
+    if let Value::Object(Some(seq)) = ctx.get_field_by_name(buf, "str") {
+        let units: Vec<u16> = read_wrapped_char_sequence(ctx, seq).encode_utf16().collect();
+        let n = units.len() as i32;
+        let lo = (off + pos).clamp(0, n) as usize;
+        let hi = (off + lim).clamp(lo as i32, n) as usize;
+        return Some(String::from_utf16_lossy(&units[lo..hi]));
+    }
+    let arr = cb_read_hb(ctx, buf)?;
+    let n = ctx.array_length(arr) as i32;
+    let lo = (off + pos).clamp(0, n);
+    let hi = (off + lim).clamp(lo, n);
+    let mut units: Vec<u16> = Vec::with_capacity((hi - lo).max(0) as usize);
+    for i in lo..hi {
+        if let Value::Int(v) = ctx.get_array_element(arr, i as usize) {
+            units.push(v as u16);
+        }
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
 /// `Objects.checkFromToIndex(from, to, length)`, the range check
 /// `HeapCharBuffer.subSequence` opens with.
 ///
@@ -1658,43 +1719,21 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             .into()),
         }
     });
-    r.register(cb, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let pos = match ctx.get_field_by_name(this, "position") {
-            Value::Int(v) => v as usize,
-            _ => match ctx.get_field(this, CB_FIELD_POS) {
-                Value::Int(v) => v as usize,
-                _ => 0,
-            },
-        };
-        let lim = match ctx.get_field_by_name(this, "limit") {
-            Value::Int(v) => v as usize,
-            _ => match ctx.get_field(this, CB_FIELD_LIMIT) {
-                Value::Int(v) => v as usize,
-                _ => 0,
-            },
-        };
-        let off = match ctx.get_field_by_name(this, "offset") {
-            Value::Int(v) => v as usize,
-            _ => 0,
-        };
-        let arr = match cb_read_hb(ctx, this) {
-            Some(a) => a,
-            None => {
-                let s = ctx.create_string("");
-                return Ok(Some(Value::Object(Some(s))));
-            }
-        };
-        let mut chars = Vec::new();
-        for i in pos..lim {
-            if let Value::Int(ch) = ctx.get_array_element(arr, i + off) {
-                chars.push(ch as u16);
-            }
-        }
-        let text = String::from_utf16_lossy(&chars);
-        let s = ctx.create_string(&text);
-        Ok(Some(Value::Object(Some(s))))
-    });
+    // `java/nio/CharBuffer.toString()` is registered ONCE, above, delegating to
+    // `cb_to_string_range`. A second registration of the same triple used to sit
+    // here, reading only the backing `char[]` through `cb_read_hb` and returning
+    // `""` when there was none. Being later, it WON -- and a real
+    // `java.nio.StringCharBuffer` has no `hb` (it holds the wrapped CharSequence
+    // in `str`), so every route that resolved `toString()` against the DECLARING
+    // class got an empty string.
+    //
+    // A direct bytecode `cb.toString()` was unaffected because it resolves the
+    // exact class and finds `StringCharBuffer.toString()` (registered separately,
+    // and correct). Reflection and `NativeContext::invoke_virtual` both land in
+    // `invoke_on_class_shared`, which resolves the inherited declaration on
+    // `java/nio/CharBuffer` -- so `Method.invoke(CharBuffer.toString(), scb)`
+    // answered `""` while `scb.toString()` answered the text.
+    // See fixed-suite-bugs/stringcharbuffer-tostring-empty-via-native-invoke-FIXED.md.
 
     // Also register under Buffer parent
     let buf = "java/nio/Buffer";

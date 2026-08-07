@@ -707,6 +707,38 @@ fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The peer a `DatagramSocket` was last `connect`ed to, as `(numeric host,
+/// port)`.
+///
+/// Separate from [`DsSide`] only because that struct is `Copy` and this is a
+/// `String`; the lifecycle is the same — written by both `connect` overloads,
+/// cleared by `disconnect`, and deliberately NOT cleared by `close`, because
+/// the JDK specifies `getPort`/`getInetAddress` keep answering after the socket
+/// is closed (same rule that keeps `isConnected()` true).
+fn ds_peer_table() -> &'static Mutex<HashMap<ObjectRef, (String, i32)>> {
+    static T: OnceLock<Mutex<HashMap<ObjectRef, (String, i32)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The connected peer, or `None` when this socket has never connected or has
+/// disconnected since. The lock is released before returning: every caller goes
+/// on to allocate, and holding a process-global mutex across an allocation
+/// (which can enter the collector, and on a cold VM a class load) is a lock
+/// cycle waiting to happen.
+fn ds_peer(this: ObjectRef) -> Option<(String, i32)> {
+    ds_peer_table().lock().get(&this).cloned()
+}
+
+fn ds_set_peer(this: ObjectRef, host: &str, port: i32) {
+    ds_peer_table()
+        .lock()
+        .insert(this, (host.to_string(), port));
+}
+
+fn ds_clear_peer(this: ObjectRef) {
+    ds_peer_table().lock().remove(&this);
+}
+
 /// `javax.net.ssl.SSLSessionContext` cache tuning, as configured through
 /// `setSessionCacheSize`/`setSessionTimeout`. Side-tabled for the same reason
 /// as the socket state above, and one more: the carrier is an instance of the
@@ -11577,13 +11609,30 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
             let proto = value_or_string(ctx, proto_val, "TLS");
-            if !(proto.eq_ignore_ascii_case("TLS")
-                || proto.eq_ignore_ascii_case("TLSv1.2")
-                || proto.eq_ignore_ascii_case("TLSv1.3")
-                || proto.eq_ignore_ascii_case("Default")
-                || proto.eq_ignore_ascii_case("SSL"))
-            {
-                return Err(ioex(format!("NoSuchAlgorithmException: {proto}")));
+            // W3-7 (RJdkSecurity.tls:291). TWO defects on this line.
+            //
+            // (1) WRONG TYPE. `ioex` builds a `java.io.IOException`, so
+            //     `getInstance("NO-SUCH-TLS")` threw
+            //     `IOException: NoSuchAlgorithmException: NO-SUCH-TLS` — the
+            //     right words in the message, the wrong class on the wire.
+            //     `java.io.IOException` and `java.security.NoSuchAlgorithm-
+            //     Exception` (via GeneralSecurityException) are disjoint below
+            //     `Exception`, so the caller's `catch (NoSuchAlgorithmException)`
+            //     did not match and the refusal escaped to main.
+            //
+            // (2) TOO NARROW. The five-name list refused `TLSv1`, `TLSv1.1`,
+            //     `SSLv3` and all three DTLS protocols — every one of which
+            //     SunJSSE really registers on JDK 25 (measured). A too-narrow
+            //     accept list is the more dangerous half: it turns a valid
+            //     `getInstance` into a refusal and takes every HTTPS-using
+            //     suite with it. The decision now lives in ONE place shared
+            //     with `phases_late::ssl_security::register_p68_ssl` and both
+            //     `tls.rs` registrations, so the four cannot drift again.
+            if !crate::jca::provider_chain::ssl_context_protocol_supported(&proto) {
+                return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("{proto} SSLContext not available"),
+                ));
             }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string(&proto);
@@ -12498,10 +12547,100 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
 // keyed by ObjectRef — the old DS_PORT/DS_CLOSED/DS_TIMEOUT/DS_FD object-slot
 // layout collided with the real-JDK single-field `DatagramSocket`.
 
+// `java.net.DatagramPacket` slots, SYNTHETIC-JDK layout only — the five
+// fabricated `_f0.._f4` slots that `classloading`'s
+// `synthetic_stub_fields("java/net/DatagramPacket") => instance_fields(5)`
+// allocates and that `phases_late::net_channels::register_p72_datagram` reads
+// and writes.
+//
+// They are NOT the real-JDK layout, and this registrar runs in BOTH builds
+// (`register_re7_datagram_socket` is called from `register_phase_e_networking`,
+// which is not feature-gated), so every use below has to go through
+// [`dp_layout`] rather than reach for these directly. Reaching for them
+// directly is exactly what `send`/`receive` used to do, and against a real
+// `java.net.DatagramPacket` — `buf, offset, length, bufLength, address, port`,
+// in that declared order — it read `length` as the address (an `int` slot, so
+// never an object: empty host) and `bufLength` as the port. For
+// `new DatagramPacket(payload, 8, lo, ephemeralPort)` that is the message
+// `DatagramPacket: bad addr :8`, with the `8` being `payload.length` echoed
+// through `bufLength`, and RJdkNet died on it at `loopbackUdp`'s first `send`.
 const DP_DATA: usize = 0;
 const DP_LENGTH: usize = 1;
 const DP_ADDR: usize = 2;
 const DP_PORT: usize = 3;
+
+/// Where one `java.net.DatagramPacket`'s fields actually live.
+///
+/// `offset`/`buf_length` are `Option` because the synthetic layout's slot 4 is
+/// written by only one of three constructors and the other two leave it
+/// uninitialised — see [`dp_layout`] for why the synthetic arm reports `None`
+/// for both.
+struct DpLayout {
+    buf: usize,
+    offset: Option<usize>,
+    length: usize,
+    buf_length: Option<usize>,
+    address: usize,
+    port: usize,
+}
+
+/// Resolve [`DpLayout`] for `pkt` by FIELD NAME, falling back to the synthetic
+/// `DP_*` slots.
+///
+/// The name lookup is the discriminator between the two builds and needs no
+/// mode flag: a real `java.net.DatagramPacket` declares `buf`/`length`/
+/// `address`/`port`, while the fabricated stub's slots are named `_f0.._f4`
+/// (`class_manager::synthetic_stub_fields`'s `instance_fields` helper), so the
+/// lookup misses and the fallback arm — today's behaviour, unchanged — applies.
+///
+/// The synthetic arm deliberately reports `offset: None` / `buf_length: None`
+/// even though slot 4 is the synthetic offset: `send`/`receive` have always
+/// treated that layout as offset-0 whole-buffer, and widening them here would
+/// change synthetic-jdk behaviour on a change whose whole purpose is the
+/// real-JDK layout. Slot 4 stays `register_p72_datagram`'s business.
+fn dp_layout(ctx: &dyn NativeContext, pkt: ObjectRef) -> DpLayout {
+    let cid = ctx.class_id_of_object(pkt);
+    let named = |name: &str| ctx.resolve_field_index_by_class_id(cid, name);
+    match (
+        named("buf"),
+        named("length"),
+        named("address"),
+        named("port"),
+    ) {
+        (Some(buf), Some(length), Some(address), Some(port)) => DpLayout {
+            buf,
+            offset: named("offset"),
+            length,
+            buf_length: named("bufLength"),
+            address,
+            port,
+        },
+        _ => DpLayout {
+            buf: DP_DATA,
+            offset: None,
+            length: DP_LENGTH,
+            buf_length: None,
+            address: DP_ADDR,
+            port: DP_PORT,
+        },
+    }
+}
+
+/// Split the `ip:port` text `FileDescriptorTable::udp_recv` reports for a
+/// datagram's origin.
+///
+/// Parsing it as a `SocketAddr` first is what keeps an IPv6 peer usable: the
+/// wire form is `[::1]:54321`, and the `rsplit_once(':')` this replaces
+/// answered the host as the *bracketed* `[::1]`, which no downstream
+/// `InetAddress` mirror can parse. The bare-`rsplit` arm survives only as the
+/// fallback for a hypothetical non-`SocketAddr` spelling.
+fn udp_origin_split(origin: &str) -> Option<(String, i32)> {
+    if let Ok(sa) = origin.parse::<std::net::SocketAddr>() {
+        return Some((sa.ip().to_string(), i32::from(sa.port())));
+    }
+    let (host, port) = origin.rsplit_once(':')?;
+    Some((host.to_string(), port.parse::<i32>().ok()?))
+}
 
 /// The raw OS descriptor of a `java.net.Socket`'s connected stream.
 ///
@@ -13067,62 +13206,11 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         // DatagramSocket.
         Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
     });
-
-    // isBound / getLocalAddress / setBroadcast / getBroadcast — the four keys
-    // the phase-72 `java/net/DatagramSocket` set owned alone. They are here now
-    // so this registrar covers the whole class in BOTH builds: phase-72 is
-    // `#[cfg(feature = "synthetic-jdk")]`, so in the default build these four
-    // did not exist at all and resolved to the abstract declaration.
-    r.register(ds, "isBound", "()Z", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let sd = ds_get(this);
-        // A `DatagramSocket` is bound from construction: every ctor here opens
-        // and binds a real UDP fd. It stays bound after close, which is what
-        // the JDK specifies.
-        Ok(Some(Value::Int(i32::from(sd.fd >= 0 || sd.closed != 0))))
-    });
-    r.register(
-        ds,
-        "getLocalAddress",
-        "()Ljava/net/InetAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let sd = ds_get(this);
-            if sd.closed != 0 || sd.fd < 0 {
-                // "If the socket is closed, returns null" — and an unbound
-                // socket answers the wildcard, which is what the fd reports.
-                return Ok(Some(Value::Object(None)));
-            }
-            let addr = ctx
-                .fd_table()
-                .udp_local_addr(sd.fd as u32)
-                .ok()
-                .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
-                .unwrap_or_else(|| "0.0.0.0".to_string());
-            // The UDP socket's own bound address, read back as numeric text.
-            let ia = alloc_inet_address_unnamed(ctx, &addr);
-            Ok(Some(Value::Object(Some(ia))))
-        },
-    );
-    r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        let fd = ds_get(this).fd;
-        if fd < 0 {
-            return Err(ioex("DatagramSocket: closed"));
-        }
-        ctx.fd_table()
-            .udp_set_broadcast(fd as u32, on)
-            .map_err(|e| ioex(format!("SO_BROADCAST: {e}")))?;
-        ds_set(this, |sd| sd.broadcast = i32::from(on));
-        Ok(None)
-    });
-    r.register(ds, "getBroadcast", "()Z", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        // Never set -> the JDK default, which is false for a plain
-        // DatagramSocket.
-        Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
-    });
+    // (A byte-identical SECOND copy of the four registrations above stood here
+    // and was removed. It was inert — last-write-wins with the same closure —
+    // but it is the exact shape the `connect`/`disconnect` note below records
+    // going wrong once already: two copies that drift silently, with the
+    // compiler seeing nothing.)
 
     // `connect(SocketAddress)` — the overload the pair further down does not
     // cover. Its `(InetAddress,int)` sibling and `disconnect()`/`isConnected()`
@@ -13141,11 +13229,16 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             let Some(Value::Object(Some(sa))) = args.get(1).copied() else {
                 return Err(ioex("DatagramSocket.connect: null address"));
             };
-            let host = match ctx.get_field(sa, 0) {
-                Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
-                _ => String::new(),
-            };
-            let port = ctx.get_field(sa, 1).as_int().unwrap_or(0);
+            // Same real-vs-synthetic layout trap `dp_layout` covers for
+            // `DatagramPacket`, one class over: a real-JDK
+            // `java.net.InetSocketAddress` declares ONE instance field
+            // (`holder`), so the slot-0-is-host / slot-1-is-port read this
+            // replaces answered the host as an unreadable holder object ("")
+            // and the port as an out-of-layout `Int(0)` — i.e. every
+            // `connect(new InetSocketAddress(h, p))` targeted `127.0.0.1:0`.
+            // `read_inet_socket_address` already knows both layouts and is
+            // what the `Socket.connect` path uses.
+            let (host, port) = read_inet_socket_address(ctx, sa)?;
             let host = if host.is_empty() {
                 "127.0.0.1".to_string()
             } else {
@@ -13159,6 +13252,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 .udp_connect(fd as u32, &format!("{host}:{port}"))
                 .map_err(|e| ioex(format!("UDP connect: {e}")))?;
             ds_set(this, |sd| sd.connected = 1);
+            ds_set_peer(this, &host, port);
             Ok(None)
         },
     );
@@ -13170,20 +13264,28 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         if fd < 0 {
             return Err(ioex("DatagramSocket: closed"));
         }
-        let data_arr = match ctx.get_field(pkt, DP_DATA) {
+        let lay = dp_layout(ctx, pkt);
+        let data_arr = match ctx.get_field(pkt, lay.buf) {
             Value::Object(Some(a)) => a,
             _ => return Err(ioex("DatagramPacket: null data")),
         };
-        let len = ctx.get_field(pkt, DP_LENGTH).as_int().unwrap_or(0);
-        let port = ctx.get_field(pkt, DP_PORT).as_int().unwrap_or(0);
-        let host = match ctx.get_field(pkt, DP_ADDR) {
+        // The real JDK sends `buf[offset .. offset+length]`. The synthetic
+        // layout reports no offset and this stays 0, as before.
+        let off = lay
+            .offset
+            .and_then(|s| ctx.get_field(pkt, s).as_int())
+            .unwrap_or(0)
+            .max(0);
+        let len = ctx.get_field(pkt, lay.length).as_int().unwrap_or(0);
+        let port = ctx.get_field(pkt, lay.port).as_int().unwrap_or(0);
+        let host = match ctx.get_field(pkt, lay.address) {
             Value::Object(Some(ia)) => inet_addr_field_string_or(ctx, ia, IA_ADDR, ""),
             _ => String::new(),
         };
         if host.is_empty() || !(1..=65535).contains(&port) {
             return Err(iae(format!("DatagramPacket: bad addr {host}:{port}")));
         }
-        let payload = java_byte_array_to_vec(ctx, data_arr, 0, len)?;
+        let payload = java_byte_array_to_vec(ctx, data_arr, off, len)?;
         let target = format!("{host}:{port}");
         // Bracket the send in the GC-blocking protocol: it can park on a full
         // local socket buffer, same rationale as MulticastSocket's send in
@@ -13209,11 +13311,29 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             if fd < 0 {
                 return Err(ioex("DatagramSocket: closed"));
             }
-            let data_arr = match ctx.get_field(pkt, DP_DATA) {
+            let lay = dp_layout(ctx, pkt);
+            let data_arr = match ctx.get_field(pkt, lay.buf) {
                 Value::Object(Some(a)) => a,
                 _ => return Err(ioex("DatagramPacket: null data")),
             };
-            let cap = ctx.array_length(data_arr);
+            // JDK: fill `buf` from `offset`, for at most `bufLength` bytes.
+            // Both are absent from the synthetic layout, where this degrades to
+            // the whole array — today's behaviour.
+            let arr_len = ctx.array_length(data_arr);
+            let off = lay
+                .offset
+                .and_then(|s| ctx.get_field(pkt, s).as_int())
+                .unwrap_or(0)
+                .max(0) as usize;
+            let room = arr_len.saturating_sub(off);
+            let cap = match lay
+                .buf_length
+                .and_then(|s| ctx.get_field(pkt, s).as_int())
+                .filter(|n| *n > 0)
+            {
+                Some(n) => room.min(n as usize),
+                None => room,
+            };
             let mut buf = vec![0u8; cap];
             let timeout_ms = ds_get(this).timeout;
             let d = if timeout_ms > 0 {
@@ -13249,14 +13369,31 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 _ => data_arr,
             };
             let (n, origin) = recv_result.map_err(udp_recv_ex)?;
-            copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
-            ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
-            if let Some((oh, op)) = origin.rsplit_once(':') {
-                let port = op.parse::<i32>().unwrap_or(0);
+            copy_bytes_into_java_array(ctx, data_arr, off as i32, &buf[..n])?;
+            // Only `length` moves: `bufLength` is the buffer's capacity and
+            // `offset` the caller's write position, and the JDK's
+            // `setReceivedLength` leaves both alone.
+            ctx.set_field(pkt, lay.length, Value::Int(n as i32));
+            if let Some((oh, port)) = udp_origin_split(&origin) {
                 // The datagram's origin, as numeric text off the wire.
-                let ia = alloc_inet_address_unnamed(ctx, oh);
-                ctx.set_field(pkt, DP_ADDR, Value::Object(Some(ia)));
-                ctx.set_field(pkt, DP_PORT, Value::Int(port));
+                //
+                // `alloc_inet_address_unnamed` ALLOCATES — and on a cold VM its
+                // `populate_inet_holder` also loads and initialises
+                // `InetAddress$InetAddressHolder`, which reliably triggers a
+                // moving young collection (same hazard that function documents
+                // for itself). `pkt` therefore cannot be held as a bare local
+                // across it: the two writes below would land in a vacated
+                // from-space copy of the packet and the caller's `getAddress()`
+                // / `getPort()` would read the pre-receive values.
+                let mut scope = NativeHandleScope::new(ctx);
+                let pkt_h = scope.root(pkt);
+                let ia = alloc_inet_address_unnamed(&mut *scope, &oh);
+                let ia_h = scope.root(ia);
+                let pkt_cur = scope.get(&pkt_h);
+                let ia_cur = scope.get(&ia_h);
+                scope.set_field(pkt_cur, lay.address, Value::Object(Some(ia_cur)));
+                let pkt_cur = scope.get(&pkt_h);
+                scope.set_field(pkt_cur, lay.port, Value::Int(port));
             }
             Ok(None)
         },
@@ -13364,6 +13501,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 // specified to keep answering true even after the socket is
                 // closed.
                 ds_set(this, |sd| sd.connected = 1);
+                ds_set_peer(this, &host, port);
             }
         }
         Ok(None)
@@ -13379,6 +13517,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             let _ = _ctx.fd_table().udp_disconnect(fd as u32);
         }
         ds_set(this, |sd| sd.connected = 0);
+        ds_clear_peer(this);
         Ok(None)
     });
     // `isConnected()` had no registration at all, so it reached the abstract
@@ -13388,6 +13527,42 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(ds_get(this).connected)))
     });
+
+    // `getPort()` / `getInetAddress()` — the read-back half of `connect`, and
+    // the same missing-registration shape as `isConnected()` above.
+    //
+    // In a real-JDK build `java.net.DatagramSocket.getPort()` is
+    // `delegate().getPort()`, and `delegate()` throws
+    // `InternalError("Should not get here")` on a null `delegate` — which is
+    // every socket this registrar constructs, because its `<init>` intercepts
+    // never run the JDK constructor that would set one. So the answer was not
+    // "wrong port", it was a hard InternalError immediately after a `connect()`
+    // that had worked and an `isConnected()` that said so.
+    //
+    // `-1` / `null` for an unconnected socket is the JDK's specified answer.
+    r.register(ds, "getPort", "()I", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let port = match ds_peer(this) {
+            Some((_, port)) => port,
+            None => -1,
+        };
+        Ok(Some(Value::Int(port)))
+    });
+    r.register(
+        ds,
+        "getInetAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `ds_peer` releases the table lock before this allocates.
+            let host = match ds_peer(this) {
+                Some((host, _)) if !host.is_empty() => host,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let ia = alloc_inet_address_unnamed(ctx, &host);
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
 }
 
 // ===========================================================================

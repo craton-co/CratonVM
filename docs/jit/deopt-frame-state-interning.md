@@ -1,7 +1,7 @@
 # Immutable, interned frame states
 
 Scope: backlog step 16, *"Make frame states immutable and interned"*
-(`docs/known-issues/c2/deep-research-vm-c2.md`, P0/P1).
+(`docs/feature-designs/c2/deep-research-vm-c2.md`, P0/P1).
 
 Acceptance criterion:
 

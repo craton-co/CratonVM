@@ -1698,6 +1698,11 @@ pub(crate) fn is_forkjoin_native_override(
             | ("setRawResult", "(Ljava/lang/Object;)V")
             | ("isDone", "()Z")
             | ("isCompletedNormally", "()Z")
+            // Reads the same side-table done/cancelled/thrown bits as
+            // isCompletedNormally and getException, so the three cannot
+            // disagree. Must stay in step with
+            // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | ("isCompletedAbnormally", "()Z")
             | ("isCancelled", "()Z")
             | ("cancel", "(Z)Z")
             | ("complete", "(Ljava/lang/Object;)V")
@@ -1705,6 +1710,32 @@ pub(crate) fn is_forkjoin_native_override(
             // completed task, so it cannot disagree with join()/get() about
             // whether the task failed.
             | ("getException", "()Ljava/lang/Throwable;")
+            // W6-9: the WRITER for that record. Registered by
+            // `native-builtins/src/phases_early.rs`. Must stay in step with
+            // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | ("completeExceptionally", "(Ljava/lang/Throwable;)V")
+            // L12: the STATIC `invokeAll` overloads — the last real-bytecode
+            // route from the lazy `fork()` above to an `awaitDone()` that no
+            // worker thread can satisfy. Must stay in step with
+            // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | (
+                "invokeAll",
+                "(Ljava/util/concurrent/ForkJoinTask;Ljava/util/concurrent/ForkJoinTask;)V"
+            )
+            | ("invokeAll", "([Ljava/util/concurrent/ForkJoinTask;)V")
+            | ("invokeAll", "(Ljava/util/Collection;)Ljava/util/Collection;")
+            // W6-7: the `quietly*` family — the remaining real-bytecode routes
+            // into `doExec()` + `awaitDone()`, which no worker thread exists to
+            // satisfy. Registered by
+            // `native-builtins/src/phases_late/concurrent.rs::
+            // register_forkjointask_quietly_bridge`. Must stay in step with
+            // `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | ("quietlyJoin", "()V")
+            | ("quietlyInvoke", "()V")
+            | ("quietlyComplete", "()V")
+            | ("quietlyJoin", "(JLjava/util/concurrent/TimeUnit;)Z")
+            | ("quietlyJoinUninterruptibly", "(JLjava/util/concurrent/TimeUnit;)Z")
+            | ("quietlyJoinPoolInvokeAllTask", "(J)V")
     )
 }
 
@@ -3546,6 +3577,11 @@ pub(super) fn force_native_over_real_jdk_bytecode(
                 | "getDescriptor"
                 | "canUse"
                 | "addUses"
+                // `getResourceAsStream` has no real-JDK-viable body here: it
+                // routes through `BuiltinClassLoader.findResourceAsStream` /
+                // a `ModuleReader`, neither of which CratonVM models. The
+                // native lives in `jboss_jdkspecific::native_module_get_resource_as_stream`.
+                | "getResourceAsStream"
                 | "addExports"
                 | "addOpens"
                 | "implAddExports"
@@ -6996,7 +7032,7 @@ pub(super) fn resolve_step1_native(
     //   32/17 to 3/46, because the surviving bridges ARE the object model for
     //   large parts of `java.base` under strict mode. See
     //   `env_cache::jdk_only_enforce_shadow` for the numbers, and
-    //   `docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md`
+    //   `jdk-only-step1-bytecode-available-RESOLVED-20260806.md`
     //   for all five blocker families with their symptoms.
     let strict_bridge = policy.is_jdk_only() && kind == cratonvm_native_api::NativeKind::Bridge;
     let enforce = strict_bridge && crate::runtime::env_cache::jdk_only_enforce_shadow();
@@ -7101,8 +7137,32 @@ fn step1_dispatch_has_code(
     let Some(start) = dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name)) else {
         return false;
     };
-    crate::classloading::find_method_recursive(start, method_name, descriptor, &cm.class_store)
-        .is_some_and(|(method, _declaring_id)| method.code().is_some())
+    // Routed through `MemberResolver` rather than a bare
+    // `find_method_recursive`, which is what `runtime::resolve::guard`'s
+    // metadata-table gate asks of a NEW site: the allowlist is a migration
+    // ledger that only ever shrinks, so adding a row (and raising the
+    // interpreter's per-needle budget with it) would have inverted the ratchet
+    // this very decision is meant to respect.
+    //
+    // Same walk, same answer, and it populates the per-VM `LinkResolver` with
+    // the resolution the invoke about to happen will ask for anyway. `cm` is
+    // passed in, per `declared_method`'s contract, so the read guard this
+    // function already holds stays the lock the call site established.
+    //
+    // An unresolvable method is `false`, exactly as the bare walk's `None` was:
+    // no `Code` means the bridge keeps the call.
+    let resolver = crate::runtime::resolve::MemberResolver::new(shared);
+    let Ok(scoped) = resolver.declared_method(&cm, resolver.scope(start), method_name, descriptor)
+    else {
+        return false;
+    };
+    let Ok((declaring_id, index)) = resolver.adopt(scoped) else {
+        return false;
+    };
+    cm.class_store
+        .get(declaring_id)
+        .and_then(|declaring| declaring.methods.get(index as usize))
+        .is_some_and(|method| method.code().is_some())
 }
 
 /// Resolve the complete identity stored by a warmed native invoke target.

@@ -4855,10 +4855,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "copy",
         "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)Ljava/nio/file/Path;",
         |ctx, args| {
+            // Read the options FIRST: the probe re-enters Java, and a moving
+            // young GC there would relocate any `ObjectRef` already lifted out
+            // of `args` (the native stale-local family).
+            let replace_existing = copy_options_replace_existing(ctx, args.get(2));
             let src = obj_arg(args, 0)?;
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
+            // Without REPLACE_EXISTING, `Files.copy` onto an existing target
+            // must throw `FileAlreadyExistsException` — callers catch it BY
+            // TYPE, so a generic IOException will not do. `std::fs::copy`
+            // below overwrites unconditionally and the directory arm swallows
+            // `AlreadyExists`, so this is the only place the contract can be
+            // enforced. The sibling `Files.move` native already does exactly
+            // this with the same two helpers. Skip the check for jarfs-encoded
+            // targets (not real filesystem paths) and for a self-copy.
+            if !replace_existing
+                && src_path != dst_path
+                && jarfs_decode(&dst_path).is_none()
+                && std::fs::symlink_metadata(&dst_path).is_ok()
+            {
+                return Err(p57_file_already_exists(ctx, &dst_path));
+            }
             // Java `Files.copy(Path,Path,CopyOption...)`: copying a DIRECTORY
             // creates an (empty) directory at the target — it does NOT open the
             // source as a file. `std::fs::copy` only handles regular files and on
@@ -5395,6 +5414,39 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let nofollow =
                 matches!(args.get(3), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
             read_named_attributes(ctx, path_obj, &spec, nofollow)
+        },
+    );
+
+    // `FileSystemProvider.setAttribute(Path, String, Object, LinkOption...)` —
+    // the write-side twin of the reader above, missing for exactly the same
+    // reason and left behind when that one was added.
+    //
+    // `Files.setAttribute` is how everything name-keyed writes: H2's
+    // `FilePathDisk.setReadOnly` takes this branch whenever the FileStore
+    // reports DOS rather than POSIX attributes (i.e. on Windows), which made
+    // `org.h2.test.unit.TestFileSystem` die at `testSetReadOnly` on EVERY
+    // filesystem prefix it exercises. It is not a Windows defect: the Linux
+    // witness fails identically, H2 just reaches
+    // `Files.setPosixFilePermissions` there instead.
+    //
+    // Args: `[this, path, attribute, value, options]`.
+    r.register(
+        fsp,
+        "setAttribute",
+        "(Ljava/nio/file/Path;Ljava/lang/String;Ljava/lang/Object;[Ljava/nio/file/LinkOption;)V",
+        |ctx, args| {
+            let path_obj = obj_arg(args, 1)?;
+            let spec = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let value = match args.get(3) {
+                Some(Value::Object(v)) => *v,
+                _ => None,
+            };
+            let nofollow =
+                matches!(args.get(4), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
+            write_named_attribute(ctx, path_obj, &spec, value, nofollow)
         },
     );
 
@@ -9797,6 +9849,17 @@ pub(crate) fn p57_visit_options_follow_links(
     // nothing else needs asking.
     if ctx.array_length(o) > 0 {
         return true;
+    }
+    // An EMPTY array is javac's zero-arg varargs form: no options were passed,
+    // so the answer is `false` and there is nothing to ask. Settle it here
+    // rather than falling through to the `isEmpty` probe below — a reference
+    // array reports its COMPONENT class by name (`registry.rs:2369-2376`), so
+    // that probe resolved `java/nio/file/FileVisitOption.isEmpty()Z` against
+    // the enum and logged a spurious `NoSuchMethodError` WARN on every
+    // `Files.walk(p)` / `deleteTree`. The verdict was already correct (the
+    // `_ => false` arm); only the noise was new.
+    if ctx.object_is_array(o) {
+        return false;
     }
     // Either an EMPTY array or the Set form
     // (`Files.walkFileTree(path, Set<FileVisitOption>, ...)`). Asking a Set is
@@ -15480,6 +15543,222 @@ fn posix_permission_set(ctx: &mut dyn NativeContext, mode: i32) -> Option<Object
     Some(set)
 }
 
+/// What `setAttribute` does with one attribute name.
+///
+/// Split out of [`write_named_attribute`] so the classification can be asserted
+/// against [`attribute_names_for_view`] in a unit test: that table is what the
+/// reader answers, and a name added there without a verdict here is exactly how
+/// "`readAttributes` returned it but writing it says it does not exist" appears.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AttributeWrite {
+    /// One of the three `FileTime` fields.
+    Time,
+    /// A DOS boolean flag.
+    DosFlag,
+    /// A POSIX permission set (`posix:permissions`).
+    Permissions,
+    /// A raw `unix:mode` int.
+    Mode,
+    /// Writable in the real JDK; not implemented here, and refused loudly.
+    Unimplemented,
+    /// The reader answers it, but the JDK lets nobody write it.
+    NotWritable,
+}
+
+pub(crate) fn attribute_write_kind(name: &str) -> AttributeWrite {
+    match name {
+        "lastModifiedTime" | "lastAccessTime" | "creationTime" => AttributeWrite::Time,
+        "readonly" | "hidden" | "archive" | "system" => AttributeWrite::DosFlag,
+        "permissions" => AttributeWrite::Permissions,
+        "mode" => AttributeWrite::Mode,
+        "owner" | "group" | "uid" | "gid" => AttributeWrite::Unimplemented,
+        _ => AttributeWrite::NotWritable,
+    }
+}
+
+/// The write side of `Files.setAttribute(path, "view:name", value)`.
+///
+/// Screened against exactly the same view/name tables as
+/// [`read_named_attributes`], so the two can never disagree about what a view
+/// contains — asking for a name the reader answers and being told it does not
+/// exist is the confusing half of that class of bug.
+///
+/// The writes themselves delegate: the DOS flags go through the very
+/// `dos_view_set_*` natives `getFileAttributeView(path, DosFileAttributeView)`
+/// hands out, and the times/permissions go through the same path-level helpers
+/// those views use. Nothing about the filesystem is reimplemented here, so a
+/// later fix to any of them reaches this entry point too.
+///
+/// Names that exist but are read-only (`size`, `isDirectory`, `fileKey`, …)
+/// raise `IllegalArgumentException` with the JDK's own wording. Names that are
+/// writable in the real JDK but not implemented here (`owner`, `group`, `uid`,
+/// `gid`) raise `UnsupportedOperationException` rather than silently doing
+/// nothing — a `setAttribute` that returns normally and changes nothing is the
+/// failure mode that made Gradle believe it had marked a cache directory
+/// read-only.
+pub(crate) fn write_named_attribute(
+    ctx: &mut dyn NativeContext,
+    path_obj: ObjectRef,
+    spec: &str,
+    value: Option<ObjectRef>,
+    nofollow: bool,
+) -> MethodCallResult {
+    let (view, name) = split_attribute_spec(spec);
+    let Some(known) = attribute_names_for_view(view) else {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    };
+    if !supported_attribute_view_names().contains(&view) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("View '{view}' not available"),
+        }
+        .into());
+    }
+    if name.is_empty() || !known.iter().any(|k| *k == name) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("'{view}:{name}' is not a recognized attribute"),
+        }
+        .into());
+    }
+
+    let path = p57_read_path(ctx, path_obj);
+
+    // Every write below follows symlinks. Rather than silently write through a
+    // link the caller asked us not to follow, refuse — the call sites that
+    // matter never pass NOFOLLOW_LINKS, and a wrong target is worse than a
+    // refusal.
+    if nofollow
+        && std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: format!("setAttribute('{spec}'): NOFOLLOW_LINKS on a symbolic link"),
+        }
+        .into());
+    }
+
+    match attribute_write_kind(name) {
+        AttributeWrite::Time => {
+            let Some(ft) = value else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(format!("setAttribute('{spec}'): null FileTime")),
+                }
+                .into());
+            };
+            let millis = filetime_read_millis(ctx, ft);
+            let (creation, access, modified) = match name {
+                "creationTime" => (Some(millis), None, None),
+                "lastAccessTime" => (None, Some(millis), None),
+                _ => (None, None, Some(millis)),
+            };
+            set_file_attribute_times(&path, creation, access, modified)
+                .map_err(|error| p57_io_error(&error))?;
+            Ok(None)
+        }
+        AttributeWrite::DosFlag => {
+            let on = boolean_attribute_value(ctx, spec, value)?;
+            // Build the one-field synthetic view the `dos_view_set_*` natives
+            // read their path out of — the same shape `getFileAttributeView`
+            // hands to Java callers. Pin the Path across the allocation: a
+            // moving young GC there would relocate it out from under us.
+            let path_pin = ctx.pin_native_root(path_obj);
+            let view_obj =
+                alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributeView", 1);
+            let path_obj = ctx.read_native_pin(path_pin, path_obj);
+            ctx.set_field(view_obj, 0, Value::Object(Some(path_obj)));
+            ctx.unpin_native_roots(path_pin);
+            let view_args = [
+                Value::Object(Some(view_obj)),
+                Value::Int(if on { 1 } else { 0 }),
+            ];
+            match name {
+                "readonly" => dos_view_set_read_only(ctx, &view_args),
+                "hidden" => dos_view_set_hidden(ctx, &view_args),
+                "archive" => dos_view_set_archive(ctx, &view_args),
+                _ => dos_view_set_system(ctx, &view_args),
+            }
+        }
+        AttributeWrite::Permissions => {
+            let Some(set) = value else {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some(format!("setAttribute('{spec}'): null permission set")),
+                }
+                .into());
+            };
+            let mode = posix_permission_bits_from_set(ctx, set);
+            set_file_mode(&path, mode)
+        }
+        AttributeWrite::Mode => {
+            let mode = int_attribute_value(ctx, spec, value)?;
+            set_file_mode(&path, (mode as u32) & 0o7777)
+        }
+        AttributeWrite::Unimplemented => Err(RuntimeError::UnsupportedOperationException {
+            message: format!("setAttribute('{spec}') is not implemented"),
+        }
+        .into()),
+        // A name the reader answers but the JDK does not let anyone write.
+        AttributeWrite::NotWritable => Err(RuntimeError::IllegalArgumentException {
+            message: format!("'{view}:{name}' is not a recognized attribute"),
+        }
+        .into()),
+    }
+}
+
+/// chmod for the POSIX/unix write paths. A no-op refusal on a host without
+/// POSIX modes, rather than a silent success.
+fn set_file_mode(path: &str, mode: u32) -> MethodCallResult {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| p57_io_error(&error))?;
+        Ok(None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        Err(RuntimeError::UnsupportedOperationException {
+            message: "POSIX file modes are not supported on this host".to_string(),
+        }
+        .into())
+    }
+}
+
+/// Unbox the `Object` value of a boolean-valued attribute. The JDK casts, so a
+/// wrong type is a `ClassCastException` there and here.
+fn boolean_attribute_value(
+    ctx: &mut dyn NativeContext,
+    spec: &str,
+    value: Option<ObjectRef>,
+) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
+    match value.map(|v| crate::lang_class::unbox_value(ctx, v)) {
+        Some(Value::Int(i)) => Ok(i != 0),
+        Some(_) | None => Err(RuntimeError::ClassCastException {
+            message: format!("setAttribute('{spec}'): value is not a Boolean"),
+        }
+        .into()),
+    }
+}
+
+/// Unbox the `Object` value of an int-valued attribute (`unix:mode`).
+fn int_attribute_value(
+    ctx: &mut dyn NativeContext,
+    spec: &str,
+    value: Option<ObjectRef>,
+) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
+    match value.map(|v| crate::lang_class::unbox_value(ctx, v)) {
+        Some(Value::Int(i)) => Ok(i),
+        Some(Value::Long(l)) => Ok(l as i32),
+        Some(_) | None => Err(RuntimeError::ClassCastException {
+            message: format!("setAttribute('{spec}'): value is not an Integer"),
+        }
+        .into()),
+    }
+}
+
 /// Read `path`'s attributes named by `spec` into a `java.util.HashMap`.
 ///
 /// This is the whole of `Files.readAttributes(Path, String, LinkOption...)`,
@@ -15661,7 +15940,10 @@ pub(crate) fn read_named_attributes(
 
 #[cfg(test)]
 mod named_attribute_tests {
-    use super::{attribute_names_for_view, split_attribute_spec, supported_attribute_view_names};
+    use super::{
+        attribute_names_for_view, attribute_write_kind, split_attribute_spec,
+        supported_attribute_view_names, AttributeWrite,
+    };
 
     /// `Files` treats a spec with no colon as the `basic` view. Getting this
     /// wrong turns `readAttributes(p, "size")` into a request for a view named
@@ -15709,6 +15991,79 @@ mod named_attribute_tests {
                 assert!(
                     names.contains(b),
                     "view `{view}` is missing basic attribute `{b}`"
+                );
+            }
+        }
+    }
+
+    /// `setAttribute` and `readAttributes` must agree about what a view holds.
+    /// Every name the reader answers gets a verdict from the writer — the
+    /// default arm makes that trivially true, so what this really pins is WHICH
+    /// verdict, i.e. that a name added to the reader's table is not silently
+    /// classified writable (a write that lands somewhere unintended) or
+    /// silently refused (a name `readAttributes` returns that `setAttribute`
+    /// claims does not exist).
+    #[test]
+    fn the_writable_attributes_are_the_ones_the_jdk_lets_you_write() {
+        for name in ["lastModifiedTime", "lastAccessTime", "creationTime"] {
+            assert_eq!(attribute_write_kind(name), AttributeWrite::Time, "{name}");
+        }
+        for name in ["readonly", "hidden", "archive", "system"] {
+            assert_eq!(attribute_write_kind(name), AttributeWrite::DosFlag, "{name}");
+        }
+        assert_eq!(
+            attribute_write_kind("permissions"),
+            AttributeWrite::Permissions
+        );
+        assert_eq!(attribute_write_kind("mode"), AttributeWrite::Mode);
+        for name in ["owner", "group", "uid", "gid"] {
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::Unimplemented,
+                "{name}"
+            );
+        }
+        // Read-only in the JDK: the basic attribute view's `setAttribute`
+        // throws for every one of these.
+        for name in [
+            "size",
+            "isRegularFile",
+            "isDirectory",
+            "isSymbolicLink",
+            "isOther",
+            "fileKey",
+            "ino",
+            "dev",
+            "rdev",
+            "nlink",
+            "ctime",
+        ] {
+            assert_eq!(
+                attribute_write_kind(name),
+                AttributeWrite::NotWritable,
+                "{name} must not be writable"
+            );
+        }
+
+        // And every name any advertised view answers is covered by one of the
+        // arms above — no name reaches the writer unclassified.
+        for view in supported_attribute_view_names() {
+            let Some(names) = attribute_names_for_view(view) else {
+                continue;
+            };
+            for name in names {
+                let kind = attribute_write_kind(name);
+                assert!(
+                    matches!(
+                        kind,
+                        AttributeWrite::Time
+                            | AttributeWrite::DosFlag
+                            | AttributeWrite::Permissions
+                            | AttributeWrite::Mode
+                            | AttributeWrite::Unimplemented
+                            | AttributeWrite::NotWritable
+                    ),
+                    "`{view}:{name}` has no write verdict"
                 );
             }
         }
@@ -16276,10 +16631,8 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
             // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let enum_obj = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            ctx.set_field(enum_obj, 0, Value::Object(Some(arr)));
-            ctx.set_field(enum_obj, 1, Value::Int(0));
+            let enum_obj = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
             Ok(Some(Value::Object(Some(enum_obj))))
         },
     );

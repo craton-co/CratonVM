@@ -1772,9 +1772,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             _ => None,
         };
         let arr = cratonvm_native_collections::native_map_keys_as_array(ctx, map);
-        let enm = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-        ctx.set_field(enm, 0, Value::Object(Some(arr)));
-        ctx.set_field(enm, 1, Value::Int(0));
+        let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
         Ok(Some(Value::Object(Some(enm))))
     });
     // keySet() — newer (Java 9+) accessor with the same role as getKeys().

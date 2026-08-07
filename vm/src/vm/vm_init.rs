@@ -979,7 +979,41 @@ impl SharedVm {
         // `RUST_LOG`. Keep these three spans intact: a regression here is
         // otherwise invisible until someone notices the VM "feels slow".
         let __boot_t0 = std::time::Instant::now();
-        let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &config.classpath);
+        // JPMS `--module-path` / `--add-modules`. Both were parsed by the
+        // launcher into `VmConfig` (vm-cli/src/main.rs:3428/3449) and then read
+        // by NOBODY — the same "parsed then ignored" shape already recorded for
+        // `--add-opens`. Resolve the selected modules here, put each root on the
+        // APPLICATION search path (HotSpot also defines module-path classes to
+        // the application loader), and re-register the descriptors as EXPLICIT
+        // modules: `ClassManager::new`'s app-class-path scan would otherwise
+        // stamp them `automatic = true`, which short-circuits every exports /
+        // opens check to "allow" and defeats the point of a module path.
+        // Empty `module_path` => empty vec, no filesystem probing: a plain `-cp`
+        // launch pays nothing.
+        let resolved_modules = crate::classloading::module::resolve_module_path(
+            &config.module_path,
+            &config.add_modules,
+        );
+        let mut app_cp: Vec<String> = config.classpath.clone();
+        app_cp.extend(resolved_modules.iter().map(|m| m.root.clone()));
+        let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &app_cp);
+        if !resolved_modules.is_empty() {
+            for m in &resolved_modules {
+                class_manager
+                    .module_registry
+                    .register(m.descriptor.clone(), m.packages.clone());
+            }
+            class_manager.module_registry.build_readability_graph();
+            tracing::info!(
+                "module path: resolved {} module(s) from {} entry/entries: {:?}",
+                resolved_modules.len(),
+                config.module_path.len(),
+                resolved_modules
+                    .iter()
+                    .map(|m| m.descriptor.name.as_str())
+                    .collect::<Vec<_>>(),
+            );
+        }
         // ── Class-origin policy, installed before the first question ───────
         //
         // This is the *very next statement* after construction on purpose, and
@@ -5658,7 +5692,7 @@ pub struct JdkOnlyRefusalCounts {
     /// policy did NOT stop, and it is here rather than in `counts` because it
     /// is the same event class as its siblings measured on the other side.
     ///
-    /// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement turns
+    /// Zero when `CRATONVM_ENFORCE_NATIVE_SHADOW` is set: enforcement turns
     /// each of these into an `interpreter_bytecode_preferred` instead. Distinct
     /// triples appear in sink 2 tagged `bridge-ran-over-bytecode`. It is
     /// deliberately excluded from [`Self::total`], which counts refusals.
@@ -8537,8 +8571,8 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
                 HprofObjectInfo {
                     object_id: ptr as u64,
                     class_id: header.class_id.as_u32(),
-                    is_array: header.kind == ObjectKind::Array,
-                    element_type: header.element_type as u8,
+                    is_array: header.kind() == ObjectKind::Array,
+                    element_type: header.element_type() as u8,
                     array_length: header.array_length(),
                     total_size: size,
                     data_ptr: ptr as *const u8,

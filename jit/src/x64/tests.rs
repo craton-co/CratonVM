@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::JitInvokeInfo;
-use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value, ARRAY_DATA_OFFSET};
 
 #[test]
 fn gc_inert_selfrec_accepts_forward_field_walk_and_rejects_gc_edges() {
@@ -4279,11 +4279,11 @@ fn calls_to(compiled: &CompiledMethod, target: usize) -> usize {
 fn fake_compact_young_object() -> Box<[u64; 8]> {
     let mut o = Box::new([0u64; 8]);
     // SAFETY: `o` is 64 bytes and 8-byte aligned (a `[u64; 8]`); both
-    // writes land inside it — `GC_FLAGS_OFFSET` is 7 and
+    // writes land inside it — `GC_FLAGS_BYTE_OFFSET` is 7 and
     // `NUM_SLOTS_OFFSET` is 12, and the reference cell is [32, 40).
     unsafe {
         let p = o.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
-        *p.add(cratonvm_types::GC_FLAGS_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
         std::ptr::write_unaligned(
             p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32, // Cast: header field
             4u32,
@@ -4509,7 +4509,7 @@ fn inline_ref_putfield_fast_path_is_gated_on_published_region_bounds() {
     // `gc_flags` header byte.
     unsafe {
         let p = obj.as_mut_ptr() as *mut u8; // Cast: array base → byte cursor
-        *p.add(cratonvm_types::GC_FLAGS_OFFSET) =
+        *p.add(cratonvm_types::GC_FLAGS_BYTE_OFFSET) =
             cratonvm_types::GC_FLAG_COMPACT | cratonvm_types::GC_FLAG_OLD_GEN;
     }
     CALLS.store(0, Ordering::SeqCst);
@@ -5738,7 +5738,7 @@ fn bulk_zero_byte_fill_executes_range_and_skips_empty_null_range() {
     // plus eight data bytes.
     unsafe {
         (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
-        std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 7, byte_len);
     }
 
     // SAFETY: the compiled method receives a correctly laid out live array.
@@ -5749,7 +5749,7 @@ fn bulk_zero_byte_fill_executes_range_and_skips_empty_null_range() {
     };
     assert_eq!(result, 6);
     // SAFETY: the eight-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     assert_eq!(data, &[7, 7, 0, 0, 0, 0, 7, 7]);
 
     // An empty range does not dereference the array, even when it is null.
@@ -5850,7 +5850,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     };
     assert_eq!(result, 9);
     // SAFETY: the eight-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
 
     // A bound beyond the array conservatively takes the scalar path. This
@@ -5858,7 +5858,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     // completes normally and demonstrates that guard failure preserves
     // the bytecode's exact store sequence.
     unsafe {
-        std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 0, byte_len);
+        std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 0, byte_len);
     }
     // SAFETY: the array is live and every reached strided index is valid.
     let conservative = unsafe {
@@ -5868,7 +5868,7 @@ fn detects_and_executes_canonical_strided_byte_set_loop() {
     };
     assert_eq!(conservative, 9);
     // SAFETY: the eight-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     assert_eq!(data, &[0, 1, 0, 1, 0, 1, 0, 1]);
 
     // Empty ranges retain Java's condition-before-array-access behavior.
@@ -5949,7 +5949,7 @@ fn detects_and_executes_canonical_byte_sieve_loop_nest() {
     // SAFETY: `words` is aligned and contains the VM header plus data.
     unsafe {
         (array_ptr.add(ARRAY_LENGTH_OFFSET) as *mut i32).write_unaligned(byte_len as i32);
-        std::ptr::write_bytes(array_ptr.add(HEADER_SIZE), 7, byte_len);
+        std::ptr::write_bytes(array_ptr.add(ARRAY_DATA_OFFSET), 7, byte_len);
     }
     // SAFETY: the compiled method receives a correctly laid out live array.
     let count = unsafe {
@@ -5959,7 +5959,7 @@ fn detects_and_executes_canonical_byte_sieve_loop_nest() {
     };
     assert_eq!(count, 11);
     // SAFETY: the 32-byte data region is within `words`.
-    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(HEADER_SIZE), byte_len) };
+    let data = unsafe { std::slice::from_raw_parts(array_ptr.add(ARRAY_DATA_OFFSET), byte_len) };
     for prime in [2usize, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31] {
         assert_eq!(data[prime], 0, "{prime} must remain prime");
     }
@@ -11270,6 +11270,130 @@ fn compile_with_direct_call(
         HashMap::new(),
         None, // string_layout
     )
+}
+
+// -----------------------------------------------------------------------
+// Regression: fixed-suite-bugs/tomcat/
+//             ecj-operandstack-corruption-jsp-compilation-500s-FIXED.md
+// -----------------------------------------------------------------------
+//
+// A direct-call site that ALSO carries `invoke_info` reserves a cold-deopt
+// copy of the arguments through `reserve_direct_call_service_slots`. That
+// reservation has to sit ABOVE the argument slots `pop_stack` just handed
+// back (they are still live sources for `emit_stack_arg_setup`), so it moves
+// `next_spill_offset` past them — and the call's return value used to be
+// pushed from there, one operand-stack slot per argument too deep.
+//
+// The shift is invisible inside a basic block: the linear walk keeps writing
+// and reading the same shifted slots. It becomes wrong code at the first
+// branch target after the call, whose depth is re-established from the
+// bytecode — writer and reader then address different slots. Measured on
+// ECJ's `OperandStack.pop(OperandCategory)`, whose `if_icmpeq` sits on a
+// tableswitch merge and so compared `TypeBinding.id` against the expected
+// category instead of `TypeIds.getCategory(id)`: every JSP compiled after
+// that method tiered up threw `AssertionError: Unexpected operand at stack
+// top`, surfacing as an HTTP 500 from Jasper.
+
+/// A one-reference-arg callee returning a reference, direct-callable.
+/// `entry` is never executed — only emitted as the CALL target.
+fn direct_callee_ref() -> crate::JitDirectCall {
+    crate::JitDirectCall {
+        entry: 0x1000,
+        needs_context: false,
+        num_params: 1,
+        return_type: b'L',
+        guard_class_id: 0,
+    }
+}
+
+///     0: aload_0
+///     1: invokestatic #1   <- direct-callable, returns a reference
+///     4: invokestatic #2   <- helper dispatch: a safepoint with the pc-1
+///                             result live on the operand stack
+///     7: areturn
+const DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT: [u8; 8] =
+    [0x2a, 0xb8, 0x00, 0x01, 0xb8, 0x00, 0x02, 0xb0];
+
+/// Compile the shape above and return the oop-map frame slots recorded at the
+/// pc-4 safepoint — i.e. where the pc-1 call parked its reference result.
+/// `service_info_at_pc1` decides whether the direct-call site also carries
+/// `invoke_info`, which is what makes it reserve the service-argument range.
+fn direct_call_result_slots_at_pc4(service_info_at_pc1: bool) -> Vec<i16> {
+    // LEAK(intentional): compiled code stores raw pointers to these, so they
+    // must outlive it; the test process owns them for its (short) lifetime.
+    let sink = Box::leak(Box::new(JitInvokeInfo {
+        class_name: "T",
+        method_name: "sink",
+        descriptor: "()V",
+        num_jit_args: 0,
+        return_type: b'V',
+        invoke_kind: 3,
+        declaring_class_id: 0,
+    }));
+    let mut invoke_info: Vec<(usize, *const JitInvokeInfo)> =
+        vec![(4usize, sink as *const JitInvokeInfo)];
+    if service_info_at_pc1 {
+        let callee = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "T",
+            method_name: "f",
+            descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;",
+            num_jit_args: 1,
+            return_type: b'L',
+            invoke_kind: 3,
+            declaring_class_id: 0,
+        }));
+        invoke_info.push((1usize, callee as *const JitInvokeInfo));
+    }
+    let compiled = compile(
+        &DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT,
+        DIRECT_CALL_RESULT_LIVE_AT_SAFEPOINT.len(),
+        1,
+        1,
+        true,
+        Vec::new(), // multianewarray_info
+        Vec::new(), // field_info
+        Vec::new(), // typecheck_info
+        Vec::new(), // static_field_info
+        Vec::new(), // new_info
+        Vec::new(), // anewarray_info
+        invoke_info,
+        vec![(1usize, direct_callee_ref())],
+        Vec::new(), // mic_slots
+        Vec::new(), // pic_slots
+        Vec::new(), // ldc_info
+        Vec::new(), // ldc2w_info
+        HashMap::new(),
+        HashMap::new(),
+        &test_helpers(),
+        std::collections::HashSet::new(),
+        HashMap::new(),
+        None, // string_layout
+    )
+    .expect("direct call followed by a dispatched call must compile");
+    let mut slots = compiled
+        .oop_maps
+        .iter()
+        .find(|m| m.bytecode_pc == 4)
+        .map(|m| m.frame_slot_offsets.clone())
+        .unwrap_or_default();
+    slots.sort_unstable();
+    slots
+}
+
+/// The return value's operand-stack depth must not depend on whether the site
+/// reserved a service-argument range.
+#[test]
+fn direct_call_result_slot_is_independent_of_service_arg_reservation() {
+    let plain = direct_call_result_slots_at_pc4(false);
+    let with_service_copy = direct_call_result_slots_at_pc4(true);
+    assert!(
+        !plain.is_empty(),
+        "the pc-1 reference result must be a mapped live oop at the pc-4 safepoint"
+    );
+    assert_eq!(
+        with_service_copy, plain,
+        "the service-argument reservation moved the return value off its          operand-stack depth: the linear walk and every branch target after          this call now disagree about which slot holds it"
+    );
 }
 
 fn compile_switch_method(code: &[u8], code_len: usize) -> Option<CompiledMethod> {

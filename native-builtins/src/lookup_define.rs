@@ -270,21 +270,85 @@ fn resolve_lookup_supertypes(
 /// only the public `NativeContext` surface so this module stays
 /// independent of `classloader.rs`.
 fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> ObjectRef {
-    // Synthetic Lookup is a 4-field allocation:
-    //   slot 0: lookupClass (Class mirror)
-    //   slot 1: allowedModes (int)
-    //   slot 2: previousLookupClass (Class mirror | null)
-    //   slot 3: lookupMode (int — duplicate, kept for layout parity)
-    //
     // FULL_POWER = PUBLIC | PRIVATE | PROTECTED | PACKAGE | MODULE | ORIGINAL
     //            = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40
     //            = 0x5F
+    // (Measured on JDK 25: `MethodHandles.lookup().lookupModes()` == 95.)
     const LK_FULL_POWER: i32 = 0x5F;
+    //
+    // TWO LAYOUTS share this allocation, and they do NOT agree past slot 0:
+    //
+    //   synthetic `MethodHandles$Lookup` (4 fields)
+    //     0 lookupClass (ref) | 1 allowedModes (int)
+    //     2 previousLookupClass (ref) | 3 lookupMode (int, duplicate)
+    //
+    //   real JDK 25 `java.lang.invoke.MethodHandles$Lookup`
+    //   (`javap -p java.lang.invoke.MethodHandles$Lookup`, instance fields in
+    //    declaration order)
+    //     0 lookupClass (ref) | 1 prevLookupClass (ref)
+    //     2 allowedModes (int) | 3 cachedProtectionDomain (ref)
+    //
+    // Writing slots 1/2/3 BY INDEX therefore type-confused the real layout:
+    // `Int(0x5F)` landed in the `prevLookupClass` REFERENCE slot, a null ref
+    // landed in `allowedModes` (which then reads back as 0 — "no access at
+    // all" in the JDK), and another `Int(0x5F)` landed in the
+    // `cachedProtectionDomain` reference slot. The failure was silent: the
+    // only consequence was a Lookup that reports zero modes, which every
+    // access check reads as powerless.
+    //
+    // Write by NAME on the real layout; keep the index writes as the
+    // synthetic-only fallback. The discriminator is the wave-3 one: an ABSENT
+    // field answers `Int(0)` from `get_field_by_name`, so a `Value::Object`
+    // answer for `prevLookupClass` means the real JDK class is what we
+    // allocated.
+    //
+    // W6-3 hardening, two additions:
+    //
+    //  1. A POSITIVE class-side witness. `resolve_field_index_by_class_id` asks
+    //     the CLASS whether it declares the field, so unlike the value-shape
+    //     test it does not have to distinguish "absent" (`Int(0)`) from "a real
+    //     reference field that is currently null" (`Object(None)`) — the two
+    //     answers a fresh object of either layout can give. A fabricated stub
+    //     names its fields `_f0.._fN`, so this misses there and the synthetic
+    //     arm still runs; the old value-shape test is kept as a disjunct so
+    //     this is a strict superset of the previous condition.
+    //
+    //  2. The by-name write is VERIFIED. Pinning only the positive half is what
+    //     made the original bug invisible: a `Lookup` whose `allowedModes` never
+    //     received the value reads back 0 — "no access at all" — and throws
+    //     nothing. If the named write did not land, fall through to the
+    //     synthetic indices rather than returning a powerless Lookup.
     let obj = crate::alloc_concurrent_synthetic(ctx, LK_CLASS, 4);
-    ctx.set_field(obj, 0, Value::Object(Some(lookup_mirror)));
-    ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
-    ctx.set_field(obj, 2, Value::Object(None));
-    ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+    // Slot 0 is `lookupClass` in BOTH layouts.
+    ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(lookup_mirror)));
+    ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(lookup_mirror)));
+    let real_layout = {
+        let cid = ctx.class_id_of_object(obj);
+        ctx.resolve_field_index_by_class_id(cid, "prevLookupClass")
+            .is_some()
+            || matches!(
+                ctx.get_field_by_name(obj, "prevLookupClass"),
+                Value::Object(_)
+            )
+    };
+    if real_layout {
+        ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
+        ctx.set_field_by_name(obj, "allowedModes", Value::Int(LK_FULL_POWER));
+        // `cachedProtectionDomain` (real slot 3) is deliberately NOT written.
+        // It is a lazy `volatile ProtectionDomain` cache that
+        // `Lookup.lookupClassProtectionDomain()` fills on first use, so null is
+        // its correct fresh value. The old index write put `Int(0x5F)` into that
+        // REFERENCE slot — an integer the GC would have scanned as an oop.
+    }
+    // Negative half: a named write that silently did not land leaves a Lookup
+    // reporting zero modes. Re-assert on the synthetic indices in that case.
+    let modes_landed =
+        matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == LK_FULL_POWER);
+    if !modes_landed {
+        ctx.set_field(obj, 1, Value::Int(LK_FULL_POWER));
+        ctx.set_field(obj, 2, Value::Object(None));
+        ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
+    }
     obj
 }
 
@@ -377,6 +441,28 @@ fn lk_define_class_b(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // The hidden class is named "<original>/0x<id>" so multiple defines
 // from the same template get distinct synthetic names.
 
+/// The base name a hidden class's mangled name is built from.
+///
+/// HotSpot names a hidden class `<this_class>/0x<addr>`, where `this_class` is
+/// the name in the SUPPLIED BYTES — not the lookup class's name. Deriving it
+/// from the lookup class produced `RJdkHidden/0x1` for a `RJdkHidden$Payload`
+/// class file defined through a lookup on `RJdkHidden`, failing
+/// `RJdkHidden.java:97`'s `getName().startsWith("RJdkHidden$Payload/0x")`.
+/// `classloader.rs:8140` already does this correctly via `extract_this_class_name`.
+/// Falls back to the lookup class name, then to a constant, so bytes this
+/// reader cannot parse still get a unique name from the counter suffix.
+fn hidden_class_base_name(class_bytes: &[u8], lookup_name: Option<&str>) -> String {
+    if let Ok(class_file) = cratonvm_reader::read_class(class_bytes) {
+        let this_class = class_file.this_class.to_string();
+        if !this_class.is_empty() {
+            return this_class;
+        }
+    }
+    lookup_name
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "HiddenClass".to_string())
+}
+
 fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this_lookup = obj_arg(args, 0)?;
     let class_bytes = decode_byte_array(ctx, args.get(1), "defineHiddenClass")?;
@@ -392,10 +478,17 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // class's NEST (JEP 371). The correct nest-host name is the lookup
     // class's *own* nest-host attribute when the lookup is itself a
     // nested class, OR the lookup class's name when the lookup IS its
-    // own nest host. Without NESTMATE, leave `nest_host_class_name`
-    // unset so the class file's NestHost attribute (if any) — or
-    // self-nest — applies via the resolution chain in
-    // `class_manager.rs:1675-1678`.
+    // own nest host.
+    //
+    // W3-2: without NESTMATE we leave `nest_host_class_name` unset, and
+    // `None` here means SELF-NEST, not "fall back to the class file's
+    // NestHost attribute". Those bytes routinely carry one — javac emits
+    // `NestHost` for every nested class, and re-defining an
+    // already-compiled nested class as a hidden class is the normal way to
+    // reach this path — but the caller did not ask to join that nest.
+    // `class_manager::hidden_class_drops_class_file_nest_host` enforces the
+    // distinction for every producer of `hidden: true`, so this stays a
+    // plain `None`.
     let lookup_name = lookup_class_name(ctx, this_lookup);
     let nest_host_class_name = if nestmate {
         resolve_lookup_nest_host(ctx, this_lookup, lookup_name.clone())
@@ -411,15 +504,14 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let loader_id = inherit_lookup_loader(ctx, this_lookup);
     let (superclass_id_override, interface_id_overrides) =
         resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
-    // Keep the original name for the mangled hidden-class label.
+    // Keep the lookup class name only as the FALLBACK label.
     let nest_host_class_name_for_label = lookup_name;
 
-    // Mint a unique mangled name. The class file's own `this_class` may
-    // hold a placeholder; we pass `override_name` so the backend stamps
-    // the new name into the class metadata.
-    let original = nest_host_class_name_for_label
-        .clone()
-        .unwrap_or_else(|| "HiddenClass".to_string());
+    // Mint a unique mangled name from the class file's own `this_class` (the
+    // name HotSpot uses); we pass `override_name` so the backend stamps the
+    // mangled name into the class metadata.
+    let original =
+        hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 
@@ -465,10 +557,69 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // WP8.11.5 helpers — ClassOption[] parsing and nest-host resolution.
 // ---------------------------------------------------------------------------
 
+/// `MethodHandles.Lookup.ClassOption.NESTMATE.flag` — JEP 371's
+/// `NESTMATE_CLASS`. Kept in sync with `classloader.rs`'s
+/// `DEFINE_CLASS0_FLAG_NESTMATE` (that one is private to its module).
+const CLASS_OPTION_FLAG_NESTMATE: i32 = 0x01;
+
+/// Is this `MethodHandles$Lookup$ClassOption` the `NESTMATE` constant?
+///
+/// # Two layouts, and why reading slot 0 is not enough
+///
+/// Under `synthetic-jdk` a `ClassOption` is a bare synthetic mirror whose
+/// field 0 holds the enum ORDINAL directly (`NESTMATE = 0`, `STRONG = 1`) —
+/// the convention `classloader.rs::lk_define_hidden_class` documents.
+///
+/// Under `--real-jdk` the array elements are REAL JDK enum constants, and
+/// this native is deliberately registered for that mode too
+/// (`reflect_annotations.rs`, so the real `Lookup.defineClass` bytecode does
+/// not descend into `defineClass1` with a 0-length byte view). A real
+/// constant is a `java.lang.Enum` subclass instance, so its slot 0 is
+/// `Enum.name` — a `String` reference — with `ordinal` at 1, `hash` at 2 and
+/// `ClassOption.flag` only at 3 (`javap -p java.lang.Enum` on JDK 25).
+/// Reading slot 0 as an `i32` therefore never matched, `nestmate` was always
+/// `false`, and `nest_host_class_name` was left `None` for BOTH arms.
+///
+/// That silence was invisible because it cancelled out: with no explicit nest
+/// host, `class_manager` fell back to the class file's own `NestHost`
+/// attribute, which for the `RJdkHidden$Payload` bytes happens to be exactly
+/// the answer the NESTMATE arm wanted. `RJdkHidden.java:101` passed for the
+/// wrong reason and `:151` failed for the right one — the two are one bug,
+/// and fixing only the `class_manager` half would have moved the failure
+/// backwards onto `:101`.
+///
+/// Each step below decides only on POSITIVE evidence and otherwise falls
+/// through, so an unrecognised shape degrades to the historical behaviour
+/// rather than guessing. In particular a by-name read of an ABSENT field
+/// answers `Int(0)`, which is why the flag step requires a non-zero value:
+/// both real constants have one (`NESTMATE = 0x1`, `STRONG = 0x4`).
+fn class_option_is_nestmate(ctx: &mut dyn NativeContext, opt: ObjectRef) -> bool {
+    // 1. Real-JDK layout, primary witness: the enum constant's own name.
+    if let Value::Object(Some(name_ref)) = ctx.get_field_by_name(opt, "name") {
+        if let Some(name) = ctx.read_string(name_ref) {
+            if name == "NESTMATE" {
+                return true;
+            }
+            if name == "STRONG" {
+                return false;
+            }
+        }
+    }
+    // 2. Real-JDK layout, second witness: `ClassOption.flag` is the JEP 371
+    //    bit itself, so this also survives a rename of the constant.
+    if let Value::Int(flag) = ctx.get_field_by_name(opt, "flag") {
+        if flag != 0 {
+            return (flag & CLASS_OPTION_FLAG_NESTMATE) != 0;
+        }
+    }
+    // 3. Synthetic layout: field 0 IS the ordinal, and NESTMATE is 0.
+    matches!(ctx.get_field(opt, 0), Value::Int(0))
+}
+
 /// Walk a `MethodHandles$Lookup$ClassOption[]` array and return `true`
-/// if any element is the `NESTMATE` constant (ordinal 0). Field 0 of
-/// each synthetic ClassOption mirror holds its ordinal — same encoding
-/// used by `classloader.rs::lk_define_hidden_class`.
+/// if any element is the `NESTMATE` constant. See
+/// [`class_option_is_nestmate`] for the two element layouts this must cope
+/// with.
 ///
 /// Returns `false` when the argument is null, missing, or not an array,
 /// matching the JDK's behaviour for an empty `ClassOption...` varargs.
@@ -480,10 +631,8 @@ fn parse_nestmate_option(ctx: &mut dyn NativeContext, opts_arg: Option<&Value>) 
     let opt_count = ctx.array_length(options_arr);
     for i in 0..opt_count {
         if let Value::Object(Some(opt)) = ctx.get_array_element(options_arr, i) {
-            if let Value::Int(ord) = ctx.get_field(opt, 0) {
-                if ord == 0 {
-                    return true;
-                }
+            if class_option_is_nestmate(ctx, opt) {
+                return true;
             }
         }
     }
@@ -576,9 +725,10 @@ fn lk_define_hidden_class_with_class_data(
         resolve_lookup_supertypes(ctx, this_lookup, &class_bytes);
     let nest_host_class_name_for_label = lookup_name;
 
-    let original = nest_host_class_name_for_label
-        .clone()
-        .unwrap_or_else(|| "HiddenClass".to_string());
+    // Same rule as the plain variant: the label comes from the class file's
+    // own `this_class`, with the lookup class name as the fallback.
+    let original =
+        hidden_class_base_name(&class_bytes, nest_host_class_name_for_label.as_deref());
     let id = crate::classloader::HIDDEN_CLASS_COUNTER.fetch_add(1, Ordering::Relaxed);
     let hidden_name = format!("{original}/0x{id:x}");
 
@@ -1050,6 +1200,109 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // W3-2 — the REAL-JDK ClassOption layout
+    // -----------------------------------------------------------------
+    //
+    // Every test above builds a SYNTHETIC ClassOption whose field 0 holds the
+    // ordinal. Under `--real-jdk` the varargs array carries genuine JDK enum
+    // constants instead, and `java.lang.Enum` declares `name` before
+    // `ordinal`, so field 0 is a String. Reading it as an `i32` silently
+    // answered "not a nestmate" for NESTMATE too — see
+    // `class_option_is_nestmate` for why that stayed invisible.
+
+    /// Build a `ClassOption` shaped like a REAL JDK enum constant: slot 0
+    /// carries `Enum.name` (a String), NOT the ordinal. `set_field_by_name`
+    /// additionally places the name wherever the mock's field model says
+    /// `name` lives, and slot 0 is deliberately a String so the synthetic
+    /// ordinal fallback CANNOT be what answers.
+    fn make_real_enum_class_option(ctx: &mut MockNativeContext, const_name: &str) -> ObjectRef {
+        let opt_cid = ctx
+            .ensure_class_initialized("java/lang/invoke/MethodHandles$Lookup$ClassOption")
+            .expect("alloc class option cid");
+        let opt = ctx.alloc_object(opt_cid, 4);
+        let name_obj = ctx.create_string(const_name);
+        ctx.set_field(opt, 0, Value::Object(Some(name_obj)));
+        ctx.set_field_by_name(opt, "name", Value::Object(Some(name_obj)));
+        opt
+    }
+
+    /// As `drive_hidden_define`, but the ClassOption[] elements use the
+    /// real-JDK enum layout. Returns the captured `nest_host_class_name`.
+    fn drive_hidden_define_real_enum_options(
+        lookup_class_name: &str,
+        const_names: &[&str],
+    ) -> Option<String> {
+        let mut ctx = MockNativeContext::new();
+        let (lookup, _lookup_cid) = make_lookup_for(&mut ctx, lookup_class_name);
+
+        let class_bytes = cafebabe_minimal();
+        let bytes_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, class_bytes.len());
+        for (i, b) in class_bytes.iter().enumerate() {
+            ctx.set_array_element(bytes_arr, i, Value::Int(*b as i32));
+        }
+
+        let opts_arr = ctx.new_array(
+            cratonvm_types::ArrayElementType::Reference,
+            const_names.len(),
+        );
+        for (i, n) in const_names.iter().enumerate() {
+            let opt = make_real_enum_class_option(&mut ctx, n);
+            ctx.set_array_element(opts_arr, i, Value::Object(Some(opt)));
+        }
+
+        let r = lk_define_hidden_class_full(
+            &mut ctx,
+            &[
+                Value::Object(Some(lookup)),
+                Value::Object(Some(bytes_arr)),
+                Value::Int(0), // initialize = false
+                Value::Object(Some(opts_arr)),
+            ],
+        );
+        assert!(r.is_ok(), "defineHiddenClass must succeed: {:?}", r.err());
+        ctx.last_define_full_opts()
+            .expect("define_class_full was not invoked")
+            .nest_host_class_name
+    }
+
+    /// THE REAL-JDK NESTMATE ARM. FAILS BEFORE THE W3-2 FIX.
+    ///
+    /// `RJdkHidden.java:101` appeared to pass only because the *class file's*
+    /// `NestHost` attribute happened to name the same class the NESTMATE
+    /// option would have selected. Assert the option itself is decoded, so
+    /// the answer no longer depends on that coincidence.
+    #[test]
+    fn real_jdk_enum_class_option_is_decoded_as_nestmate() {
+        let nh = drive_hidden_define_real_enum_options("RJdkHidden", &["NESTMATE"]);
+        assert_eq!(
+            nh.as_deref(),
+            Some("RJdkHidden"),
+            "a real-JDK ClassOption enum constant stores its NAME in slot 0; \
+             NESTMATE must still be recognised"
+        );
+    }
+
+    /// Control: the real-JDK layout must not turn STRONG into a nestmate.
+    /// `Enum.ordinal` for STRONG is 1 and its `flag` is 0x4 — neither may be
+    /// mistaken for the NESTMATE bit.
+    #[test]
+    fn real_jdk_enum_strong_only_is_not_a_nestmate() {
+        let nh = drive_hidden_define_real_enum_options("RJdkHidden", &["STRONG"]);
+        assert_eq!(
+            nh, None,
+            "STRONG alone must leave the hidden class in its own nest"
+        );
+    }
+
+    /// The Weld/LambdaMetafactory pattern under the real-JDK layout: order
+    /// must not matter, and STRONG must not veto NESTMATE.
+    #[test]
+    fn real_jdk_enum_strong_then_nestmate_still_propagates() {
+        let nh = drive_hidden_define_real_enum_options("RJdkHidden", &["STRONG", "NESTMATE"]);
+        assert_eq!(nh.as_deref(), Some("RJdkHidden"));
+    }
+
     /// Defence-in-depth: the WithClassData variant (used by
     /// LambdaMetafactory and Weld's classData-bound proxies) also walks
     /// the ClassOption[] correctly. We only need a single happy-path
@@ -1090,6 +1343,111 @@ mod tests {
             captured.as_deref(),
             Some("weld/cdi/BeanManagerImpl"),
             "WithClassData variant must also resolve to the outer nest host"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // W6-3 — the REAL-JDK `MethodHandles$Lookup` layout
+    // -----------------------------------------------------------------
+
+    /// `javap -p java.lang.invoke.MethodHandles$Lookup` on JDK 25, instance
+    /// fields in declaration order:
+    ///
+    /// ```text
+    ///   0 lookupClass            (ref)  private final Class<?>
+    ///   1 prevLookupClass        (ref)  private final Class<?>
+    ///   2 allowedModes           (int)  private final int
+    ///   3 cachedProtectionDomain (ref)  private volatile ProtectionDomain
+    /// ```
+    ///
+    /// The synthetic layout disagrees from slot 1 onwards
+    /// (`lookupClass | allowedModes | previousLookupClass | lookupMode`), so
+    /// writing modes BY INDEX type-confused all three: `Int(0x5F)` landed in the
+    /// `prevLookupClass` REFERENCE slot, a null ref landed in `allowedModes` —
+    /// which every JDK access check reads as 0, "no access at all" — and another
+    /// `Int(0x5F)` landed in the `cachedProtectionDomain` reference slot. None of
+    /// the three threw anything; the only symptom was a powerless Lookup.
+    ///
+    /// Declaring the real field names on the mock's class makes the by-name arm
+    /// the one that runs, which is what this asserts.
+    #[test]
+    fn alloc_lookup_for_writes_real_jdk_layout_by_name() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = MockNativeContext::new();
+        let lk_cid = ctx.ensure_class_initialized(LK_CLASS).expect("lookup cid");
+        let fm = |name: &str, descriptor: &str, slot_index: usize| FieldMetadata {
+            name: name.to_string(),
+            descriptor: descriptor.to_string(),
+            access_flags: 0,
+            slot_index,
+            declaring_class_id: lk_cid,
+            is_static: false,
+        };
+        ctx.set_declared_fields(
+            lk_cid,
+            vec![
+                fm("lookupClass", "Ljava/lang/Class;", 0),
+                fm("prevLookupClass", "Ljava/lang/Class;", 1),
+                fm("allowedModes", "I", 2),
+                fm(
+                    "cachedProtectionDomain",
+                    "Ljava/security/ProtectionDomain;",
+                    3,
+                ),
+            ],
+        );
+
+        let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
+        let mirror = ctx.get_class_mirror(host_cid);
+        let lookup = alloc_lookup_for(&mut ctx, mirror);
+
+        assert!(
+            matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
+            "lookupClass is slot 0 in BOTH layouts"
+        );
+        assert_ne!(
+            ctx.get_field(lookup, 1),
+            Value::Int(0x5F),
+            "slot 1 is the `prevLookupClass` REFERENCE — the mode word must not land here"
+        );
+        assert_eq!(
+            ctx.get_field(lookup, 2),
+            Value::Int(0x5F),
+            "allowedModes must be FULL_POWER_MODES (95 — measured on JDK 25 as \
+             `MethodHandles.lookup().lookupModes()`); a null here reads back as 0, \
+             which is `no access at all`"
+        );
+        assert_ne!(
+            ctx.get_field(lookup, 3),
+            Value::Int(0x5F),
+            "cachedProtectionDomain is a lazy volatile REFERENCE cache; it must stay \
+             null rather than receive an integer the GC would scan as an oop"
+        );
+    }
+
+    /// The negative half: with NO real field names declared, the object is a
+    /// fabricated stub (`_f0.._f3`), the by-name lookups all miss, and the
+    /// synthetic indices must still be written — `allowedModes` at slot 1.
+    /// A by-name-only fix would have left this arm powerless.
+    #[test]
+    fn alloc_lookup_for_still_writes_the_synthetic_indices() {
+        let mut ctx = MockNativeContext::new();
+        let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
+        let mirror = ctx.get_class_mirror(host_cid);
+        let lookup = alloc_lookup_for(&mut ctx, mirror);
+        assert!(
+            matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
+            "synthetic slot 0 is lookupClass"
+        );
+        assert_eq!(
+            ctx.get_field(lookup, 1),
+            Value::Int(0x5F),
+            "synthetic slot 1 is allowedModes"
+        );
+        assert_eq!(
+            ctx.get_field(lookup, 2),
+            Value::Object(None),
+            "synthetic slot 2 is previousLookupClass"
         );
     }
 

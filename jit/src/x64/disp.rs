@@ -614,16 +614,16 @@ mod tests {
                 "ARRAY_LENGTH_OFFSET (bounds-check load)",
                 ARRAY_LENGTH_OFFSET as i64,
             ),
-            // `emit_test_mem8_imm8(base, GC_FLAGS_OFFSET, GC_FLAG_*)`.
+            // `emit_test_mem8_imm8(base, GC_FLAGS_BYTE_OFFSET, GC_FLAG_*)`.
             (
-                "GC_FLAGS_OFFSET (per-object flag test)",
-                cratonvm_types::GC_FLAGS_OFFSET as i64,
+                "GC_FLAGS_BYTE_OFFSET (per-object flag test)",
+                cratonvm_types::GC_FLAGS_BYTE_OFFSET as i64,
             ),
-            // `CMP BYTE [recv + OBJECT_KIND_OFFSET], ObjectKind::Object` in the
+            // `CMP BYTE [recv + KIND_TAGS_BYTE_OFFSET], ObjectKind::Object` in the
             // PIC receiver-kind guard.
             (
-                "OBJECT_KIND_OFFSET (PIC kind guard)",
-                cratonvm_types::OBJECT_KIND_OFFSET as i64,
+                "KIND_TAGS_BYTE_OFFSET (PIC kind guard)",
+                cratonvm_types::KIND_TAGS_BYTE_OFFSET as i64,
             ),
             // Field-cell payload biases, added on top of a cell address.
             ("FIELD_CELL_TAG_OFFSET", FIELD_CELL_TAG_OFFSET as i64),

@@ -2523,13 +2523,48 @@ mod tests {
     fn runtime_error_array_index_carries_index() {
         let error = RuntimeError::aioobe_index_only(-1);
         // Just verify the variant holds the data; we can't check Java object
-        // creation without rt.jar but we can verify the Rust side
+        // creation without rt.jar but we can verify the Rust side.
+        //
+        // This asserted `message == None` until 2026-08-06, on the reasoning
+        // that a call site which cannot name the array's length must not invent
+        // any text. `ca7526cf0` replaced that with the JDK's OWN one-argument
+        // wording, which is the better answer for the same reason: `new
+        // ArrayIndexOutOfBoundsException(int)` in `java.base` produces exactly
+        // `"Array index out of range: N"`, so this is HotSpot's string for a
+        // site that knows only the index, not a guess at the one it cannot
+        // build. The genuinely-null case moved to `aioobe_no_message`, and is
+        // asserted below so this pair cannot silently collapse into one.
         if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = error {
             assert_eq!(index, -1);
             assert_eq!(
+                message.as_deref(),
+                Some("Array index out of range: -1"),
+                "aioobe_index_only is the \"cannot name the length\" \
+                 constructor — it carries the JDK's own one-argument wording, \
+                 which is exact for what the site knows"
+            );
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    /// The null-message sibling, which is a separate constructor precisely so
+    /// that "HotSpot really prints nothing here" is stated rather than
+    /// inherited.
+    ///
+    /// `java.lang.reflect.Array`'s accessors raise AIOOBE with no text at all,
+    /// so `Array.get(new int[4], 9).getMessage()` is null on HotSpot while a
+    /// plain `a[9]` in bytecode says "Index 9 out of bounds for length 4".
+    #[test]
+    fn runtime_error_array_index_can_carry_no_message_at_all() {
+        let error = RuntimeError::aioobe_no_message(9);
+        if let RuntimeError::ArrayIndexOutOfBoundsException { index, message } = error {
+            assert_eq!(index, 9);
+            assert_eq!(
                 message, None,
-                "aioobe_index_only is the explicit \"cannot name the length\" \
-                 constructor — it must not invent a message"
+                "aioobe_no_message exists for the sites a HotSpot control shows \
+                 producing a null getMessage(); giving it text would make \
+                 `Array.get` diverge from the JDK"
             );
         } else {
             panic!("wrong variant");

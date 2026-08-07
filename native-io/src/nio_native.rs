@@ -61,6 +61,60 @@ fn io_error(message: impl Into<String>) -> MethodCallFailed {
     }))
 }
 
+/// Build a REAL `java/nio/file/FileAlreadyExistsException` naming `path`.
+///
+/// Every file-creating `java.nio.file` entry point (`Files.copy`, `Files.move`,
+/// `createFile`, `newByteChannel`/`newOutputStream` with `CREATE_NEW`) must
+/// reject an already-existing target with this EXACT class when the caller did
+/// not pass `StandardCopyOption.REPLACE_EXISTING`. Callers discriminate by
+/// TYPE, not by message — `regression-suite/src/RJdkNio.java:99` is a bare
+/// `catch (FileAlreadyExistsException expected)`, and H2's
+/// `FilePathDisk.moveTo` catches the same class to translate it into
+/// `DbException(FILE_RENAME_FAILED_2)`. So neither a bare `IOException` with a
+/// matching message nor (worse) a silent overwrite satisfies the contract:
+/// `RuntimeError` has no `FileAlreadyExistsException` variant, which is why
+/// this is built explicitly instead of going through `io_error`.
+///
+/// Constructed through the class's REAL single-`String` constructor rather
+/// than a fabricated synthetic layout, for two reasons: the object is handed
+/// straight to real JDK bytecode (`getFile()`, `Throwable` formatting) which
+/// reads real field offsets, and a fabricated stand-in is exactly what
+/// `--jdk-only` refuses. Mirrors `native-builtins`'
+/// `phases_late::nio_file::p57_file_already_exists`, which does the same thing
+/// for the natives registered on that side.
+///
+/// GC: the fresh exception is pinned across `create_string`, which allocates
+/// and can therefore relocate it under a moving young collection (the native
+/// stale-local family) — the ref is re-read from the pin before every use.
+///
+/// The `IOException` fallback fires only when the class itself cannot be
+/// loaded, i.e. when there is no `FileAlreadyExistsException` to throw.
+///
+/// `pub` (not `pub(crate)`): `native-io` declares `pub mod nio_native`, so a
+/// crate-private helper here would trip `dead_code` until its only caller —
+/// the `java/nio/file/Files.copy` native in this crate's `lib.rs` — is wired
+/// up. Exporting it also lets the `native-builtins` side reuse one builder
+/// instead of keeping a third copy of this constructor dance.
+pub fn file_already_exists(ctx: &mut dyn NativeContext, path: &str) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/FileAlreadyExistsException")
+    {
+        let pin = ctx.pin_native_root(exc);
+        let file_str = ctx.create_string(path);
+        let exc_cur = ctx.read_native_pin(pin, exc);
+        let _ = ctx.invoke(
+            "java/nio/file/FileAlreadyExistsException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc_cur)), Value::Object(Some(file_str))],
+        );
+        let exc_cur = ctx.read_native_pin(pin, exc);
+        ctx.unpin_native_roots(pin);
+        return MethodCallFailed::ExceptionThrown(exc_cur);
+    }
+    io_error(format!("FileAlreadyExistsException: {path}"))
+}
+
 fn fd_arg(args: &[Value], idx: usize) -> Result<ObjectRef, MethodCallFailed> {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => Ok(*o),
@@ -80,6 +134,27 @@ fn int_arg(args: &[Value], idx: usize) -> i32 {
         Some(Value::Int(v)) => *v,
         _ => 0,
     }
+}
+
+/// Render the raw argument list for a refusal message.
+///
+/// `long_arg`/`int_arg` answer 0 for an argument that is absent or of the wrong
+/// `Value` shape, so a refused `(addr, len, pos)` triple of zeroes is ambiguous:
+/// the JDK may genuinely have passed a zero, or the dispatch may have handed us
+/// a shape these accessors do not read. Printing the arguments as received
+/// separates the two without a rebuild.
+fn args_debug(args: &[Value]) -> String {
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|v| match v {
+            Value::Int(x) => format!("I:{x}"),
+            Value::Long(x) => format!("J:{x}"),
+            Value::Object(Some(_)) => "L:obj".to_string(),
+            Value::Object(None) => "L:null".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    format!("[{}]", rendered.join(", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +177,10 @@ fn native_fd_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let addr = long_arg(args, 1);
     let len = int_arg(args, 2);
     if addr == 0 || len < 0 {
-        return Err(io_error("read0: bad addr/len"));
+        return Err(io_error(format!(
+            "read0: bad addr/len (addr={addr:#x}, len={len}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("read0: FileDescriptor has no open handle"));
@@ -139,7 +217,10 @@ fn native_fd_pread0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let len = int_arg(args, 2);
     let pos = long_arg(args, 3);
     if addr == 0 || len < 0 || pos < 0 {
-        return Err(io_error("pread0: bad addr/len/pos"));
+        return Err(io_error(format!(
+            "pread0: bad addr/len/pos (addr={addr:#x}, len={len}, pos={pos}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("pread0: FileDescriptor has no open handle"));
@@ -169,7 +250,10 @@ fn native_fd_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let addr = long_arg(args, 1);
     let len = int_arg(args, 2);
     if addr == 0 || len < 0 {
-        return Err(io_error("write0: bad addr/len"));
+        return Err(io_error(format!(
+            "write0: bad addr/len (addr={addr:#x}, len={len}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("write0: FileDescriptor has no open handle"));
@@ -200,7 +284,10 @@ fn native_fd_pwrite0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let len = int_arg(args, 2);
     let pos = long_arg(args, 3);
     if addr == 0 || len < 0 || pos < 0 {
-        return Err(io_error("pwrite0: bad addr/len/pos"));
+        return Err(io_error(format!(
+            "pwrite0: bad addr/len/pos (addr={addr:#x}, len={len}, pos={pos}) args={}",
+            args_debug(args)
+        )));
     }
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("pwrite0: FileDescriptor has no open handle"));

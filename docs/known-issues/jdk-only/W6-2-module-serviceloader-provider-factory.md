@@ -1,0 +1,210 @@
+# `ServiceLoader` had no `provider()` factory form, and discarded the `setAccessible` it depended on
+
+**Status:** FIX WRITTEN, UNVERIFIED (this lane may not run `cargo` and cannot
+run the VM). Lane W6-2 of the wave-6 pool. **Sixth** consecutive wall on the
+`regression-suite/src/RJdkModule.java` vector; the five before it were each
+real and each moved the vector forward (check 1 -> 4 -> ~14 -> ~20 -> ~26 ->
+~30 of 44).
+
+## The failure
+
+`RJdkModule.moduleServices()` (`:213`-`:243`). HotSpot 25 prints
+
+```
+CK RJdkModule services=[module-factory, module-hello] types=[EnGreeter, Greeter]
+```
+
+and the vector passes with 44 checks. CratonVM was predicted to stop at `:223`
+
+```
+check(greets.equals(Arrays.asList("module-factory", "module-hello")),
+        "module service providers: " + greets);
+```
+
+with `module service providers: []`, then at `:234` (`Provider.type()`), then at
+`:242` (the layer-scoped overload).
+
+## The fixture, which is the specification
+
+`regression-suite/modules/cratonvm.jdkonly.svc/module-info.java`:
+
+```
+provides com.cratonvm.jdkonly.svc.Greeter
+        with com.cratonvm.jdkonly.svc.internal.EnGreeter,
+             com.cratonvm.jdkonly.svc.internal.FactoryGreeter;
+```
+
+`com.cratonvm.jdkonly.svc.internal` is neither `exports`ed nor `opens`ed.
+
+* `EnGreeter` — public class, **public** no-arg constructor, implements
+  `Greeter`. Reachable only through `ServiceLoader`.
+* `FactoryGreeter` — public class, **private** constructor, **does not
+  implement `Greeter` at all**, and declares
+  `public static Greeter provider()`. Reachable *only* through that factory.
+
+## Two independent causes, both in `native-builtins/src/service_loader.rs`
+
+### 1. The `provider()` static-factory form was not supported at all
+
+`native_sl_iterator` and `native_sl_stream` only ever did
+`Class.getDeclaredConstructor()` + `Constructor.newInstance()`. For
+`FactoryGreeter` that is not merely a miss — `getDeclaredConstructor()`
+*succeeds* (it returns the **private** constructor), so the code was one
+successful `setAccessible` away from constructing an object that is not a
+`Greeter` and handing it to the caller. `stream()` was worse: it built
+`ServiceLoader$ProviderImpl(service, FactoryGreeter.class, ctor)`, so
+`Provider.type()` answered `FactoryGreeter` where the JDK answers `Greeter`.
+
+JDK 25 `java.util.ServiceLoader.loadProvider` (verified by `javap -p -c` against
+`C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot`):
+
+* `findStaticProviderMethod(clazz)` = `getDeclaredPublicMethods(clazz,
+  "provider")`, keep the unique **static** one, `m.setAccessible(true)`.
+* If found, `type = factoryMethod.getReturnType()` and the wrapper is built with
+  `ProviderImpl(Class service, Class type, Method factoryMethod)` — a **distinct
+  3-arg constructor** from the `(Class, Class, Constructor)` one this file
+  already drove. `ProviderImpl.get()` branches on `factoryMethod != null`.
+* The factory form is honoured **only** on the module path: the classpath
+  iterator (`LazyClassPathLookupIterator.nextService`) never looks for it and
+  requires `service.isAssignableFrom(clazz)`.
+
+### 2. `setAccessible(true)`'s result was discarded — and it was being refused
+
+Both loops called
+
+```rust
+let _ = ctx.invoke("java/lang/reflect/AccessibleObject", "setAccessible", "(Z)V", ...);
+```
+
+and ignored the return. Since wave 4, `lang_class::enforce_set_accessible_gate`
+correctly refuses that call: `resolve_caller_class_id` sees the **application**
+frame (`RJdkModule`), because `service_loader.rs` is a Rust native and pushes no
+`java.util.ServiceLoader` Java frame, and
+`com.cratonvm.jdkonly.svc.internal` is neither exported nor opened to the
+unnamed module. So `override` stayed 0, and the subsequent
+`Constructor.newInstance` was refused in turn by
+`native_constructor_new_instance`'s `check_reflection_export_access_with_target_id`
+(a **public** ctor of a **public** class still needs `exports` — JEP 261, and
+`RJdkModule.java:172` is the check that pins that behaviour and already passes).
+
+HotSpot does not meet this because *its* `ServiceLoader` is java.base and takes
+the JDK-internal caller bypass. `getConstructor` there is literally
+`if (inExplicitModule(clazz)) ctor.setAccessible(true);`.
+
+**Remedy (as specified by an earlier lane):** write `override = 1` on the
+reflective object directly instead of routing through the caller-sensitive
+`setAccessible` invoke. `read_constructor_accessible` /
+`read_method_accessible` / `accessible_override_is_set` all consult the
+JDK-inherited `override` field **first**, so this is the same grant by the same
+door, minus the caller identity a Rust native cannot supply.
+
+## What changed
+
+Only `native-builtins/src/service_loader.rs`. No out-of-file patch was needed.
+
+New helpers:
+
+| helper | role |
+| --- | --- |
+| `service_configuration_error` | `ServiceLoader.fail(service, msg)`; `provider_not_found_error` now delegates to it |
+| `sl_service_mirror` | the `service` `Class`, named field then legacy slot 0 |
+| `module_declared_providers` | the provider FQNs a JPMS `provides` clause declared for this service |
+| `grant_reflective_override` | `override = 1` + the CratonVM extra slot, no `setAccessible` invoke |
+| `provider_factory_method` | `findStaticProviderMethod`: declared, public, static, no-arg `provider()` |
+| `factory_return_type` | `factoryMethod.getReturnType()` |
+| `service_accepts_type` | `service.isAssignableFrom(candidate)` |
+
+`native_sl_iterator`: for a module-declared provider, look for the factory
+first. If present, validate the return type against the service (a mismatch is
+a `ServiceConfigurationError`, not a skip), grant the override on the `Method`,
+`Method.invoke(null, new Object[0])`, and treat a `null` return as a
+`ServiceConfigurationError` — `ProviderImpl.invokeFactoryMethod` does exactly
+that, and silently dropping the provider would be this campaign's dominant
+species (a fabricated success where the spec mandates a failure). Otherwise fall
+through to the constructor path, where a module-declared provider now gets
+`grant_reflective_override` in place of the doomed `setAccessible` invoke.
+
+`native_sl_stream`: the same detection, then build
+`ProviderImpl(service, returnType, Method)` via the `(Class, Class, Method)`
+descriptor (tag 3, never cached in the `CTOR_FORM` probe, which stays a
+4-arg-vs-3-arg *constructor* question). `getDeclaredConstructor` is skipped
+entirely on the factory path, so `FactoryGreeter`'s private constructor is never
+touched.
+
+### Deliberately scoped to module-declared providers
+
+Every new behaviour is gated on `module_declared`, i.e. on the provider having
+come from `ctx.service_providers_from_modules` rather than a
+`META-INF/services` descriptor. That is the JDK's `clazz.getModule().isNamed()`
+test asked of the *descriptor*: a provider named in `module-info` is in a named
+module by construction. Asking the descriptor rather than the class costs no
+Java dispatch on the hot classpath path (Spring/Tomcat/Elasticsearch/WildFly
+boot walks hundreds of providers, none module-declared) and keeps classpath
+discovery byte-for-byte unchanged.
+
+The registry half already worked and was **not** touched:
+`service_loader.rs:1227` -> `ctx.service_providers_from_modules` ->
+`ModuleRegistry::service_providers` (`classloading/src/module.rs:969`). The
+`CK RJdkModule ... provides=[com.cratonvm.jdkonly.svc.Greeter->2]` line already
+matches HotSpot in both CratonVM modes, so both FQNs were reaching
+`discover_providers`; they died at instantiation.
+
+### Deliberately NOT done
+
+`ServiceLoader.loadProvider` also fails when a **constructor**-form provider in
+a named module is not a subtype of the service. That check is not added: it
+would newly hard-fail every module-declared service in the JDK's own boot
+modules (`javax.tools.JavaCompiler`, the charset/zipfs/sql providers, ...) if
+this VM's `isAssignableFrom` disagrees on any one of them, and this lane cannot
+measure that. The factory-path return-type check *is* added because that path
+has zero existing users.
+
+## Mode scope — read this before believing a `--jdk-only` result
+
+`register_service_loader_natives` sets `NativeKind::SyntheticStub`, and
+`--jdk-only` strict drops SyntheticStub rows **at registration**. So in strict
+mode none of this file runs: the real `java.util.ServiceLoader` bytecode does,
+reaching `ModuleServicesLookupIterator` -> `jdk.internal.module.ServicesCatalog`
+-> `BootLoader.getServicesCatalog()`. **This fix moves the `--real-jdk`
+(Compatible, default) arm only.** Where `--jdk-only` stops next on this vector
+is an open, separate question.
+
+## Verify
+
+The module flags are REQUIRED; omitting them reproduces an earlier
+misclassification in which the oracle itself appeared to fail.
+
+```
+cd regression-suite
+<cratonvm> --java-home "C:\Program Files\Microsoft\jdk-25.0.3.9-hotspot" \
+    --module-path build-modules --add-modules cratonvm.jdkonly.svc \
+    -cp build RJdkModule
+```
+
+`CRATONVM_DIAG_SERVICELOADER=1` (the `diag_serviceloader` flag; `one_true_yes_exact`,
+so only exact `1`/`true`/`yes`) now also prints
+`[SL-DBG]   built via provider() factory: <fqn>`.
+
+## The single falsifying observation
+
+If `:223` still reports `module service providers: []` **and** the new
+`[SL-DBG] built via provider() factory` line never prints while
+`[SL-DBG] ServiceLoader service=com.cratonvm.jdkonly.svc.Greeter ... providers=2`
+does, then the gate is `module_declared` and the analysis above is wrong about
+where the two FQNs come from — i.e. `ModuleRegistry::service_providers` is
+answering for `Module.getDescriptor()` but not for
+`ctx.service_providers_from_modules`, and the fix belongs one layer down, not
+here.
+
+## Expected next wall
+
+`:242`, the layer-scoped `ServiceLoader.load(ModuleLayer, Class)` overload,
+which is **not** registered in `service_loader.rs` and therefore runs real JDK
+bytecode: `Objects.requireNonNull` x3, then `checkCaller` ->
+`jdk.internal.reflect.Reflection.verifyMemberAccess` + `Module.canUse`. The
+private constructor itself is trivial (four field writes; `newLookupIterator` is
+lazy and our `iterator()` native never calls it), and `discover_providers`
+already reads the `layer` field, so if `:242` fails it will be inside
+`verifyMemberAccess`/`canUse`, not in the discovery. Registering the overload
+natively was considered and rejected: it would have to ignore its `ModuleLayer`
+argument, which is a fabricated success for any non-boot layer.

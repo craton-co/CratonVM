@@ -1,6 +1,6 @@
 # C2 — the review lanes, and where the optimizing tier actually is
 
-`docs/known-issues/c2/deep-research-vm-c2.md` was worked through by two waves of
+`docs/feature-designs/c2/deep-research-vm-c2.md` was worked through by two waves of
 parallel agent lanes. Its decomposed, file-level items landed. Five lanes did
 not, and this directory was those five.
 

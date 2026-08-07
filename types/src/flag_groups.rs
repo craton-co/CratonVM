@@ -169,6 +169,20 @@ pub struct E {
 pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "sweep-liveness", on_key: Some("CRATONVM_DBG_SWEEP_LIVENESS"), off_key: None, off_word: None },
+    // Declared 2026-08-06: these nine were read by `runtime_var`/`runtime_var_os`
+    // but named nowhere, so each was served by a live `getenv` instead of the
+    // latched `VmFlags` snapshot -- `CRATONVM_DBG=token` could not reach them
+    // and `flags::with_thread_overrides` could not arrange one in a test.
+    E { group: Group::DBG, token: "callee-deopt", on_key: Some("CRATONVM_DBG_CALLEE_DEOPT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "layout-alias", on_key: Some("CRATONVM_DBG_LAYOUT_ALIAS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "check-override", on_key: Some("CRATONVM_DBG_CHECK_OVERRIDE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "direct-memory", on_key: Some("CRATONVM_DBG_DM"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "dupx-trace", on_key: Some("CRATONVM_DBG_DUPX_TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "read0-latency", on_key: Some("CRATONVM_DBG_READ0LAT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "refdisc", on_key: Some("CRATONVM_DBG_REFDISC"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "site-alias", on_key: Some("CRATONVM_DBG_SITE_ALIAS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "sp-ic-sites", on_key: Some("CRATONVM_DBG_SP_IC_SITES"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "stub-yield", on_key: Some("CRATONVM_DBG_STUB_YIELD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "access", on_key: Some("CRATONVM_DBG_ACCESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "active-profiles-identity-trace", on_key: Some("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "aio", on_key: Some("CRATONVM_DBG_AIO"), off_key: None, off_word: None },
@@ -607,6 +621,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "youngstate", on_key: Some("CRATONVM_DBG_YOUNGSTATE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zero-ranges", on_key: Some("CRATONVM_DBG_ZERO_RANGES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "aaload-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_AALOAD_LICM"), off_word: None },
+    // Declared 2026-08-06 with the DBG block above. The five `sp-ic-*` /
+    // `sp-inline-*` knobs are the single-pass inline-cache bisection surface;
+    // three are DEFAULT-ON and read `=0` to disable, so they carry `on_key`
+    // and the "0" off-word rather than an `off_key`.
+    E { group: Group::JIT, token: "sp-ic-deny", on_key: Some("CRATONVM_JIT_SP_IC_DENY"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "sp-ic-deopt-check", on_key: Some("CRATONVM_JIT_SP_IC_DEOPT_CHECK"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "sp-ic-only", on_key: Some("CRATONVM_JIT_SP_IC_ONLY"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "sp-inline-mega", on_key: Some("CRATONVM_JIT_SP_INLINE_MEGA"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "sp-inline-mic", on_key: Some("CRATONVM_JIT_SP_INLINE_MIC"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "sp-inline-pic", on_key: Some("CRATONVM_JIT_SP_INLINE_PIC"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "unreg-memo-gc-reset", on_key: Some("CRATONVM_JIT_UNREG_MEMO_GC_RESET"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "unreg-accept-residue", on_key: Some("CRATONVM_JIT_UNREG_ACCEPT_RESIDUE"), off_key: None, off_word: None },
     // A/B opt-in restoring the pre-2026-07-31 single global `Mutex` in
     // `types::jit_activation`; presence-parsed (`runtime_var_os(..).is_some()`),
     // so `=0` still enables it and `off_word` must stay `None`.
@@ -901,6 +927,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "card-metrics", on_key: Some("CRATONVM_GC_CARD_METRICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "pack-fields-by-width", on_key: Some("CRATONVM_PACK_FIELDS_BY_WIDTH"), off_key: None, off_word: None },
     E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
     E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
@@ -951,6 +978,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None },
     E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None },
     E { group: Group::GC, token: "youngscan-stride", on_key: Some("CRATONVM_YOUNGSCAN_STRIDE"), off_key: None, off_word: None },
+    // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
+    // `adapt_young_trigger_to_pause` reads, `0` (the default) being off.
+    E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
     // It already was a comma-separated token list before this refactor —
@@ -985,6 +1015,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::REAL, token: "use-wildfly-synth-bytecode", on_key: Some("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "vertx", on_key: Some("CRATONVM_REAL_VERTX"), off_key: Some("CRATONVM_SYNTHETIC_VERTX"), off_word: None },
     E { group: Group::LOADER, token: "allow-jsr-ret", on_key: Some("CRATONVM_ALLOW_JSR_RET"), off_key: None, off_word: None },
+    // Declared 2026-08-06, and RENAMED to be declarable. It was
+    // `CRATONVM_JDK_ONLY_ENFORCE_SHADOW`, which `jdk_only_adds_no_environment_variable`
+    // forbids in this table for a good reason: `--jdk-only` is a policy chosen
+    // per invocation (contract §9), and a second env-var spelling of it would be
+    // a way to half-enable strict mode from a parent shell. This knob is not
+    // that -- its caller tests `is_jdk_only()` first and it only decides whether
+    // §1.4's native-shadows-bytecode rule is ENFORCED or merely counted, which
+    // is what its new name says. Undeclared, it was served by a live `getenv`,
+    // so `CRATONVM_LOADER=enforce-native-shadow` could not reach it and no test
+    // could arrange it.
+    E { group: Group::LOADER, token: "enforce-native-shadow", on_key: Some("CRATONVM_ENFORCE_NATIVE_SHADOW"), off_key: None, off_word: None },
     E { group: Group::LOADER, token: "aware-resolution", on_key: Some("CRATONVM_LOADER_AWARE_RESOLUTION"), off_key: None, off_word: None },
     E { group: Group::LOADER, token: "boot-module-registry", on_key: Some("CRATONVM_BOOT_MODULE_REGISTRY"), off_key: None, off_word: Some("off") },
     E { group: Group::LOADER, token: "cl-bootstrap-scoped", on_key: Some("CRATONVM_CL_BOOTSTRAP_SCOPED"), off_key: None, off_word: Some("0") },
@@ -1016,6 +1057,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "default-watchdog-sec", on_key: Some("CRATONVM_DEFAULT_WATCHDOG_SEC"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "eqe-sync-execute", on_key: Some("CRATONVM_EQE_SYNC_EXECUTE"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "exec-depth-ceiling", on_key: Some("CRATONVM_EXEC_DEPTH_CEILING"), off_key: None, off_word: None },
+    // L19 — `ForkJoinTask.fork()` runs the body inline instead of only marking
+    // the task queued. `1`/`cc`/`counted` = eager for a `CountedCompleter`
+    // receiver only (the family with no intercepted consumer); `all` = eager
+    // for every task. Unset or unrecognised keeps today's lazy fork.
+    E { group: Group::THREADS, token: "fjp-eager-fork", on_key: Some("CRATONVM_FJP_EAGER_FORK"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "inherit-thread-ccl", on_key: Some("CRATONVM_INHERIT_THREAD_CCL"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "inherit-tl-workaround", on_key: Some("CRATONVM_INHERIT_TL_WORKAROUND"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "lock-order-check", on_key: Some("CRATONVM_LOCK_ORDER_CHECK"), off_key: None, off_word: None },
@@ -1061,6 +1107,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::COMPAT, token: "jboss-logger-level-filter", on_key: Some("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "jboss-mp-root", on_key: Some("CRATONVM_JBOSS_MP_ROOT"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "lazy-streams", on_key: Some("CRATONVM_LAZY_STREAMS"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "mh-strict-invokeexact", on_key: Some("CRATONVM_MH_STRICT_INVOKEEXACT"), off_key: None, off_word: Some("0") },
     E { group: Group::COMPAT, token: "mockito-legacy-selectors", on_key: Some("CRATONVM_MOCKITO_LEGACY_SELECTORS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::COMPAT, token: "tomcat-mapper-natives", on_key: Some("CRATONVM_TOMCAT_MAPPER_NATIVES"), off_key: None, off_word: Some("0") },
