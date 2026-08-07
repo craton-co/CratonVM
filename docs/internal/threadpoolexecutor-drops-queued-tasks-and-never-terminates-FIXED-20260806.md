@@ -127,7 +127,8 @@ the same shape as this bug (a synthetic native surface applied to a real JDK
 object) in other subsystems, and each needs the same treatment: find the
 registration, confirm the real bytecode is self-contained, add it to the
 `drop_real_layout_synthetic` family. Filed as
-`synthetic-jdk-feature-binary-diverges-under-real-jdk-20260806.md`.
+`synthetic-jdk-feature-binary-diverges-under-real-jdk-FIXED-20260807.md`,
+now retired to `docs/internal/` — all seven are closed.
 
 Until those are closed, **an A/B run with a `--features synthetic-jdk` binary
 must not treat those six as "pre-existing dev failures"** — they are artifacts

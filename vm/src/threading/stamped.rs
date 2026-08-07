@@ -90,8 +90,8 @@ mod tests {
 
         // Write lock should round-trip through the same backend.
         let s = stamped_write_lock(a);
-        assert!(s & 1 != 0);
-        stamped_unlock_write(a);
+        assert_eq!(s & 255, 128, "JDK write stamp mode field is WBIT");
+        assert!(stamped_unlock_write(a, s));
     }
 
     #[test]

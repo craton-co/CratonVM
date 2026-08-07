@@ -4825,10 +4825,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `Files.delete` reports failure. It used to discard every error, which
+    // made "the file is still there" indistinguishable from "deleted" — see
+    // `p57_delete_path_checked` for the case H2 depends on.
     r.register(files, "delete", "(Ljava/nio/file/Path;)V", |ctx, args| {
         let path_obj = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, path_obj);
-        p57_delete_path(&p);
+        // Virtual filesystems (jarfs/memfs sentinels) are not host paths;
+        // `symlink_metadata` on the encoded string always ENOENTs, so keep them
+        // on the best-effort route rather than inventing a NoSuchFileException.
+        if vfs_classify(&p).is_some() {
+            p57_delete_path(&p);
+            return Ok(None);
+        }
+        p57_delete_path_checked(&p).map_err(|e| p57_delete_error(ctx, &p, &e))?;
         Ok(None)
     });
 
@@ -4839,14 +4849,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
+            if vfs_classify(&p).is_some() {
+                p57_delete_path(&p);
+                return Ok(Some(Value::Int(1)));
+            }
             // `Path::exists()` follows links, so a DANGLING symlink read as
             // "does not exist" and was left on disk. The link itself is what
             // `deleteIfExists` is being asked about.
             if std::fs::symlink_metadata(&p).is_err() {
                 return Ok(Some(Value::Int(0)));
             }
-            p57_delete_path(&p);
-            Ok(Some(Value::Int(1)))
+            // Absence is the only failure `deleteIfExists` swallows; every
+            // other one it reports, exactly as `delete` does.
+            match p57_delete_path_checked(&p) {
+                Ok(()) => Ok(Some(Value::Int(1))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Some(Value::Int(0))),
+                Err(e) => Err(p57_delete_error(ctx, &p, &e)),
+            }
         },
     );
 
@@ -5328,6 +5347,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| fsp_new_output_stream(ctx, args),
     );
 
+    // `checkAccess` is `Files.isReadable`/`isWritable`/`isExecutable`'s only
+    // implementation — those three have no `Files`-level native, so their real
+    // JDK bytecode calls straight through to here. This used to answer "does
+    // the path exist?" and ignore the `AccessMode` array entirely, so
+    // `Files.isExecutable` said `true` for a plain 0644 file on Linux (HotSpot:
+    // `false`). `fs_check_access` is the same `access(2)` call `File.canWrite`
+    // already routes through — one implementation for both entry points.
     r.register(
         fsp,
         "checkAccess",
@@ -5344,6 +5370,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     message: format!("NoSuchFileException: {}", p),
                 }
                 .into());
+            }
+            // A jar-FS entry has no host permissions to consult; existence is
+            // the whole of what the archive can answer.
+            if vfs_classify(&p).is_some() {
+                return Ok(None);
+            }
+            for mode in access_modes_requested(ctx, args.get(2)) {
+                if !fs_check_access(&p, mode) {
+                    return Err(p57_access_denied(ctx, &p));
+                }
             }
             Ok(None)
         },
@@ -5449,6 +5485,77 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             write_named_attribute(ctx, path_obj, &spec, value, nofollow)
         },
     );
+
+    // The rest of `FileSystemProvider`'s abstract surface. Every one of these
+    // has a working `java/nio/file/Files` native in front of it, which is why
+    // none of them showed up before `setAttribute` did — `Files.delete` never
+    // reaches the provider, so the missing provider method was invisible. It
+    // stops being invisible the moment anything holds a `FileSystemProvider`
+    // and calls it directly (`Files.walkFileTree`'s own internals, NIO code
+    // written against the SPI, and every `AbstractFileSystemProvider` caller
+    // in the JDK do exactly that), and the failure is the same
+    // `AbstractMethodError: ... has no Code attribute`.
+    //
+    // These delegate to the `Files` natives rather than re-implementing them:
+    // one body per operation is what keeps the two entry points from drifting
+    // (the `Files.move` native, for instance, carries a
+    // `FileAlreadyExistsException` contract that H2 depends on by type).
+    r.register(fsp, "delete", "(Ljava/nio/file/Path;)V", |ctx, args| {
+        let path = obj_arg(args, 1)?;
+        ctx.invoke(
+            "java/nio/file/Files",
+            "delete",
+            "(Ljava/nio/file/Path;)V",
+            &[Value::Object(Some(path))],
+        )?;
+        Ok(None)
+    });
+    r.register(
+        fsp,
+        "createDirectory",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)V",
+        |ctx, args| {
+            let path = obj_arg(args, 1)?;
+            let attrs = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.invoke(
+                "java/nio/file/Files",
+                "createDirectory",
+                "(Ljava/nio/file/Path;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/file/Path;",
+                &[Value::Object(Some(path)), attrs],
+            )?;
+            Ok(None)
+        },
+    );
+    // `NativeCallback` is a plain `fn` pointer, so these two cannot share one
+    // capturing closure over the method name.
+    r.register(
+        fsp,
+        "copy",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)V",
+        |ctx, args| fsp_delegate_two_path_copy(ctx, args, "copy"),
+    );
+    r.register(
+        fsp,
+        "move",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)V",
+        |ctx, args| fsp_delegate_two_path_copy(ctx, args, "move"),
+    );
+    // `Files.isHidden` has NO `Files`-level native, so this one was reachable
+    // and did fail: `AbstractMethodError: FileSystemProvider.isHidden(Path)Z`.
+    // `dos_attr_flag` is the same rule the DOS view reads and writes — the real
+    // `FILE_ATTRIBUTE_HIDDEN` bit on Windows, the dot-file convention
+    // elsewhere.
+    r.register(fsp, "isHidden", "(Ljava/nio/file/Path;)Z", |ctx, args| {
+        let path_obj = obj_arg(args, 1)?;
+        let path = p57_read_path(ctx, path_obj);
+        if std::fs::symlink_metadata(&path).is_err() && jarfs_decode(&path).is_none() {
+            return Err(p57_no_such_file(ctx, &path));
+        }
+        Ok(Some(Value::Int(i32::from(dos_attr_flag(
+            &path,
+            DOS_ATTR_HIDDEN,
+        )))))
+    });
 
     r.register(
         fsp,
@@ -8663,11 +8770,54 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Meth
 /// `FileSystemUtils.deleteRecursively` on such a link therefore silently did
 /// nothing, stranding it for every later caller.
 pub(crate) fn p57_delete_path(path: &str) {
-    let is_real_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-    if is_real_dir {
-        let _ = std::fs::remove_dir(path);
+    let _ = p57_delete_path_checked(path);
+}
+
+/// The same removal, but reporting what happened.
+///
+/// `Files.delete` used to discard every error, so a delete that did not happen
+/// returned normally — including the case H2 depends on: on Windows,
+/// `DeleteFileW` refuses a file carrying `FILE_ATTRIBUTE_READONLY`, and
+/// `FilePathDisk.delete` catches that `AccessDeniedException`, clears
+/// `dos:readonly` and retries. Silently deleting the file instead meant that
+/// recovery branch never ran, and a program relying on read-only protection got
+/// no protection at all.
+///
+/// Rust's `std::fs::remove_file` is what made the difference invisible: on
+/// Windows it CLEARS the read-only attribute and retries rather than failing,
+/// deliberately, to give Unix semantics. That is the one case this has to
+/// re-refuse by hand; every other error is just no longer thrown away.
+pub(crate) fn p57_delete_path_checked(path: &str) -> std::io::Result<()> {
+    let md = std::fs::symlink_metadata(path)?;
+    #[cfg(windows)]
+    {
+        if !md.is_dir() && md.permissions().readonly() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "the file is marked read-only",
+            ));
+        }
+    }
+    if md.is_dir() {
+        std::fs::remove_dir(path)
     } else {
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path)
+    }
+}
+
+/// Turn a removal failure into the exception type the JDK raises for it.
+pub(crate) fn p57_delete_error(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    error: &std::io::Error,
+) -> MethodCallFailed {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => p57_no_such_file(ctx, path),
+        std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, path),
+        // `DirectoryNotEmpty` is the JDK's `DirectoryNotEmptyException`, which
+        // is a `FileSystemException` subclass; we do not model the subclass, so
+        // the reason string carries the distinction.
+        _ => p57_filesystem_exception(ctx, path, None, &error.to_string()),
     }
 }
 
@@ -10366,6 +10516,55 @@ fn attr_view_flag_arg(args: &[Value]) -> bool {
     args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0
 }
 
+/// Set (or clear) a path's read-only bit.
+///
+/// Split out of `dos_view_set_read_only` so `FileSystemProvider.setAttribute`
+/// — which is handed a `Path` and an attribute *name*, never a view object —
+/// changes the file exactly the way the view does. Two spellings of
+/// "`dos:readonly` is now true" that can drift apart is the
+/// `two-caches-one-invalidation-hook` shape.
+pub(crate) fn set_read_only_on_path(path: &str, on: bool) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(on);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(windows)]
+pub(crate) fn set_dos_flag_on_path(path: &str, flag: u32, on: bool) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    extern "system" {
+        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
+    }
+    let meta = std::fs::metadata(path)?;
+    let mut attrs = meta.file_attributes();
+    if on {
+        attrs |= flag;
+    } else {
+        attrs &= !flag;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-Windows hosts have no DOS hidden/system/archive bits. Clearing one is
+/// trivially satisfied; SETTING one is refused out loud rather than pretended.
+/// `Ok(false)` means "refuse" — the caller turns that into the
+/// `UnsupportedOperationException` its own surface owes.
+#[cfg(not(windows))]
+pub(crate) fn set_dos_flag_on_path_supported(path: &str, on: bool) -> std::io::Result<bool> {
+    // Validate the file the way the real view does, whichever branch we take.
+    std::fs::metadata(path)?;
+    Ok(!on)
+}
+
 pub(crate) fn dos_view_set_read_only(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -10373,40 +10572,18 @@ pub(crate) fn dos_view_set_read_only(
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    let mut perms = meta.permissions();
-    perms.set_readonly(on);
-    std::fs::set_permissions(&path, perms).map_err(|e| p57_io_error(&e))?;
+    set_read_only_on_path(&path, on).map_err(|e| p57_io_error(&e))?;
     Ok(None)
 }
 
 #[cfg(windows)]
 fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], flag: u32) -> MethodCallResult {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::MetadataExt;
-    extern "system" {
-        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
-    }
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    let mut attrs = meta.file_attributes();
-    if on {
-        attrs |= flag;
-    } else {
-        attrs &= !flag;
-    }
-    let wide: Vec<u16> = std::ffi::OsStr::new(&path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
-        return Err(RuntimeError::IOException {
-            message: format!("SetFileAttributes failed for {path}"),
-        }
-        .into());
-    }
+    set_dos_flag_on_path(&path, flag, on).map_err(|e| RuntimeError::IOException {
+        message: format!("SetFileAttributes failed for {path}: {e}"),
+    })?;
     Ok(None)
 }
 
@@ -10415,10 +10592,7 @@ fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], _flag: u32) ->
     let this = obj_arg(args, 0)?;
     let on = attr_view_flag_arg(args);
     let path = attr_view_path(ctx, this);
-    // Validate the file the way the real view does, whichever branch we take.
-    std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
-    if !on {
-        // Clearing a flag that can never be set here is trivially satisfied.
+    if set_dos_flag_on_path_supported(&path, on).map_err(|e| p57_io_error(&e))? {
         return Ok(None);
     }
     Err(RuntimeError::UnsupportedOperationException {
@@ -10531,6 +10705,46 @@ pub(crate) fn copy_options_replace_existing(
     }
     ctx.unpin_native_roots(pin);
     found
+}
+
+/// The `FS_ACCESS_*` bits named by a `java.nio.file.AccessMode[]` argument.
+///
+/// An empty (or absent) array is the JDK's "existence only" request, which the
+/// caller has already answered — so this returns an empty vector for it rather
+/// than defaulting to some mode the caller never asked about.
+pub(crate) fn access_modes_requested(ctx: &mut dyn NativeContext, modes: Option<&Value>) -> Vec<i32> {
+    let arr = match modes {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Vec::new(),
+    };
+    // Pin: the `toString()` probe re-enters Java and a moving young GC there
+    // would relocate the mode array (native stale-local family) — the same
+    // hazard `copy_options_replace_existing` guards against.
+    let pin = ctx.pin_native_root(arr);
+    let len = ctx.array_length(arr);
+    let mut out = Vec::new();
+    for i in 0..len {
+        let arr_cur = ctx.read_native_pin(pin, arr);
+        let Value::Object(Some(mode)) = ctx.get_array_element(arr_cur, i) else {
+            continue;
+        };
+        let Ok(Some(Value::Object(Some(s)))) =
+            ctx.invoke_virtual(mode, "toString", "()Ljava/lang/String;", &[])
+        else {
+            continue;
+        };
+        let text = ctx.read_string(s).unwrap_or_default();
+        // `AccessMode` is an enum, so `toString()` is the constant name.
+        if text.contains("EXECUTE") {
+            out.push(FS_ACCESS_EXECUTE);
+        } else if text.contains("WRITE") {
+            out.push(FS_ACCESS_WRITE);
+        } else if text.contains("READ") {
+            out.push(FS_ACCESS_READ);
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    out
 }
 
 /// Build a REAL `java/nio/file/FileAlreadyExistsException` (same approach as
@@ -13024,11 +13238,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "isHidden", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        // Cross-platform: treat files with leading '.' as hidden
-        let hidden = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().starts_with('.'))
-            .unwrap_or(false);
+        // This used to apply the leading-`.` rule on EVERY platform. On Windows
+        // that is wrong in both directions, measured against HotSpot: a
+        // `.dotfile` is NOT hidden, and a plain name carrying
+        // `FILE_ATTRIBUTE_HIDDEN` IS. `fs_boolean_attributes` is the same
+        // platform split `getBooleanAttributes` already encodes — and, since
+        // `Files.isHidden` and the `dos:hidden` attribute now read the real
+        // Windows bit, sharing it here is what stops two spellings of the same
+        // question from disagreeing.
+        let hidden = fs_boolean_attributes(&path) & FS_BA_HIDDEN != 0;
         Ok(Some(Value::Int(if hidden { 1 } else { 0 })))
     });
     r.register(file, "canRead", "()Z", |ctx, args| {
@@ -15464,6 +15682,8 @@ struct StatFacts {
     ctime_millis: i64,
     readonly: bool,
     hidden: bool,
+    system: bool,
+    archive: bool,
 }
 
 /// The attribute views a path's filesystem actually has.
@@ -15540,7 +15760,11 @@ fn vfs_stat_facts(p: &str) -> Option<std::io::Result<StatFacts>> {
         rdev: 0,
         ctime_millis: millis,
         readonly: true,
+        // An archive entry has no DOS attribute word of its own; `false` is
+        // what the JDK reports for these on a non-DOS filesystem.
         hidden: false,
+        system: false,
+        archive: false,
     }))
 }
 
@@ -15569,11 +15793,17 @@ fn stat_facts(path: &str, nofollow: bool) -> std::io::Result<StatFacts> {
         rdev: 0,
         ctime_millis: 0,
         readonly: meta.permissions().readonly(),
-        // `isOther`/`hidden` are the two the JDK derives rather than stats.
-        hidden: std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.')),
+        // The three DOS flags read through the SAME `dos_attr_flag` the
+        // `DosFileAttributeView` setters and `setAttribute` write through: real
+        // `FILE_ATTRIBUTE_*` bits on Windows, the dot-file convention for
+        // `hidden` elsewhere. They used to be derived here from the filename
+        // alone (and `system`/`archive` were hardcoded `false` at the read
+        // site), so on Windows `setAttribute(p, "dos:hidden", true)` followed by
+        // `getAttribute(p, "dos:hidden")` answered `false` — a write that
+        // really happened, reported as if it had not.
+        hidden: dos_attr_flag(path, DOS_ATTR_HIDDEN),
+        system: dos_attr_flag(path, DOS_ATTR_SYSTEM),
+        archive: dos_attr_flag(path, DOS_ATTR_ARCHIVE),
     };
     #[cfg(unix)]
     {
@@ -15726,9 +15956,19 @@ pub(crate) fn write_named_attribute(
     }
     if name.is_empty() || !known.iter().any(|k| *k == name) {
         return Err(RuntimeError::IllegalArgumentException {
-            message: format!("'{view}:{name}' is not a recognized attribute"),
+            message: format!("'{view}:{name}' not recognized"),
         }
         .into());
+    }
+
+    // The JDK stats the file before it touches any attribute, so a missing path
+    // is `NoSuchFileException` — not whichever errno the individual setter would
+    // have produced, and not (for the DOS flags, whose view natives only
+    // `std::fs::metadata`) a bare `IOException`. Measured against HotSpot. The
+    // archive-entry case is already refused above, so this only ever sees a
+    // host path.
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(p57_no_such_file(ctx, &path));
     }
 
     // Every write below follows symlinks. Rather than silently write through a
@@ -15754,6 +15994,11 @@ pub(crate) fn write_named_attribute(
                 }
                 .into());
             };
+            // Type-check BEFORE reading. `filetime_read_millis` falls back to
+            // slot 0 and then to `0`, so handing it a `String` would have set
+            // the timestamp to the epoch and reported success — a silent wrong
+            // write where the JDK's cast throws.
+            require_value_class(ctx, ft, "java/nio/file/attribute/FileTime", spec)?;
             let millis = filetime_read_millis(ctx, ft);
             let (creation, access, modified) = match name {
                 "creationTime" => (Some(millis), None, None),
@@ -15794,6 +16039,17 @@ pub(crate) fn write_named_attribute(
                 }
                 .into());
             };
+            // `posix_permission_bits_from_set` answers `0` for anything it
+            // cannot probe, and `0` is also the legitimate answer for an EMPTY
+            // set — so a non-collection value would `chmod 000` and report
+            // success. `size()` separates the two: a real collection answers it
+            // (with `0` when empty), a `String` does not have the method.
+            if !matches!(
+                ctx.invoke_virtual(set, "size", "()I", &[]),
+                Ok(Some(Value::Int(_)))
+            ) {
+                return Err(value_class_cast_error(ctx, set, "java/util/Set", spec));
+            }
             let mode = posix_permission_bits_from_set(ctx, set);
             set_file_mode(&path, mode)
         }
@@ -15806,11 +16062,57 @@ pub(crate) fn write_named_attribute(
         }
         .into()),
         // A name the reader answers but the JDK does not let anyone write.
+        // The wording is HotSpot's own, verified against it: `BasicFileAttributeView`
+        // raises `IllegalArgumentException("'" + name() + ":" + attribute + "'
+        // not recognized")`.
         AttributeWrite::NotWritable => Err(RuntimeError::IllegalArgumentException {
-            message: format!("'{view}:{name}' is not a recognized attribute"),
+            message: format!("'{view}:{name}' not recognized"),
         }
         .into()),
     }
+}
+
+/// The `ClassCastException` the JDK's own cast would raise for a `setAttribute`
+/// value of the wrong type.
+///
+/// The `(… are in module java.base of loader 'bootstrap')` clause HotSpot
+/// appends is deliberately NOT reproduced: it would mean asserting module and
+/// loader facts this call site has not looked up.
+fn value_class_cast_error(
+    ctx: &mut dyn NativeContext,
+    value: ObjectRef,
+    want: &str,
+    spec: &str,
+) -> MethodCallFailed {
+    let class_id = ctx.class_id_of_object(value);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    RuntimeError::ClassCastException {
+        message: format!(
+            "class {} cannot be cast to class {} (setting '{spec}')",
+            class_name.replace('/', "."),
+            want.replace('/', ".")
+        ),
+    }
+    .into()
+}
+
+/// Require a `setAttribute` value to be exactly the class the attribute wants.
+///
+/// Not merely cosmetic: the reader on the other side of each write arm has a
+/// benign fallback (`filetime_read_millis` answers `0` for an object with no
+/// `value` field), so without this the mistake becomes a quiet wrong write
+/// instead of the `ClassCastException` the JDK raises.
+fn require_value_class(
+    ctx: &mut dyn NativeContext,
+    value: ObjectRef,
+    want: &str,
+    spec: &str,
+) -> Result<(), MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(value);
+    if ctx.class_name_of_id(class_id).unwrap_or_default() == want {
+        return Ok(());
+    }
+    Err(value_class_cast_error(ctx, value, want, spec))
 }
 
 /// chmod for the POSIX/unix write paths. A no-op refusal on a host without
@@ -15840,9 +16142,19 @@ fn boolean_attribute_value(
     spec: &str,
     value: Option<ObjectRef>,
 ) -> Result<bool, cratonvm_types::error::MethodCallFailed> {
-    match value.map(|v| crate::lang_class::unbox_value(ctx, v)) {
-        Some(Value::Int(i)) => Ok(i != 0),
-        Some(_) | None => Err(RuntimeError::ClassCastException {
+    let Some(value) = value else {
+        return Err(RuntimeError::ClassCastException {
+            message: format!("setAttribute('{spec}'): value is not a Boolean"),
+        }
+        .into());
+    };
+    // Exact class, not "whatever unboxes to an Int". `unbox_value` answers
+    // `Int` for Integer/Byte/Short/Character too, and the JDK's cast to
+    // `Boolean` rejects every one of them.
+    require_value_class(ctx, value, "java/lang/Boolean", spec)?;
+    match crate::lang_class::unbox_value(ctx, value) {
+        Value::Int(i) => Ok(i != 0),
+        _ => Err(RuntimeError::ClassCastException {
             message: format!("setAttribute('{spec}'): value is not a Boolean"),
         }
         .into()),
@@ -15996,9 +16308,11 @@ pub(crate) fn read_named_attributes(
             "rdev" => box_long(ctx, facts.rdev),
             "readonly" => box_boolean(ctx, facts.readonly),
             "hidden" => box_boolean(ctx, facts.hidden),
-            // DOS-only flags with no Unix counterpart. `false` is what the JDK
+            // On Windows these are the real `FILE_ATTRIBUTE_*` bits; off
+            // Windows `dos_attr_flag` answers `false`, which is what the JDK
             // reports for them on a non-DOS filesystem.
-            "archive" | "system" => box_boolean(ctx, false),
+            "system" => box_boolean(ctx, facts.system),
+            "archive" => box_boolean(ctx, facts.archive),
             "permissions" => match posix_permission_set(ctx, facts.mode) {
                 Some(set) => Value::Object(Some(set)),
                 None => continue,
@@ -16050,6 +16364,27 @@ pub(crate) fn read_named_attributes(
     let map = ctx.read_native_pin(map_pin, map);
     ctx.unpin_native_roots(map_pin);
     Ok(Some(Value::Object(Some(map))))
+}
+
+/// Shared body for `FileSystemProvider.copy`/`move`: same argument shape, same
+/// delegation to the `java/nio/file/Files` native, only the method name
+/// differs. The provider overloads return `void`; the `Files` ones return the
+/// target `Path`, which is dropped here.
+fn fsp_delegate_two_path_copy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+) -> MethodCallResult {
+    let src = obj_arg(args, 1)?;
+    let dst = obj_arg(args, 2)?;
+    let options = args.get(3).copied().unwrap_or(Value::Object(None));
+    ctx.invoke(
+        "java/nio/file/Files",
+        method,
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)Ljava/nio/file/Path;",
+        &[Value::Object(Some(src)), Value::Object(Some(dst)), options],
+    )?;
+    Ok(None)
 }
 
 #[cfg(test)]

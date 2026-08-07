@@ -1426,6 +1426,31 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
 }
 
 /// Unbox a polymorphic-invoke native return using the call-site descriptor.
+///
+/// # Why `b'L' | b'['` is a PASSTHROUGH and must stay one (W8-13)
+///
+/// The symmetric-looking fix — "the call site wants a reference and the native
+/// handed back a primitive, so box it here" — is not available at this layer,
+/// and the JDK 25 oracle says why. `Value::Int` carries `boolean`, `byte`,
+/// `char`, `short` AND `int` (see `cratonvm_types::Value`), so a raw
+/// `Value::Int(1)` arriving here could correctly box to `Boolean.TRUE`,
+/// `Byte(1)`, `Character('')`, `Short(1)` or `Integer(1)`, and an erased
+/// call site's `)Ljava/lang/Object;` names none of them. HotSpot boxes by the
+/// VARIABLE's declared type: measured, `booleanVarHandle.getAndSet(arr, 1,
+/// false)` at an `Object` call site yields `java.lang.Boolean` printing `true`,
+/// where a tag-based guess here would yield `java.lang.Integer` printing `1`.
+///
+/// Only the native knows the element/field descriptor, so the boxing belongs
+/// there — and every `VarHandle` access mode that returns a value now does it,
+/// through the single `vh_box_access_result` funnel in
+/// `native-builtins/src/lang_invoke.rs`. Before W8-13 only `varhandle_get`
+/// boxed, and `getAndSet` / `getAndAdd` / `getAndBitwise*` /
+/// `compareAndExchange` returned bare primitives that this passthrough then
+/// delivered into a reference return slot: `System.out.println(
+/// va.getAndSet(arr, 1, 20))` printed `null` where HotSpot prints `2`.
+///
+/// The MethodHandle side is the same story for the same reason: `invoke` /
+/// `invokeExact` natives box before returning, and this arm hands the box on.
 pub fn unbox_poly_return(
     shared: &SharedVm,
     value: Option<Value>,
@@ -1659,15 +1684,136 @@ pub fn unbox_poly_return_checked(
     }
 }
 
+/// Kill switch for the `VarHandle` reference-return rule below. Set the exact
+/// string `0` to restore the pre-W6-1 silent wrong answer.
+///
+/// Deliberately SEPARATE from `CRATONVM_MH_STRICT_INVOKEEXACT`: the two rules
+/// fire on disjoint method names (`invokeExact` versus the `VarHandle` access
+/// modes) and share only the funnel they sit in, so one going wrong in the
+/// field must not force the other off.
+fn vh_strict_reference_return() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| {
+        !matches!(
+            cratonvm_types::flags::runtime_var("CRATONVM_VH_STRICT_REFERENCE_RETURN").as_deref(),
+            Ok("0")
+        )
+    })
+}
+
+/// Every transitive supertype of each of the eight wrapper classes, measured on
+/// the JDK 25 oracle (`Class.getSuperclass`/`getInterfaces`, transitively).
+///
+/// This is the FALLBACK half of the assignability test in
+/// [`varhandle_reference_return_mismatch`]. The primary half is a real walk of
+/// the loaded hierarchy; this table exists because that walk reports `false`
+/// when the wrapper's interfaces are not resolved in the class store, and
+/// `false` there means "fire", i.e. it fails in the dangerous direction. The
+/// two halves cover each other: a JDK that adds a supertype this table does not
+/// know is caught by the walk, and an unresolved hierarchy is caught by the
+/// table.
+///
+/// `java/lang/Object` is included in every row — an erased `Object` call site
+/// legitimately receives a box, and that used to be this function's only
+/// exclusion.
+fn boxed_primitive_supertypes(wrapper: &str) -> &'static [&'static str] {
+    const OBJ: &str = "java/lang/Object";
+    const CMP: &str = "java/lang/Comparable";
+    const SER: &str = "java/io/Serializable";
+    const CONSTABLE: &str = "java/lang/constant/Constable";
+    const CONSTANT_DESC: &str = "java/lang/constant/ConstantDesc";
+    const NUM: &str = "java/lang/Number";
+    match wrapper {
+        // Integer/Long/Float/Double are `ConstantDesc`; Byte/Short are not.
+        "java/lang/Integer" | "java/lang/Long" | "java/lang/Float" | "java/lang/Double" => {
+            &[OBJ, NUM, CMP, SER, CONSTABLE, CONSTANT_DESC]
+        }
+        "java/lang/Byte" | "java/lang/Short" => &[OBJ, NUM, CMP, SER, CONSTABLE],
+        // Character/Boolean are not `Number`.
+        "java/lang/Character" | "java/lang/Boolean" => &[OBJ, CMP, SER, CONSTABLE],
+        _ => &[],
+    }
+}
+
 /// The `VarHandle` access modes that RETURN the accessed variable, paired with
 /// a call site whose descriptor names a reference type that the produced box
 /// cannot be. `None` means "no complaint"; `Some(cls)` names what was produced.
+///
+/// # The predicate, and why it is assignability rather than equality
+///
+/// Measured on the JDK 25 oracle (`java 25.0.3`, a `VarHandle` over an `int`
+/// field read at a range of reference call sites):
+///
+/// | call site return | HotSpot |
+/// | --- | --- |
+/// | `Object` / `Number` / `Comparable` / `Serializable` | no throw |
+/// | `Constable` / `ConstantDesc` / `Integer` | no throw |
+/// | `String` / `CharSequence` / `Long` / `Double` | `WrongMethodTypeException` |
+///
+/// and, for the non-`Number` wrappers, `char`/`boolean` at a `Number` call site
+/// throws while at a `Comparable` call site it does not. So HotSpot's rule for
+/// a boxed result at a reference call site is exactly **"is the wrapper class
+/// assignable to the call site's declared return type?"** — the class-hierarchy
+/// relation, nothing more.
+///
+/// The original form of this check tested `actual == want` with a single
+/// hand-rolled exclusion for `java/lang/Object`. That is a *fragment* of the
+/// relation, so it fired on `Number`, `Comparable`, `Serializable`,
+/// `Constable` and `ConstantDesc` call sites, every one of which HotSpot
+/// accepts — a false positive on shapes as ordinary as
+/// `Number n = (Number) vh.get(o)` over an `Integer` field. Fixed here by
+/// testing real assignability.
+///
+/// # Why the remaining fire set has no false positives
+///
+/// After the fix the rule is: *the access produced a boxed primitive that is
+/// not assignable to the call site's declared reference return type*. On
+/// HotSpot that is always an exception — `WrongMethodTypeException` when the
+/// handle's `varType` is primitive (`asType` refuses the conversion) and
+/// `ClassCastException` when it is a reference (the cast fails at runtime).
+/// CratonVM cannot tell those apart from the produced value alone and raises
+/// `WrongMethodTypeException` for both; that is a wrong exception *class* in
+/// the reference-`varType` case, never a wrong outcome.
+///
+/// Still deliberately outside the fire set, each keeping today's behaviour: a
+/// `null` result, an array return, and any non-wrapper object (a synthetic
+/// stand-in, an un-nameable fabricated class, a genuine reference value).
+///
+/// # Interaction with the native-side boxing funnel (W8-13)
+///
+/// This check can only see values `lang_invoke.rs`'s `vh_box_access_result`
+/// produces, and the two cannot double-fire or disagree:
+///
+/// * they act on disjoint outcomes — the funnel BOXES, this check THROWS, and
+///   `java/lang/Object` plus every wrapper supertype is in
+///   `boxed_primitive_supertypes`, so the erased `Object` call site the funnel
+///   exists to serve is declined here by construction;
+/// * before the funnel, the RMW modes returned a bare `Value::Int`/`Long`/… ,
+///   which is not `Value::Object(Some(_))`, so this check *structurally could
+///   not fire* on `getAndSet` / `getAndAdd` / `getAndBitwise*` /
+///   `compareAndExchange` — its method-name list covered them but its value
+///   test never matched. The funnel is what makes those names reachable, i.e.
+///   it closes a hole in this check rather than colliding with it;
+/// * `compareAndSet` / `weakCompareAndSet*` stay out of the list and stay
+///   correct. javac fixes their call-site descriptor at `)Z` — the return type
+///   of a signature-polymorphic call comes from the cast context only for the
+///   modes DECLARED to return `Object`, and `compareAndSet` is declared
+///   `boolean`. Verified on JDK 25: `Object o = vh.compareAndSet(a,0,1,11)`
+///   compiles to `compareAndSet:([IIII)Z` followed by `Boolean.valueOf`, and
+///   `(String) vh.compareAndSet(...)` does not compile at all. So no boolean
+///   mode can reach a reference call site, and none needs boxing.
 fn varhandle_reference_return_mismatch(
     shared: &SharedVm,
     value: Option<Value>,
     descriptor: &str,
     method_name: &str,
 ) -> Option<String> {
+    if !vh_strict_reference_return() {
+        return None;
+    }
+    // The access modes that hand back the accessed variable. `set*` return
+    // void and `compareAndSet`/`weakCompareAndSet*` return boolean, so neither
+    // can reach a reference call site.
     if !matches!(
         method_name,
         "get"
@@ -1681,6 +1827,15 @@ fn varhandle_reference_return_mismatch(
             | "getAndAdd"
             | "getAndAddAcquire"
             | "getAndAddRelease"
+            | "getAndBitwiseOr"
+            | "getAndBitwiseOrAcquire"
+            | "getAndBitwiseOrRelease"
+            | "getAndBitwiseAnd"
+            | "getAndBitwiseAndAcquire"
+            | "getAndBitwiseAndRelease"
+            | "getAndBitwiseXor"
+            | "getAndBitwiseXorAcquire"
+            | "getAndBitwiseXorRelease"
             | "compareAndExchange"
             | "compareAndExchangeAcquire"
             | "compareAndExchangeRelease"
@@ -1692,23 +1847,26 @@ fn varhandle_reference_return_mismatch(
     }
     let want = descriptor.rsplit(')').next()?;
     let want = want.strip_prefix('L')?.strip_suffix(';')?;
-    // An erased `Object` call site legitimately receives a box.
-    if want == "java/lang/Object" {
-        return None;
-    }
     let Some(Value::Object(Some(obj))) = value else {
         return None;
     };
-    let actual = {
-        let cid = shared.mem.heap.class_id_of(obj);
-        let cm = shared.classes.class_manager.read();
-        cm.get_class(cid).map(|c| c.name.to_string())?
-    };
+    let cid = shared.mem.heap.class_id_of(obj);
+    // The guard is confined to this block; `create_exception_object` in the
+    // caller takes the class-manager WRITE lock to load the throwable and must
+    // not find this read guard still held.
+    let cm = shared.classes.class_manager.read();
+    let actual = cm.get_class(cid).map(|c| c.name.to_string())?;
     // Only a boxed primitive complains — a synthetic stand-in, an un-nameable
     // fabricated class or a genuine reference value keeps today's behaviour.
     if actual == want || !PRIMITIVE_WRAPPER_CLASSES.contains(&actual.as_str()) {
         return None;
     }
+    // Assignable by either route (see `boxed_primitive_supertypes`) is a legal
+    // widening, not a mismatch.
+    if boxed_primitive_supertypes(&actual).contains(&want) || cm.is_assignable_to_name(cid, want) {
+        return None;
+    }
+    drop(cm);
     Some(actual)
 }
 
@@ -10731,13 +10889,58 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.array_length(obj)
     }
 
+    /// # The out-of-range answer is CHOSEN, not inherited
+    ///
+    /// `VmHeap::get_array_element_unboxing` DOES range-check (`gen_heap.rs`
+    /// returns `Err(index)` for `index >= array_length`, and
+    /// `ObjectHeader::array_length` answers `0` for a non-array, so a
+    /// non-array receiver lands on the same `Err` rather than a wild read).
+    /// This impl deliberately turns that `Err` into a default value instead of
+    /// an exception, for two reasons, in this order:
+    ///
+    ///  1. **The trait forbids anything else.** `NativeContext::
+    ///     get_array_element` is declared `-> Value` (`native-api/src/
+    ///     registry.rs`) and its contract reads: *"the caller is responsible
+    ///     for range-checking against `array_length`, and the implementation
+    ///     MUST bounds-check and MUST NOT read out of range (fail safe — e.g.
+    ///     default value or VM error — never an out-of-bounds heap read)"*.
+    ///     There is no error channel to propagate into, and ~3 300 call sites
+    ///     across `native-builtins` / `native-collections` / `native-io` were
+    ///     written against that contract.
+    ///  2. **A range check here would be in the wrong place anyway.** The Java
+    ///     exception a bad index must raise depends on the *caller*:
+    ///     `ArrayIndexOutOfBoundsException` for a `VarHandle`/`Array.get`
+    ///     accessor, `IndexOutOfBoundsException` for a `List` view,
+    ///     `BufferUnderflowException` for a NIO buffer, and nothing at all for
+    ///     the many probe-shaped callers that read speculatively. Each of
+    ///     those is the caller's to raise, from the caller's own length.
+    ///     `native-builtins`'s `vh_array_index` is the worked example: it
+    ///     range-checks the coordinate and raises `RuntimeError::aioobe`,
+    ///     whose text is `Preconditions.checkIndex`'s character for character.
+    ///
+    /// What this DOES fix is the shape of the default. It used to be
+    /// `Value::Int(0)` for every element type, so an out-of-range read of a
+    /// reference array handed the caller an `Int` where it expected an oop,
+    /// and a `long[]`/`double[]` read handed it an `Int` where it expected a
+    /// `Long`/`Double` — a tag mismatch a caller cannot tell from a real
+    /// element. The default is now the JLS zero value **of the array's own
+    /// element type**, and `Int(0)` only where the element type is unknowable
+    /// (non-array receiver). The type lookup is on the cold `Err` arm only.
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
         let obj = self.shared.mem.heap.load_and_forward(obj);
-        self.shared
-            .mem
-            .heap
-            .get_array_element_unboxing(obj, index)
-            .unwrap_or(Value::Int(0))
+        match self.shared.mem.heap.get_array_element_unboxing(obj, index) {
+            Ok(value) => value,
+            Err(_) => match array_element_type_of(self.shared, obj) {
+                Some(ArrayElementType::Reference) => Value::Object(None),
+                Some(ArrayElementType::Long) => Value::Long(0),
+                Some(ArrayElementType::Float) => Value::Float(0.0),
+                Some(ArrayElementType::Double) => Value::Double(0.0),
+                // Boolean/Char/Byte/Short/Int all live in an `Int` slot, and
+                // so does the "not an array at all" case, where there is no
+                // element type to be faithful to.
+                _ => Value::Int(0),
+            },
+        }
     }
 
     fn object_is_array(&self, obj: ObjectRef) -> bool {
@@ -10745,9 +10948,20 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.kind_of(obj) == ObjectKind::Array
     }
 
+    /// The dropped `Err` is the same CHOSEN silence as
+    /// `get_array_element`'s default above — see that doc comment for why it
+    /// cannot be anything else here, and for where the range check belongs
+    /// instead. `VmHeap::set_array_element` returns `Err(index)` and writes
+    /// nothing when the index is past the end (or the receiver is not an
+    /// array), so dropping it discards a *report*, never a write: the store is
+    /// already suppressed by the time we see the result.
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let obj = self.shared.mem.heap.load_and_forward(obj);
-        let _ = self.shared.mem.heap.set_array_element(obj, index, value);
+        // Deliberate discard: `NativeContext::set_array_element` is `-> ()`
+        // and its contract is "no-op or VM error, never an out-of-bounds heap
+        // write". The caller range-checks; `native-builtins`'s
+        // `vh_array_index` is the worked example.
+        let _out_of_range = self.shared.mem.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
     }
 
@@ -22989,6 +23203,38 @@ fn invoke_on_class_shared_inner(
                         } else {
                             "java/lang/invoke/VarHandle"
                         };
+                        // OPEN — the wave-2 census gap (invoke.rs:3296), noted
+                        // here because this is where it is produced.
+                        //
+                        // The three `find` loops below dispatch without calling
+                        // `record_invocation`, so `--dump-native-registry`
+                        // reports `invocations: 0` for EVERY
+                        // signature-polymorphic MethodHandle/VarHandle native
+                        // even on a run where it executed thousands of times.
+                        // Anyone using that column as a "did this native run"
+                        // oracle gets a false negative; W8-1 was misled by
+                        // exactly this.
+                        //
+                        // It is NOT a one-line fix. Mechanically it is small —
+                        // `find(c, m, d)` is documented to equal
+                        // `resolve_id(c, m, d).and_then(callback_of)`, so each
+                        // site can resolve the id, count it, and redeem the
+                        // callback for the price of one array index. The
+                        // blocker is what the count would mean: `record_
+                        // invocation` feeds `invocations_by_kind`, which the
+                        // jdk-only gate reads with `NativeKind::SyntheticStub`
+                        // and asserts is zero. The kinds reachable from here
+                        // are not knowable at this site — the third loop
+                        // resolves an ARBITRARY receiver class name, and
+                        // several reachable registrations (e.g.
+                        // `java/lang/foreign/DowncallHandle`'s invoke/
+                        // invokeExact/invokeBasic in `panama.rs`, and
+                        // `MethodHandle.invokeWithArguments`) use plain
+                        // `register`, taking whatever category was active. So
+                        // closing the gap needs a build plus a gate run to
+                        // confirm it does not flip that assertion off zero,
+                        // which is a measurement this lane could not make.
+                        //
                         // Try all possible registered descriptors for signature-polymorphic methods.
                         // These methods are registered with generic Object[] params but varying return types.
                         let poly_descs = [

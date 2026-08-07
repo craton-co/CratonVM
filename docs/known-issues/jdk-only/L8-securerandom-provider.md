@@ -185,10 +185,11 @@ itself stamps (so a caller round-tripping `getAlgorithm()` back through
 `getInstance` is not refused). The only in-tree callers are
 `regression-suite/src/RJdkSecurity.java:150`,
 `probes/JdkOnlyPlatformProbe.java:231` and
-`docs/internal/fixed-suite-bugs/repros/jca-provider-lookup-parity/ProviderLookupProbe.java`,
+and the internal repro
+`fixed-suite-bugs/repros/jca-provider-lookup-parity/ProviderLookupProbe.java`,
 all of which ask for `SHA1PRNG`. H2's `TestAll` — the app that motivated the
 `getInstance` interception in the first place
-(`docs/internal/fixed-suite-bugs/app-jvm-bugs/bug-h2-securerandom-sha1prng.md`)
+(internal record `fixed-suite-bugs/app-jvm-bugs/bug-h2-securerandom-sha1prng.md`)
 — also asks for `SHA1PRNG`.
 
 ## Out of scope (files this lane does not own)

@@ -114,8 +114,29 @@ static on `MethodHandles`. `lang_invoke.rs`'s registration is the live one.
 
 Writes `lookupClass` / `prevLookupClass` / `allowedModes` **by name**, keeping
 the index writes as the synthetic-only fallback. Layout discriminator is the
-wave-3 one — an absent field answers `Int(0)` from `get_field_by_name`, so a
-`Value::Object` answer for `prevLookupClass` means the real class:
+wave-3 one — ~~an absent field answers `Int(0)` from `get_field_by_name`, so a
+`Value::Object` answer for `prevLookupClass` means the real class~~:
+
+> **CORRECTED 2026-08-07 — the stated reason is false, and the discriminator as
+> written does not do what this paragraph says.** Production
+> `get_field_by_name` (`vm/src/vm/vm_exec.rs`) answers **`Value::Object(None)`**
+> for an absent field, not `Int(0)`; the `Int(0)`-for-absent convention belongs
+> to `MockNativeContext` in `native-builtins/src/test_utils.rs` and to nothing
+> else (`native-api/src/test_mock.rs` answers `Object(None)` like production).
+> So `matches!(…, Value::Object(_))` matches the absent case as well as the real
+> null, and **takes the real-layout arm on the synthetic layout too** — the
+> branch it was written to exclude.
+>
+> The code is nonetheless correct today, for a reason this section predates:
+> W6-3 added a positive **class-side witness** as a disjunct in front of the
+> value-shape test —
+> `ctx.resolve_field_index_by_class_id(ctx.class_id_of_object(obj), "prevLookupClass").is_some()`
+> — and the synthetic arm is now reached only when the class genuinely does not
+> declare the field. Do not "simplify" the disjunct away on the strength of the
+> struck-through sentence. See
+> [§4 of *Natives over real JDK classes*](../../architecture/natives-over-real-jdk-classes.md)
+> and `docs/feature-designs/by-name-field-reads.md` §1 for where the real
+> `Int(0)` comes from (a present-but-**unwritten** reference slot).
 
 ```rust
 if matches!(ctx.get_field_by_name(obj, "prevLookupClass"), Value::Object(_)) {

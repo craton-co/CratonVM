@@ -5938,6 +5938,40 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
 /// `stampedlock-surface-must-be-complete-not-partial` asks for; a *partial*
 /// surface is the failure mode there, and an ambient tag that depends on call
 /// order is exactly how you get one.
+///
+/// CALLED THREE TIMES PER BOOT, AND THAT IS FINE — verified W7-15, 2026-08-07.
+/// The census will show every triple below repeated; the repeats are these:
+///
+///   1. `lib.rs::register_essential_natives_with_shims` calls it directly;
+///   2. the very next line there calls [`register_rwlock_natives`], which
+///      calls it again on BOTH of its arms (real-AQS returns early through it,
+///      synthetic AQS reaches it at the end of `register_synthetic_rwlock_natives`);
+///   3. `vm/src/vm/vm_init.rs` calls it directly, in both mode arms.
+///
+/// A `synthetic-jdk` feature build adds a fourth via
+/// `register_synthetic_overrides` -> [`register_rwlock_natives`].
+///
+/// IDEMPOTENT FOR DISPATCH. Each repeat re-registers the identical triples with
+/// the identical named-`fn` callbacks; this function states its own category, so
+/// unlike the pre-2026-08-06 behaviour described above there is no ambient-kind
+/// disagreement between callers, and `current_leaf` is `false` at all of them.
+/// `NativeMethodRegistry::register` updates the EXISTING slot in place for a key
+/// it has already seen — same callback, same `SyntheticStub` kind, same leaf
+/// claim — and does not append a slot or a `slot_invocations` counter, so
+/// already-issued `NativeMethodId`s stay valid and nothing observable changes.
+///
+/// NOT idempotent for the two per-registration LOGS, which is where the repeats
+/// become visible and why they must not be read as a defect:
+///
+///   * `registrations` / `categories` / `kind_stated` / `category_chosen_log` /
+///     `provenance` each gain a row per repeat, with
+///     `provenance.overwrote == Some(SyntheticStub)` — i.e. this surface shadows
+///     ITSELF. Those are the ~62 self-shadowed `StampedLock` rows in the
+///     duplicate-registration census, not 62 lost registrations.
+///   * under `CompatibilityMode::JdkOnly` the refusal arm returns *before*
+///     inserting, so all 31 triples are pushed onto `refused` once per call.
+///     A `--jdk-only` gate that counts refusal ROWS therefore counts this
+///     surface three times; count distinct triples instead.
 pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
@@ -6253,20 +6287,59 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Int(i32::from(valid))))
 }
 
+/// The stamp argument of a `(J)V` / `(J)Z` StampedLock native, or `None`
+/// when the frame did not carry one.
+fn stamped_arg(args: &[Value]) -> Option<i64> {
+    match args.get(1) {
+        Some(Value::Long(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+/// `unlockRead(long stamp)`.
+///
+/// The stamp is CHECKED, not ignored: the JDK throws
+/// `IllegalMonitorStateException` when the stamp is not a read stamp, when
+/// its version has moved on, or when no read hold is outstanding. Verified
+/// against HotSpot 25.0.3 (`SLBits.java` rows `J.unlockReadBogus = IMSE`).
 fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_unlock_read(addr);
-        mirror_stamped_state(ctx, obj, addr);
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(None);
+    };
+    let stamp = stamped_arg(args).unwrap_or(0);
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let released = crate::stamped_lock::stamped_unlock_read(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
+    if !released {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: format!("unlockRead: stamp {stamp} does not hold this lock"),
+        }
+        .into());
     }
     Ok(None)
 }
 
+/// `unlockWrite(long stamp)`.
+///
+/// The JDK guard is `if (state != stamp || (stamp & WBIT) == 0L) throw` — an
+/// EXACT state-word match, so a stale stamp cannot release a later writer's
+/// hold. This used to ignore the stamp and release whatever was held, which
+/// silently broke mutual exclusion whenever a caller passed the wrong stamp
+/// (which the `isWriteLockStamp` encoding bug made routine). Verified
+/// against HotSpot (`J.doubleUnlockWrite = IMSE`).
 fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
-        crate::stamped_lock::stamped_unlock_write(addr);
-        mirror_stamped_state(ctx, obj, addr);
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(None);
+    };
+    let stamp = stamped_arg(args).unwrap_or(0);
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let released = crate::stamped_lock::stamped_unlock_write(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
+    if !released {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: format!("unlockWrite: stamp {stamp} does not hold this lock"),
+        }
+        .into());
     }
     Ok(None)
 }
@@ -6284,40 +6357,43 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// dead code, never called from anywhere in the tree. The live shadower was
 /// `native-collections`, which wins by running after `register_builtins`.
 ///
-/// Spec: release whichever mode the stamp represents, and throw
-/// `IllegalMonitorStateException` if the stamp does not match the lock's
-/// current state. Our backend encodes a write hold as the low bit of the
-/// stamp (`STAMPED_ORIGIN` is even), so an odd stamp is a write stamp and
-/// an even non-zero stamp is a read stamp — mirroring the JDK's own
-/// `WBIT` test without depending on the JDK's exact bit layout.
+/// Spec, transcribed from JDK 25 `StampedLock.unlock`:
+///
+/// ```java
+/// public void unlock(long stamp) {
+///     if ((stamp & WBIT) != 0L) unlockWrite(stamp);
+///     else                      unlockRead(stamp);
+/// }
+/// ```
+///
+/// so it is a pure re-dispatch, and the `IllegalMonitorStateException` comes
+/// from the callee. Note this arm tests `(stamp & WBIT) != 0`, NOT
+/// `isWriteLockStamp`'s `(stamp & ABITS) == WBIT`.
+///
+/// Until 2026-08-07 this read the write flag as `stamp & 1` and the read
+/// flag as `stamp & 2` — a private encoding this backend no longer uses; see
+/// the constant block in `stamped_lock` for why the JDK's own layout is now
+/// mandatory. It also released the hold WITHOUT checking the stamp's
+/// version, so a stale stamp released a live hold belonging to someone else.
 fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(obj) = stamped_obj(args) else {
         return Ok(None);
     };
-    let stamp = match args.get(1) {
-        Some(Value::Long(v)) => *v,
+    let Some(stamp) = stamped_arg(args) else {
         // The verifier guarantees a long here; anything else means the call
         // did not come through `unlock(J)V`, so refuse rather than guess.
-        _ => {
-            return Err(RuntimeError::IllegalMonitorStateException {
-                message: "unlock: missing stamp argument".to_string(),
-            }
-            .into())
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: "unlock: missing stamp argument".to_string(),
         }
+        .into());
     };
     let addr = stamped_addr_for_obj(ctx, obj);
-    let released = if stamp == 0 {
-        // Stamp 0 is the JDK's "acquisition failed" sentinel and can never
-        // name a held lock.
-        false
-    } else if stamp & 1 != 0 {
-        crate::stamped_lock::stamped_try_unstamped_unlock_write(addr)
-    } else if stamp & 2 != 0 {
-        crate::stamped_lock::stamped_try_unstamped_unlock_read(addr)
+    let released = if stamp & crate::stamped_lock::JDK_WBIT != 0 {
+        crate::stamped_lock::stamped_unlock_write(addr, stamp)
     } else {
-        // Neither mode bit set: an OPTIMISTIC observation stamp, which holds
-        // nothing. The JDK throws IllegalMonitorStateException for it too.
-        false
+        // Everything else -- read stamps, optimistic stamps and the zero
+        // sentinel -- goes to unlockRead, which rejects the last two.
+        crate::stamped_lock::stamped_unlock_read(addr, stamp)
     };
     if !released {
         return Err(RuntimeError::IllegalMonitorStateException {
@@ -8767,8 +8843,12 @@ mod concurrency_tests {
         let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
-        assert!(matches!(stamp, Value::Long(v) if v & 1 != 0));
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        // Real JDK layout: a write stamp's mode field is WBIT (128). It used
+        // to be bit 0, which made `StampedLock.isWriteLockStamp` — real JDK
+        // bytecode, since nothing registers it — call this a READ stamp.
+        assert!(matches!(stamp, Value::Long(v) if v & 255 == 128), "got {stamp:?}");
+        // `unlockWrite` now CHECKS its stamp, so it must be the real one.
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
 
         // After unlock the lock must NOT report write-locked — i.e. the unlock
         // hit the SAME slot the lock established (would fail under the old
@@ -8928,7 +9008,7 @@ mod concurrency_tests {
     }
 
     #[test]
-    fn m18_stamped_write_lock_returns_odd_stamp() {
+    fn m18_stamped_write_lock_returns_wbit_stamp() {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let sl = ctx.alloc_object(ClassId::new(0), 1);
@@ -8939,7 +9019,8 @@ mod concurrency_tests {
             .unwrap();
         match stamp {
             Value::Long(v) => {
-                assert!(v & 1 != 0, "write stamp should be odd, got {}", v);
+                // JDK `isWriteLockStamp`: `(stamp & ABITS) == WBIT`.
+                assert_eq!(v & 255, 128, "write stamp mode field must be WBIT, got {v}");
             }
             _ => panic!("expected Long stamp"),
         }
@@ -8975,8 +9056,10 @@ mod concurrency_tests {
         let before = native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
         let after = native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
@@ -8989,7 +9072,8 @@ mod concurrency_tests {
                     b,
                     a
                 );
-                assert!(a & 1 == 0, "stamp should be even after unlock, got {}", a);
+                // JDK `isOptimisticReadStamp`: `(stamp & ABITS) == 0`.
+                assert_eq!(a & 255, 0, "post-unlock stamp must be optimistic, got {a}");
             }
             _ => panic!("expected Long stamps"),
         }
@@ -9032,8 +9116,10 @@ mod concurrency_tests {
             _ => panic!("expected Long"),
         };
         // Perform a write lock/unlock cycle — stamp advances
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        let wstamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), wstamp]).unwrap();
         // Old stamp should now be invalid
         let valid =
             native_stamped_validate(&mut ctx, &[Value::Object(Some(sl)), Value::Long(stamp)])
@@ -9059,7 +9145,7 @@ mod concurrency_tests {
     }
 
     #[test]
-    fn m18_stamped_read_lock_returns_even_stamp() {
+    fn m18_stamped_read_lock_returns_reader_count_stamp() {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let sl = ctx.alloc_object(ClassId::new(0), 1);
@@ -9069,7 +9155,9 @@ mod concurrency_tests {
             .unwrap()
             .unwrap();
         match stamp {
-            Value::Long(v) => assert!(v & 1 == 0, "read stamp should be even, got {}", v),
+            // JDK `isReadLockStamp`: `(stamp & RBITS) != 0`. The low 7 bits
+            // are the READER COUNT, so the sole reader's stamp ends in 1.
+            Value::Long(v) => assert_eq!(v & 255, 1, "read stamp mode field must be 1, got {v}"),
             _ => panic!("expected Long"),
         }
     }
@@ -9125,13 +9213,15 @@ mod concurrency_tests {
             .unwrap();
         assert_eq!(locked, Value::Int(0));
 
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap();
         let locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
         assert_eq!(locked, Value::Int(1));
 
-        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)]).unwrap();
+        native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
         let locked = native_stamped_is_write_locked(&mut ctx, &[Value::Object(Some(sl))])
             .unwrap()
             .unwrap();
@@ -9256,7 +9346,8 @@ mod concurrency_tests {
         match read_stamp {
             Value::Long(v) => {
                 assert!(v != 0, "conversion to read should succeed");
-                assert!(v & 1 == 0, "read stamp should be even after conversion");
+                // Downgrade leaves exactly one reader, so `& ABITS == 1`.
+                assert_eq!(v & 255, 1, "converted read stamp must be a read stamp, got {v}");
             }
             _ => panic!("expected Long"),
         }
@@ -9437,9 +9528,10 @@ mod concurrency_tests {
 
         let mut prev_stamp = STAMPED_ORIGIN;
         for _ in 0..5 {
-            native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
-            native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), Value::Long(0)])
+            let stamp = native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+                .unwrap()
                 .unwrap();
+            native_stamped_unlock_write(&mut ctx, &[Value::Object(Some(sl)), stamp]).unwrap();
             let cur = match native_stamped_optimistic(&mut ctx, &[Value::Object(Some(sl))])
                 .unwrap()
                 .unwrap()
@@ -9448,7 +9540,7 @@ mod concurrency_tests {
                 _ => panic!("expected Long"),
             };
             assert!(cur > prev_stamp, "stamp should monotonically increase");
-            assert!(cur & 1 == 0, "stamp should be even after unlock");
+            assert_eq!(cur & 255, 0, "stamp must be optimistic after unlock, got {cur}");
             prev_stamp = cur;
         }
     }

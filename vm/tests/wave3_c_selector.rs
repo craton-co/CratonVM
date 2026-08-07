@@ -93,7 +93,17 @@ fn run_selector_probe(timeout: Duration) -> Option<(String, String, Option<i32>)
     let bin = cratonvm_binary()?;
     let probe = probe_dir();
     if !probe.join("SelectorProbe.class").exists() {
-        eprintln!("[wave3-c] SelectorProbe.class missing — run javac in apps/selector_probe");
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave3-c",
+            "the Wave 3 Task C fixture `SelectorProbe` (SelectorProbe.class, compiled from \
+             SelectorProbe.java)",
+            &[
+                probe.join("SelectorProbe.class"),
+                probe.join("SelectorProbe.java"),
+            ],
+        );
         return None;
     }
     let mut cmd = Command::new(&bin);

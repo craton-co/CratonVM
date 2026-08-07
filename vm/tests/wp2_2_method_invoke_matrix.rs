@@ -105,6 +105,12 @@ fn invocation_target_exception_class_resolvable() {
 fn method_invoke_probe_class_files_exist_when_staged() {
     let probe = probe_classes_dir();
     if !probe.exists() {
+        let _ = common::require_fixture(
+            "wp2_2_method_invoke_matrix",
+            "the WP2.2 fixture directory `method_invoke_probe/classes` (built from \
+             MethodInvokeProbe.java)",
+            &[probe.clone()],
+        );
         return;
     }
     assert!(
@@ -288,6 +294,17 @@ fn ensure_probe_compiled() -> bool {
     }
     let src = probe_source_file();
     if !src.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`. `apps/` is gitignored (.gitignore line 12),
+        // which is why this fixture was never tracked and is absent here.
+        let _ = common::require_fixture(
+            "wp2_2_method_invoke_matrix",
+            "the WP2.2 fixture `MethodInvokeProbe.java` (this file's per-case tests pin its \
+             MethodInvokeProbe$Targets / $Custom / $Sub / $AbstractBase / $IFace / $WithIface \
+             inner classes)",
+            &[src.clone()],
+        );
         return false;
     }
     let _ = std::fs::create_dir_all(&classes);

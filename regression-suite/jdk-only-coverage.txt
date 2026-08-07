@@ -27,14 +27,33 @@ How to run
   # everything, across the javac release matrix
   SUITE=all RELEASES="17 21 25" bash regression-suite/run.sh
 
-Every vector is written to Java 17 source level so the whole 17/21/25 matrix
-compiles from one source tree.
+Every JDK-only vector is written to Java 17 source level so the whole 17/21/25
+matrix compiles from one source tree. Both vectors added on 2026-08-07
+(RJdkPhaser, RJdkFieldModule) were re-checked at --release 17 and 21 and are
+clean at both.
+
+KNOWN, as of 2026-08-07: `RELEASES="17 ..."` nevertheless FAILS at level 17,
+and not because of this corpus. run.sh compiles ALL of src/*.java in one javac
+invocation, so a single CORE vector above 17 takes the whole level down with
+it — today that is regression-suite/src/RChmKeySetView.java, which uses
+Executors.newVirtualThreadPerTaskExecutor() (Java 21) and ExecutorService in a
+try-with-resources (AutoCloseable since Java 19). Levels 21 and 25 compile
+clean. The level is counted as a failure, not skipped, so this shows up red
+rather than green — but the "one source tree at 17" claim above is currently
+true of the corpus and false of the suite as a whole.
 
 Mode-dependent expectations
 ---------------------------
-Twenty of the twenty-one vectors are mode-INDEPENDENT: their correct outcome is
-identical under --real-jdk and --jdk-only, so HotSpot is a valid oracle in both
-modes and run.sh diffs against it either way.
+Twenty-two of the twenty-three vectors are mode-INDEPENDENT: their correct
+outcome is identical under --real-jdk and --jdk-only, so HotSpot is a valid
+oracle in both modes and run.sh diffs against it either way.
+
+(Corpus size as of 2026-08-07: 23. RJdkPhaser and RJdkFieldModule were added on
+that date, having been written but registered in no class list — they compiled
+on every run and executed on none. Both are verified rc=0 with byte-identical
+repeated output on Temurin 25.0.3; NEITHER has yet been run on CratonVM, so
+their first scheduled run may be red, and that red is a finding, not a
+regression introduced by whoever lands next.)
 
 RJdkStrict is not. It probes precisely the places where compatible mode is
 DESIGNED to fabricate a class (the org.jboss / io.quarkus / io.smallrye
@@ -83,6 +102,10 @@ row in docs/jdk-only-runtime-services.md it maps to (P0/P1 table).
                                                        (ClassOrigin::HiddenClass)
   reflection and serialization  RJdkReflect        P1 "Reflection and generated accessors"
                                                        (incl. the inflation/accessor path)
+  field access under JPMS       RJdkFieldModule    P1 "JPMS / module semantics" (the exports-
+                                                       vs-opens question on a field read)
+                                                   P1 "Reflection and generated accessors"
+                                                       (the typed getInt/setLong family)
   JMX                           RJdkJmx            P0 "JMX real path"        <-- named P0
   ServiceLoader (class path)    RJdkServices       P1 "JPMS / module semantics" (services half)
   named-module application      RJdkModule         P1 "JPMS / module semantics"
@@ -90,6 +113,12 @@ row in docs/jdk-only-runtime-services.md it maps to (P0/P1 table).
   ForkJoin                      RJdkForkJoin       P1 "ForkJoin worker execution"
   AQS                           RJdkAqs            P1 "Concurrency + GC cooperation"
                                                    P1 "Thread and executor semantics"
+  Phaser                        RJdkPhaser         P1 "Thread and executor semantics"
+                                                   P0 "Native-first dispatch and hard-coded
+                                                       overrides" (a shim mirroring Phaser's
+                                                       volatile long state into side-state is
+                                                       a split brain; every assertion here is
+                                                       a value such a model gets wrong)
   ProcessHandle                 RJdkProcess        P1 "ProcessHandle"        <-- named P1
   files and NIO                 RJdkNio            P1 "NIO, files, networking"
   networking                    RJdkNet            P1 "NIO, files, networking"

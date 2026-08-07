@@ -134,24 +134,47 @@ fn proxy_native_call_populates_last_interfaces_after_a_proxy_is_made() {
     // proves the symbol is exposed and the cache is reachable.
     let vm = cratonvm_vm::vm::SharedVm::new(cratonvm_vm::config::VmConfig::default());
     let bits_before = cratonvm_native_builtins::proxy_last_interfaces_bits(vm.vm_identity);
-    // Without an actual `newProxyInstance` call we can't write to the
-    // cache (it's intentionally process-wide and only updated from the
-    // native). We just sanity-check that the accessor compiles, links,
-    // and returns 0 or a real pointer (never crashes).
-    let _ = bits_before;
+    // Without an actual `newProxyInstance` call we can't write to the cache
+    // (it's only updated from the native), so this cannot check the "populates"
+    // half its name promises. What it CAN check — and what `let _ = bits_before`
+    // checked, namely nothing — is the accessor's documented zero-value
+    // contract: `proxy_last_interfaces_bits` returns 0 when no proxy has been
+    // created for that VM identity (see `reflect_annotations.rs`, which maps the
+    // tracked cell through `.unwrap_or(0)`).
+    //
+    // The assertion is made against a SENTINEL identity, not `vm.vm_identity`.
+    // `vm_identity` values are not guaranteed unique across a VM's lifetime, and
+    // sibling tests in this binary run whole VMs in-process; asserting 0 for a
+    // live identity would be a race. `usize::MAX` is an identity no VM has,
+    // which makes the zero answer a property rather than a scheduling accident.
+    assert_eq!(
+        cratonvm_native_builtins::proxy_last_interfaces_bits(usize::MAX),
+        0,
+        "proxy_last_interfaces_bits must answer 0 for a VM identity that never created a proxy"
+    );
+    // A freshly built VM has created no proxy either, so its cell must read 0
+    // too. This one CAN race in principle (identities are reused), so it is
+    // reported rather than asserted — an eprintln that shows up under
+    // `--nocapture` is honest; a vacuous `bits_before >= 0` on a u64 would not
+    // be, since it is true for every possible value.
+    eprintln!("[wp2_5] fresh-VM proxy_last_interfaces_bits = {bits_before}");
 }
 
 #[test]
 fn proxy_probe_compiled_class_files_exist() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let probe_dir = manifest.parent().unwrap().join("apps").join("proxy_probe");
-    if !probe_dir.exists() {
-        return; // Fixture not staged.
-    }
     let main_cls = probe_dir.join("ProxyProbe.class");
-    if !main_cls.exists() {
-        // Source-only stage — that's fine, a builder pre-step compiles
-        // it on demand. Nothing to verify in this branch.
+    if !probe_dir.exists() || !main_cls.exists() {
+        // Loud, and a failure under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture` and the NAME COLLISION note on
+        // `probe_source_file`.
+        let _ = common::require_fixture(
+            "wp2_5_proxy",
+            "the WP2.5 fixture `ProxyProbe` (ProxyProbe.class, compiled from ProxyProbe.java; \
+             this test pins ProxyProbe$Greeter / $Counter / $PrefixedGreeter)",
+            &[main_cls.clone(), probe_dir.join("ProxyProbe.java")],
+        );
         return;
     }
     // If the classes are staged, the inner classes for the inner
@@ -174,7 +197,14 @@ fn proxy_probe_loads_under_cratonvm_when_staged() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let probe_dir = manifest.parent().unwrap().join("apps").join("proxy_probe");
     if !probe_dir.join("ProxyProbe.class").exists() {
-        eprintln!("proxy_probe/ProxyProbe.class not staged — skipping load test");
+        let _ = common::require_fixture(
+            "wp2_5_proxy",
+            "the WP2.5 fixture `ProxyProbe` (ProxyProbe.class, compiled from ProxyProbe.java)",
+            &[
+                probe_dir.join("ProxyProbe.class"),
+                probe_dir.join("ProxyProbe.java"),
+            ],
+        );
         return;
     }
 
@@ -303,7 +333,17 @@ fn proxy_lambda_handler_dispatches_single_iface() {
     // InvocationHandler. Verifies that the lambda body executes
     // (no "no Code attribute" linkage error).
     if proxy_probe_dir().is_none() {
-        eprintln!("proxy_probe not staged — skipping");
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let probe_dir = manifest.parent().unwrap().join("apps").join("proxy_probe");
+        let _ = common::require_fixture(
+            "wp2_5_proxy",
+            "the WP2.5 fixture `ProxyProbe` (compiled ProxyProbe.class, in the probe dir or its \
+             classes/ subdir)",
+            &[
+                probe_dir.join("classes").join("ProxyProbe.class"),
+                probe_dir.join("ProxyProbe.class"),
+            ],
+        );
         return;
     }
     let r = run_proxy_main("ProxyProbe");
@@ -453,6 +493,25 @@ use std::sync::OnceLock;
 
 /// Source `.java` file for the probe — used by the on-demand `javac`
 /// fallback if the classes directory is missing.
+///
+/// # NAME COLLISION — do not "repoint" this at `probes/ProxyProbe.java`
+///
+/// `apps/proxy_probe/ProxyProbe.java` is absent from the tree (`apps/` is
+/// gitignored, .gitignore line 12), and a tracked `probes/ProxyProbe.java` does
+/// exist — which makes this look like a one-line wrong-path bug. It is not.
+/// The two files share a class name and nothing else:
+///
+/// | | `probes/ProxyProbe.java` (tracked) | what THIS file asserts |
+/// |---|---|---|
+/// | interfaces | `Greeter{greet,count}`, `Marker` | `Greeter`, `Counter`, `PrefixedGreeter` |
+/// | output | `greet=`, `count=`, `PROXY-DONE` | `pass-1`..`pass-6`, `summary 6/6`, `OK` |
+/// | default methods | none | case 6 requires one |
+///
+/// Repointing would convert seven silent skips into seven failures that name
+/// the wrong defect. The WP2.5 fixture has to be rewritten to the 6-case
+/// contract documented at the bottom of this file; when it is, put it in
+/// `probes/` under a NON-colliding name (e.g. `probes/Wp25ProxyProbe.java`)
+/// and add that path here.
 fn probe_source_file() -> PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -504,6 +563,22 @@ fn ensure_probe_compiled() -> bool {
     }
     let src = probe_source_file();
     if !src.exists() {
+        // A missing fixture is a broken checkout, not an absent toolchain. Report
+        // it loudly, and fail under CRATONVM_REQUIRE_E2E — see
+        // `common::require_fixture`.
+        //
+        // DO NOT "fix" this by pointing `probe_source_file` at
+        // `probes/ProxyProbe.java`. That file exists and is tracked, but it is a
+        // DIFFERENT probe with the same class name — see the NAME COLLISION note
+        // above `probe_source_file`.
+        let _ = common::require_fixture(
+            "wp2_5_proxy",
+            "the WP2.5 6-case fixture `ProxyProbe.java` (must print pass-1..pass-6, `summary 6/6` \
+             and `OK`, and declare ProxyProbe$Greeter / $Counter / $PrefixedGreeter). NOTE: the \
+             tracked `probes/ProxyProbe.java` is a DIFFERENT probe with the same class name and \
+             will NOT satisfy these assertions",
+            &[src.clone()],
+        );
         return false;
     }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

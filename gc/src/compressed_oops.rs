@@ -43,7 +43,8 @@
 //! the JIT's inline compact-field fast paths are disabled, i.e. "a throughput
 //! regression, not incompleteness". A full sweep of every reference-slot access
 //! in the workspace found that to be false. Under the *generational* backend
-//! (the only one the gate permits — `vm/src/vm/vm_init.rs:862`) two paths read
+//! (the only one the gate permits — the `gc_backend != GcBackend::Generational`
+//! check in `vm/src/vm/vm_init.rs`) two paths read
 //! or wrote a reference slot at the wrong width:
 //!
 //! 1. **`jit/src/x64/objects.rs` `emit_load_string_value_ptr`.** It emitted an
@@ -140,8 +141,20 @@
 //! 6. `gc/src/g1.rs` (~20 sites, including the main mark loop at `:5211` and
 //!    every evacuation/remembered-set path), `gc/src/zgc.rs:1788`, and
 //!    `gc/src/region.rs:957`/`:993` are entirely unmigrated. These are held off
-//!    solely by the backend check at `vm/src/vm/vm_init.rs:862`, which is
-//!    therefore load-bearing and must not be relaxed before they are.
+//!    solely by the `gc_backend != GcBackend::Generational` check in
+//!    `vm/src/vm/vm_init.rs`, which is therefore load-bearing and must not be
+//!    relaxed before they are.
+//!
+//!    G1 and ZGC are NOT the same case, and this item used to blur them.
+//!    G1 is *unmigrated*: narrow oops and a moving-but-uncolored collector are
+//!    compatible in principle, so those ~20 sites are work someone could do.
+//!    ZGC is *incompatible by construction* and must stay refused permanently.
+//!    Its colored pointers spend bits 42-45 on mark/remap/finalizable metadata
+//!    plus bit 63 on CratonVM's escaped-word tag (see `gc/src/zgc/vaddr.rs`);
+//!    a 32-bit narrow slot has no room for them, and — the part that actually
+//!    bites — a 32-bit slot cannot represent a value above `2^47`, so the
+//!    `plausible_heap_pointer` tripwire that catches an escaped colored word
+//!    has nothing left to trip on. OpenJDK refuses the same combination.
 //!
 //! Full derivation, including the honest footprint arithmetic and how this
 //! interacts with shrinking `ObjectHeader` from 32 to 16 bytes, is in
@@ -1029,7 +1042,8 @@ pub fn enable_for_live_heap() -> Result<(u64, u8), String> {
 
 /// Announce, once, that this run has two known correctness holes.
 ///
-/// The caller (`vm/src/vm/vm_init.rs:884`) already prints a success line saying
+/// The caller (the compressed-oops setup block in `vm/src/vm/vm_init.rs`, just
+/// past the `GcBackend::Generational` gate) already prints a success line saying
 /// narrow oops are on. That line reads like an endorsement, and it is not one:
 /// anyone who flips `-XX:+UseCompressedOops` must be told what is still
 /// unmigrated at the moment they opt in, not discover it from a crash dump.

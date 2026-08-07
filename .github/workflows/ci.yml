@@ -251,6 +251,97 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test -p cratonvm-native-builtins --test lock_discipline_ratchet -- --nocapture
 
+      # THE DUPLICATE-REGISTRATION GATE
+      # (native-builtins/tests/duplicate_registration_gate.rs; see
+      # docs/known-issues/jdk-only/W6-4-duplicate-registration-gate.md).
+      #
+      # `NativeMethodRegistry::register` is last-write-wins and rewrites the
+      # slot IN PLACE, so a second registration of the same (class, method,
+      # descriptor) triple silently replaces the callback AND the kind. Live
+      # instances keep being found by hand — a hardened
+      # `ClassLoader.defineClass2` bounds decoder shadowed by an older
+      # unhardened one, and `Integer.toString(II)` registered THREE times where
+      # the two copies lanes tried to fix were both shadowed by a third.
+      #
+      # NAMED HERE FOR THE FIRST TIME, BUT NOT RUN FOR THE FIRST TIME. "Nothing
+      # runs it" is half right: it appears nowhere else in this file, yet
+      # `cargo test --workspace` above builds and runs every workspace
+      # integration test, this one included, and so does the
+      # `experimental-features` job's `--features ...,management,...` test
+      # step. What it has never had is a resolve it STATES. Both of those
+      # inherit `management` from `cratonvm-vm`'s defaults through feature
+      # unification, so the configuration the number belongs to is an accident
+      # of who else is in the build graph — and would move silently if a
+      # member stopped enabling it. `-p` plus an explicit `--features` is the
+      # fix, and it is why these are steps rather than a comment.
+      #
+      # TWO CONFIGURATIONS, TWO BASELINES, ON PURPOSE. `vm_init`'s real-JDK arm
+      # gates all ten `jmx::*` registrars behind `#[cfg(feature =
+      # "management")]` (vm/src/vm/vm_init.rs:2728-2784) and this crate's `jmx`
+      # module is gated the same way (native-builtins/src/lib.rs:4128).
+      # `cratonvm-vm` declares `default = ["awt", "management"]`, so every
+      # shipping `cratonvm-cli` build has them; `cratonvm-native-builtins`
+      # declares `default = []`, so a `-p` resolve does not. The census is
+      # therefore genuinely feature-dependent, and the test refuses to pretend
+      # otherwise: it names its configuration on every line it prints and in
+      # every failure message, and seeds a separate constant per configuration.
+      # Collapsing the two would mean dropping those ten registrars from the
+      # model in BOTH, i.e. under-measuring the build that actually ships.
+      #
+      # The second step is also a regression guard for a live break: until
+      # 2026-08-07 the replay called those ten registrars unconditionally, so
+      # this test target did not COMPILE without `management` (ten E0433s). It
+      # looked green under `cargo check --workspace --all-targets`, where
+      # unification supplies the feature, while the `experimental-features`
+      # job's `cargo check --all-targets -p cratonvm-native-builtins --features
+      # app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto` step compiles
+      # exactly the resolve that could not build it.
+      #
+      # BLOCKING, AND HONEST ABOUT WHAT IT BLOCKS ON TODAY. Two of the four
+      # tests are deterministic now and gate for real: the source witness
+      # (`vm_init` must not grow, or reorder, a registrar the replay does not
+      # model — an order inversion makes every "which registration wins" answer
+      # in the census wrong, and it carries no baseline) and the negative
+      # control (the replay must register thousands of natives, so the ratchets
+      # cannot go vacuous). The two COUNT ratchets are UNSEEDED: their
+      # baselines are `None`, and while `None` they print the measurement plus
+      # the exact `const ... = Some(N);` line to paste, and adjudicate nothing.
+      # Seeding a guess would be worse than not gating — a baseline above the
+      # true count tolerates every duplicate below it, which is precisely this
+      # species' existing failure mode.
+      #
+      # THE UNSEEDED STATE IS SELF-EXPIRING, not a permanent soft gate.
+      # `UNSEEDED_GRACE_ENDS_UNIX` in the test is 2026-09-07T00:00:00Z; past
+      # it, an unseeded baseline FAILS, and the failure text names the only two
+      # legitimate fixes (seed it, or move the date in the same commit as a
+      # written reason). That is deliberately NOT the fixed-wall-clock-bound
+      # shape this repository spent a wave removing from the synthetic-jdk
+      # suite: those asserted that an operation finished inside a duration, so
+      # they went red under load, at random, and taught people to ignore CI.
+      # This reads the calendar, is deterministic, and fires exactly once.
+      #
+      # `ubuntu-latest` only, exactly like the three ratchets above and for the
+      # same reason: registrars are platform-conditional, so a baseline is
+      # keyed to the OS that produced it, and linux is the key every other
+      # committed baseline in this file uses. Worth running the windows leg
+      # once while seeding, to learn whether the two numbers differ at all —
+      # that is a measurement, not an assumption, and it decides whether a
+      # second key is ever needed.
+      #
+      # `--nocapture` on both, because the census IS the diagnosis: a count
+      # says something changed, the loser-site/winner-site pair says what.
+      - name: Duplicate-registration gate (shipping resolve, --features management)
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          cargo test -p cratonvm-native-builtins --features management
+          --test duplicate_registration_gate -- --nocapture
+
+      - name: Duplicate-registration gate (this crate's own default resolve)
+        if: matrix.os == 'ubuntu-latest'
+        run: >
+          cargo test -p cratonvm-native-builtins
+          --test duplicate_registration_gate -- --nocapture
+
   # `synthetic-jdk` feature gate. This feature is documented and supported (see
   # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
   # it is deliberately NOT in the default set — so every job above compiles the
@@ -479,6 +570,75 @@ jobs:
           cargo check --all-targets
           -p cratonvm-native-builtins
           --features app-stubs,synthetic-quarkus-arc,legacy-synthetic-crypto
+
+      # THE ZGC HALF OF THIS JOB, AND WHY IT IS TWO MORE STEPS RATHER THAN ONE
+      # MORE NAME ON THE FEATURE LIST ABOVE.
+      #
+      # `zgc` was already on that list, and it was not enough. On 2026-08-05
+      # `ZgcRealHeap::with_capacity()` was left out of the change that gave the
+      # compact-layout registry a domain — its three sibling collectors (`Heap`,
+      # `G1Collector`, `GenHeap`) all got `layout_domain`, it did not — and the
+      # feature stopped compiling with E0063. It was found on 2026-08-07 by a
+      # human running a full suite, not by this job.
+      #
+      # Two gaps let that through, and these steps close both:
+      #
+      #  1. NOTHING BUILT THE BINARY. Every zgc step here is `-p cratonvm-vm -p
+      #     cratonvm-native-builtins`, i.e. libraries. `cratonvm-cli` was never
+      #     compiled with the feature by any job in this file. That matters more
+      #     than the usual lib-vs-bin distinction because `zgc` also gates an
+      #     enum variant (`GcAlgorithm::Zgc`) and a `parse_gc_algorithm` match
+      #     arm in `vm/src/config.rs`, plus the `VmHeap::Zgc` arms in
+      #     `gc/src/vm_heap.rs` — whole dispatch paths that a default build
+      #     resolves to nothing. It is also the `-p`-scoped resolve a suite build
+      #     actually gets, for the same reason the "Default-feature native
+      #     registry surface" step in `build-and-test` is `-p`-scoped.
+      #  2. THE COLLECTOR'S OWN TESTS RAN NOWHERE. When these steps were added
+      #     that was 89 `#[test]`s (86 in `gc/src/zgc.rs`, 3 in
+      #     `gc/src/zgc_concurrent.rs`), all inside `#[cfg(feature = "zgc")]`
+      #     modules of a crate that no job selected with the feature on.
+      #     As of 2026-08-07 it is 368, after eleven new `gc/src/zgc/` modules
+      #     landed and `zgc_concurrent.rs` was rewritten: 91 in `zgc.rs`,
+      #     12 in `zgc_concurrent.rs`, 265 across `gc/src/zgc/*.rs`. Recount
+      #     with (bash, from the repo root):
+      #       grep -c '#\[test\]' gc/src/zgc.rs gc/src/zgc_concurrent.rs \
+      #         $(sed -n 's/^pub mod \(.*\);$/gc\/src\/zgc\/\1.rs/p' gc/src/zgc.rs)
+      #     Count only modules `zgc.rs` actually declares — an undeclared file
+      #     in `gc/src/zgc/` does not compile and its tests do not run, which is
+      #     how `census.rs`'s 24 tests sat unexecuted until it was declared.
+      #     Compiling them is not the point — `ZgcRealHeap` is a real
+      #     memory-backed mark-sweep collector (`GarbageCollector` impl, real
+      #     `Arena` storage, real `ObjectHeader`s), so its unit tests are a
+      #     behavioural signal and must execute.
+      #
+      # `--features zgc` resolves bare here because `cratonvm-cli` declares its
+      # own pass-through (`zgc = ["cratonvm-vm/zgc"]`, added with these steps) —
+      # that is also the command a developer uses for a ZGC-capable launcher.
+      # `cargo build`, not `cargo check`: the missing-field class of break is a
+      # type error either way, but this is the only place the shipped launcher
+      # is linked with the collector in it, and a link-time break is not a
+      # compile-time one.
+      #
+      # NOT A MATRIX. `ubuntu-latest` only, like the rest of this job — the
+      # collector is platform-agnostic Rust over an owned `Arena`, so a second
+      # OS leg would re-prove the same compile. Behavioural parity with
+      # `Generational` is not asserted anywhere in CI and deliberately so: the
+      # backend is default-off precisely because it is not at parity yet
+      # (docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md).
+      - name: Build the cratonvm launcher with the ZGC backend compiled in
+        run: cargo build -p cratonvm-cli --features zgc
+
+      # NOT `--lib`. The unit tests alone cannot catch two ZGC modules
+      # disagreeing with each other: each module declares its own decoupling
+      # traits and its own tests exercise only its own side. The cross-module
+      # seams live in `gc/tests/zgc_module_integration.rs`, and while this step
+      # was `--lib`-scoped that target was compiled by NOTHING — it silently
+      # stopped compiling, and eight consecutive reconciliation passes were
+      # merged against a suite that had not run since. Same shape as the E0063
+      # and the never-executed-tests gaps above: a target no job builds rots.
+      - name: Test the ZGC collector (cratonvm-gc unit + integration tests)
+        timeout-minutes: 20
+        run: cargo test -p cratonvm-gc --features zgc
 
       # Some test targets are gated in their entirety —
       # `vm/tests/t4_8_jdwp_conformance.rs` is `#![cfg(feature =

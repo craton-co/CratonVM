@@ -80,7 +80,16 @@ fn java_home() -> Option<String> {
 fn compile_jmx_probe(probe: &Path) -> bool {
     let source = probe.join("JmxProbe.java");
     if !source.exists() {
-        eprintln!("[wave1_a_jmx] JmxProbe.java missing");
+        // `apps/jmx_probe/JmxProbe.java` IS tracked (force-added past the
+        // `.gitignore` `apps/` rule), so its absence means a broken checkout, not
+        // an absent toolchain. Loud, and a failure under CRATONVM_REQUIRE_E2E —
+        // see `common::require_fixture`.
+        let _ = common::require_fixture(
+            "wave1_a_jmx",
+            "the Wave 1 Task A fixture `JmxProbe.java` (tracked at apps/jmx_probe/JmxProbe.java \
+             despite the `apps/` gitignore rule)",
+            &[source.clone()],
+        );
         return false;
     }
     let javac = java_home()

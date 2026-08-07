@@ -99,6 +99,22 @@ mimalloc = ["dep:mimalloc"]
 java-bin-alias = []
 # Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
 synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
+# Memory-backed ZGC-real collector, selected at runtime with `-XX:+UseZGC`
+# (see `cratonvm_vm::config::parse_gc_algorithm`). Plain pass-through to
+# `cratonvm-vm/zgc`, which forwards to `cratonvm-gc/zgc`. Build a ZGC-capable
+# launcher with:
+#
+#     cargo build --release -p cratonvm-cli --features zgc
+#
+# It exists so that command works at all. Before it, the only way to reach the
+# collector from this crate was `--features cratonvm-vm/zgc`, and no CI job
+# built THIS binary either way: the feature also gates a `GcAlgorithm` variant
+# and a `parse_gc_algorithm` match arm, so those paths vanish from a default
+# build. That is how `ZgcRealHeap::with_capacity()` silently stopped compiling
+# when its three sibling collectors gained a `layout_domain` field on
+# 2026-08-05 (E0063, found 2026-08-07). ci.yml's `experimental-features` job
+# now builds this target under this feature.
+zgc = ["cratonvm-vm/zgc"]
 # Expose --gpu* flags and link cuda-bridge in stub mode. Probing the
 # device returns DeviceError::NoDriver but the CLI surface exists.
 gpu = ["dep:cuda-bridge", "cratonvm-vm/gpu-offload"]
