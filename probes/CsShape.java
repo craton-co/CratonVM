@@ -15,7 +15,7 @@ import java.nio.charset.CharsetDecoder;
  * That is why sending {@code CharsetDecoder.decode} to real bytecode produces
  * {@code AbstractMethodError: ... decodeLoop ... has no Code attribute}: the
  * resolution is correct, the receiver is not. See
- * {@code docs/internal/jdk-only-step1-bytecode-available-RESOLVED-20260806.md}.
+ * {@code jdk-only-step1-bytecode-available-RESOLVED-20260806.md}.
  *
  * Prints values rather than "ok", and a sentinel last, for the same reason
  * every probe in this directory does.

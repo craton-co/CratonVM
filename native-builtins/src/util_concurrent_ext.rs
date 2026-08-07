@@ -808,7 +808,7 @@ fn native_lock_support_get_blocker(
 ///
 /// That is two layouts on one class, and it is how Tomcat's CGI response body
 /// came back empty (see
-/// docs/internal/runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
+/// runtime-exec-returned-a-process-with-no-streams-FIXED-20260806.md).
 ///
 /// `num_fields < real` is a self-discriminating test for it: a class this call
 /// FABRICATED would declare exactly `num_fields` fields, so `real == num_fields`
@@ -4579,7 +4579,7 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
     // `real_protected_stub_class` yield it to the real `execute()` bytecode
     // structurally, for every receiver, which is what replaced the eight
     // hand-written receiver-shape probes in `vm`. See
-    // `docs/internal/jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
+    // `jdk-only-wave2-threadpoolexecutor-execute-receiver-shape-RETIRED-20260806.md`.
     registry.register_with_kind(
         es,
         "execute",

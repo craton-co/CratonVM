@@ -967,6 +967,62 @@ pub(crate) fn read_wrapped_char_sequence(ctx: &mut dyn NativeContext, seq: Objec
     }
 }
 
+/// The text a CharBuffer currently exposes (`position..limit`), read straight
+/// off the receiver rather than obtained by calling `toString()` on it.
+///
+/// Exists because the virtual `toString()` of a real
+/// `java.nio.StringCharBuffer` answers EMPTY when it is entered from a Rust
+/// native (`ctx.invoke_virtual`) or from `Method.invoke`, while a direct
+/// bytecode `cb.toString()` on the same object is correct — so
+/// `String.valueOf(cb)`, `"" + cb` and `sb.append(cb)` silently lost the text.
+/// See docs/known-issues/stringcharbuffer-tostring-empty-via-native-invoke.md
+/// for what that is and what has been ruled out.
+///
+/// Returns `None` for a receiver with neither a `str` nor an `hb`, so the
+/// caller can fall back to ordinary dispatch.
+pub(crate) fn cb_read_text(ctx: &mut dyn NativeContext, buf: ObjectRef) -> Option<String> {
+    // A by-name read answers `Int(0)` for a field the receiver does not have,
+    // indistinguishable from a real zero, so a named 0 means "ask the indexed
+    // slot too". Safe for position/limit specifically: both layouts agree on 0
+    // when it is genuinely 0, so they cannot disagree in the direction that
+    // matters. NOT safe for `mark`, whose unset value is -1.
+    fn coord(ctx: &dyn NativeContext, buf: ObjectRef, name: &str, slot: usize) -> i32 {
+        if let Value::Int(v) = ctx.get_field_by_name(buf, name) {
+            if v != 0 {
+                return v;
+            }
+        }
+        match ctx.get_field(buf, slot) {
+            Value::Int(v) => v,
+            _ => 0,
+        }
+    }
+    let pos = coord(ctx, buf, "position", CB_FIELD_POS);
+    let lim = coord(ctx, buf, "limit", CB_FIELD_LIMIT);
+    let off = match ctx.get_field_by_name(buf, "offset") {
+        Value::Int(v) => v.max(0),
+        _ => 0,
+    };
+    if let Value::Object(Some(seq)) = ctx.get_field_by_name(buf, "str") {
+        let units: Vec<u16> = read_wrapped_char_sequence(ctx, seq).encode_utf16().collect();
+        let n = units.len() as i32;
+        let lo = (off + pos).clamp(0, n) as usize;
+        let hi = (off + lim).clamp(lo as i32, n) as usize;
+        return Some(String::from_utf16_lossy(&units[lo..hi]));
+    }
+    let arr = cb_read_hb(ctx, buf)?;
+    let n = ctx.array_length(arr) as i32;
+    let lo = (off + pos).clamp(0, n);
+    let hi = (off + lim).clamp(lo, n);
+    let mut units: Vec<u16> = Vec::with_capacity((hi - lo).max(0) as usize);
+    for i in lo..hi {
+        if let Value::Int(v) = ctx.get_array_element(arr, i as usize) {
+            units.push(v as u16);
+        }
+    }
+    Some(String::from_utf16_lossy(&units))
+}
+
 /// `Objects.checkFromToIndex(from, to, length)`, the range check
 /// `HeapCharBuffer.subSequence` opens with.
 ///

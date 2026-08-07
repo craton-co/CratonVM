@@ -33,7 +33,7 @@ method, so `--jdk-only` admits it on a claim nobody has checked.
 >   override, so dispatch walks up to `java/lang/Process` and the native wins —
 >   returning `isAlive()==false` for a live process and `pid()==0` where the spec
 >   requires `UnsupportedOperationException`. Filed with a committed repro:
->   [`process-natives-answer-for-user-subclasses-FIXED-20260806.md`](../../internal/process-natives-answer-for-user-subclasses-FIXED-20260806.md).
+>   `process-natives-answer-for-user-subclasses-FIXED-20260806.md`.
 >   Item 5 below has the model backwards.
 > * **The row counts in this file are ~11 % too large.** The census emits one row
 >   per *registration*, not per slot, so a triple registered twice appears twice
@@ -46,7 +46,7 @@ method, so `--jdk-only` admits it on a claim nobody has checked.
 >   `scripts/jdk-only-adjudicate.py` prints the split.
 >
 > **Item 1 is CLOSED 2026-08-06** —
-> [`synthetic-process-cluster-RETIRED-20260806.md`](../../internal/synthetic-process-cluster-RETIRED-20260806.md).
+> `synthetic-process-cluster-RETIRED-20260806.md`.
 > The cluster was **37 rows and not 25** (the count below omits
 > `cratonvm/synthetic/AnonymousObject$2`, 4 rows, and miscounts the pipe
 > streams), and the `Bridge` tag was wrong by §1.5's own definition since no

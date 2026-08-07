@@ -329,7 +329,7 @@ pub(super) fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    // PGO-01 (docs/known-issues/c2/pgo-01-call-site-evidence-gap.md):
+    // PGO-01 (docs/feature-designs/c2/pgo-01-call-site-evidence-gap.md):
     // call-site evidence for invokespecial. invokevirtual/invokeinterface are
     // NOT recorded here — they are covered by the receiver-type profile
     // instead (see MethodProfile's doc comment on `receivers` vs
@@ -1717,7 +1717,7 @@ pub(super) fn execute_invoke_kind(
     //
     // Costs nothing on a healthy run: the whole check is two string compares
     // that fail, and it is only reached at a dispatch terminal. See
-    // `docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`,
+    // `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`,
     // whose "what to try next" asked for exactly this — the two
     // `CloneNotSupportedException` occurrences it recorded produced no verdict
     // because nothing on the clone path consulted the heap.

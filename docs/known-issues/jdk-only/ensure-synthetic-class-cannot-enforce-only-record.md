@@ -231,7 +231,7 @@ error.
 > iterator class, hand back the snapshot through a real `Arrays$ArrayList`'s
 > own iterator, which reads only the `Object[]` it was given. All six sections
 > are fixed; see
-> `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
+> `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`
 > (retired from this directory 2026-08-06, once its fifth class — the
 > `System.Logger` one, which had taken out every `ObjectInputStream`
 > construction — landed on a real `jdk.internal.logger.SimpleConsoleLogger`).
@@ -310,7 +310,7 @@ Reclassifying them is the dangerous direction in *Blast radius* — it silences
 the violation, keeps fabricating, and makes the zero-stub census green while
 the substitution continues. L7 acted on that verdict: the bootstrap site
 **refuses** them rather than relabelling them. See
-[VM-internal classes are mislabelled `CompatibilityStub`](../../internal/jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md)
+VM-internal classes are mislabelled `CompatibilityStub` (`jdk-only-wave2-vm-internal-classes-mislabelled-RETIRED-20260806.md`)
 (RETIRED 2026-08-06).
 
 ## What specifically must change
@@ -330,7 +330,7 @@ the substitution continues. L7 acted on that verdict: the bootstrap site
    That last one was reached from `ObjectInputFilter$Config.<clinit>`, so
    refusing it had been costing every `ObjectInputStream` construction in the
    VM. See
-   `docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
+   `jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`.
    **Still open here:** `java/util/Enumeration$Impl` in `classloader.rs`'s
    `getResources` helpers, which has no such landing yet. And the refusals are
    landings, not removals — the natives themselves are still registered, which

@@ -189,7 +189,7 @@ The residual belongs to the array-receiver dispatch family tracked on
 not to this page's throughput subject — it was only ever noted here in passing.
 If it recurs, the most likely home is the open premature-reclamation bug in the
 non-moving young sweep
-(`docs/known-issues/h2/bug-h2-classid0-stale-address-family.md`),
+(`fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`),
 whose signature — a live object's header reading back as something else — is the
 same family. **Reproduce it with no flags first**; the diagnostic that page
 recommends is the one that voided round 1 here.

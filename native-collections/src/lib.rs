@@ -44691,7 +44691,7 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `--jdk-only` refuses the fabricated shape, and the trade was argued as
     // free: "on the strict path the alternative was never a working `remove()`
     // — it was an iteration that did not reach `next()`"
-    // (`docs/internal/jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`).
+    // (`jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`).
     //
     // That argument does NOT hold here, and `RChmKeySetView` is what measured
     // it. HotSpot's `ConcurrentHashMap$KeySetView.iterator()` returns a

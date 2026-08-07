@@ -5692,7 +5692,7 @@ pub struct JdkOnlyRefusalCounts {
     /// policy did NOT stop, and it is here rather than in `counts` because it
     /// is the same event class as its siblings measured on the other side.
     ///
-    /// Zero when `CRATONVM_JDK_ONLY_ENFORCE_SHADOW` is set: enforcement turns
+    /// Zero when `CRATONVM_ENFORCE_NATIVE_SHADOW` is set: enforcement turns
     /// each of these into an `interpreter_bytecode_preferred` instead. Distinct
     /// triples appear in sink 2 tagged `bridge-ran-over-bytecode`. It is
     /// deliberately excluded from [`Self::total`], which counts refusals.
