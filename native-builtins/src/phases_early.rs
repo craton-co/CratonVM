@@ -35,7 +35,7 @@ use crate::lang_string::{
     register_phase52_string_buffer,
 };
 use crate::{
-    alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop, native_return_false,
+    try_alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop, native_return_false,
     native_unsafe_ensure_class_initialized, obj_arg,
 };
 use crate::{
@@ -361,7 +361,7 @@ fn native_collections_singleton_list(
     }
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
     ctx.set_array_element(arr, 0, elem);
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(1));
     Ok(Some(Value::Object(Some(list))))
@@ -377,8 +377,8 @@ fn native_collections_singleton_set(
         ctx.set_field_by_name(set, "element", elem);
         return Ok(Some(Value::Object(Some(set))));
     }
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
     cratonvm_native_collections::native_map_put_pub(
         ctx,
@@ -401,7 +401,7 @@ fn native_collections_singleton_map(
         return Ok(Some(Value::Object(Some(map))));
     }
     // Create HashMap with 1 entry
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let cap = 16;
     let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(map, 0, Value::Object(Some(buckets)));
@@ -409,7 +409,7 @@ fn native_collections_singleton_map(
     ctx.set_field(map, 2, Value::Int(cap as i32));
     // Put the single entry using native_map_put logic
     // Simplified: just store it
-    let node = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4);
+    let node = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4)?;
     ctx.set_field(node, 0, key);
     ctx.set_field(node, 1, val);
     let hash = 0i32; // simplified
@@ -671,7 +671,7 @@ fn native_collections_ncopies(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for i in 0..n {
         ctx.set_array_element(arr, i, elem);
     }
-    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(n as i32));
     Ok(Some(Value::Object(Some(list))))
@@ -883,7 +883,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         ctx.invoke("java/util/List", "of", "()Ljava/util/List;", &[])
     });
     r.register(cu, "emptyMap", "()Ljava/util/Map;", |ctx, _args| {
-        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
@@ -916,12 +916,12 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                         return Ok(Some(v));
                     }
                     let itr =
-                        alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
+                        try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
                     ctx.set_static_field(cid, idx, Value::Object(Some(itr)));
                     return Ok(Some(Value::Object(Some(itr))));
                 }
             }
-            let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
+            let iter = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0)?;
             Ok(Some(Value::Object(Some(iter))))
         },
     );
@@ -930,7 +930,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "emptyEnumeration",
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
-            let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+            let e = try_alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)?;
             Ok(Some(Value::Object(Some(e))))
         },
     );
@@ -944,7 +944,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             let arr = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
                 _ => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     ctx.set_field(list, 0, Value::Object(Some(empty)));
                     ctx.set_field(list, 1, Value::Int(0));
@@ -957,7 +957,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 let v = ctx.get_array_element(arr, i);
                 ctx.set_array_element(new_arr, i, v);
             }
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             ctx.set_field(list, 0, Value::Object(Some(new_arr)));
             ctx.set_field(list, 1, Value::Int(len as i32));
             Ok(Some(Value::Object(Some(list))))
@@ -1469,7 +1469,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -1485,7 +1485,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -1501,7 +1501,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -1547,7 +1547,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/Optional;",
         |ctx, args| {
             let val = args.first().copied().unwrap_or(Value::Object(None));
-            let o = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            let o = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(o, 0, val);
             Ok(Some(Value::Object(Some(o))))
         },
@@ -1558,13 +1558,13 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/Optional;",
         |ctx, args| {
             let val = args.first().copied().unwrap_or(Value::Object(None));
-            let o = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            let o = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(o, 0, val);
             Ok(Some(Value::Object(Some(o))))
         },
     );
     r.register(opt, "empty", "()Ljava/util/Optional;", |ctx, _args| {
-        let o = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let o = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         ctx.set_field(o, 0, Value::Object(None));
         Ok(Some(Value::Object(Some(o))))
     });
@@ -1657,12 +1657,12 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                         "(Ljava/lang/Object;)Ljava/lang/Object;",
                         &[Value::Object(Some(*func)), Value::Object(Some(v))],
                     )?;
-                    let o = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+                    let o = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
                     ctx.set_field(o, 0, result.unwrap_or(Value::Object(None)));
                     return Ok(Some(Value::Object(Some(o))));
                 }
             }
-            let o = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+            let o = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
             ctx.set_field(o, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(o))))
         },
@@ -1709,7 +1709,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // --- List.of() factory methods ---
     let li = "java/util/List";
     r.register(li, "of", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
@@ -1720,7 +1720,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "of",
         "(Ljava/lang/Object;)Ljava/util/List;",
         |ctx, args| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(list, 0, Value::Object(Some(arr)));
@@ -1733,7 +1733,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/List;",
         |ctx, args| {
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 2);
             ctx.set_array_element(arr, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_array_element(arr, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
@@ -1750,7 +1750,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             let src = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
                 _ => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     ctx.set_field(list, 0, Value::Object(Some(arr)));
                     ctx.set_field(list, 1, Value::Int(0));
@@ -1762,7 +1762,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             for i in 0..len {
                 ctx.set_array_element(arr, i, ctx.get_array_element(src, i));
             }
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(len as i32));
             Ok(Some(Value::Object(Some(list))))
@@ -1812,7 +1812,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     // --- Map.of() ---
     let mi = "java/util/Map";
     r.register(mi, "of", "()Ljava/util/Map;", |ctx, _args| {
-        let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
         Ok(Some(Value::Object(Some(map))))
     });
@@ -1821,7 +1821,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "of",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
         |ctx, args| {
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             let k = args.first().copied().unwrap_or(Value::Object(None));
             let v = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -1835,7 +1835,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "ofEntries",
         "([Ljava/util/Map$Entry;)Ljava/util/Map;",
         |ctx, _args| {
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             Ok(Some(Value::Object(Some(map))))
         },
@@ -1852,7 +1852,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
         |ctx, args| {
             let entry =
-                alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2)?;
             ctx.set_field(
                 entry,
                 0,
@@ -1984,7 +1984,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             ctx.set_array_element(arr, i, Value::Int(c));
         }
         // Wrap in IntStream synthetic (field 0 = int[], field 1 = length)
-        let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2);
+        let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2)?;
         ctx.set_field(stream, 0, Value::Object(Some(arr)));
         ctx.set_field(stream, 1, Value::Int(chars.len() as i32));
         Ok(Some(Value::Object(Some(stream))))
@@ -2054,7 +2054,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, args.get(1).cloned().unwrap_or(Value::Object(None)));
         let empty_prefix = ctx.create_string("");
         ctx.set_field(this, 1, Value::Object(Some(empty_prefix)));
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
@@ -2070,7 +2070,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 0, args.get(1).cloned().unwrap_or(Value::Object(None)));
             // Store prefix in field 1 (we'll use suffix from arg 3 at toString time)
             ctx.set_field(this, 1, args.get(2).cloned().unwrap_or(Value::Object(None)));
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(0));
@@ -2169,7 +2169,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(a)) => a,
                 _ => {
                     // Return empty list
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                     ctx.set_field(list, 0, Value::Object(Some(arr)));
                     ctx.set_field(list, 1, Value::Int(0));
@@ -2177,7 +2177,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 }
             };
             let len = ctx.array_length(backing);
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
             for i in 0..len {
                 let v = ctx.get_array_element(backing, i);
@@ -2233,7 +2233,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/List;",
         |ctx, args| {
             let elem = args.first().cloned().unwrap_or(Value::Object(None));
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, elem);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
@@ -2248,7 +2248,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let key = args.first().cloned().unwrap_or(Value::Object(None));
             let val = args.get(1).cloned().unwrap_or(Value::Object(None));
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -2264,8 +2264,8 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/util/Set;",
         |ctx, args| {
             let elem = args.first().cloned().unwrap_or(Value::Object(None));
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1);
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 1)?;
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))])?;
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -2699,7 +2699,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => "UTF-8".to_string(),
             };
-            let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let charset = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             let n = ctx.create_string(&name);
             ctx.set_field(charset, 0, Value::Object(Some(n)));
             Ok(Some(Value::Object(Some(charset))))
@@ -2710,7 +2710,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "defaultCharset",
         "()Ljava/nio/charset/Charset;",
         |ctx, _args| {
-            let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let charset = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             let n = ctx.create_string("UTF-8");
             ctx.set_field(charset, 0, Value::Object(Some(n)));
             Ok(Some(Value::Object(Some(charset))))
@@ -2761,7 +2761,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             ("UTF_16BE", "UTF-16BE"),
             ("UTF_16LE", "UTF-16LE"),
         ] {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
             let name = ctx.create_string(charset_name);
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_static_field_by_name(
@@ -3180,7 +3180,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             }
             Ok(Some(Value::Object(Some(build_real_layout_string_hashset(
                 ctx, &keys,
-            )))))
+            )?))))
         },
     );
 
@@ -3736,7 +3736,7 @@ fn native_tl_with_initial(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(s))) => *s,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let tl = alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1);
+    let tl = try_alloc_concurrent_synthetic(ctx, "java/lang/ThreadLocal", 1)?;
     let key = ctx.identity_hash_code(tl);
     ctx.register_var_handle_root(supplier);
     let skey = ctx.identity_hash_code(supplier);
@@ -4736,7 +4736,7 @@ fn native_bs_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let capacity_words = bs_words_obj(ctx, this)
         .map(|words_obj| ctx.array_length(words_obj))
         .unwrap_or(words.len().max(1));
-    let clone = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 3);
+    let clone = try_alloc_concurrent_synthetic(ctx, "java/util/BitSet", 3)?;
     let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, words.len());
     for (i, w) in words.iter().enumerate() {
         ctx.set_array_element(new_words, i, Value::Long(*w));
@@ -4785,7 +4785,7 @@ fn native_bs_value_of_longs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Object(None))),
     };
     let len = ctx.array_length(arr);
-    let bs = alloc_concurrent_synthetic(ctx, "java/util/BitSet", 3);
+    let bs = try_alloc_concurrent_synthetic(ctx, "java/util/BitSet", 3)?;
     let new_words = ctx.new_array(cratonvm_types::ArrayElementType::Long, len);
     let mut words_in_use = len;
     for i in 0..len {
@@ -4854,7 +4854,7 @@ fn native_bs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     for (i, &b) in set_bits.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b));
     }
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1)?;
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     Ok(Some(Value::Object(Some(stream))))
 }
@@ -4866,8 +4866,8 @@ fn native_bs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 const ES_FIELD_ELEMENTS: usize = 0;
 const ES_FIELD_TYPE: usize = 1;
 
-fn enum_set_backing_list(ctx: &mut dyn NativeContext, arr: ObjectRef, size: i32) -> ObjectRef {
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+fn enum_set_backing_list(ctx: &mut dyn NativeContext, arr: ObjectRef, size: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let backing = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let arr_value = Value::Object(Some(arr));
     ctx.set_field(backing, 0, arr_value);
     ctx.set_field(backing, 1, Value::Int(size));
@@ -4879,7 +4879,7 @@ fn enum_set_backing_list(ctx: &mut dyn NativeContext, arr: ObjectRef, size: i32)
     if let Some(slot) = ctx.resolve_field_index("java/util/ArrayList", "size") {
         ctx.set_field(backing, slot, Value::Int(size));
     }
-    backing
+    Ok(backing)
 }
 
 fn register_enum_set_natives_with_category(
@@ -5037,7 +5037,7 @@ fn synthetic_enum_set_from_array(
     len: usize,
 ) -> MethodCallResult {
     let src_pin = src.map(|s| ctx.pin_native_root(s));
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let es_pin = ctx.pin_native_root(es);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len.max(4));
     let arr_pin = ctx.pin_native_root(arr);
@@ -5053,7 +5053,7 @@ fn synthetic_enum_set_from_array(
     let es = ctx.read_native_pin(es_pin, es);
     let arr = ctx.read_native_pin(arr_pin, arr);
     let backing = enum_set_backing_list(ctx, arr, len as i32);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, enum_type);
     ctx.unpin_native_roots(src_pin.unwrap_or(es_pin));
     Ok(Some(Value::Object(Some(es))))
@@ -5064,7 +5064,7 @@ fn synthetic_enum_set_from_values(
     enum_type: Value,
     elems: &[Value],
 ) -> MethodCallResult {
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let es_pin = ctx.pin_native_root(es);
     let arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
@@ -5075,7 +5075,7 @@ fn synthetic_enum_set_from_values(
     for (i, elem) in elems.iter().enumerate() {
         ctx.set_array_element(arr_cur, i, *elem);
     }
-    let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let backing = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     let es = ctx.read_native_pin(es_pin, es);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(backing, 0, Value::Object(Some(arr)));
@@ -5280,12 +5280,12 @@ pub(crate) fn native_es_of_two(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if let Some(set) = try_jdk_enum_set_of_elements(ctx, &[e1, e2]) {
         return Ok(Some(Value::Object(Some(set))));
     }
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     let backing = enum_set_backing_list(ctx, arr, 2);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
@@ -5303,13 +5303,13 @@ pub(crate) fn native_es_of_three(ctx: &mut dyn NativeContext, args: &[Value]) ->
         return Ok(Some(Value::Object(Some(set))));
     }
 
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     ctx.set_array_element(arr, 2, e3);
     let backing = enum_set_backing_list(ctx, arr, 3);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
@@ -5325,14 +5325,14 @@ pub(crate) fn native_es_of_four(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return Ok(Some(Value::Object(Some(set))));
     }
 
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
     ctx.set_array_element(arr, 0, e1);
     ctx.set_array_element(arr, 1, e2);
     ctx.set_array_element(arr, 2, e3);
     ctx.set_array_element(arr, 3, e4);
     let backing = enum_set_backing_list(ctx, arr, 4);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
@@ -5356,13 +5356,13 @@ pub(crate) fn native_es_of_varargs(
     }
 
     let capacity = elems.len().max(4);
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, capacity);
     for (i, elem) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *elem);
     }
     let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
@@ -5374,7 +5374,7 @@ pub(crate) fn native_es_range(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
         return Ok(Some(Value::Object(Some(set))));
     }
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
         elems.len().max(4),
@@ -5383,7 +5383,7 @@ pub(crate) fn native_es_range(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.set_array_element(arr, i, *elem);
     }
     let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
@@ -5490,7 +5490,7 @@ fn native_es_complement_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if let Some(set) = try_jdk_enum_set_of_elements(ctx, &elems) {
         return Ok(Some(Value::Object(Some(set))));
     }
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     let arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
         elems.len().max(4),
@@ -5499,7 +5499,7 @@ fn native_es_complement_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         ctx.set_array_element(arr, i, *elem);
     }
     let backing = enum_set_backing_list(ctx, arr, elems.len() as i32);
-    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing)));
+    ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(backing?)));
     ctx.set_field(es, ES_FIELD_TYPE, Value::Object(None));
     Ok(Some(Value::Object(Some(es))))
 }
@@ -5953,7 +5953,7 @@ fn native_es_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn native_es_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let es = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+    let es = try_alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2)?;
     if let Some(backing) = es_get_backing(ctx, this) {
         let size = match ctx.get_field(backing, 1) {
             Value::Int(n) => n as usize,
@@ -5971,7 +5971,7 @@ fn native_es_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             let v = ctx.get_array_element(data, i);
             ctx.set_array_element(new_arr, i, v);
         }
-        let new_backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let new_backing = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         ctx.set_field(new_backing, 0, Value::Object(Some(new_arr)));
         ctx.set_field(new_backing, 1, Value::Int(size as i32));
         ctx.set_field(es, ES_FIELD_ELEMENTS, Value::Object(Some(new_backing)));
@@ -6318,7 +6318,7 @@ fn native_em_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Simplified: create new empty EnumMap
     let this = obj_arg(args, 0)?;
     let _ = this;
-    let em = alloc_concurrent_synthetic(ctx, "java/util/EnumMap", 3);
+    let em = try_alloc_concurrent_synthetic(ctx, "java/util/EnumMap", 3)?;
     let cap = 16;
     let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
     ctx.set_field(em, 0, Value::Object(Some(buckets)));
@@ -6772,8 +6772,8 @@ fn cal_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: i3
     }
 }
 
-fn alloc_calendar(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let cal = alloc_concurrent_synthetic(ctx, "java/util/GregorianCalendar", CAL_NUM_FIELDS);
+fn alloc_calendar(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let cal = try_alloc_concurrent_synthetic(ctx, "java/util/GregorianCalendar", CAL_NUM_FIELDS)?;
     ctx.set_field(cal, CAL_FIELD_YEAR, Value::Int(1970));
     ctx.set_field(cal, CAL_FIELD_MONTH, Value::Int(0));
     ctx.set_field(cal, CAL_FIELD_DAY, Value::Int(1));
@@ -6782,7 +6782,7 @@ fn alloc_calendar(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(cal, CAL_FIELD_SECOND, Value::Int(0));
     ctx.set_field(cal, CAL_FIELD_MILLIS, Value::Int(0));
     ctx.set_field(cal, CAL_FIELD_TIMEZONE, Value::Object(None));
-    cal
+    Ok(cal)
 }
 
 fn cal_get_field_index(java_field: i32) -> Option<usize> {
@@ -6887,7 +6887,7 @@ fn native_cal_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn native_cal_get_instance(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let cal = alloc_calendar(ctx);
-    Ok(Some(Value::Object(Some(cal))))
+    Ok(Some(Value::Object(Some(cal?))))
 }
 
 fn native_cal_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7048,7 +7048,7 @@ fn native_cal_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 fn native_cal_get_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let millis = cal_to_epoch_millis(ctx, this);
-    let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
+    let date = try_alloc_concurrent_synthetic(ctx, "java/util/Date", 1)?;
     ctx.set_field(date, 0, Value::Long(millis));
     Ok(Some(Value::Object(Some(date))))
 }
@@ -7093,7 +7093,7 @@ fn native_cal_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Pin across the allocation — a moving young GC there would relocate
     // `this` before the copy loop below (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
-    let clone = alloc_concurrent_synthetic(ctx, "java/util/GregorianCalendar", CAL_NUM_FIELDS);
+    let clone = try_alloc_concurrent_synthetic(ctx, "java/util/GregorianCalendar", CAL_NUM_FIELDS)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     // W2: `CAL_NUM_FIELDS` grew from 8 to 10 (leniency + first-day-of-week),
@@ -7442,7 +7442,7 @@ pub(crate) fn register_calendar_natives(r: &mut NativeMethodRegistry) {
             Value::Long(v) => v,
             _ => 0,
         };
-        let clone = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
+        let clone = try_alloc_concurrent_synthetic(ctx, "java/util/Date", 1)?;
         ctx.set_field(clone, 0, Value::Long(millis));
         Ok(Some(Value::Object(Some(clone))))
     });
@@ -7498,7 +7498,7 @@ pub(crate) fn register_currency_natives(r: &mut NativeMethodRegistry) {
                 "CNY" => 156,
                 _ => 0,
             };
-            let cur = alloc_concurrent_synthetic(ctx, "java/util/Currency", 2);
+            let cur = try_alloc_concurrent_synthetic(ctx, "java/util/Currency", 2)?;
             let s = ctx.create_string(&code_str);
             ctx.set_field(cur, 0, Value::Object(Some(s)));
             ctx.set_field(cur, 1, Value::Int(numeric));
@@ -8990,7 +8990,7 @@ fn fjp_run_callable_as_task(
     // Pin the callable BEFORE allocating: `alloc_concurrent_synthetic` can
     // trigger a collection that relocates it.
     let callable_pin = ctx.pin_native_root(callable);
-    let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+    let task = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0)?;
     let task_pin = ctx.pin_native_root(task);
     let live_callable = ctx.read_native_pin(callable_pin, callable);
     let outcome = {
@@ -9046,7 +9046,7 @@ fn fjp_run_runnable_as_task(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let runnable_pin = ctx.pin_native_root(runnable);
     let result_pin = pinned_object_value(ctx, fixed_result);
-    let task = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0);
+    let task = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinTask", 0)?;
     let task_pin = ctx.pin_native_root(task);
     let live_runnable = ctx.read_native_pin(runnable_pin, runnable);
     let outcome = {
@@ -9308,7 +9308,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         "commonPool",
         "()Ljava/util/concurrent/ForkJoinPool;",
         |ctx, _args| {
-            let p = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinPool", 1);
+            let p = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinPool", 1)?;
             ctx.set_field(p, 0, Value::Int(FJP_COMMON_PARALLELISM));
             Ok(Some(Value::Object(Some(p))))
         },
@@ -9348,7 +9348,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         fjp_state_set_done(this, Value::Object(None));
         // Nothing is ever queued — tasks run inline — so the "tasks that never
         // started" list is genuinely empty.
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
@@ -10150,7 +10150,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "commonPool",
         "()Ljava/util/concurrent/ForkJoinPool;",
         |ctx, _args| {
-            let p = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinPool", 1);
+            let p = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinPool", 1)?;
             // Field 0 is "parallelism" in synthetic mode; in real-JDK
             // mode the real fields are populated by the real JDK
             // <clinit>. The native invoke() above uses the side-table
@@ -10549,7 +10549,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         Ok(Some(Value::Object(None)))
     });
     r.register(ses, "shutdownNow", "()Ljava/util/List;", |ctx, _args| {
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
@@ -10768,11 +10768,11 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let sv = alloc_concurrent_synthetic(
+            let sv = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ScheduledThreadPoolExecutor",
                 2,
-            );
+            )?;
             ctx.set_field(sv, 0, Value::Int(ps));
             ctx.set_field(sv, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(sv))))
@@ -10787,11 +10787,11 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let sv = alloc_concurrent_synthetic(
+            let sv = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ScheduledThreadPoolExecutor",
                 2,
-            );
+            )?;
             ctx.set_field(sv, 0, Value::Int(ps));
             ctx.set_field(sv, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(sv))))
@@ -10802,11 +10802,11 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newSingleThreadScheduledExecutor",
         "()Ljava/util/concurrent/ScheduledExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(
+            let sv = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/concurrent/ScheduledThreadPoolExecutor",
                 2,
-            );
+            )?;
             ctx.set_field(sv, 0, Value::Int(1));
             ctx.set_field(sv, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(sv))))
@@ -10859,7 +10859,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Int(v)) => *v,
                 _ => 1,
             };
-            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             // Use the function's returned (possibly GC-relocated) object,
             // not `sv` directly -- see the BUG FIX comment on
             // `initialize_real_thread_pool_executor`'s return path.
@@ -10881,7 +10881,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newCachedThreadPool",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -10904,7 +10904,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
                 Some(Value::Object(Some(f))) => Some(*f),
                 _ => None,
             };
-            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -10923,7 +10923,7 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         "newSingleThreadExecutor",
         "()Ljava/util/concurrent/ExecutorService;",
         |ctx, _args| {
-            let sv = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
+            let sv = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2)?;
             let result = initialize_real_thread_pool_executor(
                 ctx,
                 sv,
@@ -11025,7 +11025,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
             "DAYS",
         ];
         for (i, name) in NAMES.iter().enumerate() {
-            let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let tu = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             tu_set_ordinal(ctx, tu, i as i32);
             ctx.set_static_field_by_name(
                 "java/util/concurrent/TimeUnit",
@@ -11054,7 +11054,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
                 "DAYS" => 6,
                 _ => 3,
             };
-            let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+            let tu = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
             tu_set_ordinal(ctx, tu, ordinal);
             Ok(Some(Value::Object(Some(tu))))
         },
@@ -11066,7 +11066,7 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 7);
             for i in 0..7 {
-                let tu = alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1);
+                let tu = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/TimeUnit", 1)?;
                 tu_set_ordinal(ctx, tu, i);
                 ctx.set_array_element(arr, i as usize, Value::Object(Some(tu)));
             }
@@ -11299,14 +11299,14 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
         ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(month, "values", "()[Ljava/time/Month;", |ctx, _args| {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 12);
         for i in 0..12 {
-            let m = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+            let m = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
             ctx.set_field(m, MONTH_FIELD_VALUE, Value::Int(i as i32 + 1));
             ctx.set_array_element(arr, i, Value::Object(Some(m)));
         }
@@ -11338,7 +11338,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
             ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(val));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -11416,7 +11416,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
         let add = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 + add) % 12 + 12) % 12 + 1) as i32;
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
         ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(new_val));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -11425,7 +11425,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
         let sub = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 - sub) % 12 + 12) % 12 + 1) as i32;
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
         ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(new_val));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -11437,7 +11437,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let v = ctx.get_field(this, MONTH_FIELD_VALUE).as_int().unwrap_or(1);
             let first = ((v - 1) / 3) * 3 + 1;
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
             ctx.set_field(obj, MONTH_FIELD_VALUE, Value::Int(first));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -11453,7 +11453,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1)?;
         ctx.set_field(obj, 0, Value::Int(val));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -11499,7 +11499,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
                     .into())
                 }
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1)?;
             ctx.set_field(obj, 0, Value::Int(val));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -11507,7 +11507,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
     r.register(dow, "values", "()[Ljava/time/DayOfWeek;", |ctx, _args| {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 7);
         for i in 0..7 {
-            let d = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
+            let d = try_alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1)?;
             ctx.set_field(d, 0, Value::Int(i as i32 + 1));
             ctx.set_array_element(arr, i, Value::Object(Some(d)));
         }
@@ -11518,7 +11518,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         let v = ctx.get_field(this, 0).as_int().unwrap_or(1);
         let add = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 + add) % 7 + 7) % 7 + 1) as i32;
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1)?;
         ctx.set_field(obj, 0, Value::Int(new_val));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -11527,7 +11527,7 @@ pub(crate) fn register_phase52_time_enums(r: &mut NativeMethodRegistry) {
         let v = ctx.get_field(this, 0).as_int().unwrap_or(1);
         let sub = args[1].as_long().unwrap_or(0);
         let new_val = (((v as i64 - 1 - sub) % 7 + 7) % 7 + 1) as i32;
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1)?;
         ctx.set_field(obj, 0, Value::Int(new_val));
         Ok(Some(Value::Object(Some(obj))))
     });
@@ -11583,7 +11583,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let ldt = obj_arg(args, 0)?;
             let offset = obj_arg(args, 1)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/OffsetDateTime", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/OffsetDateTime", 2)?;
             ctx.set_field(obj, ODT_FIELD_LDT, Value::Object(Some(ldt)));
             ctx.set_field(obj, ODT_FIELD_OFFSET, Value::Object(Some(offset)));
             Ok(Some(Value::Object(Some(obj))))
@@ -11603,7 +11603,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
             let sec = args[5].as_int().unwrap_or(0);
             let nano = args[6].as_int().unwrap_or(0);
             let offset = obj_arg(args, 7)?;
-            let ldt = alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 7);
+            let ldt = try_alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 7)?;
             ctx.set_field(ldt, 0, Value::Int(year));
             ctx.set_field(ldt, 1, Value::Int(mo));
             ctx.set_field(ldt, 2, Value::Int(day));
@@ -11611,7 +11611,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
             ctx.set_field(ldt, 4, Value::Int(min));
             ctx.set_field(ldt, 5, Value::Int(sec));
             ctx.set_field(ldt, 6, Value::Int(nano));
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/OffsetDateTime", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/OffsetDateTime", 2)?;
             ctx.set_field(obj, ODT_FIELD_LDT, Value::Object(Some(ldt)));
             ctx.set_field(obj, ODT_FIELD_OFFSET, Value::Object(Some(offset)));
             Ok(Some(Value::Object(Some(obj))))
@@ -11627,7 +11627,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
         let day_secs = ((epoch_sec % 86400) + 86400) % 86400;
         let epoch_day = (epoch_sec - day_secs) / 86400;
         let (year, month, day) = p52_epoch_day_to_ymd(epoch_day);
-        let ldt = alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 7);
+        let ldt = try_alloc_concurrent_synthetic(ctx, "java/time/LocalDateTime", 7)?;
         ctx.set_field(ldt, 0, Value::Int(year));
         ctx.set_field(ldt, 1, Value::Int(month));
         ctx.set_field(ldt, 2, Value::Int(day));
@@ -11635,9 +11635,9 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
         ctx.set_field(ldt, 4, Value::Int(((day_secs % 3600) / 60) as i32));
         ctx.set_field(ldt, 5, Value::Int((day_secs % 60) as i32));
         ctx.set_field(ldt, 6, Value::Int(nano));
-        let zo = alloc_concurrent_synthetic(ctx, "java/time/ZoneOffset", 1);
+        let zo = try_alloc_concurrent_synthetic(ctx, "java/time/ZoneOffset", 1)?;
         ctx.set_field(zo, 0, Value::Int(0));
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/OffsetDateTime", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/OffsetDateTime", 2)?;
         ctx.set_field(obj, ODT_FIELD_LDT, Value::Object(Some(ldt)));
         ctx.set_field(obj, ODT_FIELD_OFFSET, Value::Object(Some(zo)));
         Ok(Some(Value::Object(Some(obj))))
@@ -11663,7 +11663,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
                 let y = ctx.get_field(ldt_ref, 0).as_int().unwrap_or(2000);
                 let m = ctx.get_field(ldt_ref, 1).as_int().unwrap_or(1);
                 let d = ctx.get_field(ldt_ref, 2).as_int().unwrap_or(1);
-                let ld = alloc_concurrent_synthetic(ctx, "java/time/LocalDate", 3);
+                let ld = try_alloc_concurrent_synthetic(ctx, "java/time/LocalDate", 3)?;
                 ctx.set_field(ld, 0, Value::Int(y));
                 ctx.set_field(ld, 1, Value::Int(m));
                 ctx.set_field(ld, 2, Value::Int(d));
@@ -11685,7 +11685,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
                 let mi = ctx.get_field(ldt_ref, 4).as_int().unwrap_or(0);
                 let s = ctx.get_field(ldt_ref, 5).as_int().unwrap_or(0);
                 let n = ctx.get_field(ldt_ref, 6).as_int().unwrap_or(0);
-                let lt = alloc_concurrent_synthetic(ctx, "java/time/LocalTime", 4);
+                let lt = try_alloc_concurrent_synthetic(ctx, "java/time/LocalTime", 4)?;
                 ctx.set_field(lt, 0, Value::Int(h));
                 ctx.set_field(lt, 1, Value::Int(mi));
                 ctx.set_field(lt, 2, Value::Int(s));
@@ -11763,7 +11763,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(ldt_ref)) = ctx.get_field(this, ODT_FIELD_LDT) {
             let m = ctx.get_field(ldt_ref, 1).as_int().unwrap_or(1);
-            let mo = alloc_concurrent_synthetic(ctx, "java/time/Month", 1);
+            let mo = try_alloc_concurrent_synthetic(ctx, "java/time/Month", 1)?;
             ctx.set_field(mo, MONTH_FIELD_VALUE, Value::Int(m));
             Ok(Some(Value::Object(Some(mo))))
         } else {
@@ -11783,7 +11783,7 @@ pub(crate) fn register_phase52_offset_datetime(r: &mut NativeMethodRegistry) {
                 let d = ctx.get_field(ldt_ref, 2).as_int().unwrap_or(1);
                 let epoch = p52_ymd_to_epoch_day(y, m, d);
                 let dow_val = (((epoch + 3) % 7 + 7) % 7 + 1) as i32;
-                let dw = alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1);
+                let dw = try_alloc_concurrent_synthetic(ctx, "java/time/DayOfWeek", 1)?;
                 ctx.set_field(dw, 0, Value::Int(dow_val));
                 Ok(Some(Value::Object(Some(dw))))
             } else {
@@ -11881,10 +11881,10 @@ pub(crate) fn register_phase52_clock(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let clock = "java/time/Clock";
     r.register(clock, "systemUTC", "()Ljava/time/Clock;", |ctx, _args| {
-        let zi = alloc_concurrent_synthetic(ctx, "java/time/ZoneId", 1);
+        let zi = try_alloc_concurrent_synthetic(ctx, "java/time/ZoneId", 1)?;
         let utc = ctx.create_string("UTC");
         ctx.set_field(zi, 0, Value::Object(Some(utc)));
-        let obj = alloc_concurrent_synthetic(ctx, "java/time/Clock", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Clock", 2)?;
         ctx.set_field(obj, 0, Value::Object(Some(zi)));
         ctx.set_field(obj, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(obj))))
@@ -11894,10 +11894,10 @@ pub(crate) fn register_phase52_clock(r: &mut NativeMethodRegistry) {
         "systemDefaultZone",
         "()Ljava/time/Clock;",
         |ctx, _args| {
-            let zi = alloc_concurrent_synthetic(ctx, "java/time/ZoneId", 1);
+            let zi = try_alloc_concurrent_synthetic(ctx, "java/time/ZoneId", 1)?;
             let utc = ctx.create_string("UTC");
             ctx.set_field(zi, 0, Value::Object(Some(utc)));
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/Clock", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Clock", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(zi)));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -11909,7 +11909,7 @@ pub(crate) fn register_phase52_clock(r: &mut NativeMethodRegistry) {
         "(Ljava/time/ZoneId;)Ljava/time/Clock;",
         |ctx, args| {
             let zi = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/Clock", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/Clock", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(zi)));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -11925,7 +11925,7 @@ pub(crate) fn register_phase52_clock(r: &mut NativeMethodRegistry) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let inst = alloc_concurrent_synthetic(ctx, "java/time/Instant", 2);
+        let inst = try_alloc_concurrent_synthetic(ctx, "java/time/Instant", 2)?;
         ctx.set_field(inst, 0, Value::Long(now.as_secs() as i64));
         ctx.set_field(inst, 1, Value::Int(now.subsec_nanos() as i32));
         Ok(Some(Value::Object(Some(inst))))
@@ -11971,7 +11971,7 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/time/temporal/ChronoUnit", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/ChronoUnit", 1)?;
             ctx.set_field(obj, 0, Value::Int(tag));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -11983,7 +11983,7 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             for i in 0..16 {
-                let u = alloc_concurrent_synthetic(ctx, "java/time/temporal/ChronoUnit", 1);
+                let u = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/ChronoUnit", 1)?;
                 ctx.set_field(u, 0, Value::Int(i as i32));
                 ctx.set_array_element(arr, i, Value::Object(Some(u)));
             }
@@ -12019,7 +12019,7 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
         };
         let secs = nanos / 1_000_000_000;
         let nano_rem = (nanos % 1_000_000_000) as i32;
-        let dur = alloc_concurrent_synthetic(ctx, "java/time/Duration", 2);
+        let dur = try_alloc_concurrent_synthetic(ctx, "java/time/Duration", 2)?;
         ctx.set_field(dur, 0, Value::Long(secs));
         ctx.set_field(dur, 1, Value::Int(nano_rem));
         Ok(Some(Value::Object(Some(dur))))
@@ -12048,7 +12048,7 @@ pub(crate) fn register_phase52_chrono_unit(r: &mut NativeMethodRegistry) {
             8 => 604800,
             _ => 86400,
         };
-        let dur = alloc_concurrent_synthetic(ctx, "java/time/Duration", 2);
+        let dur = try_alloc_concurrent_synthetic(ctx, "java/time/Duration", 2)?;
         ctx.set_field(dur, 0, Value::Long(secs));
         ctx.set_field(dur, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(dur))))
@@ -12368,7 +12368,7 @@ fn p52_isa_check_port(port: i32) -> Result<i32, cratonvm_types::error::MethodCal
     Ok(port)
 }
 
-fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) {
+fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: Value, port: i32) -> Result<(), MethodCallFailed> {
     // Cross-call GC-safety (2026-08-04): `alloc_concurrent_synthetic` allocates
     // (and on a cold VM also loads + initialises the holder class), so `this`,
     // `host` and `addr` can all relocate across it. Writing them back through
@@ -12387,11 +12387,11 @@ fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: 
         Value::Object(Some(o)) => Some(scope.root(o)),
         _ => None,
     };
-    let holder = alloc_concurrent_synthetic(
+    let holder = try_alloc_concurrent_synthetic(
         &mut *scope,
         "java/net/InetSocketAddress$InetSocketAddressHolder",
         3,
-    );
+    )?;
     let holder_h = scope.root(holder);
     let host_cur = match &host_h {
         Some(h) => Value::Object(Some(scope.get(h))),
@@ -12409,6 +12409,7 @@ fn p52_isa_set(ctx: &mut dyn NativeContext, this: ObjectRef, host: Value, addr: 
     scope.set_field(this_cur, 0, Value::Object(Some(holder_cur)));
     scope.set_field(this_cur, 1, Value::Int(port));
     scope.set_field(this_cur, 2, addr_cur);
+    Ok(())
 }
 
 fn p52_isa_host_from_addr(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Value {
@@ -12562,7 +12563,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         let mut scope = NativeHandleScope::new(ctx);
         let this_h = scope.root(this);
         let addr =
-            crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0");
+            crate::net_phase_e::alloc_inet_address_external(&mut *scope, "0.0.0.0", "0.0.0.0")?;
         let addr_h = scope.root(addr);
         let addr_cur = scope.get(&addr_h);
         let host = p52_isa_host_from_addr(&mut *scope, addr_cur);
@@ -12574,7 +12575,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             host,
             Value::Object(Some(addr_cur)),
             port,
-        );
+        )?;
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/lang/String;I)V", |ctx, args| {
@@ -12611,7 +12612,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
                 &mut *scope,
                 &host_str,
                 &ip,
-            ))),
+            )?)),
             None => Value::Object(None),
         };
         let this_cur = scope.get(&this_h);
@@ -12622,7 +12623,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             Value::Object(Some(host_cur)),
             addr,
             port,
-        );
+        )?;
         Ok(Some(Value::Object(None)))
     });
     r.register(isa, "<init>", "(Ljava/net/InetAddress;I)V", |ctx, args| {
@@ -12649,7 +12650,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
                 &mut *scope,
                 "0.0.0.0",
                 "0.0.0.0",
-            ),
+            )?,
         };
         let addr_h = scope.root(addr);
         let addr_cur = scope.get(&addr_h);
@@ -12662,7 +12663,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             host_val,
             Value::Object(Some(addr_cur)),
             port,
-        );
+        )?;
         Ok(Some(Value::Object(None)))
     });
     r.register(
@@ -12675,7 +12676,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
             // Cross-call GC-safety: the allocation below can move `host`.
             let mut scope = NativeHandleScope::new(ctx);
             let host_h = scope.root(host);
-            let obj = alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 3);
+            let obj = try_alloc_concurrent_synthetic(&mut *scope, "java/net/InetSocketAddress", 3)?;
             let obj_h = scope.root(obj);
             let obj_cur = scope.get(&obj_h);
             let host_cur = scope.get(&host_h);
@@ -12685,7 +12686,7 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
                 Value::Object(Some(host_cur)),
                 Value::Object(None),
                 port,
-            );
+            )?;
             Ok(Some(Value::Object(Some(scope.get(&obj_h)))))
         },
     );
@@ -12849,10 +12850,11 @@ pub(crate) fn register_phase52_inet_socket_address(r: &mut NativeMethodRegistry)
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
-fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let sock = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let sock = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 5)?;
     // FIX (jndirealmintegration-ldap-connection-npe residual): field index 0
     // (SOCK_HOST in this synthetic-mode convention) lands on the REAL
     // `java.net.Socket.impl` field whenever the real class is loaded (see
@@ -12882,7 +12884,7 @@ fn phase52_alloc_socket(ctx: &mut dyn NativeContext) -> ObjectRef {
     // GC-safe helper `net_phase_e::re1_init_socket_locks` already used by the
     // synthetic `Socket.<init>`/`ServerSocket.accept()` paths, rather than
     // duplicating its pin-across-allocation logic here.
-    crate::net_phase_e::re1_init_socket_locks(ctx, sock)
+    Ok(crate::net_phase_e::re1_init_socket_locks(ctx, sock)?)
 }
 
 fn phase52_socket_connect(
@@ -12890,7 +12892,7 @@ fn phase52_socket_connect(
     host_value: Value,
     port_value: Value,
 ) -> MethodCallResult {
-    let sock = phase52_alloc_socket(ctx);
+    let sock = phase52_alloc_socket(ctx)?;
     let host = match host_value {
         Value::Object(Some(s)) => ctx
             .read_string(s)
@@ -12939,12 +12941,12 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "getDefault",
         "()Ljavax/net/SocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/SocketFactory", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/SocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(sf, "createSocket", "()Ljava/net/Socket;", |ctx, _args| {
-        Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)))))
+        Ok(Some(Value::Object(Some(phase52_alloc_socket(ctx)?))))
     });
     r.register(
         sf,
@@ -13076,7 +13078,7 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "getDefault",
         "()Ljavax/net/ServerSocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ServerSocketFactory", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -13121,6 +13123,7 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -13428,7 +13431,7 @@ pub(crate) fn register_phase52_date_format(r: &mut NativeMethodRegistry) {
         "getDateInstance",
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2)?;
             let pat = ctx.create_string("yyyy-MM-dd");
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -13440,7 +13443,7 @@ pub(crate) fn register_phase52_date_format(r: &mut NativeMethodRegistry) {
         "getDateInstance",
         "(I)Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2)?;
             let pat = ctx.create_string("yyyy-MM-dd");
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -13452,7 +13455,7 @@ pub(crate) fn register_phase52_date_format(r: &mut NativeMethodRegistry) {
         "getTimeInstance",
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2)?;
             let pat = ctx.create_string("HH:mm:ss");
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -13464,7 +13467,7 @@ pub(crate) fn register_phase52_date_format(r: &mut NativeMethodRegistry) {
         "getTimeInstance",
         "(I)Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2)?;
             let pat = ctx.create_string("HH:mm:ss");
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -13476,7 +13479,7 @@ pub(crate) fn register_phase52_date_format(r: &mut NativeMethodRegistry) {
         "getDateTimeInstance",
         "()Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2)?;
             let pat = ctx.create_string("yyyy-MM-dd HH:mm:ss");
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -13488,7 +13491,7 @@ pub(crate) fn register_phase52_date_format(r: &mut NativeMethodRegistry) {
         "getDateTimeInstance",
         "(II)Ljava/text/DateFormat;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/text/SimpleDateFormat", 2)?;
             let pat = ctx.create_string("yyyy-MM-dd HH:mm:ss");
             ctx.set_field(obj, 0, Value::Object(Some(pat)));
             ctx.set_field(obj, 1, Value::Object(None));
@@ -13509,7 +13512,7 @@ pub(crate) fn register_phase52_math_context(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let prec = args[1].as_int().unwrap_or(0);
         ctx.set_field(this, 0, Value::Int(prec));
-        let rm = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+        let rm = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
         ctx.set_field(rm, 0, Value::Int(4));
         ctx.set_field(this, 1, Value::Object(Some(rm)));
         Ok(Some(Value::Object(None)))
@@ -13563,33 +13566,33 @@ pub(crate) fn register_phase52_math_context(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(prec.wrapping_mul(59))))
     });
     r.register(mc, "DECIMAL32", "Ljava/math/MathContext;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2)?;
         ctx.set_field(obj, 0, Value::Int(7));
-        let rm = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+        let rm = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
         ctx.set_field(rm, 0, Value::Int(4));
         ctx.set_field(obj, 1, Value::Object(Some(rm)));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(mc, "DECIMAL64", "Ljava/math/MathContext;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2)?;
         ctx.set_field(obj, 0, Value::Int(16));
-        let rm = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+        let rm = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
         ctx.set_field(rm, 0, Value::Int(4));
         ctx.set_field(obj, 1, Value::Object(Some(rm)));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(mc, "DECIMAL128", "Ljava/math/MathContext;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2)?;
         ctx.set_field(obj, 0, Value::Int(34));
-        let rm = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+        let rm = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
         ctx.set_field(rm, 0, Value::Int(4));
         ctx.set_field(obj, 1, Value::Object(Some(rm)));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(mc, "UNLIMITED", "Ljava/math/MathContext;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/math/MathContext", 2)?;
         ctx.set_field(obj, 0, Value::Int(0));
-        let rm = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+        let rm = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
         ctx.set_field(rm, 0, Value::Int(4));
         ctx.set_field(obj, 1, Value::Object(Some(rm)));
         Ok(Some(Value::Object(Some(obj))))
@@ -13614,7 +13617,7 @@ pub(crate) fn register_phase52_rounding_mode(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
             ctx.set_field(obj, 0, Value::Int(ord));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -13622,7 +13625,7 @@ pub(crate) fn register_phase52_rounding_mode(r: &mut NativeMethodRegistry) {
     r.register(rm, "values", "()[Ljava/math/RoundingMode;", |ctx, _args| {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
         for i in 0..8 {
-            let obj = alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/math/RoundingMode", 1)?;
             ctx.set_field(obj, 0, Value::Int(i as i32));
             ctx.set_array_element(arr, i, Value::Object(Some(obj)));
         }
@@ -13944,17 +13947,17 @@ pub(crate) fn register_phase52_byte_order(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bo = "java/nio/ByteOrder";
     r.register(bo, "BIG_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
         ctx.set_field(obj, 0, Value::Int(0));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(bo, "LITTLE_ENDIAN", "Ljava/nio/ByteOrder;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
         ctx.set_field(obj, 0, Value::Int(1));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(bo, "nativeOrder", "()Ljava/nio/ByteOrder;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteOrder", 1)?;
         let is_le = cfg!(target_endian = "little");
         ctx.set_field(obj, 0, Value::Int(if is_le { 1 } else { 0 }));
         Ok(Some(Value::Object(Some(obj))))
@@ -14196,8 +14199,8 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cipher = "javax/crypto/Cipher";
 
-    fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> ObjectRef {
-        let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6);
+    fn cipher_alloc(ctx: &mut dyn NativeContext, algo: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
+        let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Cipher", 6)?;
         ctx.set_field(obj, CIPHER_ALGO, Value::Object(Some(algo)));
         ctx.set_field(obj, CIPHER_MODE, Value::Int(0));
         ctx.set_field(obj, CIPHER_KEY, Value::Object(None));
@@ -14206,7 +14209,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         ctx.set_field(obj, CIPHER_ACCUM, Value::Object(Some(acc)));
         let aad = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         ctx.set_field(obj, CIPHER_AAD, Value::Object(Some(aad)));
-        obj
+        Ok(obj)
     }
 
     // Cipher.getInstance(String algorithm) -> Cipher
@@ -14216,7 +14219,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -14244,7 +14247,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 &algo_str,
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
-            let obj = cipher_alloc(ctx, algo);
+            let obj = cipher_alloc(ctx, algo)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -14521,7 +14524,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(128)); // default key size
             Ok(Some(Value::Object(Some(obj))))
@@ -14541,7 +14544,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(128)); // default key size
             Ok(Some(Value::Object(Some(obj))))
@@ -14556,7 +14559,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/KeyGenerator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/KeyGenerator", 2)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(128));
             Ok(Some(Value::Object(Some(obj))))
@@ -14659,7 +14662,7 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             for b in buf.iter_mut() {
                 *b = 0;
             }
-            let sk = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 1);
+            let sk = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKey", 1)?;
             ctx.set_field(sk, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(sk))))
         },
@@ -15474,7 +15477,7 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
     match pbkdf2_prf_code(&alg) {
         Some(code) => {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
             // GC-stable, collision-disambiguated key (was the bare 32-bit
             // identity hash, which could collide or inherit a stale PRF on a
             // recycled hash and derive a WRONG key).
@@ -15492,7 +15495,7 @@ pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -
         None if is_known_pbe_keyfactory_alg(&alg)
             || (pbe_keyfactory_enabled() && is_pbe_keyfactory_alg(&alg)) =>
         {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1)?;
             let key = pbkdf2_key_for(ctx, obj);
             pbe_algo_table().lock().unwrap().insert(key, alg);
             Ok(Some(Value::Object(Some(obj))))
@@ -15655,7 +15658,7 @@ fn pbe_generate_secret(
         let kpin = ctx.pin_native_root(key_arr);
         let algo_s = ctx.create_string(alg);
         let key_arr_r = ctx.read_native_pin(kpin, key_arr);
-        let sk = alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2);
+        let sk = try_alloc_concurrent_synthetic(ctx, "javax/crypto/spec/SecretKeySpec", 2)?;
         ctx.set_field(sk, 0, Value::Object(Some(key_arr_r)));
         ctx.set_field(sk, 1, Value::Object(Some(algo_s)));
         ctx.unpin_native_roots(kpin);
@@ -16046,12 +16049,12 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
     let sec = "java/security/Security";
 
     /// Create a provider synthetic with the given name + version.
-    fn make_provider(ctx: &mut dyn NativeContext, name: &str, version: f64) -> ObjectRef {
-        let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 2);
+    fn make_provider(ctx: &mut dyn NativeContext, name: &str, version: f64) -> Result<ObjectRef, MethodCallFailed> {
+        let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 2)?;
         let n = ctx.create_string(name);
         ctx.set_field(p, 0, Value::Object(Some(n)));
         ctx.set_field(p, 1, Value::Double(version));
-        p
+        Ok(p)
     }
 
     // T2.6.15/16 — persistent Provider registry. The list is seeded
@@ -16075,7 +16078,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             let snapshot: Vec<(String, f64)> = provider_registry_snapshot();
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, snapshot.len());
             for (i, (name, ver)) in snapshot.iter().enumerate() {
-                let p = make_provider(ctx, name, *ver);
+                let p = make_provider(ctx, name, *ver)?;
                 ctx.set_array_element(arr, i, Value::Object(Some(p)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -16092,7 +16095,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             };
             match provider_registry_find(&name_str) {
                 Some(ver) => {
-                    let p = make_provider(ctx, &name_str, ver);
+                    let p = make_provider(ctx, &name_str, ver)?;
                     Ok(Some(Value::Object(Some(p))))
                 }
                 // The JDK contract is to return null for an unknown
@@ -16305,7 +16308,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/security/KeyStore;",
         |ctx, args| {
             let ks_type = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/KeyStore", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/KeyStore", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(ks_type)));
             ctx.set_field(obj, 1, Value::Int(0)); // not loaded
             ctx.set_field(obj, 2, Value::Long(0)); // ks_id (none yet)
@@ -16461,12 +16464,36 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                             let s = ctx.create_string(k);
                             ctx.set_array_element(arr, i, Value::Object(Some(s)));
                         }
-                        // IteratorEnumeration: 2 fields (elements_arr=0, pos=1)
-                        let en =
-                            alloc_concurrent_synthetic(ctx, "java/util/IteratorEnumeration", 2);
-                        ctx.set_field(en, 0, Value::Object(Some(arr)));
-                        ctx.set_field(en, 1, Value::Int(0));
-                        return Ok(Some(Value::Object(Some(en))));
+                        // IteratorEnumeration: 2 fields (elements_arr=0, pos=1).
+                        // Under `--jdk-only` that fabrication is refused, so
+                        // fall back to an enumeration the JDK builds itself —
+                        // the same landing `Enumeration$Impl` uses. Without it
+                        // the refusal reaches `KeyStore.aliases()` as a
+                        // NoClassDefFoundError and takes the whole security
+                        // section of `JdkOnlyPlatformProbe` with it.
+                        let arr_pin = ctx.pin_native_root(arr);
+                        let en = match try_alloc_concurrent_synthetic(
+                            ctx,
+                            "java/util/IteratorEnumeration",
+                            2,
+                        ) {
+                            Ok(en) => {
+                                let arr = ctx.read_native_pin(arr_pin, arr);
+                                ctx.set_field(en, 0, Value::Object(Some(arr)));
+                                ctx.set_field(en, 1, Value::Int(0));
+                                Ok(en)
+                            }
+                            Err(refusal) => {
+                                let arr = ctx.read_native_pin(arr_pin, arr);
+                                match crate::classloader::real_snapshot_enumeration(ctx, arr) {
+                                    Ok(Some(en)) => Ok(en),
+                                    Ok(None) => Err(refusal),
+                                    Err(err) => Err(err),
+                                }
+                            }
+                        };
+                        ctx.unpin_native_roots(arr_pin);
+                        return Ok(Some(Value::Object(Some(en?))));
                     }
                 }
             }
@@ -16475,7 +16502,21 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         {
             let _ = this;
         }
-        let empty = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+        let empty = match try_alloc_concurrent_synthetic(
+            ctx,
+            "java/util/Collections$EmptyEnumeration",
+            0,
+        ) {
+            Ok(empty) => empty,
+            Err(refusal) => {
+                // Same landing over a zero-length array.
+                let none = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                match crate::classloader::real_snapshot_enumeration(ctx, none)? {
+                    Some(empty) => empty,
+                    None => return Err(refusal),
+                }
+            }
+        };
         Ok(Some(Value::Object(Some(empty))))
     });
     // IteratorEnumeration helpers (used by KeyStore.aliases)
@@ -16574,11 +16615,11 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                                 _ => None,
                             };
                             if let Some(cert) = x509_cert {
-                                let cert_obj = alloc_concurrent_synthetic(
+                                let cert_obj = try_alloc_concurrent_synthetic(
                                     ctx,
                                     "java/security/cert/X509Certificate",
                                     3,
-                                );
+                                )?;
                                 let sub_str = ctx.create_string(&cert.subject_cn);
                                 let iss_str = ctx.create_string(&cert.issuer_cn);
                                 let cert_id = crypto_impl::cert_next_id();
@@ -16623,11 +16664,11 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                                 crypto_impl::KeyStoreEntry::PrivateKeyEntry {
                                     key_bytes, ..
                                 } => {
-                                    let pk = alloc_concurrent_synthetic(
+                                    let pk = try_alloc_concurrent_synthetic(
                                         ctx,
                                         "java/security/PrivateKey",
                                         4,
-                                    );
+                                    )?;
                                     ctx.set_field(pk, 0, Value::Int(6)); // RSA default
                                     ctx.set_field(pk, 1, Value::Int(2048));
                                     ctx.set_field(pk, 2, Value::Int(key_bytes.len() as i32));
@@ -16638,11 +16679,11 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                                     key_bytes,
                                     algorithm,
                                 } => {
-                                    let sk = alloc_concurrent_synthetic(
+                                    let sk = try_alloc_concurrent_synthetic(
                                         ctx,
                                         "javax/crypto/SecretKey",
                                         3,
-                                    );
+                                    )?;
                                     ctx.set_field(sk, 0, Value::Int(0));
                                     ctx.set_field(sk, 1, Value::Int((key_bytes.len() * 8) as i32));
                                     ctx.set_field(sk, 2, Value::Int(key_bytes.len() as i32));
@@ -16745,7 +16786,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/security/Signature;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", 4)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0)); // uninitialized
             ctx.set_field(obj, 2, Value::Object(None)); // key
@@ -16776,7 +16817,7 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 &algo_str,
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/Signature", 4)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -17515,7 +17556,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 // instance slot 0 (the typed `holder` reference field) is what
                 // poisoned real-JDK InetAddress bytecode dispatch.
                 let addr =
-                    crate::net_phase_e::alloc_inet_address_for_input(ctx, &host_str, &host_str);
+                    crate::net_phase_e::alloc_inet_address_for_input(ctx, &host_str, &host_str)?;
                 Ok(Some(Value::Object(Some(addr))))
             } else {
                 Ok(Some(Value::Object(None)))
@@ -17605,7 +17646,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let is = alloc_concurrent_synthetic(ctx, "java/net/SocketInputStream", 1);
+            let is = try_alloc_concurrent_synthetic(ctx, "java/net/SocketInputStream", 1)?;
             ctx.set_field(is, SIO_STREAM_ID, Value::Int(sid));
             Ok(Some(Value::Object(Some(is))))
         },
@@ -17625,7 +17666,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let os = alloc_concurrent_synthetic(ctx, "java/net/SocketOutputStream", 1);
+            let os = try_alloc_concurrent_synthetic(ctx, "java/net/SocketOutputStream", 1)?;
             ctx.set_field(os, SIO_STREAM_ID, Value::Int(sid));
             Ok(Some(Value::Object(Some(os))))
         },
@@ -18273,11 +18314,11 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         ctx.end_blocking_region();
         match outcome {
             SsAccept::Accepted(sid) => {
-                let client = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+                let client = try_alloc_concurrent_synthetic(ctx, "java/net/Socket", 5)?;
                 // Seed socketLock/closeLock -- this bare allocation skips real
                 // `Socket.<init>`; see net_phase_e::re1_init_socket_locks doc
                 // comment and jndirealmintegration-ldap-connection-npe.md.
-                let client = crate::net_phase_e::re1_init_socket_locks(ctx, client);
+                let client = crate::net_phase_e::re1_init_socket_locks(ctx, client)?;
                 // Get peer address from the stream
                 let (peer_host, peer_port) = {
                     let reg = s2_registry().lock();
@@ -18441,7 +18482,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/security/cert/CertPathValidator;",
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/cert/CertPathValidator", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertPathValidator", 1)?;
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -18458,7 +18499,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
             // For PKIX validation, return a valid PKIXCertPathValidatorResult.
             // This is a simplification: real JDK validates the chain against trust anchors.
             // We accept all chains that reach here (the TLS layer does its own validation).
-            let result = alloc_concurrent_synthetic(ctx, "java/security/cert/PKIXCertPathValidatorResult", 1);
+            let result = try_alloc_concurrent_synthetic(ctx, "java/security/cert/PKIXCertPathValidatorResult", 1)?;
             // trust_anchor field 0 — store null (no specific anchor exposed)
             ctx.set_field(result, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(result))))
@@ -18488,7 +18529,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         match ctx.get_field(this, 1) {
             Value::Object(Some(list)) => Ok(Some(Value::Object(Some(list)))),
             _ => {
-                let empty = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                let empty = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                 let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
                 ctx.set_field(empty, 0, Value::Object(Some(arr)));
                 ctx.set_field(empty, 1, Value::Int(0));
@@ -18623,6 +18664,7 @@ pub fn register_synthetic_socket_stubs(r: &mut NativeMethodRegistry) {
         });
     }
     r.set_category(__prev_cat);
+    ()
 }
 
 // ---------------------------------------------------------------------------
@@ -20181,7 +20223,7 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "getLogManager",
         "()Ljava/util/logging/LogManager;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -20191,7 +20233,7 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, _args| {
             // Return a new Logger stub
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -20342,7 +20384,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let str_ref = obj_arg(args, 0)?;
             let raw = ctx.read_string(str_ref).unwrap_or_default();
-            let obj = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
             let raw_str = ctx.create_string(&raw);
             // Parse scheme
             let (scheme, rest) = if let Some(pos) = raw.find("://") {
@@ -20534,7 +20576,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
                 _ => ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
             };
             let len = ctx.array_length(body_arr);
-            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
             ctx.set_field(stream, 0, Value::Object(Some(body_arr))); // buf
             ctx.set_field(stream, 1, Value::Int(0)); // pos
             ctx.set_field(stream, 2, Value::Int(0)); // mark
@@ -20549,7 +20591,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             ctx.set_field(this, 8, Value::Int(1)); // doOutput = true
-            let baos = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2);
+            let baos = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayOutputStream", 2)?;
             let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4096);
             ctx.set_field(baos, 0, Value::Object(Some(buf)));
             ctx.set_field(baos, 1, Value::Int(0));
@@ -20770,7 +20812,7 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
             // Pin the body across the stream allocation — a moving young GC
             // there would relocate it (native stale-local family).
             let body_pin = ctx.pin_native_root(body_arr);
-            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4)?;
             let body_arr = ctx.read_native_pin(body_pin, body_arr);
             ctx.unpin_native_roots(body_pin);
             ctx.set_field(stream, 0, Value::Object(Some(body_arr))); // buf
@@ -22912,7 +22954,7 @@ mod t2_tests {
         input: &str,
         delims: &str,
     ) -> cratonvm_types::ObjectRef {
-        let st = crate::alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3);
+        let st = crate::try_alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3)?;
         let input_s = ctx.create_string(input);
         let delim_s = ctx.create_string(delims);
         ctx.set_field(st, ST_FIELD_INPUT, Value::Object(Some(input_s)));
@@ -23540,7 +23582,7 @@ mod t2_tests {
     // -----------------------------------------------------------------------
 
     fn make_arraylist(ctx: &mut dyn NativeContext, values: &[Value]) -> cratonvm_types::ObjectRef {
-        let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = crate::try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let data = make_ref_array(ctx, values);
         ctx.set_field(list, 0, Value::Object(Some(data)));
         ctx.set_field(list, 1, Value::Int(values.len() as i32));
@@ -23670,7 +23712,7 @@ mod t2_tests {
         data: &[i32],
     ) -> cratonvm_types::ObjectRef {
         let arr = make_int_array(ctx, data);
-        let spl = crate::alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2);
+        let spl = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2)?;
         ctx.set_field(spl, SPL_FIELD_DATA, Value::Object(Some(arr)));
         ctx.set_field(spl, SPL_FIELD_CURSOR, Value::Int(0));
         spl
@@ -23722,7 +23764,7 @@ mod t2_tests {
 
     /// Allocate a default BitSet via the real init native.
     fn make_bitset(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
-        let bs = crate::alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2);
+        let bs = crate::try_alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2)?;
         native_bs_init(ctx, &[Value::Object(Some(bs))]).unwrap();
         bs
     }

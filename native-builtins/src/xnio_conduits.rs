@@ -84,7 +84,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Class names
@@ -2258,28 +2258,28 @@ fn native_setter_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // Test-only helpers to inflate a source / sink channel as a Java object.
 // ---------------------------------------------------------------------------
 
-fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_STREAM_SOURCE_CONDUIT, SRC_NUM_SLOTS);
+fn alloc_source_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_STREAM_SOURCE_CONDUIT, SRC_NUM_SLOTS)?;
     remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1));
-    obj
+    Ok(obj)
 }
 
-fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_STREAM_SINK_CONDUIT, SINK_NUM_SLOTS);
+fn alloc_sink_conduit_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_STREAM_SINK_CONDUIT, SINK_NUM_SLOTS)?;
     remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
-    obj
+    Ok(obj)
 }
 
 /// Allocate a Java-side `ConduitStreamSourceChannel` and bind it to the given
 /// channel id. Public (but `#[doc(hidden)]`) so integration tests in other
 /// crates can stand up a conduit without threading a full Selector in.
 #[doc(hidden)]
-pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS);
+pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_SOURCE, SRC_NUM_SLOTS)?;
     // Family-1 fix (cce0079): the conduit alloc below can move the
     // still-unrooted `obj` — pin and refresh it, or `remember_source_obj`
     // registers the WRONG identity-hash key (every later
@@ -2292,14 +2292,14 @@ pub fn alloc_source_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectR
     remember_source_obj(ctx, obj, id);
     ctx.set_field(obj, SRC_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SRC_FIELD_READ_SUSPENDED, Value::Int(1)); // start suspended
-    ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit)));
-    obj
+    ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit?)));
+    Ok(obj)
 }
 
 /// Allocate a Java-side `ConduitStreamSinkChannel` bound to the given id.
 #[doc(hidden)]
-pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS);
+pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, CLS_SINK, SINK_NUM_SLOTS)?;
     // Family-1 fix (cce0079): same as `alloc_source_channel_obj` — refresh
     // `obj` across the conduit alloc before registry/field use.
     let obj_pin = ctx.pin_native_root(obj);
@@ -2309,8 +2309,8 @@ pub fn alloc_sink_channel_obj(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef
     remember_sink_obj(ctx, obj, id);
     ctx.set_field(obj, SINK_FIELD_CHANNEL_ID, Value::Long(id as i64));
     ctx.set_field(obj, SINK_FIELD_WRITE_SUSPENDED, Value::Int(1));
-    ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit)));
-    obj
+    ctx.set_field_by_name(obj, "conduit", Value::Object(Some(conduit?)));
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -2894,7 +2894,7 @@ mod tests {
         ctx: &mut crate::test_utils::MockNativeContext,
         capacity: i32,
     ) -> ObjectRef {
-        let buf = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 5);
+        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 5)?;
         let arr = ctx.new_array(ArrayElementType::Byte, capacity as usize);
         ctx.set_field(buf, BB_FIELD_ARRAY, Value::Object(Some(arr)));
         ctx.set_field(buf, BB_FIELD_POS, Value::Int(0));
@@ -3329,7 +3329,7 @@ mod tests {
         let id = register_source_channel(ConduitTransport::Pipe(pipe));
         let ch_obj = alloc_source_channel_obj(&mut ctx, id);
         // Build a Setter tied to SRC_FIELD_READ_LISTENER on ch_obj.
-        let setter = alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS);
+        let setter = try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SETTER, SETTER_NUM_SLOTS)?;
         ctx.set_field(
             setter,
             SETTER_FIELD_CHANNEL_HANDLE,

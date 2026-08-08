@@ -30,7 +30,8 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
+use cratonvm_types::error::MethodCallFailed;
 
 // cceres5 (WildFly metrics `getResourceDescription` stale-ResourceBundle,
 // live-captured 2026-07-22 via CRATONVM_DBG_STALE_RECV): every helper below
@@ -406,15 +407,15 @@ fn populate_currency_names_en(ctx: &mut dyn NativeContext, map: ObjectRef) {
 /// non-null. For user `.properties` resources on the classpath we
 /// populate from the file. For known JDK locale-data base names we
 /// pre-populate English/US defaults. Unknown names get an empty bundle.
-fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
+fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     // cceres5: pin the bundle + backing map across every allocation below
     // (map init, root-locale alloc, per-property string allocations, the
     // populate tables) and return the pin-refreshed address — the raw `obj`
     // return was one producer of the stale-ResourceBundle family (see
     // rb_get_bundle).
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2)?;
     let obj_pin = ctx.pin_native_root(obj);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let obj_now = ctx.read_native_pin(obj_pin, obj);
@@ -441,11 +442,11 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
     let root_locale = crate::locale_alloc(ctx, "", "");
     let obj_now = ctx.read_native_pin(obj_pin, obj);
     if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
-        ctx.set_field(obj_now, loc_idx, Value::Object(Some(root_locale)));
+        ctx.set_field(obj_now, loc_idx, Value::Object(Some(root_locale?)));
     } else {
         // Synthetic-JDK mode (class not loaded with real layout): slot 1 is
         // the conventional `locale` placement used by the synthetic layout.
-        ctx.set_field(obj_now, 1, Value::Object(Some(root_locale)));
+        ctx.set_field(obj_now, 1, Value::Object(Some(root_locale?)));
     }
 
     // Record the base name so `getBaseBundleName()` has something true to
@@ -519,7 +520,7 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
 
     let obj_now = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
-    obj_now
+    Ok(obj_now)
 }
 
 /// Decode `java.util.Properties` escapes in a key or value: `\uXXXX`,
@@ -791,16 +792,21 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
 /// scan is the established, well-tested path and answers the same thing.
 /// Because our native IS the `getBundle` frame (no Java frame is pushed for
 /// it), the innermost captured Java frame is the caller.
-fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let frames = ctx.capture_stack_trace(0);
-    let cid = frames.last()?.class_id?;
+    let Some(frame) = frames.last() else {
+        return Ok(None);
+    };
+    let Some(cid) = frame.class_id else {
+        return Ok(None);
+    };
     let mirror = ctx.get_class_mirror(cid);
     let loader = match crate::lang_class::native_class_get_class_loader(
         ctx,
         &[Value::Object(Some(mirror))],
     ) {
         Ok(Some(Value::Object(Some(loader)))) => loader,
-        _ => return None,
+        _ => return Ok(None),
     };
     // Anything other than the application-loader singleton. NOT
     // `is_user_defined_loader`: that predicate excludes a bare
@@ -809,11 +815,11 @@ fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> 
     // application builds an isolated loader, and HotSpot resolves a bundle
     // through it. Classes owned by the built-in loaders report `null` here or
     // the app singleton, and both keep the established `-cp` path.
-    let app = crate::classloader::get_or_create_app_loader(ctx);
+    let app = crate::classloader::get_or_create_app_loader(ctx)?;
     if loader.as_ptr() == app.as_ptr() {
-        return None;
+        return Ok(None);
     }
-    Some(loader)
+    Ok(Some(loader))
 }
 
 /// Locate a `.properties` candidate through the loader supplied to
@@ -1044,7 +1050,10 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
     // An explicit `ClassLoader` argument wins; otherwise honour the JDK's
     // caller-sensitive resolution -- see `caller_bundle_class_loader`.
-    let loader = bundle_class_loader(ctx, args).or_else(|| caller_bundle_class_loader(ctx));
+    let loader = match bundle_class_loader(ctx, args) {
+        Some(loader) => Some(loader),
+        None => caller_bundle_class_loader(ctx)?,
+    };
 
     // cceres5 (WildFly metrics stale-ResourceBundle, live-captured via
     // CRATONVM_DBG_STALE_RECV): `obj`/`map`/`loader` were carried raw across
@@ -1052,9 +1061,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // and `locale_alloc` — and the PRE-MOVE `obj` was then returned to Java.
     // Pin all three; read through the pins at every later use.
     let loader_pin = loader.map(|l| ctx.pin_native_root(l));
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2)?;
     let obj_pin = ctx.pin_native_root(obj);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let obj_now = ctx.read_native_pin(obj_pin, obj);
@@ -1120,9 +1129,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let locale = crate::locale_alloc(ctx, &m_lang, &m_country);
         let obj_now = ctx.read_native_pin(obj_pin, obj);
         if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
-            ctx.set_field(obj_now, loc_idx, Value::Object(Some(locale)));
+            ctx.set_field(obj_now, loc_idx, Value::Object(Some(locale?)));
         } else {
-            ctx.set_field(obj_now, 1, Value::Object(Some(locale)));
+            ctx.set_field(obj_now, 1, Value::Object(Some(locale?)));
         }
         let first_pin = loader_pin.unwrap_or(obj_pin);
         ctx.unpin_native_roots(first_pin);
@@ -1148,10 +1157,10 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if is_jdk_internal_bundle(&bundle_name) {
         ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
         let obj = build_bundle(ctx, &bundle_name);
-        return Ok(Some(Value::Object(Some(obj))));
+        return Ok(Some(Value::Object(Some(obj?))));
     }
     ctx.unpin_native_roots(loader_pin.unwrap_or(obj_pin));
-    let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
     let msg = ctx.create_string(&format!(
         "Can't find bundle for base name {bundle_name}, locale {lang}"
     ));
@@ -1340,7 +1349,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             // Key absent: throw MissingResourceException — ResourceBundle.getObject's
             // contract, and jakarta.el.ResourceBundleELResolver.getValue catches it
             // to produce the "???key???" sentinel.
-            let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()
@@ -1381,7 +1390,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 &[Value::Object(Some(parent)), Value::Object(Some(key))],
             );
         }
-        let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+        let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
         let msg = ctx.create_string(&format!(
             "Can't find resource for key {}",
             key_str.unwrap_or_default()
@@ -1419,7 +1428,7 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 );
             }
             let key_str = ctx.read_string(key);
-            let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let exc = try_alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8)?;
             let msg = ctx.create_string(&format!(
                 "Can't find resource for key {}",
                 key_str.unwrap_or_default()
@@ -1808,7 +1817,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(loc))));
             }
         }
-        Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
+        Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")?))))
     });
     // getBaseBundleName() — the real `ResourceBundle` returns its private
     // `name` field. The Javadoc permits null ("or null if unknown"), but we
@@ -2409,6 +2418,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     );
 
     registry.set_category(__prev_cat);
+    ()
 }
 
 /// Read a `java.text.Normalizer.Form` enum argument's ordinal (NFC=0, NFD=1,

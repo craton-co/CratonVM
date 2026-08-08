@@ -35,7 +35,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 use std::fmt::Write;
 
 // java.time — LocalDate, LocalTime, Instant, Duration (Phase 17)
@@ -2585,7 +2585,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "()Ljava/time/temporal/TemporalAdjuster;",
         |ctx, _args| {
             // Tag 1 = firstDayOfMonth
-            let adj = alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1);
+            let adj = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1)?;
             ctx.set_field(adj, 0, Value::Int(1));
             Ok(Some(Value::Object(Some(adj))))
         },
@@ -2596,7 +2596,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "()Ljava/time/temporal/TemporalAdjuster;",
         |ctx, _args| {
             // Tag 2 = lastDayOfMonth
-            let adj = alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1);
+            let adj = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1)?;
             ctx.set_field(adj, 0, Value::Int(2));
             Ok(Some(Value::Object(Some(adj))))
         },
@@ -2607,7 +2607,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "()Ljava/time/temporal/TemporalAdjuster;",
         |ctx, _args| {
             // Tag 3 = firstDayOfNextMonth
-            let adj = alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1);
+            let adj = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1)?;
             ctx.set_field(adj, 0, Value::Int(3));
             Ok(Some(Value::Object(Some(adj))))
         },
@@ -2618,7 +2618,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "()Ljava/time/temporal/TemporalAdjuster;",
         |ctx, _args| {
             // Tag 4 = firstDayOfYear
-            let adj = alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1);
+            let adj = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1)?;
             ctx.set_field(adj, 0, Value::Int(4));
             Ok(Some(Value::Object(Some(adj))))
         },
@@ -2629,7 +2629,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "()Ljava/time/temporal/TemporalAdjuster;",
         |ctx, _args| {
             // Tag 5 = lastDayOfYear
-            let adj = alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1);
+            let adj = try_alloc_concurrent_synthetic(ctx, "java/time/temporal/TemporalAdjuster", 1)?;
             ctx.set_field(adj, 0, Value::Int(5));
             Ok(Some(Value::Object(Some(adj))))
         },
@@ -4895,7 +4895,7 @@ fn native_zone_id_get_available(ctx: &mut dyn NativeContext, _args: &[Value]) ->
         "Pacific/Auckland",
     ];
     // Return as a HashSet — use a simple ArrayList for now (consumers iterate)
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let set = try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, zones.len());
     for (i, z) in zones.iter().enumerate() {
         let s = ctx.create_string(z);

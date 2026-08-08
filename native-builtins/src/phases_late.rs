@@ -21,7 +21,7 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{
-    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
+    try_alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
     jul_logger_parent_get, jul_logger_parent_set, native_noop, native_noop_with_this, obj_arg,
 };
 use crate::{native_cf_then_accept, native_cf_then_apply};
@@ -748,7 +748,7 @@ fn cm_construct_via_context(
 fn cm_fallback_alloc(ctx: &mut dyn NativeContext, cls: ObjectRef) -> MethodCallResult {
     match crate::lang_class::mirror_class_name(ctx, cls) {
         Some(n) => {
-            let obj = alloc_concurrent_synthetic(ctx, &n, 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, &n, 0)?;
             Ok(Some(Value::Object(Some(obj))))
         }
         None => Ok(Some(Value::Object(None))),
@@ -1253,7 +1253,7 @@ const PB_FIELD_ENVIRONMENT: usize = 2;
 // this file registers ITS `native_process_builder_start`.
 //
 // The layout was allocated with
-// `alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT)`,
+// `try_alloc_concurrent_synthetic(ctx, "java/lang/Process", PROC_FIELD_COUNT)?`,
 // which in real-JDK mode yields the REAL six-field `java.lang.Process`: the
 // four extra slots did not exist, so every write to them was dropped and every
 // read of them returned nothing. The same shape on the `Runtime.exec` route is
@@ -1477,7 +1477,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         let mut map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[]) {
             Ok(Some(Value::Object(Some(m)))) => m,
             _ => {
-                let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+                let m = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
                 cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))])?;
                 m
             }
@@ -1555,7 +1555,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "PIPE",
         "()Ljava/lang/ProcessBuilder$Redirect;",
         |ctx, _args| {
-            let r = alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1);
+            let r = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1)?;
             ctx.set_field(r, 0, Value::Int(0)); // PIPE
             Ok(Some(Value::Object(Some(r))))
         },
@@ -1565,7 +1565,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "INHERIT",
         "()Ljava/lang/ProcessBuilder$Redirect;",
         |ctx, _args| {
-            let r = alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1);
+            let r = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessBuilder$Redirect", 1)?;
             ctx.set_field(r, 0, Value::Int(1)); // INHERIT
             Ok(Some(Value::Object(Some(r))))
         },
@@ -1768,13 +1768,13 @@ fn p58_make_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(arr))) => Some(*arr),
         _ => None,
     };
-    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants);
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, constants)?;
     // Set the call-site type from the caller-supplied MethodType so JDK
     // arity-validation reads see the real shape.
     if let Some(Value::Object(Some(mt))) = args.get(2) {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
-    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+    let cs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
     ctx.set_field(cs, 0, Value::Object(Some(mh)));
     ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
@@ -1799,11 +1799,11 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         }
     }
     let recipe: String = std::iter::repeat('\u{0001}').take(arity).collect();
-    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None);
+    let mh = crate::lang_invoke::alloc_string_concat_method_handle(ctx, &recipe, None)?;
     if let Some(Value::Object(Some(mt))) = args.get(2) {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(*mt)));
     }
-    let cs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+    let cs = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2)?;
     ctx.set_field(cs, 0, Value::Object(Some(mh)));
     ctx.set_field_by_name(cs, "target", Value::Object(Some(mh)));
     Ok(Some(Value::Object(Some(cs))))
@@ -2207,7 +2207,7 @@ fn p60_process_handle_current(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     ) {
         Ok(Some(Value::Object(Some(real)))) => real,
         _ => {
-            let synth = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+            let synth = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1)?;
             ctx.set_field(synth, 0, Value::Long(pid));
             synth
         }
@@ -2326,14 +2326,14 @@ fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     if parent_pid <= 0 {
         return p60_empty_optional(ctx, &[]);
     }
-    let parent = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1);
+    let parent = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle", 1)?;
     ctx.set_field(parent, 0, Value::Long(parent_pid));
     // GC-SAFETY (native stale-local family): `parent` is not yet reachable
     // from any Java root, and the `Optional` allocation below is a collection
     // point that can relocate it. Holding it in a bare local across that call
     // and then storing it is the use-after-move that corrupts the heap.
     let parent_pin = ctx.pin_native_root(parent);
-    let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let optional = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
     let parent = ctx.read_native_pin(parent_pin, parent);
     ctx.unpin_native_roots(parent_pin);
     ctx.set_field(optional, 0, Value::Object(Some(parent)));
@@ -2364,7 +2364,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Return empty stream
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -2375,7 +2375,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/util/stream/Stream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -2385,7 +2385,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "onExit",
         "()Ljava/util/concurrent/CompletableFuture;",
         |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true);
+            let cf = p58_new_cf(ctx, Value::Object(None), true)?;
             Ok(Some(Value::Object(Some(cf))))
         },
     );
@@ -2435,7 +2435,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "info",
         "()Ljava/lang/ProcessHandle$Info;",
         |ctx, _args| {
-            let info = alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle$Info", 0);
+            let info = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle$Info", 0)?;
             Ok(Some(Value::Object(Some(info))))
         },
     );
@@ -2448,7 +2448,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     // executable, the way the real `ProcessHandleImpl.Info` does.
     r.register(phi, "command", "()Ljava/util/Optional;", |ctx, args| {
         let Ok(exe) = std::env::current_exe() else {
-            return p60_empty_optional(ctx, args);
+            return Ok(p60_empty_optional(ctx, args)?);
         };
         // GC-SAFETY (native stale-local family): `text` is freshly allocated
         // and reachable from no Java root, and the `Optional` allocation below
@@ -2456,7 +2456,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         // re-read the forwarded ref before the (allocation-free) field write.
         let text = ctx.create_string(&exe.to_string_lossy());
         let text_pin = ctx.pin_native_root(text);
-        let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let optional = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         let text = ctx.read_native_pin(text_pin, text);
         ctx.unpin_native_roots(text_pin);
         ctx.set_field(optional, 0, Value::Object(Some(text)));
@@ -2482,6 +2482,7 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         p60_empty_optional,
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 
@@ -2532,7 +2533,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             let handlers = match jul_logger_handlers_get(ctx, this) {
                 Some(list) => list,
                 None => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     jul_logger_handlers_set(ctx, this, list);
                     list
@@ -2733,7 +2734,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "getLogManager",
         "()Ljava/util/logging/LogManager;",
         |ctx, _args| {
-            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 1);
+            let mgr = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 1)?;
             ctx.set_field(mgr, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(mgr))))
         },
@@ -2766,11 +2767,11 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         |ctx, _args| {
             // Return empty enumeration stub
-            let e = alloc_concurrent_synthetic(
+            let e = try_alloc_concurrent_synthetic(
                 ctx,
                 "java/util/logging/LogManager$LoggerEnumeration",
                 1,
-            );
+            )?;
             ctx.set_field(e, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(e))))
         },
@@ -2959,7 +2960,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             } else {
                 return Ok(Some(Value::Object(None)));
             };
-            let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+            let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
             let full = ctx.create_string(&url_str);
             ctx.set_field(url_obj, 0, Value::Object(Some(full)));
             ctx.set_field(url_obj, 5, Value::Object(Some(full)));
@@ -2974,11 +2975,11 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             let name_obj = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => {
-                    let e = alloc_concurrent_synthetic(
+                    let e = try_alloc_concurrent_synthetic(
                         ctx,
                         "java/util/Collections$EmptyEnumeration",
                         0,
-                    );
+                    )?;
                     return Ok(Some(Value::Object(Some(e))));
                 }
             };
@@ -2990,7 +2991,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             }
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
             for (i, u) in urls.iter().enumerate() {
-                let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+                let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
                 let full = ctx.create_string(u);
                 ctx.set_field(url_obj, 0, Value::Object(Some(full)));
                 ctx.set_field(url_obj, 5, Value::Object(Some(full)));
@@ -3017,7 +3018,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             match ctx.find_resource(resource_name) {
                 None => Ok(Some(Value::Object(None))),
                 Some(bytes) => Ok(Some(Value::Object(Some(
-                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes),
+                    crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes)?,
                 )))),
             }
         },
@@ -3042,7 +3043,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
             } else {
                 return Ok(Some(Value::Object(None)));
             };
-            let url_obj = alloc_concurrent_synthetic(ctx, "java/net/URL", 6);
+            let url_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URL", 6)?;
             let full = ctx.create_string(&url_str);
             ctx.set_field(url_obj, 0, Value::Object(Some(full)));
             ctx.set_field(url_obj, 5, Value::Object(Some(full)));
@@ -3120,7 +3121,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         "getPlatformClassLoader",
         "()Ljava/lang/ClassLoader;",
         |ctx, _args| {
-            let loader = alloc_concurrent_synthetic(ctx, "java/lang/ClassLoader", 1);
+            let loader = try_alloc_concurrent_synthetic(ctx, "java/lang/ClassLoader", 1)?;
             ctx.set_field(loader, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(loader))))
         },
@@ -3156,6 +3157,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 
@@ -3293,7 +3295,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_ref = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             // Try to discover providers for this service class
             let class_name = match class_ref {
                 Value::Object(Some(cls)) => {
@@ -3308,7 +3310,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .get(class_name.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
                 providers.len().max(1),
@@ -3330,7 +3332,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
         |ctx, args| {
             let class_ref = args.first().copied().unwrap_or(Value::Object(None));
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 2)?;
             let class_name = match class_ref {
                 Value::Object(Some(cls)) => {
                     match ctx.invoke_virtual(cls, "getName", "()Ljava/lang/String;", &[]) {
@@ -3344,7 +3346,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 .get(class_name.as_str())
                 .copied()
                 .unwrap_or(&[]);
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(
                 cratonvm_types::ArrayElementType::Reference,
                 providers.len().max(1),
@@ -3363,7 +3365,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
     r.register(sl, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let services = ctx.get_field(this, 0);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         ctx.set_field(itr, 0, services); // the ArrayList
         ctx.set_field(itr, 1, Value::Int(0)); // current index
         Ok(Some(Value::Object(Some(itr))))
@@ -3377,19 +3379,19 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
                 for i in 0..len {
                     ctx.set_array_element(stream_arr, i, ctx.get_array_element(arr, i));
                 }
-                let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                 ctx.set_field(stream, 0, Value::Object(Some(stream_arr)));
                 return Ok(Some(Value::Object(Some(stream))));
             }
         }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+        let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
         ctx.set_field(stream, 0, Value::Object(Some(arr)));
         Ok(Some(Value::Object(Some(stream))))
     });
     r.register(sl, "findFirst", "()Ljava/util/Optional;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        let opt = try_alloc_concurrent_synthetic(ctx, "java/util/Optional", 1)?;
         if let Value::Object(Some(al)) = ctx.get_field(this, 0) {
             let len = ctx.get_field(al, 1).as_int().unwrap_or(0);
             if len > 0 {
@@ -3487,7 +3489,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
     let hf = "java/util/HexFormat";
 
     r.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
         let empty = ctx.create_string("");
         ctx.set_field(obj, 0, Value::Object(Some(empty))); // delimiter
         let empty2 = ctx.create_string("");
@@ -3499,7 +3501,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "ofDelimiter",
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             let empty = ctx.create_string("");
             ctx.set_field(obj, 1, Value::Object(Some(empty)));
@@ -3602,7 +3604,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/HexFormat;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/HexFormat", 2)?;
             ctx.set_field(obj, 0, ctx.get_field(this, 0)); // keep delimiter
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(Some(Value::Object(Some(obj))))
@@ -3738,7 +3740,7 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
         "current",
         "()Ljava/util/concurrent/ThreadLocalRandom;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadLocalRandom", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadLocalRandom", 2)?;
             ctx.set_field(obj, 0, Value::Long(p64_simple_random() as i64));
             ctx.set_field(obj, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(obj))))
@@ -4156,7 +4158,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(r))) => *r,
                 _ => {
                     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                     ctx.set_field(stream, 0, Value::Object(Some(arr)));
                     return Ok(Some(Value::Object(Some(stream))));
                 }
@@ -4180,7 +4182,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
                 let s = ctx.create_string(part);
                 ctx.set_array_element(arr, i, Value::Object(Some(s)));
             }
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4338,7 +4340,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "of",
         "(Ljava/lang/String;)Ljava/lang/StringTemplate;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate", 2)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None))); // fragments
             ctx.set_field(obj, 1, Value::Object(None)); // values
             Ok(Some(Value::Object(Some(obj))))
@@ -4363,7 +4365,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "STR",
         "Ljava/lang/StringTemplate$Processor;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4373,7 +4375,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "RAW",
         "Ljava/lang/StringTemplate$Processor;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4400,7 +4402,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
         "FMT",
         "Ljava/lang/StringTemplate$Processor;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StringTemplate$Processor", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4560,7 +4562,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "getInstance",
         "()Ljava/lang/StackWalker;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4569,7 +4571,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/StackWalker$Option;)Ljava/lang/StackWalker;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/StackWalker", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5321,7 +5323,7 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
         "create",
         "()Ljava/lang/ref/Cleaner;",
         |ctx, _args| {
-            let cleaner = alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS);
+            let cleaner = try_alloc_concurrent_synthetic(ctx, "java/lang/ref/Cleaner", CLEANER_FIELDS)?;
             // The previous version allocated a bare 1-slot object and stopped
             // there, so `register` had nowhere to keep its Cleanables alive
             // and every registered cleanup action was collectible before it
@@ -5380,7 +5382,7 @@ pub(crate) fn register_p69_cleaner(r: &mut NativeMethodRegistry) {
             let cleaner = cleaner_reserve(ctx, cleaner);
 
             let cleanable_class = "java/lang/ref/Cleaner$Cleanable";
-            let cleanable = alloc_concurrent_synthetic(ctx, cleanable_class, CLEANABLE_FIELDS);
+            let cleanable = try_alloc_concurrent_synthetic(ctx, cleanable_class, CLEANABLE_FIELDS)?;
 
             let cleaner = ctx.read_native_pin(pin_base, cleaner);
             let referent = match (referent, referent_pin) {
@@ -5805,7 +5807,7 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
         "entry",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
         |ctx, args| {
-            let entry = alloc_concurrent_synthetic(ctx, "java/util/Map$Entry", 2);
+            let entry = try_alloc_concurrent_synthetic(ctx, "java/util/Map$Entry", 2)?;
             ctx.set_field(
                 entry,
                 0,
@@ -6774,7 +6776,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             let a = bi_read(ctx, obj_arg(args, 0)?);
             let b = bi_read(ctx, obj_arg(args, 1)?);
             let g = bi_gcd_str(&a, &b);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)?))))
         },
     );
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
@@ -6797,7 +6799,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         } else {
             v.shr(n.unsigned_abs())
         };
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
     });
     r.register(
         bi,
@@ -6814,7 +6816,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             } else {
                 v.shl(n.unsigned_abs())
             };
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))))
         },
     );
     // Bitwise and/or/xor/not via limb BigInt with FULL two's-complement
@@ -6830,7 +6832,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))?))))
         },
     );
     r.register(
@@ -6840,7 +6842,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))?))))
         },
     );
     r.register(
@@ -6850,12 +6852,12 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))?))))
         },
     );
     r.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
         let a = bi_read_int(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())))))
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())?))))
     });
     r.register(bi, "testBit", "(I)Z", |ctx, args| {
         let v = bi_read_int(ctx, obj_arg(args, 0)?);
@@ -7009,7 +7011,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             if !exp_int.is_neg() {
                 let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
                 let res = base_int.modpow(&exp_int, &m_int);
-                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))));
+                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)?))));
             }
             // Negative exponent is rare (modInverse-based); keep the decimal
             // path until step 5 lands a limb modInverse.
@@ -7023,7 +7025,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
             })?;
             let pos_exp = exp.trim_start_matches('-');
             let res = bi_mod_pow_str(&inv, pos_exp, &m);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)?))))
         },
     );
     r.register(
@@ -7040,7 +7042,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 .into());
             }
             match a.mod_inverse(&m) {
-                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv))))),
+                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &inv)?)))),
                 None => Err(RuntimeError::ArithmeticException {
                     message: "BigInteger not invertible.".into(),
                 }
@@ -7065,7 +7067,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.mul(&b))?))))
         },
     );
     r.register(
@@ -7075,7 +7077,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.add(&b))?))))
         },
     );
     r.register(
@@ -7085,7 +7087,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let a = bi_read_int(ctx, obj_arg(args, 0)?);
             let b = bi_read_int(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.sub(&b))?))))
         },
     );
     r.register(
@@ -7101,7 +7103,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.modulo(&m))?))))
         },
     );
     r.register(
@@ -7117,7 +7119,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.rem(&b))?))))
         },
     );
     r.register(
@@ -7133,7 +7135,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))))))
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.div(&b))?))))
         },
     );
 
@@ -7169,6 +7171,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let _ = bi_add_str; // keep import alive in case future ops want it
     let _ = bi_cmp_unsigned;
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Divide an unsigned decimal string by 2^32, returning (quotient, remainder).
@@ -8468,7 +8471,7 @@ mod ffm_p67_layout_tests {
 
         let path_name = ctx.create_string("size");
         let path_elem =
-            alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2)?;
         ctx.set_field(path_elem, 0, Value::Object(Some(path_name)));
         ctx.set_field(path_elem, 1, Value::Int(0));
         let path = ctx.new_array(ArrayElementType::Reference, 1);

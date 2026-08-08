@@ -11,13 +11,12 @@ is not the call sites. See *What is still open*.
 > now has somewhere for its refusal to land (a real
 > `Collections.enumeration(Arrays$ArrayList)`), so every class this record ever
 > listed as "refused with nowhere to go" is answered. Item 5 is **two thirds
-> done**: `native-io` and `native-collections` allocation funnels are fallible,
-> `native-builtins::alloc_concurrent_synthetic` is not, and the reason is
-> measured rather than estimated — see *Why `alloc_concurrent_synthetic` was
-> abandoned rather than finished*, now carrying a fourth attempt that leaves
-> **758** errors on a preserved, non-compiling branch and names the two rules
-> that got it there. `ensure_synthetic_class` therefore still exists and this
-> record stays here.
+> **CLOSED, 2026-08-07.** All three allocation funnels are fallible. The
+> `native-builtins` one — 1,904 call sites, the last and by far the largest —
+> landed on the fifth attempt; see *Why `alloc_concurrent_synthetic` was
+> abandoned rather than finished* for the four that did not and what the fifth
+> did differently. `ensure_synthetic_class` itself still exists (72 direct
+> callers outside the funnels), so this record stays open on **step 3** alone.
 
 The original defect: under `--jdk-only` this API recorded the violation and
 then fabricated the class anyway, so the run reported a violation while
@@ -256,6 +255,112 @@ Take the branch above, pick one file, finish it by hand until
 `cargo check` reports nothing in that file, commit, and repeat. The two findings
 above make the mechanical majority of each file free; the per-file residue is
 small enough to read. Six files carry 40% of what is left.
+
+### Attempt 5, 2026-08-07 — landed
+
+**2,072 errors to zero, and the acceptance run is green.** What made the
+difference was not persistence; it was finding three bugs in how the previous
+attempts read rustc.
+
+**rustc ELIDES long types.** The single most expensive mistake in attempts
+1-4. Both classifier regexes required the error type to appear in the
+diagnostic:
+
+    expected `Result<Option<ObjectRef>, ...>`, found `Option<_>`
+                                    ^^^ no `MethodCallFailed` anywhere
+
+118 mechanical errors were filed as "needs a human" because of that `...`, and
+attempt 4's 758-error "floor" was mostly them. Matching `expected \`Result<`
+and `found \`Result<` without naming the error type — and allowing `&?Result<`
+for the borrowed form — was worth more than every other rule combined.
+
+**The `Ok(..)` wrap was never automated.** Attempts 1-4 only ever wrapped tails
+*textually at widen time*, which is where all the old damage came from (a
+`return` matched inside a comment, a `;` matched inside the JVM descriptor
+`"()Ljava/io/InputStream;"`, a tail closing a multi-line call turning into
+`Ok(}))`). Wrapping from rustc's exact byte span instead is the mirror image of
+the `?` rule and just as reliable: **203 in the first round.** The general form
+is *widen the signature only, then let the compiler find every return* — it
+knows the expression tree and text does not.
+
+**The messages are in the label, not the message.** `E0005`'s message is
+`refutable pattern in local binding`; `Err(_) not covered` is on the span
+label. A rule keyed on the message matched nothing at all, silently. Two rules
+were dead for a whole round each for this reason.
+
+Beyond that, the shapes worth naming for anyone doing this again:
+
+| shape | edit | count |
+|---|---|---:|
+| `Ok(X)?` | -> `X` — always safe, and pure damage where it does not compile | 40 |
+| `f(..);` in statement position | -> `f(..)?;` — the value was already discarded, so the refusal is now the ONLY thing it carries | 181 |
+| `match f(..) { .. }` | -> `match f(..)? {` (E0004 "Err(_) not covered") | 16 |
+| `let Ok((a,b)) = f(..);` | -> `let (a,b) = f(..)?;` | 6 |
+| `opt.unwrap_or_else(\|\| f(..)?)` | `.map(Ok)` before it, one `?` after | 8 |
+| `Option<Result<T,E>>` | `.transpose()?` | several |
+| double-widen `Result<MethodCallResult, E>` | `MethodCallResult` IS `Result<Option<Value>, E>`; this broke 12 registrations with "expected fn pointer, found fn item" | 14 |
+
+**Two traps that compile.** `for x in f(..)` keeps compiling after `f` becomes
+fallible, because `Result` is `IntoIterator` over its Ok value — the loop then
+silently iterates zero-or-one `Vec<T>` instead of the elements, and only
+surfaces much later as a type error on `x`. And rustc's own suggestion for a
+discarded `Result` is `let _ = ..`, which here would reintroduce precisely the
+defect this record exists to remove.
+
+**What must NOT be widened.** `extern` declarations (no Rust body to return
+`Ok` from), trait-impl methods (`Drop::drop` cannot return a `Result`), and
+**registration functions** — 83 `register_*` had been widened by an earlier
+pass, and left that way the chain propagates into `vm_init`, whose `SharedVm`
+constructor has no error channel. Registration wires closures into a
+`NativeMethodRegistry`; the closures are the fallible part and they run later.
+
+**Where a refusal cannot propagate, it is absorbed deliberately and in one
+place**: rustls' own `resolve` trait method returns `Option`, so a refusal
+becomes "no key" — what rustls already does when a resolver has nothing; the
+bytecode-transformer entry point returns `Vec<u8>`, so a refused app loader
+falls back to the bootstrap loader. Both are commented at the site. The
+violation is recorded upstream either way.
+
+### What the ratchet caught
+
+The strict corpus earned its keep. With the funnel refusing
+`java/util/IteratorEnumeration`, `KeyStore.aliases()` raised
+`NoClassDefFoundError` and `JdkOnlyPlatformProbe`'s whole `security` section
+went from six passing assertions to one failure. That is a class needing a
+*landing*, exactly as item 4 described: it now falls back to an enumeration the
+JDK builds itself (`Arrays$ArrayList` + `Collections.enumeration`), reusing
+`real_snapshot_enumeration`. `Compatible` mode is untouched — the fallback is
+only reachable from the refusal arm.
+
+Note the twin in `phases_early.rs` sits behind
+`#[cfg(feature = "legacy-synthetic-crypto")]` and is **not** the path the CLI
+build takes; the first fix went there and the gate failed again, identically.
+Both are wired now.
+
+### Acceptance, 2026-08-07
+
+| check | result |
+|---|---|
+| `cargo build --release -p cratonvm-cli` | clean, **0** `unused Result` warnings |
+| `--jdk-only-report` `counts.compatibility_classes` | **0** (`JdkOnlyCensusLoadProbe`, `JdkOnlyBreadthProbe`; 1,211 violations still recorded — the backlog, not the result) |
+| `scripts/jdk-only-strict-probes.sh` | **PASS**, 0 divergent sections observed against 2 baselined; transcript byte-identical to HotSpot in both modes |
+| `native-builtins/tests/stub_ratchet.rs` | 7 passed, 0 failed |
+| `regression-suite` | 30/31, and the one failure **moves** — see below |
+
+`cargo check -p cratonvm-native-builtins` is **not** sufficient: the CLI's
+feature set compiles paths that check does not, and it turned up 46 more errors
+plus every one of the 181 discarded refusals after the lib alone was clean.
+
+**On the regression suite's one failure.** It is not the same test twice:
+`RSocketChannelInterrupt` on one run, `RMapGcStress` on the next, and each
+passes when run on its own. The Azure host was simultaneously running two other
+sessions' Hibernate and H2 suites. `RSocketChannelInterrupt` additionally fails
+**identically on a pre-change `dev` binary** (2026-08-05), naming the
+`blocked-reader-never-wakes` defect in `native-io/src/socket_channel.rs` that
+its own assertion text points at — so that one is pre-existing, not a
+regression. Both are load-sensitive (a blocking-read interrupt and a GC stress
+loop); neither is evidence about this change, and neither should be read as a
+clean 31/31 either.
 
 ### What making a funnel fallible actually FINDS — the reason to do it at all
 

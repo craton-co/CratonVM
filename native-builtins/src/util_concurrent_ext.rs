@@ -2273,7 +2273,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             let arr = match ctx.get_field(this, 0) {
                 Value::Object(Some(a)) => a,
                 _ => {
-                    let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
+                    let iter = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3)?;
                     ctx.set_field(iter, 0, Value::Int(0));
                     ctx.set_field(iter, 1, Value::Int(0));
                     return Ok(Some(Value::Object(Some(iter))));
@@ -2283,7 +2283,7 @@ pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry)
             for i in 0..size {
                 ctx.set_array_element(snap, i, ctx.get_array_element(arr, i));
             }
-            let iter = alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3);
+            let iter = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList$Itr", 3)?;
             ctx.set_field(iter, 0, Value::Object(Some(snap)));
             ctx.set_field(iter, 1, Value::Int(size as i32));
             ctx.set_field(iter, 2, Value::Int(0));
@@ -3316,7 +3316,7 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
                 // 0 = cancelled flag, 1 = accumulated demand (Long). The second
                 // slot is what makes `request(n)` above observable.
                 let sub =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
+                    try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
                 ctx.set_field(sub, 0, Value::Int(0)); // cancelled flag
                 ctx.set_field(sub, 1, Value::Long(0)); // demand
                 let _ = ctx.invoke_virtual(
@@ -3655,7 +3655,7 @@ pub(crate) fn native_rl_new_condition(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cond = alloc_concurrent_synthetic(ctx, "java/util/concurrent/locks/Condition", 1);
+    let cond = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/locks/Condition", 1)?;
     ctx.set_field(cond, COND_FIELD_LOCK, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(cond))))
 }
@@ -4730,7 +4730,7 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(c))) => *c,
             _ => return Ok(Some(Value::Object(None))),
         };
-        let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
         let task_count =
             match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(coll))])? {
@@ -5038,7 +5038,7 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
     );
     registry.register(ft, "isDone", "()Z", native_fut_is_done);
     // Synthetic FutureTask uses the same (result=0, done=1) layout — see the
-    // `alloc_concurrent_synthetic(.., "java/util/concurrent/FutureTask", 2)`
+    // `try_alloc_concurrent_synthetic(.., "java/util/concurrent/FutureTask", 2)?`
     // call sites in phases_late/net_channels.rs. Nothing else registers
     // FutureTask.cancel/isCancelled, so the old constant `false` pair was the
     // live answer: `FutureTask.cancel(true)` could never succeed and a
@@ -5144,14 +5144,14 @@ fn native_cf_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn native_cf_completed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = args.first().copied().unwrap_or(Value::Object(None));
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     ctx.set_field(cf, FUT_FIELD_RESULT, val);
     ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(1));
     Ok(Some(Value::Object(Some(cf))))
 }
 
 fn native_cf_supply_async(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     if let Some(Value::Object(Some(supplier))) = args.first() {
         let result = ctx.invoke_virtual(*supplier, "get", "()Ljava/lang/Object;", &[])?;
         ctx.set_field(cf, FUT_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
@@ -5310,7 +5310,7 @@ pub(crate) fn native_cf_then_apply(
         Value::Int(d) => d,
         _ => 0,
     };
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     // RD.8: propagate exceptional/cancelled state without invoking the Function.
     if done == 2 || done == 3 {
         ctx.set_field(cf, FUT_FIELD_RESULT, ctx.get_field(this, FUT_FIELD_RESULT));
@@ -5365,7 +5365,7 @@ pub(crate) fn native_cf_then_accept(
         Value::Int(d) => d,
         _ => 0,
     };
-    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+    let cf = try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4)?;
     if done == 2 || done == 3 {
         ctx.set_field(cf, FUT_FIELD_RESULT, ctx.get_field(this, FUT_FIELD_RESULT));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(done));
@@ -5612,23 +5612,23 @@ fn aqls_state_table() -> &'static parking_lot::Mutex<
 fn aqls_state_slot(
     ctx: &mut dyn NativeContext,
     synchronizer: ObjectRef,
-) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicI64>, MethodCallFailed> {
     let key = gc_stable_lock_key(ctx, synchronizer);
     let mut table = aqls_state_table().lock();
-    table
-        .entry(key)
+    Ok(table
+        .entry(key?)
         // AbstractQueuedLongSynchronizer initializes `state` to zero. Every
         // later Java-side transition goes through the three forced natives
         // registered below, including deserialization's `setState` path.
         .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)))
-        .clone()
+        .clone())
 }
 
 fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(Value::Object(Some(synchronizer))) = args.first() else {
         return Ok(Some(Value::Long(0)));
     };
-    let state = aqls_state_slot(ctx, *synchronizer).load(std::sync::atomic::Ordering::SeqCst);
+    let state = aqls_state_slot(ctx, *synchronizer)?.load(std::sync::atomic::Ordering::SeqCst);
     Ok(Some(Value::Long(state)))
 }
 
@@ -5638,7 +5638,7 @@ fn native_aqls_set_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     else {
         return Ok(None);
     };
-    aqls_state_slot(ctx, *synchronizer).store(*state, std::sync::atomic::Ordering::SeqCst);
+    aqls_state_slot(ctx, *synchronizer)?.store(*state, std::sync::atomic::Ordering::SeqCst);
     Ok(None)
 }
 
@@ -5654,7 +5654,7 @@ fn native_aqls_compare_and_set_state(
     else {
         return Ok(Some(Value::Int(0)));
     };
-    let swapped = aqls_state_slot(ctx, *synchronizer)
+    let swapped = aqls_state_slot(ctx, *synchronizer)?
         .compare_exchange(
             *expected,
             *new_state,
@@ -5746,10 +5746,10 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
     // view obtained before a GC must unlock against the SAME slot afterwards;
     // `parent.as_ptr()` shifts under a moving collector and the lock/unlock
     // pair would diverge, deadlocking the lock or corrupting a neighbour slot.
-    fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<usize> {
+    fn rwl_parent_addr(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<usize>, MethodCallFailed> {
         match ctx.get_field(this, 0) {
-            Value::Object(Some(parent)) => Some(gc_stable_lock_key(ctx, parent)),
-            _ => None,
+            Value::Object(Some(parent)) => Ok(Some(gc_stable_lock_key(ctx, parent)?)),
+            _ => Ok(None),
         }
     }
 
@@ -5758,7 +5758,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
             // rw_read_lock's internal contended wait is a raw
             // parking_lot::Condvar::wait with NO GC-blocking-region bracket
@@ -5778,7 +5778,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             crate::stamped_lock::rw_read_unlock(addr, ctx.thread_id());
         }
         Ok(None)
@@ -5788,7 +5788,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ok = match rwl_parent_addr(ctx, this) {
+        let ok = match rwl_parent_addr(ctx, this)? {
             Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
             None => false,
         };
@@ -5806,7 +5806,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let ok = match rwl_parent_addr(ctx, this) {
+            let ok = match rwl_parent_addr(ctx, this)? {
                 Some(a) => crate::stamped_lock::rw_try_read_lock(a, ctx.thread_id()),
                 None => false,
             };
@@ -5818,7 +5818,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit — see the plain `lock()` registration above.
             ctx.begin_blocking_region();
             crate::stamped_lock::rw_read_lock(addr, ctx.thread_id());
@@ -5834,7 +5834,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
             // rw_write_lock's internal contended wait is a raw
             // parking_lot::Condvar::wait with NO GC-blocking-region bracket
@@ -5856,7 +5856,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             crate::stamped_lock::rw_write_unlock(addr, ctx.thread_id());
         }
         Ok(None)
@@ -5866,7 +5866,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let ok = match rwl_parent_addr(ctx, this) {
+        let ok = match rwl_parent_addr(ctx, this)? {
             Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
             None => false,
         };
@@ -5881,7 +5881,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let ok = match rwl_parent_addr(ctx, this) {
+            let ok = match rwl_parent_addr(ctx, this)? {
                 Some(a) => crate::stamped_lock::rw_try_write_lock(a, ctx.thread_id()),
                 None => false,
             };
@@ -5893,7 +5893,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        if let Some(addr) = rwl_parent_addr(ctx, this) {
+        if let Ok(Some(addr)) = rwl_parent_addr(ctx, this) {
             // GC-blocking audit — see the plain `lock()` registration above.
             ctx.begin_blocking_region();
             crate::stamped_lock::rw_write_lock(addr, ctx.thread_id());
@@ -5906,7 +5906,7 @@ pub fn register_synthetic_rwlock_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
-        let held = match rwl_parent_addr(ctx, this) {
+        let held = match rwl_parent_addr(ctx, this)? {
             Some(a) => crate::stamped_lock::rw_write_is_held(a, ctx.thread_id()),
             None => false,
         };
@@ -6084,10 +6084,10 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
 // Pattern-A fix (bug nb-lib-gckeys §1): key the StampedLock state table by a
 // GC-stable identity (see `gc_stable_lock_key`) instead of the raw, moving
 // heap address that the lock/unlock pair could disagree on across a GC.
-fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<usize> {
+fn stamped_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<usize>, MethodCallFailed> {
     match args.first() {
-        Some(Value::Object(Some(o))) => Some(gc_stable_lock_key(ctx, *o)),
-        _ => None,
+        Some(Value::Object(Some(o))) => Ok(Some(gc_stable_lock_key(ctx, *o)?)),
+        _ => Ok(None),
     }
 }
 
@@ -6098,8 +6098,8 @@ fn stamped_obj(args: &[Value]) -> Option<ObjectRef> {
     }
 }
 
-fn stamped_addr_for_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> usize {
-    gc_stable_lock_key(ctx, obj)
+fn stamped_addr_for_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<usize, MethodCallFailed> {
+    Ok(gc_stable_lock_key(ctx, obj)?)
 }
 
 fn stamped_view_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
@@ -6112,7 +6112,7 @@ fn stamped_view_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<Ob
 
 fn native_stamped_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
         crate::stamped_lock::stamped_init(addr);
         mirror_stamped_state(ctx, obj, addr);
     }
@@ -6124,7 +6124,7 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     // GC-blocking audit (STW takeover 5-class cluster, 2026-07-13):
     // stamped_write_lock's contended wait is a raw parking_lot::Condvar::wait
     // with NO GC-blocking-region bracket — same missing-bracket bug as
@@ -6145,7 +6145,7 @@ fn native_stamped_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_read_lock(addr);
@@ -6159,7 +6159,7 @@ fn native_stamped_try_read_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
@@ -6170,7 +6170,7 @@ fn native_stamped_try_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(stamp)))
@@ -6180,7 +6180,7 @@ fn native_stamped_write_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) -
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
     crate::stamped_lock::stamped_write_lock(addr);
@@ -6196,7 +6196,7 @@ fn native_stamped_write_view_try_lock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     let stamp = crate::stamped_lock::stamped_try_write_lock(addr);
     mirror_stamped_state(ctx, parent, addr);
     Ok(Some(Value::Int(i32::from(stamp != 0))))
@@ -6209,7 +6209,7 @@ fn native_stamped_write_view_unlock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "StampedLock write lock not held".to_string(),
@@ -6224,7 +6224,7 @@ fn native_stamped_read_view_lock(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     // GC-blocking audit — see `native_stamped_write_lock` above.
     ctx.begin_blocking_region();
     crate::stamped_lock::stamped_read_lock(addr);
@@ -6240,7 +6240,7 @@ fn native_stamped_read_view_try_lock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     let stamp = crate::stamped_lock::stamped_try_read_lock(addr);
     mirror_stamped_state(ctx, parent, addr);
     Ok(Some(Value::Int(i32::from(stamp != 0))))
@@ -6253,7 +6253,7 @@ fn native_stamped_read_view_unlock(
     let Some(parent) = stamped_view_parent(ctx, args) else {
         return Ok(None);
     };
-    let addr = stamped_addr_for_obj(ctx, parent);
+    let addr = stamped_addr_for_obj(ctx, parent)?;
     if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
         return Err(RuntimeError::IllegalMonitorStateException {
             message: "StampedLock read lock not held".to_string(),
@@ -6265,7 +6265,7 @@ fn native_stamped_read_view_unlock(
 }
 
 fn native_stamped_optimistic(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Long(STAMPED_ORIGIN))),
     };
@@ -6279,7 +6279,7 @@ fn native_stamped_validate(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Long(v)) => *v,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6307,7 +6307,7 @@ fn native_stamped_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         return Ok(None);
     };
     let stamp = stamped_arg(args).unwrap_or(0);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let released = crate::stamped_lock::stamped_unlock_read(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     if !released {
@@ -6332,7 +6332,7 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return Ok(None);
     };
     let stamp = stamped_arg(args).unwrap_or(0);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let released = crate::stamped_lock::stamped_unlock_write(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     if !released {
@@ -6387,7 +6387,7 @@ fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         .into());
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let released = if stamp & crate::stamped_lock::JDK_WBIT != 0 {
         crate::stamped_lock::stamped_unlock_write(addr, stamp)
     } else {
@@ -6410,7 +6410,7 @@ fn native_stamped_unstamped_unlock_read(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
         if !crate::stamped_lock::stamped_try_unstamped_unlock_read(addr) {
             return Err(RuntimeError::IllegalMonitorStateException {
                 message: "StampedLock read lock not held".to_string(),
@@ -6427,7 +6427,7 @@ fn native_stamped_unstamped_unlock_write(
     args: &[Value],
 ) -> MethodCallResult {
     if let Some(obj) = stamped_obj(args) {
-        let addr = stamped_addr_for_obj(ctx, obj);
+        let addr = stamped_addr_for_obj(ctx, obj)?;
         if !crate::stamped_lock::stamped_try_unstamped_unlock_write(addr) {
             return Err(RuntimeError::IllegalMonitorStateException {
                 message: "StampedLock write lock not held".to_string(),
@@ -6443,7 +6443,7 @@ fn native_stamped_try_unlock_read(ctx: &mut dyn NativeContext, args: &[Value]) -
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_read(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Int(i32::from(unlocked))))
@@ -6456,7 +6456,7 @@ fn native_stamped_try_unlock_write(
     let Some(obj) = stamped_obj(args) else {
         return Ok(Some(Value::Int(0)));
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let unlocked = crate::stamped_lock::stamped_try_unstamped_unlock_write(addr);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Int(i32::from(unlocked))))
@@ -6474,7 +6474,7 @@ fn native_stamped_try_convert_to_write(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let converted = crate::stamped_lock::stamped_try_convert_to_write(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
@@ -6492,7 +6492,7 @@ fn native_stamped_try_convert_to_read(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let converted = crate::stamped_lock::stamped_try_convert_to_read(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
@@ -6512,7 +6512,7 @@ fn native_stamped_try_convert_to_optimistic(
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     let converted = crate::stamped_lock::stamped_try_convert_to_optimistic(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
@@ -6568,7 +6568,7 @@ fn native_stamped_try_read_lock_timed(
         None => return Ok(Some(Value::Long(0))),
     };
     let nanos = stamped_timeout_nanos(ctx, args);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_try_read_lock_timed(addr, nanos);
     ctx.end_blocking_region();
@@ -6585,7 +6585,7 @@ fn native_stamped_try_write_lock_timed(
         None => return Ok(Some(Value::Long(0))),
     };
     let nanos = stamped_timeout_nanos(ctx, args);
-    let addr = stamped_addr_for_obj(ctx, obj);
+    let addr = stamped_addr_for_obj(ctx, obj)?;
     ctx.begin_blocking_region();
     let stamp = crate::stamped_lock::stamped_try_write_lock_timed(addr, nanos);
     ctx.end_blocking_region();
@@ -6594,7 +6594,7 @@ fn native_stamped_try_write_lock_timed(
 }
 
 fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6604,7 +6604,7 @@ fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6616,7 +6616,7 @@ fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -
 }
 
 fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -6629,7 +6629,7 @@ fn native_stamped_get_read_lock_count(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let addr = match stamped_addr(ctx, args) {
+    let addr = match stamped_addr(ctx, args)? {
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
@@ -8015,7 +8015,7 @@ fn native_asr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // Store a real Pair object in the single `pair` field (slot 0). No write to
     // slot 1 — the ASR object itself has only one slot.
     let pair = asr_alloc_pair(ctx, r, stamp);
-    ctx.set_field(this, 0, Value::Object(Some(pair)));
+    ctx.set_field(this, 0, Value::Object(Some(pair?)));
     Ok(None)
 }
 
@@ -8064,7 +8064,7 @@ fn native_asr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // JDK `set` allocates a fresh Pair only when reference or stamp differ; we
     // always install a fresh Pair (semantically identical, slightly simpler).
     let pair = asr_alloc_pair(ctx, r, stamp);
-    ctx.set_field(this, 0, Value::Object(Some(pair)));
+    ctx.set_field(this, 0, Value::Object(Some(pair?)));
     Ok(None)
 }
 
@@ -8082,7 +8082,7 @@ fn native_asr_attempt_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if values_ref_equal(current_ref, expected_ref) {
         // Swap in a new Pair carrying the (unchanged) reference + new stamp.
         let pair = asr_alloc_pair(ctx, current_ref, new_stamp);
-        ctx.set_field(this, 0, Value::Object(Some(pair)));
+        ctx.set_field(this, 0, Value::Object(Some(pair?)));
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
@@ -8110,7 +8110,7 @@ fn native_asr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         // JDK fast-path: when both are identical it skips the casPair entirely).
         if !values_ref_equal(current_ref, new_ref) || current_stamp != new_stamp {
             let pair = asr_alloc_pair(ctx, new_ref, new_stamp);
-            ctx.set_field(this, 0, Value::Object(Some(pair)));
+            ctx.set_field(this, 0, Value::Object(Some(pair?)));
         }
         Ok(Some(Value::Int(1)))
     } else {
@@ -8167,7 +8167,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
 
     r.register(scope, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
+        pd_init_scope(ctx, this)?;
         Ok(None)
     });
     r.register(
@@ -8176,7 +8176,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/util/concurrent/ThreadFactory;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            pd_init_scope(ctx, this);
+            pd_init_scope(ctx, this)?;
             Ok(None)
         },
     );
@@ -8281,7 +8281,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
     let sof = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
     r.register(sof, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
+        pd_init_scope(ctx, this)?;
         Ok(None)
     });
     r.register(
@@ -8339,7 +8339,7 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
     let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
     r.register(sos, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        pd_init_scope(ctx, this);
+        pd_init_scope(ctx, this)?;
         Ok(None)
     });
     r.register(
@@ -8465,7 +8465,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock: hold count should become 1
@@ -8484,7 +8484,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         let result = native_rl_try_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8497,7 +8497,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock twice -- should increment hold count to 2
@@ -8523,7 +8523,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8541,7 +8541,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8567,7 +8567,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8596,7 +8596,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_to_zero_triggers_notify() {
         let mut ctx = make_ctx();
-        let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)?;
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(2)]).unwrap();
 
         assert_eq!(cdl_count(&mut ctx, cdl), 2);
@@ -8612,7 +8612,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_await_returns_when_count_is_zero() {
         let mut ctx = make_ctx();
-        let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)?;
         // Init with count=0 means await should return immediately
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(0)]).unwrap();
 
@@ -8624,7 +8624,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_below_zero_stays_at_zero() {
         let mut ctx = make_ctx();
-        let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)?;
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(1)]).unwrap();
 
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
@@ -8642,7 +8642,7 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_decrements_permits() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         assert_eq!(sem_permits(&mut ctx, sem), 3);
@@ -8654,7 +8654,7 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
@@ -8664,7 +8664,7 @@ mod concurrency_tests {
     #[test]
     fn sem_release_increments_and_notifies() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(1)]).unwrap();
 
         // Release adds a permit (calls monitor_notify internally)
@@ -8675,7 +8675,7 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_no_permits_returns_zero() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(0)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8686,7 +8686,7 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_permits_succeeds() {
         let mut ctx = make_ctx();
-        let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(5)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -9370,7 +9370,7 @@ mod concurrency_tests {
         // Verify that ReentrantLock lock/unlock cycle works with monitor-based contention
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9389,7 +9389,7 @@ mod concurrency_tests {
         // In single-threaded mock, monitor_wait returns immediately → not timed out
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9416,7 +9416,7 @@ mod concurrency_tests {
     fn m18_cond_await_nanos_returns_remaining() {
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9450,7 +9450,7 @@ mod concurrency_tests {
         // CopyOnWriteArrayList iterator should see a snapshot, not live data
         let mut ctx = make_ctx();
         let cowal =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2)?;
         cratonvm_native_collections::native_al_init(&mut ctx, &[Value::Object(Some(cowal))])
             .unwrap();
 
@@ -9563,7 +9563,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ai = "java/util/concurrent/atomic/AtomicInteger";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ai, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ai, 1)?;
 
         let init = reg.find(ai, "<init>", "(I)V").unwrap();
         init(&mut ctx, &[Value::Object(Some(obj)), Value::Int(10)]).unwrap();
@@ -9625,7 +9625,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let al = "java/util/concurrent/atomic/AtomicLong";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, al, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, al, 1)?;
 
         let init = reg.find(al, "<init>", "(J)V").unwrap();
         init(&mut ctx, &[Value::Object(Some(obj)), Value::Long(i64::MAX)]).unwrap();
@@ -9715,7 +9715,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ar = "java/util/concurrent/atomic/AtomicReference";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ar, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1)?;
         let value = ctx.create_string("CLOSED");
 
         let init = reg.find(ar, "<init>", "(Ljava/lang/Object;)V").unwrap();
@@ -9739,7 +9739,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ar = "java/util/concurrent/atomic/AtomicReference";
         let mut ctx = make_ctx();
-        let obj = alloc_concurrent_synthetic(&mut ctx, ar, 1);
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1)?;
 
         let s_a1 = ctx.create_string("hello");
         let s_a2 = ctx.create_string("hello");
@@ -9795,7 +9795,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9831,7 +9831,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3);
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9869,7 +9869,7 @@ mod concurrency_tests {
     #[test]
     fn rd8_completable_future_exceptional_passthrough() {
         let mut ctx = make_ctx();
-        let cf = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4);
+        let cf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4)?;
         let err_msg = ctx.create_string("boom");
         ctx.set_field(cf, FUT_FIELD_RESULT, Value::Object(Some(err_msg)));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(2));
@@ -10274,7 +10274,7 @@ fn rwl_view(
     // ARG — the pin is remapped, this Rust local is not. Re-read it through a
     // pin around the allocation.
     let this_pin = ctx.pin_native_root(this);
-    let view = alloc_concurrent_synthetic(ctx, class_name, 1);
+    let view = try_alloc_concurrent_synthetic(ctx, class_name, 1)?;
     let view_pin = ctx.pin_native_root(view);
     let this = ctx.read_native_pin(this_pin, this);
     let view = ctx.read_native_pin(view_pin, view);

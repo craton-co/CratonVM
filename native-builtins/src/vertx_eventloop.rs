@@ -78,7 +78,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Class name constants
@@ -955,12 +955,12 @@ fn os_tid() -> u64 {
 // Alloc helper
 // ---------------------------------------------------------------------------
 
-fn alloc_future(ctx: &mut dyn NativeContext) -> ObjectRef {
-    alloc_concurrent_synthetic(ctx, CLS_FUTURE, 1)
+fn alloc_future(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(try_alloc_concurrent_synthetic(ctx, CLS_FUTURE, 1)?)
 }
 
-fn alloc_scheduled_future_obj(ctx: &mut dyn NativeContext) -> ObjectRef {
-    alloc_concurrent_synthetic(ctx, CLS_SCHEDULED_FUTURE, 1)
+fn alloc_scheduled_future_obj(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(try_alloc_concurrent_synthetic(ctx, CLS_SCHEDULED_FUTURE, 1)?)
 }
 
 // ===========================================================================
@@ -1215,7 +1215,7 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(_))) => {}
         _ => {
             let sf = alloc_scheduled_future_obj(ctx);
-            return Ok(Some(Value::Object(Some(sf))));
+            return Ok(Some(Value::Object(Some(sf?))));
         }
     }
     let delay_raw = match args.get(2) {
@@ -1228,14 +1228,14 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(r))) => *r,
         _ => {
             let sf = alloc_scheduled_future_obj(ctx);
-            return Ok(Some(Value::Object(Some(sf))));
+            return Ok(Some(Value::Object(Some(sf?))));
         }
     };
     let raw = match ctx.get_field(this, NEL_FIELD_EVENT_LOOP_ID) {
         Value::Long(v) => v,
         _ => {
             let sf = alloc_scheduled_future_obj(ctx);
-            return Ok(Some(Value::Object(Some(sf))));
+            return Ok(Some(Value::Object(Some(sf?))));
         }
     };
     let sf = alloc_scheduled_future_obj(ctx);
@@ -1262,7 +1262,7 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             Box::new(|| {}),
         );
     }
-    Ok(Some(Value::Object(Some(sf))))
+    Ok(Some(Value::Object(Some(sf?))))
 }
 
 /// `*.inEventLoop()Z`
@@ -1300,14 +1300,14 @@ fn native_nel_shutdown_gracefully(ctx: &mut dyn NativeContext, args: &[Value]) -
         Value::Long(v) => v,
         _ => {
             let f = alloc_future(ctx);
-            return Ok(Some(Value::Object(Some(f))));
+            return Ok(Some(Value::Object(Some(f?))));
         }
     };
     if let Some(el) = lookup_vertx_loop(raw) {
         el.shutdown();
     }
     let f = alloc_future(ctx);
-    Ok(Some(Value::Object(Some(f))))
+    Ok(Some(Value::Object(Some(f?))))
 }
 
 /// `*.awaitTermination(JLjava/util/concurrent/TimeUnit;)Z`
@@ -1328,7 +1328,7 @@ fn native_nel_await_termination(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 fn native_nel_submit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_nel_execute(ctx, args)?;
     let f = alloc_future(ctx);
-    Ok(Some(Value::Object(Some(f))))
+    Ok(Some(Value::Object(Some(f?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,7 +1515,7 @@ mod tests {
         // be polluted by) the K2/K4 dead-queue tests under `cargo test`.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         let result = native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(2)]);
         assert!(result.is_ok(), "init must succeed: {:?}", result.err());
         let eid = match ctx.get_field(mirror, VERTX_FIELD_EVENT_LOOP_ID) {
@@ -1542,7 +1542,7 @@ mod tests {
         // sibling spawn/shutdown can't race the maps mid-call.
         let _guard = isolated_vertx_test();
         let mut ctx = mock_ctx();
-        let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         assert!(
             native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(0)]).is_err(),
             "pool size 0 must be rejected"
@@ -1567,7 +1567,7 @@ mod tests {
     #[test]
     fn vertx_get_event_loop_id_returns_stored() {
         let mut ctx = mock_ctx();
-        let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         ctx.set_field(mirror, VERTX_FIELD_EVENT_LOOP_ID, Value::Long(42));
         let res = native_vertx_get_event_loop_id(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(res.unwrap(), Some(Value::Long(42)));
@@ -1581,7 +1581,7 @@ mod tests {
         // FIX(test-isolation): init + close() flush the shared dead-queue.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(1)]).expect("init");
         native_vertx_close(&mut ctx, &[Value::Object(Some(mirror))]).expect("close");
         let state = match ctx.get_field(mirror, VERTX_FIELD_STATE) {
@@ -1600,16 +1600,16 @@ mod tests {
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         // Allocate a VertxImpl (starts a loop).
-        let vm = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let vm = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         native_vertx_init(&mut ctx, &[Value::Object(Some(vm)), Value::Int(1)]).expect("init");
         let eid = match ctx.get_field(vm, VERTX_FIELD_EVENT_LOOP_ID) {
             Value::Long(v) => v,
             other => panic!("expected Long, got {other:?}"),
         };
         // Wire a NioEventLoop mirror to that loop.
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(eid));
-        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        let runnable = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0)?;
         let res = native_nel_execute(
             &mut ctx,
             &[Value::Object(Some(nel)), Value::Object(Some(runnable))],
@@ -1631,9 +1631,9 @@ mod tests {
     #[test]
     fn nel_execute_invokes_runnable_and_swallows_task_error() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
-        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        let runnable = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0)?;
         // Arm the next invoke_virtual (the Runnable.run() call) to throw.
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
@@ -1669,9 +1669,9 @@ mod tests {
     #[test]
     fn nel_submit_invokes_runnable_and_returns_future_on_task_error() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
-        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        let runnable = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0)?;
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
                 cratonvm_types::error::VmError::Runtime(RuntimeError::IllegalStateException {
@@ -1695,7 +1695,7 @@ mod tests {
     #[test]
     fn nel_in_event_loop_false_outside_loop() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
         let res = native_nel_in_event_loop(&mut ctx, &[Value::Object(Some(nel))]);
         assert_eq!(res.unwrap(), Some(Value::Int(0)));
@@ -1707,7 +1707,7 @@ mod tests {
     #[test]
     fn nel_is_shutting_down_reflects_state() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         for (state, expected) in [
             (STATE_NOT_STARTED, 0),
             (STATE_STARTED, 0),
@@ -1726,7 +1726,7 @@ mod tests {
     #[test]
     fn nel_shutdown_gracefully_returns_future() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
         let res = native_nel_shutdown_gracefully(
             &mut ctx,
@@ -1751,7 +1751,7 @@ mod tests {
     #[test]
     fn nel_await_termination_reflects_state() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_STATE, Value::Int(STATE_STARTED));
         assert_eq!(
             native_nel_await_termination(
@@ -1786,9 +1786,9 @@ mod tests {
     #[test]
     fn nel_schedule_returns_scheduled_future() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
-        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        let runnable = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0)?;
         let res = native_nel_schedule(
             &mut ctx,
             &[
@@ -1808,9 +1808,9 @@ mod tests {
     #[test]
     fn nel_submit_returns_future() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
-        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        let runnable = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0)?;
         let res = native_nel_submit(
             &mut ctx,
             &[Value::Object(Some(nel)), Value::Object(Some(runnable))],
@@ -1825,7 +1825,7 @@ mod tests {
     #[test]
     fn nel_execute_null_runnable_errors() {
         let mut ctx = mock_ctx();
-        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        let nel = try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS)?;
         let res = native_nel_execute(&mut ctx, &[Value::Object(Some(nel)), Value::Object(None)]);
         assert!(res.is_err(), "null Runnable must error");
     }
@@ -2174,7 +2174,7 @@ mod tests {
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
-        let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         let pool = 3;
         // FIX(test-isolation): drain prior-test straggler dead-ids before the
         // init whose internal `flush_native_thread_deaths` would otherwise
@@ -2207,7 +2207,7 @@ mod tests {
         // FIX(test-isolation): serialize on the shared dead-queue and reset it.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(2)]).expect("init");
         let before_close = ctx
             .registered_native_threads()
@@ -2311,8 +2311,8 @@ mod tests {
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
-        let mirror_a = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
-        let mirror_b = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror_a = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
+        let mirror_b = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         // FIX(test-isolation): `native_vertx_init` internally calls
         // `flush_native_thread_deaths(ctx)`. Drain any prior-test straggler
         // (colliding) dead-id from the shared queue right before each init so
@@ -2499,7 +2499,7 @@ mod tests {
         // FIX(test-isolation): close() flushes the shared dead-queue; serialize.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let mirror_obj = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let mirror_obj = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         let pool: i32 = 5;
         let before_thread_count = ctx.registered_native_threads().len();
         native_vertx_init(
@@ -2640,8 +2640,8 @@ mod tests {
         // FIX(test-isolation): close() flushes the shared dead-queue; serialize.
         let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
-        let m_a = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
-        let m_b = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        let m_a = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
+        let m_b = try_alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS)?;
         let before = ctx.registered_native_threads().len();
         native_vertx_init(&mut ctx, &[Value::Object(Some(m_a)), Value::Int(2)]).expect("init A");
         native_vertx_init(&mut ctx, &[Value::Object(Some(m_b)), Value::Int(2)]).expect("init B");

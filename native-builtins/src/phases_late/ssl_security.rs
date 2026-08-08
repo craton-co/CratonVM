@@ -165,7 +165,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                     _ => None,
                 })
                 .unwrap_or_default();
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
             let id = ctx.identity_hash_code(obj);
             // BUG nb-phases-late(4): bound the key-bearing side-table before
             // inserting so it cannot retain key material for the VM lifetime.
@@ -198,7 +198,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                     _ => None,
                 })
                 .unwrap_or_default();
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
             let id = ctx.identity_hash_code(obj);
             // BUG nb-phases-late(4): bound the key-bearing side-table before
             // inserting so it cannot retain key material for the VM lifetime.
@@ -412,7 +412,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             .get(&ctx.identity_hash_code(this))
             .cloned()
             .unwrap_or_default();
-        let clone = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
+        let clone = try_alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4)?;
         let cid = ctx.identity_hash_code(clone);
         mac_state_table().lock().unwrap().insert(cid, src_state);
         Ok(Some(Value::Object(Some(clone))))
@@ -735,7 +735,7 @@ pub(crate) fn p68_factory_max_protocol(
 /// stashed on `args[0]` (the `SSLSocketFactory` `this`) by `getSocketFactory`.
 /// Returns an empty Vec when the factory carries no custom scope (the common
 /// case — every existing default-trust `createSocket` caller is unaffected).
-pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Vec<Vec<u8>> {
+pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     match args.first() {
         Some(Value::Object(Some(this))) => {
             let key = this.as_ptr() as usize;
@@ -745,16 +745,16 @@ pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value
                 .cloned()
                 .unwrap_or_default();
             if !direct.is_empty() {
-                return direct;
+                return Ok(direct);
             }
             if ctx.object_num_fields(*this) > 0 {
                 if let Value::Object(Some(sslctx)) = ctx.get_field(*this, 0) {
-                    return crate::t27_tls::context_trust_root_ders(ctx, sslctx);
+                    return Ok(crate::t27_tls::context_trust_root_ders(ctx, sslctx)?);
                 }
             }
-            Vec::new()
+            Ok(Vec::new())
         }
-        _ => Vec::new(),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -771,17 +771,17 @@ pub(crate) fn p68_factory_trust_roots(ctx: &mut dyn NativeContext, args: &[Value
 /// field 0 (user-defined factory subclass — see `net_phase_e`'s
 /// `createSocket` comment) simply misses the table → `None` → unchanged
 /// default verification.
-pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<u64> {
+pub(crate) fn p68_factory_java_tm_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<Option<u64>, MethodCallFailed> {
     let Some(Value::Object(Some(factory))) = args.first() else {
-        return None;
+        return Ok(None);
     };
     if ctx.object_num_fields(*factory) == 0 {
-        return None;
+        return Ok(None);
     }
     let Value::Object(Some(sslctx)) = ctx.get_field(*factory, 0) else {
-        return None;
+        return Ok(None);
     };
-    crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)
+    Ok(crate::t27_tls::ctx_trust_managers_key_if_attached(ctx, sslctx)?)
 }
 
 /// FIX (h2-testnetutils-cipherfactory-createsocket-cast): staging table for
@@ -985,9 +985,9 @@ pub(crate) fn new13_ssl_socket_connect(
 
 /// NEW-13: allocate an `SSLSession` synthetic object populated from the
 /// session info captured by `s2_tls_connect`.
-pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> ObjectRef {
+pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) -> Result<ObjectRef, MethodCallFailed> {
     let session =
-        alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS);
+        try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", NEW13_SSL_SESS_FIELDS)?;
     // Two stream registries back an `SSLSocket` here: `s2_registry` (the
     // native-tls client streams) and `t27_tls`'s rustls registry (the
     // layered/server streams AND, since it became the live registration,
@@ -1045,7 +1045,7 @@ pub(crate) fn new13_alloc_ssl_session(ctx: &mut dyn NativeContext, tls_id: i32) 
     }
     let session = ctx.read_native_pin(pin, session);
     ctx.unpin_native_roots(pin);
-    session
+    Ok(session)
 }
 
 /// Resolve an `InetAddress` argument without depending on its implementation
@@ -1095,8 +1095,8 @@ pub(crate) fn p68_create_socket_inet_address(
         }
         .into());
     }
-    let extra_roots = p68_factory_trust_roots(ctx, args);
-    let java_tm_key = p68_factory_java_tm_key(ctx, args);
+    let extra_roots = p68_factory_trust_roots(ctx, args)?;
+    let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
     let max_protocol = p68_factory_max_protocol(ctx, args);
     new13_do_create_socket(ctx, &host, port as u16, &extra_roots, java_tm_key, max_protocol)
 }
@@ -1206,7 +1206,7 @@ pub(crate) fn new13_do_create_socket(
 ) -> MethodCallResult {
     let tls_id =
         new13_connect_and_handshake(ctx, host, port, extra_root_ders, java_tm_key, max_protocol)?;
-    let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+    let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS)?;
     let sock = new13_finish_socket(ctx, sock, host, port, tls_id);
     if crate::nbflags().dbg_tls_sock {
         eprintln!(
@@ -1216,7 +1216,7 @@ pub(crate) fn new13_do_create_socket(
             tls_id
         );
     }
-    Ok(Some(Value::Object(Some(sock))))
+    Ok(Some(Value::Object(Some(sock?))))
 }
 
 /// Populate a (possibly pre-existing) `javax/net/ssl/SSLSocket` object's
@@ -1232,7 +1232,7 @@ pub(crate) fn new13_finish_socket(
     host: &str,
     port: u16,
     tls_id: i32,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let pin_base = ctx.pin_native_root(sock);
     let host_obj = ctx.create_string(host);
     let sock = ctx.read_native_pin(pin_base, sock);
@@ -1255,12 +1255,12 @@ pub(crate) fn new13_finish_socket(
     crate::net_phase_e::sock_set_for_create(ctx, sock, port as i32, tls_id);
     ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(tls_id));
     ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
-    let session = new13_alloc_ssl_session(ctx, tls_id);
+    let session = new13_alloc_ssl_session(ctx, tls_id)?;
     let sock = ctx.read_native_pin(pin_base, sock);
     ctx.set_field(sock, NEW13_SOCK_SESSION, Value::Object(Some(session)));
     let sock = ctx.read_native_pin(pin_base, sock);
     ctx.unpin_native_roots(pin_base);
-    sock
+    Ok(sock)
 }
 
 /// FIX (tomcat-clientauth-engine-config): identity-hash side table mapping a
@@ -1436,7 +1436,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 ));
             }
             let obj =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS);
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS)?;
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto_ref)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(0));
             ctx.set_field(obj, NEW13_CTX_KM, Value::Object(None));
@@ -1453,7 +1453,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // A "Default" context is pre-initialised: it uses the platform
             // trust store and an implementation-defined `SecureRandom`.
             let obj =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS);
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", NEW13_SSL_CTX_FIELDS)?;
             let proto = ctx.create_string("TLSv1.3");
             ctx.set_field(obj, NEW13_CTX_PROTOCOL, Value::Object(Some(proto)));
             ctx.set_field(obj, NEW13_CTX_INIT, Value::Int(1));
@@ -1532,10 +1532,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             };
             let this_now = scope.get(&this_h);
             let tms_now = tms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now);
+            crate::t27_tls::attach_trust_managers_to_ctx(&mut *scope, this_now, tms_now)?;
             let this_now = scope.get(&this_h);
             let kms_now = kms_h.as_ref().map(|h| scope.get(h));
-            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now);
+            crate::t27_tls::attach_key_managers_to_ctx(&mut *scope, this_now, kms_now)?;
             let ctx = &mut scope;
 
             // FIX (es-restclient-https): if the supplied TrustManager[] is
@@ -1615,7 +1615,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     kms_array,
                 );
             let this = ctx.get(&this_h);
-            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity);
+            crate::t27_tls::attach_pending_identity_to_ctx(&mut **ctx, this, resolved_identity)?;
             Ok(None)
         },
     );
@@ -1626,7 +1626,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             // Field 0 is the originating SSLContext, matching the factory
             // shape consumed by the HttpURLConnection TLS bridge.
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1)?;
             // FIX (es-restclient-https): carry this SSLContext's custom trust
             // anchors (if any) forward onto the factory so createSocket can
             // find them — createSocket only has `this` = the factory, not
@@ -1649,7 +1649,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getServerSocketFactory",
         "()Ljavax/net/ssl/SSLServerSocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1667,7 +1667,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "()Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
-            let obj = ssleng_alloc(ctx);
+            let obj = ssleng_alloc(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1676,7 +1676,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "createSSLEngine",
         "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;",
         |ctx, _args| {
-            let obj = ssleng_alloc(ctx);
+            let obj = ssleng_alloc(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1712,7 +1712,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // `t27_tls::default_ssl_socket_factory_obj` so the
             // `HttpsURLConnection` factory getters — which also used to mint
             // bare carriers — share one implementation.
-            let obj = crate::t27_tls::default_ssl_socket_factory_obj(ctx);
+            let obj = crate::t27_tls::default_ssl_socket_factory_obj(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1780,11 +1780,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // `CipherFactory.createSocket`/`NetUtils.createLoopbackSocket`; see
     // `bug-h2-netutils-dsa-privatekey-tls-unsupported.md`'s residuals).
     r.register(ssf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
-        let extra_roots = p68_factory_trust_roots(ctx, args);
-        let java_tm_key = p68_factory_java_tm_key(ctx, args);
+        let extra_roots = p68_factory_trust_roots(ctx, args)?;
+        let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
         let max_protocol = p68_factory_max_protocol(ctx, args);
         let sock =
-            alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+            try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS)?;
         ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(-1));
         ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
         stash_pending_ssl_socket_connect_ctx(ctx, sock, extra_roots, java_tm_key, max_protocol);
@@ -1823,8 +1823,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let extra_roots = p68_factory_trust_roots(ctx, args)?;
+            let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
             let max_protocol = p68_factory_max_protocol(ctx, args);
             new13_do_create_socket(
                 ctx,
@@ -1874,8 +1874,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
                 .into());
             }
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let extra_roots = p68_factory_trust_roots(ctx, args)?;
+            let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
             let max_protocol = p68_factory_max_protocol(ctx, args);
             new13_do_create_socket(
                 ctx,
@@ -1972,7 +1972,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                              SSLContext, falling back to the process default"
                         );
                     }
-                    crate::t27_tls::default_ssl_context_or_create(ctx)
+                    crate::t27_tls::default_ssl_context_or_create(ctx)?
                 }
             };
             // Same trust-anchor/TrustManager resolution `new13_do_create_socket`
@@ -1985,8 +1985,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // legacy p68 factory-identity-keyed table populated by
             // `SSLContext.getSocketFactory()`'s own "carry trust anchors
             // forward onto the factory" fix.
-            let extra_roots = p68_factory_trust_roots(ctx, args);
-            let java_tm_key = p68_factory_java_tm_key(ctx, args);
+            let extra_roots = p68_factory_trust_roots(ctx, args)?;
+            let java_tm_key = p68_factory_java_tm_key(ctx, args)?;
             let pending_id = crate::t27_tls::stash_pending_layered_socket(
                 ctx,
                 wrapped,
@@ -2016,7 +2016,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let socket = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5);
+            let socket = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;
             let host_obj = ctx.create_string(&host);
             let pending_tls_id = crate::servlet::PENDING_LAYERED_SOCK_ID_BASE + pending_id;
             // The real JDK SSLSocket field layout is not this synthetic
@@ -2078,11 +2078,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let socket = ctx.read_native_pin(socket_pin, socket);
             ctx.unpin_native_roots(socket_pin);
             let real_tls_id = handshake?;
-            let socket = new13_finish_socket(ctx, socket, &p.host, p.port, real_tls_id);
+            let socket = new13_finish_socket(ctx, socket, &p.host, p.port, real_tls_id)?;
             // A listener registered between `connect()` and the first I/O has
             // NOT missed this handshake -- unlike the `createSocket(host,
             // port)` path, which handshakes before it hands the socket back.
-            new13_fire_handshake_completed(ctx, socket);
+            new13_fire_handshake_completed(ctx, socket)?;
             return Ok(real_tls_id);
         }
         if tls_id < crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
@@ -2125,7 +2125,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ctx.set_field(socket, NEW13_SOCK_TLSID, Value::Int(real_tls_id));
         let (protocol, cipher, _alpn, _sni) = crate::t27_tls::rustls_session_info(stream_id)
             .unwrap_or_else(|| ("TLS".into(), "UNKNOWN".into(), None, None));
-        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+        let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3)?;
         let protocol = ctx.create_string(&protocol);
         let cipher = ctx.create_string(&cipher);
         ctx.set_field(session, NEW13_SESS_PROTO, Value::Object(Some(protocol)));
@@ -2148,7 +2148,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // handshakes before it returns the socket, so a listener added
         // afterwards has, correctly, missed it). Stock JSSE signals exactly
         // here; see `new13_fire_handshake_completed`.
-        new13_fire_handshake_completed(ctx, socket);
+        new13_fire_handshake_completed(ctx, socket)?;
         Ok(real_tls_id)
     }
 
@@ -2176,21 +2176,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     /// Returns `Value::Object(None)` only when there is genuinely no stream
     /// (an unconnected socket) — the one case where JSSE itself would hand
     /// back an invalid session rather than a real one.
-    fn new13_resolve_socket_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
+    fn new13_resolve_socket_session(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Value, MethodCallFailed> {
         let stored = ctx.get_field(this, NEW13_SOCK_SESSION);
         if matches!(stored, Value::Object(Some(_))) {
-            return stored;
+            return Ok(stored);
         }
         let tls_id = new13_resolve_tls_id(ctx, this);
         if tls_id < 0 {
-            return Value::Object(None);
+            return Ok(Value::Object(None));
         }
         let pin = ctx.pin_native_root(this);
-        let session = new13_alloc_ssl_session(ctx, tls_id);
+        let session = new13_alloc_ssl_session(ctx, tls_id)?;
         let this = ctx.read_native_pin(pin, this);
         ctx.unpin_native_roots(pin);
         ctx.set_field(this, NEW13_SOCK_SESSION, Value::Object(Some(session)));
-        Value::Object(Some(session))
+        Ok(Value::Object(Some(session)))
     }
 
     /// Deliver a `HandshakeCompletedEvent` to every listener registered on
@@ -2210,7 +2210,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     /// Synchronous delivery is chosen over spawning a Java thread from a
     /// native because it needs no `Runnable` shim class and cannot leak a
     /// thread when a listener throws; the event contents are identical.
-    fn new13_fire_handshake_completed(ctx: &mut dyn NativeContext, socket: ObjectRef) {
+    fn new13_fire_handshake_completed(ctx: &mut dyn NativeContext, socket: ObjectRef) -> Result<(), MethodCallFailed> {
         let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
         // Copy the handles out and release the lock BEFORE re-entering Java:
         // `handshakeCompleted` is arbitrary application code that can call
@@ -2218,14 +2218,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // socket, which would deadlock on a held non-reentrant mutex.
         let handles: Vec<usize> = match handshake_listeners().lock().get(&socket_key) {
             Some(entry) => entry.iter().map(|(_, handle)| *handle).collect(),
-            None => return,
+            None => return Ok(()),
         };
         if handles.is_empty() {
-            return;
+            return Ok(());
         }
         let pin = ctx.pin_native_root(socket);
         let socket = ctx.read_native_pin(pin, socket);
-        let session = new13_resolve_socket_session(ctx, socket);
+        let session = new13_resolve_socket_session(ctx, socket)?;
         let socket = ctx.read_native_pin(pin, socket);
         // Pin the session too: `new_object_initialized` below allocates and
         // can therefore collect, and a raw `ObjectRef` sitting in `session`
@@ -2252,7 +2252,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(event)))) => event,
             _ => {
                 ctx.unpin_native_roots(pin);
-                return;
+                return Ok(());
             }
         };
         let event_pin = ctx.pin_native_root(event);
@@ -2273,21 +2273,23 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             );
         }
         ctx.unpin_native_roots(pin);
-    }
+    Ok(())
+}
 
     /// Release the global roots held for `socket`'s handshake listeners.
     /// Called from `close()` so a long-lived process that opens many TLS
     /// sockets does not accumulate permanently-reachable listener objects.
-    fn new13_drop_handshake_listeners(ctx: &mut dyn NativeContext, socket: ObjectRef) {
+    fn new13_drop_handshake_listeners(ctx: &mut dyn NativeContext, socket: ObjectRef) -> Result<(), MethodCallFailed> {
         let socket_key = ctx.identity_hash_code(socket) as u32 as u64;
         let handles = match handshake_listeners().lock().remove(&socket_key) {
             Some(entry) => entry,
-            None => return,
+            None => return Ok(()),
         };
         for (_, handle) in handles {
             ctx.remove_global_root(handle);
         }
-    }
+    Ok(())
+}
 
     // SSLSocket methods
     let ssl_sock = "javax/net/ssl/SSLSocket";
@@ -2300,7 +2302,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Real JSSE: getSession() implicitly starts the handshake if one
             // hasn't run yet.
             ensure_layered_handshake_started(ctx, this)?;
-            let session = new13_resolve_socket_session(ctx, this);
+            let session = new13_resolve_socket_session(ctx, this)?;
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getSession sock={:?} -> {:?}",
@@ -2538,13 +2540,13 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // by default under java.util.logging), and abandon the connection having
     // never read the request or written a response — surfaced to the client
     // as a silent hang (e.g. Reactor's `.block(Duration)` timing out).
-    fn ssl_sock_negotiated_alpn(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    fn ssl_sock_negotiated_alpn(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<String>, MethodCallFailed> {
         let tls_id = new13_resolve_tls_id(ctx, this);
         if tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE {
-            return None;
+            return Ok(None);
         }
         let raw_id = tls_id - crate::servlet::RUSTLS_SOCK_ID_BASE;
-        crate::t27_tls::rustls_session_info(raw_id).and_then(|(_, _, alpn, _)| alpn)
+        Ok(crate::t27_tls::rustls_session_info(raw_id).and_then(|(_, _, alpn, _)| alpn))
     }
     r.register(
         ssl_sock,
@@ -2552,7 +2554,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            let alpn = ssl_sock_negotiated_alpn(ctx, this)?.unwrap_or_default();
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getApplicationProtocol sock={:?} -> {:?}",
@@ -2570,7 +2572,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
+            let alpn = ssl_sock_negotiated_alpn(ctx, this)?.unwrap_or_default();
             if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getHandshakeApplicationProtocol sock={:?} -> {:?}",
@@ -2606,7 +2608,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     this
                 );
             }
-            let ciphers = ssl_sock_supported_cipher_suites(ctx);
+            let ciphers = ssl_sock_supported_cipher_suites(ctx)?;
             let protocols = {
                 let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
                 let negotiated =
@@ -2628,7 +2630,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 &[Value::Object(Some(ciphers)), Value::Object(Some(protocols))],
             )? {
                 Some(Value::Object(Some(o))) => o,
-                _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
+                _ => try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4)?,
             };
             Ok(Some(Value::Object(Some(params))))
         },
@@ -2703,7 +2705,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // enabled == supported here (matches the JDK default before any
     // `setEnabledCipherSuites` call — this synthetic socket has no
     // set-side storage, so `set*` below are accepted but not persisted).
-    fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> ObjectRef {
+    fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
         // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
         let suites = crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES;
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
@@ -2711,7 +2713,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let so = ctx.create_string(s);
             ctx.set_array_element(arr, i, Value::Object(Some(so)));
         }
-        arr
+        Ok(arr)
     }
     r.register(
         ssl_sock,
@@ -2720,7 +2722,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
                 ctx,
-            )))))
+            )?))))
         },
     );
     r.register(
@@ -2730,7 +2732,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             Ok(Some(Value::Object(Some(ssl_sock_supported_cipher_suites(
                 ctx,
-            )))))
+            )?))))
         },
     );
     r.register(
@@ -2801,7 +2803,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // whatever the connection had actually negotiated, so it was a
             // guess presented as a fact, not merely an imprecise default.
             let negotiated =
-                if let Value::Object(Some(session)) = new13_resolve_socket_session(ctx, this) {
+                if let Ok(Value::Object(Some(session))) = new13_resolve_socket_session(ctx, this) {
                     match ctx.get_field(session, NEW13_SESS_PROTO) {
                         Value::Object(Some(s)) => ctx.read_string(s),
                         _ => None,
@@ -2873,7 +2875,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 );
             }
             // Return an InputStream that reads from the TLS fd
-            let is = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1);
+            let is = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketInputStream", 1)?;
             // Real JDK stream layouts do not have our synthetic Int slot 0.
             // Preserve the TLS id in the identity-keyed socket side table too.
             crate::net_phase_e::sock_set_for_create(ctx, is, 0, fd_id);
@@ -2922,7 +2924,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     fd_id
                 );
             }
-            let os = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1);
+            let os = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketOutputStream", 1)?;
             crate::net_phase_e::sock_set_for_create(ctx, os, 0, fd_id);
             ctx.set_field(os, 0, Value::Int(fd_id));
             Ok(Some(Value::Object(Some(os))))
@@ -2935,7 +2937,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // never fire another event. Unconditional (not gated on `tls_id >= 0`
         // below) so a second close(), or a socket closed before it ever
         // handshaked, still releases them.
-        new13_drop_handshake_listeners(ctx, this);
+        new13_drop_handshake_listeners(ctx, this)?;
         let tls_id = new13_resolve_tls_id(ctx, this);
         // Connected but never used (H2 `TcpServer.isRunning()` is exactly
         // this): there is no TLS stream to close, only parked state to free.
@@ -3099,7 +3101,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             if host.is_empty() {
                 return Ok(Some(Value::Object(None)));
             }
-            let address = crate::net_phase_e::alloc_inet_address_for_input(ctx, &host, &host);
+            let address = crate::net_phase_e::alloc_inet_address_for_input(ctx, &host, &host)?;
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -3142,7 +3144,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
             let address =
-                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1");
+                crate::net_phase_e::alloc_inet_address_unnamed(ctx, "127.0.0.1")?;
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -3593,7 +3595,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 // Allocate a 4-field X509Certificate: the extra field 3
                 // carries the raw DER bytes so `Certificate.getEncoded()`
                 // can return them without relying on legacy-synthetic-crypto.
-                let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
+                let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
                 let (subject, issuer) = basic_der_extract_names(der)
                     .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
                 let sub_str = ctx.create_string(&subject);
@@ -3646,7 +3648,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 .unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
             // Same 1-field synthetic shape `getPeerPrincipal` builds below.
             let princ =
-                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
             let s = ctx.create_string(&subject);
             ctx.set_field(princ, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(princ))))
@@ -3674,7 +3676,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
             for (i, der) in chain.iter().enumerate() {
-                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der);
+                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der)?;
                 ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -3709,7 +3711,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let (subject, _issuer) = basic_der_extract_names(leaf)
                 .unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
             let princ =
-                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
             let s = ctx.create_string(&subject);
             ctx.set_field(princ, 0, Value::Object(Some(s)));
             Ok(Some(Value::Object(Some(princ))))
@@ -3767,7 +3769,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     &format!("{algo_str} TrustManagerFactory not available"),
                 ));
             }
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 2);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/TrustManagerFactory", 2)?;
             ctx.set_field(obj, 0, args.get(0).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
@@ -3833,8 +3835,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 // trap/fix as the sibling
                 // `KeyManagerFactory.getKeyManagers()` — see that handler's
                 // doc comment for the full story: a bare
-                // `alloc_concurrent_synthetic(ctx, "javax/net/ssl/
-                // X509TrustManager", ...)` stamps the INTERFACE's own class
+                // `try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/
+                // X509TrustManager", ...)?` stamps the INTERFACE's own class
                 // id, so `checkClientTrusted`/`checkServerTrusted`/
                 // `getAcceptedIssuers` have no Code and throw
                 // `AbstractMethodError` the moment real bytecode calls one
@@ -3898,8 +3900,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()[Ljavax/net/ssl/TrustManager;",
         |ctx, args| {
             // FIX (tomcat-clientauth-engine-config): this used to always
-            // return a bare `alloc_concurrent_synthetic(ctx,
-            // "javax/net/ssl/X509TrustManager", 2)` — an object stamped
+            // return a bare `try_alloc_concurrent_synthetic(ctx,
+            // "javax/net/ssl/X509TrustManager", 2)?` — an object stamped
             // with the INTERFACE's own class id. `getAcceptedIssuers()` on
             // such an object was already known to throw
             // `AbstractMethodError` (see the `FIX
@@ -3968,7 +3970,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     ih, tm_id
                 );
             }
-            let tm = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2);
+            let tm = try_alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_X509_TM, 2)?;
             crate::x509_manager::set_tm_id(ctx, tm, tm_id);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(tm)));
@@ -3994,7 +3996,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/KeyManagerFactory;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/KeyManagerFactory", 3)?;
             // field 0: provider — a real `Provider` object, not the SPI's
             // factorySpi/algorithm, so `getProvider().getInfo()` et al. work.
             // Built via `provider_chain`'s own `make_provider` (not a raw
@@ -4054,7 +4056,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             let provider_name = found_provider.unwrap_or_else(|| "SunJSSE".to_string());
             let provider =
-                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name);
+                crate::jca::provider_chain::resolve_or_make_provider(ctx, &provider_name)?;
             ctx.set_field(obj, 0, Value::Object(Some(provider)));
             ctx.set_field(obj, 1, Value::Object(None)); // factorySpi — unused by this stub
             ctx.set_field(obj, 2, algorithm); // algorithm
@@ -4166,8 +4168,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()[Ljavax/net/ssl/KeyManager;",
         |ctx, args| {
             // FIX (tomcat-clientauth-engine-config): this handler used to
-            // return a bare `alloc_concurrent_synthetic(ctx,
-            // "javax/net/ssl/X509KeyManager", 0)` — an object stamped with
+            // return a bare `try_alloc_concurrent_synthetic(ctx,
+            // "javax/net/ssl/X509KeyManager", 0)?` — an object stamped with
             // the INTERFACE's own class id (it's a real, loadable JDK
             // interface, so `ensure_class_initialized` happily "succeeds").
             // Every one of `X509KeyManager`'s 6 methods is abstract with no
@@ -4221,11 +4223,11 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 crate::x509_manager::km_registry()
                     .write()
                     .insert(km_id, state);
-                let km = alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_SUN_X509_KM, 2);
+                let km = try_alloc_concurrent_synthetic(ctx, crate::x509_manager::FQN_SUN_X509_KM, 2)?;
                 crate::x509_manager::set_km_id(ctx, km, km_id);
                 km
             } else {
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0)
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/X509KeyManager", 0)?
             };
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(km)));
@@ -4417,7 +4419,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             };
             // Return an enum synthetic
             let e =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2)?;
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -4523,7 +4525,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             ctx.set_field(this, 5, Value::Int(new_hs));
 
-            let result = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
+            let result = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4)?;
             // Fields: 0=status ordinal (OK=0), 1=handshakeStatus ordinal,
             //         2=bytesConsumed, 3=bytesProduced
             ctx.set_field(result, 0, Value::Int(0)); // OK
@@ -4615,7 +4617,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             }
             ctx.set_field(this, 5, Value::Int(new_hs));
 
-            let result = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
+            let result = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4)?;
             ctx.set_field(result, 0, Value::Int(0)); // OK
             ctx.set_field(result, 1, Value::Int(new_hs));
             ctx.set_field(result, 2, Value::Int(bytes_consumed as i32));
@@ -4688,7 +4690,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                     return Ok(Some(v));
                 }
             }
-            let e = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 2);
+            let e = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$Status", 2)?;
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -4729,7 +4731,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 }
             }
             let e =
-                alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2);
+                try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult$HandshakeStatus", 2)?;
             let n = ctx.create_string(name);
             ctx.set_field(e, 0, Value::Object(Some(n)));
             ctx.set_field(e, 1, Value::Int(status));
@@ -4785,7 +4787,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(s))));
             }
             // Build a fresh session and cache it
-            let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 2);
+            let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 2)?;
             let proto = ctx.create_string("TLSv1.3");
             let cipher = ctx.create_string("TLS_AES_128_GCM_SHA256");
             ctx.set_field(session, 0, Value::Object(Some(proto)));
@@ -4795,11 +4797,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Allocate a fresh SSLEngine with default field values.
-pub(crate) fn ssleng_alloc(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 7);
+pub(crate) fn ssleng_alloc(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 7)?;
     ctx.set_field(obj, 0, Value::Int(1)); // client_mode = true by default
     ctx.set_field(obj, 1, Value::Int(0)); // need_client_auth
     ctx.set_field(obj, 2, Value::Int(0)); // want_client_auth
@@ -4807,7 +4810,7 @@ pub(crate) fn ssleng_alloc(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, 4, Value::Object(None)); // enabled_cipher_suites
     ctx.set_field(obj, 5, Value::Int(0)); // handshake_status = NOT_HANDSHAKING
     ctx.set_field(obj, 6, Value::Object(None)); // session
-    obj
+    Ok(obj)
 }
 
 // =============================================================================
@@ -5066,13 +5069,13 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             // be resolved (e.g. pure-synthetic mode, or an exotic type
             // nothing seeds).
             if crate::real_jca_mode() || crate::route_ec_to_real() || crate::route_dsa_to_real() {
-                if let Some(real_cf) =
+                if let Ok(Some(real_cf)) =
                     crate::jca::provider_chain::try_build_real_certificate_factory(ctx, args)
                 {
                     return Ok(Some(Value::Object(Some(real_cf))));
                 }
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1)?;
             ctx.set_field(obj, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -5205,12 +5208,12 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                     .map(|(subject, _)| subject)
                     .unwrap_or_else(|| "CN=Unknown".into());
                 return Ok(Some(Value::Object(Some(
-                    crate::keystore::make_x509_mirror(ctx, &alias, &data),
+                    crate::keystore::make_x509_mirror(ctx, &alias, &data)?,
                 ))));
             }
 
             // Fallback: the input stream had no readable bytes at all.
-            let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3);
+            let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 3)?;
             let sub = ctx.create_string("CN=Unknown");
             let iss = ctx.create_string("CN=Unknown");
             ctx.set_field(cert, 0, Value::Object(Some(sub)));
@@ -5238,7 +5241,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             }
 
             // Try to parse a single certificate and return it in a list
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
             ctx.set_field(al, 0, Value::Object(Some(arr)));
 
@@ -5257,7 +5260,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                     let alias = basic_der_extract_names(&data)
                         .map(|(subject, _)| subject)
                         .unwrap_or_else(|| "CN=Unknown".into());
-                    let cert = crate::keystore::make_x509_mirror(ctx, &alias, &data);
+                    let cert = crate::keystore::make_x509_mirror(ctx, &alias, &data)?;
                     ctx.set_array_element(arr, 0, Value::Object(Some(cert)));
                     ctx.set_field(al, 1, Value::Int(1));
                     return Ok(Some(Value::Object(Some(al))));
@@ -5338,7 +5341,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                    let pk = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4);
+                    let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4)?;
                     let alg_idx = match parsed.public_key_algorithm.as_str() {
                         "RSA" => 6,
                         "EC" => 7,
@@ -5403,7 +5406,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             if matches!(sub, Value::Object(Some(_))) {
                 // Wrap string in a Principal-like synthetic
                 let princ =
-                    alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                    try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
                 ctx.set_field(princ, 0, sub);
                 return Ok(Some(Value::Object(Some(princ))));
             }
@@ -5419,7 +5422,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let iss = ctx.get_field(this, 1);
             if matches!(iss, Value::Object(Some(_))) {
                 let princ =
-                    alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                    try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
                 ctx.set_field(princ, 0, iss);
                 return Ok(Some(Value::Object(Some(princ))));
             }
@@ -5434,7 +5437,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let sub = ctx.get_field(this, 0);
             let princ =
-                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
             ctx.set_field(princ, 0, sub);
             Ok(Some(Value::Object(Some(princ))))
         },
@@ -5447,7 +5450,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let iss = ctx.get_field(this, 1);
             let princ =
-                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+                try_alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1)?;
             ctx.set_field(princ, 0, iss);
             Ok(Some(Value::Object(Some(princ))))
         },
@@ -5460,7 +5463,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
+                let date = try_alloc_concurrent_synthetic(ctx, "java/util/Date", 1)?;
                 ctx.set_field(date, 0, Value::Long(parsed.not_before * 1000)); // millis
                 return Ok(Some(Value::Object(Some(date))));
             }
@@ -5476,7 +5479,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let date = alloc_concurrent_synthetic(ctx, "java/util/Date", 1);
+                let date = try_alloc_concurrent_synthetic(ctx, "java/util/Date", 1)?;
                 ctx.set_field(date, 0, Value::Long(parsed.not_after * 1000));
                 return Ok(Some(Value::Object(Some(date))));
             }
@@ -5594,7 +5597,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                     _ => 0,
                 };
                 if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                    let pk = alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4);
+                    let pk = try_alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4)?;
                     let alg_idx = match parsed.public_key_algorithm.as_str() {
                         "RSA" => 6,
                         "EC" => 7,
@@ -5730,6 +5733,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================

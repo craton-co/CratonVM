@@ -439,7 +439,7 @@ mod tests {
         std::env::set_var("org.jboss.boot.log.file", &path);
 
         let mut ctx = mock_ctx();
-        let logger = crate::alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, 3);
+        let logger = crate::try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, 3)?;
         let name = ctx.create_string("com.example.App");
         ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name)));
         let msg = ctx.create_string("hello-block2c");
@@ -474,8 +474,8 @@ mod tests {
         // panic on null-Level / null-message LogRecord shapes.
         std::env::remove_var("org.jboss.boot.log.file");
         let mut ctx = mock_ctx();
-        let logger = crate::alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, 3);
-        let rec = crate::alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 4);
+        let logger = crate::try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, 3)?;
+        let rec = crate::try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 4)?;
         let res = native_logger_log_record(
             &mut ctx,
             &[Value::Object(Some(logger)), Value::Object(Some(rec))],

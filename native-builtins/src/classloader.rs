@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service_loader::impl_jars_load_class;
 use crate::util_concurrent_ext::try_alloc_concurrent_synthetic;
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::obj_arg;
 use cratonvm_types::error::MethodCallFailed;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
@@ -771,12 +771,12 @@ pub fn get_class_data(mirror: ObjectRef) -> Value {
 }
 
 /// Get or create the singleton platform class loader.
-pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if let Some(obj) = platform_loader_of(vm) {
-        return obj;
+        return Ok(obj);
     }
-    let mut obj = alloc_classloader(ctx, LOADER_PLATFORM);
+    let mut obj = alloc_classloader(ctx, LOADER_PLATFORM)?;
     let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("platform");
     let name_pin = ctx.pin_native_root(name);
@@ -800,7 +800,7 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
     obj = ctx.read_native_pin(obj_pin, obj);
     set_platform_loader(vm, Some(obj));
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 /// Mirror of real HotSpot's `JVM_LatestUserDefinedLoader` / `jdk.internal
@@ -855,7 +855,7 @@ pub(crate) fn latest_user_defined_loader_class(
 }
 
 /// Get or create the singleton application (system) class loader.
-pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
+pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     let vm = ctx.vm_identity();
     if let Some(obj) = app_loader_of(vm) {
         // The singleton is a Rust-side cache.  If a moving collection ever
@@ -872,13 +872,13 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
             })
             .unwrap_or(false);
         if is_loader {
-            return obj;
+            return Ok(obj);
         }
         set_app_loader(vm, None);
     }
-    let platform = get_or_create_platform_loader(ctx);
+    let platform = get_or_create_platform_loader(ctx)?;
     let platform_pin = ctx.pin_native_root(platform);
-    let mut obj = alloc_classloader(ctx, LOADER_APP);
+    let mut obj = alloc_classloader(ctx, LOADER_APP)?;
     let obj_pin = ctx.pin_native_root(obj);
     let name = ctx.create_string("app");
     let name_pin = ctx.pin_native_root(name);
@@ -922,7 +922,7 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     obj = ctx.read_native_pin(obj_pin, obj);
     set_app_loader(vm, Some(obj));
     ctx.unpin_native_roots(platform_pin);
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,8 +1284,8 @@ const CS_CLASS: &str = "java/security/CodeSource";
 /// to null. The `CodeSource` itself is non-null, so `getCodeSource()` returns
 /// a real object that `getCertificates()` / `getLocation()` can be called on
 /// without NPE.
-fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mut cs = alloc_concurrent_synthetic(ctx, CS_CLASS, CS_FIELD_COUNT);
+fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let mut cs = try_alloc_concurrent_synthetic(ctx, CS_CLASS, CS_FIELD_COUNT)?;
     let cs_pin = ctx.pin_native_root(cs);
     ctx.set_field(cs, CS_LOCATION_REF, Value::Object(None));
     ctx.set_field(cs, CS_CERTIFICATES_REF, Value::Object(None));
@@ -1296,7 +1296,7 @@ fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> ObjectRef {
     cs = ctx.read_native_pin(cs_pin, cs);
     ctx.set_field_by_name(cs, "certs", Value::Object(None));
 
-    let mut pd = alloc_concurrent_synthetic(ctx, PD_CLASS, PD_FIELD_COUNT);
+    let mut pd = try_alloc_concurrent_synthetic(ctx, PD_CLASS, PD_FIELD_COUNT)?;
     let pd_pin = ctx.pin_native_root(pd);
     cs = ctx.read_native_pin(cs_pin, cs);
     pd = ctx.read_native_pin(pd_pin, pd);
@@ -1314,10 +1314,10 @@ fn alloc_default_protection_domain(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field_by_name(pd, "classloader", Value::Object(None));
     let pd = ctx.read_native_pin(pd_pin, pd);
     ctx.unpin_native_roots(cs_pin);
-    pd
+    Ok(pd)
 }
 
-pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -> ObjectRef {
+pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -> Result<ObjectRef, MethodCallFailed> {
     // WP1.5: built-in loaders must report the real JDK type name via
     // reflection. `jdk.internal.loader.ClassLoaders$PlatformClassLoader` for
     // the platform loader, `...$AppClassLoader` for the system loader, and
@@ -1327,7 +1327,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         LOADER_APP => "jdk/internal/loader/ClassLoaders$AppClassLoader",
         _ => CL_CLASS,
     };
-    let mut obj = alloc_concurrent_synthetic(ctx, class_name, CL_FIELD_COUNT);
+    let mut obj = try_alloc_concurrent_synthetic(ctx, class_name, CL_FIELD_COUNT)?;
     let obj_pin = ctx.pin_native_root(obj);
     // L1: the synthetic slots go into the object ONLY on our own layout. On a
     // real JDK image `class_name` resolves to the real
@@ -1372,7 +1372,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     }
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     let pd_pin = ctx.pin_native_root(pd);
     obj = ctx.read_native_pin(obj_pin, obj);
     let pd = ctx.read_native_pin(pd_pin, pd);
@@ -1403,13 +1403,13 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // works without additional intercepts.
     if loader_type == LOADER_PLATFORM || loader_type == LOADER_APP {
         let name_to_module =
-            alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
         let name_to_module_pin = ctx.pin_native_root(name_to_module);
         obj = ctx.read_native_pin(obj_pin, obj);
         let name_to_module = ctx.read_native_pin(name_to_module_pin, name_to_module);
         ctx.set_field_by_name(obj, "nameToModule", Value::Object(Some(name_to_module)));
         let module_to_reader =
-            alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
         let module_to_reader_pin = ctx.pin_native_root(module_to_reader);
         obj = ctx.read_native_pin(obj_pin, obj);
         let module_to_reader = ctx.read_native_pin(module_to_reader_pin, module_to_reader);
@@ -1428,7 +1428,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // then `packages()`. Pre-populate an empty CHM so the bytecode path runs
     // without additional intercepts.
     let packages_map =
-        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     let packages_map_pin = ctx.pin_native_root(packages_map);
     obj = ctx.read_native_pin(obj_pin, obj);
     let packages_map = ctx.read_native_pin(packages_map_pin, packages_map);
@@ -1436,7 +1436,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     // `ClassLoader.setDefaultAssertionStatus` uses `synchronized (assertionLock)`.
     // Real JDK ctors assign `this.assertionLock = new Object()`; synthetic
     // allocation skips that, so Surefire's forked booter NPEs on monitorenter.
-    let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let lock = try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 0)?;
     let lock_pin = ctx.pin_native_root(lock);
     let lock = ctx.read_native_pin(lock_pin, lock);
     let _ = ctx.invoke_special(
@@ -1463,7 +1463,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
         },
     );
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
 /// Get the unique loader ID from a ClassLoader object, lazily assigning one if needed.
@@ -1495,8 +1495,8 @@ pub(crate) fn get_or_assign_loader_id(ctx: &mut dyn NativeContext, cl: ObjectRef
     loader_namespace_id(ctx, cl)
 }
 
-fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let mut obj = alloc_concurrent_synthetic(ctx, UCL_CLASS, UCL_FIELD_COUNT);
+fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
+    let mut obj = try_alloc_concurrent_synthetic(ctx, UCL_CLASS, UCL_FIELD_COUNT)?;
     let obj_pin = ctx.pin_native_root(obj);
     ctx.set_field(obj, UCL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
     ctx.set_field(obj, UCL_PARENT_REF, Value::Object(None));
@@ -1514,11 +1514,11 @@ fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, UCL_LOADER_ID, Value::Int(lid as i32));
     let obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
-    obj
+    Ok(obj)
 }
 
-fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, LK_CLASS, LK_FIELD_COUNT);
+fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, LK_CLASS, LK_FIELD_COUNT)?;
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(None));
     // W6-3: both index writes are the SYNTHETIC layout. On real JDK 25
     // (`javap -p java.lang.invoke.MethodHandles$Lookup`) slot 2 is
@@ -1538,7 +1538,7 @@ fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
     // puts it at slot 2, not the synthetic slot 1 = prevLookupClass). See
     // `lk_modes_of` and `lang_invoke::lk_write_allowed_modes`.
     lk_set_modes(ctx, obj, modes);
-    obj
+    Ok(obj)
 }
 
 /// The slot of the DECLARED `allowedModes` field, or `None` when the receiver
@@ -1747,16 +1747,16 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // parent defaults to system class loader
     let sys = alloc_classloader(ctx, LOADER_APP);
     if synthetic_layout {
-        ctx.set_field(this, CL_PARENT_REF, Value::Object(Some(sys)));
+        ctx.set_field(this, CL_PARENT_REF, Value::Object(Some(sys?)));
         ctx.set_field(this, CL_NAME_REF, Value::Object(None));
         ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
         ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     } else {
-        ctx.set_field_by_name(this, "parent", Value::Object(Some(sys)));
+        ctx.set_field_by_name(this, "parent", Value::Object(Some(sys?)));
     }
     // WP2.3: build a non-null defaultDomain so JDK preDefineClass's
     // `pd.getCodeSource()` chain doesn't NPE on the no-PD defineClass path.
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     if synthetic_layout {
         ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }
@@ -1764,7 +1764,7 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // S111r17: see alloc_classloader — initialize `packages` CHM so
     // ClassLoader.packages() doesn't NPE on `getfield + values()`.
     let packages_map =
-        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
@@ -1786,14 +1786,14 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     } else {
         ctx.set_field_by_name(this, "parent", parent);
     }
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     if synthetic_layout {
         ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
-        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     Ok(None)
 }
@@ -1822,14 +1822,14 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         ctx.set_field_by_name(this, "parent", parent);
         ctx.set_field_by_name(this, "name", name);
     }
-    let pd = alloc_default_protection_domain(ctx);
+    let pd = alloc_default_protection_domain(ctx)?;
     if synthetic_layout {
         ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     }
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
     // S111r17: see alloc_classloader.
     let packages_map =
-        alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16);
+        try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/ConcurrentHashMap", 16)?;
     ctx.set_field_by_name(this, "packages", Value::Object(Some(packages_map)));
     if synthetic_layout {
         ctx.set_field(this, CL_LOADER_ID, Value::Int(lid as i32));
@@ -2650,7 +2650,7 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                 "ClassLoader.loadClass name is null",
             );
             return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                exc,
+                exc?,
             ));
         }
     };
@@ -2857,7 +2857,7 @@ fn resolve_global_if_visible(
                  dependency failed to resolve -- NoClassDefFoundError"
             );
             Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                crate::classloader_real::no_class_def_found_error(ctx, &class_name),
+                crate::classloader_real::no_class_def_found_error(ctx, &class_name)?,
             ))
         }
         Err(e) => {
@@ -3073,7 +3073,7 @@ fn cl_load_class_base_delegation_rooted(
             &internal,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exception,
+            exception?,
         ));
     }
 
@@ -3212,7 +3212,7 @@ fn cl_load_class_base_delegation_rooted(
     //    under IMPL-JARS/<module>/<jar_dir>/<classfile> inside the outer
     //    module JAR. When neither the flat classpath nor findClass can locate
     //    the class, try scanning those entries directly.
-    if let Some(mirror) = impl_jars_load_class(ctx, Some(this), &internal) {
+    if let Ok(Some(mirror)) = impl_jars_load_class(ctx, Some(this), &internal) {
         return Ok(Some(Value::Object(Some(mirror))));
     }
 
@@ -3252,7 +3252,7 @@ fn cl_load_class_resolve(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 "ClassLoader.loadClass name is null",
             );
             return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-                exc,
+                exc?,
             ));
         }
     };
@@ -3303,7 +3303,7 @@ fn cl_find_class_module(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // A module-aware lookup can be the first request for an embedded
     // implementation dependency, so share loadClass/findClass(String)'s
     // IMPL-JARS fallback here as well.
-    if let Some(mirror) = impl_jars_load_class(ctx, Some(this), &internal) {
+    if let Ok(Some(mirror)) = impl_jars_load_class(ctx, Some(this), &internal) {
         return Ok(Some(Value::Object(Some(mirror))));
     }
 
@@ -4731,12 +4731,12 @@ fn cl_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 
 fn cl_get_system_class_loader(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let app = get_or_create_app_loader(ctx);
-    Ok(Some(Value::Object(Some(app))))
+    Ok(Some(Value::Object(Some(app?))))
 }
 
 fn cl_get_platform_class_loader(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let platform = get_or_create_platform_loader(ctx);
-    Ok(Some(Value::Object(Some(platform))))
+    Ok(Some(Value::Object(Some(platform?))))
 }
 
 /// Public re-export of the `getResource` (singular) native so
@@ -4797,7 +4797,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             "ClassLoader.getResource name is null",
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     let name = {
@@ -4837,7 +4837,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
                 .find(|url| url.starts_with("jrt:"))
             {
                 let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
-                return Ok(Some(Value::Object(Some(url))));
+                return Ok(Some(Value::Object(Some(url?))));
             }
             return Ok(Some(Value::Object(None)));
         }
@@ -4994,7 +4994,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     );
 
     let url = crate::jboss_module_loader::build_synthetic_url(ctx, &url_str);
-    Ok(Some(Value::Object(Some(url))))
+    Ok(Some(Value::Object(Some(url?))))
 }
 
 /// Public re-export of the `getResources` native for `register_essential_natives`
@@ -5120,7 +5120,7 @@ fn enumeration_from_url_strings(ctx: &mut dyn NativeContext, urls: &[String]) ->
     for (i, u) in urls.iter().enumerate() {
         let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, u);
         let arr = ctx.read_native_pin(arr_pin, arr);
-        ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+        ctx.set_array_element(arr, i, Value::Object(Some(url_obj?)));
     }
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
@@ -5210,7 +5210,7 @@ fn cl_get_resources_impl(
             "ClassLoader.getResources name is null",
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     let name = {
@@ -5824,7 +5824,7 @@ pub(crate) const ENUMERATION_IMPL_CLASS: &str = "java/util/Enumeration$Impl";
 /// `native-io`'s `zip_real_jar` already drives `Collections.enumeration` this
 /// way for `ZipFile.entries()`, so the invoke is known to reach real bytecode
 /// rather than a native of ours.
-fn real_snapshot_enumeration(
+pub(crate) fn real_snapshot_enumeration(
     ctx: &mut dyn NativeContext,
     array: ObjectRef,
 ) -> Result<Option<ObjectRef>, MethodCallFailed> {
@@ -6039,7 +6039,7 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             "ClassLoader.getResourceAsStream name is null",
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exc,
+            exc?,
         ));
     }
     let Some(name) = args.iter().rev().find_map(|v| match v {
@@ -6115,7 +6115,7 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             bytes = len,
             "ClassLoader.getResourceAsStream served DEFINED-CLASS resource"
         );
-        return Ok(Some(Value::Object(Some(stream))));
+        return Ok(Some(Value::Object(Some(stream?))));
     }
     match ctx.find_resource(resource_name) {
         None => Ok(Some(Value::Object(None))),
@@ -6128,7 +6128,7 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                 bytes = len,
                 "ClassLoader.getResourceAsStream served resource"
             );
-            Ok(Some(Value::Object(Some(stream))))
+            Ok(Some(Value::Object(Some(stream?))))
         }
     }
 }
@@ -6215,7 +6215,7 @@ fn resource_stream_for_last_string_arg(
     match ctx.find_resource(resource_name) {
         Some(bytes) => {
             let stream = crate::lang_class::t19_h10_alloc_byte_array_input_stream(ctx, &bytes);
-            Ok(Some(Value::Object(Some(stream))))
+            Ok(Some(Value::Object(Some(stream?))))
         }
         None => Ok(Some(Value::Object(None))),
     }
@@ -6570,7 +6570,7 @@ pub(crate) fn record_ucl_urls(ctx: &mut dyn NativeContext, this: ObjectRef, urls
 fn ucl_init_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
-    crate::classloader_real::init_urlclassloader_constructor_with_default_parent(ctx, this, urls);
+    crate::classloader_real::init_urlclassloader_constructor_with_default_parent(ctx, this, urls)?;
     Ok(None)
 }
 
@@ -6578,7 +6578,7 @@ fn ucl_init_urls_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let this = obj_arg(args, 0)?;
     let urls = args.get(1).copied().unwrap_or(Value::Object(None));
     let parent = args.get(2).copied().unwrap_or(Value::Object(None));
-    crate::classloader_real::init_urlclassloader_constructor_with_parent(ctx, this, urls, parent);
+    crate::classloader_real::init_urlclassloader_constructor_with_parent(ctx, this, urls, parent)?;
     Ok(None)
 }
 
@@ -6610,7 +6610,7 @@ fn ucl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             &name,
         );
         return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
-            exception,
+            exception?,
         ));
     }
     let name_obj = match args.get(1) {
@@ -7425,7 +7425,8 @@ pub(crate) fn ucl_try_define_local_class(
             let mut in_progress = self.mutex.lock().unwrap_or_else(|e| e.into_inner());
             *in_progress = false;
             self.cvar.notify_all();
-        }
+    ()
+}
     }
     let _define_in_progress_guard = DefineInProgressGuard {
         mutex: define_lock_mutex,
@@ -7471,12 +7472,15 @@ pub(crate) fn ucl_try_define_local_class(
             if url_classloader_isolated_from_app(ctx, loader)
                 && !cratonvm_classloading::is_bootstrap_appended_class(internal_name)
             {
-                let exception = crate::jboss_module_loader::alloc_single_message_exception(
+                let exception = match crate::jboss_module_loader::alloc_single_message_exception(
                     ctx,
                     "java/lang/ClassNotFoundException",
                     1,
                     internal_name,
-                );
+                ) {
+                    Ok(e) => e,
+                    Err(err) => return Some(Err(err)),
+                };
                 return Some(Err(
                     cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception),
                 ));
@@ -7484,12 +7488,15 @@ pub(crate) fn ucl_try_define_local_class(
             return None;
         }
         None => {
-            let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            let exc = match crate::jboss_module_loader::alloc_single_message_exception(
                 ctx,
                 "java/lang/ClassNotFoundException",
                 1,
                 internal_name,
-            );
+            ) {
+                Ok(e) => e,
+                Err(err) => return Some(Err(err)),
+            };
             return Some(Err(
                 cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
             ));
@@ -7679,7 +7686,7 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         let local_urls = loader_local_resource_urls(ctx, this, resource_name);
         if let Some(first) = local_urls.first() {
             let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
-            return Ok(Some(Value::Object(Some(url))));
+            return Ok(Some(Value::Object(Some(url?))));
         }
         // A URLClassLoader's `findResource` is strictly local. Its public
         // `getResource` caller has already performed parent-first delegation;
@@ -7706,13 +7713,13 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let urls = ctx.find_all_resource_urls(resource_name);
     if let Some(first) = urls.first() {
         let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
-        return Ok(Some(Value::Object(Some(url))));
+        return Ok(Some(Value::Object(Some(url?))));
     }
     match ctx.find_resource(resource_name) {
         Some(_) => {
             let spec = format!("classpath:{name}");
             let url = crate::jboss_module_loader::build_synthetic_url(ctx, &spec);
-            Ok(Some(Value::Object(Some(url))))
+            Ok(Some(Value::Object(Some(url?))))
         }
         None => {
             // Custom-handler fallback: resources behind an app-supplied
@@ -7844,7 +7851,7 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
         );
         for (i, url) in local_urls.iter().enumerate() {
             let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, url);
-            ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+            ctx.set_array_element(arr, i, Value::Object(Some(url_obj?)));
         }
         let enm = crate::classloader::make_snapshot_enumeration(ctx, arr)?;
         Some(enm)
@@ -8046,7 +8053,7 @@ pub(crate) fn ucl_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let urls = args.first().copied().unwrap_or(Value::Object(None));
-    let obj = alloc_url_classloader(ctx);
+    let obj = alloc_url_classloader(ctx)?;
     // FIX: previously this only stored UCL_URL_COUNT and dropped the URL[]
     // entirely, so the returned loader couldn't search the supplied URLs.
     // Route through `ucl_setup` (the same code the `<init>` natives use) so
@@ -8066,7 +8073,7 @@ fn ucl_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 fn ucl_new_instance_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let urls = args.first().copied().unwrap_or(Value::Object(None));
     let parent = args.get(1).copied().unwrap_or(Value::Object(None));
-    let obj = alloc_url_classloader(ctx);
+    let obj = alloc_url_classloader(ctx)?;
     // FIX: mirror the `<init>(URL[], ClassLoader)` path — store the URL[] and
     // register its paths so the loader actually searches them (was dropping
     // the URLs and only recording their count). See `ucl_new_instance`.
@@ -8086,7 +8093,7 @@ fn ucl_new_instance_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
 fn lk_lookup(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_lookup(ctx, LK_FULL_POWER);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 /// `privateLookupIn(targetClass, caller)` — registered here on
@@ -8211,7 +8218,7 @@ fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
         _ => None,
     };
-    let obj = alloc_lookup(ctx, LK_FULL_POWER_MODES);
+    let obj = alloc_lookup(ctx, LK_FULL_POWER_MODES)?;
     let target_class = match pinned {
         Some((handle, o)) => {
             let current = ctx.read_native_pin(handle, o);
@@ -8243,7 +8250,7 @@ fn lk_private_lookup_in(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 /// `MethodHandles.publicLookup()` static is `lang_invoke.rs`'s. Both now agree.)
 fn lk_public_lookup(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let obj = alloc_lookup(ctx, LK_UNCONDITIONAL);
-    Ok(Some(Value::Object(Some(obj))))
+    Ok(Some(Value::Object(Some(obj?))))
 }
 
 fn lk_lookup_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8745,7 +8752,7 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         // gets the contractual return type. If the placeholder is null,
         // fall through to the normal path (which will fail cleanly).
         if let Value::Object(Some(mirror)) = v {
-            let obj = alloc_lookup(ctx, LK_FULL_POWER);
+            let obj = alloc_lookup(ctx, LK_FULL_POWER)?;
             ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
             return Ok(Some(Value::Object(Some(obj))));
         }
@@ -8791,7 +8798,7 @@ fn lk_define_hidden_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     //        is the hidden class's mirror. Full power mode lets the
     //        caller look up private members via the returned Lookup.
     let mirror = ctx.get_class_mirror(cid);
-    let obj = alloc_lookup(ctx, LK_FULL_POWER);
+    let obj = alloc_lookup(ctx, LK_FULL_POWER)?;
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(Some(mirror)));
     Ok(Some(Value::Object(Some(obj))))
 }
@@ -8822,8 +8829,8 @@ fn alloc_method_handle(
     class_mirror: Option<ObjectRef>,
     name: Option<ObjectRef>,
     method_type: Option<ObjectRef>,
-) -> ObjectRef {
-    let mh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_FIELD_COUNT);
+) -> Result<ObjectRef, MethodCallFailed> {
+    let mh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", MH_FIELD_COUNT)?;
     // GC-safety: `mirror_class_id`/`build_method_type_from_descriptor` below
     // can trigger a moving GC (classloading); `mh` is reused in the final
     // `set_field_by_name` unpinned otherwise.
@@ -8867,14 +8874,16 @@ fn alloc_method_handle(
     // mirror from the Lookup.findXxx JVM call); fall back to a synthetic
     // `()V` MethodType when nothing was supplied (e.g. lk_unreflect, where
     // the Java caller did not pass an explicit MethodType).
-    let mt_to_store =
-        method_type.or_else(|| crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V"));
+    let mt_to_store = match method_type {
+        Some(mt) => Some(mt),
+        None => crate::lang_invoke::build_method_type_from_descriptor(ctx, "()V")?,
+    };
     let mh = ctx.read_native_pin(mh_pin, mh);
     ctx.unpin_native_roots(mh_pin);
     if let Some(mt) = mt_to_store {
         ctx.set_field_by_name(mh, "type", Value::Object(Some(mt)));
     }
-    mh
+    Ok(mh)
 }
 
 /// Resolve the JVMS access flags (`ACC_PUBLIC`/`ACC_PRIVATE`/…) of the member
@@ -9036,7 +9045,7 @@ fn lk_find_virtual(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), false)?;
     let mh = alloc_method_handle(ctx, 0, class_mirror, name, mtype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9056,7 +9065,7 @@ fn lk_find_static(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), false)?;
     let mh = alloc_method_handle(ctx, 1, class_mirror, name, mtype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9072,7 +9081,7 @@ fn lk_find_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     enforce_lookup_access(ctx, this, class_mirror, Some("<init>"), false)?;
     let name_str = ctx.create_string("<init>");
     let mh = alloc_method_handle(ctx, 2, class_mirror, Some(name_str), mtype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9092,7 +9101,7 @@ fn lk_find_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
     let mh = alloc_method_handle(ctx, 3, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9112,7 +9121,7 @@ fn lk_find_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
     let mh = alloc_method_handle(ctx, 4, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9132,7 +9141,7 @@ fn lk_find_static_getter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
     let mh = alloc_method_handle(ctx, 5, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9152,7 +9161,7 @@ fn lk_find_static_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
     let mh = alloc_method_handle(ctx, 6, class_mirror, name, ftype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9172,7 +9181,7 @@ fn lk_find_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), false)?;
     let mh = alloc_method_handle(ctx, 7, class_mirror, name, mtype);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 // VarHandle synthetic layout (3 fields): 0=target_class, 1=field_name, 2=field_type
@@ -9192,7 +9201,7 @@ fn lk_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let this = obj_arg(args, 0)?;
     let name_str = name.and_then(|n| ctx.read_string(n));
     enforce_lookup_access(ctx, this, class_mirror, name_str.as_deref(), true)?;
-    let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3);
+    let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", 3)?;
     if let Some(cm) = class_mirror {
         ctx.set_field(vh, 0, Value::Object(Some(cm)));
     }
@@ -9229,7 +9238,7 @@ fn lk_unreflect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
             _ => None,
         });
     let mh = alloc_method_handle(ctx, 0, class_mirror, name, None);
-    Ok(Some(Value::Object(Some(mh))))
+    Ok(Some(Value::Object(Some(mh?))))
 }
 
 fn lk_unreflect_special(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9300,7 +9309,7 @@ fn lk_in_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     } else {
         lk_in_modes(modes, same_class, same_package, same_nest)
     };
-    let new_lk = alloc_lookup(ctx, new_modes);
+    let new_lk = alloc_lookup(ctx, new_modes)?;
     ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, target);
     Ok(Some(Value::Object(Some(new_lk))))
 }
@@ -9323,7 +9332,7 @@ fn lk_drop_lookup_mode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into());
         }
     };
-    let new_lk = alloc_lookup(ctx, new_modes);
+    let new_lk = alloc_lookup(ctx, new_modes)?;
     let cls = ctx.get_field(this, LK_LOOKUP_CLASS_REF);
     ctx.set_field(new_lk, LK_LOOKUP_CLASS_REF, cls);
     Ok(Some(Value::Object(Some(new_lk))))
@@ -12091,11 +12100,11 @@ mod classloader_tests {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
         // Build a ClassOption[] of length 1 with ordinal = 0 (NESTMATE).
-        let option = alloc_concurrent_synthetic(
+        let option = try_alloc_concurrent_synthetic(
             &mut ctx,
             "java/lang/invoke/MethodHandles$Lookup$ClassOption",
             1,
-        );
+        )?;
         ctx.set_field(option, 0, Value::Int(0)); // NESTMATE ordinal
         let options_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(options_arr, 0, Value::Object(Some(option)));

@@ -131,7 +131,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         } else {
             ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
         };
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
@@ -149,7 +149,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
             } else {
                 ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0)
             };
-            let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+            let itr = try_alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2)?;
             ctx.set_field(itr, 0, Value::Object(Some(arr)));
             ctx.set_field(itr, 1, Value::Int(0));
             Ok(Some(Value::Object(Some(itr))))
@@ -470,7 +470,7 @@ pub(crate) fn p56_build_stream(
     ctx: &mut dyn NativeContext,
     elems: Vec<Value>,
     class: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     let len = elems.len();
     // Pin across the array/stream allocs below — a moving young GC there
@@ -484,11 +484,11 @@ pub(crate) fn p56_build_stream(
         let v = read_pinned_object_value(ctx, *p, *v);
         ctx.set_array_element(arr, i, v);
     }
-    let stream = alloc_concurrent_synthetic(ctx, class, 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, class, 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
-    stream
+    Ok(stream)
 }
 
 // --- Stream.peek ---
@@ -513,7 +513,7 @@ pub(crate) fn p56_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ctx.unpin_native_roots(consumer_pin);
     // Return new stream with same elements
     let result = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- Stream.takeWhile ---
@@ -547,7 +547,7 @@ pub(crate) fn p56_stream_take_while(
     let result = read_pinned_object_values(ctx, &pins[..taken], &elems[..taken]);
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.dropWhile ---
@@ -581,7 +581,7 @@ pub(crate) fn p56_stream_drop_while(
     let result = read_pinned_object_values(ctx, &pins[start..], &elems[start..]);
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.forEachOrdered ---
@@ -615,7 +615,7 @@ pub(crate) fn p56_stream_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.ofNullable ---
@@ -629,7 +629,7 @@ pub(crate) fn p56_stream_of_nullable(
         vec![args[0]]
     };
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.iterate(seed, op) — generate 256 elements (lazy in real JVM, eager here) ---
@@ -667,7 +667,7 @@ pub(crate) fn p56_stream_iterate(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let elems = read_pinned_object_values(ctx, &pins, &elems);
     ctx.unpin_native_roots(op_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.iterate(seed, hasNext, op) --- Java 9+
@@ -723,7 +723,7 @@ pub(crate) fn p56_stream_iterate_predicate(
     let elems = read_pinned_object_values(ctx, &pins, &elems);
     ctx.unpin_native_roots(has_next_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.generate(Supplier) — generate 256 elements ---
@@ -750,7 +750,7 @@ pub(crate) fn p56_stream_generate(ctx: &mut dyn NativeContext, args: &[Value]) -
     let elems = read_pinned_object_values(ctx, &pins, &elems);
     ctx.unpin_native_roots(supplier_pin);
     let s = p56_build_stream(ctx, elems, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.flatMapToInt ---
@@ -784,7 +784,7 @@ pub(crate) fn p56_stream_flat_map_to_int(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, ints, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.flatMapToLong ---
@@ -818,7 +818,7 @@ pub(crate) fn p56_stream_flat_map_to_long(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.flatMapToDouble ---
@@ -852,7 +852,7 @@ pub(crate) fn p56_stream_flat_map_to_double(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.mapToInt ---
@@ -882,7 +882,7 @@ pub(crate) fn p56_stream_map_to_int(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, ints, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.mapToLong ---
@@ -912,7 +912,7 @@ pub(crate) fn p56_stream_map_to_long(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- Stream.mapToDouble ---
@@ -942,7 +942,7 @@ pub(crate) fn p56_stream_map_to_double(
     }
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.peek ---
@@ -962,7 +962,7 @@ pub(crate) fn p56_int_stream_peek(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
     ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- IntStream.takeWhile ---
@@ -993,7 +993,7 @@ pub(crate) fn p56_int_stream_take_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.dropWhile ---
@@ -1028,7 +1028,7 @@ pub(crate) fn p56_int_stream_drop_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.sorted → IntStream (natural ascending order) ---
@@ -1045,7 +1045,7 @@ pub(crate) fn p56_int_stream_sorted(
     let mut elems = p56_read_stream_elems(ctx, this);
     elems.sort_by_key(|v| v.as_int().unwrap_or(0));
     let s = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.boxed → Stream ---
@@ -1062,7 +1062,7 @@ pub(crate) fn p56_int_stream_boxed(
     let mut pins = Vec::with_capacity(elems.len());
     let mut first_pin = None;
     for v in elems {
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
+        let wrapper = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
         let h = ctx.pin_native_root(wrapper);
         if first_pin.is_none() {
             first_pin = Some(h);
@@ -1076,7 +1076,7 @@ pub(crate) fn p56_int_stream_boxed(
         ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.asLongStream → LongStream ---
@@ -1094,7 +1094,7 @@ pub(crate) fn p56_int_stream_as_long(
         })
         .collect();
     let s = p56_build_stream(ctx, longs, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.asDoubleStream → DoubleStream ---
@@ -1112,7 +1112,7 @@ pub(crate) fn p56_int_stream_as_double(
         })
         .collect();
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.concat ---
@@ -1125,7 +1125,7 @@ pub(crate) fn p56_int_stream_concat(
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- IntStream.forEachOrdered ---
@@ -1170,7 +1170,7 @@ pub(crate) fn p56_long_stream_peek(
     }
     ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- LongStream.takeWhile ---
@@ -1201,7 +1201,7 @@ pub(crate) fn p56_long_stream_take_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.dropWhile ---
@@ -1236,7 +1236,7 @@ pub(crate) fn p56_long_stream_drop_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.boxed → Stream ---
@@ -1252,7 +1252,7 @@ pub(crate) fn p56_long_stream_boxed(
     let mut pins = Vec::with_capacity(elems.len());
     let mut first_pin = None;
     for v in elems {
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Long", 1);
+        let wrapper = try_alloc_concurrent_synthetic(ctx, "java/lang/Long", 1)?;
         let h = ctx.pin_native_root(wrapper);
         if first_pin.is_none() {
             first_pin = Some(h);
@@ -1266,7 +1266,7 @@ pub(crate) fn p56_long_stream_boxed(
         ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.mapToObj(LongFunction) -> Stream ---
@@ -1303,7 +1303,7 @@ pub(crate) fn p56_long_stream_map_to_obj(
     let out = read_pinned_object_values(ctx, &pins, &out);
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.mapToObj(DoubleFunction) -> Stream ---
@@ -1335,7 +1335,7 @@ pub(crate) fn p56_double_stream_map_to_obj(
     let out = read_pinned_object_values(ctx, &pins, &out);
     ctx.unpin_native_roots(func_pin);
     let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.asDoubleStream ---
@@ -1353,7 +1353,7 @@ pub(crate) fn p56_long_stream_as_double(
         })
         .collect();
     let s = p56_build_stream(ctx, doubles, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- LongStream.concat ---
@@ -1366,7 +1366,7 @@ pub(crate) fn p56_long_stream_concat(
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/LongStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.peek ---
@@ -1389,7 +1389,7 @@ pub(crate) fn p56_double_stream_peek(
     }
     ctx.unpin_native_roots(consumer_pin);
     let result = p56_build_stream(ctx, elems, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // --- DoubleStream.takeWhile ---
@@ -1420,7 +1420,7 @@ pub(crate) fn p56_double_stream_take_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.dropWhile ---
@@ -1455,7 +1455,7 @@ pub(crate) fn p56_double_stream_drop_while(
     }
     ctx.unpin_native_roots(predicate_pin);
     let s = p56_build_stream(ctx, result, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.boxed → Stream ---
@@ -1471,7 +1471,7 @@ pub(crate) fn p56_double_stream_boxed(
     let mut pins = Vec::with_capacity(elems.len());
     let mut first_pin = None;
     for v in elems {
-        let wrapper = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+        let wrapper = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
         let h = ctx.pin_native_root(wrapper);
         if first_pin.is_none() {
             first_pin = Some(h);
@@ -1485,7 +1485,7 @@ pub(crate) fn p56_double_stream_boxed(
         ctx.unpin_native_roots(h);
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // --- DoubleStream.concat ---
@@ -1498,7 +1498,7 @@ pub(crate) fn p56_double_stream_concat(
     let mut elems = p56_read_stream_elems(ctx, a);
     elems.extend(p56_read_stream_elems(ctx, b));
     let s = p56_build_stream(ctx, elems, "java/util/stream/DoubleStream");
-    Ok(Some(Value::Object(Some(s))))
+    Ok(Some(Value::Object(Some(s?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1538,7 +1538,7 @@ pub(crate) fn p56_int_stream_summary_stats(
         min = i32::MAX;
         max = i32::MIN;
     }
-    let stats = alloc_concurrent_synthetic(ctx, "java/util/IntSummaryStatistics", 4);
+    let stats = try_alloc_concurrent_synthetic(ctx, "java/util/IntSummaryStatistics", 4)?;
     ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
     ctx.set_field(stats, STATS_FIELD_SUM, Value::Long(sum));
     ctx.set_field(stats, STATS_FIELD_MIN, Value::Int(min));
@@ -1571,7 +1571,7 @@ pub(crate) fn p56_long_stream_summary_stats(
         min = i64::MAX;
         max = i64::MIN;
     }
-    let stats = alloc_concurrent_synthetic(ctx, "java/util/LongSummaryStatistics", 4);
+    let stats = try_alloc_concurrent_synthetic(ctx, "java/util/LongSummaryStatistics", 4)?;
     ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
     ctx.set_field(stats, STATS_FIELD_SUM, Value::Long(sum));
     ctx.set_field(stats, STATS_FIELD_MIN, Value::Long(min));
@@ -1604,7 +1604,7 @@ pub(crate) fn p56_double_stream_summary_stats(
         min = f64::INFINITY;
         max = f64::NEG_INFINITY;
     }
-    let stats = alloc_concurrent_synthetic(ctx, "java/util/DoubleSummaryStatistics", 4);
+    let stats = try_alloc_concurrent_synthetic(ctx, "java/util/DoubleSummaryStatistics", 4)?;
     ctx.set_field(stats, STATS_FIELD_COUNT, Value::Long(count));
     ctx.set_field(stats, STATS_FIELD_SUM, Value::Double(sum));
     ctx.set_field(stats, STATS_FIELD_MIN, Value::Double(min));
@@ -2240,7 +2240,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
         |ctx, _args| {
             // Create a lambda proxy that returns its argument
             let proxy =
-                alloc_concurrent_synthetic(ctx, "java/util/function/UnaryOperator$Identity", 0);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/UnaryOperator$Identity", 0)?;
             Ok(Some(Value::Object(Some(proxy))))
         },
         cratonvm_native_api::NativeKind::SyntheticStub,
@@ -2275,7 +2275,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let comparator_pin = pinned_object_value(ctx, comparator);
             // Store comparator in a 1-field synthetic
             let proxy =
-                alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MaxBy", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MaxBy", 1)?;
             ctx.set_field(
                 proxy,
                 0,
@@ -2299,7 +2299,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // relocate it (native stale-local family).
             let comparator_pin = pinned_object_value(ctx, comparator);
             let proxy =
-                alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MinBy", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/BinaryOperator$MinBy", 1)?;
             ctx.set_field(
                 proxy,
                 0,
@@ -2513,7 +2513,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -2537,7 +2537,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -2559,7 +2559,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.unpin_native_roots(this_pin);
@@ -2577,7 +2577,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate it (native stale-local family).
             let target_pin = pinned_object_value(ctx, target);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1)?;
             ctx.set_field(
                 composite,
                 0,
@@ -2812,7 +2812,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let after_pin = pinned_object_value(ctx, after);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2);
+                try_alloc_concurrent_synthetic(ctx, "java/util/function/Consumer$AndThen", 2)?;
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -3246,7 +3246,7 @@ pub(crate) fn p59_stream_from_spliterator(
             // Pin across the stream alloc below — a moving young GC there
             // would relocate the fresh array (native stale-local family).
             let empty_pin = ctx.pin_native_root(empty);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             let empty = ctx.read_native_pin(empty_pin, empty);
             ctx.set_field(stream, 0, Value::Object(Some(empty)));
             ctx.unpin_native_roots(empty_pin);
@@ -3256,7 +3256,7 @@ pub(crate) fn p59_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3559,7 +3559,7 @@ pub(crate) fn p59_int_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3578,7 +3578,7 @@ pub(crate) fn p59_long_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3597,7 +3597,7 @@ pub(crate) fn p59_double_stream_from_spliterator(
     // Pin across the stream alloc below — a moving young GC there would
     // relocate the element array (native stale-local family).
     let arr_pin = ctx.pin_native_root(arr);
-    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(stream, 0, Value::Object(Some(arr)));
     ctx.unpin_native_roots(arr_pin);
@@ -3627,7 +3627,7 @@ pub(crate) fn p59_collection_spliterator(
     // .lowest -> Arrays.stream -> Arrays.asList(arr).stream() ->
     // Collection.stream() default method -> this native).
     let len = ctx.array_length(data) as i32;
-    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+    let spl = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
     let data = ctx.read_native_pin(data_pin, data);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
     ctx.set_field(spl, 1, Value::Int(0)); // cursor at start
@@ -3691,7 +3691,7 @@ pub(crate) fn p59_hashset_spliterator(
     // 3-field layout (elements=0, pos=1, fence=2) — see the companion fix
     // in `p59_collection_spliterator` above for why fence must be set.
     let fence = keys.len() as i32;
-    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+    let spl = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
@@ -3740,7 +3740,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
             if count > 0 {
                 ctx.set_array_element(arr, 0, val);
             }
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -3769,7 +3769,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(new_arr, a_len + i, ctx.get_array_element(b, i));
                 }
             }
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(new_arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -3804,7 +3804,7 @@ pub(crate) fn native_p64_stream_to_list(
         Value::Object(Some(a)) => a,
         _ => {
             // Empty list
-            let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             ctx.set_field(al, 0, Value::Object(None));
             ctx.set_field(al, 1, Value::Int(0));
             return Ok(Some(Value::Object(Some(al))));
@@ -3815,7 +3815,7 @@ pub(crate) fn native_p64_stream_to_list(
     for i in 0..len {
         ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
     }
-    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let al = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
     ctx.set_field(al, 0, Value::Object(Some(new_arr)));
     ctx.set_field(al, 1, Value::Int(len as i32));
     Ok(Some(Value::Object(Some(al))))
@@ -3869,7 +3869,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "(Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
             // 3-field: initializer=0, integrator=1, finisher=2
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, Value::Object(None));
             ctx.set_field(obj, 1, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -3877,14 +3877,14 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
         ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 2, Value::Object(None));
         Ok(Some(Value::Object(Some(obj))))
     });
     r.register(g, "ofSequential", "(Ljava/util/function/Supplier;Ljava/util/stream/Gatherer$Integrator;Ljava/util/function/BiConsumer;)Ljava/util/stream/Gatherer;", |ctx, args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+        let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
         ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
         ctx.set_field(obj, 2, args.get(2).copied().unwrap_or(Value::Object(None)));
@@ -3968,7 +3968,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "fold",
         "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -3981,7 +3981,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "scan",
         "(Ljava/util/function/Supplier;Ljava/util/function/BiFunction;)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -3994,7 +3994,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "windowFixed",
         "(I)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -4007,7 +4007,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         "windowSliding",
         "(I)Ljava/util/stream/Gatherer;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Gatherer", 3)?;
             ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Int(1)));
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Object(None));
@@ -4213,7 +4213,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let len = ctx.array_length(arr);
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(len as i32));
@@ -4226,7 +4226,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(0));
@@ -4258,7 +4258,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(it))) => *it,
                 _ => {
                     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+                    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
                     ctx.set_field(obj, 0, Value::Object(Some(empty)));
                     ctx.set_field(obj, 1, Value::Int(0));
                     ctx.set_field(obj, 2, Value::Int(0));
@@ -4287,7 +4287,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             for (i, v) in collected.iter().enumerate() {
                 ctx.set_array_element(arr, i, *v);
             }
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3)?;
             ctx.set_field(obj, 0, Value::Object(Some(arr)));
             ctx.set_field(obj, 1, Value::Int(0));
             ctx.set_field(obj, 2, Value::Int(collected.len() as i32));
@@ -4318,7 +4318,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => *s,
                 _ => {
                     let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-                    let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+                    let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
                     ctx.set_field(stream, 0, Value::Object(Some(empty)));
                     return Ok(Some(Value::Object(Some(stream))));
                 }
@@ -4351,7 +4351,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                     drain_spliterator(ctx, spliterator)?
                 }
             };
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4362,7 +4362,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Spliterator$OfInt;Z)Ljava/util/stream/IntStream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4373,7 +4373,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Spliterator$OfLong;Z)Ljava/util/stream/LongStream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/LongStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4384,7 +4384,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Spliterator$OfDouble;Z)Ljava/util/stream/DoubleStream;",
         |ctx, _args| {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/DoubleStream", 1)?;
             ctx.set_field(stream, 0, Value::Object(Some(arr)));
             Ok(Some(Value::Object(Some(stream))))
         },
@@ -4458,7 +4458,7 @@ pub(crate) fn drain_spliterator(
         );
     }
     // Allocate the collector consumer.
-    let collector = alloc_concurrent_synthetic(ctx, "cratonvm/internal/StreamCollector", 2);
+    let collector = try_alloc_concurrent_synthetic(ctx, "cratonvm/internal/StreamCollector", 2)?;
     let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
     ctx.set_field(collector, 0, Value::Object(Some(initial)));
     ctx.set_field(collector, 1, Value::Int(0));

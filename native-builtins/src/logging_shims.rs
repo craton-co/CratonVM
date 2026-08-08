@@ -1460,7 +1460,7 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
             let handlers = match ctx.get_field(*this, 2) {
                 Value::Object(Some(list)) => list,
                 _ => {
-                    let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                    let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;
                     ctx.set_field(*this, 2, Value::Object(Some(list)));
                     list
@@ -1710,7 +1710,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1);
+            let s = try_alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1732,7 +1732,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let a = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0);
+            let a = try_alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0)?;
             Ok(Some(Value::Object(Some(a))))
         },
     );
@@ -1807,7 +1807,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     }
                 }
             }
-            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1);
+            let s = try_alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1854,7 +1854,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(context))));
                 }
             }
-            let f = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
+            let f = try_alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0)?;
             Ok(Some(Value::Object(Some(f))))
         },
     );
@@ -1881,7 +1881,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "getSingleton",
         "()Lorg/slf4j/impl/StaticMarkerBinder;",
         |ctx, _| {
-            let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMarkerBinder", 1);
+            let s = try_alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMarkerBinder", 1)?;
             Ok(Some(Value::Object(Some(s))))
         },
     );
@@ -1909,7 +1909,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
             } else {
                 fallback
             };
-            let f = alloc_concurrent_synthetic(ctx, chosen, 0);
+            let f = try_alloc_concurrent_synthetic(ctx, chosen, 0)?;
             let _ = ctx.invoke_special(chosen, "<init>", "()V", &[Value::Object(Some(f))]);
             Ok(Some(Value::Object(Some(f))))
         },
@@ -2003,7 +2003,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/slf4j/Logger;",
         |ctx, args| {
             let name = args.get(1).copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2)?;
             // Best-effort dual-write: name-by-name (real layout) +
             // name-at-slot-0 (synthetic layout).
             ctx.set_field_by_name(logger, "name", name);
@@ -2308,7 +2308,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/slf4j/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2)?;
             ctx.set_field(logger, SLF4J_NAME, name);
             ctx.set_field(logger, SLF4J_LEVEL, Value::Int(1)); // default: DEBUG
             Ok(Some(Value::Object(Some(logger))))
@@ -2335,7 +2335,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                     Value::Object(Some(s))
                 }
             };
-            let logger = alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Logger", 2)?;
             ctx.set_field(logger, SLF4J_NAME, name_val);
             ctx.set_field(logger, SLF4J_LEVEL, Value::Int(1)); // DEBUG
             Ok(Some(Value::Object(Some(logger))))
@@ -2348,7 +2348,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getILoggerFactory",
         "()Lorg/slf4j/ILoggerFactory;",
         |ctx, _| {
-            let factory = alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0);
+            let factory = try_alloc_concurrent_synthetic(ctx, "org/slf4j/ILoggerFactory", 0)?;
             Ok(Some(Value::Object(Some(factory))))
         },
     );
@@ -2568,7 +2568,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/slf4j/Marker;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let m = alloc_concurrent_synthetic(ctx, "org/slf4j/Marker", 1);
+            let m = try_alloc_concurrent_synthetic(ctx, "org/slf4j/Marker", 1)?;
             ctx.set_field(m, 0, name);
             Ok(Some(Value::Object(Some(m))))
         },
@@ -2587,7 +2587,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(800)); // INFO level
             Ok(Some(Value::Object(Some(logger))))
@@ -2599,7 +2599,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/logging/Logger;",
         |ctx, _| {
             let name = ctx.create_string("global");
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 3)?;
             ctx.set_field(logger, 0, Value::Object(Some(name)));
             ctx.set_field(logger, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(logger))))
@@ -2675,7 +2675,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLevel",
         "()Ljava/util/logging/Level;",
         |ctx, _| {
-            let level = alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2);
+            let level = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2)?;
             let name = ctx.create_string("INFO");
             ctx.set_field(level, 0, Value::Object(Some(name)));
             ctx.set_field(level, 1, Value::Int(800));
@@ -2718,7 +2718,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                 let handlers = match ctx.get_field(this, 2) {
                     Value::Object(Some(lst)) => lst,
                     _ => {
-                        let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+                        let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
                         cratonvm_native_collections::native_al_init(
                             ctx,
                             &[Value::Object(Some(lst))],
@@ -2768,7 +2768,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Level;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let lvl = alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2);
+            let lvl = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Level", 2)?;
             ctx.set_field(lvl, 0, name);
             ctx.set_field(lvl, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(lvl))))
@@ -2782,7 +2782,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "getLogManager",
         "()Ljava/util/logging/LogManager;",
         |ctx, _| {
-            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0);
+            let mgr = try_alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 0)?;
             Ok(Some(Value::Object(Some(mgr))))
         },
     );
@@ -2792,7 +2792,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/logging/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "java/util/logging/Logger", 2)?;
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(800));
             Ok(Some(Value::Object(Some(logger))))
@@ -2827,7 +2827,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
                     Value::Object(Some(s))
                 }
             };
-            let logger = alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2)?;
             ctx.set_field(logger, 0, name_val);
             ctx.set_field(logger, 1, Value::Int(2)); // INFO
             Ok(Some(Value::Object(Some(logger))))
@@ -2839,7 +2839,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/apache/logging/log4j/Logger;",
         |ctx, args| {
             let name = args.first().copied().unwrap_or(Value::Object(None));
-            let logger = alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2)?;
             ctx.set_field(logger, 0, name);
             ctx.set_field(logger, 1, Value::Int(2)); // INFO
             Ok(Some(Value::Object(Some(logger))))
@@ -2851,7 +2851,7 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "()Lorg/apache/logging/log4j/Logger;",
         |ctx, _| {
             let name = ctx.create_string("ROOT");
-            let logger = alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2);
+            let logger = try_alloc_concurrent_synthetic(ctx, "org/apache/logging/log4j/Logger", 2)?;
             ctx.set_field(logger, 0, Value::Object(Some(name)));
             ctx.set_field(logger, 1, Value::Int(2));
             Ok(Some(Value::Object(Some(logger))))
@@ -3030,7 +3030,7 @@ fn mdc_copy_of_context_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
     if snapshot.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     for (k, v) in snapshot {
         let key_obj = ctx.create_string(&k);

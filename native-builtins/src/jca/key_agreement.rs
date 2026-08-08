@@ -22,7 +22,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 const KA_CLASS: &str = "javax/crypto/KeyAgreement";
 const ECDH_SPI: &str = "sun/security/ec/ECDHKeyAgreement";
@@ -91,7 +91,7 @@ fn ka_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let pin = ctx.pin_native_root(spi);
     let base = base_offset(ctx);
-    let obj = alloc_concurrent_synthetic(ctx, KA_CLASS, base + 1);
+    let obj = try_alloc_concurrent_synthetic(ctx, KA_CLASS, base + 1)?;
     let spi = ctx.read_native_pin(pin, spi);
     ctx.set_field(obj, base, Value::Object(Some(spi)));
     ctx.unpin_native_roots(pin);

@@ -40,12 +40,12 @@ use super::*;
 /// not registered, and `AbstractPreferences.toString()`, which is defined as
 /// `(isUserNode() ? "User" : "System") + " Preference Node: " + absolutePath()`,
 /// had no state to render.
-pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext, user: bool) -> ObjectRef {
-    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 6);
+pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext, user: bool) -> Result<ObjectRef, MethodCallFailed> {
+    let prefs = try_alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 6)?;
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
     let prefs_pin = ctx.pin_native_root(prefs);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let prefs = ctx.read_native_pin(prefs_pin, prefs);
@@ -61,7 +61,7 @@ pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext, user: bool) -> Object
     ctx.set_field(prefs, 4, Value::Int(0));
     ctx.set_field(prefs, 5, Value::Int(if user { 1 } else { 0 }));
     ctx.unpin_native_roots(prefs_pin);
-    prefs
+    Ok(prefs)
 }
 
 /// Whether this node belongs to the user tree rather than the system tree.
@@ -171,12 +171,12 @@ fn p72_prefs_child_or_create(
     this: ObjectRef,
     name_val: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let Some(children) = p72_prefs_children(ctx, this) else {
+    let Ok(Some(children)) = p72_prefs_children(ctx, this) else {
         // Pre-wave-2 layout (no child registry): fall back to the old
         // detached-node behaviour rather than failing.
         let user = p72_prefs_is_user(ctx, this);
         let name_pin = pinned_object_value(ctx, name_val);
-        let p = p72_alloc_prefs(ctx, user);
+        let p = p72_alloc_prefs(ctx, user)?;
         let name_val = read_pinned_object_value(ctx, name_pin, name_val);
         ctx.set_field(p, 1, name_val);
         if let Some((h, _)) = name_pin {
@@ -200,7 +200,7 @@ fn p72_prefs_child_or_create(
     // pin first: the map lookup above can have moved it.
     let this = ctx.read_native_pin(this_pin, this);
     let user = p72_prefs_is_user(ctx, this);
-    let child = p72_alloc_prefs(ctx, user);
+    let child = p72_alloc_prefs(ctx, user)?;
     let child_pin = ctx.pin_native_root(child);
     let name_val = read_pinned_object_value(ctx, name_pin, name_val);
     let child = ctx.read_native_pin(child_pin, child);
@@ -295,41 +295,41 @@ fn p72_prefs_removed_ex() -> MethodCallFailed {
 ///
 /// Mirrors `p72_prefs_map`'s lazy-init shape (including its pinning), so a
 /// `Preferences` built before slots 2/3 existed still works.
-pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<Option<ObjectRef>, MethodCallFailed> {
     if ctx.object_num_fields(this) < 4 {
-        return None;
+        return Ok(None);
     }
     if let Value::Object(Some(m)) = ctx.get_field(this, 3) {
-        return Some(m);
+        return Ok(Some(m));
     }
     // Pin across the map alloc/init below — a moving young GC there would
     // relocate `this` (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
     let map_pin = ctx.pin_native_root(map);
     cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
     let this = ctx.read_native_pin(this_pin, this);
     let map = ctx.read_native_pin(map_pin, map);
     ctx.set_field(this, 3, Value::Object(Some(map)));
     ctx.unpin_native_roots(this_pin);
-    Some(map)
+    Ok(Some(map))
 }
 
-pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.get_field(this, 0) {
-        Value::Object(Some(m)) => m,
+        Value::Object(Some(m)) => Ok(m),
         _ => {
             // Pin across the map alloc/init below — a moving young GC there
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let map_pin = ctx.pin_native_root(map);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             let this = ctx.read_native_pin(this_pin, this);
             let map = ctx.read_native_pin(map_pin, map);
             ctx.set_field(this, 0, Value::Object(Some(map)));
             ctx.unpin_native_roots(this_pin);
-            map
+            Ok(map)
         }
     }
 }
@@ -347,7 +347,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "userRoot",
             "()Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx, true);
+                let p = p72_alloc_prefs(ctx, true)?;
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -356,7 +356,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "systemRoot",
             "()Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx, false);
+                let p = p72_alloc_prefs(ctx, false)?;
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -365,7 +365,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "userNodeForPackage",
             "(Ljava/lang/Class;)Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx, true);
+                let p = p72_alloc_prefs(ctx, true)?;
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -374,7 +374,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             "systemNodeForPackage",
             "(Ljava/lang/Class;)Ljava/util/prefs/Preferences;",
             |ctx, _args| {
-                let p = p72_alloc_prefs(ctx, false);
+                let p = p72_alloc_prefs(ctx, false)?;
                 Ok(Some(Value::Object(Some(p))))
             },
         );
@@ -383,7 +383,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             // Pin across the map/string allocs below — a moving young GC there
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let map_pin = ctx.pin_native_root(map);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             let this = ctx.read_native_pin(this_pin, this);
@@ -473,7 +473,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 let this = obj_arg(args, 0)?;
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
                 let def = args.get(2).copied().unwrap_or(Value::Object(None));
-                let map = p72_prefs_map(ctx, this);
+                let map = p72_prefs_map(ctx, this)?;
                 let result = cratonvm_native_collections::native_map_get_pub(
                     ctx,
                     &[Value::Object(Some(map)), key],
@@ -492,7 +492,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 let this = obj_arg(args, 0)?;
                 let key = args.get(1).copied().unwrap_or(Value::Object(None));
                 let val = args.get(2).copied().unwrap_or(Value::Object(None));
-                let map = p72_prefs_map(ctx, this);
+                let map = p72_prefs_map(ctx, this)?;
                 cratonvm_native_collections::native_map_put_pub(
                     ctx,
                     &[Value::Object(Some(map)), key, val],
@@ -504,7 +504,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Int(0));
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
@@ -525,7 +525,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
             };
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let sv = ctx.create_string(&v.to_string());
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -537,7 +537,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Int(0));
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
@@ -562,7 +562,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 Some(Value::Int(i)) => *i != 0,
                 _ => false,
             };
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let sv = ctx.create_string(if v { "true" } else { "false" });
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -574,7 +574,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Long(0));
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
@@ -595,7 +595,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(l)) => *l,
                 _ => 0,
             };
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let sv = ctx.create_string(&v.to_string());
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -607,7 +607,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Double(0.0));
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
@@ -628,7 +628,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 Some(Value::Double(d)) => *d,
                 _ => 0.0,
             };
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let sv = ctx.create_string(&v.to_string());
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -640,7 +640,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let def = args.get(2).copied().unwrap_or(Value::Float(0.0));
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let result = cratonvm_native_collections::native_map_get_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
@@ -661,7 +661,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
                 Some(Value::Float(f)) => *f,
                 _ => 0.0,
             };
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let sv = ctx.create_string(&v.to_string());
             cratonvm_native_collections::native_map_put_pub(
                 ctx,
@@ -672,7 +672,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         r.register(cls, "remove", "(Ljava/lang/String;)V", |ctx, args| {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             cratonvm_native_collections::native_map_remove_pub(
                 ctx,
                 &[Value::Object(Some(map)), key],
@@ -681,7 +681,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         });
         r.register(cls, "clear", "()V", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             cratonvm_native_collections::native_map_clear_pub(ctx, &[Value::Object(Some(map))])?;
             Ok(None)
         });
@@ -740,7 +740,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let name = ctx.get_field(this, 1);
             let name_pin = pinned_object_value(ctx, name);
             let parent = ctx.read_native_pin(parent_pin, parent);
-            if let Some(children) = p72_prefs_children(ctx, parent) {
+            if let Ok(Some(children)) = p72_prefs_children(ctx, parent) {
                 let name = read_pinned_object_value(ctx, name_pin, name);
                 cratonvm_native_collections::native_map_remove_pub(
                     ctx,
@@ -756,7 +756,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         });
         r.register(cls, "keys", "()[Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let map = p72_prefs_map(ctx, this);
+            let map = p72_prefs_map(ctx, this)?;
             let keys_result = cratonvm_native_collections::native_map_key_set_pub(
                 ctx,
                 &[Value::Object(Some(map))],
@@ -965,7 +965,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             // `parent` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let parent_pin = parent.map(|p| (ctx.pin_native_root(p), p));
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let map_pin = ctx.pin_native_root(map);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
             let this = ctx.read_native_pin(this_pin, this);
@@ -996,6 +996,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -1003,17 +1004,17 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 /// Box a primitive int as java.lang.Integer (1-field synthetic with int value at field 0).
-pub(crate) fn pcs_box_int(ctx: &mut dyn NativeContext, v: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
+pub(crate) fn pcs_box_int(ctx: &mut dyn NativeContext, v: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
     ctx.set_field(obj, 0, Value::Int(v));
-    obj
+    Ok(obj)
 }
 
 /// Box a primitive bool as java.lang.Boolean (1-field synthetic with int 0/1 at field 0).
-pub(crate) fn pcs_box_bool(ctx: &mut dyn NativeContext, v: i32) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
+pub(crate) fn pcs_box_bool(ctx: &mut dyn NativeContext, v: i32) -> Result<ObjectRef, MethodCallFailed> {
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
     ctx.set_field(obj, 0, Value::Int(if v != 0 { 1 } else { 0 }));
-    obj
+    Ok(obj)
 }
 
 /// Compare two Value variants for equality. Used by PropertyChangeSupport to short-circuit
@@ -1097,7 +1098,7 @@ fn vcs_event(
     prop_name: Value,
     old_val: Value,
     new_val: Value,
-) -> (ObjectRef, ObjectRef) {
+) -> Result<(ObjectRef, ObjectRef), MethodCallFailed> {
     // Pin across the event alloc below — a moving young GC there would
     // relocate them (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
@@ -1106,14 +1107,14 @@ fn vcs_event(
     let new_pin = pinned_object_value(ctx, new_val);
     let source = ctx.get_field(this, 0);
     let source_pin = pinned_object_value(ctx, source);
-    let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
+    let event = try_alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4)?;
     ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
     ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
     ctx.set_field(event, 2, read_pinned_object_value(ctx, old_pin, old_val));
     ctx.set_field(event, 3, read_pinned_object_value(ctx, new_pin, new_val));
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
-    (this, event)
+    Ok((this, event))
 }
 
 /// Deliver `event` to every listener in VCS field 1 (ArrayList).
@@ -1189,7 +1190,7 @@ fn vcs_fire(
     let prop_pin = pinned_object_value(ctx, prop_name);
     let old_pin = pinned_object_value(ctx, old_val);
     let new_pin = pinned_object_value(ctx, new_val);
-    let (fired_this, event) = vcs_event(ctx, this, prop_name, old_val, new_val);
+    let (fired_this, event) = vcs_event(ctx, this, prop_name, old_val, new_val)?;
     let result = match vcs_dispatch(ctx, fired_this, event) {
         Ok(()) => Ok(None),
         Err(failure) => {
@@ -1198,7 +1199,7 @@ fn vcs_fire(
                 let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
                 let old_val = read_pinned_object_value(ctx, old_pin, old_val);
                 let new_val = read_pinned_object_value(ctx, new_pin, new_val);
-                let (revert_this, revert) = vcs_event(ctx, this, prop_name, new_val, old_val);
+                let (revert_this, revert) = vcs_event(ctx, this, prop_name, new_val, old_val)?;
                 let _ = vcs_dispatch(ctx, revert_this, revert);
             }
             Err(failure)
@@ -1260,7 +1261,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         // Pin across the list alloc/init below — a moving young GC there would
         // relocate `this` (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let lst_pin = ctx.pin_native_root(lst);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
         let this = ctx.read_native_pin(this_pin, this);
@@ -1383,7 +1384,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let new_pin = pinned_object_value(ctx, new_val);
             let source = ctx.get_field(this, 0);
             let source_pin = pinned_object_value(ctx, source);
-            let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
+            let event = try_alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4)?;
             ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
             ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
             ctx.set_field(event, 2, read_pinned_object_value(ctx, old_pin, old_val));
@@ -1408,7 +1409,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this_pin = ctx.pin_native_root(this);
             let prop_pin = pinned_object_value(ctx, prop_name);
             let new_pin = pinned_object_value(ctx, new_val);
-            let old_box = pcs_box_int(ctx, old_int);
+            let old_box = pcs_box_int(ctx, old_int)?;
             let old_box_pin = ctx.pin_native_root(old_box);
             let new_val = read_pinned_object_value(ctx, new_pin, new_val);
             if pcs_values_equal(&Value::Object(Some(old_box)), &new_val) {
@@ -1418,7 +1419,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             let this_cur = ctx.read_native_pin(this_pin, this);
             let source = ctx.get_field(this_cur, 0);
             let source_pin = pinned_object_value(ctx, source);
-            let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
+            let event = try_alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4)?;
             ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
             ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
             let old_box = ctx.read_native_pin(old_box_pin, old_box);
@@ -1446,14 +1447,14 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let prop_pin = pinned_object_value(ctx, prop_name);
-            let old_box = pcs_box_bool(ctx, old_b);
+            let old_box = pcs_box_bool(ctx, old_b)?;
             let old_box_pin = ctx.pin_native_root(old_box);
-            let new_box = pcs_box_bool(ctx, new_b);
+            let new_box = pcs_box_bool(ctx, new_b)?;
             let new_box_pin = ctx.pin_native_root(new_box);
             let this_cur = ctx.read_native_pin(this_pin, this);
             let source = ctx.get_field(this_cur, 0);
             let source_pin = pinned_object_value(ctx, source);
-            let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
+            let event = try_alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4)?;
             ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
             ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
             let old_box = ctx.read_native_pin(old_box_pin, old_box);
@@ -1482,14 +1483,14 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let prop_pin = pinned_object_value(ctx, prop_name);
-            let old_box = pcs_box_int(ctx, old_i);
+            let old_box = pcs_box_int(ctx, old_i)?;
             let old_box_pin = ctx.pin_native_root(old_box);
-            let new_box = pcs_box_int(ctx, new_i);
+            let new_box = pcs_box_int(ctx, new_i)?;
             let new_box_pin = ctx.pin_native_root(new_box);
             let this_cur = ctx.read_native_pin(this_pin, this);
             let source = ctx.get_field(this_cur, 0);
             let source_pin = pinned_object_value(ctx, source);
-            let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
+            let event = try_alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4)?;
             ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
             ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
             let old_box = ctx.read_native_pin(old_box_pin, old_box);
@@ -1562,7 +1563,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         // Pin across the list alloc/init below — a moving young GC there would
         // relocate `this` (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let lst_pin = ctx.pin_native_root(lst);
         cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
         let this = ctx.read_native_pin(this_pin, this);
@@ -1636,9 +1637,9 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             // relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let prop_pin = pinned_object_value(ctx, prop_name);
-            let old_box = pcs_box_int(ctx, old_i);
+            let old_box = pcs_box_int(ctx, old_i)?;
             let old_box_pin = ctx.pin_native_root(old_box);
-            let new_box = pcs_box_int(ctx, new_i);
+            let new_box = pcs_box_int(ctx, new_i)?;
             let this = ctx.read_native_pin(this_pin, this);
             let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
             let old_box = ctx.read_native_pin(old_box_pin, old_box);
@@ -1668,9 +1669,9 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             }
             let this_pin = ctx.pin_native_root(this);
             let prop_pin = pinned_object_value(ctx, prop_name);
-            let old_box = pcs_box_bool(ctx, old_b);
+            let old_box = pcs_box_bool(ctx, old_b)?;
             let old_box_pin = ctx.pin_native_root(old_box);
-            let new_box = pcs_box_bool(ctx, new_b);
+            let new_box = pcs_box_bool(ctx, new_b)?;
             let this = ctx.read_native_pin(this_pin, this);
             let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
             let old_box = ctx.read_native_pin(old_box_pin, old_box);
@@ -1987,6 +1988,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // GenericTypeAwarePropertyDescriptor stores read/write in its own fields.
     let _ = pd;
     r.set_category(__prev_cat);
+    ()
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.
@@ -2140,7 +2142,7 @@ pub(crate) fn introspector_get_bean_info(
             let pd_pin = ctx.pin_native_root(pd_arr);
             let md_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
             let md_pin = ctx.pin_native_root(md_arr);
-            let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3);
+            let bean_info = try_alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3)?;
             let pd_arr = ctx.read_native_pin(pd_pin, pd_arr);
             let md_arr = ctx.read_native_pin(md_pin, md_arr);
             ctx.set_field(bean_info, 0, Value::Object(Some(pd_arr)));
@@ -2205,15 +2207,15 @@ pub(crate) fn introspector_get_bean_info(
         // void-returning indexed setters `setXxx(int, E)` — (mirror, E desc).
         indexed_write_candidates: Vec<((usize, ObjectRef), String)>,
     }
-    fn prop_idx(props: &mut Vec<PropAcc>, name: &str) -> usize {
+    fn prop_idx(props: &mut Vec<PropAcc>, name: &str) -> Result<usize, MethodCallFailed> {
         match props.iter().position(|p| p.name == name) {
-            Some(i) => i,
+            Some(i) => Ok(i),
             None => {
                 props.push(PropAcc {
                     name: name.to_string(),
                     ..Default::default()
                 });
-                props.len() - 1
+                Ok(props.len() - 1)
             }
         }
     }
@@ -2315,7 +2317,7 @@ pub(crate) fn introspector_get_bean_info(
                     name,
                     desc,
                     method.access_flags,
-                );
+                )?;
                 let mm_all_pin = ctx.pin_native_root(mm_all);
                 all_method_mirrors.push((mm_all_pin, mm_all));
             }
@@ -2351,7 +2353,7 @@ pub(crate) fn introspector_get_bean_info(
                     name,
                     desc,
                     method.access_flags,
-                );
+                )?;
                 let mm_pin = ctx.pin_native_root(mm);
                 let mut ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
                 let mut ret_desc = ret_desc;
@@ -2370,7 +2372,7 @@ pub(crate) fn introspector_get_bean_info(
                 let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
                 let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
                 let mm = ctx.read_native_pin(mm_pin, mm);
-                let idx = prop_idx(&mut props, &prop_name);
+                let idx = prop_idx(&mut props, &prop_name)?;
                 let p = &mut props[idx];
                 if is_is {
                     // A boolean isXxx() always wins and locks out plain getters.
@@ -2401,9 +2403,9 @@ pub(crate) fn introspector_get_bean_info(
                         name,
                         desc,
                         method.access_flags,
-                    );
+                    )?;
                     let mm_pin = ctx.pin_native_root(mm);
-                    let idx = prop_idx(&mut props, &prop_name);
+                    let idx = prop_idx(&mut props, &prop_name)?;
                     if props[idx].indexed_read.is_none() {
                         props[idx].indexed_read = Some((mm_pin, mm));
                     }
@@ -2428,7 +2430,7 @@ pub(crate) fn introspector_get_bean_info(
                         name,
                         desc,
                         method.access_flags,
-                    );
+                    )?;
                     let mm_pin = ctx.pin_native_root(mm);
                     let mut param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
                     let mut param_desc = params[0].clone();
@@ -2449,7 +2451,7 @@ pub(crate) fn introspector_get_bean_info(
                     let param_mirror_pin = ctx.pin_native_root(param_mirror);
                     let param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
                     let mm = ctx.read_native_pin(mm_pin, mm);
-                    let idx = prop_idx(&mut props, &prop_name);
+                    let idx = prop_idx(&mut props, &prop_name)?;
                     props[idx].write_methods.push((
                         (mm_pin, mm),
                         param_desc,
@@ -2467,9 +2469,9 @@ pub(crate) fn introspector_get_bean_info(
                         name,
                         desc,
                         method.access_flags,
-                    );
+                    )?;
                     let mm_pin = ctx.pin_native_root(mm);
-                    let idx = prop_idx(&mut props, &prop_name);
+                    let idx = prop_idx(&mut props, &prop_name)?;
                     props[idx]
                         .indexed_write_candidates
                         .push(((mm_pin, mm), params[1].clone()));
@@ -2564,7 +2566,7 @@ pub(crate) fn introspector_get_bean_info(
             "getClass",
             "()Ljava/lang/Class;",
             0x0001, /* ACC_PUBLIC */
-        );
+        )?;
         let getter_pin = ctx.pin_native_root(getter);
         let class_class_mirror = ctx.read_native_pin(class_class_mirror_pin, class_class_mirror);
         properties.push((
@@ -2703,7 +2705,7 @@ pub(crate) fn introspector_get_bean_info(
         ) {
             Ok(Some(Value::Object(Some(d)))) => d,
             _ => {
-                let md = alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1);
+                let md = try_alloc_concurrent_synthetic(ctx, "java/beans/MethodDescriptor", 1)?;
                 // Re-read — the failed ctor invoke + the alloc above may have
                 // moved the mirror again.
                 let m = ctx.read_native_pin(m_pin, m);
@@ -2732,7 +2734,7 @@ pub(crate) fn introspector_get_bean_info(
 
     // Build BeanInfo: slot 0 = PD[], slot 1 = MethodDescriptor[],
     // slot 2 = BeanDescriptor.
-    let bean_info = alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3);
+    let bean_info = try_alloc_concurrent_synthetic(ctx, "java/beans/BeanInfo", 3)?;
     let pd_arr = ctx.read_native_pin(pd_arr_pin, pd_arr);
     let md_arr = ctx.read_native_pin(md_arr_pin, md_arr);
     let bean_descriptor = read_pinned_object_value(ctx, bd_pin, bean_descriptor);
@@ -3016,13 +3018,13 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         // Pin across the map allocs/inits below — a moving young GC there
         // would relocate them (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let bindings = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let bindings_pin = ctx.pin_native_root(bindings);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
         let this = ctx.read_native_pin(this_pin, this);
         let bindings = ctx.read_native_pin(bindings_pin, bindings);
         ctx.set_field(this, 0, Value::Object(Some(bindings)));
-        let env = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let env = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let env_pin = ctx.pin_native_root(env);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(env))]).ok();
         let this = ctx.read_native_pin(this_pin, this);
@@ -3038,7 +3040,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         // relocate them (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
         let env_pin = pinned_object_value(ctx, env_arg);
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let bindings = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let bindings_pin = ctx.pin_native_root(bindings);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(bindings))]).ok();
         let this = ctx.read_native_pin(this_pin, this);
@@ -3116,7 +3118,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         "list",
         "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
         |ctx, _args| {
-            let lst = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let lst = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(lst))]).ok();
             Ok(Some(Value::Object(Some(lst))))
         },
@@ -3127,7 +3129,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         // Pin across the map alloc/init below — a moving young GC there would
         // relocate them (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let empty = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let empty = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let empty_pin = ctx.pin_native_root(empty);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(empty))]).ok();
         let this = ctx.read_native_pin(this_pin, this);
@@ -3191,11 +3193,11 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         "createSubcontext",
         "(Ljava/lang/String;)Ljavax/naming/Context;",
         |ctx, _args| {
-            let sub = alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", 2);
+            let sub = try_alloc_concurrent_synthetic(ctx, "javax/naming/InitialContext", 2)?;
             // Pin across the map alloc/init below — a moving young GC there
             // would relocate them (native stale-local family).
             let sub_pin = ctx.pin_native_root(sub);
-            let b2 = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let b2 = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let b2_pin = ctx.pin_native_root(b2);
             cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(b2))]).ok();
             let sub = ctx.read_native_pin(sub_pin, sub);
@@ -3341,7 +3343,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         // Pin across the map alloc/init below — a moving young GC there would
         // relocate them (native stale-local family).
         let this_pin = ctx.pin_native_root(this);
-        let empty = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let empty = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let empty_pin = ctx.pin_native_root(empty);
         cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(empty))]).ok();
         let this = ctx.read_native_pin(this_pin, this);

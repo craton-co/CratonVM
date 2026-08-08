@@ -76,6 +76,7 @@ use cratonvm_types::{ObjectRef, Value};
 // already claimed parking-lot semantics.
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+use cratonvm_types::error::MethodCallFailed;
 
 // ---------------------------------------------------------------------------
 // OS entropy helpers
@@ -596,9 +597,9 @@ pub(crate) fn native_random_next_gaussian(
 /// instance this module hands out. `regression-suite/src/RJdkSecurity.java:136`
 /// asserts `sr.getProvider() != null` and failed in BOTH `--real-jdk` and
 /// `--jdk-only`. Attach the owning `Provider` here as well.
-fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
+fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> Result<(), MethodCallFailed> {
     let Some(Value::Object(Some(this))) = args.first().copied() else {
-        return;
+        return Ok(());
     };
     // `create_string` can move the heap; pin `this` across it.
     let pin = ctx.pin_native_root(this);
@@ -606,7 +607,8 @@ fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
     let this = ctx.read_native_pin(pin, this);
     ctx.set_field_by_name(this, "algorithm", Value::Object(Some(algo)));
     ctx.unpin_native_roots(pin);
-    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM);
+    secure_random_attach_provider(ctx, this, DEFAULT_ALGORITHM)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +694,7 @@ fn secure_random_attach_provider(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     algo: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     let name = secure_random_provider_name(algo);
     let pin = ctx.pin_native_root(this);
     // `resolve_or_make_provider` hands back the caller's REAL registered
@@ -700,9 +702,9 @@ fn secure_random_attach_provider(
     // what that provider's own constructor set.
     let provider = crate::jca::provider_chain::resolve_or_make_provider(ctx, &name);
     let this = ctx.read_native_pin(pin, this);
-    ctx.set_field_by_name(this, "provider", Value::Object(Some(provider)));
+    ctx.set_field_by_name(this, "provider", Value::Object(Some(provider?)));
     ctx.unpin_native_roots(pin);
-    this
+    Ok(this)
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +973,7 @@ pub(crate) fn native_secure_random_init(
 ) -> MethodCallResult {
     // Per the JDK SecureRandom contract the no-arg ctor selects a default
     // provider; we always select "OS-CSPRNG", the strongest source available.
-    secure_random_record_algorithm(ctx, args);
+    secure_random_record_algorithm(ctx, args)?;
     Ok(None)
 }
 
@@ -1383,10 +1385,10 @@ pub(crate) fn native_secure_random_generate_seed(
 /// The String is created and pinned *before* the object allocation so a moving
 /// GC during `alloc_concurrent_synthetic` cannot leave us writing through a
 /// stale reference.
-fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef {
+fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> Result<ObjectRef, MethodCallFailed> {
     let algo_str = ctx.create_string(algorithm);
     let pin = ctx.pin_native_root(algo_str);
-    let sr = crate::alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4);
+    let sr = crate::try_alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4)?;
     let algo_str = ctx.read_native_pin(pin, algo_str);
     // Resolve `algorithm:String` by name so the slot matches the real layout
     // regardless of synthetic vs real-JDK field ordering.
@@ -1394,7 +1396,7 @@ fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef
     ctx.unpin_native_roots(pin);
     // `provider` is the second field `getDefaultPRNG` / `GetInstance` stamp;
     // without it `getProvider()` reads back null. Returns the forwarded `sr`.
-    secure_random_attach_provider(ctx, sr, algorithm)
+    Ok(secure_random_attach_provider(ctx, sr, algorithm)?)
 }
 
 /// `SecureRandom.getInstance(String algorithm)` — static factory.  `algorithm`
@@ -1428,7 +1430,7 @@ pub(crate) fn native_secure_random_get_instance(
             &format!("{algo} SecureRandom not available"),
         ));
     }
-    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)))))
+    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)?))))
 }
 
 /// `SecureRandom.getInstance(String algorithm, String provider)` and
@@ -1475,7 +1477,7 @@ pub(crate) fn native_secure_random_get_instance_strong(
     Ok(Some(Value::Object(Some(make_secure_random(
         ctx,
         DEFAULT_ALGORITHM,
-    )))))
+    )?))))
 }
 
 // ---------------------------------------------------------------------------
