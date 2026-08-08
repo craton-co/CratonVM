@@ -290,9 +290,30 @@ which five other paths depend on and none of which had such a test.
   reference array's own class id *is* its component class id, so the whole
   fixture is a dozen lines against a default `SharedVm`.
 
-  Still not covered: the loader-split arm, which needs two same-named classes
-  and `ensure_synthetic_class` dedupes by name. That leg is characterised
-  instead by `classloading::class::tests::a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name`.
+  The loader-split arm — the one this whole entry is about — is covered too, by
+  `aastore_fails_open_across_a_split_loaders_two_copies_of_one_name`. It builds
+  the two-copy state that `ensure_synthetic_class` will not produce directly, by
+  fabricating the second copy under its own name and renaming it in place. That
+  leaves `ClassManager`'s name index stale, which is safe *on this path only*:
+  the predicate reads `class.name` from the store and recovers `comp_id` from
+  the array's own class id, so no by-name lookup is consulted. The test says so,
+  because the trick is not safe to copy into a test that does exercise name
+  resolution.
+
+  It covers both scenarios — the value being the other copy, and a subclass
+  whose superclass edge reaches it — each asserted against `is_subclass_of`
+  being `false` first, so an acceptance cannot be legitimate subtyping in
+  disguise. A third assertion keeps an unrelated class refused; without it, all
+  of the above would also pass against a degenerate `true`.
+
+  **Finding from mutating it: the predicate's two split checks are not two.**
+  The explicit `value_class.name == comp_name && value_class_id != comp_id`
+  early return is *subsumed* by the by-name superclass walk immediately below
+  it, because that walk starts at `value_class_id` itself and its first
+  iteration tests the same name equality. Disabling the walk fails the test;
+  disabling the fast path changes nothing. Left in place — a redundant early
+  return is not a wrong one, and deleting it is a separate decision — but nobody
+  should read those as independent defences.
 
 ### Two things ruled out — do not repeat them
 

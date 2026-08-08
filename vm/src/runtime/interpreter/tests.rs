@@ -99,6 +99,136 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
     );
 }
 
+/// The two loader-split arms of `aastore_element_assignable` — the ones that
+/// exist for `@CompileWithForkedClassLoader`, and the reason
+/// `AotIntegrationTests` reached this code at all.
+///
+/// Two scenarios, both arising when one class NAME carries two `ClassId`s:
+///
+/// 1. the value's class IS the component, under the other loader's copy;
+/// 2. the value is a SUBCLASS whose recorded superclass edge points at the
+///    other loader's copy of the component.
+///
+/// # One arm serves both, and the other is subsumed
+///
+/// The predicate spells these as two consecutive checks: an explicit
+/// `value_class.name == comp_name && value_class_id != comp_id`, then a by-name
+/// superclass walk. **Mutation testing says only the walk is load-bearing.**
+/// Disabling the walk fails scenario 2 as expected; disabling the explicit
+/// same-name check changes nothing at all, because the walk starts at
+/// `value_class_id` itself, so its first iteration already tests
+/// `class.name == comp_name`. Anything the fast path accepts, the walk accepts
+/// one line later.
+///
+/// That is recorded rather than acted on: the fast path is a redundant early
+/// return, not a wrong one, and deleting code in this predicate is a separate
+/// decision from covering it. If someone does remove it, this test should stay
+/// green — and if it does not, the two were less equivalent than they look.
+///
+/// # Building the pathological state
+///
+/// `ensure_synthetic_class` dedupes by name, so a second copy cannot be
+/// fabricated directly — which is why this leg was left uncovered when the
+/// first control landed. The state is instead reached by fabricating under a
+/// distinct name and renaming the copy in place. That deliberately leaves
+/// `ClassManager`'s name index pointing at the old name, and that is fine
+/// *here*: the predicate reads `class.name` out of the store via `get_class`,
+/// and `comp_id` is recovered from the array's own class id, so no by-name
+/// lookup is consulted on this path. Do not copy this trick into a test that
+/// does exercise name resolution.
+///
+/// # Each arm is asserted against its own negative
+///
+/// A "same name, different id" acceptance is only meaningful if the exact
+/// check would have refused, so both arms assert `is_subclass_of` is `false`
+/// first. Otherwise the store could be passing legitimately and the arm under
+/// test would never have run.
+#[test]
+fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
+    use cratonvm_types::ArrayElementType;
+
+    let shared =
+        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+
+    const COMPONENT: &str = "cratonvm/test/SplitAlpha";
+
+    let (alpha, forked, child) = {
+        let mut cm = shared.classes.class_manager.write();
+        // The parent loader's copy — what the array was created with.
+        let alpha = cm.ensure_synthetic_class(COMPONENT, 0);
+
+        // The forked loader's copy: fabricated under its own name, then renamed
+        // so the store holds two distinct ids for one name.
+        let forked = cm.ensure_synthetic_class("cratonvm/test/SplitAlpha$Forked", 0);
+        cm.class_store
+            .get_mut(forked)
+            .expect("just fabricated")
+            .name = cratonvm_types::intern_arc(COMPONENT);
+
+        // A subclass of the FORKED copy, for arm 2. `set_superclass` rather than
+        // writing the field: the store maintains a subclass adjacency index that
+        // a raw field write would desynchronise.
+        let child = cm.ensure_synthetic_class("cratonvm/test/SplitChild", 0);
+        cm.class_store.set_superclass(child, Some(forked));
+
+        (alpha, forked, child)
+    };
+    assert_ne!(alpha, forked, "the two copies must be distinct ClassIds");
+
+    let alpha_arr = shared
+        .mem
+        .heap
+        .alloc_array(alpha, ArrayElementType::Reference, 1);
+    let forked_obj = shared.mem.heap.alloc_object(forked, 0);
+    let child_obj = shared.mem.heap.alloc_object(child, 0);
+
+    {
+        let cm = shared.classes.class_manager.read();
+        assert!(
+            !cm.is_subclass_of(forked, alpha),
+            "identity must refuse the two copies — if it accepts, arm 1 is not \
+             what is being measured below",
+        );
+        assert!(
+            !cm.is_subclass_of(child, alpha),
+            "identity must refuse the child too: its superclass edge points at \
+             the FORKED copy, not at this one",
+        );
+    }
+
+    // Scenario 1: the value IS the component, under the other copy. Served by
+    // the by-name walk's first iteration (see the note above on why the
+    // explicit same-name fast path above it is subsumed).
+    assert!(
+        aastore_element_assignable(&shared, alpha_arr, forked_obj),
+        "the other loader's copy of the component must be storable — refusing \
+         it is the `array element type mismatch` that AotIntegrationTests hit",
+    );
+
+    // Scenario 2: a subclass reaching the other copy. This one is served ONLY
+    // by the walk — disabling it fails right here.
+    assert!(
+        aastore_element_assignable(&shared, alpha_arr, child_obj),
+        "a subclass whose superclass edge reaches a same-named copy must be \
+         storable",
+    );
+
+    // And the split is not a licence to accept anything: an unrelated class
+    // whose chain never reaches the component name is still refused. Without
+    // this, both assertions above would also pass against a predicate that had
+    // degenerated to `true`.
+    let unrelated = {
+        let mut cm = shared.classes.class_manager.write();
+        cm.ensure_synthetic_class("cratonvm/test/SplitUnrelated", 0)
+    };
+    let unrelated_obj = shared.mem.heap.alloc_object(unrelated, 0);
+    assert!(
+        !aastore_element_assignable(&shared, alpha_arr, unrelated_obj),
+        "an unrelated class must still be refused even once same-named copies \
+         exist in the store",
+    );
+}
+
 /// The wiring the test above cannot see: reflective `Array.set` must actually
 /// route through that shared predicate rather than keep a private check.
 ///
