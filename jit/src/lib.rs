@@ -5264,7 +5264,7 @@ pub enum ReceiverShape {
 /// Why a candidate was not inlined. Every refusal is reported rather than
 /// silently dropped, because "the inliner did nothing" and "the inliner
 /// declined for a stated reason" are indistinguishable from the outside, and
-/// that is precisely the failure mode `docs/flag-census.md` tracks.
+/// that is precisely the failure mode `audits/flag-census.md` tracks.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InlineRefusal {
     /// The compilation requested precise exception frames. Mirrors the
@@ -12075,7 +12075,7 @@ fn virtual_object_info_for(
 /// optimizing tier is an optimization, never a requirement.
 ///
 /// This is the adapter the P0 "JIT correctness" lane of
-/// `docs/feature-designs/c2/deep-research-vm-c2.md` asks for: `verify_graph` returns
+/// `feature-designs/c2/deep-research-vm-c2.md` asks for: `verify_graph` returns
 /// `Result`, the compile path returns `Option`, and rather than change the
 /// signature of anything already in the pipeline the conversion happens here,
 /// at the call site. The bailout is *counted* (`bailout::bailout_counts`) so
@@ -14586,7 +14586,7 @@ fn try_compile_inner(
         // case of — the optimizing tier replaces a C1 body whenever it CAN,
         // with no evidence the replacement is faster, and every `cov-*` lane
         // widens the set of methods that happens to — is written up in
-        // `docs/feature-designs/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
+        // `feature-designs/c2/perf-01-sieve-ir-body-6x-slower-than-c1.md`
         // and is not solved here.
         && single_pass_only_lowering_for(code, code_len, cached).is_none()
         // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
@@ -14737,7 +14737,7 @@ fn try_compile_inner(
         // the IR builder. `getstatic` + `ldc`/`ldc_w` was 189 of the 273
         // opcode-gap events measured on 2026-08-03 — 69% of every opcode the
         // optimizing builder had no arm for
-        // (`docs/feature-designs/c2/ir-coverage-survey-20260803.md`).
+        // (`feature-designs/c2/ir-coverage-survey-20260803.md`).
         //
         // Three site kinds, three tables, all fed from the SAME resolver the
         // single-pass backend uses — this lane consumes a table the caller
@@ -15680,7 +15680,7 @@ fn try_compile_inner(
                 // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
                 // reassoc off → fall through to the single-pass backend below.
             } else {
-                // P0 "JIT correctness" (docs/feature-designs/c2/deep-research-vm-c2.md):
+                // P0 "JIT correctness" (feature-designs/c2/deep-research-vm-c2.md):
                 // the IR verifier runs after every mutating pass when
                 // `ir_verify::verify_enabled()` (debug builds, or
                 // `CRATONVM_JIT_VERIFY_IR=1`), and unconditionally immediately

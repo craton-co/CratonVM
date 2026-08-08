@@ -547,7 +547,7 @@ impl VmHeap {
             // 8-byte stack word instead calls `ZgcRealHeap::is_object_address`
             // (`zgc.rs:1892`), whose first act is `self.registry.lock()`: one
             // mutex acquire PER STACK WORD, per root-gathering pass, per
-            // thread. `docs/gc/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
+            // thread. `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
             // as a competing explanation for the 35 PASS→HANG classes in
             // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`,
             // whose ApplicationContext boot/teardown shape is exactly deep
@@ -670,7 +670,7 @@ impl VmHeap {
             // `interpreter/gc_and_alloc.rs:4260`), whose dominant population
             // is zeros, small integers and long bit patterns — every one of
             // which currently buys a full walk of the heap.
-            // `docs/gc/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
+            // `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
             // instrument-separable hypotheses for the 35 PASS→HANG classes in
             // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`.
             //
@@ -2298,7 +2298,7 @@ impl VmHeap {
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`
         // ("per-cycle coverage proof, moving is possible") disagreement for
-        // THIS run — see `docs/gc/tlab-and-card-audit.md` §3.
+        // THIS run — see `audits/tlab-and-card-audit.md` §3.
         //
         // Under G1 this used to be uninformative by construction:
         // `G1Collector::collect_garbage` passed the constant

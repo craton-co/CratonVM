@@ -421,7 +421,7 @@ pub static SWEEP_BAD_EXTENT_HITS: AtomicU64 = AtomicU64::new(0);
 /// while a conservative root still points into it. That is a premature
 /// reclamation, and it is silent: the object's span is zeroed, so the next read
 /// through the stale reference sees an all-zero header, i.e. `ClassId(0)` /
-/// `java.lang.Object`. See docs/gc/old-sweep-liveness.md section 7 for the
+/// `java.lang.Object`. See audits/old-sweep-liveness.md section 7 for the
 /// old-generation twin of this, which was the H2 `MVStore` cache defect.
 ///
 /// Non-zero here means the oracle's interval verification failed on a live
@@ -2991,7 +2991,7 @@ impl GenerationalHeap {
     /// given `[from_base, from_end)` window, sorted ascending, and **coalesced
     /// so no two entries overlap**. Empty on the normal collection path.
     ///
-    /// # Why the coalesce is load-bearing (TLAB audit, `docs/gc/tlab-and-card-audit.md`)
+    /// # Why the coalesce is load-bearing (TLAB audit, `audits/tlab-and-card-audit.md`)
     ///
     /// Both consumers merge this list with `Arena::free_blocks_sorted()` and
     /// then feed the result to [`skip_free_blocks`], whose contract is a list of
@@ -5536,7 +5536,7 @@ impl GenerationalHeap {
             // branch that actually decides, so `gc_metrics::
             // collector_decision_report()` can never drift from the code the
             // way `docs/GC.md` and `ARCHITECTURE.md` drifted from each other
-            // (see `docs/gc/tlab-and-card-audit.md` §3). The order of the arms
+            // (see `audits/tlab-and-card-audit.md` §3). The order of the arms
             // below mirrors the order of the terms in `divert_non_moving`, so
             // the reported reason is the FIRST one that forced the diversion —
             // the one an operator has to fix to get a moving cycle back.
@@ -5944,7 +5944,7 @@ impl GenerationalHeap {
         let start_skips = {
             let mut v = young_from.free_blocks_sorted();
             let tails = self.jit_tlab_skip_offsets(young_base, young_base + young_used);
-            // TLAB AUDIT TRIPWIRE (docs/gc/tlab-and-card-audit.md §1, defect
+            // TLAB AUDIT TRIPWIRE (audits/tlab-and-card-audit.md §1, defect
             // T-3). We are on the MOVING path: from-space is about to be
             // evacuated, swapped and reset. A published reserved tail means
             // some ALIVE thread still owns a TLAB `[cursor, end)` in the arena
@@ -5971,7 +5971,7 @@ impl GenerationalHeap {
             //    young_used)` — this exact from-space. A non-empty result IS
             //    the hazard condition, not a proxy for it.
             //  * It is expected to be unreachable. Per the transition table in
-            //    `docs/gc/tlab-and-card-audit.md` §1.2 every alive thread
+            //    `audits/tlab-and-card-audit.md` §1.2 every alive thread
             //    retires at its exclusion point, and the one intentional
             //    un-retired case (an OS-frozen in-JIT peer) makes the VM call
             //    `mark_moving_young_coverage_incomplete`, which sends the cycle
@@ -10414,7 +10414,7 @@ impl GenerationalHeap {
         // header — `ClassId(0)`, which renders as `java.lang.Object` and
         // surfaces minutes later on another thread as
         // `java.lang.Object cannot be cast to <something>`
-        // (docs/gc/old-sweep-liveness.md §7).
+        // (audits/old-sweep-liveness.md §7).
         // Every existing guard stays quiet: the header is plausible, the extent
         // fits, no slot goes out of bounds, nothing segfaults.
         //
@@ -11250,7 +11250,7 @@ impl GenerationalHeap {
         // the in-place sweep on the cycles `has_conservative_roots` catches and
         // lets every OTHER cycle fall through to the compactor, which is where
         // the measured victim was actually lost. Full argument and
-        // measurements: docs/gc/old-sweep-liveness.md section 7.
+        // measurements: audits/old-sweep-liveness.md section 7.
         //
         // Pinning is pure over-retention: the object does not move, and a
         // false positive retains one block for one cycle, which is what
@@ -11311,7 +11311,7 @@ impl GenerationalHeap {
                     "old-gen major GC: {} root(s) are INTERIOR words of live old-gen objects, \
                      so this cycle reclaims IN PLACE instead of compacting — a slid object \
                      would leave those roots dangling and they cannot be rewritten. See \
-                     docs/gc/old-sweep-liveness.md section 7.",
+                     audits/old-sweep-liveness.md section 7.",
                     interior_pins.len(),
                 );
             }
@@ -11695,7 +11695,7 @@ impl GenerationalHeap {
                     "in-place old-gen sweep: the mark phase missed {} of {} walked block(s) \
                      that a LIVE old-gen object still references; retaining them. This is a \
                      mark push-site gap, not floating garbage — see \
-                     docs/gc/old-sweep-liveness.md.",
+                     audits/old-sweep-liveness.md.",
                     rescued,
                     objects.len(),
                 );
@@ -11713,7 +11713,7 @@ impl GenerationalHeap {
                         "in-place old-gen sweep ({} walked objects): a live old-gen object \
                          references an in-old-gen address the object walk did not yield — an \
                          EARLIER reclamation already freed a live block. See \
-                         `old_gen::COMPACT_ESCAPE_HITS` and docs/gc/old-sweep-liveness.md.",
+                         `old_gen::COMPACT_ESCAPE_HITS` and audits/old-sweep-liveness.md.",
                         objects.len(),
                     );
                 }
@@ -11787,7 +11787,7 @@ impl GenerationalHeap {
                     // an all-zero `ClassId(0)` header, i.e. `java.lang.Object`.
                     // Always on, and cheap: an in-place old sweep only runs past
                     // 75 % occupancy, and the record is one relaxed `fetch_add`
-                    // plus five relaxed stores. See docs/gc/old-sweep-liveness.md.
+                    // plus five relaxed stores. See audits/old-sweep-liveness.md.
                     if interior_pins.contains(&(obj_ptr as usize)) {
                         // Only reachable with `CRATONVM_GC_NO_OLD_INTERIOR_PINS`
                         // set: the pin above marks these, so the free loop never
@@ -14542,7 +14542,7 @@ fn note_interior_old_root(root: *mut u8, base: usize, size: usize) {
         "old-gen mark: conservative root {root:p} is an INTERIOR word of the live object at \
          {base:#x}+{size:#x} (interior_off={}, class_id={}, kind={}) — pinning the containing \
          object. Without this the in-place sweep frees it under a root it cannot rewrite; see \
-         docs/gc/old-sweep-liveness.md section 7",
+         audits/old-sweep-liveness.md section 7",
         root as usize - base,
         header.class_id.as_u32(),
         ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
@@ -14597,7 +14597,7 @@ fn note_rescued_old_mark_candidate(ptr: *mut u8, site: &'static str) {
             "old-gen mark [{site}]: candidate {ptr:p} FAILED the plausibility screen but IS an \
              object base the walk yielded (class_id={}, kind={}, shape={}, gc_flags={:#04x}) — \
              marking it. Without this the in-place sweep would free a live object; see \
-             docs/gc/old-sweep-liveness.md.",
+             audits/old-sweep-liveness.md.",
             header.class_id.as_u32(),
             ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
             header.num_slots(),
@@ -16434,7 +16434,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // TLAB audit (docs/gc/tlab-and-card-audit.md) — reserved-tail skip
+    // TLAB audit (audits/tlab-and-card-audit.md) — reserved-tail skip
     // regions must reach the walkers ascending, disjoint and non-empty.
     // -----------------------------------------------------------------
 
@@ -17881,7 +17881,7 @@ mod tests {
     /// and needs a different answer; see
     /// `an_interior_conservative_root_forbids_old_gen_compaction`. That is the
     /// reproduction in
-    /// docs/gc/old-sweep-liveness.md section 7, whose H2 `MVStore` reproduction
+    /// audits/old-sweep-liveness.md section 7, whose H2 `MVStore` reproduction
     /// needs `CRATONVM_NO_MOVING_YOUNG=1` **with the JIT on** precisely
     /// because that is the configuration in which this sweep runs against
     /// conservative roots.
@@ -18485,7 +18485,7 @@ mod tests {
         }
     }
 
-    /// T-3 (docs/gc/tlab-and-card-audit.md §1.3) — a MOVING young collection
+    /// T-3 (audits/tlab-and-card-audit.md §1.3) — a MOVING young collection
     /// must REFUSE to run while a reserved TLAB tail is published inside the
     /// from-space it is about to evacuate, swap and reset.
     ///

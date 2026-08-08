@@ -304,7 +304,7 @@ Existing records, cross-referenced rather than restated:
 the standing "resolve by name first, index as synthetic fallback" remedy),
 `W6-3-slot-index-species-residuals.md` (the `javap` oracle, `java.nio.ByteOrder`
 as a second instance), `W4-1-publiclookup-allowedmodes-never-checked.md` (the
-Lookup case end to end), `docs/jdk-only-object-layout-audit.md` (the site census).
+Lookup case end to end), `audits/jdk-only-object-layout-audit.md` (the site census).
 
 ## 6. Declaring a `CRATONVM_*` flag — four files, and it is bidirectional
 
@@ -408,7 +408,7 @@ tree; this section exists so they can be found from one place.
   nothing."* Line-bands rot the same way and have already done so in this
   campaign — `census-asks-one-class-on-one-platform.md` records its own line
   numbers as stale against `dev`, and
-  `docs/feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md`'s
+  `feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md`'s
   `run.sh` citations are stale as written (§9). Source-witness tests that scan a
   fixed window (`vm/tests/t11_safety_conformance.rs`'s five-line `// SAFETY:`
   window, `vm-cli/tests/no_diag_eprintln.rs`'s four-line window) are the same

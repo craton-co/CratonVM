@@ -5,7 +5,7 @@
 //!
 //! # The problem this solves
 //!
-//! `docs/flag-census.md` counted **692** distinct `CRATONVM_*`
+//! `audits/flag-census.md` counted **692** distinct `CRATONVM_*`
 //! identifiers: 559 with a Rust read site, 133 referenced only by prose. They
 //! accumulated at roughly one per fixed bug with no retirement path, they
 //! duplicate each other (`CRATONVM_REAL_AQS` / `CRATONVM_SYNTHETIC_AQS` are one
@@ -1865,7 +1865,7 @@ mod tests {
     fn the_documented_no_ops_now_work() {
         // Each of these was documented for months and read by nothing: the
         // default was flipped and only the opt-out half was renamed.
-        // docs/flag-census.md section 3 has the full list.
+        // audits/flag-census.md section 3 has the full list.
         let cases: &[(&str, &str, &str)] = &[
             (
                 "CRATONVM_JIT",

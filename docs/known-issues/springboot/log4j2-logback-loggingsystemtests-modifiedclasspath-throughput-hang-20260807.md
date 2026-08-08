@@ -47,8 +47,8 @@ silence until the 300s timeout kills the process (~02:20:16).
 ## What this is not
 
 - **Not the 2026-07-17/19 `ModifiedClassPathExtension` recursion livelock**
-  ([`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/modifiedclasspath-aether-network-hang-cluster-FIXED.md),
-  [`junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md)).
+  (`modifiedclasspath-aether-network-hang-cluster-FIXED.md`,
+  `junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`).
   That bug's signature was a **tight, steady (~1-2s cadence) repeat of the
   same `cratonvm::gc::guard: gen_heap::get_field: out-of-bounds field read
   dropped` warning against `InterceptingExecutableInvoker`/`InvocationInterceptorChain`

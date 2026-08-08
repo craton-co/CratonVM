@@ -114,7 +114,7 @@ fn maybe_dump_shutdown_reports() {
         // counters themselves are always collected (they do not consult
         // `metrics::enabled()`), so this prints real numbers from a default
         // run — which is the measurement that retired three of the four gates
-        // (`docs/feature-designs/c2/loop-02-planner-admission-gates.md`) and is
+        // (`feature-designs/c2/loop-02-planner-admission-gates.md`) and is
         // what would say immediately if one of them got back in the way.
         //
         // The four condition rows OVERLAP: a method with an `invokedynamic`
@@ -4355,7 +4355,7 @@ fn run() -> Result<()> {
             // Cross-thread STW peer-scan coverage. A non-zero count means the
             // collector swept while a peer it could not classify was still
             // running JIT code, i.e. that cycle marked from an INCOMPLETE root
-            // set. See docs/gc/old-sweep-liveness.md.
+            // set. See audits/old-sweep-liveness.md.
             use std::sync::atomic::Ordering as O;
             let peers = cratonvm_vm::jit::xt_root_scan::XT_PEERS_UNCLASSIFIED.load(O::Relaxed);
             let cycles =

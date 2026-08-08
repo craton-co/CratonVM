@@ -4225,7 +4225,7 @@ fn osr_exit_maps_are_emitted_at_loop_headers_only() {
 // -----------------------------------------------------------------------
 // G1-2 — the inline reference-store fast paths must not elide the
 // collector's post-write barrier on a backend that publishes no region
-// bounds. `docs/gc/g1-audit.md` §8.1: under G1 a young region held out of
+// bounds. `audits/g1-audit.md` §8.1: under G1 a young region held out of
 // the collection set by a JNI pin is reachable ONLY through its remembered
 // set, so an inline store that skips `post_write_barrier_rset` loses the
 // edge and the next pause frees a live referent.

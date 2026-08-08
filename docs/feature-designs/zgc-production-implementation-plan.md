@@ -131,7 +131,7 @@ file can run at the same time by different agents.
 |---|---|---|---|---|
 | **0a** | CI must build the *binary*, not just the libs, under `--features zgc` | `.github/workflows/ci.yml` | — | **DONE** |
 | **0b** | Pause/phase/GC-count instrumentation for `ZgcRealHeap` | `gc/src/zgc/metrics.rs` (new) | — | in progress |
-| **0c** | De-stale the ZGC docs | `docs/GC.md`, `docs/gc-tuning.md`, `docs/gc/gc-crate-audit.md` | — | **DONE** |
+| **0c** | De-stale the ZGC docs | `docs/GC.md`, `docs/gc-tuning.md`, `audits/gc-crate-audit.md` | — | **DONE** |
 
 **0a is already landed and is the precedent that motivates the rest.**
 `ZgcRealHeap::with_capacity()` was left out of the change that gave the

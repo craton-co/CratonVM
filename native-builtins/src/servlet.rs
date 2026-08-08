@@ -7511,7 +7511,7 @@ mod tests {
                 "ByteBuffer.toString must render the RECEIVER's class: expected a \
                  `{expected_prefix}…` prefix, got `{rendered}`. A hard-coded concrete \
                  class name here is a claim the shim cannot know — see \
-                 docs/feature-designs/native-builtins-shim-audit.md."
+                 feature-designs/native-builtins-shim-audit.md."
             );
         }
     }

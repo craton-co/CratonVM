@@ -25,7 +25,7 @@
 //! INTERPRETER bcis, and an OSR entry lands on the steady-state copy — the
 //! fallback under versioning — rather than a peeled prefix or a guard.
 //!
-//! `docs/feature-designs/c2/loop-01-peeling-and-versioning.md` is the lane, and
+//! `feature-designs/c2/loop-01-peeling-and-versioning.md` is the lane, and
 //! `docs/jit/loop-rewriter-wiring.md` the wiring's status of record.
 
 use super::*;

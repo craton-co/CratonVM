@@ -30,7 +30,7 @@
 //! Every one of those carries a scar from a real defect. Re-deriving them here
 //! would mean re-deriving the defects, and the two copies would then have to be
 //! fixed twice — which is exactly the failure the in-tree
-//! `docs/gc/tlab-and-card-audit.md` was written about. So this file adds only
+//! `audits/tlab-and-card-audit.md` was written about. So this file adds only
 //! what is genuinely ZGC-specific and cannot live in the shared type:
 //!
 //! 1. **The refill source.** A generational TLAB is carved from the young

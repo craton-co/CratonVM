@@ -165,7 +165,7 @@
 > `AnnotationScanCostProbe`) found three removable costs worth 4.04x on this
 > doc's own metric and 4.56x on the deploy the metric stands in for. Full
 > write-up, evidence and commits:
-> `../../internal/fixed-suite-bugs/tomcat/testmanagerwebapp-post-seek0fix-read-timeout-FIXED.md`.
+> `fixed-suite-bugs/tomcat/testmanagerwebapp-post-seek0fix-read-timeout-FIXED.md`.
 >
 > * **`jmx_locked_monitors` leaked, and the leak was quadratic — 14.9% of the
 >   run.** Two of the four `complete_jmx_monitor_enter` publishers never
@@ -410,7 +410,7 @@ It is the **per-byte I/O call chain**: ~376 ns for one
 more for the `DataInputStream.readUnsignedByte()` wrapper, against HotSpot's
 ~0.5 ns. That is exactly the frame the stack dump named all along, and it puts
 this doc in
-`../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
+`fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`'s
 territory plus the VM-wide per-call floor — not in admission-gate territory.
 
 The same probe used to **SIGSEGV on CratonVM** in its `arrayRead` stage on the
@@ -903,7 +903,7 @@ they read as clean negatives:
 ## Prior art
 
 This is the same wall
-`../../internal/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
+`tomcat/04-embedded-server-throughput-wall-CLOSED.md`
 measured on 2026-07-27 (it recorded 13–16 µs per byte for the identical
 `DataInputStream`/`BufferedInputStream` operation; today's
 `ByteReadCostProbe` reads 15.0 µs) and handed to

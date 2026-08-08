@@ -100,7 +100,7 @@ Stuck during **database-close-time compaction**, not live query work —
 MVStore file, and `Database.close()` triggers a full `compactStore()` /
 `FileStore.compact()` pass over it. This is the same MVStore machinery
 touched by the (separately fixed) old-generation coalescing issue in
-[`bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md),
+`bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`,
 but reached through H2's own compact-on-close call path rather than GC. Not
 yet established whether this is (a) H2's compaction algorithm being
 inherently expensive against a highly fragmented fuzzed store (would also be

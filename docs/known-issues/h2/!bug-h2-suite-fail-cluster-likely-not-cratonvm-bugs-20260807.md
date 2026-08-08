@@ -21,7 +21,7 @@ is **not** a `URLClassLoader` — that inheritance relationship was removed as
 part of the module system. This test predates that change and casts it
 directly. Should fail identically on real HotSpot JDK 25 with the same
 classpath. **Likely a JDK-version test/library mismatch, same family as**
-[`bug-h2-testannotationprocessorsoutput-jdk25-implicit-proc-disabled-NOT-A-BUG.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testannotationprocessorsoutput-jdk25-implicit-proc-disabled-NOT-A-BUG.md).
+`bug-h2-testannotationprocessorsoutput-jdk25-implicit-proc-disabled-NOT-A-BUG.md`.
 
 ## 2. `TestExit` — `System.exit(1) called — process terminating`
 

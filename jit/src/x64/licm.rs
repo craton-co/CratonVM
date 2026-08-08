@@ -304,7 +304,7 @@ pub fn narrow_oops_block_inline_fields() -> bool {
 /// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
 /// `CRATONVM_JIT_INLINE_PUTFIELD` opt-in is accepted as a compatibility no-op.
 ///
-/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`docs/gc/g1-audit.md`
+/// INT-6 (GC audit 2026-07-10), **as corrected by G1-2** (`audits/g1-audit.md`
 /// §8.1, 2026-07-31). The previous wording claimed the guarded-getfield
 /// receiver check was prepended by "both inline arms"; three emitters did not
 /// have it, and the `region_bounds_addr != 0` test it named is not a backend
@@ -317,7 +317,7 @@ pub fn narrow_oops_block_inline_fields() -> bool {
 /// scanned wholesale — but a region held OUT of the CSet by a JNI pin is
 /// reachable only through its remembered set, so an inline store that skips
 /// `post_write_barrier_rset` loses that edge and the next pause frees a live
-/// referent (`docs/gc/g1-audit.md` §2, §5).
+/// referent (`audits/g1-audit.md` §2, §5).
 ///
 /// **What actually gates the backend.** NOT `helpers.region_bounds_addr != 0`:
 /// that field is the ADDRESS of the process-global `JIT_REGION_BOUNDS` static
@@ -359,7 +359,7 @@ pub fn inline_putfield_enabled() -> bool {
 
 /// Does the GC backend have LIVE heap-region bounds published right now?
 ///
-/// G1-2 (`docs/gc/g1-audit.md` §8.1). This is the predicate the inline
+/// G1-2 (`audits/g1-audit.md` §8.1). This is the predicate the inline
 /// reference-store emitters need and `helpers.region_bounds_addr != 0` is not.
 /// That field holds the address of the process-global `JIT_REGION_BOUNDS`
 /// static (`gc/src/gen_heap.rs`), which `vm/src/jit/helpers.rs` assigns from
@@ -1224,7 +1224,7 @@ pub static STATIC_BASE_RESOLVER_CTX: std::sync::atomic::AtomicUsize =
 /// VM B's statics would bake the address of an unrelated class's slot into VM
 /// A's code — the same cross-VM aliasing that made the process-global
 /// `system_class_id` atomic and the unqualified `class_init_memo` wrong (see
-/// `docs/vm-jit-cache-keying.md`). There is no correct answer to give once two
+/// `audits/vm-jit-cache-keying.md`). There is no correct answer to give once two
 /// VMs share the process, so the mechanism turns itself off for BOTH and every
 /// static read goes back to the helper: slower, never wrong.
 static STATIC_BASE_RESOLVER_POISONED: std::sync::atomic::AtomicBool =

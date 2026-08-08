@@ -3438,7 +3438,7 @@ pub(super) fn execute_instruction(
                         // reclaimed object usually surfaces as a failed CAST
                         // first, and that path reported nothing — so setting
                         // the flag and reproducing still produced silence. See
-                        // docs/gc/old-sweep-liveness.md section 7.
+                        // audits/old-sweep-liveness.md section 7.
                         // H2-CID0 follow-up (2026-08-01): the `ClassId(0)` gate
                         // below is too narrow. A block freed while still
                         // referenced only reads back as `java.lang.Object`

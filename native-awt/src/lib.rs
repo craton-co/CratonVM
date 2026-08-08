@@ -108,7 +108,7 @@ use cratonvm_native_api::{NativeKind, NativeMethodRegistry};
 // `sun/awt/PlatformGraphicsInfo.hasDisplays0` — the crate's ONE
 // `JDK-ONLY-CLASSIFY: bridge` verdict — **is not in it**. See
 // `register_headless_natives` in `natives.rs`.
-// See docs/jdk-only-ambient-category-audit.md and
+// See audits/jdk-only-ambient-category-audit.md and
 // docs/known-issues/jdk-only/l5-native-io-bridge-residuals.md.
 /// Register all AWT/Swing/Java2D native methods with the VM.
 pub fn register_awt_natives(registry: &mut NativeMethodRegistry) {

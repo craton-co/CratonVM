@@ -15,13 +15,13 @@ byte-identical found/started/ok/failed/aborted counts:
   which is false-by-construction under each class's eager
   (non-lazy-loading) `@CustomEnhancementContext`. See the RE-VERIFICATION
   2026-07-31 section of
-  `../../internal/fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`.
+  `fixed-suite-bugs/hibernate/hib-bytecode-enhancement-loader-faithful-linking-FIXED.md`.
 - `org.hibernate.orm.test.manytomanyassociationclass.surrogateid.generated.ManyToManyAssociationClassGeneratedIdTest`
   — `found=6 ok=3 aborted=3` on both VMs. The 3 overridden test methods each
   call `assumeFalse(queueType == QueueType.GRAPH, ...)`, which self-skips
   under Hibernate's (now-restored) upstream GRAPH default. See §8 of
-  `../../internal/fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`
-  and `../../internal/fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md`.
+  `fixed-suite-bugs/hibernate/hib-bytebuddy-20260730-FIXED.md`
+  and `fixed-suite-bugs/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727-FIXED.md`.
 
 No doc was moved or newly filed for any of these three — do not re-open them
 as regressions on a future ABORTED sighting without first checking whether
@@ -61,7 +61,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   (tracked `apps/hib-suite-runner/class-overrides.tsv` + `run-hib.sh`,
   force-added past the blanket `apps/` ignore, LF-pinned, self-reporting
   `overrides=N (loaded)`) — retired to
-  `../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
+  `fixed-suite-bugs/hibernate/qualfiedtablenaming-runner-timeout-floor-lost-20260731-FIXED.md`.
   **Three real VM defects were found and fixed here**, and the class reached
   `132/132 failed=0` three runs for three against base `32f9db9a2` — but it was
   **not green on the `dev` tip**, and neither was any other collector arm. A
@@ -129,20 +129,20 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   `JavaDispatcher$Dispatcher$ForNonStaticMethod.invoke` tiered up. Fixed with a
   literal-class-name check mirroring the pre-existing `AnnotationProxy` case
   in the same function. Full write-up:
-  `../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`.
+  `fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`.
 
 - **`bulkid.OracleInlineMutationStrategyIdTest` — stale binary, not a
   regression; already faster on current `dev`.** This class is a long-known,
   already-documented timeout-marginal residual (see the `GROUP BY` cluster
   entry below and
-  `../../internal/fixed-suite-bugs/hibernate/h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md`'s
+  `fixed-suite-bugs/hibernate/h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md`'s
   residual section). The categorize run's binary
   (`CratonVM-hib-local-0712-v3` @ `8e8a7b8cd`) predates two fixes merged into
   `dev` hours later the same day/night
   (`f78b72670` relocation-safety gate scoping, `11901e9a6` moving-young
   liveness veto — both folded into `dev` via `edd95bc89`) that took this exact
   class from ~322-442s down to 118.9s on a quiet host — see
-  `../../internal/repros/hib-five-20260730/RESULTS-final-20260731.md`. Solo
+  `repros/hib-five-20260730/RESULTS-final-20260731.md`. Solo
   repro this session on the *same pre-fix binary* the categorize run used
   completed in 212.7s (`found=6 ok=6 failed=0`) — under the 300s cap on its
   own, so the full run's 8-way shard contention is what tipped this
@@ -153,7 +153,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 - **`batch.BatchTest` and `batchfetch.DynamicBatchFetchTest` — same
   "timeout-marginal class + contended host" pattern; moving-young mechanism
   explicitly ruled out.** Both are long-tracked members of
-  `../../internal/fixed-suite-bugs/hibernate/hib-120s-junit-timeout-cluster-20260716.md`'s
+  `fixed-suite-bugs/hibernate/hib-120s-junit-timeout-cluster-20260716.md`'s
   generic interpreter/JDBC-throughput cluster (previously confirmed passing
   clean at 98-126s on a quiet host). Solo repro this session across three
   configurations -- the categorize run's own binary, that same binary with
@@ -179,7 +179,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   JDK 25 — as a 32-bit value, which the interpreter tolerated and JIT-compiled
   code read as garbage, making `Arrays.equals(long[],long[])` return `true` for
   arrays that differ. Write-up and evidence:
-  `../../internal/fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
+  `fixed-suite-bugs/hibernate/batchtest-jit-duplicate-batch-insert-unique-violation-20260804.md`.
   `BatchTest` is now `ok=3 failed=1` under JIT with zero unique-index
   violations; the remaining failure is `testBatchInsertUpdate` (`N=5000`) on
   this cluster's own 120s throughput margin — which that doc measures at 273s
@@ -279,7 +279,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 - ~~`SmokeTests#testQueryConcurrency` — 120 s JUnit timeout, "needs ~5.2x, gated
   on the tiered manager"~~ — **RETIRED 2026-08-05** to
-  `../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
+  `fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
   Every load-bearing number in that page was stale by more than an order of
   magnitude and two of its three reproduction instructions could not be
   followed: the three probes it said were "left behind" were never committed,
@@ -303,11 +303,11 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
   Futures, so an `HqlLexer.<clinit>` NPE makes it report `ok=1` in 15 s having
   executed nothing. The ~1-in-13 crash seen while measuring is **not** this
   page: it is the `ClassId(0)` family, now recorded as a fifth reproduction on
-  `../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
+  `fixed-suite-bugs/h2-suite-bugs/bug-h2-classid0-stale-address-family-FIXED.md`.
 
 - ~~`OffsetDateTimeTest` — SIGSEGV during JUnit discovery~~ — **FIXED 2026-08-05**,
   retired to
-  `../../internal/fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md`.
+  `fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md`.
   Not the JIT codegen null-check bug the open page guessed: the null check is
   emitted and it *passes* — the faulting register held `1`, and `1 + 0xC` is the
   `0x0D`/`0x0E` fault address, an `int` delivered where an `Annotation[]` belongs.
@@ -329,7 +329,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
 - ~~`InPredicateTest` — 100k-element criteria `IN` predicate times out under JIT~~
   — **FIXED 2026-08-04**, retired to
-  `../../internal/hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md`.
+  `hib-inpredicate-dispatch-heavy-jit-timeout-RETIRED-20260804.md`.
   Not the dispatch-heavy tier-up tax the two earlier investigations settled on:
   `try_jit_compile_callee_slow` scanned an **inherited** method's bytecode
   against the **subclass's** constant pool, so those indices resolved to

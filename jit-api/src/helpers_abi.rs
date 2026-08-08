@@ -63,7 +63,7 @@
 //! [`JitRuntimeHelpers::validate_abi`], [`JitRuntimeHelpers::validate`] or
 //! [`JitRuntimeHelpers::null_pointers`] — the runtime half of this contract
 //! exists and is tested, but never runs in a real VM. See
-//! `docs/jit/helper-abi-audit.md`.
+//! `docs/jit/helper-abi.md`.
 //!
 //! # ABI contract
 //!
@@ -264,7 +264,7 @@ impl HelperRetAbi for *mut c_void {
 ///
 /// Everything here is *derived from the `HelperFn*` alias*, not transcribed:
 /// there is no second list to keep in step. What the emitter does with it is
-/// still on the emitter — see `docs/jit/helper-abi-audit.md` for the check
+/// still on the emitter — see `docs/jit/helper-abi.md` for the check
 /// that belongs in `jit/` and cannot live in this crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelperFnSig {
