@@ -95,6 +95,82 @@ and it is neither — which is the standing rule in
 [`h2database-suite-runner`](../../../apps/h2database-suite-runner/run-h2-suite.md)
 and is worth restating because it cost a full re-run to establish.
 
+## Settled 2026-08-08: the scaling slope, the profile, and load_class_concurrent
+
+The OOM that blocked all three is fixed (`0ea21c07a` + `95fee50a4`). With it
+gone, the three questions this page left open are answerable, and two of them
+are now answered against measurement rather than inference.
+
+### The thread-scaling slope — this page's "what WOULD settle it"
+
+Work term per update, with an interleaved 0-update baseline of the same shape
+subtracted, swept twice in OPPOSITE order so host-load drift cannot fake a
+slope. 16-core host; at 8 threads it was NOT oversubscribed (background load
+3-5).
+
+| threads | sweep A (load 7-10) | sweep B (load 3-5) |
+|---:|---:|---:|
+| 1 | 3.20 CPU-ms/update | 1.95 |
+| 2 | 2.26 | 2.02 |
+| 4 | 2.56 | 2.29 |
+| **8** | **8.80** | **7.99** |
+
+**Flat to 4 threads, then a ~3.5x cliff at 8**, reproduced at two different
+host loads. Wall throughput does not merely stop scaling, it INVERTS: 1176
+updates/s at 4 threads, 261/s at 8.
+
+The cliff is contention, not scheduling: user CPU dominates (505 s user vs 19 s
+sys at 8 threads) while **voluntary context switches rise ~40x** (68-74k at 4
+threads, 1.9-2.7M at 8). That is spin-then-park on a contended lock. Naming the
+lock is the next question; it is not the same question as this page's constant
+factor.
+
+### Refreshed profile — flat, and MVStore's
+
+`perf` is unavailable on this host (`perf_event_paranoid=4`), so the page's
+original method cannot be repeated. The in-VM sampler is the supported
+substitute and its own flag documentation says to pair it with `--nojit`, since
+JIT frames never reach the dispatch loop. `--nojit --stack-sample-ms 20`,
+4 threads x 3000 updates, 7314 samples, aggregated on the DEEPEST frame per
+sample (`depth=0` is the outermost frame -- aggregating that reports only
+`ThreadPoolExecutor$Worker.run` and says nothing):
+
+| samples | leaf |
+|---:|---|
+| 227 | `org/h2/mvstore/RootReference.<init>` |
+| 193 | `org/h2/mvstore/WriteBuffer.ensureCapacity` |
+| 185 | `org/h2/mvstore/Page.getKeyCount` |
+| 173 | `org/h2/mvstore/Page$Leaf.getValue` |
+| 136 | `org/h2/mvstore/tx/CommitDecisionMaker.decide` |
+| 128 | `org/h2/mvstore/Page$NonLeaf.setChild` |
+| 124 | `org/h2/mvstore/tx/Transaction.markStatementEnd` |
+
+**There is no hotspot.** The top leaf is ~3% of samples and the profile is a
+flat spread across MVStore B-tree and per-commit transaction machinery --
+exactly the shape "one commit per UPDATE" predicts. Nothing here argues for a
+single fix; the constant factor is spread across the whole path.
+
+### load_class_concurrent at 1.4% "in steady state" — not reproduced
+
+Two independent lines, both negative:
+
+* The profile above contains **no class-loading frames at all** in 7314
+  samples.
+* A call counter on `SharedVm::load_class_concurrent_for`, reporting every
+  4096 calls, fired **zero times** across a 71 s / 80 000-update run.
+
+Caveat, stated because it changes what the second line proves: fewer than 4096
+calls while loading the whole of H2 is implausible, so the more likely reading
+is that this entry point is NOT the one the interpreter and JIT resolve
+through -- `ClassManager::load_class` is the candidate. Either way the original
+attribution needs re-deriving before anyone spends effort here; it is not
+established that this function costs 1.4% of anything in steady state.
+
+Worth recording for whoever picks it up: `runtime::diagnostics::classes_loaded`
+is declared, reset, formatted and unit-tested, and is **never incremented by
+the class loader**. A counter that is never incremented reads as a confident
+zero, which is why this item survived unmeasured for so long.
+
 ## Severity
 **MEDIUM.** No incorrect behaviour, but not benign either. The class takes
 20-45 minutes of CPU where HotSpot takes 17 seconds, and H2's internal
