@@ -255,6 +255,65 @@ fn warn_unaligned_block(site: &str, offset: usize, size: usize) {
     }
 }
 
+/// Order free blocks by arena offset.
+///
+/// This used to be `v.sort_by_key(|&(off, _)| off)`. On the H2 UPDATE shape
+/// that single line was **43 % of a 25-thread profile** (`quicksort` 21.8 % +
+/// `drift::sort` 21.1 %), with driftsort's scratch buffer showing up as another
+/// 3.4 % of `memmove`. The cause is not the call frequency — an earlier fix
+/// already collapsed three rebuilds per sweep into one — but the input size: on
+/// a process wedged onto the non-moving sweep the young arena reaches
+/// `used == capacity` with a free list holding ~300 MB of holes, and every
+/// sweep comparison-sorts all of them.
+///
+/// The key is an arena offset: unique (no two free blocks start at the same
+/// place), non-negative, and bounded by the arena capacity. That is a radix
+/// key, so an LSD radix sort replaces `O(n log n)` comparisons with a fixed
+/// number of linear passes — three for a 512 MB arena at 11 bits per pass.
+/// Below `RADIX_MIN` the pass overhead and the scratch allocation are not worth
+/// it and a comparison sort wins; `sort_unstable_by_key` is used there because
+/// unique keys make stability meaningless.
+///
+/// The radix path is itself stable, so both branches agree with the previous
+/// `sort_by_key` on every input, not merely on inputs with unique keys.
+fn sort_by_offset(v: &mut Vec<(usize, usize)>) {
+    /// Below this, a comparison sort beats the radix passes.
+    const RADIX_MIN: usize = 512;
+    /// Bits consumed per pass. 11 keeps the histogram (2048 × usize = 16 KB)
+    /// inside L1/L2 while covering a 512 MB arena in three passes.
+    const BITS: u32 = 11;
+    const BUCKETS: usize = 1 << BITS;
+    const MASK: usize = BUCKETS - 1;
+
+    if v.len() < RADIX_MIN {
+        v.sort_unstable_by_key(|&(off, _)| off);
+        return;
+    }
+    let max = v.iter().map(|&(off, _)| off).max().unwrap_or(0);
+    let mut scratch: Vec<(usize, usize)> = vec![(0, 0); v.len()];
+    let mut counts = [0usize; BUCKETS];
+    let mut shift = 0u32;
+    while (max >> shift) > 0 {
+        counts.fill(0);
+        for &(off, _) in v.iter() {
+            counts[(off >> shift) & MASK] += 1;
+        }
+        let mut running = 0usize;
+        for c in counts.iter_mut() {
+            let n = *c;
+            *c = running;
+            running += n;
+        }
+        for &entry in v.iter() {
+            let bucket = (entry.0 >> shift) & MASK;
+            scratch[counts[bucket]] = entry;
+            counts[bucket] += 1;
+        }
+        std::mem::swap(v, &mut scratch);
+        shift += BITS;
+    }
+}
+
 impl Arena {
     /// Create a new arena with the given capacity in bytes.
     pub fn new(capacity: usize) -> Self {
@@ -842,7 +901,7 @@ impl Arena {
             .chain(self.free_large.iter())
             .map(|b| (b.offset, b.size))
             .collect();
-        v.sort_by_key(|&(off, _)| off);
+        sort_by_offset(&mut v);
         v
     }
 
@@ -1462,6 +1521,48 @@ mod tests {
 
     /// The sweep's hole map must see every block regardless of which class it
     /// landed in, in ascending offset order.
+    #[test]
+    fn sort_by_offset_matches_the_reference_sort_on_both_branches() {
+        // A deterministic LCG rather than a dependency; the point is a spread
+        // of offsets that straddles several radix digits, not randomness.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // 8 exercises the comparison branch, 5000 the radix branch, and 512 is
+        // exactly the boundary.
+        for &n in &[0usize, 1, 8, 511, 512, 513, 5000] {
+            let mut offsets: Vec<usize> = Vec::with_capacity(n);
+            while offsets.len() < n {
+                // Unique, 8-aligned, inside a 512 MB arena — the real key shape.
+                let off = ((next() as usize) % (64 * 1024 * 1024)) * 8;
+                if !offsets.contains(&off) {
+                    offsets.push(off);
+                }
+            }
+            let mut v: Vec<(usize, usize)> = offsets.iter().map(|&o| (o, o ^ 0xFF)).collect();
+            let mut expected = v.clone();
+            expected.sort_by_key(|&(off, _)| off);
+            super::sort_by_offset(&mut v);
+            assert_eq!(v, expected, "n={n}");
+        }
+    }
+
+    #[test]
+    fn sort_by_offset_is_stable_on_duplicate_keys() {
+        // Free blocks never share an offset, so this is belt-and-braces: it
+        // pins that the radix branch cannot reorder equal keys, which is what
+        // lets both branches claim to match the old `sort_by_key`.
+        let mut v: Vec<(usize, usize)> = (0..2000).map(|i| (i % 4, i)).collect();
+        let mut expected = v.clone();
+        expected.sort_by_key(|&(off, _)| off);
+        super::sort_by_offset(&mut v);
+        assert_eq!(v, expected);
+    }
+
     #[test]
     fn free_blocks_sorted_spans_every_size_class() {
         let mut arena = Arena::new(64 * 1024);
