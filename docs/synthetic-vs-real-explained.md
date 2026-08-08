@@ -6,9 +6,37 @@ or a synthetic compatibility implementation.
 
 - **Bridge:** behavior that cannot be expressed by ordinary Java bytecode in
   this VM, such as an OS syscall or VM metadata operation.
-- **Intrinsic:** a reviewed fast path whose result must match the Java method.
+- **Intrinsic:** the real method has concrete bytecode and the Rust replacement
+  is *observationally equivalent and measurably faster*. Equivalence is proven,
+  not asserted. This is the right tag for a Rust implementation that is correct
+  and fast — being written in Rust is not what makes something debt.
 - **Synthetic stub:** fabricated or approximate behavior that can shadow real
   JDK bytecode. This category is compatibility debt.
+
+The line between the last two is **evidence, not language and not speed**. A
+fully operational, faster Rust implementation belongs in `Intrinsic`; what it
+needs is a demonstration that it matches, not a rewrite. The promotion gate is
+[jdk-only-native-review.md](jdk-only-native-review.md), and the tag pays for
+itself: `Intrinsic` is the only kind exempt from the `--jdk-only` yield to real
+bytecode, approved for JIT direct-bind, and immune to the two registration-time
+drop arms.
+
+Read a `SyntheticStub` count as an upper bound, not a defect count. The category
+is ambient: `NativeMethodRegistry` has no default kind, so a `register()` call
+outside a `set_category` / `with_category` scope is tagged `SyntheticStub` by
+omission rather than by judgement (`native-api/src/registry.rs` says so at the
+`effective_category` definition). A global drop of every `SyntheticStub` native
+was once reverted the same day, because JMX and `Function$Identity` are
+permanent bridges that were wearing the wrong tag.
+
+Note also that a native is not free and not automatically faster. The call
+funnel costs on the order of 25 ns, and a native is opaque to JIT tier-up — the
+method it shadows never gets hot. A Rust path usually beats the *interpreter*
+and frequently loses to *JIT-compiled* bytecode, so "measurably faster" has to
+be measured against the tier the method actually reaches. `native-collections`
+is the in-tree cautionary case: its receiver-classification fast path was paying
+five to six `class_manager` lock acquisitions and `String` allocations per
+`HashMap.put` until a memo was added.
 
 The shipping defaults use real JDK paths for annotations, AQS/locks,
 ForkJoinPool, sockets, FileWriter, and RandomAccessFile. Legacy synthetic paths
@@ -44,7 +72,10 @@ hybrid, and the ratchet census measures exactly how much:
 
 The strict configuration is therefore already reachable and already stub-free by
 construction; what remains is behavioural completeness of the real paths that
-replace those 685. Two further numbers from the same gates size the rest of the
+replace those 685. Per the ambient-tag caveat above, 685 is how many
+registrations carry the tag, not how many are known to be fabricated — some
+number of them are bridges and intrinsics that no `set_category` line ever
+covered, and promotion review is how that number gets separated. Two further numbers from the same gates size the rest of the
 work: **1,148** registrations are shadowed (a later `register()` wins over an
 earlier one for the same class+method+descriptor), and **51** of those pairs
 disagree about their `NativeKind`.
