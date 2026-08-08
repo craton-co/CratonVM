@@ -3089,7 +3089,22 @@ fn run() -> Result<()> {
     // (matches HotSpot, where the more specific flag wins).
     let xverify_mode = if let Some(spec) = args.xverify.as_deref() {
         match cratonvm_vm::config::XverifyMode::parse(spec) {
-            Some(m) => Some(m),
+            Some(m) => {
+                // `All` parses and is stored, but nothing reads it — the
+                // verifier dispatcher branches on `skip_verification`, and
+                // boot-class skipping is decided by a predicate that takes no
+                // configuration. Accepting it silently tells a user asking for
+                // maximum verification that they got it. Say so instead; the
+                // analogous unimplemented control, `-agentlib:`, already fails
+                // loudly rather than quietly.
+                if m == cratonvm_vm::config::XverifyMode::All {
+                    eprintln!(
+                        "Warning: -Xverify:all is not implemented; boot classes are \
+                         not typestate-verified. Running as -Xverify:remote."
+                    );
+                }
+                Some(m)
+            }
             None => {
                 eprintln!(
                     "Warning: ignoring unknown -Xverify mode {spec:?}; expected none|remote|all"
@@ -3418,9 +3433,31 @@ fn run() -> Result<()> {
         .show_code_details_in_exception_messages
         .unwrap_or(config.show_code_details_in_exception_messages);
 
-    // JDWP debug server
+    // JDWP debug server.
+    //
+    // `jdwp_port` is only ever read behind `#[cfg(feature = "experimental-debug")]`
+    // in `vm_init`, and that feature is not in `cratonvm-vm`'s default set nor
+    // enabled by `cratonvm-cli` — so in every shipped launcher binary this is
+    // accepted and does nothing. `jdwp_suspend` is not read anywhere at all, in
+    // any configuration. Both used to be silent; a debugger that never attaches
+    // is not a subtle failure to be left unexplained.
     if let Some(port) = args.jdwp_port {
+        if !cratonvm_vm::config::JDWP_SERVER_COMPILED_IN {
+            eprintln!(
+                "Warning: --jdwp-port {port} has no effect in this build; the JDWP \
+                 server is behind the 'experimental-debug' feature, which this \
+                 binary was not built with."
+            );
+        }
+        if args.jdwp_suspend {
+            eprintln!(
+                "Warning: --jdwp-suspend is not implemented; the VM will not wait \
+                 for a debugger to attach."
+            );
+        }
         config = config.with_jdwp(port, args.jdwp_suspend);
+    } else if args.jdwp_suspend {
+        eprintln!("Warning: --jdwp-suspend has no effect without --jdwp-port.");
     }
 
     // JPMS module system flags

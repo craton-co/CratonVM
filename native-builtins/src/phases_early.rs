@@ -14703,7 +14703,11 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 /// Apply PKCS7 padding to data
-fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
+///
+/// `pub(crate)` so `jca::cipher`'s AES/ECB path uses THIS pad/unpad pair rather
+/// than its own copy. The copy had drifted: it padded unconditionally (ignoring
+/// `NoPadding`) and unpadded without verifying the padding bytes.
+pub(crate) fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
     let pad_len = 16 - (data.len() % 16);
     let mut padded = data.to_vec();
     padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
@@ -14711,7 +14715,10 @@ fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
 }
 
 /// Remove PKCS7 padding
-fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+///
+/// `pub(crate)`: see [`pkcs7_pad`]. This is the ONE PKCS7 verifier in the
+/// crate; `jca::cipher` calls it instead of re-deriving the rule.
+pub(crate) fn pkcs7_unpad(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     if data.is_empty() || data.len() % 16 != 0 {
         return Err("invalid padded data length");
     }

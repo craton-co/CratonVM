@@ -244,9 +244,20 @@ thread_local! {
     /// alive. (Relocation of the source is harmless — native code holds the copy,
     /// not a heap pointer — so this is keep-alive only, not no-relocation.) The
     /// matching `Release` only receives the buffer pointer, not the array object,
-    /// so we record `buffer_ptr -> object_base` here and look it up to UNPIN.
+    /// so we record `buffer_ptr -> PinToken` here and look it up to UNPIN.
     /// Refcounted in `pinned`, so overlapping checkouts of the same array are safe.
-    static JNI_CRITICAL_PINS: std::cell::RefCell<HashMap<usize, usize>> =
+    ///
+    /// The value is a `PinToken`, not the object base, and that is the whole
+    /// point. This map is thread-local: no collector enumerates it, and nothing
+    /// re-keys it. Storing the base captured at Get time meant that any moving
+    /// collection between Get and Release left the recorded address stale — the
+    /// pin table had already been re-keyed to the new address, so `unpin(stale)`
+    /// found nothing and was swallowed by the tolerated-unbalanced-release path,
+    /// while the live entry stayed pinned for the rest of the process. The array
+    /// and its entire transitive closure leaked, and `PINNED_COUNT` never
+    /// returned to zero, so the `any_pinned()` fast gate stayed hot forever.
+    /// A token is re-keyed by `pinned::update_after_gc` along with the table.
+    static JNI_CRITICAL_PINS: std::cell::RefCell<HashMap<usize, cratonvm_gc::pinned::PinToken>> =
         std::cell::RefCell::new(HashMap::new());
     /// Thread-local cache for parsed method descriptors.
     /// Maps descriptor string → parsed parameter type tags, avoiding
@@ -1892,31 +1903,35 @@ pub fn update_local_refs_after_gc(pointer_map: &cratonvm_types::PointerMap) {
 /// relied upon for no-relocation — see the `cratonvm_gc::pinned` module doc.
 ///
 /// `data_ptr` is the copy-buffer pointer returned to the native caller (the key
-/// the matching `Release` passes back), while the pin is keyed on the OBJECT
-/// BASE (`oref.as_ptr()`), the address a collector tests against the pin set.
+/// the matching `Release` passes back). The pin itself is taken on the OBJECT
+/// BASE (`oref.as_ptr()`), the address a collector tests against the pin set —
+/// but what is recorded here is the returned `PinToken`, which survives the
+/// object being relocated between Get and Release. See `JNI_CRITICAL_PINS`.
 fn pin_critical_array(oref: ObjectRef, data_ptr: usize) {
     let base = oref.as_ptr() as usize;
     if base == 0 || data_ptr == 0 {
         return;
     }
-    cratonvm_gc::pinned::pin(base);
-    JNI_CRITICAL_PINS.with(|c| {
-        c.borrow_mut().insert(data_ptr, base);
-    });
+    if let Some(token) = cratonvm_gc::pinned::pin_tokened(base) {
+        JNI_CRITICAL_PINS.with(|c| {
+            c.borrow_mut().insert(data_ptr, token);
+        });
+    }
 }
 
-/// Undo a [`pin_critical_array`] for the buffer at `data_ptr`. Looks up the
-/// pinned object base recorded at Get time and unpins it (refcounted, so an
-/// overlapping Get on the same array keeps it pinned until its own Release).
-/// A `data_ptr` we never handed out (foreign pointer / double-release) is
-/// absent from the map and ignored.
+/// Undo a [`pin_critical_array`] for the buffer at `data_ptr`. Releases the
+/// `PinToken` recorded at Get time, which resolves to the object's CURRENT base
+/// even if a collection relocated it in between (refcounted, so an overlapping
+/// Get on the same array keeps it pinned until its own Release). A `data_ptr`
+/// we never handed out (foreign pointer / double-release) is absent from the
+/// map and ignored.
 fn unpin_critical_array(data_ptr: usize) {
     if data_ptr == 0 {
         return;
     }
-    let base = JNI_CRITICAL_PINS.with(|c| c.borrow_mut().remove(&data_ptr));
-    if let Some(base) = base {
-        cratonvm_gc::pinned::unpin(base);
+    let token = JNI_CRITICAL_PINS.with(|c| c.borrow_mut().remove(&data_ptr));
+    if let Some(token) = token {
+        cratonvm_gc::pinned::unpin_token(token);
     }
 }
 
@@ -4448,7 +4463,28 @@ extern "C" fn jni_get_string_utf_region(
         let start = start as usize;
         let len = len as usize;
         let region = String::from_utf16_lossy(&utf16[start..start + len]);
-        let bytes = region.as_bytes();
+        // JNI writes *modified* UTF-8 here, exactly as `GetStringUTFChars`
+        // does — same encoder, so the two entry points and
+        // `GetStringUTFLength` (which measures with `modified_utf8_len`) all
+        // agree. This used to take the region's *standard* UTF-8 bytes
+        // directly, which disagreed with both siblings in two ways:
+        //
+        //   * U+0000 was written as a raw `0x00` instead of `0xC0 0x80`, so
+        //     every C consumer saw the region truncated at the first interior
+        //     NUL — `"a\0b"` read back as `"a"`.
+        //   * A supplementary character was written as its 4-byte standard
+        //     UTF-8 form instead of the 6-byte surrogate pair (CESU-8) the
+        //     spec mandates. The canonical caller sizes its buffer with
+        //     `GetStringUTFLength` (which correctly says 6) and then reads
+        //     that many bytes, so bytes 4..6 were whatever `malloc` left
+        //     there — an uninitialized read, and a string a modified-UTF-8
+        //     decoder cannot parse.
+        //
+        // Residual (unchanged, and shared with `GetStringUTFChars`): a region
+        // that splits a surrogate pair yields U+FFFD for the orphaned half,
+        // because the round-trip goes through a Rust `str`. Same byte count,
+        // so no buffer hazard.
+        let bytes = to_modified_utf8(&region);
         unsafe {
             // Per the JNI spec, GetStringUTFRegion does NOT null-terminate the
             // destination buffer (unlike GetStringUTFChars). Writing a trailing
@@ -9947,6 +9983,76 @@ mod tests {
                 "length mismatch for {s:?}"
             );
         }
+    }
+
+    /// `GetStringUTFRegion` must write **modified** UTF-8, the same encoding
+    /// `GetStringUTFChars` writes and `GetStringUTFLength` measures.
+    ///
+    /// It used to write `region.as_bytes()` — standard UTF-8 — while both
+    /// siblings went through `to_modified_utf8` / `modified_utf8_len`. The
+    /// assertions below are the two ways that disagreement is observable to a
+    /// native caller; the source witness after them pins the call site, since
+    /// driving the real entry point needs a live `SharedVm` and a heap string.
+    #[test]
+    fn get_string_utf_region_writes_modified_utf8_not_standard() {
+        // Hazard 1 — interior NUL. Standard UTF-8 emits a bare 0x00, which
+        // terminates the buffer for every C consumer: "a\0b" reads back "a".
+        let nul = "a\u{0}b";
+        assert_eq!(nul.as_bytes(), &[0x61, 0x00, 0x62]);
+        assert_eq!(to_modified_utf8(nul), vec![0x61, 0xC0, 0x80, 0x62]);
+        assert!(
+            !to_modified_utf8(nul).contains(&0),
+            "modified UTF-8 must contain no interior NUL"
+        );
+
+        // Hazard 2 — a supplementary character. `GetStringUTFLength` reports 6
+        // (the CESU-8 surrogate pair), so the canonical caller mallocs 6 and
+        // reads 6. Standard UTF-8 writes only 4, leaving two bytes of the
+        // caller's buffer uninitialized.
+        let emoji = "\u{1f600}";
+        assert_eq!(emoji.as_bytes().len(), 4, "standard UTF-8 is 4 bytes");
+        assert_eq!(
+            modified_utf8_len(emoji),
+            6,
+            "GetStringUTFLength promises 6 bytes for this region"
+        );
+        assert_eq!(to_modified_utf8(emoji).len(), 6);
+
+        // For every string, what the region path now writes must be exactly
+        // what GetStringUTFLength told the caller to expect.
+        for s in ["", "ascii", nul, "\u{00e9}", "\u{20ac}", emoji, "mix\u{0}é€😀"] {
+            assert_eq!(
+                to_modified_utf8(s).len(),
+                modified_utf8_len(s),
+                "region byte count must match the advertised UTF length for {s:?}"
+            );
+        }
+
+        // Source witness: the entry point must use the shared encoder.
+        let src = std::fs::read_to_string(format!(
+            "{}/src/native/jni.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read jni.rs");
+        let start = src
+            .find("extern \"C\" fn jni_get_string_utf_region(")
+            .expect("jni_get_string_utf_region must still exist");
+        let end = start
+            + src[start..]
+                .find("\n}\n")
+                .expect("function body must terminate");
+        let body = &src[start..end];
+        assert!(
+            body.contains("to_modified_utf8(&region)"),
+            "GetStringUTFRegion must encode through `to_modified_utf8`, the same \
+             encoder GetStringUTFChars uses and GetStringUTFLength measures"
+        );
+        assert!(
+            !body.contains("region.as_bytes()"),
+            "GetStringUTFRegion must not fall back to standard UTF-8 \
+             (`region.as_bytes()`): it truncates at an interior NUL and \
+             under-writes a caller buffer sized by GetStringUTFLength"
+        );
     }
 
     // ---- JNI argument register classification (ABI marshalling) ----

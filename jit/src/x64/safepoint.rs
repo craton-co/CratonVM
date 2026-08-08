@@ -17,6 +17,21 @@
 
 use super::*;
 
+/// The three bytes before the imm32 of `CMP r64, imm32` — `REX.W [+ REX.B]`,
+/// opcode `0x81`, ModRM `mod=11 /7 rm=r`.
+///
+/// A free function with a test rather than three inline literals, because the
+/// inline version carried REX.B unconditionally (`0x49`) on the strength of a
+/// comment asserting the register was always `r8..r15`. It is not: shadow homes
+/// come from `SCRATCH_REGS` **or** `LOCAL_REGS`, and `LOCAL_REGS` holds RBX on
+/// every platform and RSI/RDI on Windows. Forcing REX.B on rewrites the ModRM
+/// `r/m` field to `r + 8`, i.e. compares an entirely different register.
+pub(super) const fn cmp_r64_imm32_opcode(r: u8) -> [u8; 3] {
+    // 0x48 = REX.W; |0x01 adds REX.B, needed only for r8..r15.
+    let rex = 0x48 | if r >= 8 { 0x01 } else { 0x00 };
+    [rex, 0x81, 0xC0 | (7 << 3) | (r & 7)]
+}
+
 impl Compiler {
     // -----------------------------------------------------------------------
     // Frame layout, prologue and epilogue
@@ -902,17 +917,40 @@ impl Compiler {
         // read_addr=R11). Bad-path only: the pointer path emits just cmp+jae.
         if shadow_reload_dbg() && homes.len() == 1 && self.shadow_savebase_slot_off != 0 {
             if let ShadowHome::Reg(r) = homes[0] {
-                // cmp r, 0x10000   (REX.W+B, 0x81 /7 id) — r is r8..r15 here.
-                self.buf.emit(&[0x49, 0x81, 0xC0 | (7 << 3) | (r & 7)]);
+                // cmp r, 0x10000   (REX.W [+ REX.B], 0x81 /7 id).
+                //
+                // REX.B is CONDITIONAL. This used to be a hard-coded `0x49`
+                // (REX.W|REX.B) with the comment "r is r8..r15 here", and that
+                // premise is false: `collect_live_oop_homes` builds
+                // `ShadowHome::Reg` from `SCRATCH_REGS` *or* `LOCAL_REGS`, and
+                // `LOCAL_REGS` contains RBX(3) on every platform plus RSI(6)
+                // and RDI(7) on Windows. With REX.B forced on, `r == RBX`
+                // encoded `cmp r11, 0x10000` — and R11 holds the shadow-buffer
+                // read address, a heap pointer, so the JAE was always taken and
+                // this probe could never fire for the very homes it exists to
+                // inspect. `r == RSI` encoded `cmp r14, ...` instead, firing
+                // spuriously on a healthy reload.
+                self.buf.emit(&cmp_r64_imm32_opcode(r));
                 self.buf.emit(&0x10000i32.to_le_bytes());
                 let skip2 = self.emit_jcc_rel32_patch(0x83); // JAE → skip (pointer)
                 self.buf.emit_byte(0x50); // push rax (preserve call return value)
-                self.emit_mov_reg_reg(RCX, R10); // arg0 = thread
-                self.emit_mov_r64_mem_disp32(RDX, RBP, -self.shadow_savebase_slot_off); // arg1 = orig savebase slot
-                self.emit_mov_reg_reg(R8, r); // arg2 = reloaded value
-                self.emit_mov_reg_reg(R9, R11); // arg3 = actual read address
-                self.emit_sub_rsp_imm(0x28); // shadow space + 16B align (after push rax)
-                                             // Cast through a raw pointer before converting the helper address to an integer.
+                                          // `jit_dbg_shadow_reload_log` is `extern "C"`, so the argument
+                                          // registers are the platform's, not Win64's. These were hard-coded
+                                          // RCX/RDX/R8/R9, which on SysV passed three of the four fields in
+                                          // the wrong registers and printed garbage. Every other cross-ABI
+                                          // call site in this backend goes through `ARG_REGS`.
+                                          //
+                                          // Write order is safe on both ABIs: the sources are R10, [rbp-off],
+                                          // `r` and R11, and each `ARG_REGS[i]` that could alias a later
+                                          // source (`r == R8`/`R9` under Win64) is read before it is written.
+                self.emit_mov_reg_reg(ARG_REGS[0], R10); // arg0 = thread
+                self.emit_mov_r64_mem_disp32(ARG_REGS[1], RBP, -self.shadow_savebase_slot_off); // arg1 = orig savebase slot
+                self.emit_mov_reg_reg(ARG_REGS[2], r); // arg2 = reloaded value
+                self.emit_mov_reg_reg(ARG_REGS[3], R11); // arg3 = actual read address
+                                                         // 0x28 on both ABIs: Win64 needs 32 bytes of shadow space, and the
+                                                         // total 8 (`push rax`) + 40 = 48 keeps RSP 16-aligned either way.
+                self.emit_sub_rsp_imm(0x28);
+                // Cast through a raw pointer before converting the helper address to an integer.
                 self.emit_call_absolute(jit_dbg_shadow_reload_log as *const () as usize);
                 self.buf.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
                 self.buf.emit_byte(0x58); // pop rax
@@ -1128,5 +1166,49 @@ impl Compiler {
             self.buf.emit(&(sink as u64).to_le_bytes());
         }
         self.buf.emit_byte(0x58); // pop rax
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every register a `ShadowHome::Reg` can actually name must encode as
+    /// ITSELF. The `CRATONVM_DBG_SHADOW_RELOAD` probe hard-coded `0x49`
+    /// (REX.W|REX.B) with the comment "r is r8..r15 here"; `LOCAL_REGS`
+    /// contains RBX on every platform (and RSI/RDI on Windows), so for those
+    /// homes the emitted `cmp` targeted `r + 8` instead. With `r == RBX` that
+    /// is R11 — the shadow-buffer read address, always a large pointer — so
+    /// `JAE` was always taken and the probe could never report the
+    /// non-pointer reload it exists to catch.
+    #[test]
+    fn cmp_r64_imm32_sets_rex_b_only_for_the_extended_half() {
+        for &r in SCRATCH_REGS.iter().chain(LOCAL_REGS.iter()) {
+            let [rex, opcode, modrm] = cmp_r64_imm32_opcode(r);
+            assert_eq!(opcode, 0x81, "reg {r}: opcode");
+            assert_eq!(modrm >> 6, 0b11, "reg {r}: mod must be register-direct");
+            assert_eq!((modrm >> 3) & 7, 7, "reg {r}: /7 selects CMP");
+            assert_eq!(modrm & 7, r & 7, "reg {r}: rm must be the low 3 bits");
+            assert_eq!(rex & 0x48, 0x48, "reg {r}: REX.W must be set");
+            // The bug: REX.B is the fourth bit of `rm`, so it must be set iff
+            // the register really is r8..r15.
+            assert_eq!(
+                rex & 0x01,
+                u8::from(r >= 8),
+                "reg {r}: REX.B must track the register's high bit — setting \
+                 it unconditionally re-targets the compare at r{}",
+                r + 8
+            );
+        }
+    }
+
+    /// Spot-check two concrete encodings against the ISA so the property test
+    /// above cannot pass a self-consistent but wrong rule.
+    #[test]
+    fn cmp_r64_imm32_matches_known_encodings() {
+        // 48 81 FB — cmp rbx, imm32
+        assert_eq!(cmp_r64_imm32_opcode(RBX), [0x48, 0x81, 0xFB]);
+        // 49 81 FC — cmp r12, imm32
+        assert_eq!(cmp_r64_imm32_opcode(R12), [0x49, 0x81, 0xFC]);
     }
 }

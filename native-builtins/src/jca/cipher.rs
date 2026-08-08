@@ -1244,7 +1244,9 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         }
     };
 
-    let (_cipher_name, mode_str, _pad) = parse_transformation(&algo);
+    // `pad` was `_pad` — parsed, then thrown away. Every consequence of
+    // ignoring it is below; see the ECB arm.
+    let (_cipher_name, mode_str, pad) = parse_transformation(&algo);
     let encrypt = mode == 1;
 
     let result_bytes: Result<Vec<u8>, String> = match mode_str.as_str() {
@@ -1263,33 +1265,77 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     buf.extend_from_slice(&out.tag);
                     Ok(buf)
                 } else if data.len() < 16 {
-                    Err("AES-GCM ciphertext shorter than 16-byte tag".to_string())
+                    // A truncated AEAD ciphertext is an AUTHENTICATION
+                    // failure, not a VM state error. SunJCE:
+                    // `AEADBadTagException("Input too short - need tag")`.
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/crypto/AEADBadTagException",
+                        "Input too short - need tag",
+                    ));
                 } else {
                     let split = data.len() - 16;
                     let ct = &data[..split];
                     let mut tag = [0u8; 16];
                     tag.copy_from_slice(&data[split..]);
-                    AesGcm::decrypt(&aes_key, &nonce, ct, &aad, &tag)
-                        .map_err(|e| format!("AES-GCM decrypt failed: {:?}", e))
+                    match AesGcm::decrypt(&aes_key, &nonce, ct, &aad, &tag) {
+                        Ok(pt) => Ok(pt),
+                        // A GCM tag mismatch is the one outcome every caller
+                        // writes a `catch` for, and the exception CLASS decides
+                        // whether that catch runs. `AEADBadTagException` is a
+                        // checked `BadPaddingException`; the
+                        // `IllegalStateException` the `Err(String)` tail below
+                        // used to produce is UNCHECKED and sails straight past
+                        // `catch (BadPaddingException | GeneralSecurityException)`,
+                        // turning "reject this token" into an uncaught throw.
+                        // (Same defect species as the W3-7
+                        // `IllegalArgumentException`-for-`NoSuchAlgorithmException`
+                        // fix in `phases_late/ssl_security.rs`.)
+                        Err(_) => {
+                            return Err(crate::phases_early::throw_jca_exc(
+                                ctx,
+                                "javax/crypto/AEADBadTagException",
+                                "Tag mismatch",
+                            ))
+                        }
+                    }
                 }
             }
         }
         "ECB" | "" => {
-            // PKCS#7-padded AES/ECB: encrypt/decrypt each 16-byte block
-            // independently with the expanded AES round keys. Probe surface
-            // is `Cipher.getInstance("AES/ECB/PKCS7Padding", "BC")` —
-            // BouncyCastle's PKCS7 padding is identical to PKCS5 (block
-            // size 16, pad byte = pad count, full pad block on aligned
-            // input).
+            // AES/ECB. `pad` is the transformation's padding, which this arm
+            // used to ignore entirely — it always padded on encrypt and always
+            // tried to strip on decrypt. Three separate wrong answers came out
+            // of that, and none of them raised:
+            //
+            //  * `AES/ECB/NoPadding` encrypt appended a full PKCS7 block, so
+            //    the ciphertext was 16 bytes longer than HotSpot's.
+            //  * `AES/ECB/NoPadding` decrypt then truncated the real plaintext
+            //    whenever its last byte happened to land in 1..=16 — a silent
+            //    ~6%-of-the-time data corruption on a mode used for key
+            //    wrapping.
+            //  * With padding, the strip never VERIFIED the padding bytes and
+            //    did nothing at all when the last byte was out of range, so a
+            //    tampered or wrong-key ciphertext produced a plausible
+            //    plaintext where SunJCE throws `BadPaddingException`.
+            //
+            // `phases_early`'s `pkcs7_pad`/`pkcs7_unpad` are the same rule
+            // implemented once, correctly (its unpad verifies in constant time
+            // — that arm has already had its own Vaudenay-oracle fix). Call
+            // them instead of keeping a second copy that can drift again.
             let block_size = 16usize;
             if encrypt {
-                let pad_len = block_size - (data.len() % block_size);
-                let mut padded = data.clone();
-                // For PKCS7 we ALWAYS pad — a full-block-aligned input
-                // gets a full pad block (pad_len == 16 here), which is
-                // the standard behaviour and required for unambiguous
-                // unpadding on decrypt.
-                padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
+                let padded = if pad {
+                    crate::phases_early::pkcs7_pad(&data)
+                } else if data.len() % block_size != 0 {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/crypto/IllegalBlockSizeException",
+                        "Input length not multiple of 16 bytes",
+                    ));
+                } else {
+                    data.clone()
+                };
                 let mut out = Vec::with_capacity(padded.len());
                 for chunk in padded.chunks(block_size) {
                     let mut block = [0u8; 16];
@@ -1298,11 +1344,20 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     out.extend_from_slice(&ct);
                 }
                 Ok(out)
+            } else if data.is_empty() {
+                // `doFinal` with nothing buffered produces nothing, in both
+                // padding modes — `CipherCore` returns a zero-length array
+                // rather than raising.
+                Ok(Vec::new())
             } else if data.len() % block_size != 0 {
-                Err(format!(
-                    "AES/ECB ciphertext length {} not a multiple of 16",
-                    data.len()
-                ))
+                // Structural, and a `IllegalBlockSizeException` on SunJCE —
+                // a checked `GeneralSecurityException`, not the unchecked ISE
+                // this used to become.
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/crypto/IllegalBlockSizeException",
+                    "Input length must be multiple of 16 when decrypting with padded cipher",
+                ));
             } else {
                 let mut out = Vec::with_capacity(data.len());
                 for chunk in data.chunks(block_size) {
@@ -1311,14 +1366,21 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     let pt = Aes::decrypt_block(&aes_key, &block);
                     out.extend_from_slice(&pt);
                 }
-                // Strip PKCS7 padding from last byte.
-                if let Some(&pad) = out.last() {
-                    if pad as usize >= 1 && (pad as usize) <= block_size {
-                        let new_len = out.len().saturating_sub(pad as usize);
-                        out.truncate(new_len);
+                if pad {
+                    match crate::phases_early::pkcs7_unpad(&out) {
+                        Ok(stripped) => Ok(stripped),
+                        Err(_) => {
+                            return Err(crate::phases_early::throw_jca_exc(
+                                ctx,
+                                "javax/crypto/BadPaddingException",
+                                "Given final block not properly padded. Such issues can arise \
+                                 if a bad key is used during decryption.",
+                            ))
+                        }
                     }
+                } else {
+                    Ok(out)
                 }
-                Ok(out)
             }
         }
         other => Err(format!(
@@ -2396,6 +2458,61 @@ mod tests {
         assert_eq!(cipher, "AES");
         assert_eq!(mode, "CBC");
         assert!(pad);
+    }
+
+    /// `AES/ECB/NoPadding` must parse as "no padding". The ECB arm of
+    /// `cipher_do_final_impl` used to bind this flag to `_pad` and pad anyway,
+    /// which made its ciphertext 16 bytes longer than HotSpot's and made its
+    /// decrypt truncate real plaintext whenever the last byte fell in 1..=16.
+    #[test]
+    fn parse_transformation_aes_ecb_nopadding_reports_no_padding() {
+        let (cipher, mode, pad) = parse_transformation("AES/ECB/NoPadding");
+        assert_eq!(cipher, "AES");
+        assert_eq!(mode, "ECB");
+        assert!(!pad, "NoPadding must not be reported as padded");
+        // A bare `AES` / `AES/ECB` defaults to ECB + PKCS5Padding, as SunJCE does.
+        assert!(parse_transformation("AES").2);
+        assert_eq!(parse_transformation("AES").1, "ECB");
+    }
+
+    /// The PKCS7 verifier the ECB decrypt arm now delegates to must REFUSE
+    /// exactly the shapes the deleted inline strip accepted:
+    ///   * a last byte outside 1..=16 (the old code silently stripped nothing
+    ///     and returned the padding as plaintext);
+    ///   * a plausible pad length whose padding BYTES do not all match (the old
+    ///     code never looked at them, so a tampered / wrong-key block decrypted
+    ///     to a plausible plaintext instead of `BadPaddingException`).
+    #[test]
+    fn ecb_padding_verifier_rejects_what_the_old_inline_strip_accepted() {
+        use crate::phases_early::{pkcs7_pad, pkcs7_unpad};
+
+        // Round-trip still works for every pad length.
+        for n in 0..=32usize {
+            let msg = vec![0xABu8; n];
+            let padded = pkcs7_pad(&msg);
+            assert_eq!(padded.len() % 16, 0);
+            assert_eq!(pkcs7_unpad(&padded).expect("valid padding"), msg);
+        }
+
+        // Last byte 0x00 — old code: `pad >= 1` false, no strip, padding bytes
+        // handed back as plaintext.
+        let mut zero_tail = vec![0u8; 16];
+        zero_tail[15] = 0x00;
+        assert!(pkcs7_unpad(&zero_tail).is_err());
+
+        // Last byte 0x11 (17) — out of range, same silent no-strip.
+        let mut over = vec![0u8; 16];
+        over[15] = 0x11;
+        assert!(pkcs7_unpad(&over).is_err());
+
+        // Plausible length, wrong content: claims 4 bytes of padding but only
+        // the last one is 0x04. Old code truncated 4 bytes and reported success.
+        let mut wrong = vec![0u8; 16];
+        wrong[15] = 0x04;
+        assert!(pkcs7_unpad(&wrong).is_err());
+
+        // A non-block-multiple buffer is structurally invalid.
+        assert!(pkcs7_unpad(&[0u8; 15]).is_err());
     }
 
     #[test]

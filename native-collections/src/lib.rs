@@ -13529,10 +13529,34 @@ fn register_arrays_natives(r: &mut NativeMethodRegistry) {
 fn native_arrays_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let src = match args.first() {
         Some(Value::Object(Some(arr))) => *arr,
-        _ => return Ok(Some(Value::Object(None))),
+        // `Arrays.copyOf` reads `original.length` as its first act, so a null
+        // source is a `NullPointerException` AT THE CALL. Returning `null`
+        // instead moved the NPE to whatever later dereferenced the result, with
+        // a stack trace pointing away from the actual mistake.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some(
+                    "Cannot read the array length because \"original\" is null".to_string(),
+                ),
+            }
+            .into())
+        }
     };
     let new_len = match args.get(1) {
-        Some(Value::Int(l)) => std::cmp::max(*l, 0) as usize,
+        // `std::cmp::max(*l, 0)` — the clamp turned a loud bug into a quiet
+        // one. `Arrays.copyOf(names, size - 1)` with a bookkeeping bug that
+        // makes `size == 0` throws `NegativeArraySizeException: -1` on HotSpot,
+        // at the faulty line; clamped to 0 it hands back an empty array and the
+        // caller proceeds on silently truncated data. The allocation this feeds
+        // (`new_ref_array`) is the same one `anewarray` performs, and the
+        // opcode raises — so this is also the reflective side of a
+        // native-vs-bytecode pair disagreeing about one JVMS rule.
+        Some(Value::Int(l)) if *l < 0 => {
+            return Err(
+                cratonvm_types::error::RuntimeError::NegativeArraySizeException { size: *l }.into(),
+            )
+        }
+        Some(Value::Int(l)) => *l as usize,
         _ => return Ok(Some(Value::Object(None))),
     };
     let old_len = ctx.array_length(src);

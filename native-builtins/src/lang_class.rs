@@ -7133,23 +7133,47 @@ pub(crate) fn native_class_get_declared_field(
     if let Some((decl, abs_idx, is_static)) =
         ctx.link_resolver_get_field(class_id, &target_name, "")
     {
-        // Cache hit вЂ” re-fetch the metadata to build the Field mirror.
-        // We still walk `declared_fields(decl)` (small per-class vec) so
-        // the mirror's `create_field_object` payload (descriptor, mods,
-        // signature) matches what a cold miss would have produced.
-        let fields = declared_fields_with_aliases(ctx, decl);
-        for meta in &fields {
-            if meta.name == target_name
-                && meta.slot_index == abs_idx as usize
-                && meta.is_static == is_static
-            {
-                let field_obj = create_field_object(ctx, meta);
-                return Ok(Some(Value::Object(Some(field_obj))));
+        // `decl == class_id` — the guard the method twin
+        // (`native_class_get_declared_method`) already carries at its own
+        // LinkResolver probe, and the field side did not.
+        //
+        // The cache is ONE flat map keyed by `(ClassId, name, descriptor)`, and
+        // `native_class_get_field` writes into it under the class the caller
+        // QUERIED with the class that actually DECLARES the field as the value.
+        // So `Derived.class.getField("x")` on an `x` inherited from `Base`
+        // leaves `(Derived,"x","") -> Base`, and this probe then answered
+        // `getDeclaredField("x")` from `declared_fields_with_aliases(Base)` —
+        // returning `Base.x` where the JDK throws `NoSuchFieldException`.
+        // The cold walk below is correct (it only ever looks at `class_id`'s
+        // own fields), so falling through on a foreign `decl` is both safe and
+        // sufficient.
+        //
+        // Every framework that separates declared from inherited members by
+        // catching `NoSuchFieldException` while climbing `getSuperclass()`
+        // (Jackson's `AnnotatedFieldCollector`, Spring's
+        // `ReflectionUtils.findField`, Hibernate's `ReflectHelper`) attributed
+        // the field to the subclass and then processed it AGAIN at the
+        // superclass rung. And because the entry is subject to CLOCK eviction,
+        // it did so intermittently.
+        if decl == class_id {
+            // Cache hit вЂ” re-fetch the metadata to build the Field mirror.
+            // We still walk `declared_fields(decl)` (small per-class vec) so
+            // the mirror's `create_field_object` payload (descriptor, mods,
+            // signature) matches what a cold miss would have produced.
+            let fields = declared_fields_with_aliases(ctx, decl);
+            for meta in &fields {
+                if meta.name == target_name
+                    && meta.slot_index == abs_idx as usize
+                    && meta.is_static == is_static
+                {
+                    let field_obj = create_field_object(ctx, meta);
+                    return Ok(Some(Value::Object(Some(field_obj))));
+                }
             }
         }
         // Fall through to the cold-miss walk if the cached entry no
         // longer matches (declared_fields shape mutated under us; very
-        // rare).
+        // rare) or was written by `getField` for an inherited field.
     }
 
     let fields = declared_fields_with_aliases(ctx, class_id);
@@ -18396,10 +18420,59 @@ pub(crate) fn native_class_get_enum_constants(
     Ok(Some(Value::Object(Some(out))))
 }
 
-pub(crate) fn native_class_cast(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Simplified: just return the object (no type checking)
+/// `java.lang.Class.cast(Object)`.
+///
+/// The JDK body is two lines — `if (obj != null && !isInstance(obj)) throw new
+/// ClassCastException(cannotCastMsg(obj)); return (T) obj;` — and this native
+/// implemented only the second of them. It took `_ctx`, so it could not have
+/// checked anything: every cast succeeded.
+///
+/// That matters because `Class.cast` is not a convenience wrapper, it is the
+/// ONLY runtime type barrier for the reflective containers built on it —
+/// `Collections.checkedList/checkedMap`, Guava's `ClassToInstanceMap`,
+/// Jackson's converters. With the check absent a heterogeneous container
+/// accepts a wrong-typed element silently and the `ClassCastException` surfaces
+/// at some unrelated later `checkcast`, with a stack trace pointing nowhere
+/// near the insertion that caused it.
+///
+/// This is the same repair the sibling `native_class_as_subclass` (below)
+/// already received — it too "unconditionally returned `this`" until a caller
+/// that used the CCE for control flow exposed it. The two are one JVMS rule
+/// implemented twice; only one side had been fixed.
+pub(crate) fn native_class_cast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    Ok(Some(obj))
+    // `cast(null)` is null for every class, primitive mirrors included — the
+    // JDK short-circuits on `obj != null` before consulting `isInstance`.
+    let Value::Object(Some(value)) = obj else {
+        return Ok(Some(obj));
+    };
+    let this = match args.first() {
+        Some(Value::Object(Some(mirror))) => *mirror,
+        // No receiver mirror to test against. Keep the historic pass-through
+        // rather than invent a refusal out of a missing argument — the same
+        // stance `asSubclass` takes for its null/absent target.
+        _ => return Ok(Some(obj)),
+    };
+    let is_instance = matches!(
+        native_class_is_instance(ctx, &[Value::Object(Some(this)), obj])?,
+        Some(Value::Int(v)) if v != 0
+    );
+    if is_instance {
+        return Ok(Some(obj));
+    }
+    // HotSpot's `Class.cannotCastMsg`: "Cannot cast <actual> to <target>",
+    // both dotted.
+    let target_name = mirror_class_name(ctx, this)
+        .unwrap_or_default()
+        .replace('/', ".");
+    let actual_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(value))
+        .unwrap_or_default()
+        .replace('/', ".");
+    Err(cratonvm_types::error::RuntimeError::ClassCastException {
+        message: format!("Cannot cast {actual_name} to {target_name}"),
+    }
+    .into())
 }
 
 /// Native override for `java.lang.Class.getClassLoader()`.

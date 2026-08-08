@@ -6,9 +6,9 @@
 //! A differential harness that hides a regex inside its comparison function is
 //! a harness nobody can audit: the reader cannot tell whether a divergence was
 //! *neutralized* (a nondeterminism the JLS does not fix) or *laundered* (a real
-//! VM bug the harness quietly erased). `` records the failure mode
-//! from the other side too — a harness that reports its own environment noise as
-//! a VM defect burns a day of bisection on nothing.
+//! VM bug the harness quietly erased). The retired divergence log records the
+//! failure mode from the other side too — a harness that reports its own
+//! environment noise as a VM defect burns a day of bisection on nothing.
 //!
 //! So every transform lives here as a [`NormalizationRule`] with four fields a
 //! reviewer can argue with:

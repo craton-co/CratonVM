@@ -169,19 +169,93 @@ fn stamped_lock_surface_is_intercepted_completely() {
 /// `stamped_lock_surface_is_intercepted_completely` above. A new native that
 /// reaches either capability fails this test until it is gated or explicitly
 /// listed as exempt.
+///
+/// Blank out every `#[cfg(test)]` module in `text`, preserving line count.
+///
+/// Test scaffolding calls the capability helpers directly and must not be
+/// scanned, but *truncating* at the first `#[cfg(test)]` throws away all the
+/// production code that follows it — which in this crate is most of the code,
+/// because the largest files put a test module a few thousand lines in and then
+/// carry on for tens of thousands more. Each `#[cfg(test)]` region is replaced
+/// by newlines instead, so the scan sees every production line and the line
+/// numbers it reports still match the file.
+///
+/// Region detection matches this crate's layout: a column-0 test `cfg`
+/// attribute whose next non-attribute line declares a module, closed by a `}`
+/// in column 0. The module check matters — `#[cfg(test)] use ...;` is common,
+/// and treating that as the start of a region would swallow production code all
+/// the way to the next column-0 brace, i.e. hide call sites. A test module
+/// nested inside another item is not excised; that can only produce a false
+/// positive (a reported site that is really test code), never a false negative,
+/// which is the safe direction for a security gate.
+fn strip_test_modules(text: &str) -> String {
+    fn is_test_cfg(line: &str) -> bool {
+        line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test")
+    }
+    fn declares_mod(line: &str) -> bool {
+        let l = line.trim_start();
+        l.starts_with("mod ") || l.starts_with("pub mod ") || l.starts_with("pub(crate) mod ")
+    }
+
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        // Look past any further attributes to find what this cfg applies to.
+        let opens_test_mod = is_test_cfg(line) && {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim_start().starts_with("#[") {
+                j += 1;
+            }
+            j < lines.len() && declares_mod(lines[j])
+        };
+        if !opens_test_mod {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+        // Blank the region through the closing column-0 `}`, keeping newlines
+        // so the line numbers this test reports still match the file.
+        while i < lines.len() {
+            let l = lines[i];
+            if l.ends_with('\n') {
+                out.push('\n');
+            }
+            i += 1;
+            if l.starts_with('}') {
+                break;
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn native_symbol_lookups_all_pass_the_host_access_gate() {
     const GATES: [&str; 2] = ["check_host_native_access_or_throw", "require_native_access"];
     const CAPABILITIES: [&str; 2] = ["find_native_symbol", "load_native_library"];
 
-    // Exempt: reached only from VM-internal bootstrap, never from a Java
-    // caller's control. Keep this list short and justified.
-    const EXEMPT_FNS: [&str; 0] = [];
+    // Exempt: reached only from VM-internal bootstrap, or a private helper
+    // every caller of which gates first. Keep this list short and justified —
+    // and pair each entry with a check that its justification still holds, or
+    // the exemption becomes the hole. See `gated_helper_callers_all_gate`.
+    //
+    //  * `load_library_or_throw` — `lang_system.rs`. Private to that module and
+    //    called from exactly the four `System.load`/`loadLibrary` /
+    //    `Runtime.load`/`loadLibrary` closures, each of which calls
+    //    `check_host_native_access_or_throw` on the line before. The gate is in
+    //    the caller, so the scan's enclosing-scope heuristic cannot see it.
+    const EXEMPT_FNS: [&str; 1] = ["load_library_or_throw"];
 
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut ungated: Vec<String> = Vec::new();
     let mut scanned_files = 0usize;
     let mut call_sites = 0usize;
+    // Scan-integrity accounting: how much of the crate the scan actually looked
+    // at, after test modules were blanked out. See the assertion below.
+    let mut total_bytes = 0usize;
+    let mut production_bytes = 0usize;
 
     let mut stack = vec![src_dir.clone()];
     while let Some(dir) = stack.pop() {
@@ -198,12 +272,19 @@ fn native_symbol_lookups_all_pass_the_host_access_gate() {
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             scanned_files += 1;
 
-            // Everything from the first `#[cfg(test)]` module onward is test
-            // scaffolding, which legitimately calls these directly.
-            let body = match text.find("#[cfg(test)]") {
-                Some(cut) => &text[..cut],
-                None => &text[..],
-            };
+            // Test scaffolding legitimately calls these directly, so the
+            // `#[cfg(test)]` modules are blanked out. They are *excised*, not
+            // truncated at: this used to be `text.find("#[cfg(test)]")` +
+            // `&text[..cut]`, which stopped scanning at the FIRST test module
+            // and so made everything after it invisible. In `lib.rs` the first
+            // one sits at line 2596 of 42,525 — the scan was blind to 94% of
+            // the crate's largest file, including a real `load_native_library`
+            // call site, and an ungated one added there could never have failed
+            // this test. The vacuity guard below is what caught it.
+            let blanked = strip_test_modules(&text);
+            let body: &str = &blanked;
+            total_bytes += text.len();
+            production_bytes += body.bytes().filter(|b| *b != b'\n').count();
 
             for cap in CAPABILITIES {
                 let needle = format!("ctx.{cap}(");
@@ -248,10 +329,25 @@ fn native_symbol_lookups_all_pass_the_host_access_gate() {
         scanned_files > 10,
         "source scan found only {scanned_files} files — the scan itself is broken"
     );
+    // The scan must actually look at the crate. The previous truncate-at-first-
+    // `#[cfg(test)]` implementation retained 6% of `lib.rs`; this catches that
+    // class of blindness directly, rather than inferring it from a call-site
+    // count that also moves for legitimate reasons.
     assert!(
-        call_sites >= 8,
+        production_bytes * 4 >= total_bytes,
+        "the scan retained only {production_bytes} of {total_bytes} bytes after \
+         blanking test modules — `strip_test_modules` is eating production code, \
+         so an ungated call site could hide in the part it never looked at."
+    );
+    // Vacuity floor. The count is 7 as this is written (`lang_system.rs`,
+    // `lib.rs`, four in `panama.rs`, `shared_secrets_bridge.rs`); the floor sits
+    // just under it so that removing one native is not a CI failure while the
+    // capability being renamed out from under the scan still is. Do not raise
+    // this to track the exact count — that is what made it stale before.
+    assert!(
+        call_sites >= 6,
         "source scan found only {call_sites} native-symbol call sites; expected \
-         at least 8. Either the capability was renamed or the scan is broken."
+         at least 6. Either the capability was renamed or the scan is broken."
     );
 
     assert!(
@@ -259,6 +355,68 @@ fn native_symbol_lookups_all_pass_the_host_access_gate() {
         "these natives resolve a native symbol or load a native library without \
          passing the host-native-access gate, so a caller denied `loadLibrary.*` \
          (or running under CRATONVM_UNTRUSTED_CODE) can still reach them: {ungated:?}"
+    );
+}
+
+/// The `EXEMPT_FNS` entries above are exemptions from the gate scan, so each one
+/// has to keep earning it. This is the companion check for the only entry:
+/// `load_library_or_throw` is exempt *because* every caller gates first, so if a
+/// fifth caller is added without a gate the exemption silently becomes the hole
+/// the scan exists to prevent.
+///
+/// Scoped to the one module that owns the helper — it is private to
+/// `lang_system.rs`, and the test fails if it stops being private, because then
+/// callers could appear anywhere.
+#[test]
+fn exempt_helper_callers_all_gate_first() {
+    const HELPER: &str = "load_library_or_throw";
+    const GATE: &str = "check_host_native_access_or_throw";
+
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lang_system.rs");
+    let text = std::fs::read_to_string(&src).expect("lang_system.rs must be readable");
+    let body = strip_test_modules(&text);
+
+    assert!(
+        body.contains(&format!("fn {HELPER}(")),
+        "{HELPER} is no longer defined in lang_system.rs — either it moved (update \
+         this test) or it is gone (drop it from EXEMPT_FNS)."
+    );
+    assert!(
+        !body.contains(&format!("pub fn {HELPER}("))
+            && !body.contains(&format!("pub(crate) fn {HELPER}(")),
+        "{HELPER} became visible outside lang_system.rs, so this test no longer \
+         sees all of its callers. Gate it internally instead of exempting it."
+    );
+
+    let mut ungated: Vec<usize> = Vec::new();
+    let mut calls = 0usize;
+    let mut from = 0usize;
+    let needle = format!("{HELPER}(ctx");
+    while let Some(rel) = body[from..].find(&needle) {
+        let at = from + rel;
+        from = at + needle.len();
+        // The definition itself is `fn load_library_or_throw(\n    ctx:` — the
+        // needle requires `(ctx` with no newline, so it matches calls only.
+        calls += 1;
+        // Look back to the start of the enclosing registered closure.
+        let scope_start = body[..at]
+            .rfind("register")
+            .or_else(|| body[..at].rfind("\nfn "))
+            .unwrap_or(0);
+        if !body[scope_start..at].contains(GATE) {
+            ungated.push(body[..at].matches('\n').count() + 1);
+        }
+    }
+
+    assert!(
+        calls >= 4,
+        "expected at least the four System.load/loadLibrary + Runtime.load/\
+         loadLibrary call sites, found {calls} — the scan or the helper changed."
+    );
+    assert!(
+        ungated.is_empty(),
+        "these {HELPER} call sites do not call {GATE} first, so the EXEMPT_FNS \
+         entry for it is no longer true: lang_system.rs lines {ungated:?}"
     );
 }
 

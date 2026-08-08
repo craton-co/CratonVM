@@ -2771,6 +2771,45 @@ pub(super) fn execute_instruction(
                 (et, total_depth, array_class_name[total_depth..].to_string())
             };
 
+            // JVMS §4.9.1 static constraint: `dimensions` must not exceed the
+            // number of leading `[` in the referenced array class.
+            //
+            // SECURITY (defense-in-depth, same policy as `execute_ldc`'s
+            // `ClassFormatError` conversion): the type-state verifier does
+            // enforce this (`verify_insn.rs`, `Instruction::Multianewarray`),
+            // but that pass does NOT run for every class. Pass 3 is deferred
+            // wholesale for any class defined by a user-defined loader while
+            // `loader_aware_resolution()` is on — which is the default, and
+            // covers every Spring / WildFly / H2 application class — and the
+            // structural-only substitute (`verifier::verify_method_structural`)
+            // never looks at this operand. `-Xverify:none` removes it too.
+            //
+            // Without this guard `total_array_depth - d - 1` below underflows:
+            // in a release build (overflow-checks off) it wraps to `usize::MAX`,
+            // and `"[".repeat(usize::MAX)` then asks the allocator for
+            // `usize::MAX` bytes, which aborts the process rather than raising
+            // anything Java can catch.
+            if sizes.len() > total_array_depth {
+                let (cls, mname) = {
+                    let f = &thread.frames[frame_idx];
+                    (f.class_name().to_string(), f.method_name().to_string())
+                };
+                return Err(crate::runtime::exceptions::throw_linkage_error(
+                    shared,
+                    thread,
+                    LinkageError::VerifyError {
+                        class_name: cls,
+                        method_name: mname,
+                        message: format!(
+                            "multianewarray: dimensions {} exceeds array bracket count {} \
+                             of type at cp#{index}",
+                            sizes.len(),
+                            total_array_depth
+                        ),
+                    },
+                ));
+            }
+
             // Resolve the *component* class id for each allocated array level so
             // the array objects carry their precise class (e.g. the outer level
             // of `new String[8][8]` is a `[[Ljava/lang/String;` whose component

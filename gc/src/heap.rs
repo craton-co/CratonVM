@@ -668,8 +668,42 @@ impl Heap {
                 )
             };
         }
+        // HIB-DCAST-LATEPHASE.1 (mutator side), the fourth accessor family.
+        // `compact_object_field_storage` answers `None` for TWO reasons and
+        // only the first licenses the fall-through below: (1) "this is a
+        // legacy object" — its contract, and the uniform 16-byte `Value` cell
+        // is the right read; (2) "this IS a compact object (`GC_FLAG_COMPACT`,
+        // set at allocation by `alloc_object`, which sized the body with
+        // `compact_object_body_size`) whose `(class_id, num_slots)` no longer
+        // resolves to a registered layout" — a redefinition that changed the
+        // field count, or a foreign `layout_domain`.
+        //
+        // In case (2) `num_slots()` is the FIELD COUNT, not a count of 16-byte
+        // cells, so the `index < num_slots` assert above does NOT bound
+        // `HEADER_SIZE + index * SLOT_SIZE` and an entirely in-range index
+        // still reads past the allocation.
+        //
+        // `g1::get_field`, `gen_heap::get_field` and `ZgcRealHeap::get_field`
+        // all carry this guard; this accessor was the one that did not. Degrade
+        // exactly as they do (benign null, loud `cratonvm::gc::guard` record,
+        // no panic — a racing redefinition must not abort the JVM).
+        if cratonvm_types::is_compact_object(self.get_header(obj_ref)) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                class_id = ?self.get_header(obj_ref).class_id,
+                "heap::get_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — returning null rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return Value::Object(None);
+        }
         // SAFETY: `obj_ref` is a live heap object. The assert above
-        // confirms `index < num_slots`. `slot_ptr` computes
+        // confirms `index < num_slots`, and the guard above confirms the
+        // object is NOT compact, so its body really is `num_slots` uniform
+        // 16-byte cells. `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
         // allocated block. `read_slot` reads a `Value` from that pointer.
         unsafe {
@@ -703,8 +737,27 @@ impl Heap {
             };
             return;
         }
-        // SAFETY: same invariant as `get_field` — index is within bounds,
-        // and the slot pointer is within the allocated object block.
+        // HIB-DCAST-LATEPHASE.1, write half — see the long note on the matching
+        // guard in `get_field`. This half is the more damaging of the two: the
+        // legacy stride does not merely read past a compact-sized body, it
+        // *writes* a 16-byte `Value` cell over whatever follows the object.
+        if cratonvm_types::is_compact_object(self.get_header(obj_ref)) {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj_ref.as_ptr(),
+                index,
+                class_id = ?self.get_header(obj_ref).class_id,
+                value = ?value,
+                "heap::set_field: compact receiver has no registered layout for \
+                 its (class_id, field_count) — dropping the write rather than \
+                 striding its packed compact body as legacy 16-byte cells \
+                 (HIB-DCAST-LATEPHASE.1)",
+            );
+            return;
+        }
+        // SAFETY: same invariant as `get_field` — index is within bounds, the
+        // object is not compact, and the slot pointer is within the allocated
+        // object block.
         unsafe {
             let ptr = slot_ptr(obj_ref, index);
             write_slot(ptr, value);
@@ -2008,9 +2061,23 @@ pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementTy
             };
             std::ptr::write_unaligned(base.add(index * 8) as *mut f64, v);
         }
-        ArrayElementType::Byte | ArrayElementType::Boolean => {
+        ArrayElementType::Byte => {
             let v = match value {
                 Value::Int(i) => i as u8,
+                _ => 0,
+            };
+            std::ptr::write(base.add(index), v);
+        }
+        // JVMS `bastore`: a store into a *boolean* array narrows to one bit
+        // (`value & 1`), not to a byte — the opcode serves `byte[]` and
+        // `boolean[]` both, and the verifier permits either. `read_prim_element`
+        // zero-extends whatever is here, so a truncated 2 reads back as 2 and
+        // tests `true`, where HotSpot stores 0 and tests `false`. Reachable via
+        // hand-written `bastore` on a `boolean[]` and via
+        // `Unsafe.putByte`/`putBoolean`; not via javac output.
+        ArrayElementType::Boolean => {
+            let v = match value {
+                Value::Int(i) => (i & 1) as u8,
                 _ => 0,
             };
             std::ptr::write(base.add(index), v);
@@ -2051,6 +2118,48 @@ mod tests {
     #[test]
     fn header_size_check() {
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
+    }
+
+    /// `HIB-DCAST-LATEPHASE.1`, mutator side — the fourth accessor family.
+    ///
+    /// `compact_object_field_storage` answers `None` both for a legacy object
+    /// and for a genuinely compact one whose `(class_id, field_count)` no
+    /// longer resolves to a registered layout, and `Heap::get_field` /
+    /// `Heap::set_field` fell through to the uniform `index * SLOT_SIZE` stride
+    /// in *both* cases. On a real instance of the second state `alloc_object`
+    /// sized the body with `compact_object_body_size` and `num_slots()` is the
+    /// FIELD COUNT, so the `index < num_slots` assert does not bound that
+    /// stride: the read escapes the allocation and the write puts a 16-byte
+    /// `Value` cell past it. `g1.rs`, `gen_heap.rs` and `zgc.rs` all grew the
+    /// `is_compact_object` guard; this one did not.
+    #[test]
+    fn field_accessors_refuse_a_compact_object_with_no_registered_layout() {
+        let heap = Heap::new();
+        // No layout is registered for this class id, so the allocation is
+        // LEGACY and the cells written below are real, readable cells. Setting
+        // the header bit afterwards reproduces the racing state (header says
+        // compact, registry cannot serve it) without a live redefinition.
+        let obj = heap.alloc_object(ClassId::new(999_997), 4);
+        heap.set_field(obj, 0, Value::Int(1));
+        heap.set_field(obj, 1, Value::Int(2));
+
+        let header = heap.get_header(obj);
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+        assert!(
+            matches!(heap.get_field(obj, 0), Value::Object(None)),
+            "an unresolvable compact receiver must read as null, not as the \
+             legacy 16-byte cell at index * SLOT_SIZE"
+        );
+
+        // The write must be dropped, not striped over the legacy cell.
+        heap.set_field(obj, 1, Value::Int(77));
+
+        header.clear_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert!(
+            matches!(heap.get_field(obj, 1), Value::Int(2)),
+            "the dropped write must not have reached the object at all"
+        );
     }
 
     #[test]
