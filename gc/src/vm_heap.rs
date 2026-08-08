@@ -2252,6 +2252,48 @@ impl VmHeap {
                 );
             }
         }
+        // The read-side companion to the line above: that one is a marking
+        // FAIL-OPEN, this one is a read FAIL-SILENT. Every path that hands Java
+        // a `null` for a slot that held bits — the interpreter's tagged decodes,
+        // the JIT read helpers, `read_prim_element`'s reference arm — feeds one
+        // process-wide per-source table in `cratonvm_types::compact_value`, and
+        // this prints the breakdown rather than the total because the sources do
+        // not mean the same thing:
+        //
+        //   * `interpreter` reads a TAGGED slot, so a count there can be a
+        //     primitive `long` whose verbatim bits collided into the object
+        //     sub-tag. That is benign and is exactly what the degrade exists for.
+        //   * `jit` and `array-element` read UNTAGGED reference words — the JVM
+        //     type system already says the slot is a reference — so there is no
+        //     long/object ambiguity to absorb. A non-zero count there means a
+        //     word that should have been a live pointer was handed to Java as
+        //     `null`, i.e. the GC root-coverage gap of commit `6a04b0e3c1` is
+        //     live in THIS run. `jit` is the most diagnostic of the three: a
+        //     JIT'd frame is the frame a deposited root snapshot misses.
+        //
+        // Printed only when non-zero, for the same reason as the line above.
+        //
+        // The total is summed from THIS snapshot rather than read via
+        // `object_degradation_count()`: that accessor is defined as the same sum
+        // but takes its own set of relaxed loads, so under concurrency the two
+        // could disagree and the printed line would not add up.
+        {
+            let breakdown = cratonvm_types::compact_value::object_degradation_breakdown();
+            let total: u64 = breakdown.iter().sum();
+            if total != 0 {
+                let rendered = cratonvm_types::compact_value::DegradationSource::ALL
+                    .iter()
+                    .map(|s| format!("{}={}", s.name(), breakdown[s.index()]))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "[GC] object_degradations={total} ({rendered}) — READ FAIL-SILENT: \
+                     that many reference-shaped slots decoded to `null` instead of the \
+                     object they named; a non-zero `jit` or `array-element` count is a \
+                     live root-coverage failure, not a long/object collision"
+                );
+            }
+        }
         // What the collector actually did on the last cycle and why. This is
         // the line that settles the `docs/GC.md` ("young collections run
         // non-moving whenever any JIT frame is active") vs `ARCHITECTURE.md`

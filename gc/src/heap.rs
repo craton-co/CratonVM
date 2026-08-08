@@ -1681,14 +1681,16 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
 //     collector a live `Object[]` element could be nulled with no trace
 //     anywhere: no counter, no log, no assert, and `object_degradation_count()`
 //     reading a reassuring 0. That is an observability bug today, independent of
-//     ZGC, and [`REF_ELEMENT_DEGRADATIONS`] closes it.
+//     ZGC, and [`ref_element_degradation_count`] closes it.
 //
 //     NULL IS NOT A DEGRADATION. `plausible_heap_pointer(0)` is `false`, so an
 //     ordinary null element — by far the common case for `Object[]` — reaches
 //     the cold arm too. Counting it would put the counter in the millions on a
 //     clean run and make "non-zero means a live object was nulled" false on
-//     first use. The `raw == 0` test in [`ref_element_word_implausible`] is
-//     therefore load-bearing, not a micro-optimisation.
+//     first use. That test is load-bearing, not a micro-optimisation, and it
+//     now lives in the shared sink
+//     (`cratonvm_types::compact_value::note_ref_word_degradation`) rather than
+//     in this file — see [`ref_element_degradation_count`].
 //
 // (2) A ZGC COLORED WORD IS NOT CORRUPTION, and must never take the degrade.
 //     `gc/src/zgc/vaddr.rs` sets bit 63 (`Z_COLORED_TAG`) on every non-null
@@ -1713,7 +1715,7 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
 //     exactly one metadata bit), so a `--features zgc` build running
 //     Generational or G1 behaves as before.
 
-/// Process-wide count of **non-null** array reference elements
+/// Read the process-wide count of **non-null** array reference elements
 /// [`read_prim_element`] degraded to `null` because they failed
 /// [`cratonvm_types::plausible_heap_pointer`].
 ///
@@ -1723,20 +1725,27 @@ unsafe fn write_slot(ptr: *mut u8, value: Value) {
 /// recorded in commit `6a04b0e3c1` is live in this run. Expected to be ZERO;
 /// zero is the only good value.
 ///
+/// # This is one slot of the shared counter, not a private one
+///
+/// It used to be a `pub static REF_ELEMENT_DEGRADATIONS: AtomicU64` in this
+/// file, because the sink it belonged in
+/// (`cratonvm_types::compact_value::note_object_degradation`) was `pub(crate)`
+/// and this crate could not reach it. That produced the exact failure the
+/// counter exists to prevent: a triager reading
+/// `cratonvm_types::compact_value::object_degradation_count()` saw a reassuring
+/// `0` while this path was nulling live elements, because the total did not
+/// include them. The sink is now `pub` and source-tagged, so this reads
+/// [`DegradationSource::ArrayElement`]'s slot of the one process-wide table and
+/// the total genuinely totals. `vm::jit::helpers::jit_ref_degradation_count`
+/// (the `Jit` slot) was merged the same way.
+///
 /// Advisory and `Relaxed`: it carries no happens-before relationship with the
 /// slot it counts.
-///
-/// TODO: `VmHeap::print_gc_summary` (gc/src/vm_heap.rs) already reports
-/// [`COMPACT_OOP_MAP_MISSING`]; this counter belongs on the same line. That file
-/// is outside this change.
-pub static REF_ELEMENT_DEGRADATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Read the running count of stale array reference elements degraded to `null`.
-/// See [`REF_ELEMENT_DEGRADATIONS`]; zero is the only good value.
 #[inline]
 pub fn ref_element_degradation_count() -> u64 {
-    REF_ELEMENT_DEGRADATIONS.load(std::sync::atomic::Ordering::Relaxed)
+    cratonvm_types::compact_value::object_degradation_count_from(
+        cratonvm_types::compact_value::DegradationSource::ArrayElement,
+    )
 }
 
 /// Decode a raw reference word read out of an array element slot into the
@@ -1769,6 +1778,10 @@ unsafe fn decode_ref_element_word(raw: u64) -> Value {
 /// * **`raw == 0`** — an ordinary null element. Not a degradation, not counted;
 ///   the slot said null and the caller gets null. See the block comment above:
 ///   counting this would destroy the counter's meaning on the first clean run.
+///   The test is no longer written here: it lives inside
+///   [`cratonvm_types::compact_value::note_ref_word_degradation`], which exists
+///   because this arm and the JIT's twin each had to discover the rule
+///   separately. Stated once, where the next raw-word path cannot miss it.
 /// * **A structurally well-formed ZGC colored word** — legitimate data that has
 ///   simply not been through the load barrier. Nulling it is the silent-null
 ///   corruption of `zgc-jit-load-barrier.md` J1; returning the colored word is a
@@ -1785,9 +1798,6 @@ unsafe fn decode_ref_element_word(raw: u64) -> Value {
 #[cold]
 #[inline(never)]
 fn ref_element_word_implausible(raw: u64) -> Value {
-    if raw == 0 {
-        return Value::Object(None);
-    }
     #[cfg(feature = "zgc")]
     {
         // TODO(zgc): once the load barrier runs AHEAD of this decode (see the
@@ -1815,7 +1825,15 @@ fn ref_element_word_implausible(raw: u64) -> Value {
             );
         }
     }
-    REF_ELEMENT_DEGRADATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Counts the event and emits the one-shot "array-element" diagnostic, or
+    // returns `false` and does neither for `raw == 0`. See
+    // `ref_element_degradation_count` for why this is the shared table's
+    // `ArrayElement` slot rather than a static in this file.
+    cratonvm_types::compact_value::note_ref_word_degradation(
+        raw,
+        cratonvm_types::compact_value::DegradationSource::ArrayElement,
+        "gc::heap::read_prim_element",
+    );
     Value::Object(None)
 }
 
@@ -1885,7 +1903,7 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
             // hot path and never rejects a valid pointer (every real object is
             // 8-aligned, above the guard page, <=47-bit). The degrade is now
             // COUNTED rather than silent — see the chokepoint block comment
-            // above `REF_ELEMENT_DEGRADATIONS` for the failure that closes.
+            // above `ref_element_degradation_count` for the failure that closes.
             decode_ref_element_word(raw)
         }
     }
@@ -2044,8 +2062,16 @@ mod tests {
         );
     }
 
-    /// Serialises every test that reads [`REF_ELEMENT_DEGRADATIONS`] against
-    /// every test that *increments* it.
+    /// Serialises every test that reads `ref_element_degradation_count`
+    /// against every test that *increments* it.
+    ///
+    /// Still sufficient after the merge into `cratonvm_types`' shared
+    /// per-source table: that accessor reads only the
+    /// `DegradationSource::ArrayElement` slot, and
+    /// `ref_element_word_implausible` in this file is that slot's only writer
+    /// in the whole tree. A `cratonvm_types` test bumping `Interpreter`, or a
+    /// `vm` test bumping `Jit`, is both in a different test binary AND in a
+    /// different slot.
     ///
     /// The counter is process-wide and `cargo test` runs this crate's tests in
     /// one process, in parallel — so a test that merely triggers a degradation
@@ -2113,6 +2139,57 @@ mod tests {
             ref_element_degradation_count() - before,
             garbage.len() as u64,
             "every non-null degrade must be counted exactly once"
+        );
+    }
+
+    /// An array-element degrade must move the SHARED total, not just this
+    /// path's own slot.
+    ///
+    /// This is the assertion the other tests in this file cannot make. They all
+    /// measure deltas on `ref_element_degradation_count`, so they passed just as
+    /// happily when that read a `static REF_ELEMENT_DEGRADATIONS` private to
+    /// this file — and that arrangement was itself the bug: a triager reading
+    /// `cratonvm_types::compact_value::object_degradation_count()` (the name the
+    /// interpreter's twin publishes, and the one a crash report reaches for) saw
+    /// `0` while this path was nulling live elements. Re-privatising the counter
+    /// must fail a test, not merely go unnoticed.
+    ///
+    /// Deltas on the total are asserted as a LOWER bound, deliberately. The
+    /// total sums all three sources and `ref_degrade_test_lock` only serialises
+    /// this one, so a concurrently-running test in this binary that trips a
+    /// `cratonvm_types` `Interpreter` decode may add to it. `>= n` still fails
+    /// closed for the regression this guards (a private counter moves the total
+    /// by 0 while the slot moves by `n`), and does not flake.
+    #[test]
+    fn an_array_element_degrade_is_visible_in_the_shared_process_wide_total() {
+        use cratonvm_types::compact_value::{
+            object_degradation_breakdown, object_degradation_count, DegradationSource,
+        };
+        let _guard = ref_degrade_test_lock();
+        let garbage: [u64; 3] = [0x8D8D_8D8D_8D8D_8D8D, 0x1001, 0x0001_0000_0000_0000];
+        let n = garbage.len() as u64;
+
+        let before_slot = ref_element_degradation_count();
+        let before_total = object_degradation_count();
+        for raw in garbage {
+            assert_eq!(ref_element_word_implausible(raw), Value::Object(None));
+        }
+
+        assert_eq!(
+            ref_element_degradation_count() - before_slot,
+            n,
+            "the ArrayElement slot must count every non-null degrade exactly once",
+        );
+        assert!(
+            object_degradation_count() - before_total >= n,
+            "an array-element degrade was invisible to object_degradation_count() — \
+             this path is back on a counter of its own",
+        );
+        assert_eq!(
+            object_degradation_breakdown()[DegradationSource::ArrayElement.index()],
+            ref_element_degradation_count(),
+            "ref_element_degradation_count must BE the ArrayElement slot, not a \
+             parallel tally that happens to agree",
         );
     }
 

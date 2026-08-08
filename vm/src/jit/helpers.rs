@@ -4910,14 +4910,18 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
 //     root-coverage gap is *most* likely to bite (JIT'd frames are exactly the
 //     ones the deposited root snapshot misses). A root-coverage regression that
 //     only manifests under JIT is invisible to the instrument built to catch it.
-//     `JIT_REF_DEGRADATIONS` closes that, at the cost of one relaxed increment
-//     on a path that is already a broken state. This is a bug today,
-//     independent of ZGC.
+//     `jit_decode_ref_word` closes that, at the cost of one relaxed increment on
+//     a path that is already a broken state. This is a bug today, independent of
+//     ZGC.
 //
-//     TODO(zgc)/TODO(gc): `cratonvm_types::compact_value::note_object_degradation`
-//     is `pub(crate)`, so this counter cannot be merged into the interpreter's.
-//     Making it `pub` (types/src/compact_value.rs:330) and calling it here would
-//     give one number instead of two; that edit is outside this file.
+//     DISCHARGED: this used to carry a `TODO(zgc)/TODO(gc)` saying
+//     `note_object_degradation` was `pub(crate)` and so the JIT had to keep a
+//     private counter, giving two numbers where a triager needed one. The sink
+//     is now `pub` and source-tagged (`DegradationSource::{Interpreter, Jit,
+//     ArrayElement}`), and this file's counter has been folded into its `Jit`
+//     slot — see `jit_ref_degradation_count`. `object_degradation_count()` now
+//     totals every degrading path in the tree, and
+//     `object_degradation_breakdown()` still names which one fired.
 //
 // (2) A ZGC colored word is NOT corruption, and must never take the degrade.
 //     `gc/src/zgc/vaddr.rs` sets bit 63 (`Z_COLORED_TAG`) on every non-null
@@ -4935,22 +4939,42 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
 //     lands (stage (a)), the colored-word case is an invariant violation and
 //     fails loudly instead of fabricating a null.
 
-/// Process-wide count of reference words a JIT read helper degraded to `null`
-/// because they failed [`cratonvm_types::plausible_heap_pointer`].
+/// Read the running count of stale references the JIT read helpers degraded to
+/// `null` because they failed [`cratonvm_types::plausible_heap_pointer`].
 ///
-/// The JIT-side counterpart of `cratonvm_types::compact_value`'s
-/// `object_degradation_count`, which only sees the interpreter's decode path.
+/// A non-zero value means compiled code has been handed `null` for a slot that
+/// held bits — i.e. the GC root-coverage gap recorded in commit `6a04b0e3c1` is
+/// live in this run. Zero is the only good value.
+///
+/// # This is one slot of the shared counter, not a private one
+///
+/// It used to be a `static JIT_REF_DEGRADATIONS: AtomicU64` in this file,
+/// because `cratonvm_types::compact_value::note_object_degradation` was
+/// `pub(crate)` and this crate could not reach it — see the `TODO` this
+/// discharges in the block comment above. Two counters where there should be
+/// one is not merely untidy here: it made
+/// `cratonvm_types::compact_value::object_degradation_count()` read a
+/// reassuring `0` for **precisely** the configuration in which the underlying
+/// root-coverage gap is most likely to fire, because a JIT'd frame is the frame
+/// a deposited root snapshot misses. A triager had to know to read two numbers,
+/// and zero on one was not zero overall.
+///
+/// The sink is now `pub` and source-tagged, so this reads
+/// [`cratonvm_types::compact_value::DegradationSource::Jit`]'s slot of the one
+/// process-wide table. `object_degradation_count()` genuinely totals, and
+/// `object_degradation_breakdown()` still separates this source out — which
+/// matters, because a `Jit` count carries no long↔object ambiguity (the word
+/// came from a slot the JVM type system says is a reference) while an
+/// `Interpreter` count can be a benign collision.
+/// `cratonvm_gc::heap::ref_element_degradation_count` (the `ArrayElement` slot)
+/// was merged the same way.
+///
 /// Advisory and `Relaxed`: it carries no happens-before relationship with the
 /// slot it counts.
-static JIT_REF_DEGRADATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Read the running count of stale references the JIT read helpers degraded to
-/// `null`. A non-zero value means compiled code has been handed `null` for a
-/// slot that held bits — i.e. the GC root-coverage gap recorded in commit
-/// `6a04b0e3c1` is live in this run. Zero is the only good value.
 pub fn jit_ref_degradation_count() -> u64 {
-    JIT_REF_DEGRADATIONS.load(std::sync::atomic::Ordering::Relaxed)
+    cratonvm_types::compact_value::object_degradation_count_from(
+        cratonvm_types::compact_value::DegradationSource::Jit,
+    )
 }
 
 /// Decode a raw reference word read out of a heap slot into the `i64` the JIT
@@ -4999,17 +5023,17 @@ fn jit_decode_ref_word(raw: u64, site: &'static str) -> i64 {
 #[inline(never)]
 fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
     // `plausible_heap_pointer(0)` is FALSE (it requires `raw >= 0x1000`), so an
-    // ordinary null reference lands here on the way to returning 0. Without this
-    // early-out every null `aaload` / `getfield` / `getstatic` would bump
-    // `JIT_REF_DEGRADATIONS` — the counter would read in the millions on a
-    // perfectly clean run, falsifying its own contract that "zero is the only
-    // good value", and it would put an atomic RMW on the COMMON path for null
-    // field reads rather than on a cold one. A null is not a degradation: no
-    // reference was lost, because there was none to lose.
-    if raw == 0 {
-        return 0;
-    }
-
+    // ordinary null reference lands here on the way to returning 0. Counting it
+    // would put the counter in the millions on a perfectly clean run, falsifying
+    // its own contract that "zero is the only good value". A null is not a
+    // degradation: no reference was lost, because there was none to lose.
+    //
+    // That early-out used to be written here. It now lives inside
+    // `note_ref_word_degradation` below — this arm and
+    // `cratonvm_gc::heap::ref_element_word_implausible` each had to discover the
+    // rule independently, so it is stated once in the shared sink where the next
+    // raw-word path cannot miss it. Nothing below fires on a null: bit 63 of `0`
+    // is clear, so `is_colored_word(0)` is false.
     #[cfg(feature = "zgc")]
     {
         // TODO(zgc): once the load barrier is wired into this helper arm this
@@ -5037,8 +5061,15 @@ fn jit_ref_word_implausible(raw: u64, site: &'static str) -> i64 {
             );
         }
     }
-    let _ = site;
-    JIT_REF_DEGRADATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Counts the event under the `Jit` source and emits the one-shot diagnostic
+    // naming `site`, or returns `false` and does neither for `raw == 0`. See
+    // `jit_ref_degradation_count` for why this is the shared table's `Jit` slot
+    // rather than a static in this file.
+    cratonvm_types::compact_value::note_ref_word_degradation(
+        raw,
+        cratonvm_types::compact_value::DegradationSource::Jit,
+        site,
+    );
     0
 }
 
