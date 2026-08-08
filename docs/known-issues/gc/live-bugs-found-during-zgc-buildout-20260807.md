@@ -1,9 +1,21 @@
 # Live bugs found incidentally during the ZGC buildout, 2026-08-07
 
-**Status: MIXED — 4 fixed today (2 of them only partially), 2 open, 1
-downgraded to latent.** Every entry below has been re-verified against the
-working tree on `dev` as of this write-up; the `file:line` anchors are that
-tree, not the agent reports.
+**Status: 7 of 7 closed. One residual, named in entry 7, is architectural
+rather than a defect.** Every entry below has been re-verified against the
+working tree on `dev`; the `file:line` anchors are that tree, not the agent
+reports.
+
+> **Second pass, later on 2026-08-07.** The first write-up closed 4 of 7 and
+> left entries 4, 5 and the second halves of 2, 3 and 7 open. All of those have
+> since closed, most of them by *other* sessions landing on `dev` in the hours
+> after this file was written — entry 5 in particular, which was the one live
+> memory-safety bug here and which the table below then still advertised as
+> **open on the default collector**. Anyone triaging against the old table
+> would have gone hunting a fixed bug. The per-entry "STILL OPEN" sections have
+> been rewritten rather than deleted, because what closed them is the useful
+> part. Line anchors have NOT been re-pinned; `gc/src/zgc.rs` was split into
+> `gc/src/zgc/` modules in the same window, so prefer the symbol names over the
+> `:NNNN` numbers throughout.
 
 ## Why these are in one document
 
@@ -33,12 +45,12 @@ Companion documents:
 | # | Finding | Affected component | Reachable on default collector today | Status | Confidence |
 |---|---|---|---|---|---|
 | 1 | `MARK_QUARTET_MASK` was two bits short, truncating `gc_age >= 4` | Object header (`types/src/heap_types.rs`) — every collector, every build | **Was yes** (Gen + G1 both age survivors after copying the mark word) | **fixed-today** | High |
-| 2 | JIT reference degrades were silent and uncounted (6 sites) | JIT read helpers (`vm/src/jit/helpers.rs`) | Yes — JIT is on by default | **fixed-today (partial)** — counted, but still a *second* counter | High |
-| 3 | `read_prim_element`'s plausibility degrade was silent | Shared array-element read (`gc/src/heap.rs`) — used by Gen, G1 and ZGC | Yes | **fixed-today (partial)** — counted; the degrade itself remains | High |
-| 4 | `enumerate_references`' compact arm is not narrow-oop-aware | ZGC marker (`gc/src/zgc.rs:1969`) | **No — latent.** Narrow oops are refused for every non-Generational backend, and Generational's own walkers are clean | **open (latent)** | High |
-| 5 | `get_field` / `set_field` stride 16-byte cells through a compact-sized body | `gc/src/zgc.rs` **and `gc/src/gen_heap.rs` and `gc/src/g1.rs`** | **Yes — the identical fall-through is in the default collector** | **open** | High |
+| 2 | JIT reference degrades were silent and uncounted (6 sites) | JIT read helpers (`vm/src/jit/helpers.rs`) | Yes — JIT is on by default | **fixed** — counted, and the second counter is gone: folded into `DegradationSource::Jit` | High |
+| 3 | `read_prim_element`'s plausibility degrade was silent | Shared array-element read (`gc/src/heap.rs`) — used by Gen, G1 and ZGC | Yes | **fixed as an observability bug** — counted under `DegradationSource::ArrayElement` and printed by `print_gc_summary`. The *degrade* is by design; its root cause is the root-coverage gap, tracked elsewhere | High |
+| 4 | `enumerate_references`' compact arm is not narrow-oop-aware | ZGC marker (`gc/src/zgc.rs`) | No — was latent behind the `vm_init` gate | **fixed at the source** — the arm now uses `narrow_oop::read_ref_slot`, so it no longer depends on the gate | High |
+| 5 | `get_field` / `set_field` stride 16-byte cells through a compact-sized body | `gc/src/zgc.rs` **and `gc/src/gen_heap.rs` and `gc/src/g1.rs`** | **Was yes — the identical fall-through was in the default collector** | **fixed in all six accessors** — each now tests `is_compact_object(header)` before the legacy stride | High |
 | 6 | `is_addr_live`'s ZGC arm accepted interior addresses | `gc/src/vm_heap.rs:2235` | No — ZGC arm only | **fixed-today** | High |
-| 7 | ZGC native-alloc-pressure arms inert while its allocator `abort()`s | `gc/src/vm_heap.rs` + `gc/src/zgc.rs` | No — ZGC only | **fixed-today (partial)** — 2 of 3 `VmHeap` arms are still inert against a latch that now exists | High |
+| 7 | ZGC native-alloc-pressure arms inert while its allocator `abort()`s | `gc/src/vm_heap.rs` + `gc/src/zgc.rs` | No — ZGC only | **fixed** — all three `VmHeap` arms now delegate to the real latch. Residual: the two `abort()`s should be a Java `OutOfMemoryError`, which the infallible `GarbageCollector::alloc_*` signature forbids | High |
 
 ## 1. `MARK_QUARTET_MASK` was two bits short — FIXED TODAY
 
@@ -102,13 +114,13 @@ same three-way disagreement (48..61, 48..62, "13 bits"). All three now read
 (`gc_age` described as "bits 59..63", a five-bit range disagreeing with
 `AGE_SHIFT = 60`) was corrected at `:413-416`.
 
-## 2. The JIT's reference degrades were silent and uncounted — FIXED TODAY (partial)
+## 2. The JIT's reference degrades were silent and uncounted — FIXED
 
-**Anchor:** `vm/src/jit/helpers.rs:4867-4919` (the analysis),
-`:4928` (`JIT_REF_DEGRADATIONS`), `:4950` (`jit_decode_ref_word`), `:5024`
-(the increment). The six call sites are now `:5070` (`jit_aaload`/element),
-`:5380`, `:5416`, `:5448` (`jit_getfield`'s three arms), `:6307`, `:6333`
-(`jit_getstatic`'s two).
+**Anchor:** `vm/src/jit/helpers.rs`, the block comment above
+`jit_ref_degradation_count`, then `jit_decode_ref_word` (the `#[inline(always)]`
+chokepoint) and `jit_ref_word_implausible` (its `#[cold]` callee). The six call
+sites are `jit_aaload`'s element read, `jit_getfield`'s three arms and
+`jit_getstatic`'s two.
 
 **Mechanism.** All six arms carried the same three lines verbatim:
 
@@ -152,22 +164,43 @@ costs nothing per field access on any build or collector. It counts
 hard failure naming the missing barrier) from genuine garbage (the old
 degrade, now counted).
 
-**Still open.** There are now **two** counters where there should be one.
-`note_object_degradation` is `pub(crate)` (`types/src/compact_value.rs:330`),
-so `helpers.rs` cannot call it, and the file's own TODO at `:4900-4903` says
-so. Unifying them is a one-word change — `pub(crate)` → `pub` — plus swapping
-the increment at `helpers.rs:5024`. Until then a triager must read
-`jit_ref_degradation_count()` (`:4935`) *and*
-`object_degradation_count()`; zero on one is not zero overall.
+**The second counter is now gone too — CLOSED.** The first pass left **two**
+counters where there should be one, because `note_object_degradation` was
+`pub(crate)` and `helpers.rs` could not call it. That was not merely untidy: it
+meant `object_degradation_count()` — the name a crash report reaches for —
+reported a reassuring `0` for precisely the configuration in which the
+root-coverage gap is most likely to fire, and a triager had to know to read a
+second number. Closed in two steps:
 
-**The root cause is untouched.** The root-coverage gap the commit message names
-is still the only complete fix. Both counters are instruments on a live wound.
+1. `types/src/compact_value.rs` made the sink `pub` **and source-tagged**
+   (`DegradationSource::{Interpreter, Jit, ArrayElement}`), which is better than
+   the one-word `pub(crate)` → `pub` this entry originally specced. A single
+   opaque total would have been a *worse* instrument: an `Interpreter` count can
+   be a primitive `long` whose bits collided into the object sub-tag, which is
+   benign and is exactly what the degrade exists to absorb, whereas `Jit` and
+   `ArrayElement` read **untagged** reference words that carry no such
+   ambiguity. Merging them into one number would have buried the alarming case
+   in the harmless one. The same file grew `note_ref_word_degradation`, which
+   now owns the "a null is not a degradation" rule that both raw-word callers
+   had had to discover independently.
+2. `helpers.rs` deleted `JIT_REF_DEGRADATIONS` and folded it into the `Jit`
+   slot; `jit_ref_degradation_count()` is now a read of that slot, so the two
+   accessors cannot drift. `gc/src/heap.rs` did the same for `ArrayElement`
+   (entry 3).
 
-## 3. `read_prim_element`'s plausibility degrade — FIXED TODAY (partial)
+`object_degradation_count()` therefore genuinely totals, and
+`object_degradation_breakdown()` renders `interpreter=N jit=N array-element=N`.
+`print_gc_summary` prints it — see entry 3.
 
-**Anchor:** `gc/src/heap.rs:1658-1714` (the analysis), `:1732`
-(`REF_ELEMENT_DEGRADATIONS`), `:1757` (`decode_ref_element_word`), `:1787`
-(the cold arm), `:1818` (the increment).
+**The root cause is untouched, and that has not changed.** The root-coverage
+gap the commit message names is still the only complete fix. Every counter here
+is an instrument on a live wound; what closed is the wound being *invisible*.
+
+## 3. `read_prim_element`'s plausibility degrade — FIXED as an observability bug
+
+**Anchor:** `gc/src/heap.rs`, the block comment above
+`ref_element_degradation_count`, then `decode_ref_element_word` and its cold
+callee `ref_element_word_implausible`.
 
 **An agent was editing this file during the review; the state recorded here is
 the current working tree.**
@@ -183,38 +216,61 @@ independent reviewers called it the most dangerous unmigrated read in the tree,
 and `docs/feature-designs/zgc-reference-slot-representation.md` names it as
 such.
 
-**What landed today.** The same chokepoint shape as entry 2:
-`decode_ref_element_word` (`:1757`) with the old predicate as its fast path,
-and a cold callee (`:1787`) that splits three cases —
+**What landed.** The same chokepoint shape as entry 2:
+`decode_ref_element_word` with the old predicate as its fast path, and a cold
+callee that splits three cases —
 
 - `raw == 0`: an ordinary null element. **Not counted.**
   `plausible_heap_pointer(0)` is `false`, so a plain null reaches the cold arm
   too; counting it would put the counter in the millions on a clean run and
-  make "non-zero means a live object was nulled" false on first use. The
-  `raw == 0` test is load-bearing, not a micro-optimisation.
+  make "non-zero means a live object was nulled" false on first use. That test
+  is load-bearing, not a micro-optimisation — which is why it now lives in the
+  shared `note_ref_word_degradation` rather than in this file, where the JIT
+  arm had had to rediscover it.
 - a structurally well-formed ZGC colored word: hard failure naming the missing
   barrier (`#[cfg(feature = "zgc")]`, so a default build does not compile the
   branch at all).
-- stale/garbage bits: the old degrade, now counted at `:1818`.
+- stale/garbage bits: the old degrade, now counted.
 
-**Still open, and the reason this is only a partial fix:** the degrade itself
-survives. A stale reference still becomes a Java `null` on the default
-collector; it is now merely *visible*. Reading
-`ref_element_degradation_count()` (`:1738`) as non-zero means the root-coverage
-gap from entry 2 is live in that run. There is also a TODO at `:1729-1731`:
-`VmHeap::print_gc_summary` already reports `COMPACT_OOP_MAP_MISSING` and this
-counter belongs on the same line.
+**Both follow-ups are closed.**
 
-## 4. `enumerate_references`' compact arm is not narrow-oop-aware — OPEN, LATENT (downgraded)
+- *The second counter.* `REF_ELEMENT_DEGRADATIONS` is gone;
+  `ref_element_degradation_count()` reads the `DegradationSource::ArrayElement`
+  slot of the shared table (entry 2). A test —
+  `an_array_element_degrade_is_visible_in_the_shared_process_wide_total` —
+  pins that, because every *other* test in the file measures deltas on the
+  per-source accessor and so passed just as happily when it was private. The
+  regression this guards has to fail a test, not merely go unnoticed.
+- *The summary line.* `VmHeap::print_gc_summary` now prints
+  `[GC] object_degradations=N (interpreter=N jit=N array-element=N)`
+  immediately after the `compact_oop_map_missing` line, and only when non-zero.
+  The two belong together and the pairing is the point: the first is a marking
+  **fail-open**, the second a read **fail-silent**. The breakdown is printed
+  rather than the total for the reason given in entry 2.
 
-**Anchor:** `gc/src/zgc.rs:1969`.
+**What has NOT changed: the degrade itself survives.** A stale reference still
+becomes a Java `null` on the default collector; it is now merely *visible*.
+Reading a non-zero `array-element` or `jit` count means the root-coverage gap
+from entry 2 is live in that run. This entry is closed as an **observability**
+bug; it was never the fix for the underlying one.
 
-```rust
-let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
-let raw = unsafe { std::ptr::read(slot as *const u64) };
-```
+## 4. `enumerate_references`' compact arm is not narrow-oop-aware — FIXED at the source
 
-**Mechanism.** A plain 8-byte read. The real read path,
+**Anchor:** `gc/src/zgc.rs`, `enumerate_references`' compact-object arm.
+
+**FIXED.** The arm now reads
+`cratonvm_types::narrow_oop::read_ref_slot(slot)`, matching the census arms in
+the same file that were already correct — the in-file precedent this entry
+recommended following. Its `SAFETY` comment carries a `WHY NOT
+std::ptr::read(slot as *const u64)` note so the wide read cannot come back by
+accident. The fix is worth having even though the finding was latent: it
+removes ZGC from the list of things the `vm_init` gate is load-bearing for, so
+relaxing that gate is now a two-collector audit rather than a three-collector
+one. **What follows is the original analysis, kept because the cross-collector
+survey below is the durable part.**
+
+**Mechanism (as found).** A plain 8-byte read
+(`let raw = unsafe { std::ptr::read(slot as *const u64) };`). The real read path,
 `read_compact_field` (`types/src/field_layout.rs:978-993`), branches on
 `narrow_oops_enabled()` and loads an `AtomicU32` + `decode` when narrow oops
 are on, because `ref_field_size()` / `ref_element_size()`
@@ -249,26 +305,47 @@ the same pattern exists in an *ungated* collector. It does and it does not:
   mark-word (word0) reads and 16-byte `Value` cell reads, neither of which is
   a narrow slot.
 
-**Conclusion: no ungated collector has the defect.** The narrow-oop
+**Conclusion: no ungated collector had the defect.** The narrow-oop
 implementation is coherent — the one backend permitted to use it is the one
 that was audited for it, exactly as `vm_init.rs:1388-1390` claims. What is
-worth recording is that **the gate is now the only thing holding three
-collectors' worth of wide reads together**, so it must not be relaxed
-per-backend without an audit of the ~12 `g1.rs` sites and `zgc.rs:1969` first.
+worth recording, and what survives the fix, is that **the gate is still the
+only thing holding G1's ~12 wide reads together**, so it must not be relaxed
+per-backend without auditing those first. ZGC is off that list now; G1 is not.
 
-**A fix, if wanted now:** replace the read at `zgc.rs:1969` with
-`cratonvm_types::narrow_oop::read_ref_slot(slot)`. The same file already does
-this correctly in its census arm (`zgc.rs:2317`, `:2409`), which is a useful
-in-file precedent — and a sign the two arms were written by different hands.
+## 5. `get_field` can read past an allocation — FIXED in all six accessors
 
-## 5. `get_field` can read past an allocation — OPEN, and live on the default collector
+**Anchor:** `get_field` / `set_field` on each of `gc/src/zgc.rs`,
+`gc/src/gen_heap.rs` and `gc/src/g1.rs`. Grep
+`HIB-DCAST-LATEPHASE.1 (mutator side)` for all six.
 
-**Anchor:** `gc/src/zgc.rs:2530-2547` (`get_field`), `:2550-2573`
-(`set_field`), `:2432-2466` (`alloc_object`). **And, discovered while
-verifying this entry:** `gc/src/gen_heap.rs:3502` + `:3540`, and
-`gc/src/g1.rs:7906-7909` + `:7955`.
+**FIXED — and this was the one live memory-safety bug in this document.** Each
+of the six accessors now tests `is_compact_object(header)` — the per-object
+header bit, read independently of the layout registry — *before* the legacy
+16-byte-cell fall-through, exactly as the "What a fix involves" section below
+specced and as the GC walkers already did. When the bit is set but the layout
+will not resolve, the read returns `Value::Object(None)` and the write is
+dropped, each with a `cratonvm::gc::guard` `tracing::warn!` naming
+`HIB-DCAST-LATEPHASE.1`. Deliberately not a panic: a racing redefinition must
+let the Java side surface an error rather than abort the JVM. The legacy stride
+is now reachable only for objects whose compact bit is clear.
 
-**Mechanism.** `alloc_object` (`zgc.rs:2433-2443`) sizes the body with
+Two notes on how it landed versus how it was specced:
+
+- The shared helper in `gc/src/heap.rs` was **not** written; each collector
+  carries its own guard with a cross-reference to `gen_heap.rs`'s, which holds
+  the full rationale. Three copies of a five-line guard, but each sits in a
+  function whose surrounding bounds checks and humongous handling differ.
+- The `layout_domain` hazard named at the end of the mechanism below is **still
+  open** and is now recorded as a `TODO(types/src/field_layout.rs)` on
+  `gen_heap::get_field`: `compact_object_body_size` refuses a foreign
+  `layout_domain`'s entry at allocation time, but the read path
+  (`with_class_layout` / `compact_object_field_storage`) performs no domain
+  check at all. That is a second, independent route into the same divergence,
+  and it cannot be closed from the collectors.
+
+**What follows is the original analysis.**
+
+**Mechanism.** `alloc_object` (`zgc.rs`) sizes the body with
 `compact_object_body_size(...)`, falling back to `num_fields * SLOT_SIZE` only
 when that returns `None`; it sets `GC_FLAG_COMPACT` (via `set_compact_shape`,
 `:2458-2460`) only in the `Some` case. So a flagged object's body is
@@ -329,24 +406,23 @@ fall-through is in both other collectors:
   humongous arm (`:7917-7943`) is bounds-checked by `humongous_copy`; the
   ordinary single-region arm is not.
 
-**So the answer to "is it reachable on the default collector today" is yes.**
+**So the answer to "is it reachable on the default collector today" was yes.**
 The sibling GC walkers in `gen_heap.rs` were hardened against precisely this
-state (`:15488-15520`, `:15576-15600` — they now test
-`is_compact_object(header)` directly and *skip* the object rather than fall
-back to legacy striding), and `object_body_size` was given
-`IMPLAUSIBLE_BODY_SIZE` as its corrupt-signal (`field_layout.rs:1124-1187`)
-for the same reason. **The mutator-side field accessors were never given the
-same treatment.**
+state (`:15488-15520`, `:15576-15600` — they test `is_compact_object(header)`
+directly and *skip* the object rather than fall back to legacy striding), and
+`object_body_size` was given `IMPLAUSIBLE_BODY_SIZE` as its corrupt-signal
+(`field_layout.rs:1124-1187`) for the same reason. **The mutator-side field
+accessors had never been given the same treatment.** They have now — see the
+FIXED note at the head of this entry.
 
-**What a fix involves.** Adopt the walkers' discrimination in all six
+**What the fix involved (done).** Adopt the walkers' discrimination in all six
 accessors (`get_field` / `set_field` on each of the three collectors): test
 `is_compact_object(header)` — the per-object header bit, independent of the
 registry — *before* the fall-through, and when it is set but the layout will
 not resolve, return `Value::Object(None)` / drop the write and log, exactly as
-`for_each_ref_slot` now skips. The legacy fall-through must be reachable only
-for objects whose compact bit is clear. The cheapest correct shape is a shared
-helper in `gc/src/heap.rs` next to `compact_oop_scan`, since all three
-collectors currently carry their own copy of the same three lines.
+`for_each_ref_slot` skips. The legacy fall-through is now reachable only for
+objects whose compact bit is clear. The shared helper in `gc/src/heap.rs` was
+proposed but not written; see the note at the head of this entry.
 
 ## 6. `is_addr_live` used an interior-accepting predicate — FIXED TODAY
 
@@ -385,12 +461,14 @@ live object, so the map hit fires first and the loose predicate is only a
 fallback. ZGC has no such map, so its predicate is load-bearing alone and must
 be exact. Do not "harmonise" these three arms.
 
-## 7. ZGC's native-alloc-pressure arms were inert while its allocator aborts — FIXED TODAY (partial)
+## 7. ZGC's native-alloc-pressure arms were inert while its allocator aborts — FIXED
 
-**Anchor:** `gc/src/vm_heap.rs:1167-1174` / `:1178-1194` / `:1199-1236` (the
-three arms), `gc/src/zgc.rs:1521` (the latch field), `:1676` / `:1685` /
-`:1700` (the accessors), `:1765` (the arming edge in `alloc_raw`), `:2973`
-(the disarm), `:2447-2449` and `:2482-2484` (the aborts).
+**Anchor:** `VmHeap::young_spill_pressure` /
+`VmHeap::clear_young_spill_pressure` / `VmHeap::note_young_spill_pressure` in
+`gc/src/vm_heap.rs`; the `native_alloc_pressure: AtomicBool` field and its
+accessor trio, the arming edge in `alloc_raw` and the disarm in
+`collect_garbage`, all in `gc/src/zgc.rs`; the two `FATAL: ZGC(real)` aborts in
+its `GarbageCollector::alloc_object` / `alloc_array`.
 
 **Mechanism.** `ZgcRealHeap`'s allocator is **infallible**:
 
@@ -419,36 +497,46 @@ should `grep 'FATAL: ZGC(real)'` over those logs **before** assuming a test
 bug or a VM defect elsewhere. A pre-fix run that hit this looks like an
 arbitrary crash, not like an OOM.
 
-**What landed today, and the desync between two agents' fixes.** Two
-independent changes landed and they do not fully meet:
+**The desync between two agents' fixes — now joined.** Two independent changes
+landed at opposite ends of the same fix and initially did not meet:
 
 - `gc/src/zgc.rs` **grew the real latch**: a `native_alloc_pressure: AtomicBool`
-  field (`:1521`, init `false` at `:1604`), `native_alloc_pressure()` (`:1676`),
-  `clear_native_alloc_pressure()` (`:1685`), `note_native_alloc_pressure()`
-  (`:1700`), armed from `alloc_raw` on the threshold crossing (`:1764-1766`)
-  and disarmed at the end of `collect_garbage` (`:2973`), with four unit tests
-  at `:3859-3981` including one that proves it cannot reopen the `gc_rearm` GC
-  storm.
-- `gc/src/vm_heap.rs` **did not adopt it.** `young_spill_pressure` returns
-  `h.needs_gc()` (`:1172`) — a *computed* stand-in, not the latch;
-  `clear_young_spill_pressure` is a no-op (`:1192`); and
-  `note_young_spill_pressure` is a no-op (`:1234`). Its doc at `:1150-1152`
-  and its TODO at `:1217-1232` both still assert that "`ZgcRealHeap` has no
-  pressure field and this file cannot add one" — **which is no longer true.**
+  field, the `native_alloc_pressure()` / `clear_native_alloc_pressure()` /
+  `note_native_alloc_pressure()` trio G1 exposes, armed from `alloc_raw` on the
+  threshold crossing and disarmed at the end of `collect_garbage`, with four
+  unit tests including one proving it cannot reopen the `gc_rearm` GC storm.
+- `gc/src/vm_heap.rs` **did not adopt it**, and its doc and TODO both still
+  asserted that "`ZgcRealHeap` has no pressure field and this file cannot add
+  one" — a claim that had stopped being true the same day. **The stale comment
+  was the only thing holding the gap open**, which is the transferable lesson
+  here: a TODO that describes another file's state is a claim with an
+  expiry date on it.
 
-**Net effect.** The abort-on-a-heap-full-of-garbage case *is* now covered,
-because `needs_gc()` answers the same question as G1's arming edge. What is
-still dropped is an *externally* noted event: a caller that spilled below the
-trigger and wants the next boundary to collect anyway. `vm_heap.rs:1212-1215`
-argues no such caller exists outside `gc/`, which the grep confirms — so this
-is a gap in the mechanism rather than a live defect, but it is a gap held open
-by a stale comment.
+**Now closed.** All three arms are plain delegations, and the doc comments were
+rewritten rather than deleted so the reasoning survives:
 
-**Remaining work is mechanical and is already specced in-tree.** Follow
-`vm_heap.rs:1217-1232` steps (1)-(4), all of which `zgc.rs` has now done, and
-make the three arms plain delegations like G1's, with
-`young_spill_pressure` becoming `h.native_alloc_pressure() || h.needs_gc()` so
-the latch **adds to** the occupancy test rather than replacing it. Then delete
-the three stale claims in `vm_heap.rs`. Separately, the aborts at
-`zgc.rs:2449` / `:2485` should become a Java `OutOfMemoryError` — pressure
-signalling reduces how often they are reached but does not remove them.
+- `young_spill_pressure` → `h.native_alloc_pressure() || h.needs_gc()`. The
+  disjunction is deliberate and differs from G1's bare latch read: the consumer
+  in `vm/src/vm/vm_exec.rs` clears unconditionally after acting, *including*
+  when its own gates said no, so a just-cleared latch would answer `false` over
+  a heap genuinely over its trigger. `|| h.needs_gc()` keeps the `abort()` case
+  covered by construction; the latch adds the edge occupancy cannot see.
+- `clear_young_spill_pressure` → `h.clear_native_alloc_pressure()`.
+- `note_young_spill_pressure` → `h.note_native_alloc_pressure()`, which closes
+  the one thing the computed stand-in dropped: an *externally* noted event from
+  a caller that spilled below the trigger. Still no such caller outside `gc/`,
+  so this was a gap in the mechanism rather than a live defect.
+
+Neither term can recreate the `gc_rearm` GC storm: the latch is armed on
+`needs_gc`'s predicate verbatim, so it inherits the re-arm floor each collection
+raises, and the consumer re-checks `gc_overhead_limit_exceeded` and `needs_gc`
+before running anything — one note buys at most one gate evaluation.
+
+**Residual, and it is architectural rather than a defect.** The two
+`FATAL: ZGC(real)` sites still `abort()`; they should throw a Java
+`OutOfMemoryError`. Pressure signalling reduces how often they are reached but
+cannot remove them, because `GarbageCollector::alloc_object` / `alloc_array`
+return a bare `ObjectRef` — the trait has no failure channel, and giving it one
+touches every backend. That is a design change, not a fix to this entry, and it
+is why this document closes at 7 of 7 with a named residual rather than 6 of 7.
+The triage advice above stands until then: `grep 'FATAL: ZGC(real)'` first.
