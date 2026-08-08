@@ -3297,7 +3297,7 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
             }
 
             // `sockaddr` is 16 bytes; all-zero gives sa_family = AF_UNSPEC (0).
-            let addr = [0u8; 16]?;
+            let addr = [0u8; 16];
             let rc = unsafe { connect(sock.as_raw_socket() as usize, addr.as_ptr(), 16) };
             if rc == 0 {
                 return Ok(());

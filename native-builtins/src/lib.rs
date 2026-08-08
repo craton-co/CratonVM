@@ -27340,7 +27340,7 @@ fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let msb = uuid_get_msb(ctx, this);
     let lsb = uuid_get_lsb(ctx, this);
     let hilo = msb ^ lsb;
-    let hash = (((hilo >> 32) ^ hilo) as i32);
+    let hash = ((hilo >> 32) ^ hilo) as i32;
     Ok(Some(Value::Int(hash)))
 }
 
@@ -36645,7 +36645,7 @@ fn pack_lock_key(hash: u32, generation: u32) -> usize {
 ///      DISTINCT objects all bucket there, so we must NOT merge them);
 ///   3. otherwise a new object / genuine collision → fresh generation.
 fn gc_stable_lock_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<usize, MethodCallFailed> {
-    let hash = (ctx.identity_hash_code(obj) as u32);
+    let hash = ctx.identity_hash_code(obj) as u32;
     let ptr = obj.as_ptr() as usize;
     let mut reg = lock_key_registry().lock();
     let slots = reg.entry(hash).or_default();

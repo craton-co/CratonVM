@@ -15330,7 +15330,10 @@ fn nio_owner_principal(ctx: &mut dyn NativeContext, path_value: Value) -> Method
         };
         if !path_text.is_empty() {
             if std::fs::symlink_metadata(&path_text).is_err() {
-                return Err(p57_no_such_file(ctx, &path_text));
+                // `p57_no_such_file` allocates the exception object, so building
+                // it can itself fail; `?` propagates that, and the success value
+                // IS the `MethodCallFailed` this returns.
+                return Err(p57_no_such_file(ctx, &path_text)?);
             }
             let Some((account, sid_text, sid_type)) = win_file_owner_account(&path_text) else {
                 return Err(RuntimeError::IOException {
@@ -15340,7 +15343,7 @@ fn nio_owner_principal(ctx: &mut dyn NativeContext, path_value: Value) -> Method
             };
             return Ok(Some(Value::Object(Some(alloc_windows_user_principal(
                 ctx, &account, &sid_text, sid_type,
-            )))));
+            )?))));
         }
     }
     let attrs = match p59_files_read_attributes(ctx, &[path_value])? {
@@ -15552,20 +15555,20 @@ fn alloc_windows_user_principal(
     account: &str,
     sid_text: &str,
     sid_type: i32,
-) -> cratonvm_types::ObjectRef {
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, "sun/nio/fs/WindowsUserPrincipals$User", 3)?;
     // GC-SAFETY: `create_string` allocates, so pin the carrier and re-read it
     // through the pin after each allocation before writing into it.
     let pin = ctx.pin_native_root(obj);
     let sid_str = ctx.create_string(sid_text);
-    let obj = ctx.read_native_pin(pin, obj)?;
+    let obj = ctx.read_native_pin(pin, obj);
     ctx.set_field_by_name(obj, "sidString", Value::Object(Some(sid_str)));
     let account_str = ctx.create_string(account);
-    let obj = ctx.read_native_pin(pin, obj)?;
+    let obj = ctx.read_native_pin(pin, obj);
     ctx.set_field_by_name(obj, "accountName", Value::Object(Some(account_str)));
     ctx.set_field_by_name(obj, "sidType", Value::Int(sid_type));
     ctx.unpin_native_roots(pin);
-    obj
+    Ok(obj)
 }
 
 /// Same identity key as `basic_file_attributes_file_key`, but computed straight
@@ -19226,10 +19229,9 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             let link_pin = ctx.pin_native_root(link_obj);
             let link = p57_read_path(ctx, link_obj);
             let existing = p57_read_path(ctx, existing);
-            let result = p57_create_hard_link(ctx, &link, &existing)?;
+            p57_create_hard_link(ctx, &link, &existing)?;
             let link_obj = ctx.read_native_pin(link_pin, link_obj);
             ctx.unpin_native_roots(link_pin);
-            result;
             Ok(Some(Value::Object(Some(link_obj))))
         },
     );
@@ -19241,10 +19243,9 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             let link_pin = ctx.pin_native_root(link_obj);
             let link = p57_read_path(ctx, link_obj);
             let target = p57_read_path(ctx, target);
-            let result = p57_create_symbolic_link(ctx, &link, &target)?;
+            p57_create_symbolic_link(ctx, &link, &target)?;
             let link_obj = ctx.read_native_pin(link_pin, link_obj);
             ctx.unpin_native_roots(link_pin);
-            result;
             Ok(Some(Value::Object(Some(link_obj))))
         });
     r.register(
