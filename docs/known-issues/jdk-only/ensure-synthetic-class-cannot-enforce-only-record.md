@@ -351,16 +351,39 @@ Both are wired now.
 feature set compiles paths that check does not, and it turned up 46 more errors
 plus every one of the 181 discarded refusals after the lib alone was clean.
 
-**On the regression suite's one failure.** It is not the same test twice:
-`RSocketChannelInterrupt` on one run, `RMapGcStress` on the next, and each
-passes when run on its own. The Azure host was simultaneously running two other
-sessions' Hibernate and H2 suites. `RSocketChannelInterrupt` additionally fails
-**identically on a pre-change `dev` binary** (2026-08-05), naming the
-`blocked-reader-never-wakes` defect in `native-io/src/socket_channel.rs` that
-its own assertion text points at — so that one is pre-existing, not a
-regression. Both are load-sensitive (a blocking-read interrupt and a GC stress
-loop); neither is evidence about this change, and neither should be read as a
-clean 31/31 either.
+**And neither is one platform — this one got through.** A span-driven sweep
+edits text but is corrected only by diagnostics, and rustc emits none for a
+`#[cfg(windows)]` block on Linux. Those arms are therefore **rewritten and
+never type-checked**, which is the worst of both. This migration was green on
+the Azure Linux host and broke the Windows build: 8 stray `?`, including
+`let addr = [0u8; 16]?;` on an array literal and `read_native_pin(..)?` on an
+infallible function that fourteen other call sites in the same file spell
+without one. Fixed in `604bab335` by another lane, which is not where that
+should have been found.
+
+Step 3 sweeps the remaining 72 direct callers the same way, so: `grep -c
+'#[cfg('` the files you touch, and run `cargo check` on every target and
+feature combination whose arms the sweep edited — not only the one you happen
+to be driving from.
+
+**On the regression suite's one failure**, stated at the strength the
+evidence actually supports, which is not the same for the two tests:
+
+* `RSocketChannelInterrupt` — **pre-existing.** It fails identically on a
+  pre-change `dev` binary (2026-08-05), naming the `blocked-reader-never-wakes`
+  defect in `native-io/src/socket_channel.rs` that its own assertion text points
+  at. That control ran the test and hit the assertion, so it is a real
+  comparison.
+* `RMapGcStress` — **unattributed.** It passes when run on its own against this
+  change, and failed in two full-suite runs while the Azure host was also
+  running two other sessions' Hibernate and H2 suites. There is *no valid
+  pre-change control*: the A/B attempt produced nothing usable, because the
+  control arm failed on JDK resolution rather than on the test, and the other
+  arm's binary was deleted mid-run by this session's own cleanup. So it is not
+  known to be a regression and not shown to be pre-existing.
+
+The failure is also not the same test twice across runs. None of this should be
+read as a clean 31/31.
 
 ### What making a funnel fallible actually FINDS — the reason to do it at all
 
