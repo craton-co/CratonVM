@@ -10,7 +10,8 @@ seconds on dev tip (two IR-tier JIT bugs, fixed), H2's own `LOCK_TIMEOUT` /
 `bug-h2-classid0-stale-address-family.md`.
 
 What is left is this page: a constant factor, re-measured on shapes that can
-carry it, and a thread-scaling question this host cannot answer. It is
+carry it. The thread-scaling question is **answered** as of 2026-08-08 — 3.33x
+from 4 to 25 threads, and it is lock contention (see below). It is
 deliberately **not** filed as "a bug" — the previous framing ("≈100x. That is
 the bug.") pointed three sessions at a problem no single fix could match.
 
@@ -211,32 +212,70 @@ The whole-class number is the trustworthy one, because it is a single comparison
 of two runs on one host in one hour rather than a difference of two large
 quantities: **1303-1506 CPU-s vs 17.3, ≈75-87x** over three cratonvm runs.
 
-### The thread-scaling slope is NOT resolved, and the old page's was not either
+### The thread-scaling slope IS resolved (2026-08-08): 3.33x, and it is a lock
 
 The retired page claimed cratonvm's CPU per update *doubles* from 4 to 25
-threads (3.6 → 7.8) while HotSpot's falls (0.41 → 0.15), and named that as the
-UPDATE path's distinguishing feature against the INSERT half's flat scaling.
+threads (3.6 → 7.8) while HotSpot's *falls* (0.41 → 0.15). This page then
+recorded that neither reproduced, because across four campaigns the per-rep
+25t ÷ 4t ratio came out 0.84, 0.98, 1.35, 1.47, 1.56, 1.67, 1.78, 2.27 — not
+even holding its direction — and named the experiment that would settle it.
 
-**That does not reproduce.** Across four campaigns the per-rep 25t ÷ 4t ratio
-came out 0.84, 0.98, 1.35, 1.47, 1.56, 1.67, 1.78, 2.27 — it does not even hold
-its direction. The medians give 1.44x, but the two bands overlap outright
-(4 threads 3.8-9.3, 25 threads 7.5-10.6), so the median is not evidence.
+**That experiment has now been run.** Both arms do exactly **100 000 updates**
+(4 threads × 25 000 against 25 threads × 4 000), so the work term dominates the
+setup baseline instead of being a difference of two large similar numbers: the
+baseline:work ratio is **1:17 at 4 threads and 1:56 at 25**, against the 1.5:1
+that defeated every earlier attempt. The 0-update baseline of each shape is
+interleaved as an ordinary arm, the arm order rotates every rep, the metric is
+CPU (user+sys), and `--Xmx 2g`. Four reps, load 5.5-17.8 recorded per run.
 
-The reason is structural rather than bad luck, and it is worth writing down
-because it applies to every cross-thread-count comparison on this host: **at
-equal total work the two shapes have very different wall durations** — ~10
-minutes at 4 threads against ~1 minute at 25 — so running them back-to-back
-inside a rep does not make them see the same load. Pairing removes a level
-shift; it cannot remove two arms sampling different load windows.
+| | 4 threads | 25 threads | slope |
+| --- | ---: | ---: | ---: |
+| **cratonvm** work CPU / 100 000 updates | **242.2 s** | **806.8 s** | **3.33x** |
+| per update | 2.42 ms | 8.07 ms | |
+| HotSpot jdk-25, same shape | 5.6 s | 5.7 s | 1.02x |
+| gap | **43x** | **142x** | |
 
-What WOULD settle it, and has not been done: a 4-thread arm doing ~100 000
-updates (~11 CPU-minutes of work against a ~40 CPU-s baseline, a 16:1 ratio
-instead of 1.5:1), interleaved with a 25-thread arm of the same total work, on a
-host under 10 % load or on a dedicated one. Everything smaller has been tried.
+Per-rep cratonvm ratios: **2.95, 3.20, 3.25, 3.48**. The direction is unanimous
+and the bands do not overlap (4t work 237-275 CPU-s, 25t work 761-826). The
+slope is real, and it is **larger than the retired page claimed**, not absent as
+this page previously concluded — the earlier campaigns were not wrong about the
+noise, they were under-resolved.
 
-Until then the honest statement is the first table: **~30x at 4 threads and
-~60x at 25**, with the growth between them real-looking but unproven.
+### It is a lock, not per-thread work
 
+The CPU figure alone does not say whether 25 threads are doing more work or the
+same work while contending. Divide CPU by elapsed to get cores actually busy:
+
+| cratonvm arm | CPU | elapsed | cores busy |
+| --- | ---: | ---: | ---: |
+| 4 threads × 25 000 | 256.1 s | 71.3 s | **3.6 of 4** |
+| 25 threads × 4 000 | 821.1 s | 333.2 s | **2.5 of 25** |
+
+At 4 threads cratonvm gets 3.6 of its 4 threads running. At 25 it gets **2.5** —
+*less absolute parallelism from six times the threads*, while burning 3.33x the
+CPU per update. That is the signature of a global lock: the extra CPU is spin
+and wait, not work. HotSpot on the same shape goes the other way, 5.0 → 6.4
+cores busy.
+
+It also matches the other end of this page: `load_class_concurrent` is 1.4 % at
+25 threads and 0.64 % at 1, which is the `ClassManager` read lock and not class
+loading (see the 1-thread profile above). **The scaling target on this page is a
+lock inventory, not a symbol list** — and unlike the constant factor, a lock has
+the shape of something one fix can move.
+
+### Two corrections to the old framing
+
+* **HotSpot's per-update CPU does not fall.** On the same 100 000-update shape it
+  is flat (5.6 vs 5.7 CPU-s). At a 1 000 000-update shape, where C2 is fully
+  warm, it *rises* 1.55x (12.4 → 19.1 CPU-s of work) — H2 itself contends. So
+  the honest comparison is not "cratonvm rises where HotSpot falls" but
+  **"both rise; cratonvm's slope is roughly twice HotSpot's, on top of a
+  constant factor two orders of magnitude wide."**
+* **The 43x / 142x figures understate the gap.** HotSpot's 100 000-update arm
+  runs for ~2 s, so it is warmup-dominated: at 1 000 000 updates its per-update
+  work CPU is 0.0124 ms at 4 threads against 0.056 ms here. Quoted anyway
+  because they are the only same-shape, same-session, interleaved pair; treat
+  them as lower bounds.
 ## Interpreter against interpreter, the factor is ~10x — and it is flat
 
 The headline 30-87x above is measured against HotSpot **with C2**, which folds

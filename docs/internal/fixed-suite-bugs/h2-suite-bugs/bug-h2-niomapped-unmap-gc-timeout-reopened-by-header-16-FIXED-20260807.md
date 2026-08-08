@@ -1,6 +1,46 @@
 # `nioMapped:` — the unmap GC timeout is back, and the compact-header fix did not fix it
 
-**Status: OPEN**, 2026-08-07. Bisected. Reproduces on Linux and Windows, on
+**Status: FIXED** 2026-08-08, by `0ea21c07a` + `95fee50a4` -- the young-sweep
+zero-span fix, landed for a different bug entirely (the H2 UPDATE-path OOM).
+No work was done against this page's own symptom.
+
+## What fixed it, and how that was established
+
+ABBA-interleaved, two release binaries built from the same tree differing in
+**one file** (`gc/src/gen_heap.rs`), same host, same probe, same argument:
+
+| arm | `TfsProbe nioMapped:` | unmap timeouts |
+|---|---|---|
+| `gen_heap.rs` reverted to `7e3742c05` | **FAIL 10.0 s** | 1 |
+| with the fix | **OK 0.9 s** | 0 |
+| with the fix | **OK 0.9 s** | 0 |
+| `gen_heap.rs` reverted to `7e3742c05` | **FAIL 10.0 s** | 1 |
+
+2/2 each way, against HotSpot's `OK 1.4 s` on the same probe.
+
+This page asked the right question -- *"whatever keeps a `MappedByteBuffer`
+reachable after its last Java reference is gone"* -- and the answer is that
+nothing kept it reachable. **Nothing collected it.** Since `HEADER_SIZE`
+24 -> 16 a JIT-allocated `new Object()` has an all-zero header, the young
+sweep read that as walk desync, and re-anchored at the next free block --
+abandoning everything in between, and with an empty free list abandoning the
+rest of the arena outright. The sweep freed nothing at all, so a dead
+`MappedByteBuffer` was never reclaimed, and `FileNioMapped.unMap` spun through
+`System.gc()` for its full 10 s waiting for a collection that could not happen.
+
+The bisect on this page was right that `6ba350cdd` (`HEADER_SIZE` 24 -> 16)
+introduced it, and right that the compact-ref-field defect and the
+`try_thin_unlock` quartet fix were both the wrong suspects. The mechanism is
+the third thing that merge changed, written up in
+`../vm/jit-young-heap-exhaustion-after-header-16-FIXED-20260807.md`.
+
+The "Next step" below is superseded: the residue-band / `is_plausible_header`
+line of inquiry, and `CRATONVM_JIT_UNREG_ACCEPT_RESIDUE`, were never the lever.
+Kept as filed.
+
+## Status (as filed)
+
+**OPEN**, 2026-08-07. Bisected. Reproduces on Linux and Windows, on
 pristine `dev` and on any branch of it.
 
 ## Symptom
