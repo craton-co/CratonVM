@@ -2721,6 +2721,40 @@ const S2DC_SOCK_ID: usize = 4;
 
 // ---- ByteBuffer helpers ----------------------------------------------------
 
+/// The class to stamp on a HEAP `ByteBuffer`: the concrete `HeapByteBuffer`
+/// (or `HeapByteBufferR` for a read-only view) when its real-JDK bytecode is
+/// available, else the abstract `java/nio/ByteBuffer` exactly as before.
+///
+/// `java.nio.ByteBuffer` is ABSTRACT. Stamping it leaves every method without a
+/// CratonVM native dispatching to an abstract declaration, i.e.
+/// `AbstractMethodError: ... has no Code attribute` for the first caller of
+/// anything the S2 surface does not cover. Nothing hits it today only because
+/// `register_essential_natives` happens to give those methods bodies -- the
+/// exposure is conditional, not absent. Naming the concrete class gives them
+/// real JDK bodies instead, which is what HotSpot reports
+/// (`kind=HeapByteBuffer` / `kind=HeapByteBufferR`).
+///
+/// Both probes are needed and neither alone is enough -- the same idiom
+/// `allocateDirect` above uses. `would_fabricate_synthetic_stub` is the
+/// non-destructive "are the class bytes reachable" question, but it answers
+/// "no stub" once ANY earlier caller has already minted one;
+/// `is_class_synthetic_stub` covers exactly that case. Falling back to the
+/// abstract name matters: a synthetic stub would trade `AbstractMethodError`
+/// for a buffer whose every method is a silent no-op, which is strictly worse
+/// than the status quo.
+fn s2_bb_heap_class(ctx: &mut dyn NativeContext, read_only: bool) -> &'static str {
+    let name = if read_only {
+        "java/nio/HeapByteBufferR"
+    } else {
+        "java/nio/HeapByteBuffer"
+    };
+    if !ctx.would_fabricate_synthetic_stub(name) && !ctx.is_class_synthetic_stub(name) {
+        name
+    } else {
+        "java/nio/ByteBuffer"
+    }
+}
+
 fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectRef>, MethodCallFailed> {
     use cratonvm_types::ArrayElementType;
     // `ByteBuffer.allocate(n)` is caller-sized: `n` comes straight from Java,
@@ -2738,7 +2772,8 @@ fn s2_bb_alloc(ctx: &mut dyn NativeContext, cap: usize) -> Result<Option<ObjectR
     // trigger a collection that relocates `arr` (read again by
     // `bb_write_hb` immediately after); pin it and re-read.
     let arr_pin = ctx.pin_native_root(arr);
-    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+    let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.unpin_native_roots(arr_pin);
     bb_write_hb(ctx, buf, arr, cap as i32);
@@ -4473,7 +4508,8 @@ fn s2_bb_new_heap_view(
     read_only: bool,
     ord: i32,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+    let cls = s2_bb_heap_class(ctx, read_only);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
     ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
     ctx.set_field_by_name(buf, "offset", Value::Int(offset as i32));
     ctx.set_field_by_name(buf, "isReadOnly", Value::Int(read_only as i32));
@@ -4594,7 +4630,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
     r.register(bb, "wrap", "([B)Ljava/nio/ByteBuffer;", |ctx, args| {
         let arr = obj_arg(args, 0)?;
         let len = ctx.array_length(arr) as i32;
-        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+        let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
         bb_write_hb(ctx, buf, arr, len);
         Ok(Some(Value::Object(Some(buf))))
     });
@@ -4614,7 +4651,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         if off < 0 || len < 0 || i64::from(off) + i64::from(len) > i64::from(cap) {
             return Err(RuntimeError::ioobe_no_message().into());
         }
-        let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+        let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
         bb_write_hb(ctx, buf, arr, cap);
         // Override position/limit set by bb_write_hb.
         ctx.set_field_by_name(buf, "position", Value::Int(off));
@@ -5454,7 +5492,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     ctx.set_array_element(new_arr, i, b);
                 }
             }
-            let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+            let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
             bb_write_hb(ctx, buf, new_arr, rem);
             s2_bb_set_order(ctx, buf, ord);
             return Ok(Some(Value::Object(Some(buf))));
@@ -5476,7 +5515,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             // Storage-less synthetic: keep the historic empty-copy result.
             None => {
                 let new_arr = ctx.new_array(ArrayElementType::Byte, rem as usize);
-                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+                let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, rem);
                 Ok(buf)
             }
@@ -5528,7 +5568,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                         ctx.set_array_element(new_arr, i, b);
                     }
                 }
-                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+                let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 bb_write_hb(ctx, buf, new_arr, length);
                 s2_bb_set_order(ctx, buf, ord);
                 Ok(buf)
@@ -5554,7 +5595,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             _ => {
                 // Bare-synthetic / storage-less: legacy shared-array
                 // rebuild (aliases the array, no offset support needed).
-                let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+                let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                 if let Some(src_arr) = s2_bb_arr(ctx, this) {
                     bb_write_hb(ctx, buf, src_arr, cap);
                     ctx.set_field_by_name(buf, "position", Value::Int(pos));
@@ -5589,7 +5631,8 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     s2_bb_new_direct_view(ctx, addr, pos, lim, cap, mark, true, ord)
                 }
                 _ => {
-                    let buf = try_alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", 6)?;
+                    let cls = s2_bb_heap_class(ctx, false);
+    let buf = try_alloc_concurrent_synthetic(ctx, cls, 6)?;
                     if let Some(src_arr) = s2_bb_arr(ctx, this) {
                         bb_write_hb(ctx, buf, src_arr, cap);
                         ctx.set_field_by_name(buf, "position", Value::Int(pos));
