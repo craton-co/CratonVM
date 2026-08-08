@@ -8457,8 +8457,45 @@ pub(crate) fn native_method_invoke(
     // export jdk.internal.misc to unnamed module"), while
     // `ArrayList.size()` invokes normally. Without this arm CratonVM
     // fabricated a success where the spec mandates a failure.
+    //
+    // 2026-08-07: the non-public arm used to ask
+    // `check_reflection_module_access` — the OPENS/deep-reflection question —
+    // and that is the wrong question for `invoke`. `opens` is
+    // `setAccessible(true)`'s gate, not a reflective CALL's. HotSpot's
+    // `AccessibleObject.checkAccess` -> `Reflection.verifyMemberAccess` ->
+    // `verifyModuleAccess` tests `memberModule.isExported(pkg, callerModule)`
+    // and never consults `opens`; a package that is exported-but-not-open is
+    // invocable, it is merely not deep-reflectable.
+    //
+    // The visible cost was an OVER-REFUSAL of legal JLS §6.6.2 access, and it
+    // was invisible to the language-level check sitting right above this, which
+    // had already answered correctly. Measured on `Object.finalize` (protected,
+    // `java.lang`, exported but not open) invoked with NO `setAccessible`, from
+    // a classpath class, against HotSpot 25.0.3:
+    //
+    //   receiver = the caller's own class     HotSpot OK    was IllegalAccessException
+    //   receiver = a subclass of the caller   HotSpot OK    was IllegalAccessException
+    //   receiver = the declaring class        both IllegalAccessException
+    //   receiver = an unrelated class         both IllegalAccessException
+    //
+    // Both DENY rows already agreed, which is why this survived: a suite that
+    // asserts only the refusals is satisfied by an implementation that refuses
+    // everything. `regression-suite/src/RJdkFieldModule.java` asserts the
+    // positive half too, and is what caught it.
+    //
+    // `Object.finalize` is the probe, not the point — the rule governs every
+    // reflective call to an inherited `protected` member, `Object.clone`
+    // included.
+    //
+    // So both arms ask the same question now, and the `is_public` split is only
+    // about which helper carries the exact-identity target id.
     if !is_public {
-        if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
+        if let Err(msg) = check_reflection_export_access_with_target_id(
+            ctx,
+            &class_name,
+            declaring_cid,
+            accessible,
+        ) {
             return Err(
                 cratonvm_types::error::RuntimeError::IllegalAccessException {
                     message: format!("Method.invoke: {class_name}.{method_name}: {msg}"),

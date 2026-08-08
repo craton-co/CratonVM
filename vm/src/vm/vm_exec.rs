@@ -8128,6 +8128,15 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .is_some()
     }
 
+    fn module_names(&self) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .module_names()
+    }
+
     fn module_exports(&self, module_name: &str) -> Vec<(String, Vec<String>)> {
         self.shared
             .classes

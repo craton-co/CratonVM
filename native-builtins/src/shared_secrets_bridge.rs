@@ -865,6 +865,201 @@ fn jla_get_declared_public_methods(
     }
 }
 
+/// `JavaLangAccess.getDeclaredPublicMethods(Class<?> klass, String name,
+/// Class<?>... parameterTypes)` -> `List<Method>`.
+///
+/// A DIFFERENT method from the array-returning overload above, and it was
+/// pointed at the same handler, so it answered a `Method[]` of EVERY declared
+/// method where the JDK declares a `List<Method>` filtered to the public
+/// declarations named `name` with exactly `parameterTypes`.
+///
+/// What that broke, found 2026-08-07 once `--jdk-only` could finally reach it:
+/// `java.util.ServiceLoader.findStaticProviderMethod` is
+///
+/// ```java
+/// List<Method> methods = LANG_ACCESS.getDeclaredPublicMethods(clazz, "provider");
+/// ```
+///
+/// so the module-path `provider()` STATIC FACTORY form could never be found.
+/// `loadProvider` then fell through to its constructor branch and reported
+/// `ServiceConfigurationError: ... FactoryGreeter not a subtype`, which is true
+/// and beside the point: a factory provider deliberately does not implement the
+/// service. Measured on `regression-suite/src/RJdkModule.java:223`.
+///
+/// The filters are all three load-bearing:
+///
+/// * **public** - `getDeclaredPublicMethods` is public-only, and a private
+///   `provider()` must NOT be honoured;
+/// * **name** - the caller passes `"provider"` and expects nothing else back;
+/// * **parameter types** - the varargs are an EXACT match, and
+///   `findStaticProviderMethod` passes none, meaning the no-arg method. A
+///   `provider(String)` overload must not satisfy it.
+///
+/// `parameterTypes` compares by `Class.getName()` rather than by identity: the
+/// comparison spans `invoke` calls that can move objects, and a name is stable
+/// across a GC where an `ObjectRef` is not.
+fn jla_get_declared_public_methods_list(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = the Class,
+    // args[2] = the name, args[3] = the Class[] of parameter types.
+    let cls = match args.get(1) {
+        Some(Value::Object(Some(c))) => *c,
+        _ => return new_empty_list(ctx),
+    };
+    let want_name = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let want_params: Option<Vec<String>> = match args.get(3) {
+        Some(Value::Object(Some(arr))) => {
+            let arr = *arr;
+            let n = ctx.array_length(arr);
+            let mut v = Vec::with_capacity(n);
+            for i in 0..n {
+                match ctx.get_array_element(arr, i) {
+                    Value::Object(Some(c)) => {
+                        let name = class_name_via_get_name(ctx, c);
+                        v.push(name);
+                    }
+                    _ => v.push(String::new()),
+                }
+            }
+            Some(v)
+        }
+        _ => None,
+    };
+
+    let list = match new_array_list(ctx) {
+        Some(l) => l,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let list_pin = ctx.pin_native_root(list);
+
+    let methods = match ctx.invoke(
+        "java/lang/Class",
+        "getDeclaredMethods",
+        "()[Ljava/lang/reflect/Method;",
+        &[Value::Object(Some(cls))],
+    ) {
+        Ok(Some(Value::Object(Some(arr)))) => arr,
+        _ => {
+            let list = ctx.read_native_pin(list_pin, list);
+            ctx.unpin_native_roots(list_pin);
+            return Ok(Some(Value::Object(Some(list))));
+        }
+    };
+    let arr_pin = ctx.pin_native_root(methods);
+    let len = ctx.array_length(methods);
+
+    const ACC_PUBLIC: i32 = 0x0001;
+    for i in 0..len {
+        let methods = ctx.read_native_pin(arr_pin, methods);
+        let m = match ctx.get_array_element(methods, i) {
+            Value::Object(Some(m)) => m,
+            _ => continue,
+        };
+        let m_pin = ctx.pin_native_root(m);
+
+        let m_ref = ctx.read_native_pin(m_pin, m);
+        let name_ok = match ctx.invoke_virtual(m_ref, "getName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => match (&want_name, ctx.read_string(s)) {
+                (Some(want), Some(got)) => *want == got,
+                (None, _) => true,
+                _ => false,
+            },
+            _ => false,
+        };
+        if !name_ok {
+            ctx.unpin_native_roots(m_pin);
+            continue;
+        }
+
+        let m_ref = ctx.read_native_pin(m_pin, m);
+        let is_public = matches!(
+            ctx.invoke_virtual(m_ref, "getModifiers", "()I", &[]),
+            Ok(Some(Value::Int(v))) if (v & ACC_PUBLIC) != 0
+        );
+        if !is_public {
+            ctx.unpin_native_roots(m_pin);
+            continue;
+        }
+
+        if let Some(want) = &want_params {
+            let m_ref = ctx.read_native_pin(m_pin, m);
+            let got: Vec<String> =
+                match ctx.invoke_virtual(m_ref, "getParameterTypes", "()[Ljava/lang/Class;", &[]) {
+                    Ok(Some(Value::Object(Some(pt)))) => {
+                        let n = ctx.array_length(pt);
+                        let mut v = Vec::with_capacity(n);
+                        for j in 0..n {
+                            match ctx.get_array_element(pt, j) {
+                                Value::Object(Some(c)) => {
+                                    let name = class_name_via_get_name(ctx, c);
+                                    v.push(name);
+                                }
+                                _ => v.push(String::new()),
+                            }
+                        }
+                        v
+                    }
+                    _ => Vec::new(),
+                };
+            if got != *want {
+                ctx.unpin_native_roots(m_pin);
+                continue;
+            }
+        }
+
+        let list_ref = ctx.read_native_pin(list_pin, list);
+        let m_ref = ctx.read_native_pin(m_pin, m);
+        let _ = ctx.invoke_virtual(
+            list_ref,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(m_ref))],
+        );
+        ctx.unpin_native_roots(m_pin);
+    }
+
+    let list = ctx.read_native_pin(list_pin, list);
+    ctx.unpin_native_roots(arr_pin);
+    ctx.unpin_native_roots(list_pin);
+    Ok(Some(Value::Object(Some(list))))
+}
+
+/// `cls.getName()` as a Rust `String`, empty when it cannot be read.
+fn class_name_via_get_name(ctx: &mut dyn NativeContext, cls: ObjectRef) -> String {
+    match ctx.invoke_virtual(cls, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// An empty `java.util.List`, for the early-out paths above.
+fn new_empty_list(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    Ok(Some(Value::Object(new_array_list(ctx))))
+}
+
+/// A constructed, empty `java.util.ArrayList`.
+///
+/// Allocate-then-`<init>` rather than a bare allocation: the list is handed to
+/// real JDK bytecode, which reads `elementData`/`size`, and an object whose
+/// constructor never ran has neither.
+fn new_array_list(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let cid = ctx.ensure_class_initialized("java/util/ArrayList").ok()?;
+    let list = ctx.alloc_object(cid, ctx.class_num_total_fields(cid).max(4));
+    ctx.invoke(
+        "java/util/ArrayList",
+        "<init>",
+        "()V",
+        &[Value::Object(Some(list))],
+    )
+    .ok()?;
+    Some(list)
+}
+
 fn jla_get_methods_or_null(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // INSTANCE method: args[0] = receiver (System$1), args[1] = the Class.
     if let Some(Value::Object(Some(cls))) = args.get(1) {
@@ -1180,7 +1375,7 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         owner,
         "getDeclaredPublicMethods",
         "(Ljava/lang/Class;Ljava/lang/String;[Ljava/lang/Class;)Ljava/util/List;",
-        jla_get_declared_public_methods,
+        jla_get_declared_public_methods_list,
     );
     registry.register(
         owner,
