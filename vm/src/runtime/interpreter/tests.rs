@@ -3,6 +3,133 @@
 
 use super::*;
 
+/// Control for `aastore_element_assignable`, the predicate the interpreter
+/// opcode, the JIT's `jit_aastore` and (since e627cdff5) reflective
+/// `Array.set` all share.
+///
+/// # Why this needs to exist
+///
+/// That predicate is deliberately *additive*: it must never produce a FALSE
+/// `ArrayStoreException`, so it fails open along five separate arms. Nothing
+/// measured how much it still refuses, and `Array.set`'s refusal in particular
+/// had **no** coverage anywhere in the tree — grepping
+/// `array element type mismatch` found the throw site and two comments, and no
+/// test. A predicate that had degenerated into `true` would have satisfied the
+/// `Array.set` fix and broken nothing visible.
+///
+/// So this asserts the refusal and two of the fail-open arms **together**. The
+/// refusal alone would pass against a predicate that refuses everything; the
+/// lenient arms alone are what a degenerate `true` satisfies. Only the pair
+/// pins the shape.
+///
+/// # Why the class names are neutral
+///
+/// `synthetic_implements`, the last fail-open arm, is a table of specific name
+/// pairs (`HashMap$Entry` -> `Map$Entry`, `SystemLogger` -> `System$Logger`,
+/// …). Naming these classes after real JDK types could match it and make the
+/// control vacuously pass, so they are deliberately outside any table.
+///
+/// # Not covered here
+///
+/// The loader-split arm (same component name, two `ClassId`s) needs two
+/// same-named classes, which `ensure_synthetic_class` dedupes by name. That leg
+/// is characterised instead by
+/// `classloading::class::tests::a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name`.
+#[test]
+fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
+    use cratonvm_reader::class_access_flags::ClassAccessFlags;
+    use cratonvm_types::ArrayElementType;
+
+    let shared =
+        std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+
+    let (alpha, beta, iface, proxy) = {
+        let mut cm = shared.classes.class_manager.write();
+        let alpha = cm.ensure_synthetic_class("cratonvm/test/AastoreAlpha", 0);
+        let beta = cm.ensure_synthetic_class("cratonvm/test/AastoreBeta", 0);
+        let iface = cm.ensure_synthetic_class("cratonvm/test/AastoreIface", 0);
+        cm.class_store
+            .get_mut(iface)
+            .expect("just fabricated")
+            .access_flags |= ClassAccessFlags::INTERFACE;
+        // The name is the whole point: the predicate's proxy arm tests
+        // `contains("$Proxy")`, which is what admits `jdk/proxy3/$Proxy27` in
+        // the `AotIntegrationTests` case without consulting any interface list.
+        let proxy = cm.ensure_synthetic_class("jdk/proxy3/$Proxy27", 0);
+        (alpha, beta, iface, proxy)
+    };
+
+    // A reference array's own class id IS its component class id (JVMS §4.4.1),
+    // which is how `array_descriptor_of` recovers the component name.
+    let alpha_arr = shared
+        .mem
+        .heap
+        .alloc_array(alpha, ArrayElementType::Reference, 1);
+    let iface_arr = shared
+        .mem
+        .heap
+        .alloc_array(iface, ArrayElementType::Reference, 1);
+    let beta_obj = shared.mem.heap.alloc_object(beta, 0);
+    let proxy_obj = shared.mem.heap.alloc_object(proxy, 0);
+
+    // THE CONTROL. Concrete component, unrelated concrete value: every
+    // fail-open arm must decline and the store must be refused. This is the
+    // assertion that fails if the predicate ever degenerates to `true`.
+    assert!(
+        !aastore_element_assignable(&shared, alpha_arr, beta_obj),
+        "AastoreBeta into AastoreAlpha[] must be refused — if this starts \
+         passing, the predicate has stopped refusing anything and both \
+         `aastore` and `Array.set` now accept every reference store",
+    );
+
+    // Documented lenience 1: an INTERFACE component. Proving a value implements
+    // an interface is unreliable here (dynamic/annotation proxies, synthetic
+    // classes implement them at runtime), so the predicate declines to throw.
+    assert!(
+        aastore_element_assignable(&shared, iface_arr, beta_obj),
+        "an interface component must fail open",
+    );
+
+    // Documented lenience 2: a `$Proxy`-named value. This is the arm that
+    // admits the `ContextConfiguration[] <- jdk/proxy3/$Proxy27` store that
+    // `TypeMappedAnnotation.adapt` makes through `Array.set`.
+    assert!(
+        aastore_element_assignable(&shared, alpha_arr, proxy_obj),
+        "a $Proxy-named value must fail open even against a concrete component",
+    );
+}
+
+/// The wiring the test above cannot see: reflective `Array.set` must actually
+/// route through that shared predicate rather than keep a private check.
+///
+/// `reflect_array_element_assignable` lives in `native-builtins`, whose test
+/// targets do not currently compile (~620 pre-existing errors from the
+/// in-flight fallibility migration), so a behavioural test cannot be hosted
+/// beside it. A source witness is the cheap stand-in for "this call must not
+/// quietly disappear" — matched on text, never on line numbers, so ordinary
+/// edits to the file cannot rot it.
+#[test]
+fn array_set_routes_through_the_shared_aastore_predicate() {
+    let src = include_str!("../../../../native-builtins/src/lib.rs");
+    let start = src
+        .find("fn reflect_array_element_assignable")
+        .expect("reflect_array_element_assignable must exist in native-builtins");
+    // Bound the search to this function so a coincidental match elsewhere in a
+    // 39k-line file cannot vouch for it.
+    let body = &src[start..];
+    let end = body
+        .find("\nfn native_array_get_length")
+        .expect("the function that follows it must exist");
+    let body = &body[..end];
+    assert!(
+        body.contains("ctx.aastore_element_assignable(arr, value)"),
+        "Array.set must consult the same predicate as the `aastore` opcode. \
+         Without it the reflective path falls back to a ClassId-identity \
+         `is_subclass`, which refuses a proxy stored into the annotation-type \
+         array it was created from — the AotIntegrationTests failure.",
+    );
+}
+
 #[test]
 fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
     let _guard_reusing_signature: fn(

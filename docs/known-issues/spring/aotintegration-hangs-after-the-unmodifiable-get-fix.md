@@ -261,18 +261,38 @@ which five other paths depend on and none of which had such a test.
 * **The root cause is untouched.** If the split is real it is still there; this
   is a mitigation at the point of surfacing.
   `user-loader-parent-chain-was-unmodelled-rust-side` remains the neighbourhood.
-* **`Array.set`'s refusal has NO test, and did not before this change either.**
-  Searching the tree for `array element type mismatch` finds the throw site and
-  its two comments — and nothing else. No unit test, no fixture, no witness. So
-  nothing in CI would notice if this path stopped refusing altogether, which is
-  an uncomfortable place to be immediately after widening what it accepts. A
-  control was not added here because the predicate needs a `SharedVm` with two
-  genuinely resolvable classes, i.e. synthesized class files; that is worth
-  doing properly rather than approximating.
-  The nearest existing control is `difftest`'s generator case
-  (`Object[] oa = new String[1]; oa[0] = Integer.valueOf(1)`), which expects a
-  real `ArrayStoreException` — but it exercises `aastore`, not `Array.set`, and
-  the whole point of this entry is that those two were not the same code.
+* ~~**`Array.set`'s refusal has NO test.**~~ **CLOSED** — two now, in
+  `vm/src/runtime/interpreter/tests.rs`:
+  * `aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must` — the
+    control (concrete component, unrelated concrete value → refused) asserted
+    *together with* two of the fail-open arms (interface component, `$Proxy`
+    value → accepted). Deliberately paired: the refusal alone would pass against
+    a predicate that refuses everything, and the lenient arms alone are exactly
+    what a degenerate `true` satisfies. Class names are neutral
+    (`cratonvm/test/Aastore*`) because `synthetic_implements`, the last fail-open
+    arm, is a table of specific name pairs and a JDK-ish name could match it and
+    make the control vacuous.
+  * `array_set_routes_through_the_shared_aastore_predicate` — a source witness
+    that `reflect_array_element_assignable` still calls the shared predicate,
+    since the behavioural test above cannot see the wiring and `native-builtins`
+    cannot host a test of its own (~620 pre-existing compile errors in its test
+    targets from the fallibility migration). Matched on text within the
+    function's own bounds, never on line numbers.
+
+  **Both were shown to fail before being trusted.** Degenerating the predicate
+  to `return true` fails the control; deleting the call from `Array.set` fails
+  the witness. A control never shown to fire is indistinguishable from one that
+  cannot.
+
+  The blocker recorded here earlier — "needs synthesized class files" — was
+  wrong. `ClassManager::ensure_synthetic_class` fabricates a named class
+  directly in the class manager, which is all `array_descriptor_of` needs, and a
+  reference array's own class id *is* its component class id, so the whole
+  fixture is a dozen lines against a default `SharedVm`.
+
+  Still not covered: the loader-split arm, which needs two same-named classes
+  and `ensure_synthetic_class` dedupes by name. That leg is characterised
+  instead by `classloading::class::tests::a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name`.
 
 ### Two things ruled out — do not repeat them
 
