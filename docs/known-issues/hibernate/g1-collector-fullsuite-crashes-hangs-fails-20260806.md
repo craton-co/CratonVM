@@ -1,6 +1,6 @@
 # `-XX:+UseG1GC` full-suite run — 3 crashes (1 shared fault site), 4 hangs, 5 fails
 
-**Status:** OPEN (2026-08-06; substantially updated 2026-08-07 — see the update at the bottom: the crash now has a deterministic Linux repro and a named faulting function, two of the three crash classes no longer reproduce, and the GC-root-coverage reading is refuted). Full 4548-class Hibernate suite, `-XX:+UseG1GC`,
+**Status:** OPEN (2026-08-06; updated twice on 2026-08-07/08 — see the updates at the bottom. The crash has a Linux repro and a named faulting function; two of the three crash classes no longer reproduce; the GC-root-coverage and SATB-staleness readings are both refuted by measurement; a separate real defect — G1's remembered-set source walk cannot walk a full Eden region — was found and guarded. The crash itself is NOT fixed: guards drop it from 4/5 runs to 1/5 and the non-crashing runs are unhealthy in other ways.) Full 4548-class Hibernate suite, `-XX:+UseG1GC`,
 4 shards, real JDK, JIT on, binary `CratonVM-hib-local-0712-v3` (dev tip
 `a526ca521`, includes the JIT dynamic-proxy dispatch fix from the same day).
 `PASS=4440/4548` (97.6%). Results:
@@ -275,6 +275,102 @@ Not symbolization — that is done. Find the producer:
 * The Timing section's "G1 is heavier" comparison was not re-measured; the
   young-pause work that landed since (the jOOQ family going 200 s -> 10 s)
   invalidates the old figures either way.
+
+### Update 2026-08-08 — the producer hunt: two hypotheses killed, one real defect found, crash still OPEN
+
+Continued from the update above. The question was *what puts a freed object on
+G1's evacuation worklist*. Answer so far: **not what either candidate theory
+said**, and the class is unstable under G1 in more ways than the crash.
+
+#### Attribution: it is not the remembered-set source walk, and it is not SATB
+
+The guards were extended to tag every rejection with its call **site** and to
+validate the two remaining unguarded producers. Two hypotheses died on their own
+counters:
+
+| hypothesis | instrument | verdict |
+|---|---|---|
+| the RSet source-region linear walk hands out garbage | `source_walk_desync` | it DOES desync (below), but 0 of the rejected words came from its scan |
+| the SATB keep-alive drain accepts addresses recorded against a recycled region | `satb_keepalive_stale` | **0 across every run** — refuted, guard removed again |
+
+The SATB idea was well-motivated — `marking_keepalive_roots` filters a drained
+address on region containment, `region_type != Free` and "not already marked",
+and never looks at the header, while the remembered set screens for exactly this
+staleness (`rset_entry_is_stale`, G1AUD-5 / defect G1-8). The asymmetry is real
+and worth closing on principle (stamp SATB entries with `G1Region::reuse_epoch`
+at record time), but **it is not this bug**: the check never fired once.
+
+Every rejected word came from the **worklist scan**, overwhelmingly its object
+arm — 32768 in one run, 1301 in another. So the bad words are reference *fields*
+of objects already on the worklist, not bad worklist entries.
+
+#### The real defect found on the way: the source walk cannot walk a full Eden region
+
+`scan_source_region_for_cset_refs` walks a region linearly, deriving each step
+from `object_total_size(header)` at the current offset, and its only rejection
+is an implausible *size*. A zeroed header passes that (`class_id=0`,
+`num_slots=0`, `kind=Object` is exactly `HEADER_SIZE`), so a region whose object
+grid does not describe its contents is walked 16 bytes at a time until some
+stale bytes decode as an array with a large length — and the element loop then
+reads off the end of the region.
+
+Validating the header there and abandoning the walk (a desynchronised linear
+walk cannot resynchronise) catches it. It fires, and what it catches is not what
+was expected:
+
+```
+DESYNCED #1: region=86  type=Eden reuse_epoch=0 recycled_in_generation=0 offset=0x88830 cursor=0x100000
+DESYNCED #2: region=683 type=Eden reuse_epoch=3 recycled_in_generation=4 offset=0x666a0 cursor=0x100000
+DESYNCED #3: region=485 type=Eden reuse_epoch=4 recycled_in_generation=6 offset=0x6de90 cursor=0x100000
+```
+
+Every one is an **Eden region filled to `cursor == region_size`** (0x100000 = the
+whole 1 MiB), desynchronising well inside it — and the first has
+**`reuse_epoch=0`**, i.e. it has never been recycled at all. So this is *not*
+staleness and *not* recycling: a fresh, full Eden region is simply not walkable
+object-by-object. The obvious suspect is a reservation whose bytes were never
+object-initialised and which neither `gap_filler_len` (retired-TLAB gap
+sentinel) nor `jit_tlab_skip_span_len` (published frozen-peer tails) covers.
+
+**That is the sharpest open lead on this page.** It is independently checkable
+without the crash: walk every Eden region at a safepoint and assert the grid
+closes.
+
+#### The guards are diagnostics, not a fix — measured
+
+`DefaultCatalogAndSchemaTest`, `-XX:+UseG1GC`, 5 runs each:
+
+| build | outcomes |
+|---|---|
+| before any guard | **CRASH 4/5**, PASS 1/5 |
+| with the full guard set | CRASH 1/5, PASS 132/132 1/5, and 3/5 broken other ways — one JUnit-internal `PreconditionViolationException`, two `ServiceConfigurationError: BytecodeProviderImpl could not be instantiated` at init |
+
+The crash rate drops but the crash is not gone, and the non-crashing runs are
+not healthy either. **Read that as: the object graph this class builds is
+already corrupt under G1 before evacuation touches it**, and the guards only
+change which way the corruption surfaces. They are kept for attribution, not
+claimed as a fix.
+
+#### What landed from this pass
+
+Only what fired and is defensible on its own terms: the source-walk desync check
+(walking off a region is never correct), the `source_walk_desync` counter in the
+shutdown report, and the per-site tags on the existing rejection reports. The
+SATB guard was removed; the root-loop and self-forward-drain guards were removed
+too, because a second notion of "is this address in this heap" in front of
+`region_for_ptr`'s can drop a legitimate root and nothing justified the risk.
+
+#### Next step
+
+1. **Why is a full, never-recycled Eden region unwalkable?** Add a safepoint
+   assertion that walks every Eden region's grid to its cursor, and run it
+   under this class. That is a smaller, deterministic question than the crash.
+2. Then: why do reference fields of live worklist objects hold non-object words
+   (1301–32768 per run)? Dump the holder's class and field index for a sample
+   rather than the address alone — the object arm currently logs `raw` where a
+   field index belongs.
+3. The SATB `reuse_epoch` stamping remains a real asymmetry with the remembered
+   set. Worth closing, but on its own merits — it is not this bug.
 
 ## Related
 
