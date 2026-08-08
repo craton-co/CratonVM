@@ -21,6 +21,52 @@ demand"* -- then stores two explicit zero dwords there. `MARK_NEUTRAL` is
 interpreter still stamps a hash eagerly (H1), which is exactly why `--nojit`
 passes and the JIT arm does not.
 
+### Independently confirmed, 2026-08-07 — 10 classes, and no over-freeing
+
+A second session had reached the same three screens from the H2 side and built
+a different patch (gate the anomaly on `verified_spans`, the grid the
+exact-base oracle already proved). `0ea21c07a` is the better of the two and is
+what landed: stepping over the run one header at a time keeps the walk on-grid
+**everywhere**, where the grid-proof gate only helped inside a proved span and
+left the rest over-retaining. The other patch was dropped; its measurements are
+kept here because a GC change that makes the sweep reclaim *more* wants
+independent evidence that it does not reclaim something live.
+
+One class at a time, `--Xmx 1g`, real-JDK 25, `659224249` (broken) against dev
+tip with this fix:
+
+| class | broken | fixed |
+| --- | --- | --- |
+| `TestIndex` | **OOM** 100 s | **PASS** 97 s |
+| `TestCompatibility` | **OOM** 240 s | **PASS** 206 s |
+| `TestOptimizations` | HANG 400 s | **PASS** 201 s |
+| `TestTempTables` | **OOM** 84 s | HANG 400 s — no OOM; this class is the throughput factor, not this bug |
+| `TestBigDb` | PASS 2 s | PASS 2 s |
+| `TestScript` | FAIL + **OOM** 215 s | HANG 400 s, no OOM |
+| `TestCases` / `TestOpenClose` / `TestPerfectHash` / `TestCrashAPI` | HANG | HANG (unchanged) |
+
+**Every `OutOfMemoryError` in the set is gone**, and the two classes that still
+do not finish now fail the way the retired
+`bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807` record predicts —
+too slow for the budget, progressing.
+
+Over-freeing was the risk worth grepping for explicitly rather than inferring
+from exit codes: `SIGSEGV`, `ClassCastException`, `corrupt Value cell`,
+`panicked`, `overlapping` and `double free` appear in **no** arm, and the three
+newly-passing classes verify their own query results end to end.
+
+`TestIndex` also isolates the mechanism cleanly, since the three symptoms move
+together:
+
+| | broken | fixed |
+| --- | --- | --- |
+| result | OOM 63 s | PASS 82 s |
+| `selective promotion: unwound` | 3 | **0** |
+| `moving-young. fallback` | 14 | 10 |
+
+and the `--nojit` arm, which never had the bug, gets faster too (201 s → 132 s)
+because the sweep now reclaims instead of abandoning its stretch.
+
 ### The damage was the response, not the detection
 
 One 16-byte span sent the walk from offset 7938816 to 241826160 -- **233 MB of
