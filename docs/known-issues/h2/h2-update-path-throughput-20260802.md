@@ -10,8 +10,10 @@ seconds on dev tip (two IR-tier JIT bugs, fixed), H2's own `LOCK_TIMEOUT` /
 `bug-h2-classid0-stale-address-family.md`.
 
 What is left is this page: a constant factor, re-measured on shapes that can
-carry it. The thread-scaling question is **answered** as of 2026-08-08 — 3.33x
-from 4 to 25 threads, and it is lock contention (see below). It is
+carry it. The thread-scaling question is **answered** as of 2026-08-08 — it was
+3.33x from 4 to 25 threads, it was the free-list sort in the stop-the-world
+sweep rather than the lock contention it looked like, and fixing that took it to
+2.45x (see below). It is
 deliberately **not** filed as "a bug" — the previous framing ("≈100x. That is
 the bug.") pointed three sessions at a problem no single fix could match.
 
@@ -241,7 +243,7 @@ slope is real, and it is **larger than the retired page claimed**, not absent as
 this page previously concluded — the earlier campaigns were not wrong about the
 noise, they were under-resolved.
 
-### It is a lock, not per-thread work
+### It is not a lock — it is the free-list sort in the STW sweep (FIXED)
 
 The CPU figure alone does not say whether 25 threads are doing more work or the
 same work while contending. Divide CPU by elapsed to get cores actually busy:
@@ -250,6 +252,7 @@ same work while contending. Divide CPU by elapsed to get cores actually busy:
 | --- | ---: | ---: | ---: |
 | 4 threads × 25 000 | 256.1 s | 71.3 s | **3.6 of 4** |
 | 25 threads × 4 000 | 821.1 s | 333.2 s | **2.5 of 25** |
+| 25 threads × 4 000, after the fix below | 629.6 s | 165.8 s | **3.8 of 25** |
 
 At 4 threads cratonvm gets 3.6 of its 4 threads running. At 25 it gets **2.5** —
 *less absolute parallelism from six times the threads*, while burning 3.33x the
@@ -257,11 +260,62 @@ CPU per update. That is the signature of a global lock: the extra CPU is spin
 and wait, not work. HotSpot on the same shape goes the other way, 5.0 → 6.4
 cores busy.
 
-It also matches the other end of this page: `load_class_concurrent` is 1.4 % at
-25 threads and 0.64 % at 1, which is the `ClassManager` read lock and not class
-loading (see the 1-thread profile above). **The scaling target on this page is a
-lock inventory, not a symbol list** — and unlike the constant factor, a lock has
-the shape of something one fix can move.
+**That reading was wrong about the mechanism, and profiling both arms said so.**
+It is not mutator lock contention. Profiled at equal total work
+(`sudo -n perf record -F 199`, flat self-attribution), the 25-thread arm spends
+**~48 % of its CPU sorting**:
+
+| symbol | 4 threads | 25 threads |
+| --- | ---: | ---: |
+| `core::slice::sort::stable::quicksort` | — | **21.81 %** |
+| `core::slice::sort::stable::drift::sort` | — | **21.07 %** |
+| `Arena::free_blocks_sorted` | — | 3.15 % |
+| `memmove` + `sort8_stable` + `median3_rec` | — | 5.68 % |
+
+None of it appears in the 4-thread top 30. The caller is
+`Arena::free_blocks_sorted`, whose entire body was
+`v.sort_by_key(|&(off, _)| off)` over the **whole** young free list — and on a
+process wedged onto the non-moving sweep the young arena reaches
+`used == capacity` with ~300 MB of holes in that list. It presents *as*
+contention because the sweep is stop-the-world: more threads allocate faster,
+which buys more sweeps (24 against 6 for the same work), and every thread waits
+through each one.
+
+**Fixed** — the key is an arena offset: unique, non-negative, bounded by the
+capacity. That is a radix key, so an LSD radix sort replaces the comparison sort
+with three linear passes (`gc/src/arena.rs::sort_by_offset`, with a
+`sort_unstable_by_key` branch below 512 entries where the pass overhead is not
+worth it). A/B on the same host, ABBA-interleaved, n=4 per arm:
+
+| | CPU | elapsed | probe wall |
+| --- | ---: | ---: | ---: |
+| **25 threads** | 445.2 → 269.2 s (**-40 %**) | 262.5 → 114.2 s (**-56 %**) | 248.0 → 100.4 s (**-60 %**) |
+| **4 threads** (control) | 78.3 → 77.0 s (-2 %) | 28.6 → 28.4 s (-1 %) | 14.5 → 14.2 s (-2 %) |
+
+The 4-thread control is the point of the pair: the change is neutral where the
+sort was not on the profile, so this is not a general speedup being claimed from
+a noisy host. **The slope drops 3.33x → 2.45x** and parallelism at 25 threads
+goes from **2.5 to 3.8 cores busy**. All 992 `cratonvm-gc` tests pass, plus two
+new ones asserting the radix branch and the comparison branch both agree with
+the old `sort_by_key` (including on duplicate keys, which free blocks never
+have, so both branches are stable).
+
+### What is still there: the same function, at 24 %
+
+Re-profiled with the fix, `Arena::free_blocks_sorted` is **still the single
+largest symbol at 24.34 % self** — the sort is gone but the *materialisation*
+is not. Every sweep still collects the entire free list into a fresh `Vec` and
+orders it, and that list is ~300 MB of holes. The remaining work is to stop
+rebuilding it: hold the free list in an offset-ordered structure (so
+`free_blocks_sorted` becomes an iteration), or give the sweep's hole-skip
+consumer a bitmap it can query directly instead of a sorted `Vec`. That is a
+free-list data-structure change on the allocation hot path, not a local edit,
+which is why it is written down here rather than attempted in the same pass.
+
+Second on the post-fix profile is the conservative root scan
+(`is_object_address` 3.98 %, `native_stack_has_jit_frame` 2.95 %,
+`scan_one_frame` 1.51 %) — the cost the non-moving sweep pays for imprecise
+roots, priced at ~11 % of a single-threaded run in the section above.
 
 ### Two corrections to the old framing
 
