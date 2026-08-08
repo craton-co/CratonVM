@@ -167,6 +167,113 @@ loader's parent delegation is modelled, not in `Array.set` —
 `forked-loader-mixed-copies-triage-recipe` are the right neighbourhood, and
 `Array.set` is only where it happens to surface.
 
+---
+
+## 2026-08-07: why it surfaced in `Array.set` and nowhere else
+
+Two facts, both established by reading the tree rather than by running
+anything. Together they answer the "why here?" the section above left open.
+
+**1. `Array.set` was the strictest assignability check in the VM.** The
+loader-identity-blind name walk this needs already exists —
+`Class::is_assignable_to_name`, over supers *and* the interface DAG — and its
+own doc comment names `@CompileWithForkedClassLoader` child loaders re-defining
+app classes as the shape it was built for. It was already wired into five
+paths: exception `catch_type` matching (×3), JIT `checkcast`/`instanceof`, the
+recovered-mirror receiver check, `VarHandle` return coercion, and the
+`Serializable` probe. The sibling reflective coercion in `lang_class.rs` goes
+further and skips the check entirely when the expected type is an interface.
+`Array.set` had none of it and compared `ClassId`s.
+
+**2. The `aastore` bytecode makes a completely different check, and it would
+have allowed this store.** `typecheck::aastore_element_assignable` — shared by
+the interpreter opcode and the JIT's `jit_aastore`, per its own doc, "so both
+enforce the same rule" — is deliberately *additive*: it must never produce a
+FALSE `ArrayStoreException`. It fails open for an **interface component**, for a
+value whose class name `contains("$Proxy")` or is `AnnotationProxy`, for a
+synthetic class id, and for a same-named component that resolved to a different
+`ClassId` under another loader. Each hedge was paid for by a regression; one
+comment names storing an `AnnotationProxy` into an annotation-type array, which
+is this case exactly.
+
+So the two paths would have given opposite answers on the same store, and
+`Array.set` was the one that had been taught nothing.
+
+That is the answer to "why here?". `TypeMappedAnnotation.adapt` is generic over
+the component type, so it *must* go through `Array.set` where ordinary code
+emits `aastore` and sails past. A loader split presumably present in plenty of
+places met the one check strict enough to notice it.
+
+> **Correction, same day.** The first version of this section said the
+> interpreter throws `ArrayStoreException` *nowhere* and that there is no
+> `aastore` check at all. That is wrong. It came from a `grep` for the literal
+> string that hit its result limit before reaching `vm/src/runtime/`, and a
+> truncated result was read as an exhaustive one — the check is spelled
+> `RuntimeError::ArrayStoreException`, in `opcodes.rs` and `helpers.rs`, behind
+> the predicate above. The conclusion survives, but for a better reason than
+> the one first given: the bytecode path is not *unchecked*, it is checked
+> **leniently and on purpose**, and that is a far stronger argument for
+> `Array.set` adopting it than "nothing else checks".
+
+### What landed
+
+`reflect_array_element_assignable` keeps its exact `is_subclass` test and then
+calls the shared predicate, through a new
+`NativeClassAccess::aastore_element_assignable` that the VM implements by
+delegating to `typecheck::aastore_element_assignable`. Reflective `Array.set` is
+now its third caller alongside the interpreter and the JIT, which is what
+HotSpot does — there, the two are one rule. `None` from the trait method (the
+default) means "this context models no hierarchy", so mocks and the
+fabricated-class harnesses keep exact-only behaviour.
+
+This deliberately replaced a first attempt that bolted a name-based walk onto
+`Array.set` directly. That would have been a fourth reimplementation of one of
+five hedges, and not even the ones that matter here — the interface-component
+and `$Proxy` arms are what actually admit this store.
+
+`CRATONVM_DBG=coerce` now also prints both loader ids and the value's
+superclass chain, matching the `lang_class.rs` sibling.
+
+Test: `a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name`
+(`classloading/src/class.rs`) builds the two-copy hierarchy explicitly — two
+same-named `ContextConfiguration` ids, a proxy listing the forked one — and
+asserts both arms plus a negative. It characterises `is_assignable_to_name`,
+which five other paths depend on and none of which had such a test.
+
+### What is still open — read this before believing the fix
+
+* **Not verified end-to-end.** `endToEndTestsForBeanOverrides` runs on the
+  Azure Spring host; this was verified only at the unit level. Re-run
+  `onem.sh … endToEndTestsForBeanOverrides` (49 s) to confirm.
+* **But it is now much less conditional than the first attempt was.** The
+  name-walk version only worked if the proxy had recorded an interface *named*
+  `ContextConfiguration` — leaving the doc's never-ruled-out alternative (the
+  forked loader's proxy definition recorded **no** interfaces at all) as a live
+  way for the fix to do nothing. The shared predicate does not depend on that:
+  `vn.contains("$Proxy")` matches `jdk/proxy3/$Proxy27` on its name alone, and
+  the interface-component arm fires on `ContextConfiguration` being an
+  annotation type, before any interface list is consulted. Either arm admits
+  this store.
+* If a rejection still prints after this change, the enriched diagnostic is the
+  next read: it means the store reached `Array.set` with a component that is
+  *not* an interface and a value that is *not* proxy-named, which would be a
+  different finding from the one recorded here.
+* **The root cause is untouched.** If the split is real it is still there; this
+  is a mitigation at the point of surfacing.
+  `user-loader-parent-chain-was-unmodelled-rust-side` remains the neighbourhood.
+* **`Array.set`'s refusal has NO test, and did not before this change either.**
+  Searching the tree for `array element type mismatch` finds the throw site and
+  its two comments — and nothing else. No unit test, no fixture, no witness. So
+  nothing in CI would notice if this path stopped refusing altogether, which is
+  an uncomfortable place to be immediately after widening what it accepts. A
+  control was not added here because the predicate needs a `SharedVm` with two
+  genuinely resolvable classes, i.e. synthesized class files; that is worth
+  doing properly rather than approximating.
+  The nearest existing control is `difftest`'s generator case
+  (`Object[] oa = new String[1]; oa[0] = Integer.valueOf(1)`), which expects a
+  real `ArrayStoreException` — but it exercises `aastore`, not `Array.set`, and
+  the whole point of this entry is that those two were not the same code.
+
 ### Two things ruled out — do not repeat them
 
 * **Not the young-GC livelock**, however much `jcmd GC.heap_info` looks like it.

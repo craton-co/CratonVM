@@ -2201,20 +2201,26 @@ mod tests {
         assert_eq!(declared.field_offsets, vec![0, 8, 12, 16]);
     }
 
-    /// The `AotIntegrationTests` / `Array.set` shape: a proxy implementing an
-    /// interface whose `ClassId` is the child loader's copy, tested against the
-    /// parent loader's copy of the same name.
+    /// Characterises the split-loader shape these two predicates disagree on,
+    /// using the `AotIntegrationTests` case as the concrete example: a proxy
+    /// implementing an interface whose `ClassId` is the child loader's copy,
+    /// tested against the parent loader's copy of the same name.
     ///
-    /// `is_subclass_of` must answer `false` here — the ids genuinely differ, and
+    /// `is_subclass_of` must answer `false` — the ids genuinely differ, and
     /// that is the honest answer to the question it was asked.
     /// `is_assignable_to_name` must answer `true`, because it is asked the
-    /// question CratonVM can actually answer correctly in a flat class store.
-    /// Both arms are asserted against the same pair so a regression that
-    /// collapses one into the other cannot read as a pass.
+    /// question a flat class store can actually answer. Both arms are asserted
+    /// against the same pair so a regression that collapses one into the other
+    /// cannot read as a pass, and a negative pins that the name walk has not
+    /// rotted into "everything is assignable".
     ///
-    /// The interface leg is the part that matters and the part
-    /// `is_subclass_of_by_name` cannot do: an annotation type is an interface,
-    /// so a proxy reaches it through `interfaces`, never through `superclass`.
+    /// The interface leg is the part `is_subclass_of_by_name` cannot do: an
+    /// annotation type is an interface, so a proxy reaches it through
+    /// `interfaces`, never through `superclass`. Five callers depend on this
+    /// distinction — exception `catch_type` matching, JIT
+    /// `checkcast`/`instanceof`, the recovered-mirror receiver check,
+    /// `VarHandle` return coercion and the `Serializable` probe — and none of
+    /// them had a test that built the two-copy hierarchy explicitly.
     #[test]
     fn a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name() {
         let mut store = ClassStore::new();
@@ -2280,9 +2286,9 @@ mod tests {
                 "org/springframework/test/context/ContextConfiguration",
                 &store,
             ),
-            "the name walk must cross the loader split — this is what stops \
-             Array.set refusing a proxy created FROM the annotation it is \
-             being stored as",
+            "the name walk must cross the loader split — a proxy created FROM \
+             an annotation type must not read as unrelated to it just because \
+             a forked loader owns the copy it was built against",
         );
 
         // ...and it is still a real check: an unrelated name is refused, so

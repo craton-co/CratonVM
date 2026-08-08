@@ -39031,37 +39031,36 @@ fn reflect_array_element_assignable(
     if value_class == component || ctx.is_subclass(value_class, component) {
         return true;
     }
-    let comp_name = ctx.class_name_of_id(component);
-    // LOADER-SPLIT FALLBACK. `is_subclass` compares `ClassId`s, and in CratonVM's
-    // flat class store one class NAME can carry two of them — a child loader
-    // re-defining a type its parent already loaded. HotSpot never faces this
-    // (one copy, so the store succeeds), which is why a refusal here is far more
-    // often a modelling artefact than a real type error.
+    // THE SAME CHECK THE `aastore` BYTECODE MAKES. On HotSpot `Array.set` and
+    // `aastore` are one rule; here they were two, and only one of them had been
+    // taught what this VM cannot prove.
     //
-    // This was reached by `AotIntegrationTests.endToEndTestsForBeanOverrides`:
+    // `typecheck::aastore_element_assignable` — already shared by the
+    // interpreter opcode and the JIT's `jit_aastore` — is deliberately
+    // *additive*: it must never produce a FALSE `ArrayStoreException`, so it
+    // fails open for an interface component, for a `$Proxy`/`AnnotationProxy`
+    // value, for a synthetic class id, and for a same-named component that
+    // resolved to a different `ClassId` under another loader. Each hedge was
+    // paid for by a regression; one of them names storing an `AnnotationProxy`
+    // into an annotation-type array, which is this case exactly.
+    //
+    // `AotIntegrationTests.endToEndTestsForBeanOverrides` reached it:
     // `TypeMappedAnnotation.adapt` fills a `ContextConfiguration[]` with
-    // `annotations[i].synthesize()` proxies, under
-    // `@CompileWithForkedClassLoader`, and exactly one element per run was
-    // refused with `jdk/proxy3/$Proxy27` not assignable to a
-    // `ContextConfiguration` it had been created FROM. See
+    // `annotations[i].synthesize()` proxies under
+    // `@CompileWithForkedClassLoader`, and one element per run was refused —
+    // `jdk/proxy3/$Proxy27` judged not assignable to a `ContextConfiguration` it
+    // had been created FROM. `adapt` is generic over the component type, so it
+    // must go through `Array.set` where ordinary code emits `aastore` and sails
+    // past. That asymmetry, not the loader split on its own, is why this
+    // surfaced here and nowhere else. See
     // `docs/known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md`.
     //
-    // Why a NAME walk and not simply dropping the check: it still refuses a
-    // genuinely unrelated value (a `String` into a `Runnable[]` finds no
-    // `Runnable` anywhere in `String`'s hierarchy), so `ArrayStoreException`
-    // fidelity survives for the case the check exists to catch.
-    //
-    // This is the same tradeoff, and the same helper, that the VM already
-    // accepts for exception `catch_type` matching, JIT `checkcast`/`instanceof`,
-    // the recovered-mirror receiver check and `VarHandle` return coercion — see
-    // `NativeContext::is_assignable_to_name`. `Array.set` was the straggler, and
-    // being the strictest check in a VM whose sibling paths had all been
-    // relaxed is precisely why the loader split surfaced HERE and nowhere else.
-    if let Some(name) = comp_name.as_deref() {
-        if ctx.is_assignable_to_name(value_class, name) {
-            return true;
-        }
+    // `None` means the context models no hierarchy (mocks): keep the exact-only
+    // answer above rather than widening it.
+    if ctx.aastore_element_assignable(arr, value).unwrap_or(false) {
+        return true;
     }
+    let comp_name = ctx.class_name_of_id(component);
     // DIAG (`CRATONVM_DBG=coerce`): the refusal carries no detail of its own --
     // HotSpot's wording is the bare "array element type mismatch" and source
     // witnesses pin it -- so name both sides here instead. Mirrors the sibling

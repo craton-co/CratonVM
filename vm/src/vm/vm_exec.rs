@@ -7259,12 +7259,19 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .and_then(|c| c.superclass)
     }
 
-    fn is_assignable_to_name(&self, child: ClassId, target_name: &str) -> bool {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .is_assignable_to_name(child, target_name)
+    fn aastore_element_assignable(
+        &self,
+        array: cratonvm_types::ObjectRef,
+        value: cratonvm_types::ObjectRef,
+    ) -> Option<bool> {
+        // Via the `pub use typecheck::*` re-export in `interpreter.rs`, which
+        // caps each item at its own declared visibility — so this reaches the
+        // `pub(crate)` predicate without widening the module.
+        Some(crate::runtime::interpreter::aastore_element_assignable(
+            self.shared,
+            array,
+            value,
+        ))
     }
 
     fn class_id_by_name(&self, name: &str) -> Option<ClassId> {

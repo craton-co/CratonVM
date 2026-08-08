@@ -642,33 +642,30 @@ pub trait NativeClassAccess {
     /// Get the superclass ClassId. Returns None for java/lang/Object.
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
 
-    /// Loader-identity-blind assignability: is `child` assignable to a type
-    /// *named* `target_name`, walking both the superclass chain and the
-    /// interface DAG and comparing NAMES rather than [`ClassId`]s?
+    /// JVMS §aastore covariance: may the non-null `value` be stored into the
+    /// reference array `array`? `None` when this context cannot answer.
     ///
-    /// The escape hatch for CratonVM's flat class store, where one class name
-    /// can end up with two `ClassId`s — a child loader re-defining a type its
-    /// parent already loaded (Spring's `@CompileWithForkedClassLoader` and the
-    /// AOT-processing loaders are the recurring source). [`Self::is_subclass`]
-    /// then answers `false` for two copies of the same type, a refusal HotSpot
-    /// would never make because HotSpot has one copy.
+    /// This exists so `java.lang.reflect.Array.set` can enforce **the same rule
+    /// as the `aastore` bytecode**, which is what HotSpot does — they are one
+    /// check there, and were two here. The VM's implementation
+    /// (`vm::runtime::interpreter::typecheck::aastore_element_assignable`) is
+    /// already shared by the interpreter opcode and the JIT's `jit_aastore`
+    /// helper; a reflective store is simply its third caller.
     ///
-    /// The VM already accepts this tradeoff in five places — exception
-    /// `catch_type` matching, JIT `checkcast`/`instanceof`, the recovered-mirror
-    /// receiver check, `VarHandle` return coercion, and the `Serializable`
-    /// probe — under the reasoning spelled out on
-    /// `cratonvm_classloading::Class::is_assignable_to_name`: treating
-    /// identically-named classes as assignable is far less harmful than failing
-    /// a check the interpreter's loader-faithful constant-pool resolution would
-    /// have passed. Use it as a FALLBACK after [`Self::is_subclass`], never
-    /// instead of it, so a genuinely unrelated type is still refused.
+    /// The difference is not academic. That predicate is deliberately
+    /// *additive*: it must never produce a FALSE `ArrayStoreException`, so it
+    /// fails open for an interface component, for a `$Proxy`/`AnnotationProxy`
+    /// value, for a synthetic class id, and for a same-named component that
+    /// resolved to a different `ClassId` under another loader. Every one of
+    /// those hedges was paid for by a real regression. A `ClassId`-identity
+    /// check reproduces none of them.
     ///
-    /// Defaults to `false` so a context that does not model a class hierarchy
-    /// (mocks, the fabricated-class test harnesses) keeps today's exact-only
-    /// behaviour rather than silently widening it.
-    fn is_assignable_to_name(&self, child: ClassId, target_name: &str) -> bool {
-        let _ = (child, target_name);
-        false
+    /// `None` (the default) means "no VM hierarchy here" — mocks and the
+    /// fabricated-class harnesses — and leaves the caller on its own exact
+    /// check rather than silently widening it.
+    fn aastore_element_assignable(&self, array: ObjectRef, value: ObjectRef) -> Option<bool> {
+        let _ = (array, value);
+        None
     }
 
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
