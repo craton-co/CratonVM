@@ -5,7 +5,7 @@
 Of the three failure modes it reported, none survives; the class's actual
 blocker was a fourth thing the doc never saw, and it is fixed. The one live
 remainder is a *different* defect with its own page —
-[`aotintegration-hangs-after-the-unmodifiable-get-fix-20260806.md`](../known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix-20260806.md).
+[`aotintegration-hangs-after-the-unmodifiable-get-fix-20260806.md`](../known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md).
 
 The original doc's proposed next step was to bisect 882 commits starting from
 the JIT code-cache retirement path. That would have found nothing: see §2.
@@ -118,7 +118,7 @@ endToEndTestsForBeanOverrides ->
 ### 2.3 The "hang / extreme slowdown" — the one live remainder
 
 Real, still present, and now much cheaper to work on. It has its own page:
-[`aotintegration-hangs-after-the-unmodifiable-get-fix-20260806.md`](../known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix-20260806.md),
+[`aotintegration-hangs-after-the-unmodifiable-get-fix-20260806.md`](../known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md),
 to which this session contributed a per-method oracle and two ruled-out causes.
 
 The doc's own bisect setup is **moot** and should not be resumed: it used the

@@ -69,7 +69,7 @@
 //! concurrent one.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1415,6 +1415,644 @@ const ZGC_REAL_GC_THRESHOLD_PERCENT: usize = 75;
 /// Maximum array length, mirroring `heap.rs` / HotSpot's practical limit.
 const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
 
+// ---------------------------------------------------------------------------
+// Object-start membership for `ZgcRealHeap` — the allocation-path bitmap
+// ---------------------------------------------------------------------------
+//
+// # Why (a measurement with an in-tree precedent, not a hypothesis)
+//
+// [`ZgcRealHeap::registry`] holds the base address of every live allocation and
+// is written on EVERY allocation, from every mutator thread. It used to be a
+// `Mutex<FxHashSet<usize>>`. `bench/BinTreesClassic.java`, release build,
+// ABBA-interleaved, checksums identical on both sides (so this backend is
+// CORRECT, just slow), 2026-08-07:
+//
+// ```text
+//   depth 12   generational   35 ms    zgc    231 ms     6.6x
+//   depth 14   generational  138 ms    zgc   1566 ms    11.3x
+//   depth 16   generational  621 ms    zgc  11417 ms    18.4x
+//   depth 18   generational  ~7.9 s    zgc   ~116 s     14.6x
+// ```
+//
+// The ratio is SUPERLINEAR: each depth step is ~4x the objects, and the
+// generational collector scales ~4x while this one scales ~7x. And
+// `--verbose:gc` shows the depth-16 run performed exactly ONE collection
+// (1.1 ms, `bytes_freed=0`), finishing at 719 MB against a 4.2 GB heap. So the
+// cost is not the collector, and it is not allocation locking — TLABs
+// ([`ZgcRealHeap::tlabs`]) landed first and did not move the number. It is
+// per-allocation work on the mutator path that grows with the LIVE-OBJECT
+// COUNT. Tens of millions of entries in one global hash set, behind one global
+// mutex, probed with cache-missing scatter reads over a multi-gigabyte table,
+// is exactly that shape and nothing else on the path is.
+//
+// # The precedent
+//
+// `gen_heap` had this defect and it was diagnosed and fixed on 2026-07-26
+// (landed `7307935bc`). There a `young_object_starts: FxHashSet<usize>` made a
+// moving collection cost O(objects *allocated*) instead of O(objects
+// *surviving*): `perf` over bt18 measured `HashMap::insert` at 40.7% of the
+// whole process plus `reserve_rehash` at 8.3% — 49% together. The fix was
+// [`crate::young_mark::ObjectStartBits`], one bit per 8 bytes of
+// `[base, base + used)`, and bt18 went 5.0x -> 2.1x. That finding's own
+// generalisation is why this section exists: *any membership-over-a-contiguous-
+// arena set in this GC is a bitmap candidate.* This registry is precisely that,
+// and worse than the one that was fixed — `gen_heap`'s set was built once per
+// collection; this one is written on every allocation from every thread under a
+// single lock.
+//
+// # Why the two existing bitmaps could not be reused as-is
+//
+// * [`crate::young_mark::ObjectStartBits`] has exactly the right *semantics*
+//   (it is alignment-exact: an unaligned address is rejected rather than
+//   aliased onto a neighbour's bit) but its accessors take `&mut self` over a
+//   plain `Vec<u64>`, because its own doc says it is "single-threaded by
+//   construction — the walk and the forwarding that reads it both run inside
+//   the collection's stop-the-world region". This registry is written from
+//   concurrent mutators, so it cannot serve. It also has no `remove`, which the
+//   sweep's in-place prune needs.
+// * [`crate::young_mark::YoungMarkBits`] IS atomic and IS the allocation model
+//   copied below (`alloc_zeroed` + `*mut AtomicU64` + `fetch_or`), but its
+//   `locate` deliberately does NOT check alignment — `addr` and `addr + 4` map
+//   to the same bit — because its callers pre-screen. Here that would be
+//   unsound: [`ZgcRealHeap::is_object_address`] would answer `Some` for an
+//   INTERIOR conservative-root candidate and hand back an `ObjectRef` pointing
+//   four bytes into an object, which is the `is_addr_live` unsoundness
+//   [`ZgcRealHeap::conservative_addr_span`] documents. It also has no `remove`.
+//
+// Neither file is edited. [`ZObjectStartBits`] below is the atomic twin:
+// `YoungMarkBits`'s storage and RMW discipline, `ObjectStartBits`'s exactness
+// rule, plus the `remove` the sweep needs.
+//
+// # Why the bitmap is EXACT here (three legs, each verified against the code)
+//
+// 1. **One contiguous region with a stable base.** [`ZgcRealHeap::with_capacity`]
+//    creates a single [`Arena`] and captures `arena_base`/`arena_end` from it;
+//    there is no `Arena::grow` call anywhere in this file and `alloc_raw` is the
+//    single arena chokepoint, so the envelope never moves. Those two fields
+//    already back [`ZgcRealHeap::conservative_addr_span`] for exactly this
+//    reason.
+// 2. **Every footprint is a multiple of 8.** `Arena::alloc` opens with
+//    `let size = size.checked_add(7)? & !7` (`arena.rs:579`) and warns on an
+//    unrounded request, so consecutive starts sit on the 8-byte grid.
+// 3. **Every start is 8-aligned relative to `arena_base`.** All three of this
+//    heap's paths into the arena ask for `align == 8`: `alloc_raw` calls
+//    `arena.alloc(size, 8)`, `tlab_refill` calls `arena.alloc(want,
+//    ZGC_TLAB_ALIGN)` with [`ZGC_TLAB_ALIGN`]` == 8`, and the bump path aligns
+//    the *offset* (`arena.rs:634`) so `addr - arena_base` is a multiple of 8 by
+//    construction.
+//
+// Therefore `(addr - arena_base) / 8` is a total, collision-free encoding of
+// "is this an object start", and a non-multiple-of-8 offset is *provably* not
+// one — which is what lets [`ZObjectStartBits::locate`] reject it instead of
+// aliasing, preserving the exact-base answer the `FxHashSet` gave.
+//
+// **TLAB-served allocations preserve all three.** A TLAB is not a second
+// allocator: `tlab_refill` carves its chunk out of this same arena with
+// `arena.alloc(want, ZGC_TLAB_ALIGN)`, so the chunk base is on the grid; every
+// object inside is bumped at [`ZGC_TLAB_ALIGN`] (the constant's own doc pins it
+// at 8 precisely so "the cursor can never leave the object grid"); and
+// [`zgc_tlab_footprint`] rounds each request to that alignment. So a TLAB start
+// is `chunk_base + 8k` and `chunk_base` is `arena_base + 8j`.
+//
+// # The one leg that is NOT a proof, and the fallback that covers it
+//
+// `Arena`'s backing store is a `Vec<u8>`, whose pointer Rust only guarantees to
+// be 1-aligned; and `Arena::alloc`'s FREE-LIST tiers align the *absolute*
+// address (`arena.rs:481`, `:548`) while the bump tier aligns the *offset*
+// (`arena.rs:634`). The two agree iff `arena_base` is itself 8-aligned, which
+// every real allocator delivers for a multi-megabyte block but no type in this
+// tree asserts. Rather than bet on it, [`ZObjectStartBits`] keeps an
+// [`overflow`](ZObjectStartBits::overflow) set for any address the grid cannot
+// encode. It is empty on every real run (and a one-shot `tracing::warn!` says
+// so if it is not), it costs one relaxed load of a never-written cache line on
+// the query path, and it means a base can never be LOST — losing one would make
+// `is_object_address` deny a reachable object and drop it from conservative
+// rooting, which is a crash, not a slowdown.
+
+/// Runtime kill switch: `CRATONVM_ZGC_STARTBITS`. **Default on.**
+///
+/// `0` / `off` / `false` / `no` (case-insensitive) puts the registry back on
+/// the `Mutex<FxHashSet<usize>>` it used before this change, byte for byte, so
+/// the A/B is a re-run and not a rebuild.
+///
+/// Same idiom, and the same two reasons, as [`zgc_tlab_enabled_by_default`]:
+/// read through [`cratonvm_types::flags::runtime_var_os`] so it layers with
+/// `-XX:` like every other flag, and deliberately NOT declared as a
+/// [`cratonvm_types::GcFlags`] field, because a declared flag latches on first
+/// read and a mid-run `set_var` then becomes invisible to the very suite that
+/// wants to A/B it. Read once per heap, in [`ZgcRealHeap::with_capacity`].
+fn zgc_start_bits_enabled_by_default() -> bool {
+    match cratonvm_types::flags::runtime_var_os("CRATONVM_ZGC_STARTBITS") {
+        Some(raw) => {
+            let v = raw.to_string_lossy().trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no")
+        }
+        None => true,
+    }
+}
+
+/// One bit per 8 bytes of the arena: "is this address an object start?"
+///
+/// The atomic, removable twin of [`crate::young_mark::ObjectStartBits`] — see
+/// the section header above for why neither existing bitmap could be reused and
+/// for the three-leg exactness argument.
+///
+/// # Memory
+///
+/// One bit per 8 bytes is **1/64th of the arena**, committed up front: ~1 MB for
+/// the 64 MB default heap, ~66 MB for a 4.2 GB one. That is deliberate rather
+/// than lazily committed. `alloc_zeroed` for a block this size goes straight to
+/// the OS (`mmap`/`VirtualAlloc`) and the pages are demand-faulted anyway, so
+/// the resident cost already tracks the part of the arena that has been
+/// allocated into; a hand-rolled two-level commit would add a dependent load to
+/// [`ZgcRealHeap::is_object_address`], which is on the mutator path via
+/// `jit_checkcast`. It also compares favourably with what it replaces: the hash
+/// set it removes cost ~8 bytes per LIVE OBJECT plus load factor — at bt16's
+/// 719 MB of ~72-byte nodes that is well over 100 MB, and it grew without bound
+/// because the collection that would prune it essentially never fires.
+pub(crate) struct ZObjectStartBits {
+    /// `alloc_zeroed` block of [`Self::nwords`] `AtomicU64`s, freed in `Drop`.
+    /// Raw rather than `Box<[AtomicU64]>` for the same reason
+    /// [`crate::young_mark::YoungMarkBits`] is: `AtomicU64` is not `Clone`, so
+    /// `vec![]` cannot build one, and collecting an iterator would MEMSET tens
+    /// of megabytes instead of taking a zero-page mapping.
+    words: *mut AtomicU64,
+    nwords: usize,
+    /// The arena base. Bit `i` denotes `base + i * 8`.
+    base: usize,
+    /// Arena capacity in bytes; `[base, base + span)` is the covered range.
+    span: usize,
+    /// Bases the 8-byte grid cannot encode — see the section header's "one leg
+    /// that is NOT a proof". Expected to stay empty forever.
+    overflow: Mutex<FxHashSet<usize>>,
+    /// `overflow.len()`, readable without taking the lock. The query path tests
+    /// this before it will even consider locking, so the fallback costs a
+    /// relaxed load of a line that is never written on a healthy run.
+    overflow_len: AtomicUsize,
+    /// One-shot latch for the "the grid could not encode a base" warning: one
+    /// line per allocation would itself be the hang.
+    overflow_warned: AtomicBool,
+}
+
+// SAFETY: identical argument to `crate::young_mark::YoungMarkBits`. Every
+// access to `words` is an atomic operation on `AtomicU64`; the allocation is
+// owned exclusively by this value and freed exactly once in `Drop`. The
+// `overflow` set is behind a `Mutex`.
+unsafe impl Send for ZObjectStartBits {}
+// SAFETY: as above — all shared access is atomic or mutex-guarded.
+unsafe impl Sync for ZObjectStartBits {}
+
+impl ZObjectStartBits {
+    /// Cover `[base, base + span)`.
+    fn new(base: usize, span: usize) -> Self {
+        let nwords = span.div_ceil(8).div_ceil(64);
+        let words = if nwords == 0 {
+            std::ptr::NonNull::<AtomicU64>::dangling().as_ptr()
+        } else {
+            let layout = std::alloc::Layout::array::<AtomicU64>(nwords)
+                .expect("zgc object-start bitmap layout overflow");
+            // SAFETY: `nwords > 0` so the layout is non-zero-sized, and an
+            // all-zero bit pattern is a valid `AtomicU64` (value 0).
+            let p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut AtomicU64;
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            p
+        };
+        Self {
+            words,
+            nwords,
+            base,
+            span: if nwords == 0 { 0 } else { span },
+            overflow: Mutex::new(FxHashSet::default()),
+            overflow_len: AtomicUsize::new(0),
+            overflow_warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Word index and bit mask for `addr`, or `None` when the grid cannot
+    /// encode it.
+    ///
+    /// The `off & 7 != 0` rejection is the whole exactness argument in one
+    /// line, and it is what [`crate::young_mark::YoungMarkBits`] omits: without
+    /// it an interior address would alias its object's bit and
+    /// [`ZgcRealHeap::is_object_address`] would promote a conservative-root
+    /// candidate that is not a base.
+    #[inline]
+    fn locate(&self, addr: usize) -> Option<(usize, u64)> {
+        let off = addr.checked_sub(self.base)?;
+        if off >= self.span || off & 7 != 0 {
+            return None;
+        }
+        let bit = off >> 3;
+        Some((bit >> 6, 1u64 << (bit & 63)))
+    }
+
+    /// Record an object start.
+    ///
+    /// # Why `fetch_or` and not a CAS loop
+    ///
+    /// The word is shared with the 63 neighbouring 8-byte grid slots, so two
+    /// threads allocating adjacent objects write the same word — a
+    /// `load`/`or`/`store` would drop one of them. `fetch_or` is a single
+    /// atomic read-modify-write, and because this bitmap is *monotone between
+    /// collections* (inserts only ever set bits; the only clears happen in the
+    /// stop-the-world sweep, with no mutator inserting) there is no value to
+    /// re-check and therefore nothing for a retry loop to do. That is exactly
+    /// [`crate::young_mark::YoungMarkBits::try_mark`]'s argument.
+    ///
+    /// `Release`: this is at least as strong as the `Mutex::unlock` it
+    /// replaces. A thread that hands a fresh pointer to another thread does so
+    /// through a plain field store, which supplies no edge of its own; keeping
+    /// the release here means the reader's `Acquire` in [`Self::contains`]
+    /// still cannot observe "not an object" for a pointer whose publication it
+    /// has already seen. Relaxed would be sufficient under the memory model
+    /// only if the publication path itself carried the edge, and it does not.
+    #[inline]
+    fn insert(&self, addr: usize) {
+        match self.locate(addr) {
+            // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
+            Some((w, mask)) => unsafe {
+                (*self.words.add(w)).fetch_or(mask, Ordering::Release);
+            },
+            None => self.spill(addr),
+        }
+    }
+
+    /// The grid could not encode `addr`; keep it exactly, in the side set.
+    #[cold]
+    fn spill(&self, addr: usize) {
+        {
+            let mut overflow = self.overflow.lock();
+            if overflow.insert(addr) {
+                let n = overflow.len();
+                self.overflow_len.store(n, Ordering::Release);
+            }
+        }
+        if !self.overflow_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                target: "zgc",
+                addr = addr,
+                base = self.base,
+                span = self.span,
+                "zgc object-start bitmap: an allocation base is off the 8-byte \
+                 grid (or outside the arena) — falling back to the exact side \
+                 set for it; membership stays correct, but every such base \
+                 costs a lock and the bitmap is not carrying it"
+            );
+        }
+    }
+
+    /// Exact membership: is `addr` the base of a registered allocation?
+    ///
+    /// `Acquire` pairs with [`Self::insert`]'s `Release`; see there. The
+    /// overflow probe is guarded by a relaxed-cost load that is zero on every
+    /// healthy run, so the common answer is one aligned load and one mask.
+    #[inline]
+    fn contains(&self, addr: usize) -> bool {
+        if let Some((w, mask)) = self.locate(addr) {
+            // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
+            if unsafe { (*self.words.add(w)).load(Ordering::Acquire) } & mask != 0 {
+                return true;
+            }
+        }
+        self.overflow_len.load(Ordering::Acquire) != 0 && self.overflow.lock().contains(&addr)
+    }
+
+    /// Clear one start. Called only from the sweep's in-place prune, inside the
+    /// stop-the-world region.
+    ///
+    /// `fetch_and` rather than `load`/`store` for [`Self::insert`]'s reason —
+    /// the word is shared with 63 neighbours, and although the sweep is the
+    /// only writer *of this word's bits* while the world is stopped, using the
+    /// RMW costs nothing and removes the assumption. `Release` keeps the clear
+    /// no weaker than the `Mutex::unlock` it replaces, so the preceding
+    /// zero-fill of the dead object cannot be observed after it.
+    fn remove(&self, addr: usize) {
+        if let Some((w, mask)) = self.locate(addr) {
+            // SAFETY: `locate` bounds-checked `addr`, so `w < self.nwords`.
+            let prev = unsafe { (*self.words.add(w)).fetch_and(!mask, Ordering::Release) };
+            if prev & mask != 0 {
+                return;
+            }
+        }
+        if self.overflow_len.load(Ordering::Acquire) != 0 {
+            let mut overflow = self.overflow.lock();
+            if overflow.remove(&addr) {
+                let n = overflow.len();
+                self.overflow_len.store(n, Ordering::Release);
+            }
+        }
+    }
+
+    /// Is anything held outside the grid? See [`Self::overflow`].
+    #[inline]
+    fn has_spill(&self) -> bool {
+        self.overflow_len.load(Ordering::Acquire) != 0
+    }
+
+    /// Visit every set start, ASCENDING. `f` returns `false` to stop early.
+    ///
+    /// `end_hint` is a PERFORMANCE BOUND, not a filter: every base strictly
+    /// below it is guaranteed to be visited, bases at or above it MAY be. Pass
+    /// `usize::MAX` for a full walk. It exists because the walk cost of a
+    /// bitmap and of a hash set have opposite shapes — the set was O(live), the
+    /// bitmap is O(arena span), so on a mostly-empty multi-gigabyte heap an
+    /// unbounded walk would be a *regression* (~8.2M word loads for a 4.2 GB
+    /// arena against a few thousand hash steps). The one caller that walks from
+    /// the mutator path, [`ZgcRealHeap::is_heap_addr`], has the arena's
+    /// high-water mark available and passes it, which restores the O(bytes
+    /// actually allocated) shape.
+    ///
+    /// `Acquire` on each word load, matching [`Self::contains`]. These walks
+    /// are off the allocation path, so the per-word ordering is not worth
+    /// trading for a fence.
+    fn for_each_base(&self, end_hint: usize, f: &mut dyn FnMut(usize) -> bool) {
+        // Bytes of the covered span that can hold a base below `end_hint`,
+        // rounded UP to a whole word: over-approximating is what makes the
+        // parameter a hint rather than a filter.
+        let reach = end_hint.saturating_sub(self.base).min(self.span);
+        let limit = reach.div_ceil(8).div_ceil(64).min(self.nwords);
+        for w in 0..limit {
+            // SAFETY: `w < limit <= self.nwords`.
+            let mut word = unsafe { (*self.words.add(w)).load(Ordering::Acquire) };
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                if !f(self.base + ((w * 64 + b) << 3)) {
+                    return;
+                }
+            }
+        }
+        // The spill is always walked in full: its members are precisely the
+        // ones whose address the grid could not reason about, so no bound
+        // derived from the grid may exclude them.
+        if self.has_spill() {
+            for &addr in self.overflow.lock().iter() {
+                if !f(addr) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ZObjectStartBits {
+    fn drop(&mut self) {
+        if self.nwords == 0 {
+            return;
+        }
+        let layout = std::alloc::Layout::array::<AtomicU64>(self.nwords)
+            .expect("zgc object-start bitmap layout overflow");
+        // SAFETY: `words` came from `alloc_zeroed` with this exact layout and
+        // is freed exactly once.
+        unsafe { std::alloc::dealloc(self.words as *mut u8, layout) };
+    }
+}
+
+/// The membership structure behind [`ZgcRealHeap::registry`], plus its kill
+/// switch.
+///
+/// Both arms answer the same questions with the same semantics; `Hash` is the
+/// pre-2026-08-07 structure kept verbatim so `CRATONVM_ZGC_STARTBITS=0` is a
+/// true A/B and not an approximation of one.
+enum ZObjectStartsKind {
+    Bits(ZObjectStartBits),
+    Hash(Mutex<FxHashSet<usize>>),
+}
+
+/// Base address of every live allocation. See the section header for the
+/// measurement, the precedent and the exactness argument.
+pub(crate) struct ZObjectStarts {
+    kind: ZObjectStartsKind,
+}
+
+impl ZObjectStarts {
+    /// Cover the arena `[base, base + span)`, honouring
+    /// [`zgc_start_bits_enabled_by_default`].
+    ///
+    /// A zero span cannot be gridded at all, so it falls back unconditionally —
+    /// which also keeps `ZgcRealHeap`'s constructor total if the envelope is
+    /// ever degenerate.
+    fn new(base: usize, span: usize) -> Self {
+        Self::with_bitmap(base, span, zgc_start_bits_enabled_by_default())
+    }
+
+    /// [`Self::new`] with the kill switch supplied rather than read.
+    ///
+    /// The seam the arm-equivalence tests drive: they must exercise BOTH arms
+    /// in one process, and doing that through `CRATONVM_ZGC_STARTBITS` would
+    /// mean a `set_var` race against every other test in the binary.
+    fn with_bitmap(base: usize, span: usize, bitmap: bool) -> Self {
+        let kind = if bitmap && span > 0 {
+            ZObjectStartsKind::Bits(ZObjectStartBits::new(base, span))
+        } else {
+            ZObjectStartsKind::Hash(Mutex::new(FxHashSet::default()))
+        };
+        Self { kind }
+    }
+
+    /// Is the bitmap arm in force? Diagnostics for the kill-switch tests.
+    #[cfg(test)]
+    fn is_bitmap(&self) -> bool {
+        matches!(self.kind, ZObjectStartsKind::Bits(_))
+    }
+
+    /// Record one allocation base. The whole point of this file's change: on
+    /// the bitmap arm this is one `fetch_or` and no lock at all.
+    #[inline]
+    fn insert(&self, addr: usize) {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => bits.insert(addr),
+            ZObjectStartsKind::Hash(set) => {
+                set.lock().insert(addr);
+            }
+        }
+    }
+
+    /// Record a batch. Shaped for [`ZTlabHeapHooks::register_allocations`], and
+    /// the reason the `Hash` arm keeps its single `reserve` + single lock: the
+    /// A/B has to compare against what was actually there.
+    #[inline]
+    fn insert_all(&self, addrs: &[usize]) {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => {
+                for &addr in addrs {
+                    bits.insert(addr);
+                }
+            }
+            ZObjectStartsKind::Hash(set) => {
+                let mut set = set.lock();
+                set.reserve(addrs.len());
+                for &addr in addrs {
+                    set.insert(addr);
+                }
+            }
+        }
+    }
+
+    /// Exact-base membership.
+    #[inline]
+    fn contains(&self, addr: usize) -> bool {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => bits.contains(addr),
+            ZObjectStartsKind::Hash(set) => set.lock().contains(&addr),
+        }
+    }
+
+    /// Drop one base (the sweep's in-place prune).
+    fn remove(&self, addr: usize) {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => bits.remove(addr),
+            ZObjectStartsKind::Hash(set) => {
+                set.lock().remove(&addr);
+            }
+        }
+    }
+
+    /// Does this structure hold anything the arena envelope does not bound?
+    ///
+    /// `true` on the `Hash` arm unconditionally — a hash set carries no
+    /// geometry, so nothing may be inferred from an address range about what it
+    /// contains. On the bitmap arm it is `true` only if
+    /// [`ZObjectStartBits::overflow`] took something, which means: *every base
+    /// this structure holds is inside `[base, base + span)`*, because an address
+    /// outside it could not have been encoded and would have spilled. That
+    /// makes the envelope screen in [`ZgcRealHeap::is_heap_addr`] a proof rather
+    /// than an assumption.
+    #[inline]
+    fn has_spill(&self) -> bool {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => bits.has_spill(),
+            ZObjectStartsKind::Hash(_) => true,
+        }
+    }
+
+    /// Visit every base; `f` returns `false` to stop early.
+    ///
+    /// `end_hint` is a performance bound and never a filter — see
+    /// [`ZObjectStartBits::for_each_base`]. The `Hash` arm ignores it, because
+    /// its walk cost is already O(live) and it has no ordering to exploit.
+    ///
+    /// On the bitmap arm this holds NO lock (the words are read atomically),
+    /// which is strictly better than the `Hash` arm, where the guard is held
+    /// across the callback exactly as the old code held it.
+    fn for_each_base(&self, end_hint: usize, f: &mut dyn FnMut(usize) -> bool) {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => bits.for_each_base(end_hint, f),
+            ZObjectStartsKind::Hash(set) => {
+                for &addr in set.lock().iter() {
+                    if !f(addr) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every base, as a materialised list.
+    fn bases(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        self.for_each_base(usize::MAX, &mut |addr| {
+            out.push(addr);
+            true
+        });
+        out
+    }
+
+    /// A frozen copy, for the collection cycle.
+    ///
+    /// This is the direct replacement for `self.registry.lock().clone()`. On
+    /// the bitmap arm it is a `Vec<u64>` of one bit per 8 arena bytes — 1/64th
+    /// of the heap — which is *cheaper* than the `FxHashSet` clone it replaces
+    /// (8 bytes per live object plus load factor) for any occupancy above ~1.5%,
+    /// and it keeps the O(1) membership the mark phase's wild-child screen
+    /// needs.
+    fn snapshot(&self) -> ZObjectStartsSnapshot {
+        match &self.kind {
+            ZObjectStartsKind::Bits(bits) => {
+                let mut words: Vec<u64> = Vec::with_capacity(bits.nwords);
+                for w in 0..bits.nwords {
+                    // SAFETY: `w < bits.nwords`.
+                    words.push(unsafe { (*bits.words.add(w)).load(Ordering::Acquire) });
+                }
+                let extra = if bits.overflow_len.load(Ordering::Acquire) != 0 {
+                    bits.overflow.lock().clone()
+                } else {
+                    FxHashSet::default()
+                };
+                ZObjectStartsSnapshot {
+                    words,
+                    base: bits.base,
+                    extra,
+                }
+            }
+            ZObjectStartsKind::Hash(set) => ZObjectStartsSnapshot {
+                words: Vec::new(),
+                base: 0,
+                extra: set.lock().clone(),
+            },
+        }
+    }
+}
+
+/// A point-in-time copy of [`ZObjectStarts`], with the same two operations the
+/// mark phase used to get from its `FxHashSet` clone: O(1) membership and a
+/// full enumeration.
+pub(crate) struct ZObjectStartsSnapshot {
+    /// Copied bitmap words; empty on the `Hash` arm.
+    words: Vec<u64>,
+    /// The arena base the bits are relative to; meaningless when `words` is
+    /// empty.
+    base: usize,
+    /// The `Hash` arm's whole set, or the bitmap arm's (normally empty)
+    /// overflow spill.
+    extra: FxHashSet<usize>,
+}
+
+impl ZObjectStartsSnapshot {
+    /// Exact-base membership, identical in answer to `FxHashSet::contains`.
+    ///
+    /// No `span` field is needed: the trailing bits of the last word cover
+    /// addresses past `base + span`, and `ZObjectStartBits::locate` refuses to
+    /// set those, so they are always clear.
+    #[inline]
+    fn contains(&self, addr: usize) -> bool {
+        if !self.words.is_empty() {
+            if let Some(off) = addr.checked_sub(self.base) {
+                if off & 7 == 0 {
+                    let bit = off >> 3;
+                    if let Some(word) = self.words.get(bit >> 6) {
+                        if word & (1u64 << (bit & 63)) != 0 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        !self.extra.is_empty() && self.extra.contains(&addr)
+    }
+
+    /// Every base in the snapshot, bitmap portion ASCENDING.
+    ///
+    /// Ascending order is free here (it was not, from a hash set) and it is the
+    /// order the sweep wants: adjacent dead objects hand adjacent spans to
+    /// `Arena::add_free_block`, which is what the post-sweep coalescer merges.
+    fn bases(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::with_capacity(self.extra.len());
+        for (w, &word) in self.words.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                let b = word.trailing_zeros() as usize;
+                word &= word - 1;
+                out.push(self.base + ((w * 64 + b) << 3));
+            }
+        }
+        out.extend(self.extra.iter().copied());
+        out
+    }
+}
+
 /// A real, memory-backed ZGC heap.
 ///
 /// # Storage scheme
@@ -1468,17 +2106,27 @@ pub struct ZgcRealHeap {
     arena_base: usize,
     /// Exclusive upper bound of the arena envelope.
     arena_end: usize,
-    /// Base address of every live allocation, in allocation order. Rebuilt
-    /// (filtered to survivors) by each sweep.
-    /// Hash-set registry (ZGC-5/6 hardening): `is_object_address` is
-    /// consulted per conservative-root candidate (every operand-stack root
-    /// and JIT-frame qword), so membership must be O(1) — the previous
-    /// `Vec` linear scan made every GC's root collection O(roots × live)
-    /// and read as a hang at scale. The sweep also prunes DEAD bases
-    /// in place now (never wholesale-replaces the set), so an allocation
-    /// registered between the mark snapshot and the sweep publish can no
-    /// longer be silently dropped from the registry.
-    registry: Mutex<FxHashSet<usize>>,
+    /// Base address of every live allocation. Pruned (dead bases removed in
+    /// place) by each sweep.
+    ///
+    /// Membership must be O(1): `is_object_address` is consulted per
+    /// conservative-root candidate (every operand-stack root and JIT-frame
+    /// qword), and the original `Vec` linear scan made every GC's root
+    /// collection O(roots × live) and read as a hang at scale (ZGC-5/6
+    /// hardening). The sweep prunes DEAD bases IN PLACE and never
+    /// wholesale-replaces the structure, so an allocation registered between
+    /// the mark snapshot and the sweep publish cannot be silently dropped.
+    ///
+    /// It was an `FxHashSet<usize>` behind a `Mutex` until 2026-08-07, when
+    /// `bench/BinTreesClassic.java` measured this backend at 6.6x/11.3x/18.4x
+    /// the generational collector at bt12/14/16 — superlinear, with exactly ONE
+    /// collection in the whole bt16 run, so the cost was neither the collector
+    /// nor the arena lock but a per-allocation global-mutex hash insert whose
+    /// table grows with the live set. It is now an object-start BITMAP; see the
+    /// "Object-start membership" section header above this struct for the
+    /// measurement, the 2026-07-26 `gen_heap` precedent it copies, the exactness
+    /// argument, and the `CRATONVM_ZGC_STARTBITS` kill switch.
+    registry: ZObjectStarts,
     /// Monotonic identity-hash-code source (matches `Heap::next_hash`).
     next_hash_code: AtomicI32,
     /// Bytes of live+dead object payload currently outstanding (drops on
@@ -1676,8 +2324,15 @@ impl ZgcRealHeap {
     /// the sole consumer (`vm/src/jit/conservative_roots.rs`) hoists this span
     /// out of its scan loop and rejects a word with an inline
     /// `w < lo || w >= hi`. With `None` it cannot, so EVERY 8-byte stack word
-    /// went through `is_object_address`, which opens with `registry.lock()` —
-    /// one global mutex acquire per candidate qword, per frame, per thread.
+    /// went through `is_object_address`, which at the time opened with
+    /// `registry.lock()` — one global mutex acquire per candidate qword, per
+    /// frame, per thread. (That lock is gone as of the object-start bitmap; the
+    /// span filter still earns its keep, because rejecting a word with a range
+    /// compare beats even an atomic load and a mask.)
+    ///
+    /// The same two numbers grid the bitmap — see [`ZObjectStarts`] and the
+    /// "Object-start membership" section header. That is not a coincidence but
+    /// the same fact used twice: this arena is created once and never grown.
     ///
     /// **This is a filter, not an answer.** A word inside the span must still
     /// go through the exact-base registry test. Widening it into an acceptance
@@ -1720,7 +2375,13 @@ impl ZgcRealHeap {
             arena_base,
             arena_end,
             arena: Mutex::new(arena),
-            registry: Mutex::new(FxHashSet::default()),
+            // The bitmap is gridded over the arena envelope captured above —
+            // the SAME two numbers `conservative_addr_span` answers with, and
+            // sound for the same reason (this arena is created here and never
+            // grown). `arena_end` is derived from the arena's post-rounding
+            // capacity, so the span covers every address `Arena::alloc` can
+            // ever return.
+            registry: ZObjectStarts::new(arena_base, arena_end.saturating_sub(arena_base)),
             next_hash_code: AtomicI32::new(1),
             allocated: AtomicUsize::new(0),
             gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
@@ -1873,7 +2534,10 @@ impl ZgcRealHeap {
             unsafe { std::ptr::write_bytes(ptr, 0, size) };
             ptr
         };
-        self.registry.lock().insert(ptr as usize);
+        // One `fetch_or` into the object-start bitmap — no lock, no hash, no
+        // table that grows with the live set. See the "Object-start membership"
+        // section header for the measurement this replaced.
+        self.registry.insert(ptr as usize);
         let after = self.allocated.fetch_add(size, Ordering::Relaxed) + size;
         // Arm the native-allocation-pressure latch on the crossing edge. This
         // is the ZGC analogue of G1's `note_region_consumed_locked`
@@ -1992,7 +2656,7 @@ impl ZgcRealHeap {
     /// `gc::zgc::tlab`'s batched registration could not be adopted here. See
     /// [`ZArenaTlabRegistry`]'s `registry_batch` note.
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
-        if self.registry.lock().contains(&addr) {
+        if self.registry.contains(addr) {
             // SAFETY: the registry contains only live allocation bases.
             Some(unsafe { ObjectRef::from_raw(addr as *mut u8) })
         } else {
@@ -2010,23 +2674,61 @@ impl ZgcRealHeap {
     /// thread's buffer on a conservative-root probe.
     pub fn is_heap_addr(&self, addr: usize) -> Option<ObjectRef> {
         // Fast path: an exact object base (the overwhelmingly common probe).
-        if self.registry.lock().contains(&addr) {
+        if self.registry.contains(addr) {
             // SAFETY: the registry contains only live allocation bases.
             return Some(unsafe { ObjectRef::from_raw(addr as *mut u8) });
         }
-        // Interior pointers: fall back to the O(live) extent walk.
-        for &base in self.registry.lock().iter() {
+        // ---- Two screens BEFORE the extent walk -------------------------
+        //
+        // Neither changes the answer; both exist because the fallback's cost
+        // shape changed when the registry became a bitmap. The `FxHashSet`
+        // iteration was O(live); a bitmap walk is O(arena span), so on a
+        // mostly-empty multi-gigabyte heap an unbounded walk here would be a
+        // REGRESSION (~8.2M word loads for a 4.2 GB arena against a few
+        // thousand hash steps). That matters because this is not a GC-only
+        // path: `VmHeap::is_heap_addr`'s ZGC arm (`vm_heap.rs:694-700`) feeds
+        // it per-slot conservative root scanning over ambiguous
+        // JVM-long-vs-jobject operand words, whose dominant population is
+        // zeros, small integers and long bit patterns — every one of which
+        // misses the exact-base probe above and lands here.
+        //
+        // Screen 1 — the arena envelope, which `vm_heap.rs`'s own `TODO(zgc)`
+        // on that arm asks for by name ("once `ZgcRealHeap` publishes its arena
+        // envelope, the range compare belongs here too"). It cannot lose a
+        // base: `has_spill()` is false exactly when every base this registry
+        // holds was encodable on the arena grid and is therefore inside the
+        // envelope, and no in-arena object's extent can reach outside it
+        // either. When it is true (the `Hash` kill-switch arm, or a spill) the
+        // screen stands down and the behaviour is the pre-change one, byte for
+        // byte.
+        if !self.registry.has_spill() && (addr < self.arena_base || addr >= self.arena_end) {
+            return None;
+        }
+        // Screen 2 — bound the walk by the arena's high-water mark. Every base
+        // ever handed out sits below `arena_base + used` (the cursor only
+        // advances, and free-list blocks are carved from below it), so this
+        // restores the O(bytes actually allocated) shape the hash iteration
+        // had. One uncontended arena acquire, released immediately, on a path
+        // that previously took the registry mutex TWICE.
+        let end_hint = self.arena_base.saturating_add(self.arena.lock().used());
+        // Interior pointers: fall back to the O(live) extent walk. Same answer
+        // as the `FxHashSet` iteration this replaced, and on the bitmap arm it
+        // holds no lock at all while the callback dereferences headers.
+        let mut hit: Option<usize> = None;
+        self.registry.for_each_base(end_hint, &mut |base| {
             let header = unsafe { &*(base as *const ObjectHeader) };
             let size = Self::alloc_size(header);
             let Some(end) = base.checked_add(size) else {
-                continue;
+                return true;
             };
             if addr >= base && addr < end {
-                // SAFETY: the registry contains only live allocation bases.
-                return Some(unsafe { ObjectRef::from_raw(base as *mut u8) });
+                hit = Some(base);
+                return false;
             }
-        }
-        None
+            true
+        });
+        // SAFETY: the registry contains only live allocation bases.
+        hit.map(|base| unsafe { ObjectRef::from_raw(base as *mut u8) })
     }
 
     /// Total backing arena capacity.
@@ -2043,9 +2745,9 @@ impl ZgcRealHeap {
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
         self.retire_all_tlabs();
         self.registry
-            .lock()
-            .iter()
-            .map(|&base| {
+            .bases()
+            .into_iter()
+            .map(|base| {
                 let header = unsafe { &*(base as *const ObjectHeader) };
                 (base as *mut u8, Self::alloc_size(header))
             })
@@ -3033,13 +3735,7 @@ impl ZTlabHeapHooks for ZgcRealHeap {
     /// allocation clears the re-arm floor. Nothing here writes `gc_rearm`;
     /// only the sweep does.
     fn register_allocations(&self, addrs: &[usize], bytes: usize) {
-        {
-            let mut registry = self.registry.lock();
-            registry.reserve(addrs.len());
-            for &addr in addrs {
-                registry.insert(addr);
-            }
-        }
+        self.registry.insert_all(addrs);
         if bytes == 0 {
             return;
         }
@@ -3495,14 +4191,13 @@ impl census::ZCensusHeapView for ZgcRealHeap {
         // which reaches no safepoint of its own.
         self.retire_all_tlabs();
 
-        // Snapshot under the lock, then DROP the guard before reading a single
-        // header. The trait permits holding it for the whole callback, but this
-        // heap's `header_mut` reads arena bytes and `effectively_compact_header`
-        // reaches the layout cache, so the shorter window is free to take.
-        let bases: Vec<usize> = {
-            let registry = self.registry.lock();
-            registry.iter().copied().collect()
-        };
+        // Materialise the base list BEFORE reading a single header. The trait
+        // permits holding the registry for the whole callback, but this heap's
+        // `header_mut` reads arena bytes and `effectively_compact_header`
+        // reaches the layout cache, so the shorter window is free to take —
+        // and on the `Hash` arm of `ZObjectStarts` there is still a real guard
+        // to keep out of that window.
+        let bases: Vec<usize> = self.registry.bases();
 
         for base in bases {
             let header = self.header_mut(base as *mut u8);
@@ -3815,7 +4510,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
             return false;
         }
         debug_assert!(
-            self.registry.lock().contains(&(addr as usize)),
+            self.registry.contains(addr as usize),
             "try_mark on an address the engine did not gate through is_in_heap"
         );
         self.header_ref(addr as usize as *mut u8)
@@ -3932,7 +4627,7 @@ impl mark::ZMarkContext for ZgcRealHeap {
     /// loop's `wild_skipped`. Interior pointers are refused too — an object
     /// base is the only thing whose first bytes are a header.
     fn is_in_heap(&self, addr: u64) -> bool {
-        addr != 0 && self.registry.lock().contains(&(addr as usize))
+        addr != 0 && self.registry.contains(addr as usize)
     }
 
     /// Bytes to charge to live-set accounting — [`ZgcRealHeap::alloc_size`],
@@ -4274,17 +4969,24 @@ impl GarbageCollector for ZgcRealHeap {
         self.retire_all_tlabs();
 
         // ---- Mark phase --------------------------------------------------
-        // Snapshot the registry of all live-or-dead allocations under the
-        // lock, then release it: marking reads object bytes in place and
-        // does not allocate, so it needs no arena lock. The set copy also
+        // Snapshot the registry of all live-or-dead allocations: marking reads
+        // object bytes in place and does not allocate, so it needs no arena
+        // lock and must not pin the registry either. The copy also
         // serves as the mark-phase validation oracle (ZGC-4): child pointers
         // pushed by `enumerate_references` come from raw field bytes, and a
         // corrupt/stale slot must be SKIPPED, not have a mark bit written
         // through it (a wild `header_mut` write inside an innocent object —
         // or outside the arena entirely — then cascades as the garbage
         // "object" is re-parsed for more children).
-        let registered: FxHashSet<usize> = self.registry.lock().clone();
-        let all: Vec<usize> = registered.iter().copied().collect();
+        //
+        // `snapshot()` is the direct replacement for the old
+        // `self.registry.lock().clone()` and keeps its two properties exactly:
+        // it is FROZEN (so the oracle cannot drift under the mark loop) and its
+        // membership is O(1). On the bitmap arm it copies one bit per 8 arena
+        // bytes rather than 8+ bytes per live object, so it is also strictly
+        // cheaper than the set clone at any occupancy above ~1.5%.
+        let registered: ZObjectStartsSnapshot = self.registry.snapshot();
+        let all: Vec<usize> = registered.bases();
 
         // Clear all mark bits first (objects may carry a stale bit from a
         // prior cycle's survivors).
@@ -4327,7 +5029,7 @@ impl GarbageCollector for ZgcRealHeap {
             // ZGC-4: only registered allocation bases are objects. Roots are
             // pre-filtered by is_object_address, but CHILD pointers are raw
             // field bytes — skip anything that is not a current base.
-            if !registered.contains(&addr) {
+            if !registered.contains(addr) {
                 wild_skipped += 1;
                 continue;
             }
@@ -4364,7 +5066,7 @@ impl GarbageCollector for ZgcRealHeap {
         if !fin_candidates.is_empty() {
             let mut resurrected = Vec::new();
             for addr in fin_candidates {
-                if !registered.contains(&addr) {
+                if !registered.contains(addr) {
                     continue; // not a current allocation (already swept earlier)
                 }
                 let header = self.header_mut(addr as *mut u8);
@@ -4374,7 +5076,7 @@ impl GarbageCollector for ZgcRealHeap {
                 resurrected.push(addr); // non-moving: address unchanged
                 work.push(addr);
                 while let Some(a) = work.pop() {
-                    if a == 0 || !registered.contains(&a) {
+                    if a == 0 || !registered.contains(a) {
                         continue; // ZGC-4: same wild-child skip as the main loop
                     }
                     let h = self.header_mut(a as *mut u8);
@@ -4444,12 +5146,12 @@ impl GarbageCollector for ZgcRealHeap {
         {
             let survivors = self.ref_processor.lock().soft_survivor_referents();
             for addr in survivors {
-                if registered.contains(&addr) {
+                if registered.contains(addr) {
                     work.push(addr);
                 }
             }
             while let Some(addr) = work.pop() {
-                if addr == 0 || !registered.contains(&addr) {
+                if addr == 0 || !registered.contains(addr) {
                     continue; // ZGC-4: same wild-child skip as the main loop
                 }
                 let header = self.header_mut(addr as *mut u8);
@@ -4555,11 +5257,8 @@ impl GarbageCollector for ZgcRealHeap {
         // publish would be erased by a replacement — leaking its memory
         // forever (unsweepable) and, worse, making is_object_address deny it
         // so conservative rooting drops it while reachable.
-        {
-            let mut reg = self.registry.lock();
-            for d in &dead {
-                reg.remove(d);
-            }
+        for d in &dead {
+            self.registry.remove(*d);
         }
         self.allocated.store(bytes_copied, Ordering::Relaxed);
         // Re-arm the trigger: require at least a quarter of the remaining
@@ -5963,9 +6662,9 @@ mod tests {
     fn extents(heap: &ZgcRealHeap) -> Vec<(usize, usize)> {
         let mut spans: Vec<(usize, usize)> = heap
             .registry
-            .lock()
-            .iter()
-            .map(|&base| {
+            .bases()
+            .into_iter()
+            .map(|base| {
                 let header = unsafe { &*(base as *const ObjectHeader) };
                 (base, base + ZgcRealHeap::alloc_size(header))
             })
@@ -6275,5 +6974,329 @@ mod tests {
         let stats = heap.tlab_stats();
         assert_eq!(stats.fast_allocations, fast_before, "must not use the bump");
         assert_eq!(stats.refills, refills_before, "must not take a new chunk");
+    }
+
+    // ------------------------------------------------------------------
+    // Object-start bitmap — `ZObjectStarts` / `ZObjectStartBits`
+    // ------------------------------------------------------------------
+    //
+    // Counts, addresses and answers only. NO wall-clock assertions: this is a
+    // throughput fix measured with an ABBA-interleaved benchmark on a quiet
+    // host, and a timed assertion inside the unit suite would be a latent CI
+    // flake that measures the build host's load instead of this change.
+
+    /// A synthetic 8-aligned arena envelope for the structure-level tests.
+    /// 1 MiB of grid is 128 KiB of bitmap — big enough to span many words,
+    /// small enough to run anywhere.
+    const TEST_SPAN: usize = 1024 * 1024;
+    const TEST_BASE: usize = 0x1000_0000;
+
+    /// Every allocated base tests positive, and NOTHING else does.
+    ///
+    /// The negative half is the load-bearing one: `is_object_address` is the
+    /// conservative-root predicate, so a bitmap that aliased an interior or
+    /// unaligned address onto its object's bit would hand `ObjectRef`s that are
+    /// not object bases to the JIT's `jit_checkcast` and to the root scanner.
+    /// It is exactly the check `young_mark::YoungMarkBits` omits (its callers
+    /// pre-screen) and the reason that type could not simply be reused.
+    #[test]
+    fn object_starts_are_exact_over_a_dense_address_window() {
+        let heap = ZgcRealHeap::new();
+        let mut bases: Vec<usize> = Vec::new();
+        for i in 0..64u32 {
+            bases.push(
+                heap.alloc_object(ClassId::new(21), (i % 5) as usize)
+                    .as_ptr() as usize,
+            );
+            bases.push(
+                heap.alloc_array(
+                    ClassId::new(22),
+                    ArrayElementType::Byte,
+                    (i % 7) as usize + 1,
+                )
+                .as_ptr() as usize,
+            );
+        }
+        let registered: FxHashSet<usize> = bases.iter().copied().collect();
+        assert_eq!(registered.len(), bases.len(), "no address served twice");
+
+        // Positive: every base.
+        for &b in &bases {
+            assert!(
+                heap.is_object_address(b).is_some(),
+                "allocated base {b:#x} must test positive",
+            );
+        }
+
+        // Exhaustive over a dense window: EVERY 8-aligned address from a little
+        // below the first base to a little past the last must agree with the
+        // set, and every +4 offset must be refused outright.
+        let lo = bases.iter().copied().min().unwrap() - 64;
+        let hi = bases.iter().copied().max().unwrap() + 4096;
+        let mut addr = lo;
+        while addr < hi {
+            assert_eq!(
+                heap.is_object_address(addr).is_some(),
+                registered.contains(&addr),
+                "membership disagreed at {addr:#x}",
+            );
+            assert!(
+                heap.is_object_address(addr + 4).is_none(),
+                "an unaligned address is never an object start ({:#x})",
+                addr + 4,
+            );
+            addr += 8;
+        }
+
+        // Outside the arena entirely.
+        let (arena_lo, arena_hi) = heap.conservative_addr_span().expect("one arena");
+        assert!(heap.is_object_address(0).is_none());
+        assert!(heap.is_object_address(arena_lo - 8).is_none());
+        assert!(heap.is_object_address(arena_hi).is_none());
+        assert!(
+            heap.is_object_address(arena_hi - 8).is_none(),
+            "the unallocated bump tail holds no object starts",
+        );
+    }
+
+    /// Concurrent inserts from N threads are ALL observed — the property the
+    /// `&mut self` `young_mark::ObjectStartBits` cannot provide and the reason
+    /// the twin below it exists. `fetch_or` is what makes it hold: adjacent
+    /// grid slots share a `u64`, so a load/or/store would drop a neighbour's
+    /// bit.
+    #[test]
+    fn object_starts_observe_every_concurrent_insert() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 4096;
+        let starts = ZObjectStarts::with_bitmap(TEST_BASE, TEST_SPAN, true);
+        assert!(starts.is_bitmap());
+
+        // Interleave the threads across the SAME words rather than giving each
+        // a private region: thread `t` writes slots `t, t+8, t+16, ...`, so
+        // every 64-bit word is contended by all eight.
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let starts = &starts;
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        starts.insert(TEST_BASE + ((i * THREADS + t) << 3));
+                    }
+                });
+            }
+        });
+
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let addr = TEST_BASE + ((i * THREADS + t) << 3);
+                assert!(
+                    starts.contains(addr),
+                    "lost a concurrent insert at {addr:#x}"
+                );
+            }
+        }
+        assert_eq!(
+            starts.bases().len(),
+            THREADS * PER_THREAD,
+            "no extra bits were set",
+        );
+    }
+
+    /// The sweep's in-place prune clears EXACTLY the dead set: the survivors
+    /// stay registered and every reclaimed base stops answering.
+    #[test]
+    fn sweep_prunes_exactly_the_dead_bases() {
+        let heap = ZgcRealHeap::new();
+        let live = heap.alloc_object(ClassId::new(23), 2);
+        let reachable = heap.alloc_object(ClassId::new(23), 1);
+        heap.set_field(live, 0, Value::Object(Some(reachable)));
+        let mut garbage: Vec<usize> = Vec::new();
+        for _ in 0..300 {
+            garbage.push(heap.alloc_object(ClassId::new(23), 2).as_ptr() as usize);
+        }
+        let before: FxHashSet<usize> = heap.registry.bases().into_iter().collect();
+        assert_eq!(before.len(), 302);
+
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        let mut roots = [live];
+        let _ = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        let after: FxHashSet<usize> = heap.registry.bases().into_iter().collect();
+        let expected: FxHashSet<usize> = [live.as_ptr() as usize, reachable.as_ptr() as usize]
+            .into_iter()
+            .collect();
+        assert_eq!(after, expected, "exactly the two survivors stay registered");
+        for g in &garbage {
+            assert!(
+                heap.is_object_address(*g).is_none(),
+                "reclaimed base {g:#x} must stop answering",
+            );
+        }
+    }
+
+    /// The kill switch round-trips: both arms answer every question
+    /// identically, so `CRATONVM_ZGC_STARTBITS=0` is a true A/B and not an
+    /// approximation of one.
+    #[test]
+    fn both_object_start_arms_answer_identically() {
+        let bits = ZObjectStarts::with_bitmap(TEST_BASE, TEST_SPAN, true);
+        let hash = ZObjectStarts::with_bitmap(TEST_BASE, TEST_SPAN, false);
+        assert!(bits.is_bitmap());
+        assert!(
+            !hash.is_bitmap(),
+            "the switch selects the pre-change structure"
+        );
+
+        let inserted: Vec<usize> = (0..1000).map(|i| TEST_BASE + (i * 24)).collect();
+        for &a in &inserted {
+            bits.insert(a);
+            hash.insert(a);
+        }
+        let batch: Vec<usize> = (0..16).map(|i| TEST_BASE + 700_000 + (i * 8)).collect();
+        bits.insert_all(&batch);
+        hash.insert_all(&batch);
+
+        let probes: Vec<usize> = (0..3000)
+            .map(|i| TEST_BASE + (i * 8))
+            .chain([0, TEST_BASE - 8, TEST_BASE + TEST_SPAN, TEST_BASE + 4])
+            .collect();
+        for p in &probes {
+            assert_eq!(
+                bits.contains(*p),
+                hash.contains(*p),
+                "arms disagreed on {p:#x}",
+            );
+        }
+
+        let mut a = bits.bases();
+        let mut b = hash.bases();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "arms enumerate the same set");
+
+        // Snapshots agree too — this is the mark phase's oracle.
+        let (sa, sb) = (bits.snapshot(), hash.snapshot());
+        for p in &probes {
+            assert_eq!(sa.contains(*p), sb.contains(*p), "snapshots disagreed");
+        }
+        let mut a = sa.bases();
+        let mut b = sb.bases();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+
+        // Removal, on both.
+        for &r in inserted.iter().take(500) {
+            bits.remove(r);
+            hash.remove(r);
+        }
+        for p in &probes {
+            assert_eq!(
+                bits.contains(*p),
+                hash.contains(*p),
+                "arms disagreed after prune on {p:#x}",
+            );
+        }
+        assert_eq!(bits.bases().len(), hash.bases().len());
+    }
+
+    /// The bitmap is ON by default (the switch is opt-OUT), and the snapshot a
+    /// collection takes is frozen: it does not see an allocation made after it.
+    #[test]
+    fn start_bits_default_on_and_snapshot_is_frozen() {
+        let heap = ZgcRealHeap::new();
+        assert!(
+            heap.registry.is_bitmap(),
+            "CRATONVM_ZGC_STARTBITS defaults ON",
+        );
+        let a = heap.alloc_object(ClassId::new(24), 1);
+        let snap = heap.registry.snapshot();
+        let b = heap.alloc_object(ClassId::new(24), 1);
+        assert!(snap.contains(a.as_ptr() as usize));
+        assert!(
+            !snap.contains(b.as_ptr() as usize),
+            "a snapshot must not drift under the mark loop",
+        );
+        assert!(heap.registry.contains(b.as_ptr() as usize));
+    }
+
+    /// A base the 8-byte grid cannot encode is kept EXACTLY in the overflow
+    /// set rather than dropped. Losing one would make `is_object_address` deny
+    /// a reachable object and drop it from conservative rooting — a crash, not
+    /// a slowdown — which is why the fallback exists even though no real arena
+    /// is expected to need it.
+    #[test]
+    fn object_starts_keep_bases_the_grid_cannot_encode() {
+        let starts = ZObjectStarts::with_bitmap(TEST_BASE, TEST_SPAN, true);
+        let on_grid = TEST_BASE + 8;
+        let off_grid = TEST_BASE + 12; // not 8-aligned relative to the base
+        let outside = TEST_BASE + TEST_SPAN + 8; // past the covered span
+        starts.insert(on_grid);
+        starts.insert(off_grid);
+        starts.insert(outside);
+
+        assert!(starts.contains(on_grid));
+        assert!(starts.contains(off_grid));
+        assert!(starts.contains(outside));
+        // The spill must not alias anything onto the grid.
+        assert!(!starts.contains(TEST_BASE));
+        assert!(!starts.contains(TEST_BASE + 16));
+
+        let mut all = starts.bases();
+        all.sort_unstable();
+        assert_eq!(all, vec![on_grid, off_grid, outside]);
+
+        let snap = starts.snapshot();
+        assert!(snap.contains(off_grid) && snap.contains(outside) && snap.contains(on_grid));
+
+        for a in [on_grid, off_grid, outside] {
+            starts.remove(a);
+            assert!(!starts.contains(a), "remove must clear {a:#x}");
+        }
+        assert!(starts.bases().is_empty());
+    }
+
+    /// `is_heap_addr` still resolves an INTERIOR pointer to its base, and still
+    /// refuses everything else — the two screens added in front of its extent
+    /// walk (the arena envelope, and the high-water-mark walk bound) are cost
+    /// controls and must not change a single answer.
+    #[test]
+    fn is_heap_addr_still_resolves_interiors_after_the_screens() {
+        let heap = ZgcRealHeap::new();
+        let arr = heap.alloc_array(ClassId::new(25), ArrayElementType::Byte, 512);
+        let base = arr.as_ptr() as usize;
+        let obj = heap.alloc_object(ClassId::new(25), 3);
+
+        // Exact bases.
+        assert_eq!(
+            heap.is_heap_addr(base).map(|o| o.as_ptr() as usize),
+            Some(base)
+        );
+        assert_eq!(
+            heap.is_heap_addr(obj.as_ptr() as usize)
+                .map(|o| o.as_ptr() as usize),
+            Some(obj.as_ptr() as usize),
+        );
+        // Interior of the array resolves to the array.
+        for delta in [8usize, 64, 256, 500] {
+            assert_eq!(
+                heap.is_heap_addr(base + delta).map(|o| o.as_ptr() as usize),
+                Some(base),
+                "interior +{delta} must resolve to its base",
+            );
+        }
+        // Off-heap and past-the-cursor words are refused.
+        let (lo, hi) = heap.conservative_addr_span().expect("one arena");
+        assert!(heap.is_heap_addr(0).is_none());
+        assert!(
+            heap.is_heap_addr(8).is_none(),
+            "a small integer is not a heap word"
+        );
+        assert!(heap.is_heap_addr(lo - 8).is_none());
+        assert!(heap.is_heap_addr(hi).is_none());
+        assert!(
+            heap.is_heap_addr(hi - 4096).is_none(),
+            "the unallocated bump tail is not inside any object",
+        );
     }
 }
