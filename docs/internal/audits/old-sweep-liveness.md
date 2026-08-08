@@ -1,8 +1,8 @@
 # What proves an old-gen block dead: the in-place sweep's liveness argument
 
-*Written 2026-08-01 against `feat/c2-review-remediation`. Closes the item
-[`docs/gc/gc-crate-audit.md`](gc-crate-audit.md) §5.1 left open, and records the
-decisions on its GCAUD-5 and GCAUD-7.*
+*Written against `feat/c2-review-remediation`. Closes the item
+[`gc-crate-audit.md`](../internal/audits/gc-crate-audit.md) §5.1 left open, and
+records the decisions on its GCAUD-5 and GCAUD-7.*
 
 The audit owns the enumeration of the crate's liveness decisions and its
 address-keyed tables; this document owns exactly one row of that table — the one

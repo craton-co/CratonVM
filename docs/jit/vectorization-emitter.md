@@ -211,14 +211,14 @@ in the JIT were recently converted to checked ones for exactly this bug class.
 
 ## Registers
 
-`jit/src/regalloc.rs` has no vector register *class*, but since 2026-08-04 it
+`jit/src/regalloc.rs` has no vector register *class*, but it
 does have the **authority**: `regalloc::xmm_roles` declares all three XMM
 ranges in one place — `ir_lower`'s FP scratch pair (XMM0/XMM1), its linear-scan
 file (XMM2–XMM7) and the widest pool a vector region may be given. The pool is
 an **argument**, `VecEmitRequest::vector_pool`, because which registers are free
 is a fact about the surrounding method:
 
-* **XMM8..XMM15** is the pool, and since 2026-08-04 it is **disjoint** from both
+* **XMM8..XMM15** is the pool, and it is **disjoint** from both
   scalar ranges. A vector region can no longer destroy a scalar `double` a
   caller left live, so the "prove your scalars are dead" obligation is gone.
   What replaced it is narrower and mechanical: every register in the pool is
@@ -263,8 +263,7 @@ Everything below is honestly untested, because nothing calls this module yet:
   against hand-derived encodings and against the AVX2 helpers already in
   `x64.rs`; none of them run the bytes. An end-to-end execution test needs the
   call site.
-* ~~**Partial integration with the scalar register allocator.**~~ **CLOSED
-  2026-08-04 (second half).** The first half declared the three XMM authorities
+* ~~**Partial integration with the scalar register allocator.**~~ **CLOSED (second half).** The first half declared the three XMM authorities
   together in `regalloc::xmm_roles` and made the pool a caller-supplied
   argument. The residual was that the pool still overlapped both scalar ranges
   completely, so the caller's "these are dead" proof was real work — and it

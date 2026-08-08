@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Stage 1 of 4 — **internal diagnostic**. `--jdk-only` may fail on programs that run fine under `--real-jdk`; that is the intended signal, not a bug in your program. |
 | **Normative source** | [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md) |
-| **Companions** | [`jdk-only-audit.md`](jdk-only-audit.md) · [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) · [`security/jdk-only-threat-model.md`](security/jdk-only-threat-model.md) |
+| **Companions** | [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md) · [`jdk-only-native-review.md`](jdk-only-native-review.md) · [`security/jdk-only-threat-model.md`](security/jdk-only-threat-model.md) |
 
 ## What the flag means
 
@@ -129,7 +129,7 @@ The `kind` tag is stable and greppable (`JdkOnlyViolation::kind()`).
 | `synthetic-native-registered` | A `SyntheticStub` registration was refused at VM init. | Nothing you can do at the command line. The named registration site is the work item. Many of these are permanent bridges carrying the wrong tag — see [`jdk-only-runtime-services.md`](jdk-only-runtime-services.md). |
 | `synthetic-native-invocation` | A `SyntheticStub` was reached at dispatch time. | A dispatch path bypassed the registration gate. Always worth filing: it names a hole in the resolver, not just in one native. |
 | `missing-native` | An `ACC_NATIVE` method has no registered bridge. | The most actionable kind. Attach `--dump-missing-natives-grouped` — the module grouping tells you which JDK module is under-served. |
-| `native-shadows-bytecode` | A registered native was about to win over concrete real bytecode. | Under wave-1 policy this is recorded, not enforced. It is the leading indicator for a wrong-result bug. |
+| `native-shadows-bytecode` | A registered native was about to win over concrete real bytecode. | Under stage-1 policy this is recorded, not enforced. It is the leading indicator for a wrong-result bug. |
 | `missing-boot-class` | A class expected in the JDK runtime image was not found. | Almost always a `--java-home` / JDK-layout problem. Check the searched paths printed in the error. |
 | `missing-implementation` | Neither bytecode nor a native exists for the method. | An abstract/absent method reached dispatch. File with the reproducer. |
 

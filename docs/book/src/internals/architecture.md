@@ -36,7 +36,7 @@ lints.)
 | `cratonvm-embed` | `cratonvm-embed/` | Curated, semver-stable Rust embedding facade |
 | `cratonvm-difftest` | `difftest/` | Differential-testing harness against a reference JDK |
 
-It is roughly **1.35 million lines of Rust** as of 2026-07-27. The project
+It is roughly **1.35 million lines of Rust**. The project
 builds on Rust **1.80+**
 (edition 2021).
 

@@ -171,7 +171,7 @@ and a stub CUDA backend that always reports "no driver" (device probing
 never succeeds); add `--features gpu-driver` for the real CUDA Driver API
 bindings (via `cudarc`) that can actually offload work. CUDA-only
 (NVIDIA); Linux and Windows x86_64 — no macOS. Validated on real hardware
-(Windows 11, RTX 2060, sm_75) on 2026-07-11. See
+(Windows 11, RTX 2060, sm_75). See
 [`docs/PLATFORMS.md`](../../../PLATFORMS.md) for the platform matrix.
 
 | Flag | Description | Default |

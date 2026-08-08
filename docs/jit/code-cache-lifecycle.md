@@ -3,7 +3,7 @@
 Installation and invalidation protocol, epoch retirement, and the counters that
 make both auditable.
 
-**Why this exists.** The C2 review (`docs/feature-designs/c2/deep-research-vm-c2.md`)
+**Why this exists.** The C2 review
 has two adjacent P1 lanes:
 
 > **Add code-cache lifecycle metrics and reclamation** — Installed/reclaimed
@@ -276,8 +276,7 @@ first and evaluates `ACTIVE_JIT_EXECUTIONS.is_zero()` with the guard held, and
 `is_zero()` is sound (the check follows the caller's unpublication). The window
 described here is closed.
 
-**The obligation that replaced it** (2026-08-03,
-`jit-code-buffer-released-outside-retirement-queue-fixed-20260803.md`)
+**The obligation that replaced it**
 is not about ordering at all, and it is the one to check when touching this
 area:
 
@@ -427,5 +426,5 @@ shows no execution of partial or reclaimed code"* — needs, in addition:
 * `gc/src/gc_metrics.rs` — the counter/report idiom this mirrors.
 * `docs/jit/compiler-metrics.md` — per-compilation reports, including
   `code_cache_bytes_at_install`.
-* `docs/feature-designs/c2/deep-research-vm-c2.md` — the review this closes two P1
+* the C2 review — the review this closes two P1
   items of.

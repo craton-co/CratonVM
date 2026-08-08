@@ -4,7 +4,7 @@
 that real-JDK mode already boots, and forbids the compatibility substitutions
 CratonVM would otherwise make to keep a program moving.
 
-> **Status: internal diagnostic (stage 1 of 4).** Wave 1 is instrumentation and
+> **Status: internal diagnostic (stage 1 of 4).** Stage 1 is instrumentation and
 > measurement; enforcement is partial. A program that runs fine under
 > `--real-jdk` may fail under `--jdk-only` — that is the signal the mode exists
 > to produce, not a bug in the program. This is not yet a compatibility

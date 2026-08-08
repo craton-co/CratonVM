@@ -83,7 +83,7 @@ independently to inspect `.class` files.
 ## vm — Virtual Machine
 
 The VM is the core of the project (~1,350,000 Rust LoC across the 22 workspace
-member crates as of 2026-07-30, plus the separate `fuzz` harness workspace).
+member crates, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
 
@@ -99,7 +99,7 @@ find <the 22 member dirs> -name '*.rs' -type f \
   | xargs -0 cat | wc -l
 ```
 
-which reported 1,349,978 lines across 702 files on 2026-07-30.
+which reports roughly 1,350,000 lines across about 700 files.
 
 Rough size distribution, largest first, so newcomers know where the mass
 actually is:
@@ -114,8 +114,8 @@ actually is:
 | `native-collections` | 55,000 | `jit-cuda` | 10,000 |
 | `native-io` | 55,000 | remaining 9 | < 7,000 each |
 
-Several individual files are far larger than is comfortable. The two worst were
-split on 2026-07-30, at the section banners the files already carried:
+Several individual files are far larger than is comfortable. The two worst have
+been split at the section banners they already carried:
 
 - `vm/src/runtime/interpreter.rs` went ~50,500 → ~24,100 lines, with
   `interpreter/typecheck.rs` (`checkcast`/`instanceof`/`aastore` compatibility),
@@ -147,7 +147,7 @@ and re-exports `vm/src/vm/`: `vm_exec.rs` (~21,900 lines), `vm_init.rs`
 (~12,300), `vm_util.rs` (~4,600), `vm_object.rs` (~2,100), and `realms/`.
 Those are the files to open.
 
-Two `native-builtins` files were worse and were split on 2026-07-25:
+Two `native-builtins` files were worse and have also been split:
 `lib.rs` went ~90,000 → ~39,000 across 13 per-domain
 modules (`util_concurrent_ext`, `antlr_intrinsics`, `regex_matcher`,
 `math_bignum`, …), and `phases_late.rs` went ~77,000 → ~8,000 across 18
@@ -242,9 +242,9 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector with the Cheney moving young gen **enabled** — but see **"When the default does not compact"** below: requesting a moving cycle is not the same as running one, because each cycle must still carry a per-cycle root-coverage proof. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is feature-gated (`zgc`, not part of the default feature set) and holds two things of very different maturity. `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real, memory-backed collector — `Arena` storage, real `ObjectHeader`s, real `java.lang.ref` processing — and it **is** wired end to end: `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`, so `-XX:+UseZGC` really selects it. Above it in the same file sits a metadata-only *simulation* of OpenJDK's colored-pointer model (`ZgcCollector` / `ColoredPointer` / `LoadBarrier` / `GenerationalZgc`) with no production consumer. What ZGC is **not** is present in a stock build: the feature is default-off, so `GcAlgorithm::Zgc` and its `parse_gc_algorithm` arm do not exist unless you build `cargo build --release -p cratonvm-cli --features zgc`, and `-XX:+UseZGC` otherwise warns and falls back to Generational. Nor is it production ZGC — it is stop-the-world, non-moving, non-generational, non-compacting, TLAB-less. It stays default-off for pass-rate parity: on the 1975-class Spring Boot suite, same binary with only the collector toggled, it measured 1860 PASS / 49 HANG / 22 FAIL against the default collector's 1902 / 18 / 11 (2026-08-07, `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`). The path to a real one is `docs/feature-designs/zgc-production-implementation-plan.md`.
+Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector with the Cheney moving young gen **enabled** — but see **"When the default does not compact"** below: requesting a moving cycle is not the same as running one, because each cycle must still carry a per-cycle root-coverage proof. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is feature-gated (`zgc`, not part of the default feature set) and holds two things of very different maturity. `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real, memory-backed collector — `Arena` storage, real `ObjectHeader`s, real `java.lang.ref` processing — and it **is** wired end to end: `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`, so `-XX:+UseZGC` really selects it. Above it in the same file sits a metadata-only *simulation* of OpenJDK's colored-pointer model (`ZgcCollector` / `ColoredPointer` / `LoadBarrier` / `GenerationalZgc`) with no production consumer. What ZGC is **not** is present in a stock build: the feature is default-off, so `GcAlgorithm::Zgc` and its `parse_gc_algorithm` arm do not exist unless you build `cargo build --release -p cratonvm-cli --features zgc`, and `-XX:+UseZGC` otherwise warns and falls back to Generational. Nor is it production ZGC — it is stop-the-world, non-moving, non-generational, non-compacting, TLAB-less. It stays default-off for pass-rate parity: on the 1975-class Spring Boot suite, same binary with only the collector toggled, it measures 1860 PASS / 49 HANG / 22 FAIL against the default collector's 1902 / 18 / 11. The path to a real one is `docs/feature-designs/zgc-production-implementation-plan.md`.
 
-> *Corrected 2026-08-07.* This paragraph previously said `ZgcRealHeap` "is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector." That was true when written; `gc/src/vm_heap.rs:20` (`use crate::zgc::ZgcRealHeap`) and its `VmHeap::Zgc` arms disprove it today. The half worth keeping is the default-off gate, restated above. Note also that the working build command is `-p cratonvm-cli --features zgc`; the `vm-cli` pass-through was only added 2026-08-07, and before that only `--features cratonvm-vm/zgc` reached the gated code.
+> `ZgcRealHeap` **is** wired into backend dispatch — `gc/src/vm_heap.rs` imports it and `VmHeap::Zgc` has real arms. What gates it is the default-off Cargo feature, restated above. The working build command is `-p cratonvm-cli --features zgc`; `--features cratonvm-vm/zgc` also reaches the gated code.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.
@@ -283,9 +283,8 @@ proof is not. Read both before reasoning about allocation-path or GC-pause code.
    backend, moving/non-moving verdict, the stable reason code, and the specific
    unproven obligation — and `print_gc_summary` emits it on every `--verbose:gc`
    run. It is the authority for "did this process compact?"; prose about the
-   flag is not. `docs/GC.md`'s backend table stated the pre-2026-07-26 rule
-   until the drift was resolved in
-   [`docs/gc/tlab-and-card-audit.md`](docs/gc/tlab-and-card-audit.md) §3.2.
+   flag is not. `docs/GC.md`'s backend table is kept in step with that report; when the two
+   disagree, the runtime report wins.
 
    (An earlier `fail_closed_non_moving = is_active() && !allow_moving_young`
    term made this unconditional — it meant `CRATONVM_MOVING_YOUNG=1` alone could
@@ -297,7 +296,7 @@ So on a JIT-warm workload a default build can still spend cycles in the
 what a nonzero `coverage_fallbacks` count means, and it is the number to read
 before attributing a pause profile to compaction.
 
-Correctness stopped being the blocker on 2026-07-26: the heap corruption was
+Correctness is no longer the blocker: the heap corruption was
 five codegen sites pushing an untagged object reference onto the JIT's
 simulated operand stack. Throughput is the **remaining** work, now tracked as
 an optimization program rather than as a precondition, because the memory-
@@ -306,10 +305,9 @@ footprint win decided the flip: on Binary-Trees-18 the moving path measures
 5.0× before the pre-cycle object-start walk stopped building a hash set of
 every object in from-space — but bt18 at `-Xmx512m` does not complete at all
 without compaction. bt18 is simultaneously the worst case for a copying
-collector and the workload that justifies it. The open items (the `pointer_map`
+collector and the workload that justifies it. The open items are the `pointer_map`
 `FxHashMap`, the disabled self-call spill elision, and the unpriced
-`jit_frame_record` helper) are itemised in
-[`docs/moving-young-throughput.md`](docs/moving-young-throughput.md).
+`jit_frame_record` helper.
 
 **Object layout:**
 ```
@@ -561,9 +559,9 @@ pointer.
    `types/src/value.rs`) should be read with that in mind.
 
 7. **Configuration is env-var-driven, and the surface is large.** There are
-   hundreds of distinct `CRATONVM_*` identifiers across the workspace. A
-   2026-07-26 recount found 528 direct `std::env::var` / `var_os` source call
-   sites in the selected core directories; `vm/src/runtime/env_cache.rs`
+   hundreds of distinct `CRATONVM_*` identifiers across the workspace. There are
+   roughly 530 direct `std::env::var` / `var_os` source call
+   sites in the core directories; `vm/src/runtime/env_cache.rs`
    contains 40 itself. The typed and grouped flag layers centralise many
    identifiers, but direct reads remain scattered. Most are
    debug or diagnostic gates, but a meaningful subset changes semantics
@@ -612,8 +610,8 @@ pointer.
      already had two independent override gates that **disagreed** about
      `java/lang/String` and carried comments asking that they be kept in sync by
      hand. A policy evaluated at N call sites is N policies, and the divergence
-     is invisible until something silently takes the wrong branch. Wave 1 landed
-     the resolver and routed the main interpreter path through it; paths that
+     is invisible until something silently takes the wrong branch. The resolver
+     exists and the main interpreter path goes through it; paths that
      still bypass it are marked `// JDK-ONLY-WAVE2:` so they can be found
      mechanically rather than by memory.
    * **Policy state is per-VM, never a process global.** It lives on `VmConfig`
@@ -647,8 +645,7 @@ This repository has a chronic and well-evidenced failure mode: a capability
 lands behind a `CRATONVM_*` environment variable, the variable defaults to
 **off**, the work is recorded as "implemented", and the code never executes on
 the default path. The docs then describe a VM that nobody is running. Several
-of the corrections in the 2026-07-26 truth pass over this document were
-instances of this.
+of the corrections recorded in this document were instances of this.
 
 **Confirmed instances** (all verifiable in the tree today):
 
@@ -657,7 +654,7 @@ instances of this.
 | `moving_young` | `types/src/flags.rs::DEFAULT_MOVING_YOUNG` | **Resolved.** Restructured as opt-out with a compatibility opt-in, and the compiled default is now `true`. The former independent `allow_moving_young` gate has been deleted. Retained here as the worked example of the fix shape, not as an open instance — but note the second gate: a moving cycle still needs its per-cycle coverage proof, so "flag on" and "compaction ran" remain distinct claims. |
 | `use_compressed_oops` | `vm/src/config.rs` | Opt-in, defaults false. Fully wired but never enabled on the default path — and the doc claimed for a while that it was *not* wired, which is the same failure mode in the opposite direction. |
 | `safepoint_reg_spill` | `jit/src/x64.rs:2650` | **Was** the canonical case: several call sites' own comments claimed a register spill as their protection, but that spill "only ran when the SEPARATE `CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var was ALSO set — off by default, so the documented protection never actually happened." Now folded into default-on `precise_maps` and inverted to opt-**out** (`CRATONVM_NO_PRECISE_REG_SPILL`). This is the shape the fix should take. |
-| `precise_maps` register-spill half | `jit/src/x64.rs:2646-2662` | Same item; `precise_maps` was default-on since 2026-07-07 while its register-spill branch was not. A flag being on does not mean all of its branches are. |
+| `precise_maps` register-spill half | `jit/src/x64.rs:2646-2662` | Same item; `precise_maps` was default-on while its register-spill branch was not. A flag being on does not mean all of its branches are. |
 
 **Checklist — apply this before recording anything as "implemented":**
 

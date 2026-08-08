@@ -123,7 +123,7 @@ confirmed:
    warning appearing during its silent stretch — the same warning and reason
    already implicated in a **separate, independently-filed** throughput-wall
    regression for Tomcat
-   ([`gc-moving-young-persistent-nonmoving-fallback-regression.md`](../tomcat/gc-moving-young-persistent-nonmoving-fallback-regression.md)),
+   (the retired `gc-moving-young-persistent-nonmoving-fallback-regression` record),
    where persistent moving-young→non-moving-sweep fallback was measured
    making a workload 40-80x slower than its closed baseline while still
    making genuine (just very slow) forward progress. If the same fallback is

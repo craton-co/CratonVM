@@ -7,7 +7,7 @@ record. All three transforms are reachable from `plan_bytecode_loop_xform`.
 
 Nothing in the VM arms the opt-in, and an armed compile is refused anyway while
 `deopt_real` is on; see that file's "Reachability" note and
-`docs/feature-designs/c2/loop-02-planner-admission-gates.md`.
+the loop-planner admission-gate design.
 
 ## Why bytecode-to-bytecode
 
@@ -90,7 +90,7 @@ header with the guard produced a null receiver on a real workload — see
 `probes/LoopVersionOsrProbe.java`.
 
 For peel and unroll the guard is a profitability filter only — both are legal at
-every trip count. See `docs/feature-designs/c2/loop-01-peeling-and-versioning.md`.
+every trip count. See the loop peeling-and-versioning design.
 
 ## Preconditions
 

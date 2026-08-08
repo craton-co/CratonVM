@@ -22,7 +22,7 @@ The census runs **all six registration passes `vm/src/vm/vm_init.rs` runs** on
 the real-JDK boot path, in its order, behind its `set_drop_real_layout_synthetic`
 flag — see `register_boot_path` in the test.
 
-Until 2026-08-05 it ran `register_essential_natives` and nothing else, while
+It once ran `register_essential_natives` and nothing else, while
 claiming to build the registry "exactly as the VM's real-JDK boot path does". It
 therefore missed `register_concurrent_natives`, `register_forkjoin_quiescence`,
 `register_stamped_lock_natives`, `register_io_natives` and

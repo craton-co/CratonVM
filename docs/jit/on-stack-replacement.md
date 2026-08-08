@@ -1,7 +1,7 @@
 # On-stack replacement: what exists, what this change adds, what it refuses
 
 Scope: the P1 item *"Add on-stack replacement"* of
-`docs/feature-designs/c2/deep-research-vm-c2.md`.
+the C2 review.
 
 > Build HIR from interpreter state at a loop BCI, validate local/stack types,
 > enter compiled code, and support deoptimization back to the same loop state.
@@ -100,7 +100,7 @@ Two contract strengths, because two artifact shapes exist:
 Under the inferred contract an incoming `top` (uninitialized) is **accepted**:
 the dead mask only names the *hazardous* dead locals (those sharing a register
 with a live one), so a harmlessly-dead local arrives unmasked and legitimately
-uninitialized. Refusing those is what the pre-2026-07-27 blanket dead-mask
+uninitialized. Refusing those is what an earlier blanket dead-mask
 refusal did, and it cost H2's hottest method every one of its OSR entries.
 Under the precise contract an incoming `top` against a live `Exact` type **is**
 refused: the contract knows liveness, so the disagreement is real.

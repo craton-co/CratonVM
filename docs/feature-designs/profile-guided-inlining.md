@@ -1,24 +1,46 @@
 # Profile-guided inlining
 
-C2-review P1 — "Add direct-call and type-profile inlining" / "Profile-guided
-inlining". One doc for the whole feature: the policy, the evidence that feeds
-it, what the backend emits, the deopt-safety argument, how a speculation is
-retired, and what is still open.
+**Status:** Shipped (opt-in via `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`) —
+and in practice **doubly gated**, because the evidence it needs is also
+default-off.
 
-Consolidated from `pgo-01-call-site-evidence-gap.md` and
-`pgo-02-guarded-inlining.md` (both retired 2026-08-03; pgo-02's residuals
-closed 2026-08-04 — see
-`pgo-02-guarded-inlining-RETIRED-20260804.md`),
-plus the design doc this supersedes (`docs/jit/profile-guided-inlining.md`).
+## What it does today
 
-**Status 2026-08-04.** Interpreted `invokestatic`/`invokespecial` feed
-`MethodProfile::call_sites` (PGO-01). A monomorphic *or bimorphic*
-`invokevirtual`/`invokeinterface` site is speculatively inlined behind receiver
-class-id guards, each guard carrying the body **that guard's class dispatches
-to**, with the miss edge falling through to normal dispatch — never a deopt.
-Gated on `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`, default-OFF and unsoaked.
+Interpreted `invokestatic` and `invokespecial` feed
+`MethodProfile::call_sites`, recorded from four live sites in
+`vm/src/runtime/interpreter/dispatch_static.rs`,
+`.../invoke.rs` and `.../dispatch_virtual.rs`.
 
----
+A monomorphic **or bimorphic** `invokevirtual` / `invokeinterface` site is
+speculatively inlined behind receiver class-id guards. Each guard carries the
+body *that guard's class dispatches to*, and the miss edge falls through to
+normal dispatch — **never a deopt**. The policy is `plan_inline` /
+`classify_receiver_shape` / `InlineRequest` / `InlineVerdict` in
+`jit/src/lib.rs`; emission is in `jit/src/lib.rs` and
+`jit/src/x64/bytecode_walk.rs`. It fails closed: without a
+`SpeculatedReceiver` invalidation dependency from `class_id_name_resolver`, it
+refuses to inline.
+
+## The two gates
+
+| Gate | Default | Effect when off |
+|---|---|---|
+| `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE` | **off** | no guarded virtual inlining |
+| `CRATONVM_TIER_PGO` | **off** | profile recording never enabled (`vm/src/vm/vm_init.rs`), so every `record_*` short-circuits and there is no evidence to speculate on |
+
+Both must be set for this feature to do anything. The first is documented as
+unsoaked; the second is what makes the first inert by default.
+
+## What is not built yet
+
+- **`jit/src/pgo.rs` is abandoned.** Roughly 2,000 lines that nothing
+  constructs, populates or reads; `jit/src/lib.rs` declares `pub mod pgo;` and
+  never uses it. The live profile store is `jit/src/profile.rs`. Do not extend
+  `pgo.rs` — it is not the module in the loop.
+- A set of related inlining knobs remain default-off experiments:
+  `CRATONVM_JIT_MAIN_INLINE`, `CRATONVM_INLINE_ALLOW_STATIC`,
+  `CRATONVM_JIT_INLINE_GETFIELD`, `CRATONVM_JIT_INLINE_SELF_GUARD`,
+  `CRATONVM_JIT_ENABLE_INLINE_NEW`.
 
 ## 1. What existed before either lane
 
@@ -537,7 +559,7 @@ with only the inlining flag set: 15 `no-profile-evidence` refusals and zero
 splices. The harness sets both flags for this reason, and anyone measuring this
 by hand must too, or they will conclude the lowering does not work.
 
-### The measurement, 2026-08-04
+### The measurement
 
 `GuardedInlineReachProbe` (ordinary virtual and interface dispatch: a
 single-implementation interface site, a two-class overriding site, a

@@ -81,7 +81,7 @@ threads x 60 000 updates at `--Xmx 4g` now completes in 163 s. The experiment
 is runnable; see the scaling section below.
 
 **The probe is not missing, and it has moved.** `H2UpdateScaleProbe.java` was in
-`docs/internal/repros/h2-insert-scale-20260731/` — the Reproducing block below
+`repros/h2-insert-scale-20260731/` — the Reproducing block below
 names no path, and `apps/` is gitignored, so it was invisible from the obvious
 place. It now lives at **`probes/H2UpdateScaleProbe.java`**, out of a directory
 slated for deletion. Its third argument is `objectCount`, not the lock timeout.
@@ -729,6 +729,6 @@ cd <fresh writable dir>          # H2 writes ./data
 * `bug-h2-classid0-stale-address-family.md` — the memory-safety family
   found in this class. Unrelated to throughput.
 * the retired `bug-h2-mvstore-insert-loop-perf-hang` write-up
-  (`docs/internal/fixed-suite-bugs/h2-suite-bugs/…-RESOLVED-20260807.md`) —
+  (`fixed-suite-bugs/h2-suite-bugs/…-RESOLVED-20260807.md`) —
   source of the INSERT table and the flat profile above, plus the two mark-word
   quartet defects found while reproducing it.

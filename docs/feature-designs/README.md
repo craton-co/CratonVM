@@ -1,36 +1,82 @@
-# Feature Designs — XL Strategic Roadmap
+# Feature designs — status index
 
-Actionable design / implementation-plan docs for the XL features that are too
-large to land in a single pass. Each is grounded in the current implementation
-(cited `file:line`) and structured as: **Goal · Current state · Design ·
-Implementation steps (ordered) · Risks · Effort**.
+One document per large feature, each stating **what the feature does today**
+before it explains why it is built that way. These are current-state docs, not
+a roadmap: if a doc says a thing is shipped, the code says so too, and if it
+says a thing is not built, that is a claim about the tree as it stands.
 
-These are roadmap docs, not specs of shipped behavior. They capture *what to
-build and in what order*, including the cross-feature dependencies below.
+Status vocabulary:
 
-## The docs
+| Term | Meaning |
+|---|---|
+| **Shipped (default on)** | built, and active with no configuration |
+| **Shipped (opt-in)** | built, correct as far as it is soaked, but off unless a flag is set |
+| **Partial** | some of it is live; the doc names what is missing |
+| **Designed, not built** | analysis and a plan, no implementation |
+| **Not planned** | scoped, then declined for a stated reason |
 
-| Doc | Feature | Effort | Key dependency |
-|---|---|---|---|
-| [`real-frame-deopt.md`](real-frame-deopt.md) | **Keystone.** Materialize the interpreter frame at the trapping bci from JIT register/stack state (vs. today's whole-method re-run). | XL | — (gates the rest) |
-| [`default-moving-young-gen.md`](default-moving-young-gen.md) | Make a moving/compacting young gen the default to close the bt18 ~23x gap (invariant: checksum = 68332206). | XL | precise JIT roots / deopt maps |
-| [`wire-tiered-manager.md`](wire-tiered-manager.md) | Turn the dormant tiered policy + queue into a real C1+C2 pipeline with a background compile thread and OSR. | L | OSR precision ← deopt |
-| [`activate-ir-optimizer.md`](activate-ir-optimizer.md) | **Largely landed (inc 1–29).** GVN/fold/DSE/LICM + escape→scalar-replacement broad; φ/branch dam fixed; `Op::Load`/`Store`/`New`/`Call` + a full **long (64-bit) value tier** built & **default-ON** (`IR_CALL`/`SCALAR_NEW`/`IR_LONG`/`IR_CALL_SPECIAL`). **Remaining:** long/double call *returns* (`i64::MIN`-sentinel), `ldiv`/`lrem` (long deopt-resume), `double`/`float` XMM tier — see the doc's "Remaining roadmap (post-inc-29)". | L | guard-surviving SR ← deopt |
-| `real-cdi-bean-container.md` | Retire the per-framework shim cluster (ArC/Spring/WildFly/MSC/Infinispan/Agroal) with real bytecode. | XL | general `<clinit>`/classloading fixes |
-| [`jep358-helpful-npe.md`](jep358-helpful-npe.md) | Helpful NPE messages via bci-context analysis + `getExtendedNPEMessage`. | M | JIT-NPE parity ← deopt |
-| `proxy-real-classfile.md` | Generate a real `$ProxyN` class file (vs. name-lookup synthetic shim). | M | runtime defineClass (WP2.3) |
-| [`jit-osr-exit-and-recompile.md`](jit-osr-exit-and-recompile.md) | **Livelock memo and visibility gap closed.** The per-pc compile memo was already built; OSR lifecycle counters (`osr_entered`/`osr_exited`/`osr_refused_entry`/`osr_compile_declined`) are now ungated, because a silent exit is otherwise indistinguishable from never having entered. Remaining: the exit-state differential — an OSR bail resuming at the wrong state re-runs loop iterations, a wrong-answer bug no termination test sees. | M (remaining) | — |
-| [`jit-osr-entry-metadata.md`](jit-osr-entry-metadata.md) | **Contract executable and enforced.** OSR metadata spans **three** coordinate spaces (interpreter bci / output pc / local index); a publication-time check refuses OSR for the method when the vectors disagree, because a short dead mask reads as "safe" through `unwrap_or(0)`. Remaining: one door for "produce an OSR-capable artifact" — the OSR path still calls `x64::compile` directly. | M (remaining) | — |
-| [`jit-machine-level-and-instruction-selection.md`](jit-machine-level-and-instruction-selection.md) | **Increment 0 landed; 1–4 on hold, and the hold is the result.** Four compiler levels, not three; the missing one is a machine list. Shadow selection measured **15.7–19.0%** tiler coverage on real compiles with `Rule::Lea`/`AluImm` firing zero times, so the next step is six 32-bit pattern rows — not a machine level. | S (then L, gated) | — |
-| [`embedding-api.md`](embedding-api.md) | `libcratonvm` C-ABI + JNI Invocation-API parity (`JNI_CreateJavaVM`). | L | — |
-| [`keystore-mldsa-mlkem.md`](keystore-mldsa-mlkem.md) | `KeyStore.getInstance` PKCS12/JKS + route ML-DSA/ML-KEM to a real provider. | M | — |
-| [`jdk-only-wave2/`](jdk-only-wave2/README.md) | **Parallel execution plan** for finishing `--jdk-only` (contract: [`jdk-only-mode.md`](jdk-only-mode.md)). Twelve lanes with an explicit file-ownership map and conflict matrix; **nine can start simultaneously**. The defect evidence stays in [`docs/known-issues/jdk-only/`](../known-issues/jdk-only/). | L | L9 (real `String` bytecode during JDK `<clinit>`) and L10 (real `ThreadPoolExecutor` field init) gate the deletions — **neither is itself a jdk-only change** |
+Environment flags are declared centrally in `types/src/flags.rs` and
+`types/src/flag_groups.rs`, but a flag's **default is decided at its read
+site** — usually `vm/src/runtime/env_cache.rs` for VM-side accessors, or the
+owning module for jit-side ones. `docs/CONFIG.md` is the generated inventory.
 
-## Dependency note
+## Compiler and JIT
 
-`real-frame-deopt.md` is the **keystone**: precise per-safepoint register→slot
-maps unlock (a) safe default moving GC, (b) precise OSR in the tiered manager,
-(c) guard-surviving scalar replacement in the IR optimizer, and (d) precise
-JIT-thrown-NPE bci context. The others (`real-cdi-bean-container`,
-`embedding-api`, `proxy-real-classfile`, `keystore-mldsa-mlkem`) are independent
-and can proceed in parallel.
+| Feature | Status | What it does today |
+|---|---|---|
+| [IR optimizer](activate-ir-optimizer.md) | Shipped (default on) | GVN, const-fold, DSE, DCE, LICM and unrolling over a Sea-of-Nodes IR, with escape analysis → scalar replacement, and complete long and float/double value tiers. |
+| [Tiered compilation manager](wire-tiered-manager.md) | Shipped (default on) | Compilation runs on a background `cratonvm-jit-compiler` thread; the mutator interprets until the worker publishes. `CRATONVM_BG_COMPILE=0` restores inline compilation. |
+| [Real-frame deoptimization](real-frame-deopt.md) | Shipped (default on) | A failed guard resumes the interpreter at the trapping bci instead of re-running the whole method. |
+| [Deopt + precise OSR (combined design)](deopt-osr.md) | Shipped (default on) | The shared per-pc state map, virtual-object re-materialization, de-speculation and cat-2/FP resume. |
+| [OSR entry metadata](jit-osr-entry-metadata.md) | Shipped (always on) | A publication-time check refuses OSR for a method whose metadata vectors disagree across coordinate spaces. |
+| [OSR exit and recompile](jit-osr-exit-and-recompile.md) | Shipped (default on) | Per-pc compile memo, exit-site classification, and ungated lifecycle counters — one of which is declared but never recorded. |
+| [Precise JIT stack maps](precise-jit-maps-default.md) | Shipped (default on) | The collector gets a precise oop description per compiled frame. `CRATONVM_NO_PRECISE_JIT_MAPS` opts out; the old `CRATONVM_PRECISE_JIT_MAPS` is a no-op. |
+| [JIT local exception handlers](jit-local-exception-handlers.md) | Shipped (default on) | Methods combining `athrow` with a local exception table compile, behind a compile-time dataflow safety check. |
+| [Profile-guided inlining](profile-guided-inlining.md) | Shipped (opt-in via `CRATONVM_JIT_GUARDED_VIRTUAL_INLINE`) | Monomorphic and bimorphic virtual/interface sites inlined behind receiver class-id guards. Doubly gated: profile recording needs `CRATONVM_TIER_PGO`. |
+| [Machine level and instruction selection](jit-machine-level-and-instruction-selection.md) | Partial | The encoder level is built and byte-anchored; the machine list is not, and every emitting mode is default-off. |
+
+## Garbage collection
+
+| Feature | Status | What it does today |
+|---|---|---|
+| [Moving young generation](default-moving-young-gen.md) | Shipped (default on); remaining scope **not planned** | Semispace Cheney copy, fail-closed to a non-moving sweep when per-cycle root coverage is unproven. The throughput premise it was scoped against was measured and refuted. |
+| [Compact reference-field layout](compact-ref-field-layout.md) | Shipped (default on) | Reference instance fields are bare 8-byte pointers, not 16-byte tagged cells. |
+| [Concurrent garbage collection](concurrent-gc-maturation.md) | Partial | Concurrent old-gen mark and sweep run by default on the Generational collector; G1 is opt-in and has a real marker thread; ZGC has neither. |
+| [Production ZGC](zgc-production-implementation-plan.md) | Partial | Selectable behind the `zgc` cargo feature, but the collector it selects is a stop-the-world non-moving mark-sweep. The concurrent/compacting modules are written and unadopted. |
+| [ZGC JIT load barrier](zgc-jit-load-barrier.md) | Designed, not built | Correctness argument, site inventory and cost model. No barrier emission exists in the JIT. |
+| [ZGC reference-slot representation](zgc-reference-slot-representation.md) | Designed, not built | What it would cost to give the barrier a CAS-able slot. Reference slots are plain pointers today. |
+| [Native root handles](native-handle-discipline.md) | Shipped (default on), unenforced | A scoped handle API with ~405 adoption sites. Nothing fails a build when native code holds a raw `ObjectRef` across an allocating call. |
+
+## Embedding and runtime services
+
+| Feature | Status | What it does today |
+|---|---|---|
+| [`libcratonvm` embedding API](embedding-api.md) | Shipped (default on) | `cdylib`/`staticlib` exposing the JNI Invocation API, a flat `cratonvm_*` C ABI, and a curated Rust facade. |
+| [Foreign-thread attach](foreign-thread-attach.md) | Shipped (default on) | A host-created OS thread becomes a GC-safe Java thread that participates in stop-the-world. |
+| [JEP 358 helpful NPE messages](jep358-helpful-npe.md) | Shipped for the CLI; partial for embedders | Backward expression reconstruction producing HotSpot's `because "x" is null`. An embedder that never wires the flag gets the legacy strings. |
+| [JVMTI event delivery](jvmti-delivery-threading.md) | Partial | Every interpreter delivery site is VM-attributed. There is no C `jvmtiEnv` function table, and `GetEnv` returns a `JNIEnv` for any requested version. |
+| [KeyStore, ML-DSA and ML-KEM](keystore-mldsa-mlkem.md) | Shipped (default on), real-JDK mode only | Real PKCS#12 and JKS; post-quantum algorithms route to the JDK's own implementations, so there is no native lattice crypto. |
+
+## Class loading, natives and modes
+
+| Feature | Status | What it does today |
+|---|---|---|
+| [JDK-only mode](jdk-only-mode.md) | Partial | `--jdk-only` is a policy orthogonal to `JdkMode`; it refuses synthetic stubs and class fabrication, but the two large hard-coded dispatch lists survive, bypassed rather than removed. |
+| [Collection base-class interception](collections-interception.md) | Shipped (default on) | Natives on `AbstractCollection`/`AbstractSet` and friends are registered in the default real-JDK build, not only under the `synthetic-jdk` feature. |
+| [Fallible synthetic-class fabrication](synthetic-class-fallibility.md) | Partial | The fallible spelling exists end to end; 32 native call sites still use the infallible one against 15 that do not. |
+| [`get_field_by_name` descriptor awareness](by-name-field-reads.md) | Partial | The accessor is still not descriptor-aware; ~22 high-consequence call sites are mitigated through a descriptor-safe reader. |
+
+## Correctness infrastructure
+
+| Feature | Status | What it does today |
+|---|---|---|
+| [Semantic differential fuzzer](differential-fuzzer.md) | Shipped (default on) | `cratonvm-difftest` diffs observable behaviour against a real JDK. Its CI gate is blocking. |
+| [Fuzzing harness](fuzzing-state.md) | Partial | Seventeen libfuzzer targets, all reaching real parsers, all built by CI on every commit — and never executed. |
+| [Class-file parser hardening](class-file-parser-hardening.md) | Shipped (default on) | Parsing is fully fallible, every attacker-controlled length is bounded by bytes remaining, and no production path panics. |
+
+## Where the other material went
+
+Audits, censuses, campaign plans and per-increment delivery logs are not
+current-state documents and are not kept here. Retired write-ups that are still
+worth reading for provenance live under the internal documentation tree; a
+public document should inline the durable fact rather than link to one.

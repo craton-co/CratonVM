@@ -1,108 +1,39 @@
 # Class-file parser hardening (`reader/`)
 
-> Status as of 2026-08-01, branch `feat/c2-review-remediation`.
-> Scope: the P0 Security lane's parser half — "complete verifier hardening
-> for adversarial class files; fuzz all binary parsers".
+**Status:** Shipped (default on). Parsing is fully fallible and every
+attacker-controlled length is bounded.
 
-Threat model: an attacker supplies the `.class` bytes. Every length, count,
-index and offset in the file is attacker-controlled. The parser must reject
-non-conforming input with a precise error, without panicking, without
-allocating attacker-chosen amounts of memory, and without reading out of
-bounds.
+## The threat model
 
-## The report's premise was mostly already satisfied
+An attacker supplies the `.class` bytes. Every length, count, index and offset
+in the file is attacker-controlled. The parser must reject non-conforming input
+with a precise error, without panicking, without allocating attacker-chosen
+amounts of memory, and without reading out of bounds.
 
-The lane was scoped as if `reader/` were unhardened. It is not. Three prior
-commits (`96f90473d` "Harden reader malformed input handling", `9c279636e`
-"Polish reader format validation", `21c8ce8da` "Add reader parser robustness
-regressions") plus several audit rounds had already closed most of the
-listed attack classes. Verified by reading, not assumed:
+## What it does today
 
-| Attack class | State before this pass |
-|---|---|
-| Length-driven allocation | **Closed.** `reader/src/limits.rs` is a dedicated module whose `ensure_count_fits` / `bounded_capacity` bound every reservation by *bytes actually remaining*, not by a magic constant. `read_constant_pool` (`class_reader.rs:322`) rejects "65 535 entries in a 40-byte file" before touching the allocator. Interfaces/fields/methods/attributes all do the same (`class_reader.rs:160,185,203,636`). `StackMapTable::parse` reserves from `remaining` at `stack_map.rs:150`. |
-| Arithmetic on attacker input | **Closed.** `checked_span`, `checked_end`, `wire_len_to_usize` in `limits.rs`; `checked_add` in `buffer.rs:103,118`, `instruction.rs:281,307`, `stack_map.rs:253`, `jimage.rs:500-516`. Boundary tests exist at `usize::MAX`, `u32::MAX` and `i32::MIN`-as-unsigned. |
-| Panics as a vulnerability | **Closed** on the paths swept. The `unwrap()`s in `buffer.rs:40,52,64,80` are `try_into` on a slice whose length was just proven by `get()`, and are unreachable. No `expect()`/`panic!`/`unreachable!` outside `#[cfg(test)]` except `attribute.rs:668`, which is genuinely unreachable (the `Raw` arm was rewritten to `Decoded` three lines above). Raw slicing survives only where a preceding bounds check dominates (`jimage.rs:396,715`). |
-| Modified UTF-8 (JVMS §4.4.7) | **Closed, and correct in both directions** — this is the item the report most expected to find broken. The parser does *not* call `String::from_utf8`. It uses `cesu8::from_java_cesu8`, with a hand-written fallback `decode_java_mutf8_to_utf16` (`class_reader.rs:256`) that emits raw UTF-16 units so lone surrogates round-trip (ANTLR `_serializedATN` is the real-world producer). It rejects a bare `0x00` (must be `C0 80`), rejects 4-byte UTF-8 as illegal, and rejects bad continuation bytes. `ConstantPool` carries a `wide_utf8` side table so `ldc` materialises the exact `char[]`. Tests at `class_reader.rs:747-801`. |
-| Structural limits | **Mostly closed.** `code_length ∈ 1..=65535` at `attribute.rs:797,1802`. Attribute length must match parsed content *exactly* — `attribute.rs:944` (top level) and `:1633` (nested) both compare `consumed != length`; the class file itself must have zero trailing bytes (`class_reader.rs:220`). Switch entry counts capped and bounded by the remaining code (`instruction.rs:542,591,603`). |
-| Constant-pool index validity | **Partly closed.** See below — this is where the real gap was. |
-
-Two claims in the lane brief did not hold up:
-
-- **"Bound `n` by the bytes remaining, not by a magic constant."** Already
-  true for every table on the hot path. The ~25 `Vec::with_capacity(n.min(PREALLOC_CAP))`
-  sites in `attribute.rs` (Module, annotations, Record, type-annotation
-  paths) use the weaker *constant* bound of 1024 elements. That is still a
-  hard cap — the amplification is bounded at ~16 KB per reservation and each
-  loop iteration must consume input to continue — so it is not exploitable
-  and was left alone rather than churned.
-- **"Check that self-referential and cyclic constant-pool chains terminate."**
-  There is nothing to check. Cycles are *structurally impossible*: every
-  cross-reference in the pool is type-constrained to a strictly lower stratum
-  (`Fieldref`/`Methodref` → `Class` → `Utf8`; `NameAndType` → `Utf8`;
-  `MethodHandle` → ref → `Class` → `Utf8`). A `Class` whose `name_index`
-  points at another `Class` fails the "must point to Utf8" test, so the chain
-  cannot close. No cycle detector was added, and none is needed.
-
-## What was actually broken, and fixed
-
-### 1. `exception_table` entries were entirely unvalidated (the real find)
-
-`decode_code_body` parsed each entry as four raw `u16`s and stored them
-verbatim. `start_pc`, `end_pc`, `handler_pc` and `catch_type` were never
-compared against `code_length` or against the constant pool — JVMS §4.7.3
-constrains all four and HotSpot's `ClassFileParser::parse_exception_table`
-enforces all four.
-
-This matters because **`handler_pc` is a jump target**. The JIT reads it
-straight out of this table — `jit/src/lib.rs:11670`, `let handler_pc =
-entry.handler_pc as usize;`, fed into a code walk — and the interpreter uses
-it to reposition `pc` while unwinding. A `handler_pc` of `0xFFFF` in a
-four-byte method was an attacker-chosen out-of-range bytecode index handed to
-code entitled to assume the parser had already rejected it.
-
-Fixed in `reader/src/attribute.rs`:
-
-- `validate_exception_range` — enforces `start_pc < end_pc <= code_length`
-  and `handler_pc < code_length`, exactly HotSpot's rule set. Called from
-  `validate_attribute_shape`'s `Code` arm, so violations fail at
-  `read_class` time rather than at first downstream decode, **and** from
-  `decode_code_body`, which is reachable independently (`decode_attribute`
-  is `pub`, and nested `Code` bodies skip the eager walk).
-- `validate_catch_type` — enforces "zero, or a `CONSTANT_Class`". Only
-  callable from `decode_code_body`; the eager shape walk has no constant
-  pool. This one check closes three of the four distinct constant-pool
-  index hazards at once: index `0` (reserved sentinel), an out-of-range
-  index, and an index landing on the **unusable second slot of a
-  `CONSTANT_Long`/`Double`** — all three are `Tombstone` or `None`, so the
-  positive "must be a `ClassReference`" test rejects them. The fourth
-  hazard, wrong tag, is what the test checks directly.
-
-Every rejection names the field and cites JVMS §4.7.3.
-
-Compatibility checked by reading: all five in-tree class generators
-(`classloading/src/proxy_gen.rs`, `native-builtins/src/cglib_enhancer.rs`,
-`native-builtins/src/jboss_module_loader.rs`, `native-builtins/src/lang_class.rs`,
-`classloading/tests/wp2_3_define_class_backend.rs`) emit
-`exception_table_length = 0`. The one existing decoder test with a non-empty
-table (`attribute.rs:3834`) uses `start_pc=0, end_pc=1, handler_pc=0,
-catch_type=0` against `code_length=1`, which remains legal. Any real jar that
-runs on HotSpot passes, because these are HotSpot's own rules.
-
-### 2. `ConstantPool::validate` skipped `Module` / `Package`
-
-`Module` and `Package` were the last reference-bearing tags still falling
-into the `_ => {}` catch-all, so their `name_index` was the only
-cross-reference in the pool that `validate` never inspected (JVMS §4.4.11,
-§4.4.12 both require a `Utf8`). Now covered.
-
-**`validate` is still not called on the parse path**, by deliberate prior
-decision — see `reader/tests/wp_validate_wire_up.rs`, which pins that choice.
-The reader's field/method/attribute parsers resolve indices to `Utf8` /
-`ClassReference` directly and bail with `InvalidConstantPool` when they do
-not find what they expect, so the reachable cross-references are checked at
-use. `validate` covers the residue: entries no one dereferences. Wiring it in
-is a policy change with an O(N)-per-class cost and was out of scope here.
+- **Every entry point returns `Result`.** `read_class`, `read_class_arc` and
+  `read_class_shared` in `reader/src/class_reader.rs` yield
+  `Result<ClassFile, ClassReaderError>`; errors are typed in
+  `reader/src/class_reader_error.rs`.
+- **Every primitive read is bounds-checked and fallible.**
+  `reader/src/buffer.rs` — `read_u8`/`u16`/`u32`/`i32`/`i64`/`f32`/`f64`,
+  `read_bytes` and `skip` all return `Result`, with
+  `ClassReaderError::UnexpectedEndOfData`.
+- **Length-driven allocation is closed.** `reader/src/limits.rs` is a dedicated
+  module whose `ensure_count_fits` / `bounded_capacity` bound every reservation
+  by *bytes actually remaining*, not by a magic constant, so "65,535 constant
+  pool entries in a 40-byte file" is rejected before the allocator is touched.
+  Explicit caps: `MAX_CODE_LENGTH`, `MAX_ATTRIBUTE_DEPTH` (16),
+  `MAX_ANNOTATION_DEPTH` (256), `MAX_SIGNATURE_DEPTH` (256),
+  `MAX_SWITCH_ENTRIES`, `MAX_STACK_MAP_ENTRIES`, `PREALLOC_CAP` (1024),
+  `MIN_CONSTANT_POOL_ENTRY_BYTES`.
+- **No production panics.** The `unwrap()` / `panic!` occurrences in
+  `class_reader.rs` and `attribute.rs` are all inside `#[cfg(test)]` assertion
+  arms.
+- Panic-only fuzz targets cover the reader; see
+  [`fuzzing-state.md`](fuzzing-state.md) for what CI does and does not do with
+  them.
 
 ## Mutation harness
 

@@ -5,7 +5,7 @@
 | **Status** | **No baseline has been captured.** Every number in the budget table is a *proposed engineering gate*, not a measurement. |
 | **Normative source** | [`../feature-designs/jdk-only-mode.md`](../feature-designs/jdk-only-mode.md) |
 | **Methodology** | [`../../BENCHMARK.md`](../../BENCHMARK.md) is the house standard and takes precedence on anything this file does not cover. |
-| **Related** | [`../jdk-only-audit.md`](../jdk-only-audit.md) (the dumps several metrics read from) |
+| **Related** | [`../jdk-only-runtime-services.md`](../jdk-only-runtime-services.md) (the open blocker inventory) |
 
 ## Why strict mode needs its own benchmark plan
 

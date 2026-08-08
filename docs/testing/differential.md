@@ -13,6 +13,13 @@ project's own history:
 > divergences that look exactly like wrong code — and each one burns a
 > bisection.
 
+No CratonVM-vs-HotSpot divergence is currently open. The live record is the
+harness itself — `vm/tests/differential.rs` plus the report it writes to
+`bench/differential-divergences.json` — not a hand-maintained log. To add a
+case, write a fixture class under `vm/tests/resources/cratonvm/`, add an
+`#[ignore]`d `assert_main_matches_hotspot("cratonvm/YourFixture")` test, or
+point the `DIFFERENTIAL_CLASSES` env var at it for an ad-hoc run.
+
 Everything below is organised around making a reported divergence *actionable*:
 you should be able to read a report and say which observable moved, which
 transforms stood between the two runs, and whether a reference JDK was involved

@@ -152,8 +152,7 @@ Source-verified, `NativeMethodRegistry::register` (`native-api/src/registry.rs`)
 
 The file states it in prose too: *"`register()` is last-registration-wins"* and
 *"Re-registration of a key we have already seen UPDATES THE EXISTING SLOT IN
-PLACE."* Duplicates are never rejected and never warned about. One nuance: since
-2026-08-05 the *kind* is not blindly overwritten — a prior **chosen**
+PLACE."* Duplicates are never rejected and never warned about. One nuance: the *kind* is not blindly overwritten — a prior **chosen**
 `NativeKind` survives a later registration that expressed no opinion. The
 **callback** is always overwritten.
 
@@ -403,7 +402,7 @@ tree; this section exists so they can be found from one place.
   taxonomy of tests that read green while measuring nothing is
   `W6-5-vacuous-tests.md`.
 * **Fixed wall-clock bounds and fixed line-bands are latent flakes.** The rule is
-  written in `docs/feature-designs/c2/verify-01-differential-harness.md`:
+  written in the differential-harness design:
   *"Do not add fixed wall-clock bounds to any check. Both directions flake: an
   upper bound fails under contention, and a lower bound can pass while measuring
   nothing."* Line-bands rot the same way and have already done so in this
@@ -449,8 +448,9 @@ before editing:
 | `feature-designs/jdk-only-wave2/README.md` | cites `probes/ExecProbe.java` | `apps/executor_probe/ExecProbe.java` (tracked) |
 
 Separately, seven records in `known-issues/jdk-only/` (`L5`, `L8` ×2, `W4-2`,
-`W5-4`, `W6-5` ×4, `W6-8`) cited internal records by a `docs/internal/…` path,
-which `types/tests/doc_citation_paths.rs::no_source_file_links_into_docs_internal`
+`W5-4`, `W6-5` ×4, `W6-8`) cited internal records by their path inside the
+internal archive, which
+`types/tests/doc_citation_paths.rs::no_source_file_links_into_docs_internal`
 forbids: those records are not published, so the path is a link no public reader
 can follow. Each now cites the record by its path **relative to the internal
 tree's own root**, which is the form that test prescribes. No finding was

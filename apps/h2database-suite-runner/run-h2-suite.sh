@@ -214,7 +214,7 @@ run_one_class() {
   # `env CRATONVM_DEFAULT_WATCHDOG_SEC=45 ./run-h2-suite.sh run ...` produce a
   # per-class log with the startup banner and no T19.H1 dump, long past the
   # deadline (recorded as an unexplained residual in
-  # docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md until
+  # fixed-suite-bugs/h2-suite-bugs/bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md until
   # 2026-08-07).
   local -a wd_env=(CRATONVM_DISABLE_DEFAULT_WATCHDOG=1)
   [ -n "${CRATONVM_DEFAULT_WATCHDOG_SEC:-}" ] && wd_env=()

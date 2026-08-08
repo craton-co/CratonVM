@@ -13,17 +13,14 @@ Collection](../user-guide/memory-and-gc.md).
 | **G1** (region-based) | `-XX:+UseG1GC` | Experimental. The generational collector remains the safety net during its maturation. |
 | **ZGC** (`ZgcRealHeap`, `gc/src/zgc.rs:1396`) | `-XX:+UseZGC`, in a build with the default-off `zgc` Cargo feature | Real and wired end to end — `GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc` — but **not** a real ZGC: one `Arena`, a non-moving whole-heap stop-the-world mark-sweep, no TLABs. Absent from a stock build. The colored-pointer / `ZPage` code alongside it in the same file (`ZgcCollector`, `ColoredPointer`, `LoadBarrier`, `GenerationalZgc`) is a metadata-only simulation with no production consumer. |
 
-> **Corrected 2026-08-07.** The `zgc` row above used to read "feature-gated
-> stub … a real stop-the-world mark-sweep heap that isn't wired into the backend
-> dispatch". That was true when written and is now false on both counts:
-> `gc/src/vm_heap.rs` does `use crate::zgc::ZgcRealHeap` and carries `VmHeap::Zgc`
-> arms behind the same cfg, and `cratonvm-vm` forwards the feature, so
-> `-XX:+UseZGC` really selects it. What is still true is that the feature is
+> **On the `zgc` row.** `gc/src/vm_heap.rs` does `use crate::zgc::ZgcRealHeap`
+> and carries `VmHeap::Zgc` arms behind the same cfg, and `cratonvm-vm` forwards
+> the feature, so `-XX:+UseZGC` really selects it. The feature is
 > **default-off** — a stock build compiles only two backends, and
 > `cargo build --release -p cratonvm-cli --features zgc` is what produces a
 > ZGC-capable launcher. It stays default-off for pass-rate parity, not for want
 > of a consumer: on the 1975-class Spring Boot suite, same binary with only the
-> collector toggled, ZGC measured 1860 PASS / 49 HANG / 22 FAIL against the
+> collector toggled, ZGC measures 1860 PASS / 49 HANG / 22 FAIL against the
 > default collector's 1902 / 18 / 11
 > ([record](../../../known-issues/springboot/zgc-real-fullsuite-regression-20260807.md)). The path to
 > a genuinely concurrent, generational, compacting ZGC is

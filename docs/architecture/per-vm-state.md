@@ -467,10 +467,6 @@ Ordered by *silent-wrong-answer risk first*, then by blast radius.
 5. **V7 — `ObjectStreamClass` cache registry**
    (`vm/src/runtime/serialization/oscache.rs:85`). Same shape: per-VM maps,
    process-global registry, GC scan from any VM.
-6. **V8/V9/V10 — JVMTI** (`vm/src/runtime/jvmti.rs:3096, :2737, :2800`).
-   V10 is a five-line fix (reuse `live_hook_vms`'s registry shape, already
-   landed for V2). V9 needs a `VmId → Arc<JvmtiEventManager>` map. V8 needs the
-   `ClassId` key prefixed with `vm_identity`.
 7. **V26 — `types::flags::FLAGS`** (§5.4) and **V25 — `env_cache` memo slots**.
    Required by the "disjoint flags" clause specifically. Large but mechanical.
 8. **V12 — `PROCESS_VM`** (`vm/src/native/jni.rs:323`). Needs a `JavaVM*` → VM
@@ -482,6 +478,16 @@ Ordered by *silent-wrong-answer risk first*, then by blast radius.
 10. **V19/V13 — diagnostic sinks.** `--jdk-only-report` merges two VMs'
     violations; `ec_watch` mixes two VMs' object addresses. Report-only. Fix
     last.
+
+JVMTI (V8/V9/V10, `vm/src/runtime/jvmti.rs`) is **closed**: event delivery, the
+real-agent bridge and the field-watchpoint table are all keyed on
+`vm_identity`. What remains there is a migration seam, not a global — a small
+number of call sites outside `jvmti.rs` still fire events with no VM identity
+and land in a reserved `UNATTRIBUTED_VM` (`0`) row.
+
+Every `ClassId`-keyed and call-site-keyed memo in `vm/src/jit/` carries a VM
+key, and the one thread-local that caches raw heap addresses carries a heap
+key.
 
 Items deliberately **not** on this list because they are correct as-is: V14
 (already VM-keyed and per-VM-rooted — the reference implementation), V15/V16

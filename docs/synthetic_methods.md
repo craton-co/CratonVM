@@ -158,7 +158,7 @@ Whether that actually removes code depends on the feature. In
 `serialization` are `#[cfg]`-gated module declarations, so dropping the feature
 stops compiling them.
 
-Two features were renamed on 2026-07-30 because their names described an intent
+Two features were renamed because their names described an intent
 the code does not have. Both old names remain as back-compat aliases so existing
 `--features` invocations keep building; both are slated for removal in 0.4.
 

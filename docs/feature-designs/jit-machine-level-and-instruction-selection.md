@@ -1,44 +1,56 @@
 # A machine level for the JIT, and the instruction selector that needs one
 
-**Status: increments 0, 1, 1b, 2, 2c and 4 landed and measured; 3 partially
-built — its prerequisite landed 2026-08-04, its GP register class deliberately
-did not.** Shadow instruction selection (`CRATONVM_JIT=ir-isel-shadow`, default
-off, emits nothing) measured the tiler's real coverage at **15.7–19.0%**, with
-the two rules the migration was *for* firing **zero** times. Closing the
-immediate half of that gap moved it to **19.3%** and `AluImm` fired **once**
-across 719 methods — which read as "the rules do not match the shape of the IR
-the optimizer produces".
+**Status:** Partial — the encoder level is built and anchored; the machine
+level (level 2) is not, and every mode that would affect production output is
+default-off.
 
-**That reading was half right, and the half that was wrong mattered.**
-2026-08-04 closed the other named gap (`lea_r32_m`, one anchored row) and
-`Rule::Lea` went from zero to **26 tiles** on a framework-shaped corpus. And
-`AluImm`'s near-zero turned out not to be about rows at all: a safepoint
-snapshot **pins** almost every live constant, so a tile cannot absorb it, and
-the cost model then compares a two-byte `ADD EAX, ECX` against a three-byte
-`ADD EAX, 7` **without pricing the frame load the register form also pays**.
+## What is built
 
-Increment 2 is therefore built and measured rather than argued about: the
-selector has a production caller (`CRATONVM_JIT=ir-isel-emit`, default off,
-fail-closed) and a byte-equality oracle that ran over a real workload and found
-**zero** disagreements. See
-`hir-02-mir-regalloc-handoff-RETIRED-20260804.md` in the internal tree.
+There are **four** compiler levels here, not three, and naming the missing one
+is most of the value of this document.
 
-**2026-08-04, second pass.** The brief's first increment asks for three things —
-a tile list, *an allocation over it verified by `verify_allocation`*, and an
-encoder — and only the middle one was missing. It is increment 2c below. On its
-back, increment 3's prerequisite (a callee-saved save area in `emit_prologue`)
-landed too, which closed increment 4's residual overlap outright: the scalar
-file grew to XMM2–XMM7 and the vector pool moved to XMM8–XMM15. What remains
-unbuilt in increment 3 is the **GP** register class, and the reason is no longer
-the prologue — it is the safepoint obligation the section below states.
+- **Level 3, the encoder, is solid.** `jit/src/x64/isel.rs` carries a
+  `PATTERNS` table with `Pattern`/`Op`/`Ty`/`OpKind`/`ImmForm`/`DispPolicy`/
+  `Constraint`/`Cost`/`Enc`, a `select()` entry point, and byte-for-byte
+  anchoring tests against the hand-written emitters in `jit/src/x64.rs`.
+- **Tiler rules exist**, including `Rule::Lea` and `Rule::AluImm`, with a cost
+  function.
+- **The XMM half of the register-class work landed** (scalar file XMM2–XMM7,
+  vector pool XMM8–XMM15).
 
-Consolidates the `hir-01` and `hir-02` lanes of
-`docs/feature-designs/c2/deep-research-vm-c2.md`, which asked for an HIR/LIR/MIR
-split and for somewhere to send `isel`'s output. Both are answered here.
+Three modes exist to exercise it, all default-off, declared in
+`jit/src/ir_lower.rs`:
 
-Every claim is checked against the tree and cited `file:line`.
+| Flag | What it does |
+|---|---|
+| `CRATONVM_JIT_IR_ISEL_SHADOW` | tile and count, discard — emits nothing |
+| `CRATONVM_JIT_IR_ISEL_VERIFY` | build the level-2 list and byte-compare it against the per-opcode arms — emits nothing |
+| `CRATONVM_JIT_IR_ISEL_EMIT` | the only mode that emits, and it is fail-closed: an uncovered block, a tile-slot disagreement or an encoder refusal discards the artifact and drops the method to a lower tier |
 
----
+`CRATONVM_DBG_IR_ISEL` reports.
+
+## What is not built yet
+
+- **Level 2 — the machine list** (`Vec<MInst>` plus a frame plan and safepoint
+  records) does not exist. That is the level the selector needs, and its
+  absence is why the selector cannot be the production path.
+- **The GP register class is deliberately unbuilt.** It carries a safepoint
+  obligation the XMM side does not.
+
+## What the measurement said, and why the hold is the result
+
+Shadow selection measured the tiler's real coverage on production compiles at
+**15.7–19.0%**, with the two rules the migration was *for* firing **zero**
+times. Closing the immediate half moved it to **19.3%**. Adding one anchored
+`lea_r32_m` row took `Rule::Lea` from zero to **26 tiles** on a
+framework-shaped corpus.
+
+`AluImm`'s near-zero turned out not to be about pattern rows at all: **a
+safepoint snapshot pins almost every live constant**, so a tile cannot absorb
+it, and the cost model then compares a two-byte `ADD EAX, ECX` against a
+three-byte `ADD EAX, 7` *without pricing the frame load the register form also
+pays*. The next step is therefore more 32-bit pattern rows and a cost model
+that prices the frame load — not a machine level.
 
 ## Goal
 
@@ -196,316 +208,6 @@ semantics entirely; this arm names the node the caller must still lower."
 
 ---
 
-## Implementation steps
-
-### Increment 0 — shadow selection · **LANDED 2026-08-03**
-
-Run `select_block` per block inside `lower_inner_with_scopes`, assert
-`BlockSelection::covers`, count what fired, discard, and emit through the
-unchanged path.
-
-| Piece | Where |
-|---|---|
-| Flag (declared, default off) | `CRATONVM_JIT=ir-isel-shadow` → `ir_lower::isel_shadow_enabled` |
-| Report | `CRATONVM_DBG=ir-isel` → `ir_lower::isel_shadow_reporting` |
-| The pass | `isel::shadow_select_method`, with `ShadowStats` + process totals |
-| Call site | nine lines in `lower_inner_with_scopes`, after every refusal |
-
-Placed after every refusal on purpose, so the population it measures is exactly
-the population that gets a compiled body.
-
-**Deliberately NOT fail-closed** — the one such place in `ir_lower`. A flag whose
-documented effect is a count must not decide what compiles, or the count
-describes a different program. A `covers()` violation is counted and printed,
-not raised. `shadow_selection_changes_no_emitted_byte` holds that up; fail-closed
-returns at increment 1.
-
-**Its answer** — Azure Linux, release binary, two Spring Boot test classes,
-every method the optimizing tier actually compiled:
-
-| | `ConfigurationPropertiesTests` | `BinderTests` |
-|---|---|---|
-| methods shadowed | 718 | 132 |
-| blocks | 1 653 | 258 |
-| scheduled data nodes | 4 136 | 696 |
-| tiles | 4 917 | 828 |
-| tiles firing a real rule | 443 | 64 |
-| **nodes covered by a real rule** | **785 (19.0%)** | **109 (15.7%)** |
-| `covers()` violations | **0** | **0** |
-
-Rules that fired, both classes summed:
-
-| Rule | Tiles | Worth |
-|---|---|---|
-| `TestZeroBranch` | 284 | `CMP r, 0` → `TEST r, r`. Real, and small. |
-| `AluReg` | 123 | The two-address form. Real — drops a frame round trip. |
-| `TestBranch` | 60 | **Nothing.** Byte-for-byte what `lower_terminator` already emits. |
-| `CmpBranch` | 40 | Compare-and-branch fusion. Best per-site win here. |
-| `Lea` | **0** | — |
-| `AluImm` | **0** | 119 `Unencodable` refusals |
-| `AluFoldedLoad` | **0** | `fold_loads` off; `AddrSource::Opaque` |
-| `CmpSetCc` | **0** | no `SETcc` row |
-
-**The finding: the two rules the migration was *for* fire zero times on real
-code.** `Rule::Lea` — address-mode folding, the headline item in
-`instruction-selection.md` §1 — never matched once across 850 methods.
-`Rule::AluImm` never matched either. Same cause: **the pattern table is 64-bit
-and Java arithmetic is 32-bit.** `Rule::Lea` refuses `Ty::I32` outright; there
-are no `*_r32_imm*` rows.
-
-A synthetic ten-shape corpus had predicted 38.2% — double the truth, *and*
-pointing at the wrong rules (it fired `Lea` once; real code never does).
-Increment 1 would have been justified on that number. It is not justified on
-this one. This is what increment 0 was for.
-
-Also proved: `covers()` held on all **1 911** blocks. The invariant the
-three-defect argument below rests on is real on real code, not just on
-hand-built graphs.
-
-### Increment 1 — the 32-bit immediate rows · **DONE 2026-08-03, and the answer is +0.3 points**
-
-Eight rows added — `add/sub_r32_imm8`, `add/sub_r32_imm32`,
-`and/or/xor_r32_imm8`, `cmp_r32_imm8` — each anchored to a byte literal
-`x64.rs`'s constant-folding fast path already emits (the `iadd`/`isub`/`iand`/
-`ior`/`ixor`/`if_icmp` const arms, EAX destination, no REX). Plus the half that
-makes them load-bearing: `MInst::pattern_name` now maps `AluRI`/`CmpRI` at
-`Ty::I32`, without which `require_encodable` discards the tile whatever the
-table holds.
-
-Same workload, same flag, before and after:
-
-| | before | after |
-|---|---|---|
-| methods / nodes | 718 / 4 136 | 719 / 4 138 |
-| **nodes covered** | **785 (19.0%)** | **797 (19.3%)** |
-| `AluImm` tiles | 0 | **1** |
-| `Unencodable` refusals | 104 | **57** |
-| `CmpBranch` / `TestBranch` | 33 / 53 | 44 / 42 |
-| `covers()` violations | 0 | 0 |
-
-**The gap was real and closing it bought almost nothing.** `Unencodable`
-halved, so the rows are being reached; `AluImm` then fired **once** across 719
-methods. The genuine gain is elsewhere and smaller than it looks: `cmp_r32_imm8`
-let eleven branches move from `TestBranch` (which buys nothing) to `CmpBranch`
-(which fuses), and that is most of the +12 nodes.
-
-The reason is `ir_optimize`. It runs *before* selection and folds constants, so
-by the time the tiler sees the graph an `Add(x, Const)` is mostly already gone.
-The rows were missing, but the population that wanted them is nearly empty on
-optimized IR — a fact no amount of reading the table would have produced.
-
-### Increment 1b — `Rule::Lea` at `Ty::I32` · **DONE 2026-08-04, and it fires**
-
-The other half of `instruction-selection.md` §6 item 2. **The proof it was
-blocked on is now available**, and it is simpler than the doc expected:
-
-> `ir_lower`'s `Int` arms already leave the high half of the destination slot
-> unspecified, and inconsistently so. `Op::Add`/`Mul` at `IrType::Int` emit
-> 32-bit ops (`ADD EAX, ECX`), which x86-64 **zero**-extends into RAX;
-> `Op::Const` at `IrType::Int` emits `emit_mov_rax_imm64`, which for a negative
-> `int` **sign**-extends. `Op::Return` then copies the whole 64-bit slot. So the
-> high half of an `int` slot is already two different things depending on which
-> arm produced it, and the caller already truncates by descriptor — which is the
-> only reason the tree is green.
-
-A 32-bit `LEA` zero-extends, exactly like `ADD EAX, ECX`. It therefore leaves
-the same high half the majority of existing `Int` arms leave and introduces no
-new observability question. The `lea_r32_m` row is anchored too — `x64.rs`
-already emits `8D 04 40` / `8D 04 80` / `8D 04 C0` (`LEA EAX, [RAX+RAX*n]`) in
-its small-multiply fast path.
-
-It was left unbuilt on the strength of increment 1's **+0.3 points**, on the
-argument that the other half of the same gap would be worth about the same.
-**That argument was wrong, and the reason is worth keeping.** `Rule::AluImm`'s
-near-zero was never mostly about the rows (see the status banner); `Rule::Lea`'s
-zero was *entirely* about the row, and the row was one line of table.
-
-Built 2026-08-04. `Rule::Lea` fires **26 tiles** across CratonBenchC2's three
-phases (12 / 4 / 10) against zero before, and is the most frequent non-generic
-rule on that corpus.
-
-**It also re-ranked the tiling, immediately.** `a + b` with `a` still live
-started selecting an `LEA` — because `needs_copy` priced a two-address `MOV`
-that does not exist under a frame-homed allocation, where the destination
-register never held the left operand. `SelectOptions::frame_homed` now states
-the allocation and `Tile::frame_homed` re-prices every candidate from its own
-operand set. **Closing one gap re-ranks every other rule**, in both directions.
-
-### Increment 2 — emit one rule, byte-identical · **DONE 2026-08-04**
-
-`Rule::AluReg`: its rows are anchored to the exact byte literals
-`lower_data_node` emits, and the frame-homed allocation the encoder assumes IS
-this backend's allocation, so byte equality is reachable rather than
-approximate.
-
-| Piece | Where |
-|---|---|
-| The artifact | `ir_lower::MirPlan` — a `Vec<MInst>` per block plus a `tile_of` index. `SlotPlan` and `RegResidency` stay where they were. |
-| The encoder | `Lowerer::encode_tile_frame_homed`, through `isel::select` — level 3 unchanged. |
-| The oracle | `CRATONVM_JIT=ir-isel-verify`: the per-opcode arms still emit, and the encoder's answer is compared against what they wrote, per node. |
-| The wiring | `CRATONVM_JIT=ir-isel-emit`: the encoder emits; the arm is not run for a node a tile covers. |
-
-Both modes are **fail-closed** — an uncovered block, a destination slot the
-encoder and `alloc_slot` disagree on, or any byte mismatch discards the
-artifact. Scope is tiles covering exactly their own root: the caller skips every
-node a tile covers, so an absorbed node the encoder does not fold would be
-computed nowhere.
-
-**The result**, CratonBenchC2, three phases, one process each: 19 methods, 39
-tiles, **0 byte mismatches**, and a bit-identical checksum in all three modes.
-Coverage on that corpus is 23.6% / 24.0% / 32.3%.
-
-Two supporting refactors, both removing a copy rather than adding one:
-`load_to_rax`/`load_to_rcx`/`store_rax` now delegate to `enc_frame_load` /
-`enc_frame_store` (a byte-equality oracle is only as strong as the number of
-places the bytes come from), and `alloc_slot_checked` splits into a pure
-`planned_slot_off` plus its three mutations.
-
-### Increment 2c — the allocation over the tile list · **DONE 2026-08-04**
-
-The brief's first increment is "a tile list with virtual registers, **an
-allocation over it, verified by the existing `verify_allocation`**, and an
-encoder". The tile list and the encoder landed with increment 2; this is the
-allocation, and it is the piece that makes the other two reviewable.
-
-`ir_lower::verify_mir_allocation` builds an `Allocation` describing where the
-machine list actually keeps every value — its frame home, empty register file —
-and puts it through `regalloc::verify_allocation` **unmodified**. Deliberately
-not a new verifier: the value of the increment is that the level-2 artifact is
-checkable by the allocator's *own* checker, and a second checker written for it
-would be a second model of one program to keep in step.
-
-With nothing in a register the register rules go quiet. Four others do not:
-
-| Rule | What it catches here |
-|---|---|
-| the timeline covers the live range | a value the tile list reads after its recorded death, or defines with no location — refused instead of `?`-ing out inside the encoder |
-| no two simultaneously live values share a home word | checked against `build_live_model`'s ranges, computed **independently** of `plan_slots`'; the tile list is a third consumer of that model and two implementations drifting apart is how a backend comes to alias two live values |
-| home pools stay separated | a word holding a `Ref` for one value and a pinned primitive for another is what a moving collector misreads |
-| no reference is register-resident at a safepoint | vacuous today, the entire point tomorrow — increment 3 swaps the empty `RegFile` for a real one at this exact call site |
-
-The verdict is **three-valued**, not an `Option`: `Verified` / `NothingToCover`
-/ `Indescribable`. That is the shape `emit_safepoint_map` already refuses to
-collapse and the "Consequences" section above requires. A corpus where every
-method came back `NothingToCover` and one where every method verified thousands
-of values are indistinguishable in a single "ok" tally, and only the second is
-evidence. `[ir-isel] MIR ALLOC` prints the five counters separately.
-
-Failure policy follows each mode's contract. `Verify` changes no emitted byte,
-so it must not change which methods compile either: it records the rejection.
-`Emit`'s bytes **are** the allocation's, so it refuses the compile.
-
-One finding, and it is increment 3's sizing: a tile rooted at a value the
-colourer gives **no** home word is normal, not a defect. `(a + b) * a`'s last
-value is returned straight out of RAX and `plan_slots` allocates nothing for it,
-while `select_block` still roots a tile there — a tile is about *computing* a
-value, not storing it. `mir_totals::read_unlocated_tile_roots` counts them,
-because every one is a value that must live in a register since there is no
-memory for it to live in. That is a number taken from real compiles, not a
-synthetic shape count.
-
-### Increment 2b — emitting the rules byte equality cannot cover · open
-
-`Rule::AluImm` and `Rule::Lea` **cannot** ride increment 2's oracle by
-construction: dropping a frame load is the point, so the bytes differ. They need
-a differential-execution oracle — `verify-01`'s harness — and a decision about
-whether the saving is worth it. Verify mode already reports the size of the
-prize, on the `[ir-isel] MIR TOTALS` line: `shadow_tiles` is how many such tiles
-there were, `arm_bytes` and `enc_bytes` what the two paths would have written
-for exactly those nodes. On CratonBenchC2's `pipeline` phase, reproduced across
-two binaries: **150 bytes → 114 over seven nodes**.
-
-### Increment 3 — registers · **prerequisite DONE 2026-08-04; the GP class still deliberately not built**
-
-Only here does `Allocation` stop being a read cache.
-
-**The prerequisite — the prologue — landed.** `ir_lower::IR_LOWER_SAVED_XMMS`
-is a callee-saved save area: XMM6/XMM7 on Windows, empty on System V where the
-ABI makes every XMM volatile. It is restored on all three exits — including
-`emit_deopt_stub`'s *inlined* teardown, which does not go through
-`emit_epilogue` and is the one that would otherwise return to the caller holding
-this frame's XMM6. It sits at `spill_cap_off`, so `callee_saved_lo` keeps its
-value and the band `conservative_roots::band_slot_is_verifiable` already skips
-simply grows from below: no reader-side edit at all. Sizing is static, emission
-is dynamic, and the default configuration reserves zero bytes.
-
-It was built with a consumer rather than without one, which is what the earlier
-refusal was about. Three things use it today:
-
-* `IR_LINEAR_SCAN` reaches XMM2–XMM7. The ceiling is XMM7 because
-  `fp_load`/`fp_store`/`fp_binop` emit no REX, not because of the frame.
-* XMM6/XMM7 are `caller_saved: false` on Windows, so an FP value may live
-  **across a call** there. The back-edge safepoint poll was narrowed to the
-  caller-saved subset to let it — the same rule `MachineModel::for_graph`
-  applies at a call, sound because the poll's slow path is an ordinary
-  `extern "C"` function.
-* increment 4's pool separation, below, which was blocked on exactly this.
-
-**What is still not built is the GP register class, and the reason changed.**
-It is no longer the prologue; extending the save area to RBX/R12–R15 is
-mechanical. It is the rule this document's Design section states: today
-`ir_lower` satisfies "no reference is register-resident at a GC safepoint"
-*structurally*, by having no GP register to give (`RegClass::of(IrType::Ref)`
-is `Some(Gp)`, and the file is XMM-only). A GP class turns a structural
-guarantee into one that must be **proved per site**, by spilling to the home
-word before every safepoint the way `x64.rs` does
-(`SafepointPublishPlan::no_reference_in_registers`). Increment 2c's verifier is
-where that proof would be checked — it already runs `verify_allocation`'s
-reference-at-a-safepoint rule over the tile list, against an empty register
-file, at the exact call site a real one would go.
-
-What would change this: a measurement showing the frame round trip is a material
-cost on real code. Increment 2 did not produce one, and its oracle cannot —
-byte equality answers a correctness question by construction. Increment 2c's
-`unlocated_tile_roots` is the first number that bears on it, because those are
-values with no memory to live in.
-
-### Increment 4 — unify the vector pool · **DONE 2026-08-04, and the overlap is gone**
-
-`vec_emit`'s private XMM0–5 pool overlapped `ir_lower`'s FP value tier
-(XMM0/XMM1) *and* its whole linear-scan file, and the failure is a scalar FP
-value silently destroyed across a vector region.
-
-**First pass** removed the privacy and the assumption:
-
-* `regalloc::xmm_roles` declares all three ranges together, and `ir_lower`'s
-  `XMM0`/`XMM1`/`IR_LOWER_LS_XMMS` are defined from it — one declaration, not
-  three that agree today.
-* `VecEmitRequest::vector_pool` replaced the private constant: which XMM
-  registers are free is a fact about the surrounding method, so the surrounding
-  method states it. An **empty pool is legal** and refuses at the first
-  allocation. A pool naming a register the emitter cannot encode refuses the
-  whole region rather than being quietly narrowed.
-
-It could not remove the overlap itself, because the only registers that would
-separate the ranges are XMM6–XMM15, callee-saved on Windows, against an
-`emit_prologue` that saved nothing. So
-`the_three_xmm_authorities_are_stated_in_one_place` **asserted** the overlap
-rather than wishing it away, and said in its own doc comment that it would fail
-the day a save area landed.
-
-**Second pass, once the save area landed.** It did fail, and the pool moved:
-
-* `VECTOR_REGION_MAX` is **XMM8–XMM15**, disjoint from both scalar ranges.
-  `xmm_roles::disjointness_violation()` returns `None`, and
-  `the_three_xmm_authorities_are_disjoint` scans the whole 0..16 range so a
-  *fourth* authority added later trips the same assertion.
-* XMM8–XMM15 rather than the low half because `vec_emit` encodes with VEX,
-  which carries the high register bit for free — the REX constraint that pins
-  the scalar file to XMM0–XMM7 does not apply.
-* The caller's obligation changed shape rather than disappearing, and that is
-  the point: it no longer has to prove *which scalars are dead* (unanswerable in
-  general), only whether its own prologue saves the pool
-  (`VecEmitRequest::frame_saved_xmms`, consulted on Windows, ignored on System V
-  where every XMM is volatile). A frame that saves nothing gets an empty pool
-  and `emit_vector_loop` refuses — the correct answer, not a missed
-  optimization.
-* The encoding tests moved with it. Their expectations were **re-derived from
-  the VEX rules**, not transcribed from the new output; the derivation and the
-  emitter disagreed once, on `vmovd eax, xmm8`, and the emitter was right.
-
----
-
 ## Why the migration is not a correctness argument
 
 The brief asked whether a level split would make three real defects
@@ -540,7 +242,7 @@ belonged* — a catch-all arm, an `Option` conflating zero with unknown, a key
 conflating "no offset" with "offset zero". None was a missing level. So the
 migration is justified by the coverage measurement or not at all.
 
-### The cheap alternative, landed instead · **DONE 2026-08-03**
+### The cheap alternative, landed instead · **DONE**
 
 One set of operations was enumerated in three places, in two vocabularies:
 `lower_data_node`'s arms (48 of 53 variants), `op_defines_result_slot` (37), and
@@ -584,7 +286,7 @@ firings of the new arm.
    the rule above; the map format and its `vm/`-side consumer must change
    together or not at all.
 4. ~~**The vector pool** (increment 4). A scalar FP value in XMM0–5 is silently
-   destroyed across a vector region.~~ **Retired 2026-08-04** — the pool is
+   destroyed across a vector region.~~ **Retired** — the pool is
    XMM8–XMM15 and disjoint from both scalar ranges. The risk that replaced it is
    narrower and mechanical: a caller that hands out a pool register its own
    prologue does not save, which `vector_pool_is_encodable` refuses.
@@ -604,36 +306,6 @@ firings of the new arm.
 * A big-bang conversion of `ir_lower`'s 90 GP memory accesses. That is the "stop
   treating the frame as the value's identity" change — the whole item, not an
   increment (`docs/jit/linear-scan-wiring.md`).
-
-## Effort
-
-Increments 0, 1, 1b, 2, 2c and 4: **done**. Increment 2b (emitting
-`AluImm`/`Lea` behind a differential oracle): **M**, and verify mode already
-reports what it would be worth.
-
-Increment 3 splits. Its prologue prerequisite is **done** — a save area with
-three consumers, not a fourth unwired component. Its GP register class is
-**L**, and what gates it is no longer the prologue but the safepoint
-obligation: a GP class can hold a reference, so "no reference is
-register-resident at a GC safepoint" stops being structural and has to be
-proved per site. That, plus a performance measurement nobody has taken.
-
----
-
-## Premise deltas found while answering this
-
-Reported per `docs/known-issues/c2/README.md` rule 1. All corrected in place.
-
-| Claim | Source | Actual |
-|---|---|---|
-| "`isel.rs` … has never been compiled … its tests have never run" | `instruction-selection.md` §0 | **Stale.** `pub mod isel;` at `x64.rs:136`; 68 tests pass. |
-| "add `pub mod isel;` before wave 1" | `instruction-patterns.md` | **Stale**, same reason. |
-| "the applier still reads `field_values` … correct but pessimistic" | `escape-analysis.md` §3, §6.1 | **Stale.** `plan_scalar_replacement` consumes `load_value` and refuses on `Unknown`; witness `ea_load_before_a_later_store_forwards_the_pre_store_value` (`lib.rs:17228`). |
-| the monitor ops have "no lowering arm here"; the catch-all "is `_ => {}`" | the guard atop `lower_inner_with_scopes` | **Stale.** A real `Op::MonitorEnter \| MonitorExit` arm exists. The guard's actual scope is narrower: monitor ops plus a helper table with no monitor entry. |
-| `CRATONVM_JIT_NO_PRECISE_FIELD_OPS` declared | — | It was read by code and declared nowhere; `types`' `flag_declaration_guard` was **already red on `dev`**. Rule 4's recurrence. Declared. |
-| "`ir_lower.rs` (~10.6k lines)" | the `hir-01` brief | 11 138 lines. |
-| "no register bank in the oop map" | the `hir-01` brief | True for GC. **Not true for deopt.** The asymmetry is deliberate. |
-| implied: `isel` is the only unwired component | the `hir-02` brief | `vec_emit::emit_vector_loop` has no caller either, for the same reason. |
 
 ## See also
 

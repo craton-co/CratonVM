@@ -1,374 +1,45 @@
-# Wire the Tiered Compilation Manager
+# The tiered compilation manager
 
-> **Increment 7 (Step 7 — retire the single fixed-threshold inline path) landed.**
-> Builds on increment 6. The **default flip**: the background tiered pipeline
-> (Steps 1–5) is now the default compiler — *all* synchronous on-mutator
-> compilation (the fixed-threshold `try_jit_upgrade_with_gate` AND the eager
-> first-call single-pass compile) is replaced, by default, with off-thread
-> compilation; the mutator interprets until the worker publishes.
-> - **`bg_compile()` flipped default-ON** (`runtime/env_cache.rs`): was
->   opt-in (`cached_is_set!`), now an explicit predicate that is `true` unless
->   `CRATONVM_BG_COMPILE=0`/`false`. The opt-out restores the historical inline +
->   eager paths verbatim — the safety net while the off-thread pipeline soaks on
->   the gauntlet (per the repo rule: flip default-on, opt-out is the net).
-> - **Both invocation triggers enqueue under the default.** The static path
->   (`execute_invokestatic_cached`) was already bg-aware (Steps 1–2). The virtual
->   path (`execute_invokevirtual_cached`) is now bg-aware too: under `bg_compile`
->   it `ensure_bg_compiler_started` + `on_method_invocation` (enqueue) and keeps
->   interpreting, instead of inline `try_jit_upgrade_with_gate`. OSR already
->   compiles off-thread by default (Step 5, same `bg_compile`).
-> - **Eager first-call rerouted (the key change).** The eager single-pass compile
->   in `fn execute` (the de-facto default compiler — it ran on call #1 and thereby
->   *preempted* the worker, which is why a naive gate-flip left the worker firing
->   0×) is now, under `bg_compile`, replaced by an invocation-counted **enqueue**:
->   `execute` counts invocations, ensures the worker + `on_method_invocation` once
->   past the warmup threshold, and returns `None` to interpret (with
->   `c2_not_hot = true` so the method isn't sealed and the counter keeps running —
->   covering reflective / uncached-hot methods). So the worker is now genuinely the
->   default compiler; the mutator never runs codegen on a default run.
-> - **Opt-out = byte-for-byte historical.** `CRATONVM_BG_COMPILE=0` → the worker is
->   never started, `execute` eager-compiles on first call, both triggers compile
->   inline at the 500 threshold, and OSR is inline — exactly as before Step 7.
-> - **Validation.** 843 jit-crate tests pass. Under the new default (no flags) the
->   worker is confirmed to be the compiler (`bg-compile` events > 0, was 0 before
->   the reroute) and results match HotSpot: `OsrProbe 10M`=`1550058760673472`,
->   `OsrShapes 5M`=`-784340278423176288`, `binarytrees 16`=`14985902`,
->   `binarytrees 18`=`68332206`, and a 4-thread `MtProbe` (concurrent hot methods +
->   allocation, exercising the worker × GC × multi-mutator STW path that
->   historically deadlocked) = `30594089` — every run timeout-guarded (no hangs).
->   The opt-out (`CRATONVM_BG_COMPILE=0`) reproduces each result.
-> - **Honest caveat / risk.** This flips DEFAULT JIT behavior for every program and
->   changes warmup semantics: methods now interpret until the worker publishes
->   (a method in a short run may finish before its compiled body is ready, and
->   reflection-/uncached-heavy or worker-starved workloads could see a throughput
->   shift). It is validated == HotSpot above + on the increment-1–6 evidence, but
->   has **NOT** been soaked on the full 50+ app gauntlet (which needs a quiet
->   machine — this repo runs many concurrent worktrees, so wall-time/throughput
->   here is unreliable). `CRATONVM_BG_COMPILE=0` is the immediate revert if a
->   regression surfaces. **Strongly recommended follow-up:** a gauntlet soak
->   (startup + throughput + stability) before treating this flip as settled.
->
-> **Increment 6 (Step 6 — `CRATONVM_TIER_*` threshold overrides) landed.**
-> Builds on increment 5. The tiered policy's thresholds were hardcoded
-> (`CompilationPolicy::default()`), so the pipeline could not be tuned without a
-> recompile. Increment 6 exposes them as environment knobs and threads them into
-> VM init; it does **not** change the (HotSpot-referenced) defaults — authoritative
-> retuning against the app gauntlet is an empirical activity deferred to a quiet
-> machine (this repo runs many concurrent worktrees, so wall-time here is
-> unreliable; cf. `MEMORY` "never measure VM wall-time with a build running").
-> - **Policy knobs.** `CompilationPolicy::from_env()` (`jit/src/tiered.rs`) applies
->   `CRATONVM_TIER_C1_THRESHOLD` / `_C2_THRESHOLD` / `_OSR_THRESHOLD` /
->   `_C2_MIN_INVOCATIONS` (each parsed `u32`, clamped `>= 1` so a `0` can't defeat
->   warmup) and `CRATONVM_TIER_ENABLED=0` over `Default`. The parsing core is a
->   pure, env-free `with_overrides(get)` (production passes `std::env::var`), so it
->   is unit-tested deterministically with a fake getter — no racy/`unsafe`
->   `set_var`. `TieredCompilationManager::with_env_policy()` wraps it; `SharedVm::new`
->   (`vm_init.rs`) now constructs the manager from it (was `with_default_policy`).
->   These four govern `on_method_invocation`'s tier recommendation, i.e. the
->   background tiered pipeline (gated by `CRATONVM_BG_COMPILE`).
-> - **Live OSR back-edge knob.** `CRATONVM_TIER_OSR_BACKEDGE`
->   (`env_cache::tier_osr_backedge`, default `OSR_THRESHOLD` = 1000) overrides the
->   per-frame back-edge count at which `try_osr_with_backoff` first attempts OSR.
->   Unlike the four policy knobs this is live on **both** the default inline-OSR
->   path and the Step-5 background-OSR path (both gate on `Frame::should_try_osr`),
->   which is why it is a VM-side `env_cache` flag rather than a policy field. The
->   function returns `Option<u32>` so `OSR_THRESHOLD` stays the single canonical
->   default at the call site (`.unwrap_or(OSR_THRESHOLD)`).
-> - **Default-OFF safety.** With no `CRATONVM_TIER_*` set, `from_env() ==
->   default()` and `tier_osr_backedge() == None` (→ `OSR_THRESHOLD`), so every
->   threshold is byte-for-byte the historical value; no behavior change.
-> - **Tests** (`jit/src/tiered.rs`): `step6_policy_overrides_apply_and_clamp`
->   (parse, `0`→`1` clamp, unparseable→default, `ENABLED=0`) and
->   `step6_policy_overrides_empty_env_is_default`. 843 jit-crate tests pass.
-> - **Validation / demonstration (`scratch/tier6/`).** `OsrProbe 10M`
->   (`1550058760673472`) and `binarytrees 16` (`14985902`) stay == HotSpot with
->   defaults AND with overridden thresholds. The knobs demonstrably change behavior
->   (via `CRATONVM_DBG_JITC`): lowering `CRATONVM_TIER_OSR_BACKEDGE` makes OSR fire
->   after fewer back-edges, and `CRATONVM_TIER_C2_THRESHOLD` shifts the
->   background-tiered tier recommendation — correctness is invariant under tuning.
-> - **Tuning guidance.** HotSpot's defaults (c1 200 / c2 5000 / osr 10000) are the
->   starting reference. CratonVM's C2 compile is comparatively expensive and its
->   interpreter comparatively slow, so the two levers that matter most in practice
->   are `CRATONVM_TIER_OSR_BACKEDGE` (lower → hot loops in cold methods reach
->   compiled code sooner; too low → OSR churn / premature compiles before the
->   profile is useful) and `CRATONVM_JIT_THRESHOLD` (the existing default-path
->   invocation knob). Retune on a quiet machine by sweeping these against the
->   gauntlet's startup-vs-throughput trade-off; the defaults are intentionally
->   conservative (interpreter-first) until that data exists.
->
-> **Increment 5 (Step 5 — precise background OSR) landed.**
-> Builds on increment 4. CratonVM already had fully-working **inline** OSR: every
-> back-edge site does `frame.backward_count += 1; try_osr_with_backoff(…)`, and
-> `try_osr` compiled an OSR-enterable artifact (`x64::compile`, `compiled_via_osr`)
-> and transferred the live interpreter frame into it. The gap this step closes is
-> that the OSR **compile ran on the mutator** (a first-caller stall), the tiered
-> manager's `on_backedge` was never called, and `background_compile_task` ignored
-> `osr_bci`. Increment 5 moves the precise OSR compile **off the mutator**:
-> - **Frame-free compile core.** `try_osr`'s ~620-line compile/publish closure is
->   extracted verbatim into `compile_osr_artifact(shared, class_id, class_name,
->   method_name, descriptor, code, max_locals, entry_pc) -> Option<Arc<CompiledMethod>>`
->   (`interpreter.rs`). Its only former frame dependency (`max_locals`) is now a
->   param; everything else is method metadata, so it runs with no live frame. The
->   `entry_pc` only feeds the *reuse* probe (`can_osr_enter`) — the compile is
->   entry-pc-independent (the artifact supports OSR entry at every loop header it
->   emits). `try_osr` now extracts metadata from the frame, calls
->   `compile_osr_artifact`, and does the live-frame entry on the result (unchanged
->   transfer logic). Validated behavior-preserving (see below).
-> - **Worker honors `osr_bci`.** `background_compile_task`: an OSR task resolves
->   `(class_id, padded bytecode, max_locals)` from the (loaded) class via
->   `fetch_osr_compile_inputs` and calls `compile_osr_artifact` off-thread,
->   publishing a `compiled_via_osr` body into `jit_cache`. Same GC-STW lock
->   discipline as `try_jit_compile_callee_slow`; `PENDING_COMPACT_FIELD_INFO` is
->   thread-local so the worker stages its own.
-> - **Back-edge → enqueue, reuse-only entry.** Under `CRATONVM_BG_COMPILE`,
->   `try_osr_with_backoff` (gated by the cheap per-frame `should_try_osr` schedule)
->   enqueues an OSR task via the new `TieredCompilationManager::request_osr` (a
->   sibling of `on_backedge` that enqueues *immediately* and idempotently — the
->   per-frame schedule is the throttle, avoiding a per-back-edge lock and the
->   10 000-count threshold), then **keeps interpreting**; it only ENTERS a
->   worker-published artifact (the existing `osr_reused` reuse path) and never
->   inline-compiles. `ensure_bg_compiler_started` is factored so the back-edge path
->   starts the worker even for an all-hot-loop program that never crosses the
->   invocation threshold.
-> - **Default-OFF safety.** With `CRATONVM_BG_COMPILE` unset, `try_osr_with_backoff`
->   takes the historical inline-OSR path byte-for-byte (the extraction is the only
->   change, and it is behavior-preserving). The manager's `on_backedge`/`request_osr`
->   are never called.
-> - **Tests** (`jit/src/tiered.rs`): `step5_request_osr_enqueues_osr_task_immediately`
->   (first call enqueues a High-priority `osr_bci` task; idempotent while queued;
->   counted once) and `step5_request_osr_skips_when_already_c2_or_bailed`. 841
->   jit-crate tests pass. (Incidentally repaired two `cratonvm-jit` test closures
->   the compact-ref-field-layout merge left on the old 2-tuple `cp_field_resolver`,
->   which had broken the whole jit test binary.)
-> - **Runtime validation (`scratch/bgosr/`).** `OsrProbe.compute` (a long int/long
->   loop invoked once — so it only ever runs via OSR), `binarytrees 16`
->   (recursion + allocation), and `OsrShapes` (arrays, branchy, nested loops + a
->   callee) all produce **identical** results on HotSpot and CratonVM across
->   `CRATONVM_BG_COMPILE` off/on × `CRATONVM_JIT_C2_FIRST_CALL` off/on
->   (`compute`@10M = `1550058760673472`; bt16 = `14985902`; `OsrShapes` =
->   `-784340278423176288`). The **off-thread** path is proven non-vacuously: under
->   `CRATONVM_BG_COMPILE=1 CRATONVM_JIT_C2_FIRST_CALL=1 CRATONVM_DBG_JITC=1` the
->   worker logs `bg-compile …compute… osr_bci=4` + `OSR-compile …entry=0x…` while
->   the mutator logs `OSR-reuse …entry=0x…` at the **same** entry address — the
->   compile ran on the worker and the interpreter entered its artifact (the mutator
->   never logs `OSR-compile` under the gate). `OsrShapes` shows off-thread OSR for
->   `arraySum`/`branchy`/`nestedCalls` independently.
-> - **Why `C2_FIRST_CALL`.** As in increment 4, the eager first-call single-pass
->   compile (`fn execute`) compiles a method on call #1, so a once-invoked method
->   would run fully compiled and never reach an interpreter back-edge. With
->   `CRATONVM_JIT_C2_FIRST_CALL=1` the method stays interpreted until hot, so its
->   loop OSRs — which is how the off-thread path is exercised. Correctness holds in
->   every combination regardless.
-> - **Boundaries / not in this step.** (1) The compile is off-thread; the live-frame
->   **entry** stays on the mutator (it must — the frame is the mutator's). (2)
->   Threshold tuning of "hot enough" + `CRATONVM_TIER_*` overrides is Step 6. (3)
->   The per-frame `should_try_osr` exponential backoff still gates entry attempts;
->   a worker artifact is entered on the next firing after it publishes. (4) IR-path
->   OSR (vs the single-pass `x64::compile` OSR reused here) remains future work.
->
-> **Increment 4 (Step 4 — profile handoff C1 → C2) landed.**
-> Builds on increment 3. The PGO machinery was fully present but **dormant in
-> production**: `jit::profile::enable_profiling` was only ever called from the
-> profile-crate's own tests, so `is_profiling_enabled()` was always `false`, the
-> interpreter's ~13 `record_branch`/`record_receiver`/`record_backedge` sites all
-> short-circuited, `shared.profile_store` stayed empty, and every compile-time
-> `get_profile` returned `None`. Increment 4 turns the handoff on (gated) and
-> makes the optimizing C2 backend a profile consumer:
-> - **Populate (C1 / warmup phase).** New `CRATONVM_TIER_PGO` gate
->   (`runtime/env_cache.rs`, `tier_pgo()`). When set, `SharedVm::new`
->   (`vm/src/vm/vm_init.rs`, post-construction) calls
->   `jit::profile::enable_profiling(true)` **once at VM init** — it must happen
->   before any frame runs because the dispatch loop captures
->   `is_profiling_enabled()` once per frame entry (`interpreter.rs` ~4617), so a
->   method already warming up would never start recording. With the gate on, the
->   interpreted (C1/warmup) phase populates `profile_store` (branch bias, receiver
->   types, loop trips).
-> - **C2 reads it.** The single-pass backend already biased branch layout +
->   pre-populated virtual-call MICs + loop-unroll from the profile (it serves both
->   the fast C1 tier and the C2 IR-bail fallback). The gap was the **optimizing IR
->   pipeline itself, which ignored `profile` entirely.** `ir_lower::lower` gained a
->   sibling `lower_with_branch_hints(…, &HashMap<usize,bool>)`; the `Lowerer` now
->   carries the per-bytecode-PC branch bias and, in the `Op::If` terminator, picks
->   the conditional polarity from it. `cmp != 0` ⟺ the JVM branch is TAKEN
->   (`successors[0]` = taken edge), so the historical layout (`JE around_true`,
->   true edge as fall-through) already favours the taken edge; a branch the profile
->   marks **usually-not-taken** inverts to `JNE` so the not-taken edge becomes the
->   fall-through. `lib.rs` builds `ir_branch_hints` from `profile` exactly as the
->   single-pass path builds its `branch_hints`, keyed by the branch instruction's
->   bytecode PC (matching `Op::If::bytecode_pc` and the interpreter's
->   `record_branch` PC). The two layouts are semantically identical — only the
->   predicted/fall-through edge and block order differ; phi copies stay attached to
->   their own edge in both.
-> - **Default-OFF safety.** With the gate unset (default), `enable_profiling` is
->   never called, every `record_*` short-circuits, `get_profile` returns `None`,
->   `ir_branch_hints` is empty, and the `Op::If` arm reproduces its historical
->   bytes byte-for-byte. So the default path — interpreter hot loop and all codegen
->   (single-pass and IR) — is unchanged until the gate is opted in.
-> - **Tests** (`jit/src/ir_lower.rs`): `step4_ir_lower_consumes_branch_bias_hint`
->   (a usually-not-taken hint flips the emitted conditional `JE 0F84` → `JNE 0F85`
->   and changes the buffer; a usually-taken hint reproduces the default
->   byte-for-byte) and `step4_ir_lower_branch_bias_keyed_by_pc` (a hint for an
->   unrelated PC does not perturb codegen). 839 jit-crate tests pass.
-> - **Runtime smoke (`scratch/tierpgo/TierPgoProbe.java`).** Two pure-int,
->   `ir_compatible` methods invoked 3M times each with `x >= 0`: `gate(int)`
->   (`if (x >= 0) … else …`, which `javac` emits as `iflt else` — a branch taken
->   only when `x < 0`, i.e. **usually NOT taken**, with a phi merge) and
->   `classify(int)` (`if (x < 0) …`, emitted as `ifge` — **usually taken**). Result
->   (`196560529536`) is **identical** on HotSpot, CratonVM default (PGO off), and
->   `CRATONVM_TIER_PGO=1`, with and without `CRATONVM_JIT_C2_FIRST_CALL=1`. With
->   `CRATONVM_JIT_C2_FIRST_CALL=1 CRATONVM_DBG_JIT_DISASM=gate` the C2 (IR) body of
->   `gate` shows `test eax,eax; je …` with profiling off and the inverted
->   `test eax,eax; jne …` (with the two edge `JMP`s swapped) under
->   `CRATONVM_TIER_PGO=1` — proving the profile is collected by the interpreter and
->   consumed by the IR lowerer end-to-end (not a vacuous == HotSpot probe).
->   `classify` correctly stays `je` (usually-taken ⇒ no inversion), confirming the
->   bias is directional, not a blanket flip.
-> - **Boundaries / not in this step.** (1) The IR path consumes **branch bias**;
->   receiver-MIC pre-population stays single-pass-only (the IR virtual-call path
->   dispatches via the generic helper with no inline cache — IR-level MICs are
->   future work). (2) `on_backedge` / OSR remains Step 5 (still no VM call site).
->   (3) Loop-unroll-from-profile stays single-pass; the IR path has its own
->   LICM/unroll. (4) PGO is inherently a *post-warmup* optimization: a method must
->   be interpreted long enough to accumulate samples, then compiled via
->   `try_compile`. The **eager first-call single-pass compile** in `fn execute`
->   (`interpreter.rs` ~3738, `x64::compile` direct, empty hints) compiles most
->   methods on call #1 — before any profile exists — and that cached body preempts
->   the optimizing IR pipeline on every later path (the pre-existing increment-3
->   boundary 1 + the `c2_first_call` note). So the live C2 branch-bias is reached
->   through the invocation-counted `try_compile` upgrade / callee / OSR paths;
->   `CRATONVM_JIT_C2_FIRST_CALL=1` routes the first-call compile through that same
->   `try_compile(optimize=true)` path and is what the disasm smoke above uses.
->   Making the default tiering reliably reach a profiled C2 compile is Steps 6–7
->   (threshold tuning + retiring the eager fixed-threshold path) and C1→C2
->   supersede (boundary 1).
->
-> **Increment 3 (Step 3 — real per-call C1/C2 backend routing) landed.**
-> Builds on increment 2. The C1/C2 split is no longer advisory: the target tier
-> now selects the actual backend per compile.
-> - **Per-call `optimize` toggle in the jit crate.** `jit::try_compile` /
->   `try_compile_inner` (`jit/src/lib.rs`) gained a trailing `optimize: bool`.
->   The IR-pipeline gate (`lib.rs` ~4185) is now
->   `optimize && ir::ir_compatible(&scan) && !method_uses_category2(...)`:
->   `optimize == false` skips the whole optimizing pipeline (IR build → optimize
->   → escape analysis → schedule → lower) and falls through to the single-pass
->   `x64::compile` backend — the fast **C1** tier. `optimize == true` keeps the
->   historical IR-first behaviour (**C2**). The single-pass backend is the
->   existing, well-tested fallback (it already serves every category-2 /
->   non-`ir_compatible` method), so C1 is a throughput trade-off, never a
->   correctness risk.
-> - **Threaded VM-side.** `background_compile_task`
->   (`vm/src/runtime/interpreter.rs`) passes
->   `tiered::tier_uses_optimized_backend(task.target_tier)` into
->   `try_jit_compile_callee` → `try_jit_compile_callee_slow` →
->   `jit::try_compile`. Every inline JIT-dispatch caller (the three
->   `try_jit_compile_callee` sites in `vm/src/jit/helpers.rs`, the eager
->   direct-call site `interpreter.rs:16172`, and the early-compile / main-path
->   `jit::try_compile` sites) passes `optimize = true`, so the default
->   (`CRATONVM_BG_COMPILE`-off) path is byte-for-byte unchanged. Only the
->   background tiered worker can request `optimize = false`.
-> - **`tier_uses_optimized_backend` is now real routing, not a hint** — the
->   former "STUB" comments in `tiered.rs` and `background_compile_task` are
->   updated accordingly.
-> - **Test:** `step3_optimize_toggle_routes_c1_singlepass_and_c2_ir`
->   (`jit/src/lib.rs`) compiles `static int add(int,int)` both ways and asserts,
->   via the thread-local `IR_LOWER_COMPILES` telemetry counter, that
->   `optimize=true` takes the IR pipeline (count 1) while `optimize=false` skips
->   it (count 0) — both producing non-empty native code. (777 jit-crate tests
->   pass; `cratonvm-vm` builds clean.)
-> - **Runtime smoke (gated on):** with `CRATONVM_BG_COMPILE=1
->   CRATONVM_DBG_JITC=1`, a hot `Bg.busy(I)I` enqueues `tier=C1`, the worker logs
->   `bg-compile … tier=C1 optimized=false` + `full-compile … len=350`, and the
->   program prints a result **identical** to the default run — the off-thread
->   single-pass C1 code is correct.
-> - **Boundaries (follow-ups, all behind the default-off flag):**
->   1. *No C1→C2 supersede yet.* The `jit_cache` probe in
->      `try_jit_compile_callee` returns whatever body was published first,
->      regardless of `optimize`, so a method is compiled at whichever tier
->      reaches it first. Re-compiling a hot C1 method at C2 needs safe
->      code-cache replacement (cf. the bug-24 baked-pointer UAF), out of scope
->      here.
->   2. *C1 is "single-pass", not "no-opt-at-all".* The single-pass backend still
->      runs its own internal escape analysis; threading the flag into
->      `x64::compile` to disable those passes for an even leaner C1 is separate.
->   3. *With the default policy, the bg path only ever reaches C1.*
->      `c1_threshold(200) < c2_threshold(5000)`, and `on_method_invocation` is
->      consulted only at the interpreter's stride boundaries (every 64 calls past
->      the warmup), so C1 fires first; once it publishes, the call site flips to
->      `Jit` and tiered counting stops — the method never accumulates to the C2
->      threshold. Reaching bg-C2 needs threshold tuning (Step 6) or supersede
->      (boundary 1).
->
-> **Increment 2 (Step 2 done + Step 3, gated `CRATONVM_BG_COMPILE` default-off) landed.**
-> Builds on increment 1. The background worker now runs a **real** compile
-> callback and (when the flag is on) the mutator no longer compiles inline:
-> - **Real `compile_fn`.** `ensure_background_compiler` is now wired with a live
->   closure (`vm/src/runtime/interpreter.rs` ~14495–14510) that captures a
->   `Weak<SharedVm>` and, per drained `CompilationTask`, calls the new
->   `background_compile_task` (`interpreter.rs` ~16755). That runs the SAME
->   codegen entry point the inline path uses — `try_jit_compile_callee`
->   (by-name lookup → `jit::try_compile` → publish into `shared.jit_cache`) —
->   **off the mutator thread**. Publishing into the shared `jit_cache` IS the
->   cross-thread "flip the invoke cache" mechanism: the per-thread `invoke_cache`
->   is thread-local and can't be touched from the worker, but the `Bytecode`
->   arm's `jit_cache` fast-path (`interpreter.rs` ~14366) upgrades the call site
->   to `Jit` on the next mutator invocation once the entry is present.
-> - **Gated default-OFF behind `CRATONVM_BG_COMPILE`** (`runtime/env_cache.rs`,
->   `bg_compile()`). Flag ON → start the worker once and switch the trigger
->   (~14365) to **enqueue-only** (the inline `try_jit_upgrade_with_gate` stall is
->   dropped; the method stays interpreted until the worker publishes). Flag OFF
->   (default) → the worker is never started and the existing inline path runs
->   **exactly as before**, so the off-thread pipeline cannot regress steady-state
->   behaviour until proven on the gauntlet.
-> - **Step 3 (C1 tier routing) — partial.** `jit/src/tiered.rs` gained
->   `tier_uses_optimized_backend(tier)`: `C1`/`C1WithProfiling` → single-pass
->   (no-opt) backend, `C2`/`FullProfile` → optimizing pipeline. The compile
->   closure computes/logs this hint per task. **STUB note:** the VM's
->   `jit::try_compile` currently selects single-pass vs. optimized by
->   process-global env flags, not a per-call switch, so both tiers presently
->   funnel into `try_jit_compile_callee` and the C1 no-opt routing is advisory
->   until a per-call backend toggle is threaded through `try_compile` (Step 3
->   follow-up).
-> - Tests (`jit/src/tiered.rs`):
->   `flag_on_threshold_compiles_off_thread_and_publishes_jit_target` (a crossed
->   C2 threshold compiles off-thread on a different `ThreadId`, the worker
->   publishes the Jit target, and `current_tier` flips to C2 — the jit-crate
->   analogue of the invoke cache being updated) and
->   `tier_routing_selects_optimized_backend_for_c2`.
-> - Still SKIPPED: Step 5 (precise OSR) — gated on `real-frame-deopt.md` state
->   maps. `on_backedge` is implemented in the manager but not yet called from the
->   interpreter back-edge sites (Step 5).
->
-> **Increment 1 (tier recommendation wired + background compile thread) landed.**
-> Steps 1–2 of the ordered plan below are now real:
-> - The interpreter no longer discards the recommended tier
->   (`vm/src/runtime/interpreter.rs` ~14361–14400). `on_method_invocation` now
->   *enqueues* a `CompilationTask` at the policy-recommended tier when the C1/C2
->   thresholds are crossed (the result is bound to `recommended_tier` and acted
->   on, not dropped into `_`).
-> - A real **background compile thread** now drains the queue off the mutator
->   thread. `jit/src/tiered.rs` grew a shared `CompilerCore` (per-method state +
->   queue + stats + wake condvar + shutdown flag behind an `Arc`), a
->   `BackgroundCompiler` worker handle (RAII: drop → drain+join, so no thread
->   outlives the VM), `start_background_compiler(compile_fn)`, and a process-
->   global `ensure_background_compiler(mgr, make_compile_fn)` started once via
->   `Once` from the interpreter hook. The worker blocks on the condvar (no spin),
->   dequeues highest-priority first, runs the compile callback off-thread, then
->   publishes the tier via `CompilerCore::complete_task`.
-> - **Scope note:** for this increment the worker runs a *drain-only* compile
->   closure and the mutator keeps its existing inline `try_jit_upgrade_with_gate`
->   path, because the real codegen callback needs VM-init / class-metadata access
->   that lives outside this item's subsystem boundary. Wiring the real
->   `compile_fn` and switching the mutator to enqueue-only (removing the inline
->   stall) is the remainder of step 2 / step 3.
-> - Test: `background_worker_drains_enqueued_task_off_thread` in
->   `jit/src/tiered.rs` (deterministic via an `mpsc` sync handle — asserts the
->   task is compiled on a *different* `ThreadId` than the caller).
-> - Step 5 (precise OSR) remains gated on `real-frame-deopt.md` state maps.
+**Status:** Shipped (default on; `CRATONVM_BG_COMPILE=0` restores synchronous
+on-mutator compilation).
 
-Status: design / not started. L. `jit/src/tiered.rs` is a full HotSpot-style
-tiered policy + priority compilation queue that the interpreter currently
-**throws away** — it compiles exactly one tier at one fixed invocation
-threshold, synchronously, on the calling thread.
+## What it does today
+
+Compilation happens **off-thread by default**. `start_background_compiler`
+(`jit/src/tiered.rs`) spawns a named `cratonvm-jit-compiler` thread with a
+16 MiB stack; `compiler_loop` blocks on a jit-crate-private `parking_lot`
+condvar, holding no VM lock, which is what makes it safe against a
+stop-the-world pause. The VM side is real wiring, not a drain-only stub:
+`vm/src/runtime/interpreter/jit_bridge.rs` calls
+`tiered::ensure_background_compiler` with `background_compile_task` as the
+codegen closure.
+
+Under the default, both invocation triggers enqueue and keep interpreting
+until the worker publishes — the static path and the virtual path alike — and
+OSR compiles off-thread too. The opt-out restores the historical inline
+fixed-threshold and eager-first-call paths verbatim.
+
+Policy lives in `CompilationPolicy::from_env` (`jit/src/tiered.rs`):
+
+| Knob | Default | Override |
+|---|---|---|
+| C1 threshold | 500 | `CRATONVM_TIER_C1_THRESHOLD` |
+| C2 threshold | 20000 | `CRATONVM_TIER_C2_THRESHOLD` |
+| OSR threshold | 10000 | `CRATONVM_TIER_OSR_THRESHOLD` |
+| C2 minimum invocations | 1000 | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
+| tiering enabled | on | `CRATONVM_TIER_ENABLED=0` |
+| C1→C2 supersede | on | `CRATONVM_C2_SUPERSEDE=0` |
+
+Failure handling is real: `MAX_TIER_FAIL_RETRIES = 3`, a dynamic
+`osr_deny_list`, and `CompilationStats` counters.
+
+## What is not built yet
+
+- **Profile recording is default-off** (`CRATONVM_TIER_PGO`), so the
+  evidence the C2 tier could speculate on is not being collected in a default
+  run. See [`profile-guided-inlining.md`](profile-guided-inlining.md).
+- `CRATONVM_JIT_FORCE_C2` and `CRATONVM_JIT_C2_FIRST_CALL` remain default-off
+  experiments.
 
 ## Goal
 
@@ -377,47 +48,6 @@ Turn the existing tiered policy into a real two-tier pipeline: a fast **C1**
 optimizing JIT), with a **background compilation thread** draining the existing
 `CompilationQueue`, and with the **OSR / back-edge** path actually firing
 on-stack replacement for hot loops.
-
-## Current state (cited)
-
-The policy engine is complete and unit-tested; almost none of it is on a live
-path.
-
-- **Only one tier, one threshold, synchronous.** The interpreter's JIT trigger
-  (`vm/src/runtime/interpreter.rs:14160`–`14186`) reads a single
-  `jit_invocation_threshold` (default 500, `CRATONVM_JIT_THRESHOLD`), and once
-  crossed calls `try_jit_upgrade_with_gate` **inline on the calling thread**
-  (`:14186`) producing the full optimizing backend in one shot. `JIT_RETRY_STRIDE
-  = 64` (`:14165`) re-attempts on failure. There is no C1; cold methods jump
-  straight from interpreter to the C2-equivalent backend.
-- **The tiered manager is consulted, then ignored.** `interpreter.rs:14181`:
-  ```
-  let _recommended_tier = shared.tiered_manager.on_method_invocation(&tiered_key);
-  ```
-  The recommended tier is bound to `_` and discarded. The only other live use is
-  `vm/src/vm/vm_init.rs:3342` (`on_deoptimization`), which records the event for
-  the give-up policy.
-- **`on_backedge` is never called.** `tiered.rs:366` implements OSR triggering
-  (back-edge count ≥ `osr_threshold`, enqueues a `High`-priority
-  `CompilationTask` with `osr_bci: Some(bci)` at `:392`), but **no VM code calls
-  `on_backedge`** (grep over `vm/src/` finds zero call sites). So a hot loop in a
-  cold method never OSR-compiles — it must wait until the *whole method* is
-  invoked `osr_threshold` times, which for a `main()`-style loop never happens.
-- **The `CompilationQueue` is never drained.** `tiered.rs:232`–`280` is a
-  full three-priority (`High`/`Normal`/`Low`) `VecDeque` queue with
-  `enqueue`/`dequeue`; `CompilationTask` (`:222`) carries `target_tier`,
-  `priority`, and `osr_bci`. `enqueue_compilation` exists
-  (`tiered.rs:480`) and there's a `background_compiler_active`
-  flag (`:617`), but **nothing dequeues** — there is no background thread, and
-  the VM never enqueues. Tasks would accumulate and never compile.
-- **Policy is sound.** `CompilationPolicy` (`tiered.rs:58`) has
-  `c1_threshold: 200`, `c2_threshold: 5_000`, `osr_threshold: 10_000`,
-  `c2_min_invocations: 1_000`; `should_compile` (`tiered.rs:654`) and
-  `CompilationStats` (`tiered.rs:288`, tracks c1/c2/osr/deopt/bailout counts)
-  are implemented and tested. The C1↔C2↔Interpreter transition graph is in the
-  module doc (`tiered.rs:18`).
-
-Net: a complete policy + queue with no executor and no real C1 tier behind it.
 
 ## Design
 
@@ -475,54 +105,6 @@ tier instead of by the current ad-hoc gates.
   10_000) and `c1_threshold` (200) against the app gauntlet — HotSpot's
   defaults are a reference but CratonVM's compile cost differs.
 
-## Implementation steps (ordered)
-
-1. **Background compiler thread (no behavior change yet).** Spawn it; have the
-   interpreter *also* enqueue tasks (in addition to its current inline compile)
-   and the thread drain them, but keep using the inline result. Validate the
-   queue drains and code is produced off-thread.
-2. **Move compilation off the mutator.** Switch the interpreter trigger to
-   enqueue-only; the method stays interpreted until the background compile
-   publishes. Confirm no first-call stall and no lost compiles under the gauntlet.
-3. **Introduce the C1 tier.** ✅ **Done (increment 3).** Added the per-call
-   `optimize` toggle to `jit::try_compile`; `C1`/`C1WithProfiling` route to the
-   single-pass `x64::compile` backend, `C2` to the optimizing IR pipeline. The
-   recommended tier is already honored (increment 1). Remaining nuance — the
-   single-pass backend keeps its own internal escape analysis, and there is no
-   C1→C2 supersede yet — is recorded in the increment-3 header above.
-4. **Profile handoff C1 → C2.** ✅ **Done (increment 4).** Gated `CRATONVM_TIER_PGO`
-   enables interpreter profile recording at VM init so the C1/warmup phase
-   populates `profile_store`; the optimizing IR (C2) lowerer now consumes the
-   branch bias (`lower_with_branch_hints`), on top of the single-pass backend's
-   pre-existing branch/MIC/unroll consumption. Default-OFF = byte-identical. See
-   the increment-4 header above for the boundaries (receiver-MIC + loop-unroll in
-   the IR path remain single-pass-only / future work).
-5. **Wire `on_backedge` + OSR.** ✅ **Done (increment 5).** Precise OSR (the
-   existing single-pass `x64::compile` OSR entry — already exact, not the design's
-   "approximate" fallback) now compiles **off the mutator**: `compile_osr_artifact`
-   is the extracted frame-free compile core, the background worker honors
-   `osr_bci`, and under `CRATONVM_BG_COMPILE` the back-edge path enqueues via
-   `TieredCompilationManager::request_osr` and enters only the worker-published
-   artifact (reuse-only). Default-OFF keeps the inline OSR byte-for-byte. The
-   `real-frame-deopt` dependency the design assumed turned out not to gate this —
-   the single-pass OSR works without it. See the increment-5 header above.
-6. **Tune thresholds** on the gauntlet; expose `CRATONVM_TIER_*` overrides.
-   ✅ **Overrides exposed (increment 6):** `CRATONVM_TIER_C1_THRESHOLD` /
-   `_C2_THRESHOLD` / `_OSR_THRESHOLD` / `_C2_MIN_INVOCATIONS` / `_ENABLED`
-   (policy, via `CompilationPolicy::from_env`) and `CRATONVM_TIER_OSR_BACKEDGE`
-   (the live per-frame OSR trigger). Defaults unchanged (HotSpot-referenced).
-   *Authoritative gauntlet retuning of the defaults is deferred* — it needs a
-   quiet machine for reliable wall-time; the knobs make that a config sweep, not
-   a recompile. See the increment-6 header for tuning guidance.
-7. **Retire** the single fixed-threshold inline path. ✅ **Done (increment 7).**
-   `bg_compile()` flipped default-ON (opt-out `CRATONVM_BG_COMPILE=0`); both the
-   static and virtual invocation tier-up triggers now enqueue to the background
-   worker by default and OSR compiles off-thread by default. The eager
-   first-call single-pass compile is kept as the quick first tier. Validated
-   == HotSpot (incl. a multi-thread probe) with no hangs; **not yet
-   gauntlet-soaked** — see the increment-7 header for the caveat and the
-   `=0` revert. This completes the wire-tiered-manager build (Steps 1–7).
-
 ## Risks
 
 - **Compile-thread/mutator races**: a method being recompiled while executing,
@@ -539,9 +121,3 @@ tier instead of by the current ad-hoc gates.
 - **Background thread + GC**: the compiler thread must be a safepoint-aware
   participant or excluded from the root set appropriately.
 
-## Effort
-
-L overall; the background-thread + enqueue refactor (steps 1–2) is the bulk and
-is independently valuable (removes mutator compile stalls). The real C1 tier
-(step 3) is M. Precise OSR (step 5) is gated on `real-frame-deopt.md` state maps;
-an approximate OSR is M.

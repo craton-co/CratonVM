@@ -104,7 +104,7 @@ Four more classes report `HANG` (`process-died rc=124`) in the same
 
     A throughput residual, unchanged and not a regression: ~35–50 min against
     HotSpot's 120 s. That part *is* the
-    [moving-young-inert-under-JIT](moving-young-inert-under-jit-throughput-tax-20260730.md)
+    the retired `moving-young-inert-under-jit-throughput-tax` record
     throughput tax, and it stays there.
   - `--nojit` — **FIXED 2026-08-03**, retired to
     `fixed-suite-bugs/hibernate/map-resize-unpinned-chain-cursors-nojit-segv-20260731-FIXED.md`.

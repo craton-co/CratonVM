@@ -1,16 +1,15 @@
-# JIT helper ABI audit
+# JIT helper ABI contract
 
 Scope: `jit-api/src/lib.rs` (the `JitRuntimeHelpers` struct and the
 `helper_fields!` list) and `jit-api/src/helpers_abi.rs` (the typed ABI
 description). Producer: `vm/src/jit/helpers.rs::build_helpers`. Consumers:
 `jit/src/x64.rs`, `jit/src/ir_lower.rs`.
 
-Date: 2026-08-01. Table state at audit time: 62 fields, 496 bytes,
-`JIT_HELPERS_ABI_VERSION` raised from 2 to 3 by this audit.
+Table shape: 62 fields, 496 bytes, `JIT_HELPERS_ABI_VERSION` 3.
 
-## 0. What is actually load-bearing (premise correction)
+## 0. What is actually load-bearing
 
-The pre-existing module doc opened with:
+It is tempting to assume that
 
 > the JIT bakes each slot's **byte offset** into generated RWX machine code
 > (`CALL [helpers + disp32]`, `MOV reg, [helpers + disp32]`)
@@ -28,7 +27,7 @@ The pre-existing module doc opened with:
   (`helpers_ptr`, `offset_of!(JitRuntimeHelpers`, `HELPERS_OFF`) returns
   **nothing** in `jit/` or `vm/`.
 
-Consequences for this audit:
+Consequences:
 
 1. A *reorder* of the struct, on its own, does not mis-target a call inside this
    workspace: producer and consumer are the same Rust type compiled from the
@@ -60,32 +59,32 @@ Consequences for this audit:
 | 5 | size == `fields * stride` (no padding) | `helpers_abi.rs` `const _` | CT | A non-`usize` field |
 | 6 | `HELPER_FIELDS` covers every field | `helpers_abi.rs` `const _` vs `NUM_FIELDS` | CT | Add a field, forget the descriptor row |
 | 7 | Descriptor row *i* sits at `i * 8` | `helpers_abi.rs` `const _` | CT | Reorder the struct **without** reordering the descriptor table |
-| 8 | **Golden name → literal offset** | `helpers_abi.rs` `GOLDEN_HELPER_OFFSETS` + `const _` | CT | **NEW.** Any rename, insert, delete, or reorder — *including* a reorder that also reorders every derived table |
+| 8 | **Golden name → literal offset** | `helpers_abi.rs` `GOLDEN_HELPER_OFFSETS` + `const _` | CT | Any rename, insert, delete, or reorder — *including* a reorder that also reorders every derived table |
 | 9 | Callable count == alias count | `helpers_abi.rs` `const _` | CT | Add a `Function` row, forget the alias |
-| 10 | Callable rows and alias rows match **by name** | `helpers_abi.rs` `const _` | CT | **NEW.** Compensating edits (drop one alias, add another) that keep the count |
+| 10 | Callable rows and alias rows match **by name** | `helpers_abi.rs` `const _` | CT | Compensating edits (drop one alias, add another) that keep the count |
 | 11 | Required-slot count == 42 | `helpers_abi.rs` `const _` | CT | Promote/demote a slot |
-| 12 | Function/Offset/Constant census == 53/4/5 | `helpers_abi.rs` `const _` | CT | **NEW (CT).** Reclassify a slot's kind |
-| 13 | Optional-callable count == 11 | `helpers_abi.rs` `const _` | CT | **NEW (CT).** Promote/demote a callable slot |
+| 12 | Function/Offset/Constant census == 53/4/5 | `helpers_abi.rs` `const _` | CT | Reclassify a slot's kind |
+| 13 | Optional-callable count == 11 | `helpers_abi.rs` `const _` | CT | Promote/demote a callable slot |
 | 14 | No non-callable slot is `required` | `helpers_abi.rs` `const _` | CT | Mark an `Offset`/`Constant` required |
 | 15 | Descriptor kinds agree with crate-root `FieldKind` | `helper_fields_agree_with_crate_root` | RT | Classify a slot differently in the two lists |
-| 16 | `ABI_REVISIONS` newest row == this table | `helpers_abi.rs` `const _` | CT | **NEW.** Append a field without bumping `JIT_HELPERS_ABI_VERSION` — the exact hole the monitor-helper wave went through |
-| 17 | Ledger is append-only and dense | `helpers_abi.rs` `const _` | CT | **NEW.** Record a removal or a version gap |
-| 18 | Accessor name == `field` + `_fn` | `helpers_abi.rs` `const _` (per macro row) | CT | **NEW.** A `helper_fn_slots!` row whose getter and field disagree |
-| 19 | Every int/pointer helper argument is 8 bytes wide | `helpers_abi.rs` `const _` (per argument) | CT | **NEW.** Declare a helper argument as `i32`/`u32`/`bool` |
-| 20 | Helper arity <= 6 (SysV int reg file) | `helpers_abi.rs` `const _` | CT | **NEW.** A 7-argument helper |
-| 21 | No helper mixes integer and float arguments | `helpers_abi.rs` `const _` | CT | **NEW.** A `(i64, f64)` helper — Win64 assigns register files positionally, SysV does not |
-| 22 | Float helpers have <= 4 arguments (Win64 XMM0-3) | `helpers_abi.rs` `const _` | CT | **NEW.** A 5-float helper |
-| 23 | Exactly 1 helper spills args to the Win64 stack | `helpers_abi.rs` `const _` | CT | **NEW.** A second >4-argument helper, whose args 5+ would be garbage in R8/R9 on Windows unless the call site is hand-written like `invoke_virtual_mic`'s |
-| 24 | Argument/return types are from a closed set | `HelperArgAbi` / `HelperRetAbi` have no blanket impl | CT | **NEW.** Any new argument or return type — "trait bound not satisfied" until it is classified |
+| 16 | `ABI_REVISIONS` newest row == this table | `helpers_abi.rs` `const _` | CT | Append a field without bumping `JIT_HELPERS_ABI_VERSION` |
+| 17 | Ledger is append-only and dense | `helpers_abi.rs` `const _` | CT | Record a removal or a version gap |
+| 18 | Accessor name == `field` + `_fn` | `helpers_abi.rs` `const _` (per macro row) | CT | A `helper_fn_slots!` row whose getter and field disagree |
+| 19 | Every int/pointer helper argument is 8 bytes wide | `helpers_abi.rs` `const _` (per argument) | CT | Declare a helper argument as `i32`/`u32`/`bool` |
+| 20 | Helper arity <= 6 (SysV int reg file) | `helpers_abi.rs` `const _` | CT | A 7-argument helper |
+| 21 | No helper mixes integer and float arguments | `helpers_abi.rs` `const _` | CT | A `(i64, f64)` helper — Win64 assigns register files positionally, SysV does not |
+| 22 | Float helpers have <= 4 arguments (Win64 XMM0-3) | `helpers_abi.rs` `const _` | CT | A 5-float helper |
+| 23 | Exactly 1 helper spills args to the Win64 stack | `helpers_abi.rs` `const _` | CT | A second >4-argument helper, whose args 5+ would be garbage in R8/R9 on Windows unless the call site is hand-written like `invoke_virtual_mic`'s |
+| 24 | Argument/return types are from a closed set | `HelperArgAbi` / `HelperRetAbi` have no blanket impl | CT | Any new argument or return type — "trait bound not satisfied" until it is classified |
 | 25 | `size_of::<usize>() == 8` | `lib.rs` `const _`; `helpers_abi.rs` `const _` | CT | A 32-bit target |
-| 26 | fn pointer / thin raw pointer / `Option<fn>` are one word | `helpers_abi.rs` `const _` | CT | **NEW.** A target where any of those is not a plain machine word |
-| 27 | Each `<field>_fn` accessor reads **only** its own slot | `accessor_reads_only_its_own_slot` | RT | **NEW.** Two swapped rows in `helper_fn_slots!` — every count, offset, size and census check still passes, but each helper gets the other's signature |
-| 28 | Every accessor is `None` on an unwired slot | `every_accessor_is_none_on_a_zeroed_table` | RT | **NEW.** Was spot-checked for 9 of 53 accessors; now all 53 |
+| 26 | fn pointer / thin raw pointer / `Option<fn>` are one word | `helpers_abi.rs` `const _` | CT | A target where any of those is not a plain machine word |
+| 27 | Each `<field>_fn` accessor reads **only** its own slot | `accessor_reads_only_its_own_slot` | RT | Two swapped rows in `helper_fn_slots!` — every count, offset, size and census check still passes, but each helper gets the other's signature |
+| 28 | Every accessor is `None` on an unwired slot | `every_accessor_is_none_on_a_zeroed_table` | RT | Covers all 53 accessors |
 | 29 | `validate_with` rejects each null required slot | `jit_runtime_helpers_validate_rejects_each_required_null` | RT | Drop a slot from the validator |
 | 30 | An `Offset` slot holding a pointer is rejected | `validate_with_rejects_a_pointer_stored_in_an_offset_slot` | RT | Store a pointer in a displacement slot |
 | 31 | ABI version mismatch is rejected | `validate_with_rejects_a_foreign_abi_version` | RT | — |
 
-## 2. What this audit added
+## 2. The machinery that enforces the table
 
 All in `jit-api/src/helpers_abi.rs` unless noted.
 
@@ -99,8 +98,8 @@ All in `jit-api/src/helpers_abi.rs` unless noted.
    `const` assertions that the newest row equals `(JIT_HELPERS_ABI_VERSION,
    NUM_HELPER_FIELDS, JIT_HELPERS_ABI_SIZE)`, that versions are dense from 1,
    that `size == fields * 8` in every row, and that field counts strictly
-   increase (append-only). **`JIT_HELPERS_ABI_VERSION` bumped 2 → 3**, which the
-   monitor-helper append should have done.
+   increase (append-only). Appending a field without bumping
+   `JIT_HELPERS_ABI_VERSION` is a compile error.
 3. **`HELPER_FN_SIGS`** — per-slot `{field, accessor, alias, arity, float_args,
    returns_value, returns_float}`, *derived* from the same `helper_fn_slots!`
    rows that declare the `HelperFn*` aliases, so there is no second list to keep
@@ -115,13 +114,13 @@ All in `jit-api/src/helpers_abi.rs` unless noted.
    asserted per macro row, so a row pointing a getter at another field is a
    compile error.
 7. **Census `const` assertions** — Function/Offset/Constant/required/optional
-   counts moved from runtime-only to compile-time.
+   counts are pinned at compile time.
 8. **Platform `const` assertions** — 8-byte aligned `usize`, one-word function
    pointers, one-word thin raw pointers, niche-optimized `Option<fn>`.
 9. **`typed_helper_addr!`** — an exported macro that coerces a function through
    its declared `HelperFn*` alias before taking its address, so the producer's
    signature is checked by the compiler. Not yet used (see §4).
-10. **Two new derived tests** — `accessor_reads_only_its_own_slot` (wires one
+10. **Derived tests** — `accessor_reads_only_its_own_slot` (wires one
     callable slot at a time and requires exactly the matching accessor to see
     it, for all 53) and `every_accessor_is_none_on_a_zeroed_table`. Plus
     `golden_offsets_are_the_struct_offsets`,
@@ -129,10 +128,6 @@ All in `jit-api/src/helpers_abi.rs` unless noted.
     `helper_fn_sigs_record_the_real_c_signatures`,
     `slot_census_matches_the_pinned_counts`,
     `typed_helper_addr_yields_the_declared_functions_address`.
-11. **Doc corrections** — the module header no longer claims the backend uses
-    `[helpers + disp32]`; the `JIT_HELPERS_ABI_VERSION` doc no longer says
-    "60-field, 480-byte"; `helper_field`'s "linear over 58 entries" no longer
-    names a stale count.
 
 ## 3. Still unasserted, and why
 
@@ -147,9 +142,10 @@ All in `jit-api/src/helpers_abi.rs` unless noted.
 | **Endianness** | The backend writes immediates with explicit `to_le_bytes`, so a big-endian target would fail elsewhere first; asserting it here would be theatre. |
 | **`x86_64` specifically** | `jit/src/aarch64_backend.rs` exists and AAPCS64 has 8 integer argument registers, so pinning the arch would be wrong. Only 64-bit-ness is asserted. Note that invariant 23's Win64 reasoning is x86-64-specific and the aarch64 backend does not use these helper call sites today. |
 
-## 4. Cross-file changes this audit could not make
+## 4. Open gaps outside `jit-api/`
 
-These are the highest-value remaining items. All are outside `jit-api/`.
+These are the highest-value remaining items. None can be closed from inside
+`jit-api/`.
 
 ### 4.1 Arm the validator (`vm/src/jit/helpers.rs`)
 
@@ -191,7 +187,7 @@ const _: () = {
 };
 ```
 
-**(b) Route each slot through the new macro**, which is the same check at the
+**(b) Route each slot through `typed_helper_addr!`**, which is the same check at the
 assignment: `monitor_enter: typed_helper_addr!(HelperFnMonitorEnter,
 jit_monitor_enter),`. Stronger (it cannot drift from the assignment) but a
 62-line diff in a hot file.
@@ -213,18 +209,18 @@ const _: () = assert!(helper_sig("invoke_virtual_mic").arity == 6);
 ```
 
 (`helper_sig` would be a small `const fn` in `helpers_abi.rs` doing a linear
-`str_eq` scan; I did not add it because there is no caller yet and an unused
-const-fn reads as coverage. Say the word and it is four lines.)
+`str_eq` scan. It does not exist yet: there is no caller, and an unused
+const-fn reads as coverage.)
 
-Also worth pinning in `jit/src/ir_lower.rs:162-172`: `CALL_ARG_REGS` is capped
+Also worth pinning in `jit/src/ir_lower.rs`: `CALL_ARG_REGS` is capped
 at 4 on **both** platforms with the comment "capped at 4 because the dispatch
-helper only ever takes 4". `HELPERS_NEEDING_WIN64_STACK_ARGS == 1` now pins the
+helper only ever takes 4". `HELPERS_NEEDING_WIN64_STACK_ARGS == 1` pins the
 fact that makes that safe; a `const _: () = assert!(CALL_ARG_REGS.len() >= …)`
 tying the two would close the loop.
 
 ### 4.4 `jit/tests` tables use `std::mem::zeroed()`
 
-`jit/src/lib.rs:15691` and ~8 other sites build `JitRuntimeHelpers` with
+`jit/src/lib.rs` and ~8 other sites build `JitRuntimeHelpers` with
 `unsafe { std::mem::zeroed() }`, i.e. every required slot null. They then wire
 only what they exercise. That is legitimate, but `validate_abi()` will reject
 such a table, so §4.1's panic must not be added to a path those tests reach —

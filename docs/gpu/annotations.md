@@ -44,7 +44,7 @@ public final class VectorAdd {
 }
 ```
 
-Run with `--gpu --print-gpu-decisions` (as of 2026-07-11 evening the flag is
+Run with `--gpu --print-gpu-decisions` (the flag is
 self-sufficient — no separate `RUST_LOG` needed, see
 [Diagnostics](#diagnostics)) on a CUDA-equipped box and you will see:
 
@@ -86,8 +86,8 @@ flow into the `LaunchConfig` builder when the kernel is launched. The
 |------|-----------------|
 | `STRICT` | Nothing (default). The analyzer applies every rule. |
 | `ALLOW_ALLOCATION` | Primitive-array `new int[n]` where `n` is derived from a parameter (a `LOAD` of an argument, or `arraylength` of an array argument). The allocation must be the *first* statement of the method and the array must be one of the method's `*astore` targets. No escape analysis. |
-| `ALLOW_DIV_BY_ZERO` | Skip the divisor-zero check on `idiv`, `ldiv`, `irem`, `lrem`. The kernel emits no `setp.eq.s32` against zero before the divide. Use only when the caller has already established the divisor is non-zero. **As of 2026-07-11 this hint is also reused to gate `frem`/`drem`** (see below) — same "the caller has already established a safe input" contract, applied to IEEE remainder instead of integer division. |
-| `ALLOW_INTRINSIC_CALLS` | Loosens the analyzer's rejection of `invokestatic`, and — **as of 2026-07-11** — actually resolves and lowers the call. See [`ALLOW_INTRINSIC_CALLS`](#allow_intrinsic_calls) below for the curated table of what's supported. |
+| `ALLOW_DIV_BY_ZERO` | Skip the divisor-zero check on `idiv`, `ldiv`, `irem`, `lrem`. The kernel emits no `setp.eq.s32` against zero before the divide. Use only when the caller has already established the divisor is non-zero. **this hint is also reused to gate `frem`/`drem`** (see below) — same "the caller has already established a safe input" contract, applied to IEEE remainder instead of integer division. |
+| `ALLOW_INTRINSIC_CALLS` | Loosens the analyzer's rejection of `invokestatic`, and — now — actually resolves and lowers the call. See [`ALLOW_INTRINSIC_CALLS`](#allow_intrinsic_calls) below for the curated table of what's supported. |
 
 The hints are independent — each one only loosens its own rule. A
 method that allocates *and* calls `Math.sqrt` needs
@@ -161,7 +161,7 @@ A runtime zero divisor in this kernel produces undefined PTX behaviour
 (typically a NaN-like sentinel or a 0; depends on the architecture).
 Use only when the caller has independently established the invariant.
 
-#### `frem` / `drem` reuse (2026-07-11)
+#### `frem` / `drem` reuse
 
 `ALLOW_DIV_BY_ZERO` also gates `frem` (0x72) and `drem` (0x73) — Java's IEEE
 remainder opcodes. In `Strict` mode both still reject unconditionally, same as
@@ -191,7 +191,7 @@ bit-exact agreement with the CPU interpreter across all possible inputs.
 
 ### `ALLOW_INTRINSIC_CALLS`
 
-**Current status (verified 2026-07-11 evening against
+**Current status (verified against
 `jit-cuda/src/analyzer.rs` and `jit-cuda/src/lowering/emit.rs`): this hint is
 implemented.** The PHASE1-GUESS gap described in earlier drafts of this
 section — the analyzer admitting *any* `invokestatic` without resolving the
@@ -261,7 +261,7 @@ public static void rootArray(double[] src, double[] dst) {
 (This is the `AdmitMathSqrt.java` fixture under
 `test_classes/gpu/annotations/`. `jit-cuda/src/lowering.rs`'s
 `ptxas_round_trip_math_intrinsics` test round-trips a kernel using this table
-through `ptxas` as part of the 2026-07-11 evening validation pass, alongside
+through `ptxas` as part of the validation pass, alongside
 five other lowering shapes — the reduction epilogue's `ptxas` rejection
 (`atom.global.add`'s 2-operand form) is what motivated adding these
 round-trip tests in the first place; see [`reductions.md`](reductions.md).)
@@ -319,8 +319,7 @@ has no effect on this particular line.
 
 #### Before / after
 
-Without `@GpuExclude`, running with `--print-gpu-decisions` alone (as of
-2026-07-11 evening no separate `RUST_LOG` is needed — see
+Without `@GpuExclude`, running with `--print-gpu-decisions` alone (no separate `RUST_LOG` is needed — see
 [Diagnostics](#diagnostics) below):
 
 ```
@@ -388,7 +387,7 @@ Each fixture exercises one annotation or admission hint in isolation:
 | `StrictRejectsAllocation.java` | `@GpuKernel` (STRICT) on a method that allocates → `OffloadVerdict::Ineligible(Reason::Allocation)`. |
 | `AdmitAllocation.java` | `@GpuKernel(admit = ALLOW_ALLOCATION)` on the same shape; analyzer admits the `newarray`. |
 | `AdmitDivByZero.java` | `@GpuKernel(admit = ALLOW_DIV_BY_ZERO)` on a method whose loop body divides by a data-dependent value. |
-| `AdmitMathSqrt.java` | `@GpuKernel(admit = ALLOW_INTRINSIC_CALLS)` calling `Math.sqrt(double)`. Analyzer-eligible and lowered as of 2026-07-11 evening — see [`ALLOW_INTRINSIC_CALLS`](#allow_intrinsic_calls) above for the full curated table. |
+| `AdmitMathSqrt.java` | `@GpuKernel(admit = ALLOW_INTRINSIC_CALLS)` calling `Math.sqrt(double)`. Analyzer-eligible and lowered — see [`ALLOW_INTRINSIC_CALLS`](#allow_intrinsic_calls) above for the full curated table. |
 | `ExcludedKernel.java` | `@GpuExclude` on an analyzer-eligible method. Cache returns `Blacklisted`. |
 | `ExcludedAndKernel.java` | Both `@GpuExclude` and `@GpuKernel` on the same method. Exclude wins. |
 | `WarmupTwo.java` | `@EnableGpuAsync(warmup = 2)` over a class with three `@GpuKernel` methods; only the first two are warmed. |
@@ -400,7 +399,7 @@ exact method bodies.
 
 ## Diagnostics
 
-**Updated 2026-07-11 evening.** `--print-gpu-decisions` used to be a silent
+`--print-gpu-decisions` used to be a silent
 no-op unless you separately exported `RUST_LOG=info` — see the "before"
 behavior below, which earlier drafts of this doc documented as the permanent
 state of the world. It no longer is: `vm-cli/src/main.rs` now has the flag add
@@ -429,8 +428,7 @@ nothing above changes how `RUST_LOG` itself behaves, only what
 1. **The `--print-gpu-decisions` flag.** Gates a plain `tracing::info!(...)`
    call in `OffloadCache::lookup_or_compile` that logs one line per analyzer
    verdict (`Eligible(...)` / `Rejected(...)`) under the module's default
-   tracing target (`cratonvm_vm::runtime::offload`), *not* `gpu.offload`. As
-   of 2026-07-11 evening the flag itself is sufficient to see these lines —
+   tracing target (`cratonvm_vm::runtime::offload`), *not* `gpu.offload`. The flag itself is sufficient to see these lines —
    no separate `RUST_LOG` required (see above).
 2. **The `target: "gpu.offload"` tracing target.** Separate call
    sites (currently: the `@GpuExclude` blacklist record) tag their
@@ -485,7 +483,7 @@ auditable.
   no fallback to the CPU on a runtime zero — the kernel completes
   with whatever value PTX produces.
 - **`ALLOW_INTRINSIC_CALLS` is now implemented, but the table is curated
-  and closed, not "any `Math` method."** As of 2026-07-11 evening the
+  and closed, not "any `Math` method."** The
   analyzer resolves the constant-pool callee via
   `analyzer::resolve_math_intrinsic` and only admits (then lowers) an exact
   hit against the table in [`ALLOW_INTRINSIC_CALLS`](#allow_intrinsic_calls)
@@ -501,7 +499,7 @@ auditable.
   exception, class load proceeds), but `warmup_class` always emits an
   unconditional `tracing::info!` line either way (a per-class summary,
   or a "no device available; skipping" line) — visible with either
-  `RUST_LOG=info` or, as of 2026-07-11 evening, `--print-gpu-decisions`
+  `RUST_LOG=info` or, `--print-gpu-decisions`
   alone (shares item 1's tracing target). See [Diagnostics](#diagnostics).
 - **Annotations are advisory.** A `@GpuKernel(admit = STRICT)` on a
   method that fails any *other* analyzer rule (synchronized, reference

@@ -84,7 +84,7 @@ originally filed for. The HotSpot baseline has never hung on this class
 (29.3s clean, 07-17). Isolated single-class reruns (`pulsar-recheck-r1-20260806`,
 182s; `craton-hangverify-20260731`, 369s) always pass, which — per this
 codebase's established "isolation reruns understate cluster bugs 4:1" lesson
-(`docs/internal/fixed-suite-bugs/springboot/mockito-bytebuddy-classfile-metadata-cluster-FIXED-20260805.md`)
+(`fixed-suite-bugs/springboot/mockito-bytebuddy-classfile-metadata-cluster-FIXED-20260805.md`)
 — means this needs to be chased under the suite's own concurrency, not in
 isolation.
 

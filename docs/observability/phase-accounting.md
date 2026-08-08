@@ -3,7 +3,7 @@
 Where a CratonVM run's wall clock actually went, as named categories plus an
 explicit unattributed remainder.
 
-**Why this exists.** The C2 review (`docs/feature-designs/c2/deep-research-vm-c2.md`)
+**Why this exists.** The C2 review
 has a P0 lane *"Separate startup, compilation, execution, and GC time"*, whose
 acceptance criterion is:
 
@@ -688,4 +688,4 @@ residual is not interpretable.
   the size it is
 * `docs/benchmarking/methodology.md` — how to measure the wall clock this
   report partitions
-* `docs/feature-designs/c2/deep-research-vm-c2.md` — the review lane this closes
+* the C2 review — the review lane this closes

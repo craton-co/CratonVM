@@ -3,7 +3,7 @@
 `jit/src/regalloc.rs` has had a complete, self-verifying linear-scan register
 allocator (`allocate_linear_scan`, `verify_allocation`, `resolve_parallel_copy`)
 and no production consumer — which is what
-`docs/feature-designs/c2/deep-research-vm-c2.md` item 3 is about, and what
+the C2 review item 3 is about, and what
 `docs/jit/linear-scan-regalloc.md` documents from the allocator's side.
 
 This document is the *consumer* side: what `ir_lower.rs` now does with that
@@ -30,7 +30,7 @@ frame image is unchanged; only reads get cheaper.
 | Piece | Where |
 |---|---|
 | Flag | `ir_lower::linear_scan_enabled` (`CRATONVM_JIT_IR_LINEAR_SCAN`) |
-| Register file | `ir_lower::IR_LOWER_LS_XMMS` = XMM2–XMM7 (XMM2–XMM5 before 2026-08-04) |
+| Register file | `ir_lower::IR_LOWER_LS_XMMS` = XMM2–XMM7 |
 | Machine model | `ir_lower::ir_lower_machine_model` — `MachineModel::for_graph` plus this backend's own clobbers |
 | The call site | `ir_lower::plan_register_residency` → `regalloc::allocate_linear_scan` + `regalloc::verify_allocation` |
 | Install | `Lowerer::set_residency`, once, before the prologue |
@@ -121,7 +121,7 @@ Three consequences, and they are the reason for the shape:
 ## The register file, and why it is this small
 
 `regalloc::RegFile::x86_64()` offers `LOCAL_REGS` (RBX, R12–R15, plus RSI/RDI on
-Win64), R8/R9 and XMM8–XMM15. Until 2026-08-04 **none** of them was usable here,
+Win64), R8/R9 and XMM8–XMM15. **None** of them was usable here at one point,
 for a reason that had nothing to do with the allocator:
 
 > `ir_lower::emit_prologue` saves **no callee-saved register**. It pushes RBP,
@@ -340,7 +340,7 @@ Listed so nobody reads a green test suite as a finished item.
    registers and no store elimination, and should be expected to deliver a small
    fraction of it.
 2. **Integer values get nothing.** The register file is FP-only. The blocker is
-   **no longer the prologue**: `IR_LOWER_SAVED_XMMS` landed on 2026-08-04, with
+   **no longer the prologue**: `IR_LOWER_SAVED_XMMS` has landed, with
    the restore on all three exits (`emit_epilogue`, the inlined epilogue in
    `emit_deopt_stub`, and `emit_call_exc_stub`) and the area placed at
    `callee_saved_lo` so the conservative band scan does not read a caller's

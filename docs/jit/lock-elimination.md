@@ -1,7 +1,7 @@
 # Lock elimination and coarsening: what is proved, what is refused
 
 Scope: the P2 item *"Lock elimination/coarsening"* of
-`docs/feature-designs/c2/deep-research-vm-c2.md` — wait/notify, identity exposure,
+the C2 review — wait/notify, identity exposure,
 exceptions, deopt relocking, contention.
 
 Subject: `jit/src/escape_analysis.rs`, "Phase 4". Companion to

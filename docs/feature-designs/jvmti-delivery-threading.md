@@ -1,62 +1,42 @@
-# JVMTI delivery is now VM-attributed at every interpreter site
+# JVMTI event delivery and VM attribution
 
-**Status: 🟢 all 33 interpreter delivery sites carry an exact `vm_identity`.**
-The `UNATTRIBUTED_VM` (`0`) migration seam is no longer reachable from
+**Status:** Partial — interpreter delivery is fully VM-attributed; the C
+`jvmtiEnv` surface a native agent would drive does not exist.
+
+## What it does today
+
+Events are fired **synchronously on the raising thread**, and every one of the
+33 interpreter delivery sites passes both the thread id and the raising VM's
+`vm_identity` (`vm/src/runtime/interpreter/jvmti_events.rs`). The
+`UNATTRIBUTED_VM` (`0`) migration seam is no longer reachable from
 `vm/src/runtime/interpreter.rs` or `vm/src/runtime/interpreter/**` on any path.
-Six sites outside this lane still use it, and one of them is load-bearing —
-`SharedVm::new` must keep populating row 0 until they land. See
-[what remains unattributed](#what-remains-unattributed-and-why).
 
-This is the delivery half of
-[`jvmti-vm-scoping.md`](jvmti-vm-scoping.md), which made the environment
-per-VM (`ENVIRONMENTS`, keyed on `vm_identity`) but could not thread the
-identity down to the sites that raise events. Until now those sites called the
-VM-less `runtime::jvmti::fire_*` free functions, which resolve row 0 exactly —
-so with the registry already per-VM, **every interpreter event in production
-was landing in the unattributed row rather than in the raising VM's**.
+This is the delivery half of the JVMTI per-VM scoping work (see
+[`../architecture/per-vm-state.md`](../architecture/per-vm-state.md)), which made
+the environment registry per-VM (`ENVIRONMENTS`, keyed on `vm_identity`) but
+could not thread the identity down to the sites that raise
+events. Until it was threaded, every interpreter event in production landed in
+the unattributed row rather than in the raising VM's.
 
----
+The rest of the Rust-side plumbing is real: `vm/src/jvmti/mod.rs` (`JvmtiEnv`,
+`ObjectTagMap`, heap iteration, `get_class_methods`, local-variable get/set),
+`capabilities.rs`, `events.rs`, `agent.rs` (`dlopen` plus
+`Agent_OnLoad`/`OnAttach`/`OnUnload`), `vm/src/runtime/jvmti.rs` (per-VM
+`ENVIRONMENTS`, `JVMTI_VERSION_11`, field watchpoints, the `fire_*_for_vm`
+family), and `-agentlib:` / `-agentpath:` parsing in `vm/src/config.rs`.
 
-## What the handover got right, and what it missed
+## What is not built yet
 
-The handover's four watchpoint sites plus `:8800` were correct, and its
-line numbers had not drifted. Two corrections:
-
-* **It undercounted the callers by roughly half, and by a whole file.** It
-  estimated "~15 call sites across `interpreter.rs`". The real count is **28**,
-  and **8 of them are in `vm/src/runtime/interpreter/invoke.rs`**, which the
-  handover does not mention at all: five `push_frame_and_fire_entry` sites and
-  three `fire_jvmti_exception_catch` sites on the OSR bail path. A change that
-  had trusted the census would have left the entire cached-invoke and OSR
-  surface unattributed while looking complete.
-* **`fire_jvmti_method_entry` has no callers.** It is listed in the handover as
-  a site to thread; `push_frame_and_fire_entry` inlines the equivalent logic
-  and is the sole frame-push chokepoint. It is threaded anyway (a future caller
-  must not get the VM-less form for free) and now carries `#[allow(dead_code)]`
-  like its `fire_jvmti_method_exit_exception` sibling, which was already marked.
-
-### There is no route to the VM from `&JvmThread` or `&Frame`
-
-Checked by reading, because taking the identity from something the helper
-already holds would have been much cheaper than 28 call sites:
-
-* `JvmThread` (`vm/src/threading/jvm_thread.rs:336`) has no VM field, and no
-  reference to one — the whole struct is checked, not just its head.
-* `Frame` (`vm/src/runtime/frame.rs:249`) likewise.
-* The only process-level `SharedVm` registry is
-  `set_global_shared_vm_for_hooks` / `live_hook_vms`
-  (`vm/src/vm/vm_init.rs:3490`, `:3498`). It is a **fan-out list of every live
-  VM**, used by hooks that deliberately over-apply (`resolution_invalidate_adapter`
-  invalidates all VMs' caches because over-invalidating costs a re-resolve).
-  It can answer "which VMs exist"; it cannot answer "which VM is running this
-  frame". Reading a VM out of it would be a guess, and a guess here *is* the
-  bug — an event delivered to the wrong agent.
-
-So the identity comes from the caller. Every one of the 28 callers already has
-`shared: &SharedVm` in scope (verified per call site), so `shared.vm_identity`
-is exact at all of them and no caller needed a new parameter of its own.
-
----
+- **There is no C `jvmtiEnv` function table anywhere in the tree** — only a
+  `typedef void* jvmtiEnv` in the generated header. Worse, `jni_get_env`
+  (`vm/src/native/jni.rs`) **ignores the requested version and always returns
+  the `JNIEnv*`**, so an agent calling
+  `GetEnv(vm, &jvmti, JVMTI_VERSION_1_2)` receives a `JNIEnv`. A real native
+  agent can be `Agent_OnLoad`'d but cannot then drive JVMTI over the C ABI.
+- **Six sites outside the interpreter still use `UNATTRIBUTED_VM`**, and one is
+  load-bearing: `SharedVm::new` must keep populating row 0 until they land.
+  `install_manager`, `set_field_watchpoint` and `manager()` still resolve on
+  row 0.
 
 ## Site table
 

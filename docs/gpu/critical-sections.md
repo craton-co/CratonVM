@@ -1,6 +1,6 @@
 # GPU critical sections: token lifetime, the wait bound, and the leak paths
 
-*Written 2026-07-31 for report item P1, "Bound GPU critical-section waiting".*
+*Scope: bounding GPU critical-section waiting.*
 
 The report's finding was: *"GPU coordination pins references and makes
 collection yield-spin while critical tokens are alive"*, with the

@@ -93,5 +93,5 @@ treating any as fully closed:
 $JAVA_HOME/bin/java -cp "target/classes:target/test-classes:$(cat craton-testcp.txt)" <class>
 ```
 If HotSpot fails identically, retitle to `...-NOT-A-BUG.md` per convention
-and move to `docs/internal/`. If HotSpot passes any of them, that one is
+and move to ``. If HotSpot passes any of them, that one is
 retracted from this doc and re-opened as a genuine CratonVM-specific defect.

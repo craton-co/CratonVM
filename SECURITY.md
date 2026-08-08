@@ -107,7 +107,8 @@ adversarial input.
   JARs as a substitute for controlling the classpath or an OS trust boundary.
 - **Resolved RAF/JIT crash history.** The two native-crash root causes and their
   regression coverage are recorded in
-  [`docs/real-raf-segv-root-cause.md`](docs/real-raf-segv-root-cause.md).
+  [`docs/SECURITY_HARDENING.md`](docs/SECURITY_HARDENING.md), under "Resolved
+  native-crash classes".
 
 ## Hardening Measures
 

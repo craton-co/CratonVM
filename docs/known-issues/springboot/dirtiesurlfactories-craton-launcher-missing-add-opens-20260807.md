@@ -88,7 +88,7 @@ member silently succeeded on CratonVM regardless of module opens (a duplicate, u
 native registration in `register_essential_natives_with_shims` was last-writer-wins over the
 checked one — see `native-builtins/src/lang_class.rs:4697-4759`,
 `enforce_set_accessible_gate`'s own doc comment). This is exactly what
-`docs/internal/fixed-suite-bugs/springboot/mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md`
+`fixed-suite-bugs/springboot/mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md`
 observed and noted as *fidelity-only* on 2026-07-27 ("CratonVM does not enforce strong
 encapsulation... including a `java.lang.ProcessEnvironment.theEnvironment` read that
 requires `--add-opens` on real HotSpot") — that observation was correct **at the time**, and

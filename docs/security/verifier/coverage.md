@@ -1,6 +1,6 @@
 # Bytecode verifier — JVMS coverage, gaps, and residual attacker capability
 
-Status: 2026-07-31. Scope: `classloading/src/{verifier,bytecode_verifier,verify_insn,verify_frame,vtype}.rs`.
+Scope: `classloading/src/{verifier,bytecode_verifier,verify_insn,verify_frame,vtype}.rs`.
 
 This document is the honest inventory. It states, rule by rule, what CratonVM's
 verifier enforces, where the enforcement lives, which test pins it, and — in

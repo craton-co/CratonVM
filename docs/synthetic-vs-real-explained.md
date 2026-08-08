@@ -15,6 +15,44 @@ ForkJoinPool, sockets, FileWriter, and RandomAccessFile. Legacy synthetic paths
 are explicit diagnostic opt-ins (`CRATONVM_SYNTHETIC_*` tokens), never the
 silent production default.
 
+## The three configurations, and which one you are running
+
+Two independent settings decide what a run executes. They are orthogonal, and
+conflating them is the most common source of confusion about this VM.
+
+**Which class library** — `JdkMode`, selected by `--real-jdk` / `--synthetic-jdk`.
+
+| | class library | availability |
+|---|---|---|
+| `real-jdk` | the JDK's own `jmods`/`lib/modules` bytecode | the launcher default; needs a JDK on the host |
+| `synthetic-jdk` | CratonVM's own Rust re-implementation | requires the `synthetic-jdk` Cargo feature, which is **not** in any default build |
+
+**Which substitutions are permitted** — `CompatibilityMode`, selected by
+`--jdk-only`. Default `compatible` allows Bridges, Intrinsics *and* synthetic
+stubs. `--jdk-only` makes the real class bytes authoritative: no fabricated
+compatibility class, no `SyntheticStub` registered or invoked, and a structured
+error instead of a silent substitution. Strictness is a runtime policy, never
+inferred from a Cargo feature or an environment variable.
+
+So the shipped default — real class library, permissive policy — is genuinely a
+hybrid, and the ratchet census measures exactly how much:
+
+| configuration | total registrations | `SyntheticStub` |
+|---|---|---|
+| `real-jdk`, `compatible` (the default) | 11,639 | **685** |
+| `real-jdk`, `--jdk-only` | 10,954 | **0** (737 registrations refused) |
+
+The strict configuration is therefore already reachable and already stub-free by
+construction; what remains is behavioural completeness of the real paths that
+replace those 685. Two further numbers from the same gates size the rest of the
+work: **1,148** registrations are shadowed (a later `register()` wins over an
+earlier one for the same class+method+descriptor), and **51** of those pairs
+disagree about their `NativeKind`.
+
+Run the census yourself with `--dump-native-registry`, or reproduce the table
+with `cargo test -p cratonvm-native-builtins --test stub_ratchet -- --nocapture`
+and `--test duplicate_registration_gate`.
+
 ## Change policy
 
 Do not add a `SyntheticStub` registration when a Bridge, Intrinsic, or real

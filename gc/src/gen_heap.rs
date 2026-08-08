@@ -9621,7 +9621,7 @@ impl GenerationalHeap {
                     // one 16-byte span, `young_free_list=0` and
                     // `freed == promoted` exactly, until old gen bled out into
                     // `OutOfMemoryError` at 68 MB live in a 1 GB heap. See
-                    // docs/internal/fixed-suite-bugs/vm/jit-young-heap-exhaustion-after-header-16-FIXED-20260807.md
+                    // fixed-suite-bugs/vm/jit-young-heap-exhaustion-after-header-16-FIXED-20260807.md
                     //
                     // Resume at the next allocator-recorded object start
                     // instead: on-grid by construction (see `next_grid_anchor`

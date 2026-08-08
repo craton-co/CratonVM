@@ -349,7 +349,7 @@ Mixing `launch_raw` and `launch_on_stream` (or the sync and async
 `DeviceBuffer` methods) against the *same buffers* is safe: both
 launch paths gate on and update the same per-buffer `last_write`
 event (`cuda-bridge/src/backend_cuda.rs`'s `launch_raw_inner` mirrors
-`launch.rs`'s choreography exactly, fixed 2026-06-17 after a race
+`launch.rs`'s choreography exactly, fixed after a race
 through the old context-wide singleton event). The thing to actually
 watch for is scheduling, not correctness: `launch_raw` always competes
 for `ctx.compute`, so a dispatch path that wants true concurrency
