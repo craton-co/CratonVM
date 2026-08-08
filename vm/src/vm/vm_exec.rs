@@ -7259,6 +7259,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .and_then(|c| c.superclass)
     }
 
+    fn is_assignable_to_name(&self, child: ClassId, target_name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .is_assignable_to_name(child, target_name)
+    }
+
     fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
         self.shared
             .classes

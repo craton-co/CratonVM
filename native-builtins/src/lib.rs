@@ -39031,26 +39031,79 @@ fn reflect_array_element_assignable(
     if value_class == component || ctx.is_subclass(value_class, component) {
         return true;
     }
+    let comp_name = ctx.class_name_of_id(component);
+    // LOADER-SPLIT FALLBACK. `is_subclass` compares `ClassId`s, and in CratonVM's
+    // flat class store one class NAME can carry two of them — a child loader
+    // re-defining a type its parent already loaded. HotSpot never faces this
+    // (one copy, so the store succeeds), which is why a refusal here is far more
+    // often a modelling artefact than a real type error.
+    //
+    // This was reached by `AotIntegrationTests.endToEndTestsForBeanOverrides`:
+    // `TypeMappedAnnotation.adapt` fills a `ContextConfiguration[]` with
+    // `annotations[i].synthesize()` proxies, under
+    // `@CompileWithForkedClassLoader`, and exactly one element per run was
+    // refused with `jdk/proxy3/$Proxy27` not assignable to a
+    // `ContextConfiguration` it had been created FROM. See
+    // `docs/known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md`.
+    //
+    // Why a NAME walk and not simply dropping the check: it still refuses a
+    // genuinely unrelated value (a `String` into a `Runnable[]` finds no
+    // `Runnable` anywhere in `String`'s hierarchy), so `ArrayStoreException`
+    // fidelity survives for the case the check exists to catch.
+    //
+    // This is the same tradeoff, and the same helper, that the VM already
+    // accepts for exception `catch_type` matching, JIT `checkcast`/`instanceof`,
+    // the recovered-mirror receiver check and `VarHandle` return coercion — see
+    // `NativeContext::is_assignable_to_name`. `Array.set` was the straggler, and
+    // being the strictest check in a VM whose sibling paths had all been
+    // relaxed is precisely why the loader split surfaced HERE and nowhere else.
+    if let Some(name) = comp_name.as_deref() {
+        if ctx.is_assignable_to_name(value_class, name) {
+            return true;
+        }
+    }
     // DIAG (`CRATONVM_DBG=coerce`): the refusal carries no detail of its own --
     // HotSpot's wording is the bare "array element type mismatch" and source
-    // witnesses pin it -- so name both sides here instead. The recurring cause
-    // is NOT a real type error but one class NAME resolved to two `ClassId`s
-    // under two loaders; the same lever already exists for the sibling
-    // "argument type mismatch" in `lang_class.rs`. See
+    // witnesses pin it -- so name both sides here instead. Mirrors the sibling
+    // "argument type mismatch" diagnostic in `lang_class.rs`, including the
+    // loader ids, because the two are read together. See
     // `field-set-argument-type-mismatch-is-a-loader-split-use-dbg-coerce`.
+    //
+    // The value's INTERFACE list is the evidence that separates the two
+    // remaining explanations once the name fallback above has also declined:
+    // a proxy that lists the component's name means the walk is broken, and a
+    // proxy that lists nothing means its interfaces were never recorded at
+    // definition time (a different defect, in the proxy-definition path).
     if crate::nbflags().dbg_coerce {
-        let comp_name = ctx
-            .class_name_of_id(component)
-            .unwrap_or_else(|| "<unnamed>".to_string());
+        let comp_name = comp_name.unwrap_or_else(|| "<unnamed>".to_string());
         let value_name = ctx
             .class_name_of_id(value_class)
             .unwrap_or_else(|| "<unnamed>".to_string());
         let arr_name = ctx
             .class_name_of_id(arr_class)
             .unwrap_or_else(|| "<unnamed>".to_string());
+        let mut chain = String::new();
+        let mut cur = Some(value_class);
+        let mut hops = 0;
+        while let Some(c) = cur {
+            if hops > 16 {
+                chain.push_str(" -> ...");
+                break;
+            }
+            hops += 1;
+            let n = ctx.class_name_of_id(c).unwrap_or_default();
+            chain.push_str(&format!(
+                " -> {n}(cid={c:?},loader={:?})",
+                ctx.loader_id_of_class(c)
+            ));
+            cur = ctx.superclass_of(c);
+        }
         eprintln!(
             "[DBG_COERCE] Array.set: rejecting -- array={arr_name} component={comp_name} \
-(cid={component:?}) value_class={value_name} (cid={value_class:?})"
+(cid={component:?}, loader={:?}) value_class={value_name} (cid={value_class:?}, loader={:?}) \
+supers:{chain}",
+            ctx.loader_id_of_class(component),
+            ctx.loader_id_of_class(value_class),
         );
     }
     false

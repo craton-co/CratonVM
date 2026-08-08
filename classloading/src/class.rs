@@ -2201,6 +2201,99 @@ mod tests {
         assert_eq!(declared.field_offsets, vec![0, 8, 12, 16]);
     }
 
+    /// The `AotIntegrationTests` / `Array.set` shape: a proxy implementing an
+    /// interface whose `ClassId` is the child loader's copy, tested against the
+    /// parent loader's copy of the same name.
+    ///
+    /// `is_subclass_of` must answer `false` here — the ids genuinely differ, and
+    /// that is the honest answer to the question it was asked.
+    /// `is_assignable_to_name` must answer `true`, because it is asked the
+    /// question CratonVM can actually answer correctly in a flat class store.
+    /// Both arms are asserted against the same pair so a regression that
+    /// collapses one into the other cannot read as a pass.
+    ///
+    /// The interface leg is the part that matters and the part
+    /// `is_subclass_of_by_name` cannot do: an annotation type is an interface,
+    /// so a proxy reaches it through `interfaces`, never through `superclass`.
+    #[test]
+    fn a_proxy_is_assignable_to_the_other_loaders_copy_of_its_interface_by_name() {
+        let mut store = ClassStore::new();
+
+        // The parent loader's copy — the one the `ContextConfiguration[]` array
+        // was created with.
+        let parent_iface = store.next_id();
+        store.add(make_class(
+            parent_iface,
+            "org/springframework/test/context/ContextConfiguration",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        // The forked loader's copy: same name, different id. This is the whole
+        // defect in one line.
+        let forked_iface = store.next_id();
+        store.add(make_class(
+            forked_iface,
+            "org/springframework/test/context/ContextConfiguration",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        assert_ne!(parent_iface, forked_iface);
+
+        // `jdk/proxy3/$Proxy27`, synthesized against the FORKED copy.
+        let proxy = store.next_id();
+        store.add(make_class(
+            proxy,
+            "jdk/proxy3/$Proxy27",
+            None,
+            vec![forked_iface],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        let proxy_class = store.get(proxy).expect("proxy present");
+
+        // Exact-identity: correctly false against the parent's copy, true
+        // against its own. Neither is a bug; the bug is stopping there.
+        assert!(
+            !proxy_class.is_subclass_of(parent_iface, &store),
+            "the two copies have different ids, so identity must not match — if \
+             this starts passing, the loader split itself was fixed and the \
+             fallback below is no longer the thing under test",
+        );
+        assert!(proxy_class.is_subclass_of(forked_iface, &store));
+
+        // Name-based: reaches the interface through the DAG and answers the
+        // question HotSpot would have, where there is only one copy.
+        assert!(
+            proxy_class.is_assignable_to_name(
+                "org/springframework/test/context/ContextConfiguration",
+                &store,
+            ),
+            "the name walk must cross the loader split — this is what stops \
+             Array.set refusing a proxy created FROM the annotation it is \
+             being stored as",
+        );
+
+        // ...and it is still a real check: an unrelated name is refused, so
+        // `ArrayStoreException` fidelity survives for the case the check exists
+        // for (a String into a Runnable[]).
+        assert!(
+            !proxy_class.is_assignable_to_name("java/lang/Runnable", &store),
+            "the fallback must not degrade into 'everything is assignable'",
+        );
+    }
+
     /// Reordering must not disturb which *index* names which field: the storage
     /// kind recorded at index `i` is still field `i`'s, whatever offset it got.
     #[test]
