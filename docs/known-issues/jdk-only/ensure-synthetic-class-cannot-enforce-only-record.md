@@ -351,6 +351,21 @@ Both are wired now.
 feature set compiles paths that check does not, and it turned up 46 more errors
 plus every one of the 181 discarded refusals after the lib alone was clean.
 
+**And neither is one platform — this one got through.** A span-driven sweep
+edits text but is corrected only by diagnostics, and rustc emits none for a
+`#[cfg(windows)]` block on Linux. Those arms are therefore **rewritten and
+never type-checked**, which is the worst of both. This migration was green on
+the Azure Linux host and broke the Windows build: 8 stray `?`, including
+`let addr = [0u8; 16]?;` on an array literal and `read_native_pin(..)?` on an
+infallible function that fourteen other call sites in the same file spell
+without one. Fixed in `604bab335` by another lane, which is not where that
+should have been found.
+
+Step 3 sweeps the remaining 72 direct callers the same way, so: `grep -c
+'#[cfg('` the files you touch, and run `cargo check` on every target and
+feature combination whose arms the sweep edited — not only the one you happen
+to be driving from.
+
 **On the regression suite's one failure.** It is not the same test twice:
 `RSocketChannelInterrupt` on one run, `RMapGcStress` on the next, and each
 passes when run on its own. The Azure host was simultaneously running two other
