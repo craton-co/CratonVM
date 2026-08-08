@@ -13539,7 +13539,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                 // classloader_real) rather than the synthetic one, so
                 // JDK bytecode reading ClassLoader fields by name sees
                 // valid values rather than our synthetic Int(LOADER_APP=2).
-                if let Some(loader) =
+                if let Ok(Some(loader)) =
                     cratonvm_native_builtins::classloader_real::get_or_create_system_cl(self)
                 {
                     // System-CL construction allocates → may relocate the mirror.

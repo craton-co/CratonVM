@@ -15,7 +15,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Archive format constants
@@ -599,7 +599,7 @@ pub fn format_class_list(classes: &[String]) -> String {
 ///  4  archive_path               (Object / String)
 /// ```
 fn alloc_cds_metrics_obj(ctx: &mut dyn NativeContext, metrics: &CdsMetrics) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "sun/management/CDSMetrics", 5);
+    let obj = try_alloc_concurrent_synthetic(ctx, "sun/management/CDSMetrics", 5)?;
     ctx.set_field(obj, 0, Value::Int(metrics.total_classes_in_archive as i32));
     ctx.set_field(
         obj,
@@ -618,7 +618,7 @@ fn alloc_cds_metrics_obj(ctx: &mut dyn NativeContext, metrics: &CdsMetrics) -> O
 /// `ctx.set_field` if needed.
 fn alloc_properties_obj(ctx: &mut dyn NativeContext) -> ObjectRef {
     use cratonvm_types::ClassId;
-    let obj = alloc_concurrent_synthetic(ctx, "java/util/Properties", 2);
+    let obj = try_alloc_concurrent_synthetic(ctx, "java/util/Properties", 2)?;
     let backing = ctx.new_ref_array(ClassId::new(0), 0);
     ctx.set_field(obj, 0, Value::Object(Some(backing)));
     ctx.set_field(obj, 1, Value::Int(0));

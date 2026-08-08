@@ -155,12 +155,12 @@ fn report_env_bootstrap_failure(reason: &str) {
     }
 }
 
-fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn get_noop_environment(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {
     if let Some((key, cached)) = *noop_environment().lock() {
         // Re-read the CURRENT address: the GC remaps the var-handle-root
         // registry entry after a move, not this raw static copy. Contexts
         // without a registry (mocks) fall back to the cached ref.
-        return ctx.read_var_handle_root(key).unwrap_or(cached);
+        return Ok(ctx.read_var_handle_root(key).unwrap_or(cached));
     }
 
     let env_class = "org/springframework/core/env/StandardEnvironment";
@@ -175,7 +175,7 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
         // EMPTY — Spring Boot's SystemEnvironmentPropertySourceEnvironmentPostProcessor
         // will then trip "PropertySource named 'systemEnvironment' does not exist".
         // The real-env path above is strongly preferred.
-        let mut env = crate::alloc_concurrent_synthetic(ctx, env_class, 32);
+        let mut env = crate::try_alloc_concurrent_synthetic(ctx, env_class, 32)?;
 
         // GC-safety: `new_object`/the MPS `<init>` invoke below can allocate
         // and trigger a collection that relocates `env`; pin it and re-read
@@ -201,10 +201,10 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Some((ekey, existing)) = *guard {
         // A racing creator already installed one; converge on it (our
         // orphaned registration is harmless — same trade-off as ASYNC_POOL).
-        return ctx.read_var_handle_root(ekey).unwrap_or(existing);
+        return Ok(ctx.read_var_handle_root(ekey).unwrap_or(existing));
     }
     *guard = Some((key, obj));
-    obj
+    Ok(obj)
 }
 
 /// `AbstractApplicationContext.getEnvironment()` — PER-CONTEXT, mirroring the
@@ -264,7 +264,7 @@ fn get_environment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
         ctx.unpin_native_roots(this_pin);
     }
-    Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
+    Ok(Some(Value::Object(Some(get_noop_environment(ctx)?))))
 }
 
 /// `AbstractApplicationContext.createEnvironment()` — a FRESH environment per
@@ -273,7 +273,7 @@ fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     if let Some(env) = construct_real_standard_environment(ctx) {
         return Ok(Some(Value::Object(Some(env))));
     }
-    Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
+    Ok(Some(Value::Object(Some(get_noop_environment(ctx)?))))
 }
 
 // `SpringApplication.getOrCreateEnvironment()` is normally where Spring Boot
@@ -405,7 +405,7 @@ fn spring_app_get_or_create_environment(
         }
         ctx.unpin_native_roots(this_pin);
     }
-    Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
+    Ok(Some(Value::Object(Some(get_noop_environment(ctx)?))))
 }
 
 // Environment.getProperty(String) → null (no properties in synthetic env, safe default)
@@ -462,18 +462,18 @@ fn env_accepts_profiles_arr(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 fn env_get_property_sources(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let env = get_noop_environment(ctx);
     // Try to read the real propertySources field.
-    let mps = ctx.get_field_by_name(env, "propertySources");
+    let mps = ctx.get_field_by_name(env?, "propertySources");
     if matches!(mps, Value::Object(Some(_))) {
         return Ok(Some(mps));
     }
     // If the real env was created but field lookup failed by name, try
     // to return the env object itself as a last resort — the caller will
     // likely NPE later, but this keeps us progressing.
-    let fallback = crate::alloc_concurrent_synthetic(
+    let fallback = crate::try_alloc_concurrent_synthetic(
         ctx,
         "org/springframework/core/env/MutablePropertySources",
         8,
-    );
+    )?;
     Ok(Some(Value::Object(Some(fallback))))
 }
 
@@ -576,7 +576,7 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
     ctx.unpin_native_roots(bean_factory_pin);
 }
 
-fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> ObjectRef {
+fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // Fast path: the field was already populated by the bytecode constructor.
     let current = ctx.get_field_by_name(receiver, "beanFactory");
     // CRATONVM_DBG_GOCBF=1 (added 2026-07-21, restclient-webclient-withoutjackson-
@@ -598,7 +598,7 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
         );
     }
     if let Value::Object(Some(bf)) = current {
-        return bf;
+        return Ok(bf);
     }
 
     // GC-safety: `receiver` is dereferenced again (`set_field_by_name`)
@@ -663,17 +663,18 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
                 Some(obj)
             })()
         })
+        .map(Ok::<_, MethodCallFailed>)
         .unwrap_or_else(|| {
             // Fallback: synthetic allocation with generous field count.
-            crate::alloc_concurrent_synthetic(ctx, DLBF, 64)
-        });
+            crate::try_alloc_concurrent_synthetic(ctx, DLBF, 64)
+        })?;
     let receiver = ctx.read_native_pin(receiver_pin, receiver);
     ctx.unpin_native_roots(receiver_pin);
 
     // Write the newly created factory back into the context object so future
     // reads from the bytecode (GETFIELD beanFactory) also see it.
     ctx.set_field_by_name(receiver, "beanFactory", Value::Object(Some(bf)));
-    bf
+    Ok(bf)
 }
 
 fn get_bean_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -690,7 +691,7 @@ fn get_bean_factory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             ))
         }
     };
-    let bf = get_or_create_bean_factory(ctx, receiver);
+    let bf = get_or_create_bean_factory(ctx, receiver)?;
     // GC-safety: `ensure_bean_post_processors_list` can allocate; pin `bf`
     // and re-read the forwarded reference before returning it.
     let bf_pin = ctx.pin_native_root(bf);
@@ -756,7 +757,7 @@ fn dlbf_register_bean_definition(
 fn empty_hashmap(ctx: &mut dyn NativeContext) -> MethodCallResult {
     let map = match ctx.new_object("java/util/HashMap").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8),
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 8)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `map` and re-read the forwarded reference before returning it.
@@ -828,7 +829,7 @@ fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 #[allow(dead_code)]
-fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<()> {
+fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Result<Option<()>, MethodCallFailed> {
     let data_class =
         "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache$Data";
 
@@ -882,22 +883,34 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
     // call below allocates and can trigger a collection that relocates the
     // PREVIOUSLY produced locals (all read again by the Data-record
     // construction/fallback further down); pin each right after it's bound.
-    let mappings = mk_hashmap(ctx)?;
+    let Some(mappings) = mk_hashmap(ctx) else {
+        return Ok(None);
+    };
     let mappings_pin = ctx.pin_native_root(mappings);
-    let reverse_mappings = mk_hashmap(ctx)?;
+    let Some(reverse_mappings) = mk_hashmap(ctx) else {
+        return Ok(None);
+    };
     let reverse_mappings_pin = ctx.pin_native_root(reverse_mappings);
-    let descendants = mk_hashset(ctx)?;
+    let Some(descendants) = mk_hashset(ctx) else {
+        return Ok(None);
+    };
     let descendants_pin = ctx.pin_native_root(descendants);
-    let sys_env_copy = mk_hashmap(ctx)?;
+    let Some(sys_env_copy) = mk_hashmap(ctx) else {
+        return Ok(None);
+    };
     let sys_env_copy_pin = ctx.pin_native_root(sys_env_copy);
 
     // Empty ConfigurationPropertyName[] — class must be loadable.
-    let cpn_cid = ctx.class_id_by_name(SICP_NAME)?;
+    let Some(cpn_cid) = ctx.class_id_by_name(SICP_NAME) else {
+        return Ok(None);
+    };
     let cpn_arr = ctx.new_ref_array(cpn_cid, 0);
     let cpn_arr_pin = ctx.pin_native_root(cpn_arr);
 
     // Empty String[]
-    let str_cid = ctx.class_id_by_name("java/lang/String")?;
+    let Some(str_cid) = ctx.class_id_by_name("java/lang/String") else {
+        return Ok(None);
+    };
     let str_arr = ctx.new_ref_array(str_cid, 0);
     let str_arr_pin = ctx.pin_native_root(str_arr);
 
@@ -939,8 +952,9 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
         ctx.unpin_native_roots(obj_pin);
         Some(obj)
     })()
+    .map(Ok::<_, MethodCallFailed>)
     .unwrap_or_else(|| {
-        let obj = crate::alloc_concurrent_synthetic(ctx, data_class, 8);
+        let obj = crate::try_alloc_concurrent_synthetic(ctx, data_class, 8)?;
         let mappings = ctx.read_native_pin(mappings_pin, mappings);
         let reverse_mappings = ctx.read_native_pin(reverse_mappings_pin, reverse_mappings);
         let descendants = ctx.read_native_pin(descendants_pin, descendants);
@@ -967,13 +981,13 @@ fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<(
             Value::Object(Some(sys_env_copy)),
         );
         ctx.set_field_by_name(obj, "lastUpdated", Value::Object(Some(str_arr)));
-        obj
-    });
+        Ok(obj)
+    })?;
 
     let cache = ctx.read_native_pin(cache_pin, cache);
     ctx.unpin_native_roots(cache_pin);
     ctx.set_field_by_name(cache, "data", Value::Object(Some(data_obj)));
-    Some(())
+    Ok(Some(()))
 }
 
 #[allow(dead_code)]
@@ -983,7 +997,7 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => {
             // Return empty set
-            let s = crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8);
+            let s = crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8)?;
             return Ok(Some(Value::Object(Some(s))));
         }
     };
@@ -996,7 +1010,7 @@ fn cache_get_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // data was null OR we just installed an empty one — return empty Set.
     let s = match ctx.new_object("java/util/HashSet").ok().flatten() {
         Some(Value::Object(Some(o))) => o,
-        _ => crate::alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8),
+        _ => crate::try_alloc_concurrent_synthetic(ctx, "java/util/HashSet", 8)?,
     };
     // GC-safety: the `<init>` invocation below can itself allocate; pin
     // `s` and re-read the forwarded reference before returning it.
@@ -1402,7 +1416,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
                                     if let Some(meta) = ctx.declared_methods(child_declaring).into_iter().find(
                                         |meta| meta.name == name && meta.descriptor == descriptor,
                                     ) {
-                                        method = Some(crate::lang_class::create_method_object(ctx, &meta));
+                                        method = Some(crate::lang_class::create_method_object(ctx, &meta)?);
                                     }
                                 }
                             }
@@ -2063,7 +2077,7 @@ fn bean_wrapper_get_wrapped_instance(
     }
     // Fallback: hand back a synthetic Object so callers keep progressing
     // instead of throwing an unrecoverable IllegalStateException.
-    let placeholder = crate::alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
+    let placeholder = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/Object", 0)?;
     Ok(Some(Value::Object(Some(placeholder))))
 }
 
@@ -2202,7 +2216,7 @@ fn ccpp_process_config_bean_definitions(
             &mut seen_imports,
             &mut registered,
             0,
-        );
+        )?;
     }
 
     if registered > 0 {
@@ -2261,9 +2275,9 @@ fn walk_imports_recursive(
     seen: &mut std::collections::HashSet<String>,
     registered: &mut usize,
     depth: usize,
-) {
+) -> Result<(), MethodCallFailed> {
     if depth > 16 {
-        return; // safety guard against pathological @Import cycles
+        return Ok(()); // safety guard against pathological @Import cycles
     }
     let cid = match ctx.class_id_by_name(class_name) {
         Some(c) => c,
@@ -2271,11 +2285,11 @@ fn walk_imports_recursive(
             // Try to load on demand so @Import targets that aren't yet
             // loaded still get walked.
             if ctx.load_class(class_name).is_err() {
-                return;
+                return Ok(());
             }
             match ctx.class_id_by_name(class_name) {
                 Some(c) => c,
-                None => return,
+                None => return Ok(()),
             }
         }
     };
@@ -2283,13 +2297,13 @@ fn walk_imports_recursive(
     let anns = ctx.class_annotations(cid);
     let import_ann = match anns.iter().find(|a| a.type_descriptor == IMPORT_DESC) {
         Some(a) => a.clone(),
-        None => return,
+        None => return Ok(()),
     };
 
     // @Import.value() is a Class[] — find the "value" element.
     let value_array = match import_ann.elements.iter().find(|(name, _)| name == "value") {
         Some((_, v)) => v.clone(),
-        None => return,
+        None => return Ok(()),
     };
 
     let entries = match value_array {
@@ -2325,12 +2339,13 @@ fn walk_imports_recursive(
             continue;
         }
         // Register a RootBeanDefinition for this imported class.
-        if register_root_bean_definition(ctx, registry, &imp_class) {
+        if register_root_bean_definition(ctx, registry, &imp_class)? {
             *registered += 1;
         }
         // Recurse into the import's own @Import tree.
-        walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1);
+        walk_imports_recursive(ctx, &imp_class, registry, seen, registered, depth + 1)?;
     }
+    Ok(())
 }
 
 /// Allocate a `RootBeanDefinition`, set its bean class name, and call
@@ -2339,7 +2354,7 @@ fn register_root_bean_definition(
     ctx: &mut dyn NativeContext,
     registry: ObjectRef,
     class_name: &str,
-) -> bool {
+) -> Result<bool, MethodCallFailed> {
     const RBD: &str = "org/springframework/beans/factory/support/RootBeanDefinition";
     // GC-safety: `registry` (a function parameter) is only dereferenced by
     // the final `registerBeanDefinition` call, well after every allocation
@@ -2356,7 +2371,7 @@ fn register_root_bean_definition(
             ctx.unpin_native_roots(o_pin);
             o
         }
-        _ => crate::alloc_concurrent_synthetic(ctx, RBD, 16),
+        _ => crate::try_alloc_concurrent_synthetic(ctx, RBD, 16)?,
     };
     let bd_pin = ctx.pin_native_root(bd);
     // setBeanClassName(String) — declared on AbstractBeanDefinition.
@@ -2385,7 +2400,7 @@ fn register_root_bean_definition(
         ],
     );
     ctx.unpin_native_roots(registry_pin);
-    res.is_ok()
+    Ok(res.is_ok())
 }
 
 fn return_null_object(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -3800,8 +3815,8 @@ fn types_to_match_is_empty(ctx: &dyn NativeContext, args: &[Value], idx: usize) 
 /// Build (but do not throw) a `java.lang.ClassNotFoundException` for
 /// `class_name`, mirroring what `Class.forName`/`ClassLoader.loadClass`
 /// would raise for the same name.
-fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef {
-    let exc = crate::alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1);
+fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
+    let exc = crate::try_alloc_concurrent_synthetic(ctx, "java/lang/ClassNotFoundException", 1)?;
     // GC-safety: `create_string` below can trigger a collection that
     // relocates `exc`; pin it and re-read before writing into it.
     let exc_pin = ctx.pin_native_root(exc);
@@ -3809,7 +3824,7 @@ fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Objec
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.unpin_native_roots(exc_pin);
     ctx.set_field(exc, 0, Value::Object(Some(msg)));
-    exc
+    Ok(exc)
 }
 
 /// Throw `java.lang.ClassNotFoundException` for `class_name` directly
@@ -3818,8 +3833,8 @@ fn build_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Objec
 /// properly-wrapped `CannotLoadBeanClassException` real Spring's PUBLIC
 /// `resolveBeanClass` wrapper produces; see
 /// [`throw_cannot_load_bean_class_exception`] for that case.
-fn throw_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> MethodCallFailed {
-    MethodCallFailed::ExceptionThrown(build_class_not_found(ctx, class_name))
+fn throw_class_not_found(ctx: &mut dyn NativeContext, class_name: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+    Ok(MethodCallFailed::ExceptionThrown(build_class_not_found(ctx, class_name)?))
 }
 
 /// Construct and throw a real
@@ -3840,8 +3855,8 @@ fn throw_cannot_load_bean_class_exception(
     resource_description: Option<&str>,
     bean_name: &str,
     bean_class_name: &str,
-) -> MethodCallFailed {
-    let cause = build_class_not_found(ctx, bean_class_name);
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    let cause = build_class_not_found(ctx, bean_class_name)?;
     // GC-safety: `cause` is read again well after the `new_object`/several
     // `create_string` calls below (each of which allocates); `exc` is
     // likewise read again after the LATER `create_string` calls; each of
@@ -3889,11 +3904,11 @@ fn throw_cannot_load_bean_class_exception(
                 ],
             );
             ctx.unpin_native_roots(cause_pin);
-            MethodCallFailed::ExceptionThrown(exc)
+            Ok(MethodCallFailed::ExceptionThrown(exc))
         }
         _ => {
             ctx.unpin_native_roots(cause_pin);
-            MethodCallFailed::ExceptionThrown(cause)
+            Ok(MethodCallFailed::ExceptionThrown(cause))
         }
     }
 }
@@ -4001,7 +4016,7 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
                 }
             }
             if types_to_match_is_empty(ctx, args, 2) {
-                Err(throw_class_not_found(ctx, &name))
+                Err(throw_class_not_found(ctx, &name)?)
             } else {
                 Ok(Some(Value::Object(None)))
             }
@@ -4213,7 +4228,7 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
                     resource_description.as_deref(),
                     &bean_name,
                     &name,
-                ))
+                )?)
             } else {
                 Ok(Some(Value::Object(None)))
             };
@@ -4260,7 +4275,7 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
             resource_description.as_deref(),
             &bean_name,
             &name,
-        ));
+        )?);
     }
 
     // Non-empty `typesToMatch` (a type-probe) on a `lazy-init="true"` bean

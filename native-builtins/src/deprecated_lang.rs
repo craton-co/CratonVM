@@ -20,7 +20,7 @@ use cratonvm_types::error::{
 };
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // T8.1.1 — Thread.stop()
@@ -98,7 +98,7 @@ fn native_thread_stop(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Family-1 fix (cce0079): the ThreadDeath alloc can move `this` — pin
     // and refresh before the identity read. GC-stable key as in stop0.
     let this_pin = ctx.pin_native_root(this);
-    let thread_death = alloc_concurrent_synthetic(ctx, "java/lang/ThreadDeath", 0);
+    let thread_death = try_alloc_concurrent_synthetic(ctx, "java/lang/ThreadDeath", 0)?;
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     let thread_key = ctx.identity_hash_code(this) as u64;
@@ -489,7 +489,7 @@ mod tests {
         ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
 
         let res = call_native(
             &reg,
@@ -513,8 +513,8 @@ mod tests {
         ALLOW_THREAD_STOP.store(false, Ordering::SeqCst);
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/ThreadDeath", 0);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ThreadDeath", 0)?;
 
         let res = call_native(
             &reg,
@@ -533,8 +533,8 @@ mod tests {
         ALLOW_THREAD_STOP.store(true, Ordering::SeqCst);
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
-        let exc = alloc_concurrent_synthetic(&mut ctx, "java/lang/Throwable", 0);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Throwable", 0)?;
         // GC-stable keying: the natives key by identity hash now.
         let tid = ctx.identity_hash_code(thr) as u64;
 
@@ -561,7 +561,7 @@ mod tests {
         ALLOW_THREAD_STOP.store(true, Ordering::SeqCst);
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
         // GC-stable keying: the natives key by identity hash now.
         let tid = ctx.identity_hash_code(thr) as u64;
 
@@ -588,7 +588,7 @@ mod tests {
         ALLOW_THREAD_SUSPEND.store(false, Ordering::SeqCst);
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
 
         let res = call_native(
             &reg,
@@ -612,7 +612,7 @@ mod tests {
         ALLOW_THREAD_SUSPEND.store(false, Ordering::SeqCst);
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
 
         let res = call_native(
             &reg,
@@ -631,7 +631,7 @@ mod tests {
     fn test_thread_destroy_throws_no_such_method() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
 
         let res = call_native(
             &reg,
@@ -655,7 +655,7 @@ mod tests {
     fn test_thread_count_stack_frames_throws() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let thr = alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5);
+        let thr = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 5)?;
 
         let res = call_native(
             &reg,
@@ -825,15 +825,15 @@ mod tests {
     fn test_classloader_define_class_3arg_delegates() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
-        let loader = alloc_concurrent_synthetic(&mut ctx, "java/lang/ClassLoader", 0);
+        let loader = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ClassLoader", 0)?;
 
         // Pre-arm invoke_virtual to return a class-like object
-        let fake_class = alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 0);
+        let fake_class = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 0)?;
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Ok(Some(Value::Object(Some(fake_class)))));
         }
 
-        let byte_arr = alloc_concurrent_synthetic(&mut ctx, "[B", 0);
+        let byte_arr = try_alloc_concurrent_synthetic(&mut ctx, "[B", 0)?;
         let res = call_native(
             &reg,
             &mut ctx,

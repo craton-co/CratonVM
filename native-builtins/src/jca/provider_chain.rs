@@ -17,7 +17,7 @@
 //!
 //! ## Provider object layout
 //!
-//! Allocated through `alloc_concurrent_synthetic("java/security/Provider", N)`,
+//! Allocated through `try_alloc_concurrent_synthetic("java/security/Provider", N)?`,
 //! which calls `ensure_class_initialized` and uses the *larger* of the
 //! requested field count and `class_num_total_fields` (so the real JDK
 //! field map — `name`, `info`, `version`, `versionStr`, … — is fully
@@ -43,7 +43,7 @@ use cratonvm_types::{ObjectRef, Value};
 
 use rustc_hash::FxHashMap;
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 
 // ---------------------------------------------------------------------------
 // Provider chain — process-wide mutable list mirroring HotSpot's default
@@ -250,7 +250,7 @@ pub(crate) fn make_provider(
     name: &str,
     version: f64,
     coverage: &str,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // `alloc_concurrent_synthetic` upsizes to the real-JDK field count
     // (Provider has > 10 instance fields counting inherited Properties
     // slots), so writing to slots 0/1/2 stays in bounds even when our
@@ -273,7 +273,7 @@ pub(crate) fn make_provider(
     // backs any algorithm — particularly important for unbacked
     // entries like SunPKCS11 / SunMSCAPI / SunPCSC that look real but
     // never resolve a Service.
-    let p = alloc_concurrent_synthetic(ctx, "java/security/Provider", 8);
+    let p = try_alloc_concurrent_synthetic(ctx, "java/security/Provider", 8)?;
     let n = ctx.create_string(name);
     let info_str = format!("{} security provider (cratonvm) — {}", name, coverage);
     let info = ctx.create_string(&info_str);
@@ -315,7 +315,7 @@ pub(crate) fn make_provider(
     ctx.set_field(p, 0, Value::Object(Some(n)));
     ctx.set_field(p, 1, Value::Double(version));
     ctx.set_field(p, 2, Value::Object(Some(info)));
-    p
+    Ok(p)
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +466,7 @@ fn security_get_providers(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, chain.len());
     for (i, (name, ver, coverage)) in chain.iter().enumerate() {
         let p = make_provider(ctx, name, *ver, coverage);
-        ctx.set_array_element(arr, i, Value::Object(Some(p)));
+        ctx.set_array_element(arr, i, Value::Object(Some(p?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -491,7 +491,7 @@ fn security_get_providers_filtered(ctx: &mut dyn NativeContext, args: &[Value]) 
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, matches.len());
     for (i, (name, ver, coverage)) in matches.iter().enumerate() {
         let provider = make_provider(ctx, name, *ver, coverage);
-        ctx.set_array_element(arr, i, Value::Object(Some(provider)));
+        ctx.set_array_element(arr, i, Value::Object(Some(provider?)));
     }
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -504,7 +504,7 @@ fn security_get_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     match find(&name_str) {
         Some((ver, coverage)) => {
             let p = make_provider(ctx, &name_str, ver, coverage);
-            Ok(Some(Value::Object(Some(p))))
+            Ok(Some(Value::Object(Some(p?))))
         }
         // JDK contract: return null for unknown name.
         None => Ok(Some(Value::Object(None))),
@@ -1959,7 +1959,7 @@ fn make_service(
     prov: ObjectRef,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let prov_pin = ctx.pin_native_root(prov);
-    let svc0 = alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7);
+    let svc0 = try_alloc_concurrent_synthetic(ctx, "java/security/Provider$Service", 7)?;
     let svc_pin = ctx.pin_native_root(svc0);
     let type_s0 = ctx.create_string(&entry.type_str);
     let type_pin = ctx.pin_native_root(type_s0);
@@ -2216,7 +2216,7 @@ fn resolve_service(
     provider: &str,
     type_str: &str,
     algo: &str,
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let entry = get_service_entry(provider, type_str, algo);
     if crate::nbflags().diag_jca {
         match &entry {
@@ -2242,10 +2242,12 @@ fn resolve_service(
             }
         }
     }
-    let entry = entry?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
-    let prov_obj = make_provider(ctx, provider, ver, coverage);
-    Some(make_service(ctx, &entry, prov_obj).ok()?)
+    let prov_obj = make_provider(ctx, provider, ver, coverage)?;
+    Ok(Some(make_service(ctx, &entry, prov_obj)?))
 }
 
 /// `sun.security.jca.GetInstance.getService(String type, String algorithm,
@@ -2259,7 +2261,7 @@ fn getinstance_get_service_provider(
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     let provider = read_arg_string(ctx, args, 2);
-    match resolve_service(ctx, &provider, &type_str, &algo) {
+    match resolve_service(ctx, &provider, &type_str, &algo)? {
         Some(svc) => Ok(Some(Value::Object(Some(svc)))),
         None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
             feature: format!(
@@ -2277,7 +2279,7 @@ fn getinstance_get_service_search(ctx: &mut dyn NativeContext, args: &[Value]) -
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 1);
     for (name, _, _) in snapshot() {
-        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(svc)) = resolve_service(ctx, &name, &type_str, &algo) {
             return Ok(Some(Value::Object(Some(svc))));
         }
     }
@@ -2670,12 +2672,12 @@ fn security_get_algorithms(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// the caller's own `Provider` constructor set — otherwise a fresh synthetic
 /// built from the seed-list entry (or a generic `USER_PROVIDER_COVERAGE`
 /// synthetic if `name` isn't in the seed list at all).
-pub(crate) fn resolve_or_make_provider(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+pub(crate) fn resolve_or_make_provider(ctx: &mut dyn NativeContext, name: &str) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(real) = resolve_real_provider(ctx, name) {
-        return real;
+        return Ok(real);
     }
     let (ver, coverage) = find(name).unwrap_or((1.0, USER_PROVIDER_COVERAGE));
-    make_provider(ctx, name, ver, coverage)
+    Ok(make_provider(ctx, name, ver, coverage)?)
 }
 
 pub(crate) fn build_jca_impl(
@@ -2743,9 +2745,11 @@ fn build_jca_instance(
     provider: &str,
     type_str: &str,
     algo: &str,
-) -> Option<MethodCallResult> {
-    let impl_result = build_jca_impl(ctx, provider, type_str, algo)?;
-    Some((|| {
+) -> Result<Option<MethodCallResult>, MethodCallFailed> {
+    let Some(impl_result) = build_jca_impl(ctx, provider, type_str, algo) else {
+        return Ok(None);
+    };
+    Ok(Some((|| {
         let impl_ref = match impl_result? {
             Some(Value::Object(Some(o))) => o,
             _ => {
@@ -2760,7 +2764,7 @@ fn build_jca_instance(
         // Pin the SPI across the Provider allocation below (which can GC).
         let pin = ctx.pin_native_root(impl_ref);
         let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
-        let prov_obj = make_provider(ctx, provider, ver, coverage);
+        let prov_obj = make_provider(ctx, provider, ver, coverage)?;
         let impl_ref = ctx.read_native_pin(pin, impl_ref);
         // 2. Build GetInstance$Instance(provider, impl) via its real ctor.
         let inst = ctx.new_object_initialized(
@@ -2770,7 +2774,7 @@ fn build_jca_instance(
         );
         ctx.unpin_native_roots(pin);
         inst
-    })())
+    })()))
 }
 
 fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2785,7 +2789,7 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
             ProviderArgWording::Shared,
         ));
     }
-    match build_jca_instance(ctx, &provider, &type_str, &algo) {
+    match build_jca_instance(ctx, &provider, &type_str, &algo)? {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
             ctx,
@@ -2810,7 +2814,7 @@ fn getinstance_instance_provider_obj(
             .unwrap_or_default(),
         _ => String::new(),
     };
-    match build_jca_instance(ctx, &provider, &type_str, &algo) {
+    match build_jca_instance(ctx, &provider, &type_str, &algo)? {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
             ctx,
@@ -2839,7 +2843,7 @@ fn getinstance_get_services(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ctx.invoke(al, "<init>", "()V", &[Value::Object(Some(list))])?;
     let pin = ctx.pin_native_root(list);
     for (name, _, _) in snapshot() {
-        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(svc)) = resolve_service(ctx, &name, &type_str, &algo) {
             list = ctx.read_native_pin(pin, list);
             ctx.invoke(
                 al,
@@ -2865,7 +2869,7 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
     for (name, _, _) in snapshot() {
-        if let Some(r) = build_jca_instance(ctx, &name, &type_str, &algo) {
+        if let Ok(Some(r)) = build_jca_instance(ctx, &name, &type_str, &algo) {
             return r;
         }
     }
@@ -2917,12 +2921,14 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 pub(crate) fn try_build_real_certificate_factory(
     ctx: &mut dyn NativeContext,
     args: &[Value],
-) -> Option<ObjectRef> {
+) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let algo = read_arg_string(ctx, args, 0);
-    let provider = find_service_provider("CertificateFactory", &algo)?;
-    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo)? {
-        Ok(Some(Value::Object(Some(o)))) => o,
-        _ => return None,
+    let Some(provider) = find_service_provider("CertificateFactory", &algo) else {
+        return Ok(None);
+    };
+    let impl_ref = match build_jca_impl(ctx, &provider, "CertificateFactory", &algo) {
+        Some(Ok(Some(Value::Object(Some(o))))) => o,
+        _ => return Ok(None),
     };
     let pin = ctx.pin_native_root(impl_ref);
     let provider_obj = resolve_or_make_provider(ctx, &provider);
@@ -2933,14 +2939,14 @@ pub(crate) fn try_build_real_certificate_factory(
         "(Ljava/security/cert/CertificateFactorySpi;Ljava/security/Provider;Ljava/lang/String;)V",
         &[
             Value::Object(Some(impl_ref)),
-            Value::Object(Some(provider_obj)),
+            Value::Object(Some(provider_obj?)),
             Value::Object(Some(algo_str)),
         ],
     );
     ctx.unpin_native_roots(pin);
     match result {
-        Ok(Some(Value::Object(Some(o)))) => Some(o),
-        _ => None,
+        Ok(Some(Value::Object(Some(o)))) => Ok(Some(o)),
+        _ => Ok(None),
     }
 }
 
@@ -4274,8 +4280,8 @@ fn key_store_get_instance_with_provider(
         let provider_ref = if provider_name.is_empty() {
             resolve_or_make_provider(ctx, "SUN")
         } else {
-            provider_ref
-        };
+            Ok(provider_ref)
+        }?;
         ctx.new_object_initialized(
             "java/security/KeyStore",
             "(Ljava/security/KeyStoreSpi;Ljava/security/Provider;Ljava/lang/String;)V",

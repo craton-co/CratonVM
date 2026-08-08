@@ -67,8 +67,9 @@ use cratonvm_types::{ObjectRef, Value};
 
 use cratonvm_native_io::eintr::EintrIo;
 
-use crate::alloc_concurrent_synthetic;
+use crate::try_alloc_concurrent_synthetic;
 use crate::servlet;
+use cratonvm_types::error::MethodCallFailed;
 
 thread_local! {
     // Re-entrancy guard for the interface-level `HostnameVerifier.verify`
@@ -300,13 +301,13 @@ pub(crate) fn selected_context_trust_root_ders() -> Vec<Vec<u8>> {
 pub(crate) fn context_trust_root_ders(
     ctx: &mut dyn NativeContext,
     context: ObjectRef,
-) -> Vec<Vec<u8>> {
+) -> Result<Vec<Vec<u8>>, MethodCallFailed> {
     let key = ctx_obj_key(ctx, context);
-    ctx_trust_roots_table()
+    Ok(ctx_trust_roots_table()
         .lock()
-        .get(&key)
+        .get(&key?)
         .map(|roots| roots.root_ders.clone())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 #[cfg(unix)]
@@ -349,8 +350,8 @@ fn ctx_trust_managers_table() -> &'static Mutex<HashMap<u64, Vec<ObjectRef>>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> u64 {
-    crate::gc_stable_lock_key(ctx, obj) as u64
+fn ctx_obj_key(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Result<u64, MethodCallFailed> {
+    Ok(crate::gc_stable_lock_key(ctx, obj)? as u64)
 }
 
 /// `SSLContext.init(km, tms, random)` calls this with the raw `tms` array
@@ -363,8 +364,8 @@ pub(crate) fn attach_trust_managers_to_ctx(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
     tms_array: Option<ObjectRef>,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let mut list = Vec::new();
     if let Some(arr) = tms_array {
         let len = ctx.array_length(arr);
@@ -434,6 +435,7 @@ pub(crate) fn attach_trust_managers_to_ctx(
         table.insert(key, list);
         ctx_accepted_issuers_table().lock().insert(key, issuers);
     }
+    Ok(())
 }
 
 /// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
@@ -543,12 +545,12 @@ fn capture_accepted_issuer_dns(
 pub(crate) fn ctx_trust_managers_key_if_attached(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
-) -> Option<u64> {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<Option<u64>, MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     if ctx_trust_managers_table().lock().contains_key(&key) {
-        Some(key)
+        Ok(Some(key))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -575,8 +577,8 @@ pub(crate) fn attach_key_managers_to_ctx(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
     kms_array: Option<ObjectRef>,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let mut list = Vec::new();
     if let Some(arr) = kms_array {
         let len = ctx.array_length(arr);
@@ -600,6 +602,7 @@ pub(crate) fn attach_key_managers_to_ctx(
     } else {
         table.insert(key, list);
     }
+    Ok(())
 }
 
 /// `SSLContext.init` calls this to move pending KMF identity and TMF trust
@@ -625,8 +628,8 @@ pub(crate) fn attach_pending_identity_to_ctx(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
     resolved_km_identity: Option<(String, String)>,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let pending = take_pending_km_identity();
     if let Some(ident) = resolved_km_identity.or(pending) {
         if crate::nbflags().dbg_tls_auth {
@@ -659,14 +662,15 @@ pub(crate) fn attach_pending_identity_to_ctx(
             key
         );
     }
+    Ok(())
 }
 
 /// Look up the identity previously associated with an `SSLContext` object.
 pub(crate) fn ctx_identity(
     ctx: &mut dyn NativeContext,
     ctx_obj: ObjectRef,
-) -> Option<(String, String)> {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<Option<(String, String)>, MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
@@ -676,7 +680,7 @@ pub(crate) fn ctx_identity(
         );
     }
     set_selected_context_trust_roots(trust_roots);
-    ctx_identity_table().lock().get(&key).cloned()
+    Ok(ctx_identity_table().lock().get(&key).cloned())
 }
 
 /// Convert a private-key DER (PKCS#8, PKCS#1, or SEC1) + DER cert chain (leaf
@@ -796,8 +800,8 @@ pub(crate) fn client_config_for_ssl_context_with_ciphers(
     ctx_obj: ObjectRef,
     enabled_ciphers: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
-    let key = ctx_obj_key(ctx, ctx_obj);
-    let identity = ctx_identity(ctx, ctx_obj);
+    let key = ctx_obj_key(ctx, ctx_obj).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
+    let identity = ctx_identity(ctx, ctx_obj).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
     build_engine_client_config_with_identity_ciphers(
         &["http/1.1"],
         identity
@@ -960,14 +964,15 @@ pub(crate) fn huc_default_key_managers_ctx_key() -> Option<u64> {
     *huc_default_km_ctx_key_slot().lock()
 }
 
-fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+fn capture_huc_trust_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_managers = ctx_trust_managers_table()
         .lock()
         .get(&key)
         .map(|managers| !managers.is_empty())
         .unwrap_or(false);
     *huc_default_tm_ctx_key_slot().lock() = has_managers.then_some(key);
+    Ok(())
 }
 
 pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
@@ -981,8 +986,8 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 /// whose `SSLContext.init` passed a null/empty `KeyManager[]`) keeps falling
 /// back to `client_identity`/no-client-auth instead of spuriously trying (and
 /// failing) to consult an empty resolver.
-pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
     if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
@@ -991,17 +996,18 @@ pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_
         );
     }
     set_huc_default_key_managers_ctx_key(if has_kms { Some(key) } else { None });
+    Ok(())
 }
 
 /// Capture all TLS state for the Java SSLContext supplying HttpsURLConnection.
 /// This also runs for anonymous clients: `ctx_identity` transfers scoped trust
 /// roots even when it returns no client certificate, and every context needs a
 /// stable ClientConfig to retain TLS 1.3 tickets across URL requests.
-pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
-    let ident = ctx_identity(ctx, ctx_obj);
+pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) -> Result<(), MethodCallFailed> {
+    let ident = ctx_identity(ctx, ctx_obj)?;
     set_huc_default_client_identity(ident);
-    capture_huc_key_managers_ctx_key(ctx, ctx_obj);
-    capture_huc_trust_managers_ctx_key(ctx, ctx_obj);
+    capture_huc_key_managers_ctx_key(ctx, ctx_obj)?;
+    capture_huc_trust_managers_ctx_key(ctx, ctx_obj)?;
 
     let ident = huc_default_client_identity();
     let km_ctx_key = huc_default_key_managers_ctx_key();
@@ -1015,6 +1021,7 @@ pub(crate) fn capture_huc_ssl_context(ctx: &mut dyn NativeContext, ctx_obj: Obje
         trust_managers_ctx_key,
     );
     *huc_default_client_config_slot().lock() = config.ok();
+    Ok(())
 }
 
 /// Capture an instance factory without changing the process-default TLS
@@ -1025,14 +1032,14 @@ pub(crate) fn capture_huc_ssl_context_for_connection(
     ctx: &mut dyn NativeContext,
     connection: ObjectRef,
     ctx_obj: ObjectRef,
-) {
+) -> Result<(), MethodCallFailed> {
     let default_identity = huc_default_identity_slot().lock().clone();
     let default_roots = huc_default_trust_roots_slot().lock().clone();
     let default_config = huc_default_client_config_slot().lock().clone();
     let default_km = *huc_default_km_ctx_key_slot().lock();
     let default_tm = *huc_default_tm_ctx_key_slot().lock();
 
-    capture_huc_ssl_context(ctx, ctx_obj);
+    capture_huc_ssl_context(ctx, ctx_obj)?;
     if let Some(config) = huc_default_client_config() {
         let key = ctx.identity_hash_code(connection);
         let mut configs = huc_connection_client_configs().lock();
@@ -1047,6 +1054,7 @@ pub(crate) fn capture_huc_ssl_context_for_connection(
     *huc_default_client_config_slot().lock() = default_config;
     *huc_default_km_ctx_key_slot().lock() = default_km;
     *huc_default_tm_ctx_key_slot().lock() = default_tm;
+    Ok(())
 }
 
 /// Returns the shared HttpsURLConnection config selected by its SSLContext.
@@ -2256,7 +2264,7 @@ fn key_types_from_sigschemes(schemes: &[SignatureScheme]) -> Vec<String> {
 /// fix — see the `SSLContext.init` comment in `net_phase_e.rs` for the
 /// measurement that showed a stale copy silently produces an anonymous client.
 /// The caller must root the returned array itself before allocating again.
-fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[u8]]) -> ObjectRef {
+fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[u8]]) -> Result<ObjectRef, MethodCallFailed> {
     let dn_strings: Vec<String> = root_hint_subjects
         .iter()
         .filter_map(|der| crate::security_manager::x509::parse_name_dn(der).ok())
@@ -2269,7 +2277,7 @@ fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[
     let arr_h = scope.root(arr);
     for (i, dn) in dn_strings.iter().enumerate() {
         let princ =
-            alloc_concurrent_synthetic(&mut *scope, "javax/security/auth/x500/X500Principal", 1);
+            try_alloc_concurrent_synthetic(&mut *scope, "javax/security/auth/x500/X500Principal", 1)?;
         let princ_h = scope.root(princ);
         let s = scope.create_string(dn);
         let princ = scope.get(&princ_h);
@@ -2277,7 +2285,7 @@ fn build_issuer_principals(ctx: &mut dyn NativeContext, root_hint_subjects: &[&[
         let arr = scope.get(&arr_h);
         scope.set_array_element(arr, i, Value::Object(Some(princ)));
     }
-    scope.get(&arr_h)
+    Ok(scope.get(&arr_h))
 }
 
 /// GC NOTE: see [`build_issuer_principals`] — `arr` is rooted because
@@ -2337,12 +2345,12 @@ impl JavaKeyManagerResolver {
         ctx: &mut dyn NativeContext,
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
-    ) -> Option<Arc<CertifiedKey>> {
+    ) -> Result<Option<Arc<CertifiedKey>>, MethodCallFailed> {
         let dbg = crate::nbflags().dbg_tls_auth_ok;
-        let mut km_list = ctx_key_managers_table()
-            .lock()
-            .get(&self.km_ctx_key)?
-            .clone();
+        let mut km_list = match ctx_key_managers_table().lock().get(&self.km_ctx_key) {
+            Some(list) => list.clone(),
+            None => return Ok(None),
+        };
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::resolve km_ctx_key={} km_count={} root_hint_subjects={} sigschemes={:?}",
@@ -2353,7 +2361,7 @@ impl JavaKeyManagerResolver {
             );
         }
         if km_list.is_empty() {
-            return None;
+            return Ok(None);
         }
         let key_types = key_types_from_sigschemes(sigschemes);
         if dbg {
@@ -2377,7 +2385,7 @@ impl JavaKeyManagerResolver {
         let key_type_arr = materialize_java_string_array(&mut *scope, &key_types);
         let key_type_h = scope.root(key_type_arr);
         let issuers_arr = build_issuer_principals(&mut *scope, root_hint_subjects);
-        let issuers_h = scope.root(issuers_arr);
+        let issuers_h = scope.root(issuers_arr?);
         let ctx = &mut scope;
 
         // Pin every KeyManager ObjectRef before any call that can allocate
@@ -2549,7 +2557,7 @@ impl JavaKeyManagerResolver {
         })();
 
         ctx.unpin_native_roots(first_pin);
-        result
+        Ok(result)
     }
 }
 
@@ -2579,9 +2587,14 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
         // from a cause other than the stale-`ObjectRef` one fixed alongside
         // this is diagnosable from an ordinary run's log.
         let had_key_managers = self.has_certs();
+        // `resolve` is rustls' own trait method and returns `Option`: there
+        // is nowhere to put a refusal. Absorb it to "no key", which is what
+        // rustls already does when a resolver has nothing to offer. The
+        // `--jdk-only` violation was recorded when the class was refused.
         let out = with_active_native_context(|ctx| {
             self.resolve_via_java(ctx, root_hint_subjects, sigschemes)
-        });
+        })
+        .and_then(|r| r.ok());
         if dbg && out.is_none() {
             eprintln!("[dbg-tls-auth] JavaKeyManagerResolver::resolve NO active native context");
         }
@@ -3780,13 +3793,15 @@ pub(crate) fn stash_pending_layered_socket(
     // `drive_pending_layered_handshake`, once any `setEnabledCipherSuites`
     // narrowing is known too.
     let use_java_trust_manager = java_tm_key.is_some();
-    let client_identity = ctx_identity(ctx, ssl_context);
+    let client_identity = ctx_identity(ctx, ssl_context).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())?;
     // Server identity: same resolution `rustls_server_handshake_over_stream`'s
     // former caller used (this SSLContext's own identity, else the
     // process-wide runtime-configured one) — resolved here too so SERVER mode
     // never needs to touch `ssl_context` again.
-    let server_identity = ctx_identity(ctx, ssl_context)
-        .or_else(|| runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)));
+    let server_identity = match ctx_identity(ctx, ssl_context).map_err(|_| "--jdk-only refused a class this TLS context needs".to_string())? {
+        Some(identity) => Some(identity),
+        None => runtime_tls_identity().map(|identity| (identity.cert_pem, identity.key_pem)),
+    };
     let mut pending = pending_layered_sockets().lock();
     let mut id = 1i32;
     while pending.contains_key(&id) {
@@ -4332,7 +4347,7 @@ pub(crate) fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
             let ders = accepted_issuer_ders();
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), ders.len());
             for (i, der) in ders.iter().enumerate() {
-                let cert = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
+                let cert = try_alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4)?;
                 // Best-effort CN extraction via the existing DER parser.
                 let (subject, issuer) = crate::phases_late::basic_der_extract_names(der)
                     .unwrap_or_else(|| ("CN=Unknown".into(), "CN=Unknown".into()));
@@ -4406,23 +4421,23 @@ fn create_ssl_server_socket(
     // have been replaced by an unrelated client context by the time LDAPS
     // starts its listener. getDefault() returns an unbound factory and keeps
     // the established runtime-identity fallback for that case.
-    let identity = args
-        .first()
-        .and_then(|value| match value {
-            Value::Object(Some(factory)) if ctx.object_num_fields(*factory) > 0 => {
-                match ctx.get_field(*factory, 0) {
-                    Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context),
-                    _ => None,
-                }
+    let configured = match args.first() {
+        Some(Value::Object(Some(factory))) if ctx.object_num_fields(*factory) > 0 => {
+            match ctx.get_field(*factory, 0) {
+                Value::Object(Some(ssl_context)) => ctx_identity(ctx, ssl_context)?,
+                _ => None,
             }
-            _ => None,
-        })
+        }
+        _ => None,
+    };
+    let fallback = require_runtime_tls_identity()?;
+    let identity = configured
         .map(|(cert_pem, key_pem)| RuntimeTlsIdentity {
             cert_pem,
             key_pem,
             client_ca_pem: None,
         })
-        .unwrap_or(require_runtime_tls_identity()?);
+        .unwrap_or(fallback);
     let config = build_server_config_single_cert(
         &identity.cert_pem,
         &identity.key_pem,
@@ -4482,7 +4497,7 @@ fn create_ssl_server_socket(
     // `sss_listener_identities`.
     sss_listener_identities().lock().insert(id, identity);
 
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS)?;
     set_ssl_server_socket_state(
         ctx,
         obj,
@@ -4577,7 +4592,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/ServerSocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocketFactory", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -4680,7 +4695,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
 
         // Build an SSLSocket wrapper. Reuses the existing SSLSocket/
         // SSLSocketInputStream/SSLSocketOutputStream classes.
-        let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", SSS_SOCK_FIELDS);
+        let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", SSS_SOCK_FIELDS)?;
         let (proto, cipher, alpn, sni) = rustls_session_info(stream_id)
             .unwrap_or_else(|| ("TLSv1.3".into(), "UNKNOWN".into(), None, None));
         // PIN across every allocation below. `create_string` and
@@ -4717,7 +4732,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
 
         // 4-field synthetic session: proto, cipher, streamId, attrs (slot 3 —
         // see SSLSESS_ATTRS_SLOT doc comment).
-        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4);
+        let session = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4)?;
         let p = ctx.create_string(&proto);
         let c = ctx.create_string(&cipher);
         let sock = ctx.read_native_pin(sock_pin, sock);
@@ -5011,13 +5026,13 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     /// winning, and the slot is already a GC root.
     fn huc_default_factory_or_publish(
         ctx: &mut dyn cratonvm_native_api::NativeContext,
-    ) -> ObjectRef {
+    ) -> Result<ObjectRef, MethodCallFailed> {
         if let Some(f) = huc_default_ssl_socket_factory() {
-            return f;
+            return Ok(f);
         }
-        let obj = default_ssl_socket_factory_obj(ctx);
+        let obj = default_ssl_socket_factory_obj(ctx)?;
         set_huc_default_ssl_socket_factory(obj);
-        obj
+        Ok(obj)
     }
 
     r.register(
@@ -5048,14 +5063,14 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             // freshly opened connections report the same default-factory
             // identity, even though `SSLSocketFactory.getDefault()` itself
             // returns a new object per call.
-            let obj = huc_default_factory_or_publish(ctx);
+            let obj = huc_default_factory_or_publish(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     // Walk from an arbitrary `SSLSocketFactory`-typed object down to the
     // `SSLContext` it ultimately carries. The fast path is our own synthetic
-    // carrier (`alloc_concurrent_synthetic("javax/net/ssl/SSLSocketFactory",
-    // 1)`, field 0 = the SSLContext, as returned by `SSLContext.
+    // carrier (`try_alloc_concurrent_synthetic("javax/net/ssl/SSLSocketFactory",
+    // 1)?`, field 0 = the SSLContext, as returned by `SSLContext.
     // getSocketFactory()`), but real test/application code routinely wraps
     // that in a REAL bytecode subclass that delegates to it — e.g. Tomcat's
     // own `TesterSupport.ClientSSLSocketFactory(SSLSocketFactory delegate)`,
@@ -5088,8 +5103,8 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
     ) -> Option<ObjectRef> {
         // `class_num_total_fields` is NOT trustworthy here: our own synthetic
-        // `SSLSocketFactory` carrier (`alloc_concurrent_synthetic(...,
-        // "javax/net/ssl/SSLSocketFactory", 1)`) reports 0 total fields for
+        // `SSLSocketFactory` carrier (`try_alloc_concurrent_synthetic(...,
+        // "javax/net/ssl/SSLSocketFactory", 1)?`) reports 0 total fields for
         // its ClassId even though it was allocated with (and, per
         // `get_field`'s M4a contract, safely holds) exactly 1 real slot —
         // confirmed via `CRATONVM_DBG_TLS_AUTH` tracing (`cid=ClassId(1046)
@@ -5176,15 +5191,16 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         factory: ObjectRef,
         connection: Option<ObjectRef>,
-    ) {
+    ) -> Result<(), MethodCallFailed> {
         if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
-                capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
+                capture_huc_ssl_context_for_connection(ctx, connection, sslctx)?;
             } else {
-                capture_huc_ssl_context(ctx, sslctx);
+                capture_huc_ssl_context(ctx, sslctx)?;
             }
         }
-    }
+            Ok(())
+}
     // FIX (tls-handshake-enforcement-gap, doc 21): this native REPLACES the
     // real `HttpsURLConnection.setDefaultSSLSocketFactory` bytecode, so the
     // real JDK static field `HttpsURLConnection.defaultSSLSocketFactory` was
@@ -5206,7 +5222,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     fn publish_default_ssl_socket_factory(
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         factory: ObjectRef,
-    ) {
+    ) -> Result<(), MethodCallFailed> {
         // Keep the reference in a GC-rooted native slot. Writing the real JDK
         // static field was tried first and does NOT work: with
         // `CRATONVM_DBG_TLS_AUTH` the very next read reports "default factory
@@ -5217,21 +5233,22 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         // `HttpsURLConnection.defaultSSLSocketFactory` reflectively sees it if
         // the VM ever starts honouring this.
         let Some(cid) = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection") else {
-            return;
+            return Ok(());
         };
         let Some(idx) = ctx.static_field_index_by_name(cid, "defaultSSLSocketFactory") else {
-            return;
+            return Ok(());
         };
         ctx.set_static_field(cid, idx, Value::Object(Some(factory)));
-    }
+    Ok(())
+}
     r.register(
         hurl,
         "setDefaultSSLSocketFactory",
         "(Ljavax/net/ssl/SSLSocketFactory;)V",
         |ctx, args| {
             if let Some(Value::Object(Some(f))) = args.first() {
-                capture_huc_client_identity(ctx, *f, None);
-                publish_default_ssl_socket_factory(ctx, *f);
+                capture_huc_client_identity(ctx, *f, None)?;
+                publish_default_ssl_socket_factory(ctx, *f)?;
             }
             Ok(None)
         },
@@ -5252,7 +5269,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                     .into());
                 }
             };
-            capture_huc_client_identity(ctx, factory, Some(connection));
+            capture_huc_client_identity(ctx, factory, Some(connection))?;
             // FIX (huc-per-connection-ssf-readback): this setter used to
             // capture the connection's client identity and then DROP the
             // factory object, so `getSSLSocketFactory()` could not read back
@@ -5310,7 +5327,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(f))));
                 }
             }
-            let obj = huc_default_factory_or_publish(ctx);
+            let obj = huc_default_factory_or_publish(ctx)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5353,7 +5370,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(v))));
                 }
             }
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5423,7 +5440,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(v))));
                 }
             }
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0);
+            let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0)?;
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -5431,7 +5448,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     // `javax/net/ssl/HostnameVerifier`, so it can be reached two ways:
     //
     //   1. The VM's OWN default verifier, allocated above via
-    //      `alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0)`.
+    //      `try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0)?`.
     //      Its runtime class is the bare interface itself (no concrete
     //      subclass). For that object we short-circuit `true`: the underlying
     //      rustls/native-tls handshake already validated the SNI hostname
@@ -5812,7 +5829,7 @@ mod tests {
         for i in 0..16 {
             ctx.set_array_element(arr, i, Value::Int(i as i32));
         }
-        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8);
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8)?;
         ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
         ctx.set_field_by_name(bb, "position", Value::Int(1));
         ctx.set_field_by_name(bb, "limit", Value::Int(4));
@@ -5848,7 +5865,7 @@ mod tests {
     fn bb_view_direct_named_reads_and_writes_native_memory() {
         let mut ctx = crate::test_utils::mock_ctx();
         let mut native: Vec<u8> = (0u8..32).collect();
-        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8);
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8)?;
         ctx.set_field_by_name(
             bb,
             "address",
@@ -5883,7 +5900,7 @@ mod tests {
     fn bb_view_direct_clamps_to_capacity() {
         let mut ctx = crate::test_utils::mock_ctx();
         let mut native: Vec<u8> = (10u8..18).collect(); // 8 bytes
-        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8);
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8)?;
         ctx.set_field_by_name(
             bb,
             "address",
@@ -5917,7 +5934,7 @@ mod tests {
         }
         // A class OUTSIDE the mock's java/nio/*ByteBuffer named-field map,
         // so only slot-indexed reads can resolve it.
-        let bb = alloc_concurrent_synthetic(&mut ctx, "javax/net/ssl/SyntheticBuf", 4);
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "javax/net/ssl/SyntheticBuf", 4)?;
         ctx.set_field(bb, 0, Value::Object(Some(arr)));
         ctx.set_field(bb, 1, Value::Int(1)); // pos
         ctx.set_field(bb, 2, Value::Int(3)); // limit
@@ -5954,7 +5971,7 @@ mod tests {
         for i in 0..4 {
             ctx.set_array_element(arr, i, Value::Int((10 + i) as i32));
         }
-        let bb = alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8);
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8)?;
         ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
         ctx.set_field_by_name(bb, "position", Value::Int(0));
         ctx.set_field_by_name(bb, "limit", Value::Int(16));
@@ -5987,7 +6004,7 @@ mod tests {
     #[test]
     fn bb_view_unresolved_moves_zero_bytes() {
         let mut ctx = crate::test_utils::mock_ctx();
-        let bb = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 3);
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 3)?;
         let mut out = Vec::new();
         assert_eq!(bb_read_into(&mut ctx, bb, &mut out, 64), 0);
         assert!(out.is_empty());
@@ -7518,7 +7535,7 @@ fn alloc_engine_result(
     hs: i32,
     consumed: i32,
     produced: i32,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Build a REAL SSLEngineResult via its public ctor with REAL enum constants,
     // so `getStatus()`/`getHandshakeStatus()` return singletons the connector
     // can `==`-compare. (The old synthetic int-slot object made every enum
@@ -7541,7 +7558,7 @@ fn alloc_engine_result(
                         hs_name(hs)
                     );
                 }
-                return o;
+                return Ok(o);
             }
             other => {
                 if __dbg_hs {
@@ -7566,12 +7583,12 @@ fn alloc_engine_result(
         );
     }
     // Fallback: synthetic int-slot object (enum resolution failed).
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4)?;
     ctx.set_field(obj, 0, Value::Int(status));
     ctx.set_field(obj, 1, Value::Int(hs));
     ctx.set_field(obj, 2, Value::Int(consumed));
     ctx.set_field(obj, 3, Value::Int(produced));
-    obj
+    Ok(obj)
 }
 
 /// Compute the next handshake status from an EngineState.
@@ -8811,7 +8828,7 @@ fn engine_run_trust_check(
     let base = ctx.pin_native_root(arr);
     let mut arr = arr;
     for (i, der) in pending.peer_chain_der.iter().enumerate() {
-        let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
+        let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der)?;
         // No allocation between this re-read and the store.
         arr = ctx.read_native_pin(base, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
@@ -9126,7 +9143,7 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 /// Shared by `getSession()` and `getHandshakeSession()` — see the latter's
 /// registration for why real JDK's `getHandshakeSession()` cannot be left
 /// un-intercepted on this engine implementation.
-fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRef {
+fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> Result<ObjectRef, MethodCallFailed> {
     let (proto, cipher, alpn) = with_engine(id, |s| {
         let proto = match s.conn.as_ref().and_then(|c| c.protocol_version()) {
             Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
@@ -9151,7 +9168,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRe
     });
     // 8-field synthetic session: cipher, protocol, valid, peerHost, peerPort,
     // creationTime, alpn, attrs (slot 7 — see SSLSESS_ATTRS_SLOT doc comment).
-    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 8);
+    let ses = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 8)?;
     let cipher_s = ctx.create_string(&cipher);
     let proto_s = ctx.create_string(&proto);
     let alpn_s = ctx.create_string(&alpn);
@@ -9208,7 +9225,7 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRe
             .lock()
             .insert(gc_stable_objref_key(ctx, ses), local_chain);
     }
-    ses
+    Ok(ses)
 }
 
 fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
@@ -9608,7 +9625,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let id = engine_id_or_alloc(ctx, this);
             Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
                 ctx, id,
-            )))))
+            )?))))
         },
     );
 
@@ -9642,7 +9659,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let id = engine_id_or_alloc(ctx, this);
             Ok(Some(Value::Object(Some(build_synthetic_ssl_session(
                 ctx, id,
-            )))))
+            )?))))
         },
     );
 
@@ -9704,6 +9721,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+    ()
 }
 
 // -- wrap/unwrap closures (split out for arity / arg shapes) -----------------
@@ -9726,10 +9744,10 @@ fn wrap_single(
                 HS_NEED_WRAP_R,
                 0,
                 0,
-            )))))
+            )?))))
         }
     };
-    do_wrap(ctx, this, src.into_iter().collect(), dst)
+    Ok(do_wrap(ctx, this, src.into_iter().collect(), dst)?)
 }
 
 fn wrap_array(
@@ -9750,7 +9768,7 @@ fn wrap_array(
                 HS_NEED_WRAP_R,
                 0,
                 0,
-            )))))
+            )?))))
         }
     };
     let mut srcs: Vec<ObjectRef> = Vec::new();
@@ -9762,7 +9780,7 @@ fn wrap_array(
             }
         }
     }
-    do_wrap(ctx, this, srcs, dst)
+    Ok(do_wrap(ctx, this, srcs, dst)?)
 }
 
 fn wrap_array_offset(
@@ -9785,7 +9803,7 @@ fn wrap_array_offset(
                 HS_NEED_WRAP_R,
                 0,
                 0,
-            )))))
+            )?))))
         }
     };
     let mut srcs: Vec<ObjectRef> = Vec::new();
@@ -9798,7 +9816,7 @@ fn wrap_array_offset(
             }
         }
     }
-    do_wrap(ctx, this, srcs, dst)
+    Ok(do_wrap(ctx, this, srcs, dst)?)
 }
 
 fn do_wrap(
@@ -9828,7 +9846,7 @@ fn do_wrap(
             );
         }
         let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Some(Value::Object(Some(result))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     // Lazily realize rustls connection.
@@ -9963,7 +9981,7 @@ fn do_wrap(
         );
     }
     let result = alloc_engine_result(ctx, status, hs, total_consumed, produced as i32);
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 fn unwrap_single(
@@ -9980,14 +9998,14 @@ fn unwrap_single(
                 HS_NEED_UNWRAP_R,
                 0,
                 0,
-            )))))
+            )?))))
         }
     };
     let dst = match args.get(2) {
         Some(Value::Object(Some(b))) => Some(*b),
         _ => None,
     };
-    do_unwrap(ctx, this, src, dst.into_iter().collect())
+    Ok(do_unwrap(ctx, this, src, dst.into_iter().collect())?)
 }
 
 fn unwrap_array(
@@ -10004,7 +10022,7 @@ fn unwrap_array(
                 HS_NEED_UNWRAP_R,
                 0,
                 0,
-            )))))
+            )?))))
         }
     };
     let mut dsts: Vec<ObjectRef> = Vec::new();
@@ -10016,7 +10034,7 @@ fn unwrap_array(
             }
         }
     }
-    do_unwrap(ctx, this, src, dsts)
+    Ok(do_unwrap(ctx, this, src, dsts)?)
 }
 
 fn unwrap_array_offset(
@@ -10033,7 +10051,7 @@ fn unwrap_array_offset(
                 HS_NEED_UNWRAP_R,
                 0,
                 0,
-            )))))
+            )?))))
         }
     };
     let off = args.get(3).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
@@ -10048,7 +10066,7 @@ fn unwrap_array_offset(
             }
         }
     }
-    do_unwrap(ctx, this, src, dsts)
+    Ok(do_unwrap(ctx, this, src, dsts)?)
 }
 
 fn do_unwrap(
@@ -10077,7 +10095,7 @@ fn do_unwrap(
             );
         }
         let result = alloc_engine_result(ctx, SR_CLOSED, HS_NOT_HANDSHAKING_R, 0, 0);
-        return Ok(Some(Value::Object(Some(result))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     {
@@ -10154,7 +10172,7 @@ fn do_unwrap(
             );
         }
         let result = alloc_engine_result(ctx, status, hs, 0, idx as i32);
-        return Ok(Some(Value::Object(Some(result))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     // If the caller's dst has no room for APPLICATION data, do NOT
@@ -10177,7 +10195,7 @@ fn do_unwrap(
             );
         }
         let result = alloc_engine_result(ctx, SR_BUFFER_OVERFLOW, hs, 0, 0);
-        return Ok(Some(Value::Object(Some(result))));
+        return Ok(Some(Value::Object(Some(result?))));
     }
 
     let src_view = bb_view(ctx, src);
@@ -10437,7 +10455,7 @@ fn do_unwrap(
         consumed as i32,
         produced_total as i32,
     );
-    Ok(Some(Value::Object(Some(result))))
+    Ok(Some(Value::Object(Some(result?))))
 }
 
 // -----------------------------------------------------------------------------
@@ -10662,7 +10680,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                 &[carr, parr],
             )? {
                 Some(Value::Object(Some(o))) => o,
-                _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
+                _ => try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4)?,
             };
             // Echo back the endpoint-identification algorithm this engine is
             // configured with. JSSE's contract is a round-trip
@@ -10796,8 +10814,8 @@ pub(crate) fn set_engine_trust_ctx_key(
     ctx: &mut dyn NativeContext,
     engine_obj: ObjectRef,
     ctx_obj: ObjectRef,
-) {
-    let key = ctx_obj_key(ctx, ctx_obj);
+) -> Result<(), MethodCallFailed> {
+    let key = ctx_obj_key(ctx, ctx_obj)?;
     let id = engine_id_or_alloc(ctx, engine_obj);
     if crate::nbflags().dbg_tls_auth_ok {
         let has_entry = ctx_trust_managers_table().lock().contains_key(&key);
@@ -10809,6 +10827,7 @@ pub(crate) fn set_engine_trust_ctx_key(
     with_engine(id, |s| {
         s.trust_managers_ctx_key = Some(key);
     });
+    Ok(())
 }
 
 /// GC root scan for `ctx_trust_managers_table` — see the table's doc for why
@@ -10982,16 +11001,16 @@ pub(crate) fn get_runtime_default_ssl_context() -> Option<ObjectRef> {
 /// `fixed-suite-bugs/springboot/sslsocketfactory-getdefault-aether-resolution-regression-20260804-FIXED.md`.
 pub(crate) fn default_ssl_context_or_create(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     if let Some(existing) = get_runtime_default_ssl_context() {
-        return existing;
+        return Ok(existing);
     }
-    let new_ctx = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
+    let new_ctx = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2)?;
     let name = ctx.create_string("TLS");
     ctx.set_field(new_ctx, 0, Value::Object(Some(name)));
     ctx.set_field(new_ctx, 1, Value::Int(1));
     set_runtime_default_ssl_context(new_ctx);
-    new_ctx
+    Ok(new_ctx)
 }
 
 /// Mint the object `SSLSocketFactory.getDefault()` hands back: the same
@@ -11002,7 +11021,7 @@ pub(crate) fn default_ssl_context_or_create(
 /// JDK documents both as defaulting to `SSLSocketFactory.getDefault()`.
 pub(crate) fn default_ssl_socket_factory_obj(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
-) -> ObjectRef {
+) -> Result<ObjectRef, MethodCallFailed> {
     // Deliberately a FRESH carrier per call, not a cached singleton.
     // Measured on real JDK 21: `SSLSocketFactory.getDefault()` hands back a
     // different object each time (`SSLContextImpl.engineGetSocketFactory`
@@ -11012,9 +11031,9 @@ pub(crate) fn default_ssl_socket_factory_obj(
     // `HttpsURLConnection.getDefaultSSLSocketFactory`, which caches its result
     // in its own static field (see that registration).
     let ssl_ctx = default_ssl_context_or_create(ctx);
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
-    ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));
-    obj
+    let obj = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1)?;
+    ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx?)));
+    Ok(obj)
 }
 
 /// GC root scan for `default_ssl_context_slot` -- mirrors
@@ -11166,7 +11185,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             }
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
             for (i, der) in chain.iter().enumerate() {
-                let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der);
+                let mirror = crate::keystore::make_x509_mirror(ctx, "peer", der)?;
                 ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
             }
             Ok(Some(Value::Object(Some(arr))))
@@ -11406,6 +11425,7 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(out))))
     });
+    ()
 }
 
 /// Lazily allocate (and cache in the session's own last field) the

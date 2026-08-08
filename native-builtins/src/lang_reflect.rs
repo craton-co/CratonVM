@@ -46,6 +46,7 @@ use crate::lang_class::{
 use crate::obj_arg;
 
 use std::sync::OnceLock;
+use cratonvm_types::error::MethodCallFailed;
 
 /// Cached `CRATONVM_DBG_METHOD_INVOKE_BOX` lookup. `Method.invoke`'s
 /// defensive-box wrap-up runs on every reflective call (and ByteBuddy /
@@ -717,7 +718,7 @@ pub(crate) fn native_class_get_enclosing_method_public(
     let methods = ctx.declared_methods(enc_class_id);
     for meta in &methods {
         if &*meta.name == method_name && &*meta.descriptor == method_desc {
-            let m = create_method_object(ctx, meta);
+            let m = create_method_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(m))));
         }
     }
@@ -759,7 +760,7 @@ pub(crate) fn native_class_get_enclosing_constructor_public(
     let methods = ctx.declared_methods(enc_class_id);
     for meta in &methods {
         if &*meta.name == "<init>" && &*meta.descriptor == method_desc {
-            let c = create_constructor_object(ctx, meta);
+            let c = create_constructor_object(ctx, meta)?;
             return Ok(Some(Value::Object(Some(c))));
         }
     }
@@ -817,7 +818,7 @@ pub(crate) fn native_method_get_default_value(
         Some(class_id),
         container_loader,
         Some(class_id),
-    )))
+    )?))
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +998,7 @@ pub(crate) fn native_method_get_generic_exception_types(
                     let _gscope = crate::generics::GenericDeclScope::new(decl);
                     let v = crate::generics::type_sig_to_java(ctx, t);
                     let arr = ctx.read_native_pin(arr_pin, arr);
-                    ctx.set_array_element(arr, i, v);
+                    ctx.set_array_element(arr, i, v?);
                 }
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(arr_pin);
@@ -2303,13 +2304,13 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
         this: cratonvm_types::ObjectRef,
         field: &str,
-    ) -> Value {
+    ) -> Result<Value, MethodCallFailed> {
         let raw = ctx.get_field_by_name(this, field);
         let Value::Object(Some(arr)) = raw else {
-            return raw;
+            return Ok(raw);
         };
         if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
-            return raw;
+            return Ok(raw);
         }
         // A wildcard bound may itself be a type-variable USE (`? super T`, the
         // shape Kotlin emits for a suspending function's `Continuation`
@@ -2344,17 +2345,17 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     // then to Object, if the shape isn't modellable.
                     let reified = jdk_tree_to_typesig(ctx, node)
                         .map(|ts| crate::generics::typesig_to_real_type(ctx, &ts))
-                        .filter(|v| !matches!(v, Value::Object(None)))
-                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls))
+                        .filter(|v| !matches!(v, Ok(Value::Object(None))))
+                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls).map(Ok))
                         .or_else(|| {
                             // Unresolvable exotic bound: degrade to Object
                             // (the JDK's implicit upper bound) rather than
                             // leaking a non-Type.
                             ctx.class_id_by_name("java/lang/Object")
-                                .map(|c| Value::Object(Some(ctx.get_class_mirror(c))))
+                                .map(|c| Ok(Value::Object(Some(ctx.get_class_mirror(c)))))
                         })
-                        .unwrap_or(Value::Object(None));
-                    out.push(reified);
+                        .unwrap_or(Ok(Value::Object(None)));
+                    out.push(reified?);
                     continue;
                 }
             }
@@ -2379,9 +2380,9 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     .unwrap_or(cratonvm_types::ClassId::new(0));
                 let result = ctx.new_ref_array(type_cid, 0);
                 ctx.set_field_by_name(this, field, Value::Object(Some(result)));
-                return Value::Object(Some(result));
+                return Ok(Value::Object(Some(result)));
             }
-            return Value::Object(Some(arr));
+            return Ok(Value::Object(Some(arr)));
         }
         let type_cid = ctx
             .class_id_by_name("java/lang/reflect/Type")
@@ -2393,7 +2394,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         // Write back so subsequent reads (incl. real bytecode getfield) see
         // reified values — mirrors the lazy write-back in the real impl.
         ctx.set_field_by_name(this, field, Value::Object(Some(result)));
-        Value::Object(Some(result))
+        Ok(Value::Object(Some(result)))
     }
     // SB-02b — convert a real-JDK `sun.reflect.generics.tree.*` node into
     // CratonVM's `TypeSig` AST so `crate::generics::type_sig_to_java` can
@@ -2666,7 +2667,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "bounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "bounds")?))
         },
     );
     registry.register(
@@ -2701,7 +2702,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")?))
         },
     );
     registry.register(
@@ -2710,7 +2711,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")?))
         },
     );
     let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";

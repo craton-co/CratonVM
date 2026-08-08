@@ -13,11 +13,12 @@
 //! - T3.1.15 Flow reactive streams (in lib.rs)
 //! - T3.1.16-T3.1.18 Virtual threads extras
 
-use crate::{alloc_concurrent_synthetic, obj_arg};
+use crate::{try_alloc_concurrent_synthetic, obj_arg};
 use cratonvm_native_api::NativeContext;
 use cratonvm_native_api::NativeMethodRegistry;
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
+use cratonvm_types::error::MethodCallFailed;
 
 // =============================================================================
 // T3.8 — javax.naming / JNDI
@@ -36,7 +37,7 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
     r.register(ic, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // bindings = HashMap synthetic (keys=0, values=1, size=2)
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let bindings = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let keys_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         let vals_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(bindings, 0, Value::Object(Some(keys_arr)));
@@ -51,7 +52,7 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
     r.register(ic, "<init>", "(Ljava/util/Hashtable;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let env = args.get(1).copied().unwrap_or(Value::Object(None));
-        let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let bindings = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
         let keys_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         let vals_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
         ctx.set_field(bindings, 0, Value::Object(Some(keys_arr)));
@@ -190,10 +191,10 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
                 _ => 1099,
             };
             // Create a synthetic Registry backed by a HashMap
-            let registry = alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2);
+            let registry = try_alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2)?;
             let keys_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             let vals_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let bindings = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             ctx.set_field(bindings, 0, Value::Object(Some(keys_arr)));
             ctx.set_field(bindings, 1, Value::Object(Some(vals_arr)));
             ctx.set_field(bindings, 2, Value::Int(0));
@@ -209,8 +210,8 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)Ljava/rmi/registry/Registry;",
         |ctx, args| {
             // Return a synthetic registry pointing to the given host:port
-            let registry = alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2);
-            let bindings = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let registry = try_alloc_concurrent_synthetic(ctx, "java/rmi/registry/Registry", 2)?;
+            let bindings = try_alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3)?;
             let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(bindings, 0, Value::Object(Some(keys)));
@@ -523,7 +524,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newInstance",
         "()Ljavax/xml/stream/XMLInputFactory;",
         |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1);
+            let factory = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1)?;
             ctx.set_field(factory, 0, Value::Int(0)); // configuration flags
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -533,7 +534,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newFactory",
         "()Ljavax/xml/stream/XMLInputFactory;",
         |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1);
+            let factory = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLInputFactory", 1)?;
             ctx.set_field(factory, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -763,7 +764,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newInstance",
         "(Ljava/lang/String;)Ljavax/xml/validation/SchemaFactory;",
         |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "javax/xml/validation/SchemaFactory", 1);
+            let factory = try_alloc_concurrent_synthetic(ctx, "javax/xml/validation/SchemaFactory", 1)?;
             ctx.set_field(factory, 0, Value::Int(0));
             Ok(Some(Value::Object(Some(factory))))
         },
@@ -774,7 +775,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newSchema",
         "(Ljavax/xml/transform/Source;)Ljavax/xml/validation/Schema;",
         |ctx, _args| {
-            let schema = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1);
+            let schema = try_alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1)?;
             ctx.set_field(schema, 0, Value::Int(1)); // valid
             Ok(Some(Value::Object(Some(schema))))
         },
@@ -785,7 +786,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newSchema",
         "()Ljavax/xml/validation/Schema;",
         |ctx, _args| {
-            let schema = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1);
+            let schema = try_alloc_concurrent_synthetic(ctx, "javax/xml/validation/Schema", 1)?;
             ctx.set_field(schema, 0, Value::Int(1));
             Ok(Some(Value::Object(Some(schema))))
         },
@@ -798,7 +799,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         "newValidator",
         "()Ljavax/xml/validation/Validator;",
         |ctx, _args| {
-            let v = alloc_concurrent_synthetic(ctx, "javax/xml/validation/Validator", 1);
+            let v = try_alloc_concurrent_synthetic(ctx, "javax/xml/validation/Validator", 1)?;
             ctx.set_field(v, 0, Value::Int(1));
             Ok(Some(Value::Object(Some(v))))
         },
@@ -889,12 +890,12 @@ fn stax_create_event_reader(
     let events_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, event_count + 2);
 
     // START_DOCUMENT event
-    let start_doc = alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3);
+    let start_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
     ctx.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
     ctx.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
 
     for (i, ev) in events.iter().enumerate() {
-        let event_obj = alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3);
+        let event_obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
         ctx.set_field(event_obj, 0, Value::Int(ev.event_type));
         if let Some(ref name) = ev.name {
             let s = ctx.create_string(name);
@@ -908,12 +909,12 @@ fn stax_create_event_reader(
     }
 
     // END_DOCUMENT event
-    let end_doc = alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3);
+    let end_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
     ctx.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
     ctx.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
 
     let total = (event_count + 2) as i32;
-    let reader = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLEventReader", 3);
+    let reader = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLEventReader", 3)?;
     ctx.set_field(reader, 0, Value::Object(Some(events_arr)));
     ctx.set_field(reader, 1, Value::Int(total));
     ctx.set_field(reader, 2, Value::Int(0));
@@ -929,12 +930,12 @@ fn stax_create_stream_reader(
     let event_count = events.len();
     let events_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, event_count + 2);
 
-    let start_doc = alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3);
+    let start_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
     ctx.set_field(start_doc, 0, Value::Int(STAX_START_DOCUMENT));
     ctx.set_array_element(events_arr, 0, Value::Object(Some(start_doc)));
 
     for (i, ev) in events.iter().enumerate() {
-        let event_obj = alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3);
+        let event_obj = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
         ctx.set_field(event_obj, 0, Value::Int(ev.event_type));
         if let Some(ref name) = ev.name {
             let s = ctx.create_string(name);
@@ -947,12 +948,12 @@ fn stax_create_stream_reader(
         ctx.set_array_element(events_arr, i + 1, Value::Object(Some(event_obj)));
     }
 
-    let end_doc = alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3);
+    let end_doc = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/events/XMLEvent", 3)?;
     ctx.set_field(end_doc, 0, Value::Int(STAX_END_DOCUMENT));
     ctx.set_array_element(events_arr, event_count + 1, Value::Object(Some(end_doc)));
 
     let total = (event_count + 2) as i32;
-    let reader = alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLStreamReader", 4);
+    let reader = try_alloc_concurrent_synthetic(ctx, "javax/xml/stream/XMLStreamReader", 4)?;
     ctx.set_field(reader, 0, Value::Object(Some(events_arr)));
     ctx.set_field(reader, 1, Value::Int(total));
     ctx.set_field(reader, 2, Value::Int(0));
@@ -1060,7 +1061,7 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
     // Fields: 0=engines_list
     r.register(sem, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let engines = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let engines = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 4);
         ctx.set_field(engines, 0, Value::Object(Some(arr)));
         ctx.set_field(engines, 1, Value::Int(0));
@@ -1086,9 +1087,9 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
                 || name == "graal.js"
                 || name == "rhino"
             {
-                let engine = alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2);
+                let engine = try_alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2)?;
                 // Fields: 0=bindings_map, 1=engine_name
-                let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
+                let bindings = try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
                 let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 ctx.set_field(bindings, 0, Value::Object(Some(keys)));
@@ -1114,8 +1115,8 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             if ext == "js" {
-                let engine = alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2);
-                let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
+                let engine = try_alloc_concurrent_synthetic(ctx, "javax/script/ScriptEngine", 2)?;
+                let bindings = try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
                 let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
                 ctx.set_field(bindings, 0, Value::Object(Some(keys)));
@@ -1149,11 +1150,11 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
                 Some(n) => {
                     // Box the result as an Integer or Double
                     if n.fract() == 0.0 && n.abs() < i32::MAX as f64 {
-                        let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1);
+                        let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Integer", 1)?;
                         ctx.set_field(boxed, 0, Value::Int(n as i32));
                         Ok(Some(Value::Object(Some(boxed))))
                     } else {
-                        let boxed = alloc_concurrent_synthetic(ctx, "java/lang/Double", 1);
+                        let boxed = try_alloc_concurrent_synthetic(ctx, "java/lang/Double", 1)?;
                         ctx.set_field(boxed, 0, Value::Double(n));
                         Ok(Some(Value::Object(Some(boxed))))
                     }
@@ -1207,7 +1208,7 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
         "createBindings",
         "()Ljavax/script/Bindings;",
         |ctx, _args| {
-            let bindings = alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3);
+            let bindings = try_alloc_concurrent_synthetic(ctx, "javax/script/SimpleBindings", 3)?;
             let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
             ctx.set_field(bindings, 0, Value::Object(Some(keys)));
@@ -1482,7 +1483,7 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
         // untouched. Writing Strings into those typed-object slots used to
         // poison real-JDK Locale bytecode dispatch (bogus
         // `NoSuchMethodError java/lang/String.getUnicodeLocaleType`).
-        let locale = crate::locale_alloc(ctx, &language, &country);
+        let locale = crate::locale_alloc(ctx, &language, &country)?;
         Ok(Some(Value::Object(Some(locale))))
     });
 
@@ -1518,12 +1519,12 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
                 "ISO-8859-2",
                 "ISO-8859-15",
             ];
-            let map = alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3);
+            let map = try_alloc_concurrent_synthetic(ctx, "java/util/TreeMap", 3)?;
             let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
             let vals = ctx.new_array(cratonvm_types::ArrayElementType::Reference, charsets.len());
             for (i, name) in charsets.iter().enumerate() {
                 let key = ctx.create_string(name);
-                let charset = alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2);
+                let charset = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 2)?;
                 let name_s = ctx.create_string(name);
                 ctx.set_field(charset, 0, Value::Object(Some(name_s)));
                 ctx.set_field(charset, 1, Value::Object(None)); // aliases
@@ -1541,6 +1542,7 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
     // This is registered elsewhere for UTF-8/ISO-8859-1; we add Shift_JIS support
     // The encoding/decoding for exotic charsets is best-effort.
     r.set_category(__prev_cat);
+    ()
 }
 
 // =============================================================================
@@ -1575,7 +1577,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         let msg = ctx.create_string(
             "CratonVM: javac native compilation not yet available. Use JDK bytecode path.",
         );
-        let stderr = alloc_concurrent_synthetic(ctx, "java/io/PrintStream", 1);
+        let stderr = try_alloc_concurrent_synthetic(ctx, "java/io/PrintStream", 1)?;
         ctx.set_field(stderr, 0, Value::Object(Some(msg)));
         Ok(Some(Value::Int(2))) // exit code 2 = error
     });
@@ -1588,7 +1590,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         "()Ljavax/tools/JavaCompiler;",
         |ctx, _args| {
             // Return a compiler object with run/getTask/getStandardFileManager support
-            let compiler = alloc_concurrent_synthetic(ctx, "javax/tools/JavaCompiler", 2);
+            let compiler = try_alloc_concurrent_synthetic(ctx, "javax/tools/JavaCompiler", 2)?;
             let name = ctx.create_string("cratonvm-javac");
             ctx.set_field(compiler, 0, Value::Object(Some(name)));
             ctx.set_field(compiler, 1, Value::Int(0)); // invocation count
@@ -1619,7 +1621,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
 
     // JavaCompiler.getStandardFileManager(DiagnosticListener, Locale, Charset) -> StandardJavaFileManager
     r.register(jc, "getStandardFileManager", "(Ljavax/tools/DiagnosticListener;Ljava/util/Locale;Ljava/nio/charset/Charset;)Ljavax/tools/StandardJavaFileManager;", |ctx, _args| {
-        let fm = alloc_concurrent_synthetic(ctx, "javax/tools/StandardJavaFileManager", 2);
+        let fm = try_alloc_concurrent_synthetic(ctx, "javax/tools/StandardJavaFileManager", 2)?;
         let name = ctx.create_string("cratonvm-filemanager");
         ctx.set_field(fm, 0, Value::Object(Some(name)));
         ctx.set_field(fm, 1, Value::Int(0));
@@ -1628,7 +1630,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
 
     // JavaCompiler.getTask(Writer, FileManager, DiagnosticListener, Iterable, Iterable, Iterable) -> CompilationTask
     r.register(jc, "getTask", "(Ljava/io/Writer;Ljavax/tools/JavaFileManager;Ljavax/tools/DiagnosticListener;Ljava/lang/Iterable;Ljava/lang/Iterable;Ljava/lang/Iterable;)Ljavax/tools/JavaCompiler$CompilationTask;", |ctx, _args| {
-        let task = alloc_concurrent_synthetic(ctx, "javax/tools/JavaCompiler$CompilationTask", 1);
+        let task = try_alloc_concurrent_synthetic(ctx, "javax/tools/JavaCompiler$CompilationTask", 1)?;
         ctx.set_field(task, 0, Value::Int(0)); // not yet called
         Ok(Some(Value::Object(Some(task))))
     });
@@ -1637,7 +1639,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
     let ct = "javax/tools/JavaCompiler$CompilationTask";
     r.register(ct, "call", "()Ljava/lang/Boolean;", |ctx, _args| {
         // Native compilation not available — return false (compilation failed)
-        let result = alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1);
+        let result = try_alloc_concurrent_synthetic(ctx, "java/lang/Boolean", 1)?;
         ctx.set_field(result, 0, Value::Int(0)); // false
         Ok(Some(Value::Object(Some(result))))
     });
@@ -1674,7 +1676,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
                 .into());
             }
             // Return an empty list; file objects require JDK filesystem integration
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
             ctx.set_field(list, 0, Value::Object(Some(arr)));
             ctx.set_field(list, 1, Value::Int(0));
@@ -1686,8 +1688,8 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
     let jshell = "jdk/jshell/JShell";
     r.register(jshell, "create", "()Ljdk/jshell/JShell;", |ctx, _args| {
         // Fields: 0=history_list, 1=variable_count
-        let shell = alloc_concurrent_synthetic(ctx, "jdk/jshell/JShell", 2);
-        let history = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        let shell = try_alloc_concurrent_synthetic(ctx, "jdk/jshell/JShell", 2)?;
+        let history = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 32);
         ctx.set_field(history, 0, Value::Object(Some(arr)));
         ctx.set_field(history, 1, Value::Int(0));
@@ -1720,7 +1722,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
             let result_str = jshell_evaluate(source_trimmed);
 
             // Create a SnippetEvent
-            let event = alloc_concurrent_synthetic(ctx, "jdk/jshell/SnippetEvent", 3);
+            let event = try_alloc_concurrent_synthetic(ctx, "jdk/jshell/SnippetEvent", 3)?;
             let src = ctx.create_string(&source);
             let val = ctx.create_string(&result_str);
             ctx.set_field(event, 0, Value::Object(Some(src))); // source
@@ -1728,7 +1730,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
             ctx.set_field(event, 2, Value::Int(0)); // status (0=VALID)
 
             // Wrap in a single-element list
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
             ctx.set_array_element(arr, 0, Value::Object(Some(event)));
             ctx.set_field(list, 0, Value::Object(Some(arr)));
@@ -1762,7 +1764,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             // Return a Status enum
-            let status = alloc_concurrent_synthetic(ctx, "jdk/jshell/Snippet$Status", 2);
+            let status = try_alloc_concurrent_synthetic(ctx, "jdk/jshell/Snippet$Status", 2)?;
             let name = ctx.create_string("VALID");
             ctx.set_field(status, 0, Value::Object(Some(name)));
             ctx.set_field(status, 1, ctx.get_field(this, 2));

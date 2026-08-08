@@ -52,6 +52,7 @@ use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use crate::obj_arg;
+use cratonvm_types::error::MethodCallFailed;
 
 const LK_CLASS: &str = "java/lang/invoke/MethodHandles$Lookup";
 /// Slot index of the lookup class reference within the synthetic Lookup
@@ -264,7 +265,7 @@ fn resolve_lookup_supertypes(
 /// the given mirror. Mirrors `classloader.rs::alloc_lookup` but uses
 /// only the public `NativeContext` surface so this module stays
 /// independent of `classloader.rs`.
-fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> ObjectRef {
+fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Result<ObjectRef, MethodCallFailed> {
     // FULL_POWER = PUBLIC | PRIVATE | PROTECTED | PACKAGE | MODULE | ORIGINAL
     //            = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x40
     //            = 0x5F
@@ -369,7 +370,7 @@ fn alloc_lookup_for(ctx: &mut dyn NativeContext, lookup_mirror: ObjectRef) -> Ob
             ctx.set_field(obj, 3, Value::Int(LK_FULL_POWER));
         }
     }
-    obj
+    Ok(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +571,7 @@ fn lk_define_hidden_class_full(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // Return a fresh Lookup whose lookup class is the new hidden class.
     let mirror = ctx.get_class_mirror(cid);
     let lookup = alloc_lookup_for(ctx, mirror);
-    Ok(Some(Value::Object(Some(lookup))))
+    Ok(Some(Value::Object(Some(lookup?))))
 }
 
 // ---------------------------------------------------------------------------
@@ -799,7 +800,7 @@ fn lk_define_hidden_class_with_class_data(
 
     let mirror = ctx.get_class_mirror(cid);
     let lookup = alloc_lookup_for(ctx, mirror);
-    Ok(Some(Value::Object(Some(lookup))))
+    Ok(Some(Value::Object(Some(lookup?))))
 }
 
 // ---------------------------------------------------------------------------
