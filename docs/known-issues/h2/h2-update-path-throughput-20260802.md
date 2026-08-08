@@ -295,7 +295,8 @@ and so are the next targets:
   grows with (threads × collections). Every young collection in this workload
   falls back to the non-moving sweep — `reason=unregistered-jit-frame-on-stack`,
   `compiled-frame-oop-not-published`, `innermost-rbp-belongs-to-unguarded-callee`
-  — which is its own question and has its own pages.
+  — which is its own question and has its own pages. **Priced 2026-08-08 and
+  it is not the gap** — see "What the non-moving sweep actually costs" below.
   **RESOLVED 2026-08-07 (`0ea21c07a`).** The escalation below was right that
   this had stopped being a throughput tax, and wrong about which half was at
   fault: the fallback FRACTION barely moved (75% -> 99.4%), the collection
@@ -385,6 +386,68 @@ incoherent chain, produced by unwinding through deeply inlined Rust. The flat
 self-attribution above needs no unwinding and is sound; every caller-side claim
 from this data set was discarded. If a caller question has to be answered, it
 needs an in-VM counter, not perf.
+
+## What the non-moving sweep actually costs: 11% of the run, 3 points over the moving collector
+
+This page has named the non-moving fallback as a scaling target since it was
+written. Measured on `17af31abb` (2026-08-08), it is not the gap.
+
+**Method.** There is no lever that switches young collectors on one
+configuration — `CRATONVM_DBG=force-moving` changes the fallback *count* and
+still produces no moving cycle, and `CRATONVM_GC=-moving-young` barely moves the
+histogram. What does work is `--nojit`: with no live JIT frames there is nothing
+to make coverage unprovable, `coverage_fallbacks` drops to **0**, and every
+collection is decided MOVING. So the two collectors were each priced against
+their own no-GC control (`--Xmx 8g`, which reaches `minor=0` on this shape),
+giving two **internal ratios** that stay comparable even though `--nojit`
+changes absolute throughput. `H2UpdateScaleProbe 1 20000 10000`,
+single-threaded so wall clock is defensible, ABBA-interleaved, load 4-8.
+
+| young collector | `--Xmx 1g` | `--Xmx 8g` (`minor=0`) | GC cost | share of the run |
+| --- | --- | --- | --- | --- |
+| **non-moving sweep** (JIT on, the fallback) | 35 750 ms, n=10 | 32 154 ms, n=10 | 3 595 ms | **11.2 %** |
+| **moving Cheney** (`--nojit`, 0 fallbacks) | 61 413 ms, n=6 | 56 748 ms, n=6 | 4 665 ms | **8.2 %** |
+
+Medians. Per collection the non-moving sweep is dearer — ~654 ms against
+~518 ms — but it runs fewer of them (5.5 per run against 9), so the two land
+three percentage points apart.
+
+**So: eliminating the fallback entirely buys ~3 % of this workload, and
+eliminating young GC entirely buys ~11 %.** Against a ~10x interpreter-to-
+interpreter gap that is a rounding error, and it belongs on the same list as
+everything else this page refuses to treat as a bug list. The `--Xmx 8g` arm
+also differs from the `1g` arm by more than GC (page tables, allocation
+locality), so 11 % is an upper bound, not a point estimate.
+
+### Three things worth knowing before re-measuring this
+
+* **`moving_young: cycles=0` does not mean the moving collector never ran.** It
+  counts moving cycles *under live JIT frames* (the same quantity as
+  `decision history: moving_cycles_under_live_jit`). The `--nojit` arm above
+  reports `moving=9 non_moving=0 fallbacks=0` and `cycles=0` simultaneously. Read
+  the decision histogram, not this counter.
+* **The pause instrument does not cover this path.** `CRATONVM_DBG=gcpause`
+  emits nothing on a run whose collections are all non-moving —
+  `MOVING_PHASE_MARKS` is recorded by the Cheney cycle only. Every phase-share
+  number on the young pause (`cheney_drain` 60 %, and the rest) describes the
+  collector this workload does not use. The non-moving sweep has no phase
+  breakdown at all, which is why this section prices it from the outside.
+* **The fallback is entirely JIT-frame-caused.** `--nojit` takes
+  `coverage_fallbacks` from 5-6 per run to exactly 0. Nothing else about the
+  workload provokes it.
+
+### The 2026-08-07 profile above was taken on a broken tree
+
+Between that profile and this section, dev fixed a young-generation defect from
+the same `HEADER_SIZE 24 -> 16` landing (`0ea21c07a`): a JIT-allocated
+`new Object()` became bit-identical to zeroed arena, the sweep read it as walk
+desync, and one 16-byte span abandoned 233 MB of a 256 MB young generation
+unswept. On that tree this same shape did **250-892 minor collections per run**
+and threw `NoClassDefFoundError: java/time/format/DateTimeFormatterBuilder`
+about half the time; on the fixed tree it does **4-7**, and 20 of 20 runs are
+clean. So the flat profile above overstates every GC symbol — `is_object_address`
+at 5.80 % most of all — and should be re-taken before any of it is treated as a
+target.
 
 ## Setup cost
 
