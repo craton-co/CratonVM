@@ -7249,7 +7249,9 @@ pub(crate) mod gdmp {
 
     pub fn on() -> bool {
         *ON.get_or_init(|| {
-            std::env::var("CRATONVM_DBG_GDM_PROF")
+            // `runtime_var`, not `std::env::var` — see the flag-declaration
+            // guard: a raw getenv bypasses the latched `VmFlags` snapshot.
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_GDM_PROF")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false)
         })

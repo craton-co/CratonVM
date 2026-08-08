@@ -1672,7 +1672,12 @@ fn copy_tally_take() -> [u64; 6] {
 fn fwd_walk_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var("CRATONVM_DBG_FWDWALK").is_ok_and(|v| v != "0"))
+    // `runtime_var`, not `std::env::var`: a raw getenv bypasses the latched
+    // `VmFlags` snapshot, so `CRATONVM_DBG=fwdwalk` could not reach it and a
+    // test could not arrange it with `flags::with_thread_overrides`.
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_FWDWALK").is_ok_and(|v| v != "0")
+    })
 }
 
 impl GenerationalHeap {
