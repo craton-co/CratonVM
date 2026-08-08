@@ -366,16 +366,24 @@ Step 3 sweeps the remaining 72 direct callers the same way, so: `grep -c
 feature combination whose arms the sweep edited — not only the one you happen
 to be driving from.
 
-**On the regression suite's one failure.** It is not the same test twice:
-`RSocketChannelInterrupt` on one run, `RMapGcStress` on the next, and each
-passes when run on its own. The Azure host was simultaneously running two other
-sessions' Hibernate and H2 suites. `RSocketChannelInterrupt` additionally fails
-**identically on a pre-change `dev` binary** (2026-08-05), naming the
-`blocked-reader-never-wakes` defect in `native-io/src/socket_channel.rs` that
-its own assertion text points at — so that one is pre-existing, not a
-regression. Both are load-sensitive (a blocking-read interrupt and a GC stress
-loop); neither is evidence about this change, and neither should be read as a
-clean 31/31 either.
+**On the regression suite's one failure**, stated at the strength the
+evidence actually supports, which is not the same for the two tests:
+
+* `RSocketChannelInterrupt` — **pre-existing.** It fails identically on a
+  pre-change `dev` binary (2026-08-05), naming the `blocked-reader-never-wakes`
+  defect in `native-io/src/socket_channel.rs` that its own assertion text points
+  at. That control ran the test and hit the assertion, so it is a real
+  comparison.
+* `RMapGcStress` — **unattributed.** It passes when run on its own against this
+  change, and failed in two full-suite runs while the Azure host was also
+  running two other sessions' Hibernate and H2 suites. There is *no valid
+  pre-change control*: the A/B attempt produced nothing usable, because the
+  control arm failed on JDK resolution rather than on the test, and the other
+  arm's binary was deleted mid-run by this session's own cleanup. So it is not
+  known to be a regression and not shown to be pre-existing.
+
+The failure is also not the same test twice across runs. None of this should be
+read as a clean 31/31.
 
 ### What making a funnel fallible actually FINDS — the reason to do it at all
 
