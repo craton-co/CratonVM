@@ -103,7 +103,7 @@ Sibling record for the crates L5b/L5c did next:
 ## What L5 did, and why this file exists
 
 Lane L5 of the wave-2 plan
-([`docs/feature-designs/jdk-only-wave2/`](../../feature-designs/jdk-only-wave2/README.md);
+(the retired jdk-only wave-2 execution plan;
 the lane doc itself is retired, as the `jdk-only-wave2-L5-nativekind-native-io`
 write-up) migrated the four `JDK-ONLY-CLASSIFY: bridge` registrars in `native-io` from the
 ambient `set_category(Bridge)` to `register_with_kind(.., NativeKind::Bridge)`,

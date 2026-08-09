@@ -636,7 +636,7 @@ pub struct JvmThread {
     ///
     /// A collection between the stash and the drain therefore keeps the
     /// throwable alive and hands the drain its post-move address.
-    /// See `docs/jit-signals-root-gap.md`.
+    /// See `fixed-bugs/jit-signals-root-gap.md`.
     pub jit_pending_exception: Option<ObjectRef>,
 
     /// T17.Δ.3 — JVMTI single-step enable for this thread.

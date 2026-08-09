@@ -878,7 +878,7 @@ pub(super) fn try_lambda_default_method_dispatch(
 /// guards against redefinition, not against identity collision; only the key
 /// can do the latter.
 ///
-/// See `docs/feature-designs/vm-process-global-state-round-2.md`.
+/// See `feature-designs/vm-process-global-state-round-2.md`.
 type VmScopedClassPairKey = (usize, u32, u32);
 
 thread_local! {

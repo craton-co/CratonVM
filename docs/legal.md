@@ -75,7 +75,7 @@ implementations:
   Divergences are written to `bench/differential-divergences.json`; the
   regression fixtures live in `vm/tests/resources/cratonvm/Diff*.java`, and
   `DIFFERENTIAL_CLASSES` runs an ad-hoc sweep over any additional classes. No
-  divergence is currently open (the standing log was retired on 2026-07-28 once
+  divergence is currently open (the standing log was retired once
   its last entry was fixed).
 
 ## Current Status

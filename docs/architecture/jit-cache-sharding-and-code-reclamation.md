@@ -1,6 +1,6 @@
 # Lock-free JIT lookup and executable-code reclamation
 
-Status: implemented (2026-07-24)
+Status: implemented
 
 ## Architecture
 

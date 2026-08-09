@@ -105,7 +105,7 @@ one owner thread closes it, many threads may submit while it is open.
 Returned by every `submit` / `launch`. Modelled on
 `CompletableFuture` but bound to a CUDA stream.
 
-> **Completion model, updated 2026-07-11 evening.** `dispatch_async`
+> **Completion model.** `dispatch_async`
 > (`vm/src/runtime/offload.rs`) launches the kernel, records a CUDA event,
 > and returns immediately with the submission in the `Running` state.
 > `GpuFuture.get()` still works exactly as before: it calls the blocking
@@ -123,7 +123,7 @@ Returned by every `submit` / `launch`. Modelled on
 > has already fired) — so **`isDone()` returning `true` now means the
 > submission really is finalized**, not just "probably."
 >
-> **Update, 2026-07-12.** Completion no longer requires a Java thread to
+> Completion no longer requires a Java thread to
 > call anything. The same `cuLaunchHostFunc` host callback that sets
 > `device_done` also wakes a process-wide completion reaper thread
 > (`ensure_completion_reaper_started`/`completion_reaper_loop` in
@@ -138,7 +138,7 @@ Returned by every `submit` / `launch`. Modelled on
 
 | Method | Semantics |
 | --- | --- |
-| `boolean isDone()` | A real non-blocking device probe (`Native.futureStatus` → `poll_submission_status`): checks a host-callback flag, falls back to non-blocking `Event::query()`, and finalizes inline if the device reports done. Safe to poll in a loop — each call does bounded work, never a blocking device wait. As of 2026-07-12, the submission is often already finalized by the background completion reaper by the time this is called at all. |
+| `boolean isDone()` | A real non-blocking device probe (`Native.futureStatus` → `poll_submission_status`): checks a host-callback flag, falls back to non-blocking `Event::query()`, and finalizes inline if the device reports done. Safe to poll in a loop — each call does bounded work, never a blocking device wait. The submission is often already finalized by the background completion reaper by the time this is called at all. |
 | `T get()` | Block the calling thread until done. This is the call that actually finalizes the submission (waits on the CUDA event, drains writebacks) if `isDone()`/`getNow()` haven't already done so. Throws `GpuException` if the kernel failed or the analyzer rejected the lambda. |
 | `T get(long timeout, TimeUnit unit)` | Bounded wait. Throws `TimeoutException` on expiry. |
 | `Optional<T> getNow()` | Non-blocking peek, same underlying `poll_submission_status` probe as `isDone()`. Returns the result if the device reports the submission complete (finalizing it inline as a side effect, same as `isDone()`), `Optional.empty()` while still `Running`. |
@@ -180,7 +180,7 @@ kernel launch that consumes the array.
 | Method | Purpose |
 | --- | --- |
 | `static GpuArray<int[]> wrap(int[] host)` | Create a handle. `Native.arrayWrap*` takes an eager **byte-copy snapshot** of the array into a Rust-owned buffer (`native-builtins/src/craton_gpu.rs::wrap_primitive_array`) — there is no `Heap::pin_ref` or other GC-pinning call; the snapshot exists precisely so GC moving the original Java array afterward is a non-issue. Type parameter `T` is one of the supported primitive-array types. |
-| `static GpuArray<int[]> allocate(GpuExecutor exec, int len)` | Allocate a device-only array. `toHost()` materialises a fresh Java array on first call. **Rust-side shim landed 2026-07-11 evening, Java jar binding still pending.** `native-builtins/src/craton_gpu.rs` now registers `arrayAllocateInt`/`arrayAllocateLong`/`arrayAllocateFloat`/`arrayAllocateDouble` (`builtin_array_allocate_*`, minting a zero-filled device-only `state::ArrayEntry` the same way `arrayWrap*` does for a host-backed one) alongside the existing `arrayWrapInt/Long/Float/Double`. What's still missing is the `craton-gpu-java` side: the external `craton/gpu/internal/Native` class and the public `GpuArray.allocate(...)` factory method that would call it. Until that binding lands, the native entry points exist and are ready to call but nothing in the Java jar calls them yet. |
+| `static GpuArray<int[]> allocate(GpuExecutor exec, int len)` | Allocate a device-only array. `toHost()` materialises a fresh Java array on first call. **Rust-side shim landed, Java jar binding still pending.** `native-builtins/src/craton_gpu.rs` now registers `arrayAllocateInt`/`arrayAllocateLong`/`arrayAllocateFloat`/`arrayAllocateDouble` (`builtin_array_allocate_*`, minting a zero-filled device-only `state::ArrayEntry` the same way `arrayWrap*` does for a host-backed one) alongside the existing `arrayWrapInt/Long/Float/Double`. What's still missing is the `craton-gpu-java` side: the external `craton/gpu/internal/Native` class and the public `GpuArray.allocate(...)` factory method that would call it. Until that binding lands, the native entry points exist and are ready to call but nothing in the Java jar calls them yet. |
 | `CompletableFuture<T> toHost()` | Schedule a D2H copy and return a future for the host array. **Always synchronises the stream.** Treat it as the expensive read-back operation it is. |
 | `int length()` | Element count. Free; does not touch the device. |
 | `void close()` | Release the device buffer. Idempotent. |
@@ -225,7 +225,7 @@ should rely on the executor's implicit default stream.
 | `void synchronize()` | Block until the stream is drained. |
 | `void close()` | Destroy the stream. Outstanding futures complete or fail before close returns. |
 
-> **Executor default-stream affinity is real (2026-07-11 evening); explicit
+> **Executor default-stream affinity is real; explicit
 > `GpuStream` routing is still not.** These used to be one limitation; they
 > are now two different states. `submit`/`launch`/`submitWithArg(s)`/
 > `submitMethod` all route through `resolve_or_create_default_stream`
@@ -405,10 +405,10 @@ a substitute for resource management.
 
 Implementation-status gaps between this document's target API and what
 `vm/src/runtime/offload.rs` / `native-builtins/src/craton_gpu.rs`
-actually do as of 2026-07-11 (post `f4311e5f3`). These are distinct
+actually do (post `f4311e5f3`). These are distinct
 from the by-design [Limitations](#limitations) below.
 
-- **Push-driven completion model (closed 2026-07-12).** `isDone()` /
+- **Push-driven completion model (closed).** `isDone()` /
   `getNow()` still work exactly as described under
   [`GpuFuture<T>`](#gpufuturet): a non-blocking `poll_submission_status`
   probe that finalizes a submission inline the moment it observes the
@@ -420,7 +420,7 @@ from the by-design [Limitations](#limitations) below.
   the mutator, while application code is doing something else entirely.
   See [`async-completion-reaper.md`](async-completion-reaper.md) for the
   reaper's design.
-- **Only `Void` results were surfaced until 2026-07-11 evening; scalar
+- **Only `Void` results were surfaced at one point; scalar
   reduction results now reach Java too.** `SerializedResult`'s
   `ScalarI32/I64/F32/F64` variants (integer/long reduction kernels, `)I`/`)J`
   descriptors with a `red.global.add` epilogue) are wired into
@@ -437,8 +437,7 @@ from the by-design [Limitations](#limitations) below.
   (`Pipeline.vectorAdd(a, b)`, `Pipeline.histogram`, etc.) still describes
   the intended surface, not today's behavior; a scalar-returning reduction
   kernel now genuinely works end to end through `GpuExecutor`.
-- **`GpuStream` affinity is partially wired up (updated 2026-07-11
-  evening).** `resolve_or_create_default_stream` gives every submission on
+- **`GpuStream` affinity is partially wired up.** `resolve_or_create_default_stream` gives every submission on
   a given `GpuExecutor` — via `submit`/`launch`/`submitWithArg(s)`/
   `submitMethod`, with no explicit stream involved — one real, shared,
   lazily-created CUDA stream instead of a fresh private one per dispatch.

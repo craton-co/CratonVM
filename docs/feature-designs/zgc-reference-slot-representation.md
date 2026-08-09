@@ -1,20 +1,14 @@
-# ZGC reference-slot representation: what it costs to give the load barrier a CAS-able slot
+# ZGC reference-slot representation
 
-Status: **analysis + recommendation. No code change proposed for this pass.**
-Companion to [`zgc-production-implementation-plan.md`](zgc-production-implementation-plan.md)
-(which owns the phase/lane structure and does **not** cover this question) and to
-[`compact-ref-field-layout.md`](compact-ref-field-layout.md) (which owns the
-compact layout this document leans on).
+**Status:** Designed, not built. Reference slots are plain pointers; nothing in
+the heap stores a colored word.
 
-*Written 2026-08-07, grounded in a read of `gc/src/zgc/{barrier,vaddr,remembered}.rs`,
-`gc/src/{zgc,gen_heap,g1,heap,collector,compressed_oops}.rs`,
-`types/src/{value,compact_value,field_layout,heap_types,narrow_oop}.rs`,
-`classloading/src/class.rs`, `vm/src/vm/realms/class_realm.rs`,
-`vm/src/vm/vm_init.rs`, `vm/src/runtime/interpreter/opcodes.rs`,
-`vm/src/jit/helpers.rs`, `jit/src/x64/{objects,bytecode_walk,arrays}.rs` and
-`jit/src/ir_lower.rs`. Every factual claim below carries a `file:line`.*
-
----
+This document works out what it would cost to give a load barrier a CAS-able
+reference slot, and recommends an option. Nothing here is implemented. It is
+the slot-shape companion to
+[`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md) (which owns barrier
+emission) and leans on the layout owned by
+[`compact-ref-field-layout.md`](compact-ref-field-layout.md).
 
 ## 0. Verdict, up front
 
@@ -141,7 +135,7 @@ Encoding (`compact_value.rs:109-138`, `:186-194`):
 reasons, both structural:
 
 1. **It is not a heap-slot type.** It backs the interpreter's operand stack and
-   locals (`docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md` §3.1);
+   locals only;
    no heap reference field or array element is stored as a `CompactValue`
    anywhere in the tree. The heap already uses a *bare* 8-byte pointer for both
    compact fields and array elements — a strictly better representation for this
@@ -220,9 +214,8 @@ That last one is not a corner case. Its own comment names the population:
 *"the untyped `ClassId(0)`-minted synthetic containers … every HashMap/LinkedHashMap
 node, view backings, …"* (`class.rs:1610-1613`). Auto-boxed primitives are also
 legacy — `set_array_element` boxes into `AUTOBOX_CLASS_ID` with one field
-(`gc/src/zgc.rs:2135-2136`), and the footprint table in
-`docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md` §2 records
-`java.lang.Integer` as *"autoboxed ⇒ legacy 16-byte cell"*.
+(`gc/src/zgc.rs`), so `java.lang.Integer` is autoboxed into a legacy 16-byte
+cell.
 
 Compactness is **per object**, decided at allocation from the `GC_FLAG_COMPACT`
 header bit (`field_layout.rs:1120-1122`, set at `gc/src/zgc.rs:1959-1961`), not
@@ -441,8 +434,7 @@ workspace to it — including legacy instance fields and statics.
 **Correctness:** achievable, and it is the destination the tree is already
 drifting towards. `RawSlot` (`types/src/value.rs:1109-1113`) is a
 `repr(transparent) u64` that already exists for the frame/operand-stack side and
-whose reference encoding is *"a bare pointer; `0` is `null`"*
-(`docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md` §3.3).
+whose reference encoding is *"a bare pointer; `0` is `null`"*.
 
 **Cost:** this is the whole-workspace rewrite the framing feared, and it is
 mostly *not* ZGC work:
@@ -759,18 +751,3 @@ cross-collector cost option (b) would incur and option (e) avoids entirely.
    `barrier.rs`'s `Root` kind (`:445-449`) already covers them as
    `&AtomicU64` — but I did not verify that every root table stores an 8-byte
    aligned word.
-
----
-
-## 7. Corrections to the commissioning premise
-
-Recorded explicitly, because acting on the original framing would have produced
-the wrong plan.
-
-| Claimed | Actual |
-|---|---|
-| "There is no `AtomicU64` reference slot to CAS today." | Compact reference fields are read and written as `AtomicU64` today (`types/src/field_layout.rs:986`, `:1047`), on the ZGC and G1 paths. Legacy cells are read and written as two `AtomicU64` words (`types/src/value.rs:1570-1573`, `:1582-1586`). |
-| "References are `Value::Object(Option<ObjectRef>)` inside a 16-byte `Value` cell." | True only for legacy instance fields and statics. Reference **array elements** have always been bare 8-byte words (`types/src/heap_types.rs:176`), and compact instance fields have been since the compact layout landed (`:185`), which is **on by default** (`types/src/field_layout.rs:183`). |
-| "A 16-byte `Value` cell cannot be CAS-ed … the tag/payload split makes a single-word compare wrong." | The tag/payload split makes a single-word compare *right*, not wrong. The pointer is a self-contained 8-byte word at `cell+8` with `0 == null` (`types/src/value.rs:1506-1509`), the JIT's legacy load reads exactly that word and never checks the tag (`jit/src/x64/bytecode_walk.rs:4076-4082`), and a reference field's tag is invariant at `4` once written. The genuine constraint is the *unwritten* cell, whose tag is `0` (§1.7). |
-| `CompactValue` "may already be the answer". | It is not in the running: it is an operand-stack/locals type, never a heap slot, and its NaN box claims bit 63 — the same bit `Z_COLORED_TAG` claims (`gc/src/zgc/vaddr.rs:264`) — with a hard 47-bit payload refusal (`types/src/compact_value.rs:516-517`). |
-| "Any change here is a change for all three collectors." | Only under option (b). Under (e) the other two collectors need one shared improvement (`read_ref_slot`/`write_ref_slot` atomicity) that is a correctness fix they want anyway, and nothing else. |

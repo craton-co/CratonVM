@@ -1,22 +1,23 @@
-# Real-frame deoptimization + precise OSR (entry *and* exit)
+# Real-frame deoptimization + precise OSR (entry and exit)
 
-Status: **LANDED on dev + DEFAULT-ON (2026-06-22)** (`CRATONVM_DEOPT_REAL` flipped default-on; opt out with `CRATONVM_DEOPT_REAL=0`).
-Steps 1–9, Workstreams A & B, the cat-2/FP resume (P2), and the `CRATONVM_DEOPT_VERIFY` structural/oop verifier are all on dev.
+**Status:** Shipped (default on; `CRATONVM_DEOPT_REAL=0` opts out).
 
-**The default-on flip (2026-06-22).** `deopt_real_enabled()` now defaults ON: a guard/loop bail RESUMES at the trapping bci instead of the `i64::MIN` whole-method re-run. It rides on the correctness-verified GC foundation — the *current default young gen is non-moving* (the moving young gen is "design / not started", see `default-moving-young-gen.md`), so OSR/JIT frames are conservatively pinned and precisely covered (`precise-jit-maps-default.md`, default-on). The flip enables ONLY the real feature: the OSR-exit in-place transfer (`CRATONVM_OSR_EXIT_TRANSFER`) and the moving-GC OSR-frame tracking (`CRATONVM_SHADOW_OSR_TRACK`) stay default-off, so OSR-exit uses the safe reject path. Validation: bt10/12/14/16/18 + long/double/float-accumulator, int-array-BCE, and nested-loop programs all == HotSpot with the gate **off, on, and on+`DEOPT_EAGER`** (eager forces the reconstruct+resume path on every loop); 848 jit-lib + 48 vm-lib deopt + 14 vm OSR tests green. **Footprint cost:** every JIT frame reserves +256 B (the `SavedRegisters` deopt region) when on, even methods with no deopt point — a possible follow-up is to make that conditional on `!deopt_points.is_empty()`. **Forward-looking:** when a moving young gen later becomes the default, re-evaluate OSR-frame relocation (`SHADOW_OSR_TRACK`, still partial: bt18 68199090 ≠ golden) before relying on OSR-exit transfer.
+A guard or loop bail **resumes at the trapping bci** instead of re-running the
+whole method. The shared per-pc state map, the virtual-object
+re-materialization consumer, de-speculation with epoch invalidation, and the
+category-2 / floating-point resume are all live.
 
-**Remaining (non-blocking follow-ups):**
-- The eager-deopt **value** differential (infra-blocked — read-once gates + forced-deopt codegen; see Validation).
-- Typed operand-stack cat-2/FP resume (currently falls back to sound conservative re-run).
-- Optional: make the +256 B deopt-region reservation conditional on the method having deopt points.
+Two companions stay default-off, so an OSR exit takes the safe reject path:
+`CRATONVM_OSR_EXIT_TRANSFER` (in-place OSR-exit transfer) and
+`CRATONVM_SHADOW_OSR_TRACK` (moving-GC OSR-frame tracking).
 
-(The three Step-9 follow-ups — FREE_CODE before-deref epoch check, eager recompile re-queue, and per-bci de-spec — are **done**; see §D.)
+**Footprint cost:** every JIT frame reserves an extra 256 B for the
+`SavedRegisters` deopt region while the feature is on.
 
-This doc is the consolidated joining piece between two efforts that already existed in the tree but stopped short of each other:
-1. **Real-frame deopt** — reconstruct a precise interpreter frame at the trapping bci instead of re-running the method from bci 0.
-2. **OSR (On-Stack Replacement)** — enter JIT code mid-loop from the interpreter. The **entry** direction is real, wired, and exercised on hot loops (Binary Trees). The **exit** direction — leaving an OSR'd (or any JIT) frame mid-loop back to the interpreter at a bytecode index — is now implemented via the OSR-exit/mid-loop deopt-out path.
-
----
+This document is the combined design. The per-feature current state lives in
+[`real-frame-deopt.md`](real-frame-deopt.md),
+[`jit-osr-entry-metadata.md`](jit-osr-entry-metadata.md) and
+[`jit-osr-exit-and-recompile.md`](jit-osr-exit-and-recompile.md).
 
 ## Problem & motivation
 

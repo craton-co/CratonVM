@@ -2629,7 +2629,7 @@ impl G1Collector {
         // young source (every young region is in this CSet, so the holder is
         // traced) but NOT for a young source held out of the CSet by a JNI
         // pin, which is reached only through its remembered set. Closing it
-        // requires a `jit/` change (see `docs/gc/g1-audit.md`, defect G1-2);
+        // requires a `jit/` change (see `audits/g1-audit.md`, defect G1-2);
         // the debug-only `verify_no_dangling_into_cset` below is the tripwire
         // in the meantime.
         let dbg_phases = gc_flags().g1_dbg_reach;
@@ -6571,7 +6571,7 @@ impl G1Collector {
         // Publish the remembered-set size gauge for G1. Until now
         // `remembered_set_bytes` described only the generational card table, so
         // `rset_bytes_per_live_byte` read as zero under `-XX:+UseG1GC` — the
-        // reconciliation item left open by `docs/gc/tlab-and-card-audit.md`
+        // reconciliation item left open by `audits/tlab-and-card-audit.md`
         // §2.3. Measured here (once per mark cycle, after the prune) rather
         // than per pause: this is the point at which the set is smallest and
         // final, and it costs one lock per region on a path that just walked
@@ -14298,7 +14298,7 @@ mod tests {
     }
 
     // =======================================================================
-    // G1 correctness audit (docs/gc/g1-audit.md)
+    // G1 correctness audit (audits/g1-audit.md)
     // =======================================================================
 
     use crate::gc_metrics::{g1_cycle_kind, g1_degraded, last_g1_cycle};

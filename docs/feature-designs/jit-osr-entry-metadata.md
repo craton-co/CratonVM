@@ -1,50 +1,37 @@
 # OSR entry metadata: the contract between the pieces
 
-**Status: CLOSED 2026-08-04. All four of the brief's near-misses are handled,
-both remaining implementation steps landed, and Risk 1 (the newtype) is built.**
-OSR entry itself has worked for a long time. What had no owner is the *contract
-between* the vectors it rides on, and every near-miss this campaign found there
-was one bug class — **a plausible integer in the wrong coordinate space**.
+**Status:** Shipped (always on — the check is ungated).
 
-Answers the `osr-01` lane of `docs/feature-designs/c2/deep-research-vm-c2.md`. The
-brief is retired to
-`osr-01-entry-metadata-contract-RETIRED-20260804.md`.
+## What it does today
 
-## What the closing increment found
+OSR entry itself has worked for a long time. What this contract adds is a
+**publication-time check** over the vectors it rides on, because those vectors
+span more than one coordinate space and a plausible integer in the wrong space
+reads as valid.
 
-Three things worth carrying into a neighbouring lane, each of which contradicted
-something this document previously said or assumed:
+- `jit/src/osr_coords.rs` gives the spaces distinct types — `OutPcIndexed<T>`
+  and `BciIndexed<T>` — with `from_translated` and a checked
+  `into_bci_by_identity`, plus a `note_mismatch` / `osr_coordinate_mismatches()`
+  counter. The third space (JVM local index) is deliberately not modelled here.
+- `jit/src/osr_contract.rs` provides `check_at_publication` and
+  `osr_contract_violations()`. It enforces two invariants: the bci-indexed
+  vectors agree in length, and every local the entry trampoline reads is
+  assigned.
+- The check runs at the real publication site, `jit/src/x64/osr.rs`. **A
+  violation publishes no OSR metadata for that method** — the method still
+  compiles, it just never enters via OSR. Failing closed matters because a
+  short dead mask otherwise reads as "safe" through `unwrap_or(0)`.
+- Counters are surfaced through `jit/src/tiered.rs`.
 
-1. **There are THREE compile doors, not the two the brief names.** `try_compile`,
-   `compile_osr_artifact`, and the interpreter's *eager first-call* compile in
-   `execute`. `jit_force_interpret`'s own doc had already enumerated all three
-   from the other side and nothing connected the two observations. Both direct
-   doors had hand-copied *subsets* of the admission chain and **neither had ever
-   checked the code-cache cap**.
-2. **The OSR door's compile-epoch witness was ~1,000 lines too late.** It was
-   opened immediately before the backend call, after all of that function's
-   class loading and constant-pool resolution — so a redefinition landing in
-   that window produced a body stamped with the *current* epoch, which the
-   install barrier then accepted. `try_compile` opens its witness "FIRST, before
-   any constant-pool resolver runs" and says so in a comment; the OSR copy of
-   that comment claimed the same thing and was in the wrong place.
-3. **Every counter this document cited as evidence had no caller.**
-   `osr_contract_violations()`, `jit_bail_shortcircuits()`,
-   `jit_code_cache_cap_refusals()` and `stale_install_epoch_refusals()` are all
-   `pub fn`s that nothing in the tree read. Each one's doc says it is "expected
-   to stay zero" and that a diagnostic nobody enables is how a compiler bug
-   stays unnoticed — and none of them could be enabled at all. They now print
-   under `CRATONVM_DBG=jit-method-stats`.
+The master OSR switch is `CRATONVM_JIT_OSR` (`osr_backedge_enabled()` in
+`vm/src/runtime/env_cache.rs`), default on.
 
-And one about the *test*, which is the more transferable finding: the door
-witness was first written under `vm/tests/`, and its first injection run — the
-gate deleted outright from the OSR door — **passed**. `cargo test -p cratonvm-vm`
-does not rebuild the `cratonvm` binary, so the probe ran a binary from several
-commits earlier. Any test in this repository that spawns `target/release/cratonvm`
-has that hazard. The fix is to host it in `vm-cli`, whose own integration tests
-get `CARGO_BIN_EXE_cratonvm` pointed at the binary cargo just built.
+## What is not built yet
 
----
+- **There is still more than one door to "produce an OSR-capable artifact."**
+  The OSR path reaches the backend directly rather than through a single
+  admission funnel, which is how two of the doors came to carry hand-copied
+  subsets of the admission chain in the first place.
 
 ## Goal
 
@@ -88,8 +75,8 @@ The conversion is `LoopXform::rebuild_pc_to_native` plus the pointwise
 |---|---|---|
 | 1 | `osr_pc_to_native` is bci-indexed by the runtime but output-pc-indexed by the emitter | **Handled and now TYPED apart.** `jit/src/osr_coords.rs` — `OutPcIndexed` / `BciIndexed`, with the identity conversion checked against `orig_code_len`. |
 | 2 | The `-1` refusal sentinel was not enforced as an invariant | **Fixed before this lane.** The publication site re-imposes `-1` at every bci `osr_entry_pc` refuses, "regardless of which producer filled the vector". |
-| 3 | The OSR compile path calls the backend directly, not through `try_compile` | **Fixed 2026-08-04.** `jit/src/compile_gate.rs` is the one door; all three call it, the backend *requires* the token (so skipping it is a compile error), and an entry made under the test escape hatch is still counted. It still calls the backend directly — what it can no longer do is skip the admission chain. |
-| 4 | `osr_entry_frame_state` and the deopt frame state are unchecked against each other | **Fixed 2026-08-04.** `CompiledMethod::osr_home_disagreement`, consulted by `validate_osr_entry` before the per-slot loop. |
+| 3 | The OSR compile path calls the backend directly, not through `try_compile` | **Fixed.** `jit/src/compile_gate.rs` is the one door; all three call it, the backend *requires* the token (so skipping it is a compile error), and an entry made under the test escape hatch is still counted. It still calls the backend directly — what it can no longer do is skip the admission chain. |
+| 4 | `osr_entry_frame_state` and the deopt frame state are unchecked against each other | **Fixed.** `CompiledMethod::osr_home_disagreement`, consulted by `validate_osr_entry` before the per-slot loop. |
 
 ---
 
@@ -187,162 +174,6 @@ wrong reason; 125 logged entries is what rules that out.
 
 ---
 
-## Implementation steps
-
-### 1. The contract module · **DONE**
-
-`jit/src/osr_contract.rs`: `check()` (pure, over slices), `check_at_publication()`
-(counter + diagnostic), `OsrContractViolation` carrying the numbers rather than
-just a discriminant — a violation is a compiler bug and the first question is
-always "by how much". Six tests over synthetic vectors, including both
-directions of the length mismatch and the "longer than `num_locals` is fine"
-case (a category-2 high half can push the vector past it).
-
-### 2. Wire it at publication · **DONE**
-
-One call in `x64.rs` where the four vectors are finalised, fail-closed as above.
-
-### 3. One door for "produce an OSR-capable artifact" · **DONE 2026-08-04**
-
-`jit/src/compile_gate.rs`. The shape this document prescribed — "a shared gate
-function both paths must call, with a test that the OSR path calls it" — with
-one correction and one strengthening.
-
-The correction: **there are three doors**, and the third (the interpreter's
-eager first-call compile) is gated too. Leaving it out would have made the drift
-witness below meaningless, because it would have been counting a real door as a
-violation forever.
-
-`compile_gate::admit(class, method, descriptor, door)` asks four questions and
-does two things:
-
-| | Was asked by | Now asked by |
-|---|---|---|
-| `CRATONVM_DISABLE_JIT` | OSR + the VM-side callers | all three |
-| the permanent bail-list | method-entry; **hand-copied** into OSR | all three |
-| `CRATONVM_JIT_DENY` / `_BISECT_ONLY` | method-entry; **hand-copied** into OSR and eager-first-call | all three |
-| the code-cache cap | method-entry **only** | all three |
-| opens the compile-epoch witness | method-entry, first; OSR, ~1,000 lines late | all three, first |
-| clears the one-shot bail-site record | method-entry | all three |
-
-It returns a `#[must_use]` RAII token that owns the witness, so dropping it
-early re-narrows the window it exists to widen.
-
-**The strengthening: "cannot", not "will be caught".** The brief asks for the
-two paths to be unable to *drift again*, and a counter asserted zero by a test
-is only the second of those. So `x64::compile_with_param_slots` — the entry
-point all three doors use — **takes `&CompileAdmission`**, and the only way to
-obtain one is `compile_gate::admit`. A fourth door written without the gate does
-not compile.
-
-Two deliberate holes, both left visible rather than closed:
-
-* the `jit` crate's own tests drive the backend with hand-built bytecode and no
-  method identity to admit, and an integration test under `jit/tests/` is a
-  separate crate, so `#[cfg(test)]` cannot serve them.
-  `CompileAdmission::for_backend_test()` is their way in;
-* the legacy `x64::compile` wrapper keeps its signature and mints that token
-  itself. Its "arg index == JVM slot" assumption is wrong for any method with a
-  `long`/`double` parameter, so no production path can use it — gating it would
-  have meant editing **~140 unit-test call sites to protect a function
-  production cannot reach**. (That count is the finding: the first attempt did
-  add the parameter there, and 140 compile errors is what said the gate was in
-  the wrong place.)
-
-Neither hole hides anything: `for_backend_test` does **not** open the thread
-scope, so an entry made under it is still counted by
-`ungated_backend_entries()`, which the VM asserts is zero over a real run.
-**The type system stops the accident; the counter stops the deliberate misuse;
-the name makes the latter greppable.**
-
-Both layers are behaviour-named rather than source-scanning, because five checks
-in this repository named a *file* where they meant a module and died when that
-file was split.
-
-What this does **not** do: unify `compile_osr_artifact` and `try_compile_inner`
-into one function. The OSR door still carries ~1,000 lines of its own
-constant-pool resolution, duplicating what `try_compile_inner` does with
-different resolvers. That duplication is real and still open — but it was never
-the drift the brief was about, which was the *admission chain*, and that is now
-impossible to skip.
-
-Two things this deliberately did NOT do. `compile_osr_artifact` asks the two
-whole-method vetoes (kill switch, bisect levers) *before* consulting its
-artifact cache, via `compile_gate::compiled_execution_forbidden`, and takes the
-full admission only when it is about to compile — refusing to *reuse* a body
-that is already committed because the code cache is full would cost throughput
-and buy nothing. And `SELF_CALL_IDENTITY_STABLE` stays in `try_compile`: it is a
-proof the caller deposits for one compile, and the other two doors neither set
-nor read it.
-
-### 4. Cross-check `osr_entry_frame_state` against the deopt frame state · **DONE 2026-08-04**
-
-`CompiledMethod::osr_home_disagreement`, consulted by `validate_osr_entry`
-before its per-slot loop.
-
-The two views are not "the entry frame state and the deopt frame state" — those
-are literally the same object; `osr_entry_frame_state` reads `deopt_points`. The
-real pair, and the one that can contradict, is:
-
-* the **precise `FrameState`** at the entry bci — what `validate_osr_entry`
-  type-checks the interpreter's offer against; and
-* the **register homes** (`osr_local_assignments` / `osr_xmm_assignments`) —
-  what `osr_trampoline` actually seeds through.
-
-Both are produced by one compile from one allocator state, so a disagreement
-means *the entry that was validated is not the entry that is performed*: a
-`double` whose only home is a GPR has its bits moved into a register the body
-reads as an integer, and — worse — a reference whose only home is an XMM is
-seeded into the FP file **with the frame-slot store elided**, so the GC's
-precise map has nothing to find.
-
-Deliberately narrow, and the narrowness is the design:
-
-* it cross-checks the register **file** only. It does not assert that a live
-  slot has a home (memory-homed locals are ordinary), that a homed slot is
-  described (a snapshot shorter than the frame simply does not describe its
-  tail), or anything about the dead mask;
-* a slot's homes are an *admissible set*, not a single answer. A JVM slot index
-  is legally reused by locals of different types in disjoint live ranges
-  (`DualPivotQuicksort.mixedInsertionSort` has slot 7 as a `long`'s high half in
-  one region and an `int` counter in the others), so one slot can carry BOTH a
-  GPR and an XMM home and the trampoline seeds both. Treating "has an XMM home"
-  as "is FP" would have refused those;
-* masked-dead slots are skipped: the trampoline does not seed them, so their
-  homes describe nothing that happens at this entry.
-
-The refusal tag `osr-entry-contract-disagreement` is **artifact-level** and
-therefore memoable through `mark_osr_entry_rejected` — it reads no offered
-locals. Memoing a state-dependent refusal is the same bug in the other
-direction: a silent, permanent loss of OSR.
-
-### 5. The pc-space newtype (was Risk 1) · **DONE 2026-08-04**
-
-`jit/src/osr_coords.rs`: `OutPcIndexed<T>` and `BciIndexed<T>`. Not a
-`BciPc`/`OutPc` scalar newtype threaded through `x64.rs` and `lib.rs` — that
-would have rippled into the artifact corpus, the runtime and thirty test call
-sites for a property that only matters at one boundary. What the *vectors* are
-indexed by is the thing that goes wrong, so the vectors carry the type.
-
-There are exactly two ways out of output-pc space, and the dangerous one is the
-boring one:
-
-* `BciIndexed::from_translated` — the loop rewriter is armed, so
-  `rebuild_pc_to_native` (or the pointwise `osr_entry_pc` remap) produced a new
-  vector. Announced by its own call.
-* `OutPcIndexed::into_bci_by_identity` — the rewriter is not armed, so the two
-  spaces coincide and the vector is reinterpreted. **This was a bare
-  `None => osr_entry_native` match arm.** The assumption behind it —
-  `code_len == orig_code_len` on that path — was stated nowhere and checked
-  nowhere. The conversion now takes `orig_code_len` and verifies the length it
-  implies, and a mismatch takes the same fail-closed path as a contract
-  violation.
-
-`osr_coordinate_mismatches()` counts them; `coordinates_agree` short-circuits
-the contract check so one bug is not counted in both places.
-
----
-
 ## Risks
 
 1. ~~**A newtype for the two pc spaces is not there.**~~ Built — see step 5.
@@ -377,74 +208,6 @@ metadata set whose pieces disagree, and one whose two views of the frame
 disagree about which register file a local lives in. All three are the same
 trade: over-refusal costs an optimisation, under-refusal re-runs loop iterations
 or resumes with the wrong locals.
-
-## Verification (2026-08-04, Azure Linux, release build)
-
-Every check here is fail-closed, so "it never fires" has to be a measurement and
-each one has to be shown capable of firing.
-
-**Correctness, differential.** `probes/OsrDeadLocalProbe` FNV-1a accumulator
-`5697627218349681645` on **HotSpot (JDK 21)**, on **CratonVM `--nojit`**, and on
-**CratonVM with the JIT and this change** — the same value this document
-recorded for the previous increment. `bench/CratonBench`: all seven phase
-checksums identical to HotSpot, in both the default arm and the
-`bg-compile=0` arm.
-
-**The counters, on real runs.**
-
-| Workload | method-entry | eager-first-call | osr | ungated | contract viol. | coord. mismatch |
-|---|---:|---:|---:|---:|---:|---:|
-| `OsrDeadLocalProbe` | 0 | 0 | **8** | 0 | 0 | 0 |
-| `CratonBench`, default | 8 | 0 | **7** | 0 | 0 | 0 |
-| `CratonBench`, `bg-compile=0` | 8 | **22** | 7 | 0 | 0 | 0 |
-
-The first row is why the third exists: no single configuration exercises all
-three doors, so a one-arm measurement would have left two of them unproven.
-
-**Over-refusal: none.** The new entry-time refusal is the one change here that
-could silently cost a workload its OSR, so it was A/B'd against a `dev`-base
-binary (`51bbf9211`), arms interleaved base/fix/base/fix:
-
-| | base | fix |
-|---|---:|---:|
-| `OsrDeadLocalProbe` OSR entries | 22, 22 | 22, 22 |
-| `CratonBench` compiles (c1 / c2 / osr) | 4 / 9 / 7 | 4 / 9 / 7 |
-| `CratonBench` `OSR-refuse` lines (`CRATONVM_DBG=jitc`) | 0 | 0 |
-| `CratonBench` `osr_refused_entry` | — | **0** |
-
-`validate_osr_entry` refused **nothing** on either arm, so the contract-
-disagreement tag never fired on real code — which is what "expected to stay
-zero" has to mean before it is worth having.
-
-One thing this measurement corrected on its own: `CratonBench` OSR *entries*
-first read 509 (base) against 508 (fix), reproducibly, across both interleaved
-rounds. It is not a delta. Repeating it on the **same** binary gives 510 and 508,
-and the workload's own `total invocations` swings 4,240–6,224 run to run — the
-interpreter/compiled split moves with timing, so a back-edge counter can miss
-its threshold. The compile counts, which do not depend on timing, are identical
-on every run. A two-round interleave was not enough to see that; the same-binary
-repeat was.
-
-**Each check shown capable of firing** (inject, build, run, revert):
-
-| Injected edit | Observed |
-|---|---|
-| delete `compile_gate::admit` from `compile_osr_artifact` | `osr: admitted=0`, `ungated-backend-entries=3`; the witness test FAILS |
-| delete it from the eager first-call door | `eager-first-call: admitted=0`, `ungated-backend-entries=9`; the witness test FAILS |
-| `into_bci_by_identity(orig_code_len + 1)` at the publication site | `osr-coordinate-mismatches=8` with a per-method line naming both lengths; `osr-contract-violations` stays **0** (the short-circuit stops one bug being counted twice); the probe's FNV accumulator is **unchanged** — the fail-closed path drops OSR and the interpreter finishes the method, which is what fail-closed is supposed to look like |
-
-And the injection that mattered most: the *first* run of the first injection
-**passed**, because the test then lived under `vm/tests/` and cargo had not
-rebuilt the binary it spawned. See the banner at the top of this document.
-
-**Suites.** `cargo test --release -p cratonvm-jit`: 1,912 lib tests + all
-integration targets, 0 failed.
-
-## Effort
-
-Steps 1–5: **done**. Nothing in this document is open.
-
----
 
 ## See also
 

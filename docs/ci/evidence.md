@@ -50,7 +50,7 @@ Behaviour of the non-default configurations is `ci.yml`'s job — it runs the
 `synthetic-jdk` and `experimental-*` test suites.
 
 **Why it exists.** `cargo build --workspace` compiles exactly one configuration.
-On 2026-07-25 `cargo build --features synthetic-jdk` was found broken on `dev`
+`cargo build --features synthetic-jdk` has been found broken on `dev`
 with 22 name-resolution errors in production code and 327 more errors' worth of
 API drift behind them, in a test module gating 1,522 tests that no compiler had
 looked at for months. Nothing was red, because nothing built that configuration.

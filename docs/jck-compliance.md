@@ -1,6 +1,6 @@
 # JCK Compliance Matrix
 
-> **Status anchor:** 2026-04-18. Numbers are the *internal* running
+> Numbers are the *internal* running
 > estimate produced by mapping unit / JTReg / application-smoke test
 > outcomes onto JCK sections — **not** a claim of OCTLA-signed
 > conformance. Only an Oracle-endorsed run of the actual JCK bundle
@@ -77,16 +77,6 @@
 | `java.sql` / `javax.sql` (via Hibernate+H2 smoke) | 1 | **n/a** | 0 |
 | VM-spec (JVMS 24.0) | 592 JIT tests + 1 568 VM tests | **83%** | 9 |
 | **Workspace total** | **2 243** | **80%** | **41** |
-
-## Changelog
-
-* **2026-04-18 (Session 78, RJ.5):** First full matrix committed.
-  Baseline is the post-Phase-G / post-Phase-A workspace; see
-  `project_state.md` for commit-level detail.
-* **2026-04-18 (Session 79, Phase G):** JIT correctness pinned,
-  `jvm` row moved from 78% → 85%.
-* **2026-04-18 (Session 78, Phase A):** `api/java_nio` moved from
-  62% → 80% on the back of RA.1/RA.2/RA.3/RA.6/RA.7.
 
 ## How this file is regenerated
 

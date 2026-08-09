@@ -1409,12 +1409,19 @@ fn vh_has_synthetic_layout(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
 }
 
 /// Allocate a VarHandle for an instance field.
+/// `field_index` is `i32`, not `usize`, because `-1` is a MEANINGFUL value here:
+/// it is the "not resolved yet" sentinel that `varhandle_get`/`varhandle_set`
+/// branch on to re-resolve the field BY NAME (see their `field_idx >= 0` test).
+/// Both call sites used to launder a failed `resolve_field_index` through
+/// `.unwrap_or(0)`, which is not "unresolved" — it is slot 0, a real field — so
+/// the by-name fallback could never run and every access silently hit the
+/// receiver's first field instead.
 pub(crate) fn alloc_instance_var_handle(
     ctx: &mut dyn NativeContext,
     class_name: &str,
     field_name: &str,
     field_desc: &str,
-    field_index: usize,
+    field_index: i32,
     class_id: cratonvm_types::ClassId,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let vh = try_alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT)?;
@@ -1428,7 +1435,7 @@ pub(crate) fn alloc_instance_var_handle(
         ctx.set_field(vh, VH_FIELD, Value::Object(Some(fld_s)));
         let desc_s = ctx.create_string(field_desc);
         ctx.set_field(vh, VH_FIELD_DESC, Value::Object(Some(desc_s)));
-        ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(field_index as i32));
+        ctx.set_field(vh, VH_FIELD_INDEX, Value::Int(field_index));
         ctx.set_field(vh, VH_CLASS_ID, Value::Int(class_id.as_u32() as i32));
     }
     // WP4.2: also stash in the side table so the descriptor-aware setter
@@ -1441,7 +1448,7 @@ pub(crate) fn alloc_instance_var_handle(
             class_name: class_name.to_string(),
             field_name: field_name.to_string(),
             field_desc: field_desc.to_string(),
-            field_index: field_index as i32,
+            field_index,
             class_id: class_id.as_u32(),
         },
     );
@@ -5218,8 +5225,6 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let field_name = ctx.read_string(name_obj).unwrap_or_default();
     let field_desc = field_descriptor_from_mirror(ctx, type_obj);
 
-    // Resolve the field index
-    let field_index = ctx.resolve_field_index(&class, &field_name).unwrap_or(0);
     let class_id = match mirror_class_id(ctx, class_obj) {
         Some(id) => id,
         None => match ctx.class_id_by_name(&class) {
@@ -5232,6 +5237,22 @@ fn lookup_find_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 }
             }
         },
+    };
+    // HotSpot raises `NoSuchFieldException` from `findVarHandle` for a field
+    // that is not there. `findGetter`/`findSetter` two functions up already run
+    // this exact gate; `findVarHandle` did not, and the `.unwrap_or(0)` below
+    // then turned the miss into a handle onto SLOT 0 — so
+    // `findVarHandle(Point.class, "z", int.class).set(p, 42)` silently
+    // overwrote `Point.x`. `lookup_require_field` only refuses when it could
+    // actually enumerate the declared fields, which keeps the stub-class escape
+    // hatch its two existing callers depend on.
+    lookup_require_field(ctx, Some(class_id), &class, &field_name)?;
+    // `-1`, not `0`, is "unresolved" — see `alloc_instance_var_handle`. A `0`
+    // here is indistinguishable from a real first field, so the by-name
+    // re-resolution in `varhandle_get`/`varhandle_set` could never fire.
+    let field_index = match ctx.resolve_field_index(&class, &field_name) {
+        Some(idx) => idx as i32,
+        None => -1,
     };
 
     let vh =
@@ -10629,7 +10650,15 @@ fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let vh = alloc_static_var_handle(ctx, &class_name, &field_name, &field_desc);
         return Ok(Some(Value::Object(Some(vh?))));
     }
-    let field_index = ctx.resolve_field_index(&class_name, &field_name).unwrap_or(0);
+    // `-1` is the "re-resolve by name at access time" sentinel; `0` is slot 0.
+    // The `Field` object proves the field EXISTS, so no `lookup_require_field`
+    // gate here — but `resolve_field_index` can still miss it (an inherited or
+    // otherwise not-directly-resolvable field), and answering slot 0 for that
+    // aliases an unrelated field of the receiver.
+    let field_index = match ctx.resolve_field_index(&class_name, &field_name) {
+        Some(idx) => idx as i32,
+        None => -1,
+    };
     let class_id = match class_mirror.and_then(|m| mirror_class_id(ctx, m)) {
         Some(id) => id,
         None => match ctx.class_id_by_name(&class_name) {

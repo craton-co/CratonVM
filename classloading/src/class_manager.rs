@@ -9650,7 +9650,7 @@ impl ClassManager {
         // report a duplicate-define `LinkageError` where it currently mints a
         // second copy. That is arguably the JVMS-correct outcome, but it is a
         // behaviour change on the hottest path in the VM and is out of scope
-        // here — see `docs/feature-designs/classloading-identity-audit.md`.
+        // here — see `feature-designs/classloading-identity-audit.md`.
         if let (Some(previous_loader_id), Some(registered_name)) =
             (previous_loader_id, registered_name)
         {

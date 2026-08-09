@@ -58,7 +58,7 @@ withdrawn while the code that reads it is running.
 | `CachedInvokeTarget::Jit::compiled` (`JvmThread::invoke_cache`) | the interpreter's cached invokestatic/invokevirtual arms | itself, as a `RetainedCode` | `get`'s staleness auto-evict, `put` replacement, `evict`, `clear`, thread exit |
 
 The last two are the ones the `jit`-crate inventory above cannot see, and they
-are the ones that broke on 2026-08-03. They are worse than the inline-cache
+are the ones that have broken before. They are worse than the inline-cache
 slots in one specific way: **a per-thread cache is evicted by the thread
 dispatching through it**, and both eviction paths run *from* the dispatch
 helper, i.e. from inside compiled code. So the eviction can run while a frame of
@@ -172,7 +172,7 @@ the artifact to `defer_jit_owner`, which drops it immediately only when
 `put_osr` (superseded body), `invalidate_matching` (both maps),
 `clear_all`, the four inline-cache eviction paths
 (`JitMICSlot::clear_compiled_entry`, `JitPICSlot::install`'s refresh and LFU
-arms, `clear_entries`, `invalidate_targets`), and — since 2026-08-03 — every
+arms, `clear_entries`, `invalidate_targets`), and every
 `cratonvm_jit::RetainedCode` drop, which is how the two `vm/`-side per-thread
 dispatch caches in §1.2 release their keep-alive.
 
@@ -223,7 +223,7 @@ pair across the artifact's drop. Reading the registry:
 — the same lookup with the keep-alive attached. `None` is the safe answer for
 "no live body covers this address"; the alternative was a raw address.
 
-**2026-08-03.** The "closed only indirectly, by `defer_jit_owner`" residual
+**Update.** The "closed only indirectly, by `defer_jit_owner`" residual
 above was not merely untidy — it was the bug. `try_call_compiled_entry_reentrant`
 (the JIT→JIT dispatch helper) dereferenced the bare `usize` and entered the
 callee holding no reference at all, on a `SAFETY` comment claiming the registry
@@ -416,7 +416,7 @@ across the use. Callers that only need "is this address in JIT code" should
 keep using `snapshot_code_ranges_into`, which hands out no owner pointer at
 all.
 
-**Done 2026-08-03:** `try_call_compiled_entry_reentrant` — the one that was not
+**Done:** `try_call_compiled_entry_reentrant` — the one that was not
 a root scan but an *entry into the body*, and therefore the one where the
 missing keep-alive was a use-after-free rather than a stale read. The pin is now
 lock-free, so the cost objection that kept this on the "should" list no longer
@@ -448,7 +448,7 @@ is the same `SharedVm::method_epochs` map `stamp_compilation_epoch` already
 uses, extended so `put` can consult it. Worth doing only once there is evidence
 of an in-flight compile surviving a CHA invalidation; nothing observed.
 
-### 6.5 ~~Retire `docs/jit/code-cache-lifecycle.md` §"Reconciliation 1"~~ — DONE 2026-08-03
+### 6.5 ~~Retire `docs/jit/code-cache-lifecycle.md` §"Reconciliation 1"~~ — DONE
 
 Its "`drain_deferred_jit_owners_if_quiescent` has the ordering backwards"
 finding was fixed; the lock is taken first and the argument is in the function's

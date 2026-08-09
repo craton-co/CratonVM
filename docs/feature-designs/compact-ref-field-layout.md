@@ -1,23 +1,36 @@
-# Compact reference-field layout (architectural lever #1)
+# Compact reference-field layout
 
-**Status:** implemented, validated, and default-ON. Set
-`CRATONVM_COMPACT_REF_FIELDS=0` (also accepts `false`/`off`/`no`) to force the
-legacy uniform 16-byte-cell layout for A/B runs. Correctness ==
-HotSpot (bt10–18, GC_STRESS, HashMap/ArrayList/inheritance mix). Footprint
-reduced (node 56 vs 72 B). Throughput **bt16 ~10 % faster, bt18 parity** with
-the compact-aware inline codegen; current Binary Trees reruns keep this as the
-default allocation-footprint lever.
+**Status:** Shipped (default on; `CRATONVM_COMPACT_REF_FIELDS=0` opts out —
+`false`/`off`/`no` also accepted).
 
-**Goal:** shrink allocation-heavy object footprint by storing **reference
-instance fields as bare 8-byte pointers** instead of the 16-byte tagged `Value`
-cell. A 2-reference node (`TreeNode {l, r}`) drops from HEADER(40)+2×16 = **72 B**
-to HEADER(40)+2×8 = **56 B** (~22 %). The win compounds across every
-reference-heavy workload (linked structures, HashMap.Node, AST nodes, …) as less
-memory allocated, written, swept, and cache-resident per object.
+## What it does today
 
-This was the recommended first slice identified during the binary-trees
-throughput investigation (bt18 vs. HotSpot), where it was tracked as
-architectural lever #4.
+A **reference instance field is a bare 8-byte pointer**, not a 16-byte tagged
+`Value` cell. A two-reference node (`TreeNode {l, r}`) is
+HEADER(40) + 2×8 = **56 B** instead of HEADER(40) + 2×16 = **72 B**, about 22%
+smaller, and the saving compounds across every reference-heavy shape — linked
+structures, `HashMap.Node`, AST nodes.
+
+`compact_ref_fields_enabled()` in `types/src/field_layout.rs` returns `true`
+when the variable is absent, and the answer is read once into a `OnceLock`, so
+the layout is fixed for the life of the process. The layout is honoured on
+every real path: class layout construction (`classloading/src/class.rs`), the
+collector (`gc/src/gen_heap.rs`), the interpreter
+(`vm/src/runtime/interpreter.rs`, `.../jit_bridge.rs`) and JIT codegen
+(`jit/src/ir_lower.rs`, `jit/src/x64/objects.rs` —
+`emit_inline_body_compact_ref_putfield` and the fresh-ctor variant —
+`jit/src/x64/bytecode_walk.rs`, `jit/src/x64/inlining.rs`).
+
+A companion lever in the same file is also default-on:
+`pack_fields_by_width_enabled()` / `CRATONVM_PACK_FIELDS_BY_WIDTH=0`.
+
+Reference **array** elements were always 8 bytes (`REF_ELEMENT_SIZE`,
+`types/src/heap_types.rs`); this feature is about instance fields.
+
+Setting the opt-out restores the legacy uniform 16-byte-cell layout, which is
+what makes A/B runs possible.
+
+## Design rationale
 
 ---
 
@@ -149,64 +162,6 @@ Build `cvmcref.exe` (unique name). Oracle harness (checksums == HotSpot):
 - `CardTest` old→young card barrier under GC_STRESS (= 529637376).
 - `CtorTest`, `CollSmall`/`CollTest`.
 - Measure node size (56 vs 72) and bt throughput delta.
-
-## Validation results (2026-06-22, `cvmcref.exe`)
-
-**Correctness — all == HotSpot golden, compact ON and OFF, JIT on:**
-- binarytrees bt10=135854, bt14=3222190, bt16=14985902, bt18=68332206.
-- bt16 under `CRATONVM_GC_STRESS` = 14985902.
-- Mix (HashMap + ArrayList + inheritance + long/double/object fields) ==
-  HotSpot (199990002100158883), incl. GC_STRESS.
-- stdout/collections work (after the two compat fixes below).
-
-**Footprint — confirmed reduced:** `TreeNode` body 2×8 = 16 B vs 2×16 = 32 B
-(object 56 B vs 72 B). bt18 runs **one fewer young GC** with compact on
-(`CRATONVM_SP_STATS`: 3 collections vs 4).
-
-**Throughput — net win (with the inline codegen below):**
-
-| | bt16 | bt18 |
-|---|---|---|
-| OFF (min-of-5, interleaved) | 12014 ms | 48986 ms |
-| ON | 10880 ms | 49423 ms |
-| ON/OFF | **90 % (~10 % faster)** | **100 % (parity)** |
-
-Getting there required **compact-aware inline codegen** — without it the compact
-JIT path routed field access + allocation through the helpers (each doing a
-per-access `compact_field_slot` → `RwLock` + `Arc`-clone lookup), which made
-compact ~18 % *slower*. The implemented levers, all baking the per-field compact
-offset + ref-ness at JIT-compile time (the offset is hierarchy-invariant under
-the prefix-sum layout, so the declaring class's layout suffices):
-
-1. **Inline getfield** — 8-byte raw-pointer load for a reference field, 16-byte
-   cell payload at the packed offset for a primitive.
-2. **Inline reference putfield** — 8-byte pointer store on the same barrier-free
-   fast path as lever #2 (non-null young receiver, null old, in bounds), else
-   bail to the compact-aware `jit_putfield_object` helper.
-3. **Inline TLAB `new`** — bump-allocate the packed body size and write
-   `array_length`=body + `GC_FLAG_COMPACT` inline; `jit_post_tlab_init`
-   (non-skip path) sets the same.
-
-**Plumbing gotcha that masked the win:** the interpreter's *execute first-call*
-and *OSR-recompile* paths compile through the `x64::compile` wrapper, not
-`try_compile_inner` — so they initially passed an empty `compact_field_info` and
-bt's field ops silently fell back to helpers (inline `new` still engaged because
-`emit_inline_tlab_new` self-looks-up the layout). Fixed by staging
-`compact_field_info` through a thread-local the wrapper consumes. Confirm with
-`CRATONVM_DBG_COMPACT_INLINE=1` (one-shot compile trace per field op / `new`).
-
-**bt18 (parity) — investigated, GC was NOT the bottleneck (refuted).** Measured:
-compact does **fewer** young GCs than legacy at bt18 (3 vs 4, `CRATONVM_SP_STATS`),
-and a `CRATONVM_NO_GC` mutator-only A/B still shows compact ~7 % slower — so
-bt18's gap is **mutator-side**, not GC-scan-side, and is within run-to-run noise
-on this load-volatile box (bt18 ON/OFF bounced 100–115 % across runs while bt16
-held steady at ~90 %). A per-thread cache for the GC `compact_oop_scan` lookup
-(generation-validated; commit `eae5028c`) was added anyway as a general
-GC-hot-path cleanup — it removes a per-object registry `RwLock` acquire and helps
-contended / GC-heavy workloads — but it does **not** move bt18 (consistent with
-GC not being the bottleneck there). The real bt18 mutator residual (if any beyond
-noise) and the broader tagged-`Value`-traffic gap remain for a future pass; the
-headline win is **bt16 ~10 % faster, bt18 ~parity**.
 
 ## Gotcha: synthetic objects that store the wrong type into a reference slot
 

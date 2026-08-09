@@ -455,6 +455,137 @@ fn native_fd_isother0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 ///   * `shared`  — true => shared (read) lock; false => exclusive.
 ///   * `blocking == false` (i.e. `tryLock`) => fail immediately if the
 ///     range is contended rather than waiting.
+/// MEASURED file-locking semantics, so the next reader does not have to
+/// re-derive them from a comment — one of which was wrong (see
+/// `native_fd_release0`).
+///
+/// `lock0` takes its OS lock through a `clone_file` handle that it then drops,
+/// and `release0` unlocks through a DIFFERENT, freshly cloned handle. Both are
+/// only correct if a byte-range lock outlives the particular handle it was
+/// placed through. These tests assert exactly that, on whichever platform they
+/// run, and include the negative control that makes the assertion mean
+/// something.
+///
+/// Measured on Windows 11 (JDK-independent, this is pure Win32) 2026-08-08:
+/// `LockFileEx` locks live on the kernel FILE_OBJECT, not on the HANDLE. A
+/// `DuplicateHandle` (which is what `File::try_clone` is) yields a second handle
+/// onto the SAME file object, so closing it releases nothing, and `UnlockFileEx`
+/// through any handle onto that object releases the range. A separate
+/// `CreateFile` makes a NEW file object and does contend.
+#[cfg(test)]
+mod file_lock_semantics_tests {
+    use super::os_lock;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::path::Path;
+
+    fn open_at(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+    }
+
+    /// `lock0`'s load-bearing premise: the lock it places through a transient
+    /// `clone_file` handle is still held after that handle is dropped, because
+    /// the fd_table's own handle keeps the underlying file object alive.
+    ///
+    /// If this ever stops holding, `lock0` returns `LOCKED (0)` — the value
+    /// `FileChannelImpl.lock`/`tryLock` branches on to hand back a live
+    /// `FileLockImpl` — for a lock that is not there, and two processes running
+    /// `if (ch.tryLock() == null) bail;` both proceed. That is the H2
+    /// `FileLock` / Derby `db.lck` / Lucene `NativeFSLockFactory` shape, so this
+    /// test is the guard on a silent two-writer corruption, not on a comment.
+    #[test]
+    fn a_lock_outlives_the_transient_handle_it_was_placed_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("guard.lck");
+
+        // Stands in for the fd_table entry: alive for the channel's lifetime.
+        let owner = open_at(&path).expect("owner handle");
+        // Stands in for `ctx.fd_table().clone_file(fd)`.
+        let transient = owner.try_clone().expect("clone_file stand-in");
+
+        assert!(
+            os_lock::lock_range(&transient, 0, i64::MAX, false, false).expect("lock_range"),
+            "the first exclusive whole-file lock must be granted"
+        );
+        drop(transient); // exactly what `lock0` does on its way out
+
+        // Stands in for the other process / another opener.
+        let rival = open_at(&path).expect("rival handle");
+        assert!(
+            !os_lock::lock_range(&rival, 0, i64::MAX, false, false)
+                .expect("a contended tryLock must report, not error"),
+            "PREMISE VIOLATED: dropping the handle `lock0` locked through released \
+             the lock, so `lock0` returns LOCKED for a lock that is not held"
+        );
+
+        // `release0`'s actual implementation: unlock through a FRESH clone,
+        // not through the handle that locked. Measured to work — which is what
+        // makes `release0` correct despite its (now corrected) comment.
+        let fresh = owner.try_clone().expect("fresh clone");
+        os_lock::unlock_range(&fresh, 0, i64::MAX)
+            .expect("unlock through a different handle onto the same file object");
+
+        assert!(
+            os_lock::lock_range(&rival, 0, i64::MAX, false, false).expect("lock_range"),
+            "after release0's unlock the range must be acquirable again"
+        );
+        os_lock::unlock_range(&rival, 0, i64::MAX).expect("cleanup unlock");
+    }
+
+    /// NEGATIVE CONTROL. Without this, the test above would also pass on a
+    /// platform where nothing ever contends — e.g. if `lock_range` quietly
+    /// no-op'd and always answered `true`.
+    #[test]
+    fn control_an_independent_opener_really_is_refused_and_then_admitted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("control.lck");
+
+        let holder = open_at(&path).expect("holder");
+        let rival = open_at(&path).expect("rival");
+
+        assert!(
+            os_lock::lock_range(&holder, 0, i64::MAX, false, false).expect("lock"),
+            "control: an uncontended lock must be granted"
+        );
+        assert!(
+            !os_lock::lock_range(&rival, 0, i64::MAX, false, false).expect("probe"),
+            "control: locking is not enforced at all on this platform — every \
+             assertion in this module is vacuous"
+        );
+        os_lock::unlock_range(&holder, 0, i64::MAX).expect("unlock");
+        assert!(
+            os_lock::lock_range(&rival, 0, i64::MAX, false, false).expect("probe 2"),
+            "control: the range stayed locked after an explicit unlock"
+        );
+        os_lock::unlock_range(&rival, 0, i64::MAX).expect("cleanup");
+    }
+
+    /// Closing the LAST handle onto the file object releases the range. This is
+    /// the property that bounds the blast radius of a `FileChannel.close()` that
+    /// never called `release0`.
+    #[test]
+    fn closing_the_only_handle_releases_the_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sole.lck");
+
+        let sole = open_at(&path).expect("sole handle");
+        assert!(os_lock::lock_range(&sole, 0, i64::MAX, false, false).expect("lock"));
+        drop(sole);
+
+        let rival = open_at(&path).expect("rival");
+        assert!(
+            os_lock::lock_range(&rival, 0, i64::MAX, false, false).expect("probe"),
+            "a lock must not outlive the last handle onto its file"
+        );
+        os_lock::unlock_range(&rival, 0, i64::MAX).expect("cleanup");
+    }
+}
+
 fn native_fd_lock0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // JDK sun.nio.ch.FileDispatcher return codes.
     const NO_LOCK: i32 = -1;
@@ -507,19 +638,36 @@ fn native_fd_release0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Nothing to release if the fd is already gone.
         return Ok(None);
     };
-    // Best-effort unlock. cratonvm's `lock0` places the OS lock through a
-    // transient duplicated handle (`clone_file`) that the kernel releases as
-    // soon as that handle is dropped at the end of `lock0` — notably Windows
-    // `LockFileEx`, whose locks are per-HANDLE — so by the time `release0` runs
-    // there is usually no live OS lock left, and a fresh clone here cannot
-    // unlock a range it never locked. The real JDK calls `nd.release()` BEFORE
+    // Unlock through a fresh clone of the same fd. This is a DIFFERENT handle
+    // from the one `lock0` locked through, and that is fine on both platforms —
+    // measured, not assumed, by `file_lock_semantics_tests` above:
+    //
+    //   * Unix: `flock` binds to the open file description, which the `dup`
+    //     shares, so `LOCK_UN` here releases the lock `lock0` took.
+    //   * Windows: `LockFileEx` ranges live on the kernel FILE_OBJECT, and
+    //     `File::try_clone` is `DuplicateHandle` — a second handle onto that
+    //     SAME object. `UnlockFileEx` through it releases the range, and the
+    //     range is still there to release.
+    //
+    // CORRECTION (2026-08-08): this comment previously asserted the opposite —
+    // "Windows `LockFileEx`, whose locks are per-HANDLE — so by the time
+    // `release0` runs there is usually no live OS lock left, and a fresh clone
+    // here cannot unlock a range it never locked". Both halves are false, and
+    // the belief is load-bearing in the wrong direction: read literally it says
+    // `lock0` hands out `LOCKED` for a lock that no longer exists, i.e. that
+    // `tryLock()` cannot exclude a second process. It can — see
+    // `a_lock_outlives_the_transient_handle_it_was_placed_through`, which pins
+    // exactly that and now fails loudly if it ever stops being true. (Locks are
+    // per-handle in the sense that they are NOT inherited by a re-`CreateFile`;
+    // they are not per-handle across a `DuplicateHandle` of one file object.)
+    //
+    // The error is still SWALLOWED, for the unrelated reason that follows: the
+    // real JDK calls `nd.release()` BEFORE
     // `fileLockTable.remove(fli)` in `FileChannelImpl.release`, so propagating
     // an IOException from a failed unlock would ABORT that table removal,
     // leaving a phantom in-JVM lock that makes the next `tryLock` on the same
     // file throw `OverlappingFileLockException` (H2 reopen: "the file is
-    // locked"). Swallow the unlock result so the JDK's FileLockTable
-    // bookkeeping always completes; the kernel has already dropped any real
-    // lock with the lock0 clone handle.
+    // locked").
     if let Ok(file) = ctx.fd_table().clone_file(fd) {
         let _ = os_lock::unlock_range(&file, pos as u64, size);
     }

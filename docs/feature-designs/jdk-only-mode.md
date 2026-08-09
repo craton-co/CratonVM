@@ -1,18 +1,71 @@
 # JDK-only mode — normative design and cross-crate API contract
 
-Status: **in implementation (wave 1)**. Owner: orchestrated multi-agent delivery,
-started 2026-07-31.
+**Status:** Partial — `--jdk-only` exists, boots, and enforces the core
+refusals; the hard-coded dispatch lists it was meant to retire are still there,
+bypassed rather than removed.
 
-Source of the plan: `deep-research-report` (JDK-only mode research), which audited
-the repository and produced the blocker inventory this document implements.
+## What it does today
 
-> **This file is the interface contract.** It is owned by the orchestrator.
-> Implementation agents **read** it and **must not edit** it. Every item below
-> that says MUST is a compile-level commitment other agents are coding against
-> without being able to build. Deviating from a signature breaks other people's
-> code.
+**`--jdk-only` is a policy, not a JDK mode.** `JdkMode` is still exactly
+`{Real, Synthetic}` (`vm/src/config.rs`); strictness is a second, orthogonal
+enum `CompatibilityMode::{Compatible, JdkOnly}` (`types/src/compat.rs`) carried
+as an `ExecutionPolicy`. `--jdk-only` sets `JdkMode::Real` **and**
+`CompatibilityMode::JdkOnly`, and conflicts with `--synthetic-jdk`. Both the
+launcher and the embedded entry point default to `Compatible`.
 
----
+The single decision point is `resolve_dispatch` in `vm/src/vm/vm_exec.rs`.
+Companion CLI switches: `--jdk-only-report`, `--dump-class-origins`,
+`--trace-jdk-only`, `--explain-jdk-only`.
+
+What strict mode enforces today, over and above plain real-JDK mode:
+
+- refuses `NativeKind::SyntheticStub` **at registration and at invocation**
+  (`native-api/src/registry.rs`, `resolve_dispatch`);
+- refuses compatibility-class fabrication
+  (`classloading/src/class_manager.rs`);
+- refuses the canonical-interface substitution map
+  (`Set`→`HashSet`, `Map`→`HashMap`, …) in `vm/src/runtime/interpreter.rs`;
+- refuses unapproved JIT direct-native ladders
+  (`jit/src/lib.rs::direct_native_helper`);
+- **records** `NativeShadowsBytecode` observations rather than rejecting them.
+
+Deletions that did land, with anti-regression tests: the four copies of the
+forced-native `java/lang/String` lists, and the `ThreadPoolExecutor.execute`
+receiver-shape sites. Where those lists went is
+`drop_real_layout_synthetic` in `native-api/src/registry.rs` — still
+name-based, but centralised at **registration** rather than replicated across
+dispatch paths.
+
+## What is not built yet
+
+- **The two large hard-coded lists survive.**
+  `force_native_over_real_jdk_bytecode` (~55 `(class, method, descriptor)`
+  branches, `vm/src/runtime/interpreter/native_override.rs`) and
+  `check_override` (~250 disjuncts, `vm/src/vm/vm_exec.rs`) are untouched. Of
+  `check_override`'s disjuncts only `method.is_abstract()` survives §7 of this
+  contract; the rest are class-name exceptions. They are dead under
+  `--jdk-only` and load-bearing under `Compatible`, which is exactly why
+  deleting them is a `Compatible`-mode change, not a jdk-only one.
+- **`compat_native_wins: true` is still hard-coded** at both
+  `vm/src/runtime/interpreter.rs` and
+  `native_override.rs::resolve_step1_native`, so §7's "concrete bytecode wins"
+  is enforced by the strict arm rather than by the dispatch rule itself.
+- **The `redefine_immune_*` predicate family** (~8 families) is intact and not
+  policy-gated.
+- **`JIT_COMPATIBILITY_MODE`** in `jit/src/lib.rs` is still a process-global
+  latched `AtomicU8`, though `jit_bridge.rs` now reads per-VM policy at three
+  sites.
+
+**Rename, do not purge.** The end state is two modes reached by renaming:
+`--jdk-only` becomes `--real-jdk`, and today's `--real-jdk` (`Compatible`)
+becomes `--synthetic-jdk`. **No synthetic method used by either surviving mode
+may be removed.** Strict mode declines to *admit* a native — at registration,
+by `NativeKind` — and that is the whole mechanism. Deleting the Rust function
+is a different, larger change that breaks the other mode. Sort every candidate
+into *policy artefacts* (hard-coded name lists, per-path copies of one
+decision, `matches!` chains — delete) and *implementations* (the natives
+themselves — keep, and tag `SyntheticStub` if they must not run under strict
+policy).
 
 ## 1. Normative semantics
 
@@ -76,7 +129,7 @@ process-global native caches leaking across VMs.)
 
 ---
 
-## 3. Contract: `types` crate  (owner: agent F)
+## 3. Contract: `types` crate
 
 New module `types/src/compat.rs`, re-exported from `types/src/lib.rs` as
 `pub mod compat;`.
@@ -180,7 +233,7 @@ rather than duplicating.
 
 ---
 
-## 4. Contract: `native-api` crate  (owner: agent D)
+## 4. Contract: `native-api` crate
 
 `native-api/src/registry.rs`:
 
@@ -241,7 +294,7 @@ Rules for D:
 
 ---
 
-## 5. Contract: `classloading` crate  (owner: agent C)
+## 5. Contract: `classloading` crate
 
 New file `classloading/src/class_origin.rs`, `pub mod class_origin;` in
 `classloading/src/lib.rs`.
@@ -339,7 +392,7 @@ Rules for C:
 
 ---
 
-## 6. Contract: `vm/src/config.rs`  (owner: agent A)
+## 6. Contract: `vm/src/config.rs`
 
 ```rust
 pub use cratonvm_types::compat::{CompatibilityMode, ExecutionPolicy};
@@ -365,7 +418,7 @@ impl VmConfig {
 
 ---
 
-## 7. Contract: `vm/src/vm/vm_exec.rs` + interpreter  (owner: agent E)
+## 7. Contract: `vm/src/vm/vm_exec.rs` + interpreter
 
 ```rust
 pub enum DispatchDecision<'a> {
@@ -403,7 +456,7 @@ in place but funnel them through `resolve_dispatch` and mark each with
 
 ---
 
-## 8. Contract: `vm/src/vm/vm_init.rs`  (owner: agent G)
+## 8. Contract: `vm/src/vm/vm_init.rs`
 
 - Propagate `config.compatibility_mode` into the registry
   (`set_compatibility_mode`) **before** any `register_*` pass, and into the
@@ -418,7 +471,7 @@ in place but funnel them through `resolve_dispatch` and mark each with
 
 ---
 
-## 9. Contract: `vm-cli/src/main.rs`  (owner: agent B)
+## 9. Contract: `vm-cli/src/main.rs`
 
 ```text
 --jdk-only                    Real JDK, reject compatibility stubs and fabricated classes.
@@ -461,15 +514,15 @@ Absolute paths are redacted unless `--explain-jdk-only` is passed.
 
 ---
 
-## 10. Wave-1 enforcement posture
+## 10. Enforcement posture
 
-Wave 1 is **measurement, not deletion.** `--jdk-only` may be diagnostic-only
-where enforcement is not yet safe: record the violation, keep going, and count
-it. Only class fabrication (§5) and stub registration (§4) enforce in wave 1.
-Compatible mode must be unchanged; that is checked by the existing regression
-suite and by the stub ratchet.
+Enforcement is **measurement first, deletion later.** Where enforcing is not
+yet safe, `--jdk-only` may be diagnostic-only: record the violation, keep
+going, and count it. Class fabrication (§5) and stub registration (§4) are the
+two that enforce hard. `Compatible` mode must be unchanged by any of it; that
+is checked by the existing regression suite and by the stub ratchet.
 
-## 11. Acceptance criteria (feature-level, not wave-1)
+## 11. Acceptance criteria
 
 - `--jdk-only` cannot start without a valid real JDK runtime image.
 - Final native registry contains zero `SyntheticStub` entries.

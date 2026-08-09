@@ -22,7 +22,7 @@ Logs:
 ## Investigated: is this the known, previously-FIXED Flyway hang recurring?
 
 `FlywayAutoConfigurationTests` was the subject of
-[`fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`](../../internal/fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md),
+`fixed-suite-bugs/springboot/flywayautoconfigurationtests-timeout-jit-site-cache-aliasing-FIXED-20260805.md`,
 a real HANG on 2026-08-05 caused by `383e7f5cf` (a recycled `JitInvokeInfo`
 box address letting one JIT call site serve another site's cached dispatch
 answer — 39 of 73 tests failed with corrupted-looking exceptions such as

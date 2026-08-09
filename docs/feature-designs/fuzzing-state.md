@@ -1,33 +1,39 @@
-# Fuzzing state (`fuzz/`)
+# Fuzzing harness (`fuzz/`)
 
-> Status as of 2026-08-01, branch `feat/c2-review-remediation`.
-> Scope: the P0 Security lane's fuzzing half — "fuzz all binary parsers".
-> Companion to [`class-file-parser-hardening.md`](class-file-parser-hardening.md),
-> which covers the reader's hardening by inspection.
+**Status:** Partial — the harness is complete and CI builds all of it; **no
+fuzzing campaign has ever been run.**
 
-The one-line answer: **the harness is in far better shape than the lane
-brief assumed, and the campaign has still never been run.** Those are two
-separate facts and they have been conflated. Seventeen targets exist, all
-of them reach a real parser, and CI has been building all seventeen on
-every commit for some time. Not one input has ever been executed by CI, and
-there is no record of any human ever having run one either.
+## What it does today
 
-## What the lane brief said, and what is actually there
+Those are two separate facts and conflating them is the standing hazard here.
 
-Verified by reading, with citations, before anything was written:
+- **Seventeen libfuzzer targets exist**, declared in `fuzz/Cargo.toml` with a
+  matching file each in `fuzz/fuzz_targets/`: `fuzz_classfile`, `read_class`,
+  `fuzz_jimage`, `fuzz_stack_map`, `fuzz_instruction`, `fuzz_descriptor`,
+  `fuzz_verifier`, `fuzz_asn1`, `fuzz_keystore`, `fuzz_tls_record`,
+  `fuzz_constant_pool`, `fuzz_attribute_nesting`, `fuzz_jni_descriptor`,
+  `fuzz_jfr_chunk`, `fuzz_zip_entry`, `fuzz_signed_jar`, `difftest_bytecode`.
+  Every one of them reaches a real parser.
+- `fuzz/` is a **standalone workspace**, not a root member, and carries its own
+  `[patch.crates-io]` mirror.
+- Seed corpora are committed under `fuzz/corpus/<target>/`; manual runners are
+  `fuzz/run-all.ps1`, `run-all.sh` and `replay-corpus.sh`.
+- **CI builds, and only builds.** The `fuzz-smoke` job runs exactly
+  `cargo +nightly fuzz build`. It is blocking, which is what stops the
+  standalone harness rotting — but **zero inputs are executed**, and there is
+  no scheduled or long-running fuzz workflow.
 
-| Claim | Reality |
-|---|---|
-| "`fuzz/` contains 18 `libfuzzer` targets" | **17.** `fuzz/Cargo.toml:74-192` declares seventeen `[[bin]]` blocks and `fuzz/fuzz_targets/` holds seventeen files. The count of 18 appears in `class-file-parser-hardening.md:151` and in the brief; nothing has eighteen. |
-| "they are not wired into CI" | **False.** `.github/workflows/ci.yml:926-942` defines a job `fuzz-smoke`, and its own comment says "Keeping this blocking prevents the standalone harness and the native-builtins feature set from drifting." It installs nightly, installs `cargo-fuzz`, and runs `cargo +nightly fuzz build`. All seventeen targets are compiled on every commit. **None is executed.** The same false claim is repeated in `reader/tests/mutation_harness.rs:11-13` — see "Cross-file corrections" below. |
-| "with seed corpora" | **6 of 17 had one.** `fuzz_constant_pool`, `fuzz_attribute_nesting`, `fuzz_jni_descriptor`, `fuzz_jfr_chunk`, `fuzz_zip_entry`, `fuzz_signed_jar`. The other eleven had nothing. Closed by this pass — all seventeen now have committed seeds. |
-| "no crash corpus, no coverage report" | **Confirmed.** No `fuzz/artifacts/` directory has ever existed. No coverage report exists anywhere in the tree. No document records a run. |
-| "no record of any coverage-guided campaign ever having been run" | **Confirmed, and it is the finding that matters.** Everything else in this lane is scaffolding around a campaign that has not happened. |
+## What is not built yet
 
-The distinction is not pedantic. "Not in CI" implies the fix is to add a CI
-job; a job exists and is blocking. The fix is to make that job *execute*
-something, which is a different change with a different cost — see
-[The CI proposal](#the-ci-proposal).
+- **Execution.** Not one input has been run by CI, and there is no record of a
+  human having run one. Everything below about corpus quality and coverage
+  gaps describes a harness that has never been driven.
+- **A nightly (or otherwise long-running) job**, which is what a campaign
+  needs and what the repository does not have.
+
+The behavioural differential harness is a different thing with a different
+posture — it *is* executed and blocking. See
+[`differential-fuzzer.md`](differential-fuzzer.md).
 
 ## Per-target census
 
@@ -142,219 +148,6 @@ input space that reaches it is too structured for a mutator to find and
 too small to need one. Recommended as a `#[test]` in
 `classloading/src/jar_signer.rs`, not as target #18.
 
-## The CI proposal
-
-Two jobs. The first is blocking and cheap; the second is scheduled and
-expensive. Neither can pass without executing something, which is the
-whole point — `fuzz-smoke` as it stands is a compile check wearing a
-fuzzing job's name.
-
-`fuzz/` is not a workspace member and the workflow file is not this lane's
-to edit, so the YAML is reproduced here for the orchestrator to apply.
-
-### Job 1 — replace `fuzz-smoke` (`.github/workflows/ci.yml:926-942`)
-
-Blocking, every PR. Adds roughly two minutes to a job that already pays
-the nightly + `cargo-fuzz` install cost.
-
-```yaml
-  # Fuzz build smoke + committed-corpus replay. Blocking on two counts:
-  # the standalone harness must keep building against the workspace's
-  # feature set, AND every committed seed and crash reproducer must still
-  # execute cleanly. A fuzz job that only compiles is a compile job.
-  fuzz-smoke:
-    name: Fuzz build smoke + corpus replay
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install nightly Rust
-        uses: dtolnay/rust-toolchain@nightly
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cargo-fuzz
-
-      # A JDK boot image so `fuzz_verifier` resolves `java/lang/Object`.
-      # Without it, linking bails before the verifier's type-merge lattice
-      # and the target degrades to a class-file parse.
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '25'
-
-      - name: Build fuzz targets
-        run: cargo +nightly fuzz build
-
-      # Executes every committed seed and every committed crash
-      # reproducer exactly once (`-runs=0`) and exits. Seconds, not hours.
-      # Fails when a committed input crashes, hangs, or trips a property
-      # assertion — so a fixed bug stays fixed — and when a target has no
-      # committed seeds at all, which is the state that makes a
-      # coverage-guided campaign near-useless.
-      # Invoked as `bash <script>`, not `./<script>`: both shell runners in
-      # `fuzz/` are tracked mode 100644 (`git ls-files -s`), because they
-      # were authored on the Windows checkout, which does not carry the
-      # exec bit. `./fuzz/replay-corpus.sh` would be "Permission denied".
-      - name: Replay committed corpus
-        env:
-          CRATONVM_FUZZ_BOOTCP: ${{ env.JAVA_HOME }}/lib/modules
-        run: bash fuzz/replay-corpus.sh
-
-      # The seeds are generated, so a stale corpus is a real failure mode:
-      # a layout change lands, nobody re-runs the generator, and the seeds
-      # quietly stop matching. Regenerating and diffing catches it.
-      - name: Seed corpus is up to date with its generator
-        run: |
-          python3 fuzz/corpus/gen_seeds.py
-          git diff --exit-code -- fuzz/corpus/ \
-            || { echo "::error::fuzz/corpus is stale — run python3 fuzz/corpus/gen_seeds.py and commit"; exit 1; }
-
-      - name: Upload replay logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-replay-logs
-          path: fuzz/artifacts/logs/
-          if-no-files-found: ignore
-```
-
-### Job 2 — the campaign (new file, `.github/workflows/fuzz-campaign.yml`)
-
-Scheduled, not per-PR. One shard per target, 15 minutes each, in parallel:
-roughly 4.25 aggregate CPU-hours per nightly run against the README's
-24-aggregate-hour-per-target acceptance criterion, so a target clears that
-bar in about 96 nightly runs — or immediately, by dispatching manually
-with a larger `duration`.
-
-```yaml
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2024-2026 Craton Software Company
-name: Fuzz campaign
-
-on:
-  schedule:
-    # 03:00 UTC daily. Not on PRs: a coverage-guided run is unbounded and
-    # its result is a property of the commit, not of the diff.
-    - cron: '0 3 * * *'
-  workflow_dispatch:
-    inputs:
-      duration:
-        description: Seconds per target
-        required: false
-        default: '900'
-      targets:
-        description: Space-separated target names (empty = all)
-        required: false
-        default: ''
-
-permissions:
-  contents: read
-
-jobs:
-  campaign:
-    name: fuzz ${{ matrix.target }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - fuzz_classfile
-          - fuzz_read_class
-          - fuzz_constant_pool
-          - fuzz_attribute_nesting
-          - fuzz_stack_map
-          - fuzz_instruction
-          - fuzz_descriptor
-          - fuzz_jni_descriptor
-          - fuzz_verifier
-          - fuzz_zip_entry
-          - fuzz_signed_jar
-          - fuzz_jimage
-          - fuzz_jfr_chunk
-          - fuzz_asn1
-          - fuzz_keystore
-          - fuzz_tls_record
-          - difftest_bytecode
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-fuzz
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '25'
-
-      # `run-all.sh` exits non-zero if the target crashed OR produced a new
-      # artifact, so the job fails on a finding rather than reporting one in
-      # a log nobody opens. `-timeout` and `-rss_limit_mb` are what turn a
-      # hang and an OOM into reportable findings instead of a wedged job;
-      # per fuzz/README.md, a run without them does not count toward the
-      # acceptance budget.
-      - name: Fuzz
-        env:
-          CRATONVM_FUZZ_BOOTCP: ${{ env.JAVA_HOME }}/lib/modules
-          FUZZ_TIMEOUT: '25'
-          FUZZ_RSS_MB: '4096'
-        run: |
-          bash fuzz/run-all.sh "${{ github.event.inputs.duration || '900' }}" ${{ matrix.target }}
-
-      # Always, not just on failure: the log carries the coverage and
-      # corpus-growth numbers, which are the record that a campaign ran at
-      # all. That record is what this whole lane was missing.
-      - name: Upload logs and any crash artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-${{ matrix.target }}-${{ github.run_number }}
-          path: |
-            fuzz/artifacts/
-          retention-days: 30
-          if-no-files-found: warn
-
-      # A crash artifact is a finding even if libFuzzer's own exit code
-      # were to miss it. Belt and braces, because a fuzz job that cannot
-      # fail is theatre.
-      - name: Fail on any crash artifact
-        if: always()
-        run: |
-          n=$(find fuzz/artifacts/${{ matrix.target }} -type f 2>/dev/null | wc -l)
-          if [ "$n" -gt 0 ]; then
-            echo "::error::${{ matrix.target }} produced $n crash artifact(s)"
-            exit 1
-          fi
-```
-
-### What makes each job fail
-
-| Job | Fails on |
-|---|---|
-| `fuzz-smoke` | a target that no longer compiles; a committed seed or reproducer that crashes, hangs past 25 s, or trips a property assertion; a target with **zero** committed seeds; a `fuzz/corpus/` that no longer matches `gen_seeds.py`. |
-| `fuzz-campaign` | any crash, hang, OOM, or property-assertion failure found during the run; any file appearing under `fuzz/artifacts/<target>/`. |
-
-### Where the crash corpus lives
-
-`fuzz/artifacts/<target>/crash-<sha1>` — cargo-fuzz's default
-`-artifact_prefix`, uploaded from every campaign run and gitignored by
-default (`fuzz/.gitignore`, added by this pass). A reproducer worth keeping
-is committed deliberately:
-
-```sh
-cargo +nightly fuzz tmin <target> fuzz/artifacts/<target>/crash-<sha1>
-cp fuzz/artifacts/<target>/minimized-from-<sha1> \
-   fuzz/corpus/<target>/regression-<short-description>
-git add fuzz/corpus/<target>/regression-<short-description>
-```
-
-`replay-corpus.sh` then executes it on every commit, so the fix stays
-fixed. Without the `.gitignore` an hour of `run-all.sh` leaves thousands of
-untracked SHA1-named files in `git status`, which is how a real finding
-gets lost — and, on the Windows checkout, how machine-specific bytes get
-swept into history by a repo-wide auto-commit.
-
 ## Nightly is a hard blocker, and here is the honest fallback
 
 libFuzzer instrumentation is nightly-only. `cargo +nightly fuzz` is not
@@ -388,32 +181,6 @@ Which targets are better expressed that way:
 A bounded deterministic sweep that actually runs does beat an unbounded
 campaign that does not. It does not replace one that does.
 
-## Cross-file corrections needed (not this lane's files)
-
-1. **`docs/known-issues/c2/class-file-parser-hardening.md:151`** says "18
-   `libfuzzer` targets". There are 17.
-2. **`docs/known-issues/c2/class-file-parser-hardening.md:154`** says they
-   "are not wired into CI". They are — `ci.yml:926-942`, blocking. The
-   accurate statement is that CI builds them and never runs them.
-3. **`reader/tests/mutation_harness.rs:11-13`** repeats the same claim in
-   a module docstring: "they require a nightly toolchain and `cargo fuzz`,
-   so they do not run in CI". Same correction. This one matters more than
-   the doc, because it is the first thing a reader of the mutation harness
-   sees and it understates what already exists.
-4. **`classloading/src/class_path.rs:1024,1035`** — `is_safe_resource_name`
-   is `pub(crate)` and `is_safe_class_name` is private, which forced
-   `fuzz_zip_entry` to hand-mirror both predicates. Making them `pub` and
-   having the target call them directly removes a silent-drift hazard: as
-   written, tightening the real predicate makes the fuzz assertion quietly
-   weaker rather than failing.
-5. **`classloading/src/jar_signer.rs`** — the multi-`SignerInfo` case wants
-   an ordering-invariance `#[test]`, not a fuzz target. See above.
-6. **Exec bits.** `fuzz/run-all.sh` and `fuzz/replay-corpus.sh` are tracked
-   mode `100644`; the Windows checkout cannot set the bit. The YAML above
-   works around it with `bash <script>`, which is the robust form anyway.
-   `git update-index --chmod=+x fuzz/*.sh` from a POSIX host is the tidier
-   fix if the orchestrator wants it.
-
 ## Not verified
 
 Stated plainly, because this lane is about not mistaking scaffolding for
@@ -438,11 +205,3 @@ results:
   `fuzz/README.md` — 24 aggregate hours per target with zero findings —
   stands at **zero hours for all 17 targets**.
 
-## Campaign log
-
-Empty by design: nothing has ever been run. Append one row per completed
-shard. This table, not the CI badge, is the record.
-
-| Date | Commit | Target | Duration | Host | Result |
-|---|---|---|---|---|---|
-| — | — | — | — | — | *no campaign has ever been run* |

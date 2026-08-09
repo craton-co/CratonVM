@@ -23,7 +23,7 @@
 //! [`JIT_HELPERS_ABI_VERSION`] when you do — [`helpers_abi::ABI_REVISIONS`]
 //! makes that a compile error to forget. The full contract, the per-field
 //! signatures, and the per-field nullability rules live in [`helpers_abi`];
-//! `docs/jit/helper-abi-audit.md` lists which invariants have tripwires, which
+//! `docs/jit/helper-abi.md` lists which invariants have tripwires, which
 //! do not, and the procedure for adding a slot.
 //!
 //! ## `gpu-lowering` feature status

@@ -1,209 +1,56 @@
-# Production ZGC: parallel implementation plan
+# Production ZGC
 
-Status: **superseded in part — see [§0 Status as of 2026-08-07](#0-status-as-of-2026-08-07).**
-Phase 0 is landed; Phases 1 (except 1c), 2, 3 and 4a landed the same day as
-**unadopted modules**; 4b landed as an audit; Phase 5 is not started.
-*Original banner, 2026-08-07 (superseded): "plan — Phase 0 partly landed,
-Phases 1–5 not started."* Target, unchanged: turn the default-off `zgc` feature
-from a stop-the-world non-moving mark-sweep into a concurrent, generational,
-compacting collector that is at pass-rate parity with Generational.
+**Status:** Partial — selectable behind the `zgc` cargo feature, but the
+collector it selects is a stop-the-world non-moving mark-sweep. The concurrent,
+generational, compacting machinery is written and unit-tested and **not
+adopted**.
 
-*Written 2026-08-07, grounded in a read of `gc/src/{zgc,zgc_concurrent,vm_heap,tlab,g1_concurrent,satb,compressed_oops}.rs`,
-`vm/src/config.rs`, `vm/src/vm/vm_init.rs`, `gc/Cargo.toml`, `vm/Cargo.toml` and
-`.github/workflows/ci.yml`. The measured baseline is
-[`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`](../known-issues/springboot/zgc-real-fullsuite-regression-20260807.md);
-that record is history and is not edited by this plan.*
+## What is built
 
-This doc is the **execution guide** — who can work on what, simultaneously,
-without colliding. It follows the lane/ownership convention of
-[`jdk-only-wave2/README.md`](jdk-only-wave2/README.md) and the status-banner
-convention of [`concurrent-gc-maturation.md`](concurrent-gc-maturation.md),
-whose §8 lists production ZGC as explicitly out of its own scope. **This doc is
-that follow-up.**
+- **The feature and its wiring.** `zgc = []` in `gc/Cargo.toml`, forwarded as
+  `zgc = ["cratonvm-gc/zgc"]` (`vm/Cargo.toml`) and
+  `zgc = ["cratonvm-vm/zgc"]` (`vm-cli/Cargo.toml`). Nothing defaults to it.
+  The `GcAlgorithm::Zgc` variant and the `"z" | "zgc"` arm of
+  `parse_gc_algorithm` are themselves `#[cfg(feature = "zgc")]`, so
+  `-XX:+UseZGC` selects a real backend only in a build that compiled it.
+- **`ZgcRealHeap` is real, not a stub** (`gc/src/zgc.rs`). It backs every
+  allocation with owned memory, writes real object headers, and implements
+  `GarbageCollector` with the same bounds-checked semantics as its siblings.
+  Its `collect_garbage` traces the live graph, marks survivors and reclaims
+  onto a free list. It is **non-moving**, so it reclaims but does not compact,
+  and it returns an empty pointer map.
+- **The submodules exist and are unit-tested**: `vaddr`, `page`, `barrier`,
+  `forwarding`, `metrics`, `remembered`, `mark`, `generation`, `relocate`,
+  `tlab`, `census`, `adapters`.
+- **Partial adoption has begun.** `ZgcRealHeap` implements `ZTlabHeapHooks` and
+  `mark::ZMarkContext` and owns a `census::ZSlotCensus`.
 
----
+## What is not built yet
 
-## 0. Status as of 2026-08-07
+- **Nothing concurrent runs.** `gc/src/zgc_concurrent.rs` has zero non-doc
+  callers; no `ZMarkContext`-backed coordinator is spawned for `ZgcRealHeap`.
+- **Nothing relocates.** `barrier`, `forwarding`, `relocate`, `page`,
+  `generation`, and `vaddr`-as-a-slot-encoding are unadopted. There is no
+  production `impl ZBarrierContext` anywhere — only test implementations
+  inside `gc/src/zgc/barrier.rs`. `ZgcRealHeap`'s `ZMarkContext` returns
+  `vaddr::Z_REMAPPED` unconditionally, because the heap stores raw pointers in
+  its slots, never a colored word.
+- **The JIT emits no load barrier.** See
+  [`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md).
+- **Reference slots are not colored.** See
+  [`zgc-reference-slot-representation.md`](zgc-reference-slot-representation.md).
+- **`ZgcCollector` / `ZgcHeap` / `GenerationalZgc` / `ColoredPointer` /
+  `LoadBarrier` are a metadata-only simulation** of OpenJDK's model — synthetic
+  page addresses with no backing storage, a forwarding table that copies no
+  bytes, a `&mut self` barrier rather than an atomic self-healing CAS.
+  Selecting one emits a one-time warning so it cannot masquerade as production
+  ZGC.
 
-*Added 2026-08-07, later the same day this plan was written, by a recount from
-disk. Sections 1–5 below are preserved as the reasoning trail that produced the
-work; where a claim was true when written and is no longer, it carries a dated
-supersession note rather than being deleted.*
-
-### 0.1 The scope point, first, because it is the one that gets misread
-
-The **eleven** modules under `gc/src/zgc/` are **built, unit-tested, and
-compiling green under `--features zgc`. They are NOT ADOPTED BY `ZgcRealHeap`.**
-The "Production-ZGC submodules" banner over the `pub mod` block in
-`gc/src/zgc.rs` says so in the source:
-
-> NONE of them is wired into `ZgcRealHeap` yet — `ZgcRealHeap` is still the
-> stop-the-world non-moving mark-sweep it has always been.
-
-A `grep` for `vaddr::|page::|barrier::|forwarding::|metrics::|remembered::|mark::|generation::|relocate::|tlab::|census::`
-in `gc/src/zgc.rs` returns **zero** hits outside the `pub mod` declarations
-themselves — the sole match is a `TODO(zgc)` comment about
-`metrics::ZgcMetrics::format_cycle_line`, i.e. an intent, not a call.
-
-*Recounted 2026-08-07 (later): the count was **ten** when this section was
-first written; `census.rs` was declared shortly afterwards. The
-non-adoption verdict is unchanged and was re-verified against the tree.*
-
-**One nuance, because it cuts the other way and should not be hidden:**
-`gc/src/zgc_concurrent.rs` **does** consume `zgc::mark` (it imports
-`ZMarkCoordinator`, `ZMarkEndResult`, `ZMarkHandle`, `ZNonStrongRefHook`), so
-`mark.rs` is not friendless. But that driver has **no `ZMarkContext`
-implementation for `ZgcRealHeap`** — its own module docs say the only
-implementation is the test-only `TestMarkContext`, and that
-`ZgcRealHeap::collect_garbage` remains single-threaded. So `zgc_concurrent.rs`
-is not on the execution path either, and the conclusion below stands.
-
-**RUNTIME BEHAVIOUR IS UNCHANGED.** `-XX:+UseZGC` today selects exactly the
-collector it selected before these modules landed: stop-the-world, non-moving,
-non-generational, no TLABs, no load barrier, no compaction. **ZGC is not now
-concurrent and not now generational.** Nothing in the 2026-08-07 baseline
-(1860 PASS / 49 HANG / 22 FAIL) has been re-measured or moved, because no code
-on the execution path changed.
-
-This distinction is not pedantry. Writing "Phase 2 landed" when what landed is
-an unadopted `generation.rs` is precisely how this tree accumulated the stale
-ZGC docs that workstream 0c existed to clean up. **"Module landed" and
-"collector does this" are two different claims.** Keep them apart.
-
-### 0.2 What actually landed
-
-| WS | Artifact | Lines | Tests | State |
-|---|---|---|---|---|
-| **0a** | `.github/workflows/ci.yml:490-495` | — | — | **LANDED** — builds `cargo build -p cratonvm-cli --features zgc`, runs `cargo test -p cratonvm-gc --lib --features zgc` |
-| **0b** | `gc/src/zgc/metrics.rs` | 1819 | 29 | **LANDED, unadopted** |
-| **0c** | `docs/GC.md`, `docs/gc-tuning.md`, `docs/gc/gc-crate-audit.md` | — | — | **LANDED** |
-| **1a** | `gc/src/zgc/vaddr.rs` | 1499 | 30 | **LANDED, unadopted** |
-| **1b** | `gc/src/zgc/barrier.rs` | 2326 | 39 | **LANDED, unadopted** (interpreter side only) |
-| **1c** | JIT emit sites | — | — | **NOT STARTED** — see §0.4 |
-| **1d** | `gc/src/zgc/page.rs` | 2111 | 19 | **LANDED, unadopted** |
-| **1e** | `gc/src/zgc/forwarding.rs` | 2068 | 25 | **LANDED, unadopted** |
-| **2a** | `gc/src/zgc/generation.rs` | 2632 | 20 | **LANDED, unadopted** |
-| **2b** | `gc/src/zgc/remembered.rs` (planned as `remset.rs`) | 2137 | 29 | **LANDED, unadopted** — but see the live decision in §0.3 |
-| **3a** | `gc/src/zgc/mark.rs` + `gc/src/zgc_concurrent.rs` rewrite | 3256 + 1531 | 20 + 12 | **LANDED, unadopted** (`mark.rs` is used by the driver — see §0.1) |
-| **3b** | `gc/src/zgc/relocate.rs` | 3079 | 19 | **LANDED, unadopted** |
-| **4a** | `gc/src/zgc/tlab.rs` | 2090 | 19 | **LANDED, unadopted** — an *adapter* over `gc/src/tlab.rs`, not a duplicate |
-| **4b** | [`docs/gc/zgc-vmheap-arm-audit.md`](../gc/zgc-vmheap-arm-audit.md) | — | — | **AUDIT LANDED**, arms unchanged — see §0.5 |
-| **5a–5d** | — | — | — | **NOT STARTED** |
-
-`gc/src/zgc.rs` is now **3788 lines** and `gc/src/zgc_concurrent.rs` **1531**.
-The **eleven declared** modules total **~25,700 lines** and **~275 `#[test]`s**.
-Whole-feature unit-test count: **~380 and rising** (91 + 12 + ~275).
-
-*Recounted 2026-08-07 (later). This paragraph first read "ten … ~22,970 lines …
-241 … 344"; that was correct before `census.rs` was declared (+2708 lines, +24
-tests). **Every number in §0.2 is a moving target — modules were still gaining
-tests during this very recount (`barrier.rs` 36→39, `metrics.rs` 27→29,
-`remembered.rs` 26→29, and the whole-feature total 368→379, all within the
-hour).** Treat the line counts as approximate
-and the test totals as "as-of"; the stable facts are the **module count** and
-the **unadopted** state.* Recount with:
-
-```bash
-grep -c '#\[test\]' gc/src/zgc.rs gc/src/zgc_concurrent.rs \
-  $(sed -n 's/^pub mod \(.*\);$/gc\/src\/zgc\/\1.rs/p' gc/src/zgc.rs)
-```
-
-There is also `gc/tests/zgc_module_integration.rs` (2021 lines, 25 tests), an
-integration target — it is **not** in the `--lib` count above.
-
-> **`gc/src/zgc/census.rs` (2708 lines, 24 tests) — the eleventh module.**
-> *Superseded 2026-08-07 (later the same day): this blockquote originally read
-> "exists on disk but is **NOT declared** in `gc/src/zgc.rs`. It therefore does
-> not compile and none of its tests run." **That is no longer true.*** It is now
-> declared (`pub mod census;`, the last entry in the `pub mod` block), so it
-> compiles and its 24 tests run under `--features zgc` — worth **+24** on the
-> whole-feature count (344 → 368 at that moment; ~376 by the time of this
-> recount, as other modules gained tests). Risk **R4** (feature-gate rot) is
-> **closed for this file**; the "declare it or delete it" call was resolved by
-> declaring it.
->
-> It still belongs to
-> [`zgc-reference-slot-representation.md`](zgc-reference-slot-representation.md)
-> rather than to a workstream in this plan, and like every other module here it
-> is **unadopted** — a reference-slot *measurement* instrument, not collector
-> code. Declaring it changed what CI compiles; it changed nothing at runtime.
-
-> **R4 is NOT closed in general — it has already recurred.** As of this recount
-> `gc/src/zgc/adapters.rs` (59 KB, 11 `#[test]`s) sits in the module directory
-> and is **declared nowhere** (`grep -rn 'mod adapters' gc/src/` returns
-> nothing). It does not compile and none of its 11 tests run. This is the exact
-> situation `census.rs` was in a few hours earlier, so treat the pattern, not
-> the file, as the finding: **a file appearing under `gc/src/zgc/` is not
-> evidence it builds.** Either declare it or delete it.
->
-> **Consequence for anyone counting:** do **not** recount with a
-> `gc/src/zgc/*.rs` glob — it counts undeclared files and silently inflates the
-> total (by 11 right now). Use the `pub mod`-driven command above, which counts
-> only what the compiler sees.
-
-### 0.3 Live decision: `remembered.rs` vs the existing card table
-
-`gc/src/zgc/remembered.rs` builds a per-page bitmap pair, faithful to OpenJDK
-Generational ZGC. **Its own author recommends NOT using it for the first
-generational landing.** From its module doc (`remembered.rs:25-163`): the
-bitmap pair costs **16x** the byte-map of the existing
-[`crate::card_table::CardTable`], and the three properties that justify that
-cost — O(1) per-page lookup, page-relative indexing, a non-contiguous address
-space — only become load-bearing once ZGC actually allocates from real
-`page.rs` pages. Until then the recommendation is to **reuse
-`gc/src/card_table.rs`** over a contiguous range.
-
-**This is an open decision, not a settled one.** Whoever adopts Phase 2 picks
-one; picking the bitmap by default because it is the newer file would be the
-wrong reason.
-
-### 0.4 1c (JIT load barrier) is the outstanding correctness gap
-
-1b shipped the **interpreter** barrier only. Risk **R3** in §4 is therefore
-live and unmitigated: a barrier the interpreter honours and compiled code does
-not is not a partial barrier, it is a broken one. This does not bite today only
-because 1b is unadopted — the moment `ZgcRealHeap` takes the barrier, 1c is a
-hard blocker, not a follow-up.
-
-> **Superseded 2026-08-07 (later the same day).** This blockquote originally
-> read: *"a companion doc `docs/feature-designs/zgc-jit-load-barrier.md` has
-> been described as costing this work out. **No such file exists** — `grep -r
-> zgc-jit-load-barrier` returns nothing anywhere in the tree as of this
-> writing."* **That was true when written and is now false:**
-> [`zgc-jit-load-barrier.md`](zgc-jit-load-barrier.md) landed the same day and
-> is referenced from `vm/src/vm/vm_init.rs`. The ZGC companion docs are now
-> that one, [`zgc-reference-slot-representation.md`](zgc-reference-slot-representation.md)
-> and [`../gc/zgc-vmheap-arm-audit.md`](../gc/zgc-vmheap-arm-audit.md).
->
-> **What has NOT changed is the status of 1c itself: no JIT emit site was
-> modified, so the correctness gap above is fully live.** A design doc is not
-> an implementation — treat that file as a costing, and re-read it before
-> quoting it, rather than as evidence 1c has moved.
-
-### 0.5 4b landed as an audit, and it found live bugs
-
-[`docs/gc/zgc-vmheap-arm-audit.md`](../gc/zgc-vmheap-arm-audit.md) classifies
-every `VmHeap::Zgc` arm. Headline: **16 NON-MOVING-ONLY** (correct today, wrong
-under compaction or a generational split) and **5 ALREADY-WRONG** — wrong for
-today's non-moving collector, i.e. **five live defects that do not need Phase 3
-to bite**. No code was changed by that audit; the arms are as they were.
-
-Ranked 1–5 there: the empty `pointer_map`; the `is_addr_live` /
-`watched_pre_gc_addr_survived` predicates that must land *with* it;
-`supports_jit_tlab_skip` plus the two skip-region no-ops; `pin_critical_region`
-returning `Vec::new()`; and `metadata_pin_deferrable` / `mirror_pin_deferrable`
-answering `true`.
-
-### 0.6 Metrics: the concurrent column is zero by construction
-
-`gc/src/zgc/metrics.rs:544` defaults `phases_run_concurrently` to **`false`**,
-deliberately, because the collector is stop-the-world for everything. **Any
-report showing 0% concurrent time is reproducing that default, not measuring
-the collector.** It becomes a measurement only once a phase genuinely runs off
-the safepoint and something calls `set_phases_run_concurrently(true)`. Do not
-quote it as evidence either way before then.
-
----
+**Why it is default-off:** not because nothing uses it, but because it is not
+at pass-rate parity with Generational. Default-off is not uncompiled — CI's
+`experimental-features` job builds the `cratonvm-cli` binary under the feature
+and runs the gc crate's unit tests with it, because this configuration once
+stopped compiling entirely and nobody noticed.
 
 ## 1. Where ZGC actually is
 
@@ -282,9 +129,9 @@ file can run at the same time by different agents.
 
 | WS | What | Owned files | Gated on | Status |
 |---|---|---|---|---|
-| **0a** | CI must build the *binary*, not just the libs, under `--features zgc` | `.github/workflows/ci.yml` | — | **DONE 2026-08-07** |
+| **0a** | CI must build the *binary*, not just the libs, under `--features zgc` | `.github/workflows/ci.yml` | — | **DONE** |
 | **0b** | Pause/phase/GC-count instrumentation for `ZgcRealHeap` | `gc/src/zgc/metrics.rs` (new) | — | in progress |
-| **0c** | De-stale the ZGC docs | `docs/GC.md`, `docs/gc-tuning.md`, `docs/gc/gc-crate-audit.md` | — | **DONE 2026-08-07** |
+| **0c** | De-stale the ZGC docs | `docs/GC.md`, `docs/gc-tuning.md`, `audits/gc-crate-audit.md` | — | **DONE** |
 
 **0a is already landed and is the precedent that motivates the rest.**
 `ZgcRealHeap::with_capacity()` was left out of the change that gave the
@@ -514,11 +361,11 @@ anything that adds a `VmHeap` method. Serialize them or hold the file.
   must survive as long as any type in it is constructible.
 * **G1 maturation** — owned by [`concurrent-gc-maturation.md`](concurrent-gc-maturation.md),
   which picks G1 as its target and explicitly defers production ZGC to its §8.
-* **The 2026-08-07 regression record** —
+* **The regression record** —
   [`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`](../known-issues/springboot/zgc-real-fullsuite-regression-20260807.md)
   is a run record. It is history. Phase 5 adds new records beside it rather than
   editing it.
-* **`gc/src/zgc.rs`'s address-keyed state was never audited.**
-  [`docs/gc/gc-crate-audit.md`](../gc/gc-crate-audit.md) §5.4 explicitly
-  excludes it ("a distinct model that deserves its own pass"). That audit is
+* **`gc/src/zgc.rs`'s address-keyed state has never been reviewed.** The
+  address-keyed review that covers the rest of the `gc` crate explicitly
+  excluded it as "a distinct model that deserves its own pass". That pass is
   still owed, and Phase 1 makes it larger, not smaller.

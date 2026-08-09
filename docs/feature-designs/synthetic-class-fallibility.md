@@ -1,15 +1,34 @@
-# Fabricating a synthetic class is now fallible — the ambiguity contract
+# Fabricating a synthetic class is fallible — the ambiguity contract
 
-**Status: 🟡 PARTIALLY FIXED 2026-08-01.** The class-manager end refuses to
-fabricate a compatibility stand-in for an ambiguous name, the `NativeContext`
-trait has a channel that can carry that refusal, and the VM's context
-implements it. The ~34 native call sites still use the infallible spelling;
-they are listed below with the exact edit each needs. Nothing in
-`native-builtins/`, `native-io/` or `native-collections/` was touched.
+**Status:** Partial — the fallible spelling exists end to end, but most native
+call sites still use the infallible one.
 
-This closes *Open 2* of `docs/known-issues/c2/classloading-identity-audit.md` and
-unblocks the item `docs/known-issues/c2/native-builtins-shim-audit.md` recorded as
-"cannot be done from this end".
+## What is built
+
+Both spellings live side by side in `native-api/src/registry.rs`:
+
+```rust
+fn ensure_synthetic_class(&mut self, name, num_fields) -> ClassId;              // infallible
+fn try_ensure_synthetic_class(&mut self, name, num_fields)
+    -> Result<ClassId, ClassIdentityError>;                                     // fallible
+```
+
+The infallible one is now a provided method defined as
+`try_ensure_synthetic_class(..).unwrap_or(ClassId::new(0))`, so there is one
+implementation and one place where the refusal is discarded.
+
+- `ClassManager::fabricate_class` (`classloading/src/class_manager.rs`) returns
+  `Result` and reports `ambiguous_stand_in_refused` / `ambiguity_stand_in`.
+- The `NativeContext` trait carries the refusal channel, and the VM's context
+  (`vm/src/vm/vm_exec.rs`) implements it.
+
+## What is not built yet
+
+**32 infallible call sites remain against 15 fallible ones** across
+`native-builtins/`, `native-io/`, `native-collections/` and `native-awt/`.
+Three of the infallible sites are the allocation funnels with roughly 2,300
+callers between them, which is why this is not a mechanical sweep: converting
+a funnel converts its whole call tree's error handling with it.
 
 ## The bug this removes
 
@@ -302,6 +321,6 @@ own wave.
 
 ## Related
 
-* `docs/known-issues/c2/classloading-identity-audit.md` — *Open 2* is this
-  document; *Open 1*, *3*, *4*, *5* remain.
-* `docs/known-issues/c2/native-builtins-shim-audit.md` — the call-site end.
+* [`../architecture/per-vm-state.md`](../architecture/per-vm-state.md) — the
+  class-identity invariant this contract fails closed on: a runtime class is
+  `(binary name, defining loader)`, never a name alone.

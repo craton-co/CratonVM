@@ -4,7 +4,7 @@
 
 ## Not the already-closed doc
 
-`docs/internal/fixed-suite-bugs/springboot/quartzendpoint-webflux-sortedset-first-npe-and-jersey-hk2-perlookup-FIXED-20260803.md`
+`fixed-suite-bugs/springboot/quartzendpoint-webflux-sortedset-first-npe-and-jersey-hk2-perlookup-FIXED-20260803.md`
 closed this exact class 2026-08-03, verifying 7/7 JIT runs and 2/2 `--nojit`
 runs all clean (45/45 each) after two prior symptom families
 (`SortedSet.first()` NPE, Jersey HK2 `PerLookup` resolution) both turned out

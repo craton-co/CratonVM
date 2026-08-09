@@ -152,8 +152,7 @@ Source-verified, `NativeMethodRegistry::register` (`native-api/src/registry.rs`)
 
 The file states it in prose too: *"`register()` is last-registration-wins"* and
 *"Re-registration of a key we have already seen UPDATES THE EXISTING SLOT IN
-PLACE."* Duplicates are never rejected and never warned about. One nuance: since
-2026-08-05 the *kind* is not blindly overwritten — a prior **chosen**
+PLACE."* Duplicates are never rejected and never warned about. One nuance: the *kind* is not blindly overwritten — a prior **chosen**
 `NativeKind` survives a later registration that expressed no opinion. The
 **callback** is always overwritten.
 
@@ -305,7 +304,7 @@ Existing records, cross-referenced rather than restated:
 the standing "resolve by name first, index as synthetic fallback" remedy),
 `W6-3-slot-index-species-residuals.md` (the `javap` oracle, `java.nio.ByteOrder`
 as a second instance), `W4-1-publiclookup-allowedmodes-never-checked.md` (the
-Lookup case end to end), `docs/jdk-only-object-layout-audit.md` (the site census).
+Lookup case end to end), `audits/jdk-only-object-layout-audit.md` (the site census).
 
 ## 6. Declaring a `CRATONVM_*` flag — four files, and it is bidirectional
 
@@ -403,13 +402,13 @@ tree; this section exists so they can be found from one place.
   taxonomy of tests that read green while measuring nothing is
   `W6-5-vacuous-tests.md`.
 * **Fixed wall-clock bounds and fixed line-bands are latent flakes.** The rule is
-  written in `docs/feature-designs/c2/verify-01-differential-harness.md`:
+  written in the differential-harness design:
   *"Do not add fixed wall-clock bounds to any check. Both directions flake: an
   upper bound fails under contention, and a lower bound can pass while measuring
   nothing."* Line-bands rot the same way and have already done so in this
   campaign — `census-asks-one-class-on-one-platform.md` records its own line
   numbers as stale against `dev`, and
-  `docs/feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md`'s
+  `feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md`'s
   `run.sh` citations are stale as written (§9). Source-witness tests that scan a
   fixed window (`vm/tests/t11_safety_conformance.rs`'s five-line `// SAFETY:`
   window, `vm-cli/tests/no_diag_eprintln.rs`'s four-line window) are the same
@@ -449,8 +448,9 @@ before editing:
 | `feature-designs/jdk-only-wave2/README.md` | cites `probes/ExecProbe.java` | `apps/executor_probe/ExecProbe.java` (tracked) |
 
 Separately, seven records in `known-issues/jdk-only/` (`L5`, `L8` ×2, `W4-2`,
-`W5-4`, `W6-5` ×4, `W6-8`) cited internal records by a `docs/internal/…` path,
-which `types/tests/doc_citation_paths.rs::no_source_file_links_into_docs_internal`
+`W5-4`, `W6-5` ×4, `W6-8`) cited internal records by their path inside the
+internal archive, which
+`types/tests/doc_citation_paths.rs::no_source_file_links_into_docs_internal`
 forbids: those records are not published, so the path is a link no public reader
 can follow. Each now cites the record by its path **relative to the internal
 tree's own root**, which is the form that test prescribes. No finding was

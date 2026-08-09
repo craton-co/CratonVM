@@ -1,24 +1,26 @@
-# Semantic Differential Fuzzer vs HotSpot
+# Semantic differential fuzzer vs HotSpot
 
-> Industrialize the manual "run it on HotSpot and eyeball the diff" loop that
-> has produced nearly every bug logged in `MEMORY.md`. Generate
-> and mutate Java programs (and bytecode), run them on **both** CratonVM and a
-> real JDK, and **diff observable behavior** — stdout/stderr, thrown exception
-> type+message, return value, and process exit code — automatically, with
-> corpus growth, crash minimization, and an advisory-to-blocking CI gate path.
->
-> **Goal · Current state · Design · Incremental delivery · Risks · Validation ·
-> Scaffolding to land first.**
+**Status:** Shipped (default on, and blocking in CI).
 
----
+## What it does today
 
-> **Status update (2026-07-02).** `difftest/` is now a workspace member package
-> named `cratonvm-difftest`, and its installed binary is also named
-> `cratonvm-difftest` to satisfy the repository's unique-binary rule. Its CI job
-> is advisory (`continue-on-error`) while cross-platform ledger stability is
-> proven. `fuzz/` remains a separate standalone workspace with 11 declared
-> targets; treat fuzz-build status as advisory release evidence until the
-> current fuzz-smoke job is green on the release commit.
+`difftest/` is a workspace member, `cratonvm-difftest`, whose installed binary
+carries the same name (the repository requires unique binary names). It
+generates and mutates Java programs, runs them on both CratonVM and a real
+JDK, and diffs observable behaviour — stdout/stderr, thrown exception type and
+message, return value, exit code — with corpus growth, crash minimization and
+a divergence ledger.
+
+Modules: `generate.rs`, `mutate.rs`, `minimize.rs`, `oracle.rs`, `ledger.rs`,
+`matrix.rs`, `crossmode.rs`, `census.rs`.
+
+**The CI gate is blocking, not advisory.** The `difftest-gate` job runs
+`gate --corpus difftest/seeds` against a real JDK 25 oracle without
+`continue-on-error`. A second gate runs `--corpus difftest/seeds-jdk-only`.
+The opcode `matrix` step is explicitly report-only.
+
+The panic-only parser fuzzers are a separate harness with a separate posture —
+see [`fuzzing-state.md`](fuzzing-state.md).
 
 ## 1. Problem & motivation
 
@@ -60,116 +62,6 @@ against `java`/`javac` on PATH. The work is to (a) make the *oracle* robust
 (b) feed it a **generator** instead of a hand-written method list, (c) add
 **minimization** and a **regression corpus**, and (d) wire it into the existing
 HotSpot-baseline tooling and CI.
-
----
-
-## 2. Current state in the codebase (what actually exists)
-
-### 2.1 A working semantic differential harness — small and manual
-
-`vm/tests/differential.rs` (642 lines) is the seed of this whole feature and is
-**already real**:
-
-- `differential_run(class, method, descriptor) -> DiffResult` — runs a Java
-  static method under CratonVM and HotSpot and compares.
-- `run_cratonvm(...)` runs **in-process** via `cratonvm_vm::vm::Vm::new(config)`
-  + `vm.invoke(class, method, descriptor, &args)`, capturing
-  `vm.main_thread.printed_lines` and the returned `Value` (`format_value`).
-- `run_hotspot(...)` shells out to `java`/`javac` on PATH: for `main` it runs
-  the class directly; for value-returning methods it **generates, compiles, and
-  runs a `DiffWrapper__` wrapper** that `System.out.println`s the result.
-- `Outcome { stdout, return_value }`, `DiffResult { ..., matches }`, and a
-  serializable `Divergence` / `DivergenceReport` that **writes
-  `bench/differential-divergences.json`** (`DivergenceReport::write_to_file`).
-- Tests `diff_basic_arithmetic` and `diff_string_operations` over
-  `cratonvm/DiffArithmetic` and `cratonvm/DiffString`, both
-  `#[ignore = "requires java/javac on PATH"]`.
-
-**Limitations (the gap this design closes):** the input is a *hand-written list*
-of `(method, descriptor)`; the oracle compares only `stdout` + `return_value`
-(no exit code, no exception **type/message**, no stderr); HotSpot is invoked
-via a stringly-typed wrapper that only handles `()<prim>` and `main`; the
-CratonVM side runs **in-process** so it cannot vary `CRATONVM_DISABLE_JIT` /
-GC-mode per run (the env cache is a process-lifetime `OnceLock`, see §2.4);
-there is no generator, no minimizer, no corpus, no CI hook.
-
-### 2.2 The intrinsic differential pattern (subprocess, two-mode)
-
-`vm/tests/intrinsic_diff.rs` (536 lines) already solves the "vary a
-process-lifetime flag" problem that §2.1 cannot: it launches the **`cratonvm`
-CLI binary as a subprocess** twice — once with `CRATONVM_DISABLE_INTRINSICS=1`
-and once without — and asserts identical stdout. It documents binary resolution
-(`CRATONVM_BIN` → `target/release/cratonvm[.exe]` → `target/debug/...`), a hard
-`RUN_TIMEOUT = Duration::from_secs(120)` per child (to catch the megamorphic
-inline-cache livelock), and the skip-if-not-built convention. This is the exact
-process model the fuzzer's runner should adopt for *both* VMs.
-
-`vm/tests/cluster_a_aqs_chm.rs` / `cluster_c_constructor.rs` (referenced there)
-are further examples of the subprocess-launch pattern.
-
-### 2.3 The JIT-internal differential (host IEEE-754 oracle)
-
-`jit/tests/differential.rs` (360 lines) diffs the **JIT** against the host's
-own f64/f32 evaluation of the same arithmetic (the interpreter follows the same
-semantics), via `cratonvm_jit::x64::compile` + `is_jit_compatible`. Plus
-`jit/tests/intrinsic_arraycopy.rs`, `intrinsic_crc32.rs`, `intrinsic_int_bits.rs`,
-`intrinsic_long_bits.rs`, `intrinsic_string_search.rs`. These are a *self*-diff
-(JIT vs interpreter/host), not vs HotSpot — but they establish the
-"JIT-on vs reference must be identical" axis we want the fuzzer to drive at
-scale, against HotSpot as the reference.
-
-### 2.4 The CLI surface the fuzzer drives
-
-`vm-cli` builds the `cratonvm` binary (`vm-cli/Cargo.toml`, `[[bin]] name =
-"cratonvm"`; optional `java` alias under feature `java-bin-alias`). Its arg
-normalizer (`vm-cli/src/main.rs`) is **`java`-compatible**: accepts `-cp` /
-`-classpath` / `--classpath`, `-jar`, `-Xbootclasspath`, `-Xmx…`, `@argfile`,
-and a main class — so **the same command line runs on `cratonvm` and on `java`**
-(modulo the binary name). This is what makes a clean A/B runner possible: build
-one arg vector, dispatch it to two executables.
-
-Per-run behavior is switched by `CRATONVM_*` env vars cached once per process in
-`vm/src/runtime/env_cache.rs` (`OnceLock`): `CRATONVM_DISABLE_JIT`,
-`CRATONVM_JIT_THRESHOLD`, `CRATONVM_DISABLE_INTRINSICS`,
-`CRATONVM_HELPFUL_NPE_OPCODES`, `CRATONVM_REAL_PROXY_SUPER`,
-`CRATONVM_ROOTSNAP_CACHE`, plus the moving/selective-promote GC knobs referenced
-in `MEMORY.md` (e.g. `CRATONVM_NO_SELECTIVE_PROMOTE`, `CRATONVM_SHADOW_STACK`).
-Because the cache is process-lifetime, **each behavioral mode must be a fresh
-subprocess** — exactly why §2.2's model wins over §2.1's in-process model.
-
-### 2.5 The HotSpot-baseline tooling (perf, not behavior)
-
-`scripts/capture-hotspot-baseline.{sh,ps1}` + `vm/src/bin/bench_hotspot_compare.rs`
-are a **performance** pipeline: capture HotSpot C2 median-ns per kernel into
-`bench/hotspot-baseline.json` (schema `Baseline { schema_version, host,
-captured_at, metrics: { name: { median_ns } } }`), and `bench-hotspot-compare`
-emits a `CratonVM/HotSpot` ratio table + geomean and gates at 1.5×
-(`bench/baseline.json` vs `bench/hotspot-baseline.json`). This is **orthogonal**
-to semantic diffing but is the template to reuse: the committed-JSON-baseline +
-schema_version + host tag + CLI-gate-with-exit-codes shape is exactly what the
-semantic fuzzer's *divergence ledger* and CI gate should imitate. The semantic
-analogue of `hotspot-baseline.json` is `bench/differential-divergences.json`
-(already produced by §2.1) — promote it to a first-class, committed
-*known-divergence ledger*.
-
-### 2.6 The parser fuzz crate (panic-only, to be reused for plumbing)
-
-`fuzz/` (libFuzzer via `cargo +nightly fuzz`, 11 `[[bin]]` targets) fuzzes
-*bytes* with a panic-only oracle. `fuzz-review.md` documents it has **no corpus,
-no regression dir, no `fuzz.toml`, no CI hook, no oracle beyond panic**, and one
-broken target. We **reuse its libFuzzer plumbing and corpus discipline** (seed /
-artifact / `tmin` minimization / OSS-Fuzz `build.sh`) for the *bytecode* mutator
-target (§4 step 5), but the semantic fuzzer's primary engine is generative +
-process-level, not libFuzzer-in-proc (it must fork `java`, which libFuzzer's
-in-process model forbids in the hot loop).
-
-### 2.7 Test infra & app harness (for the macro tier)
-
-`scripts/app-checker.sh` (smoke / functional / recursive / all over `apps/`),
-`scripts/real-run-all.sh`, `test-infra/run-comparison-full.sh`,
-`scripts/triage.sh` already run *real apps* under CratonVM and classify
-rc/first-error. The fuzzer's "macro corpus" tier (whole programs from
-`bench/*.java`, `apps/`) plugs into these rather than reinventing app launch.
 
 ---
 
@@ -372,89 +264,6 @@ suites.
 
 ---
 
-## 4. Incremental delivery plan (small, independently mergeable, each build-green)
-
-Each step compiles and ships value alone; no step requires a later one.
-
-**Step 0 — Scaffolding (see §6).** New `difftest/` workspace crate with a
-`difftest` bin that has subcommands `run` / `gen` / `min` / `gate`, all
-stubbed to a clean "not yet implemented, here's the plan" exit. Lift the
-`Outcome`/`Divergence`/`DivergenceReport`/`JvmException` types from
-`vm/tests/differential.rs` into `difftest::ledger`. Config knobs + env flags
-declared (no behavior yet). *Green:* crate builds, `difftest --help` works,
-`gate` on an empty corpus exits 3. **No source-code behavior change to the VM.**
-
-**Step 1 — Robust two-VM runner over hand seeds.** Implement §3.2 `Runner`
-(subprocess both sides, capture stdout/stderr/rc/timeout) and §3.3 oracle for
-the four channels (exit code, exception fqcn+message, stdout, stderr), with
-strict-by-default normalization. Wire the existing
-`vm/tests/resources/cratonvm/*.java` + a dozen `difftest/seeds/` as the first
-corpus. Port `diff_basic_arithmetic` / `diff_string_operations` to drive the
-new runner. *Green:* `difftest run --corpus seeds` reproduces the manual loop
-for ~20 seeds and writes the ledger; `cargo test -p cratonvm-difftest -- --ignored` runs
-it. **Immediately useful** — replaces the eyeball loop for the seed set.
-
-**Step 2 — Mode matrix + auto-classification.** Add the per-mode subprocess
-fan-out (`jit-on`, `--nojit`, `DISABLE_INTRINSICS`, GC modes, low
-`JIT_THRESHOLD`) and the `JitOnly`/`GcMode`/`Universal`/`Hang`/`Crash`
-classifier (§3.3). *Green:* a seeded known JIT-only divergence (pick one from
-`bench/` that's `--nojit`-clean) is auto-labeled `JitOnly`. This alone
-automates the most common manual triage in `MEMORY.md`.
-
-**Step 3 — Determinism filter + ledger gate + CI.** Add the twice-on-HotSpot
-determinism pre-flight (§3.3), promote `bench/differential-divergences.json` to
-the committed ledger with `known|fixed|new` status, implement `difftest gate`
-with the §3.5 exit codes, and add the CI step. *Green:* CI runs the seed corpus
-on every PR; new divergences fail the difftest job, and the job becomes
-blocking only after `continue-on-error` is removed.
-
-**Step 4 — Grammar-based source generator.** Implement §3.1 tier 2 (typed
-self-printing Java generator) behind `difftest gen --grammar`, seeded weighted
-toward the bug history. *Green:* `difftest gen | difftest run` finds and
-minimizes at least one divergence (or proves parity over N programs) for the
-**first target families** below.
-
-**Step 5 — Bytecode mutator (libFuzzer tier).** Add a structured `ClassFile`
-mutator as a `fuzz/`-style target whose *interestingness* is "diverges from
-HotSpot," reusing `cargo fuzz tmin` for minimization and the §3.4 predicate.
-Re-verify each mutant with `classloading`'s verifier before running. *Green:*
-the mutator runs under `cargo +nightly fuzz run difftest_bytecode` and promotes
-divergent inputs into the differential tier.
-
-**Step 6 — Source minimizer + regression corpus.** Implement §3.4 ddmin source
-shrinker; every confirmed divergence lands a minimized repro under
-`difftest/regression/` and a ledger entry. *Green:* a reproduced historical bug
-(e.g. an arithmetic-overflow or NPE-message case) is minimized to <15 lines and
-committed as a regression.
-
-**Step 7 — Macro tier + OSS-Fuzz onboarding.** Wire `app-checker.sh` programs
-as macro seeds (rc/first-error diff) and add the `difftest_bytecode` target to
-the `fuzz/` OSS-Fuzz `build.sh` sketch already in `fuzz/README.md`.
-
-### First targets (the corners that dominate the bug history)
-
-Ordered by historical bug density in `MEMORY.md`:
-
-1. **`invokedynamic` family** — lambdas, `String` concat indy, record
-   `toString`/components, switch patterns, `MethodHandle` invoke/adapt
-   (Jackson-3 record deser, `reference_record_generics_jackson3`).
-2. **Reflection / generics** — `getDeclaredMethod`, `getGenericSuperclass`,
-   bridge methods, `Class.getModifiers` on primitive/array/void
-   (`reference_bug06_*`, kafka bug-09 Mockito), `forLanguageTag` CCE.
-3. **JIT correctness** — escape-analysis scalar replacement (kafka bug-25),
-   catch-bypass (bug-H/I/#13), null-check-elim, inline-cache dispatch
-   (bug-24) — surfaced as `JitOnly` via the mode matrix.
-4. **GC value-correctness** — bt-style allocate/retain/checksum programs where
-   a lost root changes the printed checksum (`project_precise_jit_stack_maps`,
-   `default-moving-young-gen`).
-5. **Exception semantics** — JEP-358 NPE message parity, stacktrace order,
-   try/catch/finally ordering, exit-code mapping.
-6. **Arithmetic edge cases** — overflow, `MIN_VALUE/-1`, shift masking, FP
-   `NaN`/`-0.0`/`Math.*Exact` overflow strings (cheap, high-yield, the §2.3 FP
-   diff already proves the axis).
-
----
-
 ## 5. Risks & open questions
 
 - **Nondeterminism is the central threat.** If an accepted program is secretly
@@ -500,65 +309,6 @@ libFuzzer for bytecode. (2) Should the ledger live in `bench/` (gitignored
 `docs/`? no — `bench/` is committed) or a new `difftest/ledger.json`? Lean
 `bench/differential-divergences.json` for continuity with §2.1. (3) How aggressive
 should the CI smoke budget be (per-target seconds)?
-
----
-
-## 6. Scaffolding to land first (minimal compiling stubs/flags/knobs)
-
-The first PR (Step 0) should be **all scaffold, no risky logic**, so it builds
-green and the rest can land incrementally. Described here, not implemented in
-this design doc:
-
-1. **New crate `difftest/`** — a *normal* workspace member (unlike `fuzz/`):
-   `difftest/Cargo.toml` (`license.workspace`, `edition.workspace`,
-   `lints.workspace`, deps on `cratonvm-vm`, `cratonvm-reader`,
-   `cratonvm-classloading`, `serde`/`serde_json`), `difftest/src/lib.rs` with
-   modules `ledger`, `runner`, `oracle`, `generate`, `minimize` — each a
-   documented stub with the `pub` types from §3.2/§3.3 and `todo!()`-free
-   no-op bodies (return `Unimplemented` / empty `Vec`, never panic).
-
-2. **`difftest` binary** (`difftest/src/main.rs`, `[[bin]] name = "difftest"`)
-   with clap subcommands `run`, `gen`, `min`, `gate`, each parsing args and
-   printing a "planned, not yet wired" message with the §3.5 exit-code contract
-   already in place (so CI can adopt the gate step from day one and it just
-   passes on an empty corpus).
-
-3. **Lift shared types** — move `Outcome`, `Divergence`, `DivergenceReport`
-   (today private to `vm/tests/differential.rs`) into `difftest::ledger`, plus
-   the new `Observation`, `JvmException`, `Classification`, and `LedgerEntry
-   { id, status: Known|Fixed|New, ... }`. Re-export so the existing integration
-   test can switch to the shared types without behavior change.
-
-4. **Binary resolution helper** — copy `intrinsic_diff.rs`'s `cratonvm_binary()`
-   (env `CRATONVM_BIN` → `target/release` → `target/debug`) and a
-   `java_executable()`/`javac_executable()` pair (already in `differential.rs`)
-   into `difftest::runner`, shared by all subcommands.
-
-5. **Config knobs / flags** (declared, default-inert):
-   - CLI: `--corpus DIR`, `--modes jit-on,nojit,no-intrinsics,moving-gc`,
-     `--timeout-secs` (default 120, matching `intrinsic_diff.rs`),
-     `--jdk PATH`, `--allow-jdk-downgrade`, `--ledger FILE`
-     (default `bench/differential-divergences.json`), `--update-ledger`.
-   - Env: reuse the existing `CRATONVM_BIN`; add `DIFFTEST_JAVA_HOME` (fallback
-     to PATH). **No new `CRATONVM_*` VM flags** — the runner only *sets*
-     existing ones (`CRATONVM_DISABLE_JIT`, `CRATONVM_DISABLE_INTRINSICS`,
-     `CRATONVM_JIT_THRESHOLD`, the GC knobs) per mode; it does not require any
-     VM source change.
-
-6. **Corpus directories** — `difftest/seeds/` (a handful of self-printing
-   `.java`), `difftest/corpus/.gitkeep`, `difftest/regression/.gitkeep`, and a
-   `difftest/README.md` documenting the run/min/gate workflow (mirroring
-   `fuzz/README.md`'s structure, which the review wants but `fuzz/` lacks).
-
-7. **CI integration** — an advisory `difftest gate` step in
-   `.github/workflows/ci.yml` using `continue-on-error` until Step 3 is stable
-   enough to enforce on hosted runners.
-
-**Explicitly not in Step 0:** no generator logic, no mutator, no real diffing
-beyond compiling the types, **no edits to any VM source crate** (the whole
-feature is additive tooling that *drives* the existing `cratonvm` binary and
-`java`). This keeps the keystone risk at zero and lets each later step be a
-small, reviewable, build-green PR.
 
 ---
 

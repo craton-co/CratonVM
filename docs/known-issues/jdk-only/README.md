@@ -15,8 +15,8 @@ and 7) closed 2026-08-06** — see the pass note below the table.
 >
 > | vector | was | now |
 > |---|---|---|
-> | `RJdkModule` | strict-only, `module service providers: []` | **FIXED** — [`W6-11`](../../internal/jdk-only-W6-11-module-serviceloader-FIXED-20260807.md); 44 checks, matching HotSpot |
-> | `RJdkFieldModule` | both modes, JLS 6.6.2 over-refusal | **FIXED** — [`method-invoke-refuses-the-jls-6-6-2-protected-receiver`](../../internal/method-invoke-jls-6-6-2-protected-receiver-FIXED-20260807.md) |
+> | `RJdkModule` | strict-only, `module service providers: []` | **FIXED** — module ServiceLoader providers now resolve; 44 checks, matching HotSpot |
+> | `RJdkFieldModule` | both modes, JLS 6.6.2 over-refusal | **FIXED** — `Method.invoke` no longer over-refuses a protected receiver |
 > | `RMapGcStress` | fails in every mode and every build | still open; dev's own, not this campaign |
 >
 > Corpus after the two fixes: **53 passed, 1 failed**, ABBA-interleaved.
@@ -38,7 +38,7 @@ and 7) closed 2026-08-06** — see the pass note below the table.
 > `ONLY="RJdkModule" bash -x regression-suite/run.sh 2>&1 | grep <binary>`.
 >
 > Campaign-level record:
-> [`STRICT-CORPUS-CAMPAIGN-20260807.md`](../../feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md).
+> the retired `STRICT-CORPUS-CAMPAIGN` record.
 
 > ## Looking for the plan? It is not here.
 >
@@ -47,7 +47,7 @@ and 7) closed 2026-08-06** — see the pass note below the table.
 > the internal record tree when it is fixed.
 >
 > **The parallel execution plan is
-> [`docs/feature-designs/jdk-only-wave2/`](../../feature-designs/jdk-only-wave2/README.md)** —
+> the retired jdk-only wave-2 execution plan** —
 > twelve lanes with an explicit file-ownership map, a conflict matrix, and a
 > verification protocol. Nine of the twelve can start simultaneously. Read that
 > to decide *what to work on*; read this to understand *what you are fixing*.
@@ -236,14 +236,15 @@ deletion** (contract §10). Everything in this directory is a gap wave 1
 deliberately deferred rather than papered over, with the evidence that makes it
 actionable.
 
-Related non-known-issue docs: [`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
-[`docs/jdk-only-audit.md`](../../jdk-only-audit.md),
+Related non-known-issue docs:
+[`docs/jdk-only-runtime-services.md`](../../jdk-only-runtime-services.md),
 [`docs/jdk-only-native-review.md`](../../jdk-only-native-review.md),
-[`docs/jdk-only-migration.md`](../../jdk-only-migration.md),
-[`docs/jdk-only-ambient-category-audit.md`](../../jdk-only-ambient-category-audit.md),
-[`docs/jdk-only-object-layout-audit.md`](../../jdk-only-object-layout-audit.md).
-The last two did not exist when these records were first written and are the
-evidence base for items 1 and 2.
+[`docs/jdk-only-migration.md`](../../jdk-only-migration.md).
+
+The registration census behind items 1 and 2, and the object-layout survey they
+rest on, were one-off audits; they have been retired and their durable findings
+are stated in [`docs/README.md`](../../README.md) and
+[`docs/architecture/natives-over-real-jdk-classes.md`](../../architecture/natives-over-real-jdk-classes.md).
 
 ---
 

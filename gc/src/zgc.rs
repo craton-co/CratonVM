@@ -1415,6 +1415,16 @@ const ZGC_REAL_GC_THRESHOLD_PERCENT: usize = 75;
 /// Maximum array length, mirroring `heap.rs` / HotSpot's practical limit.
 const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
 
+/// Registered objects the sweep refused to size (and therefore refused to
+/// reclaim) since process start. See [`ZgcRealHeap::alloc_size`]. Non-zero
+/// means a class was unloaded while an instance was still registered, or a
+/// header is corrupt; both leak the object rather than corrupt the arena.
+pub static ZGC_UNSIZABLE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// One-shot latch for the [`ZGC_UNSIZABLE_OBJECTS`] warning — one line per
+/// swept object would itself be the hang.
+static ZGC_UNSIZABLE_WARNED: AtomicBool = AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // Object-start membership for `ZgcRealHeap` — the allocation-path bitmap
 // ---------------------------------------------------------------------------
@@ -2717,7 +2727,14 @@ impl ZgcRealHeap {
         let mut hit: Option<usize> = None;
         self.registry.for_each_base(end_hint, &mut |base| {
             let header = unsafe { &*(base as *const ObjectHeader) };
-            let size = Self::alloc_size(header);
+            // An object this collector cannot size cannot be said to CONTAIN
+            // `addr` either — claiming a 1 TiB extent for it would swallow
+            // every higher arena address and map unrelated conservative-root
+            // words onto the wrong `ObjectRef`. Its own base is still answered
+            // by the exact-base fast path above.
+            let Some(size) = Self::alloc_size(header) else {
+                return true;
+            };
             let Some(end) = base.checked_add(size) else {
                 return true;
             };
@@ -2747,9 +2764,12 @@ impl ZgcRealHeap {
         self.registry
             .bases()
             .into_iter()
-            .map(|base| {
+            .filter_map(|base| {
                 let header = unsafe { &*(base as *const ObjectHeader) };
-                (base as *mut u8, Self::alloc_size(header))
+                // Drop rather than report a sentinel extent: this feeds heap
+                // dumps and referrer queries, and `(ptr, 1 TiB)` is worse for
+                // every one of them than an omitted row.
+                Self::alloc_size(header).map(|size| (base as *mut u8, size))
             })
             .collect()
     }
@@ -2788,16 +2808,64 @@ impl ZgcRealHeap {
         unsafe { &*(base as *const ObjectHeader) }
     }
 
-    /// Total size in bytes of the allocation rooted at `header`.
-    fn alloc_size(header: &ObjectHeader) -> usize {
+    /// Largest body this collector will believe. Mirrors the `1 << 24` slot cap
+    /// `gen_object_total_size` (`gen_heap.rs`) and `object_body_size`'s own
+    /// legacy screen already apply — "no real class has 16M fields" — expressed
+    /// in bytes so it also bounds a compact body.
+    ///
+    /// It exists to reject [`cratonvm_types::object_body_size`]'s corrupt-header
+    /// sentinel, which is `1 << 40` (1 TiB). That value is deliberately
+    /// "impossibly large" rather than `0` so that a caller deriving an extent
+    /// from it fails its own arena bounds check and re-syncs — see the constant's
+    /// doc in `types/src/field_layout.rs`. This collector had no such check.
+    const MAX_PLAUSIBLE_BODY: usize = (1usize << 24) * SLOT_SIZE;
+
+    /// Total size in bytes of the allocation rooted at `header`, or `None` when
+    /// the header cannot be sized.
+    ///
+    /// # Why this is fallible
+    ///
+    /// [`cratonvm_types::object_body_size`] answers `IMPLAUSIBLE_BODY_SIZE`
+    /// (1 TiB) — not `0` — for two states: a `GC_FLAG_COMPACT` object whose
+    /// `(class_id, num_slots)` no longer resolves to a registered layout (a
+    /// class unloaded by `ClassStore::remove` -> `unregister_class_layout`
+    /// while an instance is still in this heap's registry), and a legacy header
+    /// whose `num_slots` is past the plausibility cap (a desynced walk, a
+    /// dangling base). The sentinel is a REFUSAL, and every sibling collector
+    /// treats it as one: `gen_heap`'s non-moving sweep stops the walk on
+    /// `cursor + total > used`, `g1` refuses to evacuate a sub-header object,
+    /// and `gen_object_total_size` returns `0` rather than passing the sentinel
+    /// on.
+    ///
+    /// This function used to return it verbatim, and
+    /// [`Self::collect_garbage`]'s sweep fed it straight to
+    /// `std::ptr::write_bytes(base, 0, size)` and `Arena::add_free_block`
+    /// (whose only bound is a `debug_assert!`, compiled out in release). One
+    /// unresolvable compact object therefore memset a terabyte from its base
+    /// and handed the allocator a free block far outside the arena. Five other
+    /// sites in this same file already guard the identical "compact-flagged,
+    /// layout does not resolve" state (`get_field`, `set_field`,
+    /// `visit_strong_refs_at`, `census::reference_slots`,
+    /// `effectively_compact_header`); the one that decides how many bytes to
+    /// ZERO was the only consumer without a screen.
+    ///
+    /// The array arm is fallible for the matching reason: `array_data_size`
+    /// answers `None` on an overflowing length, and the previous
+    /// `.unwrap_or(0)` under-reported the extent — the direction that leaves
+    /// live bytes on the free list.
+    fn alloc_size(header: &ObjectHeader) -> Option<usize> {
         match header.kind() {
             ObjectKind::Object | ObjectKind::HumongousFiller => {
-                HEADER_SIZE + cratonvm_types::object_body_size(header)
+                let body = cratonvm_types::object_body_size(header);
+                if body > Self::MAX_PLAUSIBLE_BODY {
+                    return None;
+                }
+                HEADER_SIZE.checked_add(body)
             }
             ObjectKind::Array => {
                 let data =
-                    array_data_size(header.array_length() as usize, header.element_type()).unwrap_or(0);
-                ARRAY_DATA_OFFSET + data
+                    array_data_size(header.array_length() as usize, header.element_type()).ok()?;
+                ARRAY_DATA_OFFSET.checked_add(data)
             }
         }
     }
@@ -4640,7 +4708,11 @@ impl mark::ZMarkContext for ZgcRealHeap {
         if addr == 0 {
             return 0;
         }
-        Self::alloc_size(self.header_ref(addr as usize as *mut u8))
+        // A header this collector cannot size contributes no accounted bytes.
+        // `alloc_size`'s `None` is a corrupt/unresolvable header (see its doc),
+        // and charging a 1 TiB sentinel to the live set would make every
+        // occupancy figure derived from it meaningless.
+        Self::alloc_size(self.header_ref(addr as usize as *mut u8)).unwrap_or(0)
     }
 
     // `on_worker_start` / `on_worker_end` are left at their defaults on
@@ -5192,12 +5264,32 @@ impl GarbageCollector for ZgcRealHeap {
         let mut bytes_copied = 0usize; // "retained" bytes (non-moving)
         let mut bytes_freed = 0usize;
         let mut objects_copied = 0usize;
+        // Registered bases whose header could not be sized this cycle — see
+        // the refusal in the sweep loop below.
+        let mut unsizable = 0usize;
         {
             let mut arena = self.arena.lock();
             let arena_base = arena.base_ptr() as usize;
             for &base in &all {
                 let header = self.header_mut(base as *mut u8);
-                let size = Self::alloc_size(header);
+                // A header this collector cannot size must not be swept. The
+                // dead arm below `write_bytes`es `size` bytes and hands the
+                // same span to `Arena::add_free_block`, whose only bound is a
+                // `debug_assert!` — so passing `object_body_size`'s 1 TiB
+                // corrupt-header sentinel through here memsets a terabyte from
+                // `base` and free-lists memory that is not in the arena.
+                //
+                // Retaining it instead leaks one object until its layout
+                // resolves again (or forever, if its class really is gone),
+                // which is the fail-safe direction: it stays registered, stays
+                // rooted conservatively, and is never handed out twice. The
+                // one-shot `tracing::warn!` makes the leak visible rather than
+                // silent.
+                let Some(size) = Self::alloc_size(header) else {
+                    unsizable += 1;
+                    header.clear_gc_flags(GC_FLAG_MARKED);
+                    continue;
+                };
                 if header.gc_flags() & GC_FLAG_MARKED != 0 {
                     // Survivor: clear the mark bit for next cycle, keep it.
                     header.clear_gc_flags(GC_FLAG_MARKED);
@@ -5251,6 +5343,19 @@ impl GarbageCollector for ZgcRealHeap {
             }
         }
 
+        if unsizable != 0 {
+            ZGC_UNSIZABLE_OBJECTS.fetch_add(unsizable, Ordering::Relaxed);
+            if !ZGC_UNSIZABLE_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    target: "cratonvm::gc::guard",
+                    count = unsizable,
+                    "zgc sweep: registered object(s) whose header could not be \
+                     sized (compact layout unresolvable, or an implausible \
+                     legacy num_slots) — retained rather than zeroed and \
+                     free-listed. See ZgcRealHeap::alloc_size.",
+                );
+            }
+        }
         // Prune DEAD bases from the registry IN PLACE (never wholesale-
         // replace it with the mark snapshot's survivors): an allocation
         // registered by another path between the mark snapshot and this
@@ -6357,6 +6462,82 @@ mod tests {
         }
     }
 
+    /// `object_body_size` answers `IMPLAUSIBLE_BODY_SIZE` (1 TiB) — not `0` —
+    /// for a `GC_FLAG_COMPACT` object whose `(class_id, num_slots)` no longer
+    /// resolves to a registered layout (a class unloaded by
+    /// `unregister_class_layout` while an instance is still registered here).
+    /// The sentinel is a REFUSAL that every caller is required to bounds-check.
+    ///
+    /// `ZgcRealHeap::alloc_size` returned it verbatim, and the sweep fed it to
+    /// `std::ptr::write_bytes(base, 0, size)` and to `Arena::add_free_block`
+    /// (whose only bound is a `debug_assert!`, compiled out in release). One
+    /// such object therefore memset a terabyte from its own base.
+    #[test]
+    fn alloc_size_refuses_a_compact_object_with_no_registered_layout() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let obj = heap.alloc_object(ClassId::new(999_996), 4);
+
+        // Sizable while it is an ordinary legacy object.
+        let header = unsafe { &*(obj.as_ptr() as *const ObjectHeader) };
+        assert_eq!(
+            ZgcRealHeap::alloc_size(header),
+            Some(HEADER_SIZE + 4 * SLOT_SIZE)
+        );
+
+        // No layout is registered for this class id, so flipping the per-object
+        // compact bit reproduces the racing state (header says compact, the
+        // registry cannot serve it) without a live class unload.
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert_eq!(
+            ZgcRealHeap::alloc_size(header),
+            None,
+            "an unresolvable compact header must be refused, not sized at \
+             HEADER_SIZE + 1 TiB"
+        );
+    }
+
+    /// The sweep must RETAIN an object it cannot size rather than zero it and
+    /// hand its span to the arena. Retaining leaks one object; the alternative
+    /// is a 1 TiB `write_bytes` and a free block outside the arena.
+    #[test]
+    fn the_sweep_retains_an_object_it_cannot_size() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let live = heap.alloc_object(ClassId::new(1), 2);
+        let doomed = heap.alloc_object(ClassId::new(999_995), 4);
+        let doomed_addr = doomed.as_ptr() as usize;
+        // Sentinel bytes in the body: if the sweep zeroed this object we would
+        // see it, and a 1 TiB memset would have taken the whole process with it.
+        heap.set_field(doomed, 0, Value::Int(0x5A5A_5A5A));
+
+        let header = unsafe { &*(doomed.as_ptr() as *const ObjectHeader) };
+        header.add_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+
+        let before = ZGC_UNSIZABLE_OBJECTS.load(Ordering::Relaxed);
+        // SAFETY: these unit tests run the heap single-threaded.
+        let stw = unsafe { StopTheWorldToken::new() };
+        // `doomed` is unreachable from the root set, so an unguarded sweep
+        // would take the dead arm.
+        let mut roots = [live];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        assert!(
+            ZGC_UNSIZABLE_OBJECTS.load(Ordering::Relaxed) > before,
+            "the refusal must be counted, not silent"
+        );
+        assert!(
+            heap.registry.contains(doomed_addr),
+            "an unsizable object stays registered — dropping it from the \
+             registry would make is_object_address deny it while conservative \
+             rooting still reaches it"
+        );
+        header.clear_gc_flags(cratonvm_types::GC_FLAG_COMPACT);
+        assert_eq!(
+            heap.get_field(doomed, 0),
+            Value::Int(0x5A5A_5A5A),
+            "the body must not have been zeroed"
+        );
+    }
+
     #[test]
     fn real_freed_memory_is_reused() {
         // Small heap so reuse is observable: allocate, drop all roots, GC,
@@ -6666,7 +6847,9 @@ mod tests {
             .into_iter()
             .map(|base| {
                 let header = unsafe { &*(base as *const ObjectHeader) };
-                (base, base + ZgcRealHeap::alloc_size(header))
+                let size =
+                    ZgcRealHeap::alloc_size(header).expect("test objects are always sizable");
+                (base, base + size)
             })
             .collect();
         spans.sort_unstable();

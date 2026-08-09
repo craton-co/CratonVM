@@ -16,7 +16,7 @@ regression; only whoever happened to run `bench-gpu/` by hand on real
 hardware would notice.
 
 That gap was not theoretical. During the first systematic real-hardware
-validation (RTX 2060, 2026-07-11), an invoke-cache promotion bug was found
+validation (RTX 2060), an invoke-cache promotion bug was found
 that made offload **silently stop dispatching to the GPU after the first
 call at a call site** — the program kept running, produced correct output
 (the CPU fallback is correct, just slow), and nothing but a timing

@@ -7,14 +7,14 @@ with hardware, OS load, JDK version, and VM configuration.
 
 ## QuickBench vs. HotSpot JDK 25 C2
 
-*Best-of-N snapshot measured 2026-07-08 on a shared Azure Linux build host (16
+*Best-of-N snapshot on a shared Azure Linux build host (16
 cores, sustained load average 10-16 from concurrent sessions) against JDK
 25.0.3 Temurin C2 and a CratonVM release build off `dev` at `bfc26c2d`. N=10
 samples for JDK 25, N=7 for CratonVM (one run of 50,516 ms excluded as a
 host-contention outlier) — best-of-N rather than a single run because
 run-to-run variance on this shared host was 2-4x. Ratio = CratonVM time /
 HotSpot time (lower is better; 1.00x is parity). `dev` enables back-edge OSR
-by default (flipped 2026-07-04), so this column already includes OSR; forcing
+by default, so this column already includes OSR; forcing
 `CRATONVM_JIT_THRESHOLD=1` on top no longer showed a distinct benefit in this
 snapshot, so that tuned column was dropped. Set `CRATONVM_JIT_OSR=0` to
 reproduce the old OSR-off lane.*

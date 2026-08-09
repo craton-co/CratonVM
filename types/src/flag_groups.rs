@@ -5,7 +5,7 @@
 //!
 //! # The problem this solves
 //!
-//! `docs/flag-census.md` counted **692** distinct `CRATONVM_*`
+//! `audits/flag-census.md` counted **692** distinct `CRATONVM_*`
 //! identifiers: 559 with a Rust read site, 133 referenced only by prose. They
 //! accumulated at roughly one per fixed bug with no retirement path, they
 //! duplicate each other (`CRATONVM_REAL_AQS` / `CRATONVM_SYNTHETIC_AQS` are one
@@ -354,11 +354,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "frame-trace", on_key: Some("CRATONVM_FRAME_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fsp", on_key: Some("CRATONVM_DBG_FSP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fullstack-scan", on_key: Some("CRATONVM_DBG_FULLSTACK_SCAN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "fwdwalk", on_key: Some("CRATONVM_DBG_FWDWALK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fwdguard", on_key: Some("CRATONVM_DBG_FWDGUARD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-headers", on_key: Some("CRATONVM_G1_DBG_HEADERS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-pins", on_key: Some("CRATONVM_G1_DBG_PINS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-reach", on_key: Some("CRATONVM_G1_DBG_REACH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-rootcensus", on_key: Some("CRATONVM_G1_DBG_ROOTCENSUS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "gdm-prof", on_key: Some("CRATONVM_DBG_GDM_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1-dbg-zero", on_key: Some("CRATONVM_G1_DBG_ZERO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1diag", on_key: Some("CRATONVM_DBG_G1DIAG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-array-guard-bt", on_key: Some("CRATONVM_GC_ARRAY_GUARD_BT"), off_key: None, off_word: None },
@@ -594,6 +596,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "rootsnap", on_key: Some("CRATONVM_DBG_ROOTSNAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rootsnap-every", on_key: Some("CRATONVM_DBG_ROOTSNAP_EVERY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rootsnap-verify", on_key: Some("CRATONVM_DBG_ROOTSNAP_VERIFY"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "rootprof", on_key: Some("CRATONVM_DBG_ROOTPROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rset-audit", on_key: Some("CRATONVM_DBG_RSET_AUDIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rset-audit-young-scan", on_key: Some("CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rterr", on_key: Some("CRATONVM_DBG_RTERR"), off_key: None, off_word: None },
@@ -1057,6 +1060,8 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None },
     E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None },
     E { group: Group::GC, token: "youngscan-stride", on_key: Some("CRATONVM_YOUNGSCAN_STRIDE"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "zgc-startbits", on_key: Some("CRATONVM_ZGC_STARTBITS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: None },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
     // `adapt_young_trigger_to_pause` reads, `0` (the default) being off.
     E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: None },
@@ -1865,7 +1870,7 @@ mod tests {
     fn the_documented_no_ops_now_work() {
         // Each of these was documented for months and read by nothing: the
         // default was flipped and only the opt-out half was renamed.
-        // docs/flag-census.md section 3 has the full list.
+        // audits/flag-census.md section 3 has the full list.
         let cases: &[(&str, &str, &str)] = &[
             (
                 "CRATONVM_JIT",

@@ -1,9 +1,5 @@
 # Garbage Collection in CratonVM — architecture and current state
 
-*Last updated 2026-08-07 (ZGC sections only; the rest is as of 2026-07-27).
-The historical four-wave G1/ZGC correctness audit is retained in
-the internal fixed-issue archive.*
-
 CratonVM has three garbage-collector backends behind one dispatcher
 (`gc/src/vm_heap.rs::VmHeap`). All are stop-the-world at the collection
 level; G1 additionally runs its marking phase concurrently. Selection is
@@ -24,8 +20,7 @@ which gates the `GcAlgorithm::Zgc` variant and its `parse_gc_algorithm` arm
 (`vm/src/config.rs:51`) as well as the `VmHeap::Zgc` arms — so in a default
 build `-XX:+UseZGC` takes the fall-back path above. A ZGC-capable launcher
 is `cargo build -p cratonvm-cli --features zgc`. It is default-off because
-it is not at parity: measured 2026-08-07 on the 1975-class Spring Boot
-suite, 1860 PASS vs. Generational's 1902, 49 HANG vs. 18
+it is not at parity: on the 1975-class Spring Boot suite it measures 1860 PASS vs. Generational's 1902, 49 HANG vs. 18
 ([record](known-issues/springboot/zgc-real-fullsuite-regression-20260807.md)). The plan to make
 it a real, concurrent, generational, compacting ZGC is
 [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
@@ -39,7 +34,7 @@ each depositing a **root snapshot** first. Threads inside blocking
 natives are excluded from the arrival quota and covered by their
 deposited snapshot plus a wake-time fixup (`check_post_block_gc`).
 Threads stuck in compiled code that never polls are handled by the
-**cross-thread JIT takeover** (INT-3, all backends since 2026-07-11):
+**cross-thread JIT takeover** (INT-3, all backends):
 the initiator freezes them at OS level, conservatively scans their
 registers/stacks, publishes their un-retired TLAB tails as walker skip
 regions, and — under G1 — pins every region they can address so nothing
@@ -86,9 +81,8 @@ and also drives the G1 concurrent cycle forward.
 
 ## Current correctness state
 
-A systematic audit (2026-07-10/11: four parallel deep code reviews plus a
-deterministic differential probe kit diffed against HotSpot jdk25)
-found and fixed, in four merged waves: G1 humongous accounting/reclaim
+A systematic review, backed by a deterministic differential probe kit diffed
+against HotSpot JDK 25, found and fixed: G1 humongous accounting/reclaim
 (IHOP-blind humongous, decay-to-zero IHOP, last-ditch full cycle before
 OOM), TLAB gap-sentinel desync in every G1 region walker, initiator-only
 JIT pinning, SATB holes (statics side-table, thread-exit buffer loss,
@@ -100,11 +94,36 @@ liveness-unknown regions, kept-region coherence after evacuation
 failure, a Generational remark→sweep TAMS window, and the cross-thread
 JIT takeover for G1/ZGC (INT-3) including concurrent-mark pauses.
 
-**Verified invariants** (probe kit, re-run on the current tip): all of
+**Verified invariants** (probe kit): all of
 ChurnCheck / HumongousCheck / CopyChurn / MTChurn / RefCheck /
 RefCheckOld / SpinPoll / SpinPollMark produce HotSpot-identical output on
 Generational, G1 and ZGC at `-Xmx256m`; the gc crate's unit+integration
 suites are green.
+
+**Standing invariants the collectors are checked against.** These are asserted
+in `gc/`, not just documented:
+
+- The published TLAB skip-offset list is sorted, coalesced and disjoint. Two
+  partially overlapping spans would make the sweep walk resync twice and
+  silently skip every object between them.
+- A TLAB's published reserved tail starts 8-byte aligned. A non-aligned start
+  is rounded up (the fail-safe direction) rather than dropped.
+- A moving young collection **refuses to run** while a non-empty clipped tail
+  set is published: the cycle over-retains, spills to old gen and retries,
+  instead of relocating over a TLAB some mutator left un-retired.
+- `OldGen::free` returns exactly the extent `alloc` reserved. An unrounded
+  return would leave a remainder off the free list, and `walk_objects` derives
+  allocated extents from the gaps *between* free blocks, so the walk would
+  resume at a non-object-start and abandon the rest of the region.
+- The old-gen in-place sweep runs a live-set closure before its free loop, so
+  an unmarked block still referenced by a marked old-gen object is retained
+  transitively rather than handed back.
+- A conservative root that lands in a field or a mid-object spill is resolved
+  to the object that contains it. Both plausibility screens are exact-base
+  tests, so an interior root would otherwise mark nothing and let the sweep
+  free a live block under it. The compacting arm cannot honour an interior
+  root — a slid object leaves it dangling — and is downgraded to the in-place
+  sweep for that cycle.
 
 **Current limitations:**
 
@@ -175,10 +194,8 @@ is honoured, or if `System.gc()` requested a full cycle. A JIT-warm
 workload may legitimately spend most cycles non-moving — but that is a
 *measured* fallback rate, not a rule, and the running process states its
 own answer through `gc_metrics::collector_decision_report()`. (The older
-"any JIT frame ⇒ non-moving" rule was the pre-2026-07-26 behaviour and is
-reachable today only under `CRATONVM_NO_MOVING_YOUNG` or
-`CRATONVM_MOVING_YOUNG_NO_JIT=1`; the evidence is in
-[the TLAB/card audit §3.2](gc/tlab-and-card-audit.md).) That default young
+"any JIT frame ⇒ non-moving" rule is reachable today only under
+`CRATONVM_NO_MOVING_YOUNG` or `CRATONVM_MOVING_YOUNG_NO_JIT=1`.) That default young
 collection is PARALLEL in two phases. The transitive closure is drained
 by several workers over a lock-free mark bitmap (one bit per 8 bytes of
 from-space) — sound because the phase is pure and read-only on a frozen
@@ -199,8 +216,7 @@ attempt. This replaced a full-arena exact-base oracle walk costing ~240
 ms and 2 GiB walked per collection; the same grid, subsampled at
 `CRATONVM_GC_SWEEP_ANCHOR_STRIDE`, now costs ~0 ms and 4.7 MB walked,
 and the conservative-candidate oracle traverses only those anchor
-intervals that actually contain a candidate. The 2026-07-18
-truncated-oracle fail-safe survives as `verified_spans`: an interval
+intervals that actually contain a candidate. The truncated-oracle fail-safe survives as `verified_spans`: an interval
 counts as proved only if its chain lands EXACTLY on the next anchor, an
 unproved interval has its ranges discarded rather than trusted, and a
 candidate outside every proved span falls back to direct validation. Each chunk

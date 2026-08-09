@@ -404,7 +404,7 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
 
   ### The detector was widened 2026-08-05, and the number went up
 
-  Lane [L4](../../feature-designs/jdk-only-wave2/L4-overlay-detector-blind-spots.md)
+  Lane L4 of the retired jdk-only wave-2 execution plan
   closed the three gaps. Same three probes, both modes, JDK 25, A/B against a
   pre-fix binary built from the same tree:
 
@@ -850,8 +850,6 @@ finding, not a general rule.
 * The `StringJoiner` divergence between the two real-protected-stub allow-lists
   is a *separate* consequence of the same class's layout drift; see
   real-protected-stub allow-lists diverge (`jdk-only-real-protected-stub-allowlists-FIXED-20260804.md`) (reconciled 2026-08-04).
-* [`docs/jdk-only-object-layout-audit.md`](../../jdk-only-object-layout-audit.md)
-  — the companion audit. The original filing recorded that this file did not
-  exist; **it does now**, and it is the right starting point for the sweep in
-  step 1. Read it before extending the marker discipline into a new crate, so
-  the verdict vocabulary stays consistent.
+* The companion object-layout survey has been retired as a one-off audit. Its
+  verdict vocabulary is the one this record uses; keep to it when extending the
+  marker discipline into a new crate, so the two stay consistent.

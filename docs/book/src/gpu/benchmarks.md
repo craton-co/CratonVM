@@ -1,6 +1,6 @@
 # GPU Offload Benchmarks
 
-Measured 2026-07-11 on a GeForce RTX 2060 (sm_75, 12 GiB, driver 591.86,
+Measured on a GeForce RTX 2060 (sm_75, 12 GiB, driver 591.86,
 CUDA 13.1), Intel hybrid 24C/32T host. Compared against
 [TornadoVM](https://github.com/beehive-lab/TornadoVM) 4.0.1-jdk25 (PTX
 backend, explicit `@Parallel` + TaskGraph API) and HotSpot JDK 25.0.1 (C2).

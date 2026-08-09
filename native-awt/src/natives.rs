@@ -576,7 +576,7 @@ fn get_double(args: &[Value], idx: usize) -> f64 {
 // Per-group verdicts are annotated on each `register_*_natives` below and were
 // derived from `javap -p -s` against JDK 25; they are static evidence only and
 // must be confirmed with schema-v2 `invocations` counts before any group is
-// retagged. See docs/jdk-only-ambient-category-audit.md.
+// retagged. See audits/jdk-only-ambient-category-audit.md.
 pub fn register_all(registry: &mut NativeMethodRegistry) {
     register_toolkit_natives(registry);
     register_headless_natives(registry);

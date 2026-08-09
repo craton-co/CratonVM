@@ -45,7 +45,7 @@
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::IoFlags`], parsed once at first use. This crate used to
 /// carry its own `env_flag_enabled` boolean parser, one of the five
-/// inconsistent truth tables catalogued in `docs/flag-census.md`; the
+/// inconsistent truth tables catalogued in `audits/flag-census.md`; the
 /// parser now lives in `cratonvm_types::flags::parse::truthy_word` with its
 /// semantics unchanged.
 #[inline]

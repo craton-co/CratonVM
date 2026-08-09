@@ -1,7 +1,7 @@
 # Escape analysis and scalar replacement: what is proved, what is refused
 
 Scope: the P1 item *"Escape analysis and scalar replacement"* of
-`docs/feature-designs/c2/deep-research-vm-c2.md` — identity/hash, synchronization,
+the C2 review — identity/hash, synchronization,
 exceptions, arrays, partial escape, deopt reconstruction.
 
 Subject: `jit/src/escape_analysis.rs`, the **sea-of-nodes** escape analysis
@@ -188,7 +188,7 @@ rather than guesses when program order is not dominance. The in-module applier
 `apply_scalar_replacement` was rewritten to consume `load_values` (it had the
 same last-write-wins bug) and to be all-or-nothing.
 
-**Yes, end-to-end too, since 2026-08-02.** §6.1's edit landed: the production
+**Yes, end-to-end too.** §6.1's edit landed: the production
 applier's planner `plan_scalar_replacement` consumes `info.load_value` per load
 and refuses on `Unknown` (`jit/src/lib.rs:10353`), and the id-comparison
 heuristic is gone. The end-to-end witness is
@@ -271,7 +271,7 @@ compilation knows to revisit `program_order_proves_dominance`.
 All in `jit/src/lib.rs`, which is another agent's file. Cited by symbol, not
 line, because that file is being edited concurrently.
 
-### 6.1 Use the per-load answer — **DONE 2026-08-02**
+### 6.1 Use the per-load answer — **DONE**
 
 Landed as written below. `plan_scalar_replacement` now builds `load_plans` from
 `info.load_value(ea_load)` and returns `None` on `LoadResolution::Unknown`

@@ -21,7 +21,7 @@ is **not** a `URLClassLoader` — that inheritance relationship was removed as
 part of the module system. This test predates that change and casts it
 directly. Should fail identically on real HotSpot JDK 25 with the same
 classpath. **Likely a JDK-version test/library mismatch, same family as**
-[`bug-h2-testannotationprocessorsoutput-jdk25-implicit-proc-disabled-NOT-A-BUG.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testannotationprocessorsoutput-jdk25-implicit-proc-disabled-NOT-A-BUG.md).
+`bug-h2-testannotationprocessorsoutput-jdk25-implicit-proc-disabled-NOT-A-BUG.md`.
 
 ## 2. `TestExit` — `System.exit(1) called — process terminating`
 
@@ -93,5 +93,5 @@ treating any as fully closed:
 $JAVA_HOME/bin/java -cp "target/classes:target/test-classes:$(cat craton-testcp.txt)" <class>
 ```
 If HotSpot fails identically, retitle to `...-NOT-A-BUG.md` per convention
-and move to `docs/internal/`. If HotSpot passes any of them, that one is
+and move to ``. If HotSpot passes any of them, that one is
 retracted from this doc and re-opened as a genuine CratonVM-specific defect.

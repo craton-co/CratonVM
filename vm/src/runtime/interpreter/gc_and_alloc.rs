@@ -4116,7 +4116,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // SEGV — that crash was experimentally shown to be NOT a GC reclamation /
     // relocation bug (it reproduces with the young sweep capturing these JIT
     // roots and with the concurrent old-gen collector disabled). See
-    // docs/real-raf-segv-root-cause.md.
+    // fixed-bugs/real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
         // `update_root_snapshot` is also called at ordinary native-call
         // boundaries, not only immediately before a safepoint.  Its JIT-root

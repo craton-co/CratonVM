@@ -21,7 +21,7 @@ rows.
 **Fact 1 — there is no member access check on the bytecode path.**
 
 `classloading/src/access_control.rs` implements JVMS §5.4.4 in full. Its own
-module docs (audited 2026-07-26) record the finding:
+module docs record the finding:
 
 | function | production call sites |
 |---|---|

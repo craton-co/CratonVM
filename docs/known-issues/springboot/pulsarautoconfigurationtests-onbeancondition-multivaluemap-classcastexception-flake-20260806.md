@@ -84,7 +84,7 @@ originally filed for. The HotSpot baseline has never hung on this class
 (29.3s clean, 07-17). Isolated single-class reruns (`pulsar-recheck-r1-20260806`,
 182s; `craton-hangverify-20260731`, 369s) always pass, which — per this
 codebase's established "isolation reruns understate cluster bugs 4:1" lesson
-(`docs/internal/fixed-suite-bugs/springboot/mockito-bytebuddy-classfile-metadata-cluster-FIXED-20260805.md`)
+(`fixed-suite-bugs/springboot/mockito-bytebuddy-classfile-metadata-cluster-FIXED-20260805.md`)
 — means this needs to be chased under the suite's own concurrency, not in
 isolation.
 
@@ -210,7 +210,7 @@ root-cause it live.
 resolved, and *not* as a GC defect: it was the recycled-`JitInvokeInfo`
 dispatch defect (`383e7f5cf`), where a site key freed with its `CompiledMethod`
 and re-issued let one call site return another's answer — see
-[`spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`](../../internal/fixed-suite-bugs/springboot/spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md).
+`spring-boot-annotation-metadata-null-cluster-RESOLVED-20260806.md`.
 Two things follow for this page. First, its ~1030 instrumented hunt runs found
 nothing because both detectors watched the map and the map was innocent — a hit
 rate is not worth buying with runs while the instrument points at the wrong
@@ -232,7 +232,7 @@ this as new:
   empty-deduction/wrong-exception-message, tied to `@ClassPathExclusions`
   isolated classloaders). This class doesn't use classpath exclusion.
 - `spring-bean-attribute-type-null-flake` (now
-  [`...-RESOLVED-20260806.md`](../../internal/fixed-suite-bugs/springboot/spring-bean-attribute-type-null-flake-RESOLVED-20260806.md))
+  `...-RESOLVED-20260806.md`)
   — same general "rare, one-shot, Spring reflection/annotation-processing miss"
   family and same `OnBeanCondition.Spec` constructor neighborhood, but a
   different concrete failure: an `IdentityHashMap` primitive-wrapper lookup

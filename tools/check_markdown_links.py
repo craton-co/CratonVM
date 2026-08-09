@@ -117,8 +117,8 @@ def main() -> int:
         action="store_true",
         help=(
             "audit every Markdown file in the repo, including the dated "
-            " archive and vendored trees; the default scope is "
-            "root *.md plus docs/** excluding "
+            "internal archive and vendored trees; the default scope is "
+            "root *.md plus docs/** excluding the internal archive"
         ),
     )
     args = parser.parse_args()
@@ -128,9 +128,9 @@ def main() -> int:
         paths = markdown_files(root)
     else:
         # Default (CI) scope: root-level Markdown plus everything under docs/
-        # recursively, minus .
+        # recursively, minus the internal archive (`docs` + `/internal`).
         #
-        #  is dated archival material (~396 broken links), and
+        # That archive is dated material (~396 broken links), and
         # most of those links point at documents that were intentionally
         # deleted once the work they described landed. Gating CI on it would
         # produce pure noise and would pressure people into resurrecting dead

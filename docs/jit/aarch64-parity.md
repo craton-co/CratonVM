@@ -1,6 +1,5 @@
 # AArch64 JIT backend — parity census against x86-64
 
-**Audit date:** 2026-08-01.
 **Scope:** `jit/src/aarch64.rs`, `jit/src/aarch64_backend.rs`, `jit/src/platform.rs`,
 compared against `jit/src/x64.rs` + `jit/src/x64/*`.
 
@@ -61,8 +60,8 @@ bang, and the missing Windows-on-ARM i-cache flush.
 | **Callee-saved register discipline (FP)** | correct | **was broken** — float locals were homed in `D8`–`D15`, which AAPCS64 makes callee-saved, while the prologue saved only GPRs and `Arm64FrameLayout` reserves no FP save area | **FIXED.** `compile_pass` now ignores `alloc.xmm_assignments`; float locals live in frame slots or GPRs. See §4. |
 | **Frame-slot addressing (GPR)** | correct | correct since "ARM64 BUG #1" (`ldur`/`stur`, no writeback) | OK. |
 | **Frame-slot addressing (FP)** | correct | **was broken** — `offset as u16` into the *scaled unsigned* form, which cannot express a negative displacement | **FIXED.** See §4. |
-| **Branch-displacement overflow** | `ExecutableBuffer::overflowed` → bail | `Aarch64Emitter::overflowed()` sticky flag, read by `emit_machine_code` | OK (fixed 2026-07-26). |
-| **Unbound label / unresolved branch** | n/a | `emit_machine_code` returns `None` | OK (fixed 2026-07-26). |
+| **Branch-displacement overflow** | `ExecutableBuffer::overflowed` → bail | `Aarch64Emitter::overflowed()` sticky flag, read by `emit_machine_code` | OK (fixed). |
+| **Unbound label / unresolved branch** | n/a | `emit_machine_code` returns `None` | OK (fixed). |
 | **Wide-immediate truncation** | n/a | `emit_addsub_imm_safe` / `CmpImm` materialise into IP0 | OK, and the one unencodable shape now **bails** instead of emitting `BRK` and reporting success. |
 | **32-bit int semantics** | W-form / correct wrapping | **`iadd`/`isub`/`imul`/`ineg`/`ishl`/`ishr`/`iushr` lower to 64-bit X-form** | **OPEN — silent miscompile.** See §5. Deliberately not fixed here. |
 | **I-cache maintenance, Linux/FreeBSD aarch64** | n/a (coherent caches) | `__clear_cache` in `platform_make_executable`, before the RW→RX flip | OK. |
@@ -288,9 +287,8 @@ backend masks the value but not the shift), and mixing with `l*` ops.
 32-bit-producing op, and mask shift amounts with `AND Xd, Xn, #31`
 (`0x92401000 | Rn<<5 | Rd`) — but it touches the arithmetic lowering of a
 backend that cannot be built or run from this host, on a branch where eight other
-agents are editing concurrently. The module header has documented this as a
-known, deliberate non-fix since the 2026-07-26 audit; this audit does not
-unilaterally reverse that. It is recorded here as the single largest remaining
+agents are editing concurrently. The module header documents this as a
+known, deliberate non-fix. It is recorded here as the single largest remaining
 silent-miscompile risk, with the fix shape written down so the next pass is
 mechanical.
 

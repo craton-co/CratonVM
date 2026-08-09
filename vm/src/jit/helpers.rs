@@ -290,7 +290,7 @@ thread_local! {
     /// [`JvmThread::jit_pending_exception`], because a `thread_local!` is
     /// unreachable from a collecting thread and the throwable was therefore
     /// neither scanned nor remapped for the whole stash→drain window (see
-    /// `docs/jit-signals-root-gap.md`). Every remaining field is a
+    /// `fixed-bugs/jit-signals-root-gap.md`). Every remaining field is a
     /// plain scalar the collector has no interest in, which is why they may
     /// stay here and keep the one-TLS-access drain. **Do not add an
     /// `ObjectRef`, a `Value`, or a raw heap address to this struct** — put it
@@ -670,7 +670,7 @@ pub fn clear_jit_thread() {
 ///
 /// Scalars only — the pending throwable lives on
 /// [`JvmThread::jit_pending_exception`] so the collector can see and relocate
-/// it (`docs/jit-signals-root-gap.md`).
+/// it (`fixed-bugs/jit-signals-root-gap.md`).
 struct JitSignals {
     /// RBC.6 correctness fix — the bytecode pc of the `athrow` that produced
     /// the thread's `jit_pending_exception`, when statically known at
@@ -1748,7 +1748,7 @@ const VIRTUAL_TARGET_CACHE_CAP: usize = 4096;
 /// cross-VM hit therefore does not degrade to a slow path — it CALLs another
 /// VM's compiled body, or runs `java/util/HashMap`'s native against whatever
 /// class happens to hold that id in this VM. See
-/// `docs/vm-jit-cache-keying.md`.
+/// `audits/vm-jit-cache-keying.md`.
 ///
 /// `vm_identity` is a monotonically issued counter (`vm_init.rs`
 /// `NEXT_VM_IDENTITY`), never an address, so it is never recycled — unlike a
@@ -5921,7 +5921,7 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 /// the `OWNER` latch, and every other VM answers `is_initialized == false` and
 /// takes the authoritative `ensure_class_initialized_shared` path forever. That
 /// is a correct-but-slower outcome for VM #2, and no shared mutable state can
-/// give a wrong answer. See `docs/vm-jit-cache-keying.md`.
+/// give a wrong answer. See `audits/vm-jit-cache-keying.md`.
 mod class_init_memo {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -7339,7 +7339,7 @@ pub unsafe extern "C" fn jit_checkcast(
         // reproduces produced no evidence. `java.lang.Object` is `ClassId(0)`,
         // which is also the all-zero header the collector leaves over a
         // reclaimed span; free-list membership tells the two apart.
-        // See docs/gc/old-sweep-liveness.md section 7.
+        // See audits/old-sweep-liveness.md section 7.
         //
         // 2026-08-02: moved into `memory::reclaim_guard` so the three faces of
         // this defect — interpreted `checkcast`, compiled `checkcast`, and an
@@ -7654,7 +7654,7 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     } else if let Some((thread, _guard)) = jit_thread_mut() {
         // The throwable is stashed on the `JvmThread` so the collector can
         // both keep it alive and relocate it before the interpreter's drain
-        // reads it back (`docs/jit-signals-root-gap.md`).
+        // reads it back (`fixed-bugs/jit-signals-root-gap.md`).
         set_jit_pending_exception_with_bci(
             thread,
             ObjectRef::from_raw(exc_ptr as usize as *mut u8),
@@ -13251,7 +13251,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Per-VM keying of the JIT dispatch memos
-    // (docs/vm-jit-cache-keying.md)
+    // (audits/vm-jit-cache-keying.md)
     // -----------------------------------------------------------------------
 
     /// Serializes the tests that reset the two process-global, VM-owned
@@ -13267,7 +13267,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // The pending JIT exception is thread-resident, not TLS-resident
-    // (docs/jit-signals-root-gap.md)
+    // (fixed-bugs/jit-signals-root-gap.md)
     // -----------------------------------------------------------------------
 
     fn scratch_thread(id: u64) -> JvmThread {
@@ -15226,7 +15226,7 @@ pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
 /// another VM's safepoint flag and write card marks into another VM's
 /// table. A missed card mark is a missed remembered-set update, which is a
 /// use-after-free, not a slowdown. See
-/// `docs/feature-designs/vm-process-global-state.md`.
+/// `feature-designs/vm-process-global-state.md`.
 ///
 /// Every production caller has its own `SharedVm` in scope and should use
 /// this. [`build_helpers`] remains for VM-less unit tests.
@@ -15524,7 +15524,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
     // `JitRuntimeHelpers::validate_abi` checks the ABI revision, the struct
     // size, that every `required` slot is non-zero, and that every `Offset`
     // slot is a plausible displacement — and until now it had **no callers
-    // outside `jit-api`'s own tests** (`docs/jit/helper-abi-audit.md` §4). A
+    // outside `jit-api`'s own tests** (`docs/jit/helper-abi.md` §4). A
     // zeroed required slot therefore left the producer silently and surfaced
     // as a `CALL 0` from RWX memory somewhere downstream, with the crash
     // pointing at the JIT backend rather than at the one line here that failed
@@ -15551,7 +15551,7 @@ fn build_helpers_opt(vm_for_helpers: Option<&crate::vm::SharedVm>) -> JitRuntime
 }
 
 // ---------------------------------------------------------------------------
-// Helper-slot signature checks (`docs/jit/helper-abi-audit.md` §4)
+// Helper-slot signature checks (`docs/jit/helper-abi.md` §4)
 // ---------------------------------------------------------------------------
 //
 // `build_helpers` above stores every callable slot as

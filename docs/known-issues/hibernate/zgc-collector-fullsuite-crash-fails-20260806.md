@@ -16,7 +16,7 @@ recurring in a *worse* form under ZGC specifically.
 
 `DefaultCatalogAndSchemaTest` — fixed to clean `132/132` under the default
 collector earlier the same day
-(`../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`)
+(`fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`)
 — fails under ZGC with the **identical root cause the fix targeted**:
 
 ```
@@ -140,7 +140,7 @@ Single run, not yet confirmed deterministic.
   actionable, not ZGC-specific.
 - `org.hibernate.orm.test.sql.exec.SmokeTests` — `found=17 ok=16 failed=1`,
   exact match to the well-documented `testQueryConcurrency` throughput
-  timeout (`../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`).
+  timeout (`fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`).
   Not ZGC-specific.
 
 ## Timing
@@ -160,5 +160,5 @@ suite, by the shard-count-independent per-class-sum metric.
   exception). Don't conflate the two — they may share a root cause upstream
   (both are non-default-collector-specific) or may be unrelated; not
   established either way.
-- `../../internal/fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`
+- `fixed-suite-bugs/hibernate/defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`
   — the fix this doc's headline finding shows is incomplete under ZGC.

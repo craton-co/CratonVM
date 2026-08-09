@@ -263,6 +263,16 @@ pub const EMBEDDED_DEFAULT_COMPATIBILITY_MODE: CompatibilityMode = Compatibility
 /// call [`require_synthetic_jdk`]) before honouring a synthetic request.
 pub const SYNTHETIC_JDK_COMPILED_IN: bool = cfg!(feature = "synthetic-jdk");
 
+/// Whether this build actually contains the JDWP debug server.
+///
+/// Same shape as [`SYNTHETIC_JDK_COMPILED_IN`], and for the same reason: the
+/// server is started from a `#[cfg(feature = "experimental-debug")]` block in
+/// `vm/src/vm/vm_init.rs`, and that feature is not in `cratonvm-vm`'s default
+/// set nor enabled by `cratonvm-cli`. Without this constant `--jdwp-port` is
+/// accepted and does nothing in every shipped launcher binary, and the only
+/// symptom is a debugger that never connects.
+pub const JDWP_SERVER_COMPILED_IN: bool = cfg!(feature = "experimental-debug");
+
 /// obsaudit D12 (2026-07-26) — settings for `-XX:StartFlightRecording`.
 /// Parsed by `vm-cli/src/main.rs`, consumed by `Vm::new`
 /// (`vm/src/vm/vm_init.rs`) to start a real JFR recording at boot.
@@ -629,11 +639,21 @@ pub enum AotMode {
 ///                  `sun/`, `com/sun/`). This is HotSpot's default.
 ///   - **All**    — verify boot classes too. Useful for compliance testing.
 ///
-/// cratonvm currently runs Pass 2 (structural) on every class and Pass 3
-/// (typestate) on non-boot classes by default; selecting `All` is honoured
-/// by the verifier dispatcher in `vm/src/vm/vm_util.rs`. `None` is wired
-/// through `skip_verification` for backward compatibility with the existing
-/// `--noverify` CLI flag.
+/// cratonvm runs Pass 2 (structural) on every class and Pass 3 (typestate) on
+/// non-boot classes. `None` is wired through [`Self::skips_verification`] into
+/// `skip_verification`, which the verifier dispatcher in `vm/src/vm/vm_util.rs`
+/// reads.
+///
+/// **`All` is not implemented.** This field is written at CLI parse time and
+/// never read: the dispatcher branches on `skip_verification`, and whether a
+/// boot class is skipped is decided by `verifier_skip_eligible(&Class)`, which
+/// takes no configuration and so cannot observe this mode.
+/// `classloading::bytecode_verifier::verify_bytecode_strict` — documented as the
+/// `-Xverify:all` entry point — has no production caller. `Remote` and `All`
+/// therefore behave identically, which is why the launcher warns when `All` is
+/// requested rather than accepting it silently. Wiring it up would turn strict
+/// typestate verification on for the whole JDK boot image; that is a product
+/// decision with real regression surface, not a mechanical change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum XverifyMode {
     /// Equivalent to `-Xverify:none` / `-noverify`.

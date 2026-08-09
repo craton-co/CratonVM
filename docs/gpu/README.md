@@ -9,7 +9,7 @@ If you only want to run the JVM on CPU, you can stop reading. If you
 want to enable GPU offload, route a recurring Java workload through
 it, or extend the feature, read on.
 
-> **Status (2026-07-11).** The full transparent-offload path — analyze
+> **Status.** The full transparent-offload path — analyze
 > → lower to PTX → load → marshal → launch → writeback/deopt — is
 > implemented and validated on real hardware (RTX 2060, sm_75, CUDA
 > driver 591.86). Checksums match HotSpot bit-for-bit on every kernel
@@ -46,7 +46,7 @@ it, or extend the feature, read on.
 | [`lowering-branches.md`](lowering-branches.md) | Basic-block and join-state lowering for loop-body branches. |
 | [`hardware-ci.md`](hardware-ci.md) | Self-hosted GPU CI scaffolding and enrollment status. |
 | [`../book/src/gpu/overview.md`](../book/src/gpu/overview.md) | User-facing book chapter: what can be offloaded, build modes, CLI flags. |
-| [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The 2026-07-11 RTX 2060 benchmark writeup (methodology + tables). |
+| [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The RTX 2060 benchmark writeup (methodology + tables). |
 
 ## At a glance
 
@@ -486,7 +486,7 @@ and a GC stress program (`GcStress`).
 ## Known follow-ups
 
 All hardware-validation follow-ups from the first real-hardware pass are
-closed. Summary as of 2026-07-12:
+closed. Summary:
 
 - **DONE**: reduction dispatch (int/long only — see "What the analyzer
   accepts"), the JIT-caller admission gate, the launch-config thread-

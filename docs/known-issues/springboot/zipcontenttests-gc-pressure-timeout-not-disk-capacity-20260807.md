@@ -127,7 +127,7 @@ Not established this session whether:
    progressively slower/more memory-constrained than it should be rather
    than just naturally heavy.
 
-`docs/gc/old-sweep-liveness.md` section 7 (referenced directly in the log
+`audits/old-sweep-liveness.md` section 7 (referenced directly in the log
 line) is the right starting point for (2) — it already documents the
 conservative-interior-root-pinning mechanism as a known, intentional
 correctness safeguard, not obviously a bug in itself, but its *frequency*

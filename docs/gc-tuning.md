@@ -4,7 +4,7 @@ Audience: developers tuning CratonVM heap behaviour for a specific workload
 — Quarkus boot, JFR-recorded benchmarks, low-latency request handlers,
 long-running daemons, or test fixtures with tight budget envelopes.
 
-Source: [`gc/src/`](../gc/src/) (34 files, ~62 k LOC, measured 2026-07-30).
+Source: [`gc/src/`](../gc/src/) (34 files, ~62 k LOC).
 The collector
 dispatches through the `VmHeap` enum
 ([`gc/src/vm_heap.rs`](../gc/src/vm_heap.rs)); each backend is a separate
@@ -31,15 +31,14 @@ Trade-offs at a glance:
   per pause target. It pays a per-store remembered-set cost (~10 ns) but
   amortises full-heap compaction. Use it when the old generation is large
   and reclamation latency matters more than minor-GC throughput.
-- **ZGC** is **not** stub-only (that claim was true when written and is
-  superseded 2026-08-07). `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real
+- **ZGC** is **not** stub-only. `ZgcRealHeap` (`gc/src/zgc.rs:1396`) is a real
   memory-backed collector — `Arena` storage, real `ObjectHeader`s, real
   reference processing — and `-XX:+UseZGC` really selects it
   (`GcAlgorithm::Zgc` → `GcBackend::Zgc` → `VmHeap::Zgc`). What it is *not* is
   ZGC: it is stop-the-world, non-moving, whole-heap, non-generational, and has
   no TLABs (every allocation takes the arena lock). The colored-pointer /
   `ZPage` code above it in the same file is a metadata-only simulation with no
-  production consumer. Measured 2026-08-07 on the 1975-class Spring Boot suite:
+  production consumer. On the 1975-class Spring Boot suite:
   1860 PASS vs. Generational's 1902, with 49 HANG vs. 18 — see
   [`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`](known-issues/springboot/zgc-real-fullsuite-regression-20260807.md).
   **Do not depend on it in production.** The path to a real one is

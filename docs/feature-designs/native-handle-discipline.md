@@ -1,7 +1,28 @@
 # Native root handles
 
-Status: implemented. New native code must use the scoped handle API when an
-object survives an allocating or re-entrant operation.
+**Status:** Shipped (default on) as an API and a convention — **not
+mechanically enforced.**
+
+## What it does today
+
+The scoped handle API exists and is widely adopted: roughly 405
+`HandleScope::new` / `.root(` sites across the tree. The storage-generic core
+is `types/src/handle.rs` (`HandleStorage`, `RootedHandle` — an opaque `u32`
+slot, deliberately not a pointer — and a LIFO `HandleScope`). The
+native-facing wrapper is in `native-api/src/registry.rs` (`NativeHandle`,
+`NativeHandleScope`, whose `Drop` closes the scope on normal return, early
+return and unwind alike).
+
+The rule is: **new native code must use the scoped handle API when an object
+survives an allocating or re-entrant operation.**
+
+## What is not built yet
+
+**Nothing enforces the rule.** There is no clippy lint, no guard test and no CI
+grep that fails when a native holds a raw `ObjectRef` across an allocating
+call. The tests under "Enforcement and validation" below exercise the handle
+type itself, not its adoption. Validation against a moving collector is
+likewise still owed.
 
 ## Problem
 

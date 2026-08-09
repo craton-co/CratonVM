@@ -5,7 +5,7 @@
 clean host (`origin/dev` merge @ `f9315411a`, load average ~14). All three
 classes are in the 41-class non-passing set, all HANG at the per-class
 timeout. Split out from
-[`bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`](bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md)
+the retired `bug-h2-mvstore-insert-loop-perf-hang` record
 because each is stuck at a locus that is NOT the row-iteration / commit path
 that doc already characterizes — grouping them there would misattribute the
 cause. Each entry below is a single `--stack-dump-on-timeout` sample; unlike
@@ -100,7 +100,7 @@ Stuck during **database-close-time compaction**, not live query work —
 MVStore file, and `Database.close()` triggers a full `compactStore()` /
 `FileStore.compact()` pass over it. This is the same MVStore machinery
 touched by the (separately fixed) old-generation coalescing issue in
-[`bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md),
+`bug-h2-testmvstorecacheperformance-sigsegv-hib-cv-32-family.md`,
 but reached through H2's own compact-on-close call path rather than GC. Not
 yet established whether this is (a) H2's compaction algorithm being
 inherently expensive against a highly fragmented fuzzed store (would also be
@@ -121,6 +121,6 @@ slow, just less so, on HotSpot), or (b) a CratonVM-side cost specific to the
   bottleneck.
 
 ## Related
-* [`bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md`](bug-h2-mvstore-insert-loop-perf-hang-RESOLVED-20260807.md)
+* the retired `bug-h2-mvstore-insert-loop-perf-hang` record
   — the row-iteration/commit throughput cliff; the working hypothesis this
   doc exists to rule in or out for these three classes.

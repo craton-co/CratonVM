@@ -4144,7 +4144,7 @@ pub mod tls;
 // Deny-by-default guard for the JSSE socket-factory surface: an
 // `SSLSocketFactory`/`SSLServerSocketFactory` overload with no TLS bridge must
 // raise rather than inherit `javax.net.{Socket,ServerSocket}Factory`'s
-// plaintext implementation. See `docs/security/tls-and-jca-failure-audit.md`.
+// plaintext implementation. See `audits/tls-and-jca-failure-audit.md`.
 pub mod tls_deny;
 // Step 1 of the limb-based BigInteger rewrite (gaps/biginteger-limb-rewrite-scope.md).
 // Additive only — nothing routes through it yet; later steps migrate the

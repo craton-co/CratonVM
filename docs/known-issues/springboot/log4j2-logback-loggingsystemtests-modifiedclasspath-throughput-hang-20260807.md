@@ -47,8 +47,8 @@ silence until the 300s timeout kills the process (~02:20:16).
 ## What this is not
 
 - **Not the 2026-07-17/19 `ModifiedClassPathExtension` recursion livelock**
-  ([`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/modifiedclasspath-aether-network-hang-cluster-FIXED.md),
-  [`junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md)).
+  (`modifiedclasspath-aether-network-hang-cluster-FIXED.md`,
+  `junit5-interceptingexecutableinvoker-layout-probe-livelock-cluster-FIXED.md`).
   That bug's signature was a **tight, steady (~1-2s cadence) repeat of the
   same `cratonvm::gc::guard: gen_heap::get_field: out-of-bounds field read
   dropped` warning against `InterceptingExecutableInvoker`/`InvocationInterceptorChain`
@@ -123,7 +123,7 @@ confirmed:
    warning appearing during its silent stretch — the same warning and reason
    already implicated in a **separate, independently-filed** throughput-wall
    regression for Tomcat
-   ([`gc-moving-young-persistent-nonmoving-fallback-regression.md`](../tomcat/gc-moving-young-persistent-nonmoving-fallback-regression.md)),
+   (the retired `gc-moving-young-persistent-nonmoving-fallback-regression` record),
    where persistent moving-young→non-moving-sweep fallback was measured
    making a workload 40-80x slower than its closed baseline while still
    making genuine (just very slow) forward progress. If the same fallback is

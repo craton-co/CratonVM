@@ -59,7 +59,7 @@
 //!
 //! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
 //! mean": the [`parse`] module carries five *different* boolean parsers because
-//! five different ones are in use today. `docs/flag-census.md` §10 has
+//! five different ones are in use today. `audits/flag-census.md` §10 has
 //! the full matrix. Unifying them is a behaviour change and is deliberately not
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
@@ -385,7 +385,7 @@ pub mod parse {
     /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
     /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
     /// [`affirmative_word`]. Truth table 8 (see the module docs and
-    /// `docs/flag-census.md` §10). Lifted from
+    /// `audits/flag-census.md` §10). Lifted from
     /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
     #[inline]
     pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {

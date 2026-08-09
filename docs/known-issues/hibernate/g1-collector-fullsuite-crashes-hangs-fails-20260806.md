@@ -106,7 +106,7 @@ default collector.
   unchanged, not G1-specific.
 - `org.hibernate.orm.test.sql.exec.SmokeTests` — the well-documented
   `testQueryConcurrency` throughput timeout, most recently retired to
-  `../../internal/fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
+  `fixed-suite-bugs/hibernate/smoketests-concurrent-query-throughput-20260723-RETIRED.md`.
   Not G1-specific.
 - `org.hibernate.orm.test.stream.basic.JpaStreamTest` — **new, not
   previously seen under the default collector.**
@@ -385,7 +385,7 @@ too, because a second notion of "is this address in this heap" in front of
   controlled Java exception) where this G1 defect does not (a native
   SIGSEGV). Worth comparing mechanisms once the G1 fault site is symbolized.
 - `defaultcatalogandschematest-jit-proxy-dispatch-abstractmethoderror-FIXED-20260806.md`
-  (in `../../internal/fixed-suite-bugs/hibernate/`) — the JIT dynamic-proxy
+  (in `fixed-suite-bugs/hibernate/`) — the JIT dynamic-proxy
   fix that made `DefaultCatalogAndSchemaTest` clean under the default
   collector the same day this G1 run started. This doc's G1 crash on the
   same class is a **different** mechanism (native SIGSEGV vs. the fixed

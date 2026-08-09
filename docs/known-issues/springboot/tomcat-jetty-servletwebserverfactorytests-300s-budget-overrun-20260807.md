@@ -18,10 +18,10 @@ Logs:
 ## Not the previously-fixed hangs — checked against both existing docs
 
 Both classes have substantial fix history:
-`docs/internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-stw-takeover-hang-FIXED.md`
+`fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-stw-takeover-hang-FIXED.md`
 (an STW cross-thread JIT-takeover deadlock, fixed 2026-07-27, re-verified 2026-08-06 with 72
 clean reruns) and
-`docs/internal/fixed-suite-bugs/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals-FIXED.md`
+`fixed-suite-bugs/springboot/jetty-webserver-factory-poststartup-timeout-and-reflective-supertype-residuals-FIXED.md`
 (several distinct hangs/crashes fixed through 2026-07-21, ending in an AB-BA
 `class_manager`/`vtable_manager` lock-ordering deadlock, "Final resolution," verified
 113/113 with 0 aborted on JIT and `--nojit`).
@@ -74,7 +74,7 @@ inside 300s. CratonVM's ~4-5s/cycle vs. HotSpot's ~1-1.3s/test puts CratonVM at 
 **4-4.5x HotSpot's wall time** for this workload (repeated embedded-container
 start/stop, TLS/keystore setup, Mockito self-attach), the same general shape (if less
 extreme) as the previously-filed
-`docs/internal/springboot/CRATONVM_BUGS`-adjacent "N x HotSpot, budget runs out before a
+`springboot/CRATONVM_BUGS`-adjacent "N x HotSpot, budget runs out before a
 large multi-cycle class finishes" pattern seen elsewhere in this suite (e.g.
 `JooqAutoConfigurationTests`, `FlywayAutoConfigurationTests`).
 

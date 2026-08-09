@@ -35,7 +35,7 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 
 `--jdk-only` is an **internal diagnostic**, not a supported runtime mode.
 `--real-jdk` remains the default and is unchanged by anything in this section.
-Wave 1 is measurement-first: violations that cannot yet be enforced safely are
+Stage 1 is measurement-first: violations that cannot yet be enforced safely are
 recorded and counted rather than made fatal. Normative semantics live in
 [`feature-designs/jdk-only-mode.md`](feature-designs/jdk-only-mode.md); the
 operator-facing walkthrough is [`jdk-only-migration.md`](jdk-only-migration.md).
@@ -426,7 +426,7 @@ are **off by default** (the default posture is JDK-faithful single-tenant).
 | Token | Group | Description | Default |
 |-------|-------|-------------|---------|
 | `-lazy-streams` / `eager-streams` | `COMPAT` | Opt **out** of the lazy / short-circuiting synthetic `java.util.stream` pipeline back to the legacy eager pipeline. Lazy is the default (keycloak-16 Part B): intermediate ops (`peek`/`map`/`filter`/`limit`/`skip`) defer instead of materialising, and short-circuit terminals stop early — so `Stream.of(...).peek(p).findFirst()` runs `p` once, matching HotSpot. Eager-terminal results and exceptions are identical either way. | lazy |
-| `mockito-legacy-selectors` | `COMPAT` | Restore the pre-2026-07-27 native overrides of Mockito's own selector methods: `LocationFactory.create` returns a `Java8LocationImpl` carrying the hardcoded string `"-> at <<unknown line>>"` instead of walking the stack, and `ModuleMemberAccessor.delegate` always returns `ReflectionMemberAccessor`. Off by default — the real selectors run and pick `LocationImpl` / `InstrumentationMemberAccessor` as on HotSpot, so Mockito failure messages name their real call site. Escape hatch only. | Off |
+| `mockito-legacy-selectors` | `COMPAT` | Restore the older native overrides of Mockito's own selector methods: `LocationFactory.create` returns a `Java8LocationImpl` carrying the hardcoded string `"-> at <<unknown line>>"` instead of walking the stack, and `ModuleMemberAccessor.delegate` always returns `ReflectionMemberAccessor`. Off by default — the real selectors run and pick `LocationImpl` / `InstrumentationMemberAccessor` as on HotSpot, so Mockito failure messages name their real call site. Escape hatch only. | Off |
 | `-default-watchdog` | `THREADS` | Disable the 120-second hang watchdog. | on |
 | `default-watchdog-sec=N` | `THREADS` | Override the default watchdog timeout. | `120` |
 | `lock-order-check` | `THREADS` | Opt in (release builds) to runtime lock-ordering deadlock detection. Truthy values: `1`/`true`/`yes`/`on`. Always on in debug builds. | Off (release) |

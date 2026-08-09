@@ -5178,3 +5178,71 @@ fn b3_gate_scans_full_production_body_of_interpreter() {
          across {scanned} scanned lines; it must be panic-free.",
     );
 }
+
+/// `multianewarray` must reject `dimensions > <bracket count of the referenced
+/// array class>` *itself*, not lean on the verifier for it.
+///
+/// The type-state verifier does check it (`classloading/src/verify_insn.rs`,
+/// `Instruction::Multianewarray`), but that pass does not run for every class:
+/// `ClassManager::define_class_shared_with_options` sets
+/// `defer_loader_sensitive_pass3` for any class defined by a user-defined
+/// loader while `loader_aware_resolution()` is on — which is the default —
+/// and the structural-only substitute it runs instead
+/// (`verifier::verify_method_structural`) never looks at this operand.
+/// `-Xverify:none` removes the check too.
+///
+/// Without the guard the opcode arm computes `total_array_depth - d - 1` for
+/// `d` in `0..dimensions`. The first `d == total_array_depth` underflows
+/// `usize`: a release build (`[profile.release]` sets no `overflow-checks`, so
+/// it defaults off) wraps it to `usize::MAX`, and the very next statement is
+/// `"[".repeat(comp_brackets)` — `Vec::with_capacity(usize::MAX)`, which the
+/// allocator cannot satisfy and which aborts the process rather than raising
+/// anything Java can catch. `multianewarray #cp("java/lang/Object"), 1`
+/// underflows on the *first* iteration.
+///
+/// This is a source witness rather than an execution test: reaching the arm
+/// needs a full `Vm`, a hand-built classfile and a `skip_verification`/
+/// user-loader define, and there is no single-opcode harness in this module.
+/// It is anchored on code text, not line numbers, so it does not go stale the
+/// way a fixed line band would.
+#[test]
+fn multianewarray_arm_guards_the_component_bracket_subtraction() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/runtime/interpreter/opcodes.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read opcodes.rs");
+
+    let arm = src
+        .find("Instruction::Multianewarray { index, dimensions } =>")
+        .expect("the multianewarray arm must still exist");
+    // Anchor on the whole binding, not the bare expression: the guard's own
+    // explanatory comment quotes `total_array_depth - d - 1`, and matching that
+    // would find the comment (which sits *before* the guard) instead of the code.
+    let subtraction = src[arm..]
+        .find("let comp_brackets = total_array_depth - d - 1")
+        .map(|off| arm + off)
+        .expect(
+            "the component-bracket subtraction must still exist; if it was rewritten \
+             (e.g. to `checked_sub`), retarget this witness at the new form",
+        );
+
+    let guard = src[arm..subtraction].find("sizes.len() > total_array_depth");
+    assert!(
+        guard.is_some(),
+        "multianewarray: `total_array_depth - d - 1` is reached with no \
+         `sizes.len() > total_array_depth` rejection in front of it. A class \
+         whose Pass 3 was deferred (any user-defined loader, the default) can \
+         then underflow it to usize::MAX and abort the process in \
+         `\"[\".repeat(..)`."
+    );
+
+    // The guard must reject, not clamp: a silently-truncated dimension count
+    // would allocate the wrong shape instead of crashing, which is worse.
+    let guarded = &src[arm..subtraction];
+    assert!(
+        guarded.contains("LinkageError::VerifyError"),
+        "the multianewarray depth guard must raise a catchable VerifyError, \
+         not clamp the dimension count or fall through"
+    );
+}

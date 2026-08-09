@@ -47,7 +47,7 @@ pub use vm_util::*;
 // because they never meet them. Do not copy a slot number out of this module
 // into production code, and do not treat a green run of these tests as
 // evidence that a native's slot arithmetic survives stub removal.
-// See `docs/jdk-only-object-layout-audit.md`.
+// See `audits/jdk-only-object-layout-audit.md`.
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use crate::classloading::resolution::MethodHandleKind;
 #[cfg(all(test, feature = "synthetic-jdk"))]

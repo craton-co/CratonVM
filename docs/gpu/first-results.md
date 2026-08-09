@@ -2,7 +2,7 @@
 
 This file was the placeholder for "acceptance numbers once a GPU box exists."
 That happened: the offload path was validated end-to-end on an RTX 2060
-(sm_75) on 2026-07-11 — device probe, transparent `--gpu` offload, checksum
+(sm_75) — device probe, transparent `--gpu` offload, checksum
 parity with HotSpot, and head-to-head numbers against TornadoVM 4.0.1 (PTX).
 
 The living results now belong to:

@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-420 tokens.
+423 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -176,15 +176,16 @@ export inherited from a parent shell.
 | `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
 | `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
 | `forname-trace` | `CRATONVM_FORNAME_TRACE` |
-| `fjp-eager-fork` | `CRATONVM_FJP_EAGER_FORK` |
 | `frame-trace` | `CRATONVM_FRAME_TRACE` |
 | `fsp` | `CRATONVM_DBG_FSP` |
 | `fullstack-scan` | `CRATONVM_DBG_FULLSTACK_SCAN` |
+| `fwdwalk` | `CRATONVM_DBG_FWDWALK` |
 | `fwdguard` | `CRATONVM_DBG_FWDGUARD` |
 | `g1-dbg-headers` | `CRATONVM_G1_DBG_HEADERS` |
 | `g1-dbg-pins` | `CRATONVM_G1_DBG_PINS` |
 | `g1-dbg-reach` | `CRATONVM_G1_DBG_REACH` |
 | `g1-dbg-rootcensus` | `CRATONVM_G1_DBG_ROOTCENSUS` |
+| `gdm-prof` | `CRATONVM_DBG_GDM_PROF` |
 | `g1-dbg-zero` | `CRATONVM_G1_DBG_ZERO` |
 | `g1diag` | `CRATONVM_DBG_G1DIAG` |
 | `gc-array-guard-bt` | `CRATONVM_GC_ARRAY_GUARD_BT` |
@@ -380,6 +381,7 @@ export inherited from a parent shell.
 | `rootsnap` | `CRATONVM_DBG_ROOTSNAP` |
 | `rootsnap-every` | `CRATONVM_DBG_ROOTSNAP_EVERY` |
 | `rootsnap-verify` | `CRATONVM_DBG_ROOTSNAP_VERIFY` |
+| `rootprof` | `CRATONVM_DBG_ROOTPROF` |
 | `rset-audit` | `CRATONVM_DBG_RSET_AUDIT` |
 | `rset-audit-young-scan` | `CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN` |
 | `rterr` | `CRATONVM_DBG_RTERR` |
@@ -663,7 +665,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_GC`
 
-37 tokens.
+40 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -676,6 +678,7 @@ export inherited from a parent shell.
 | `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
 | `defrag-promote` | `CRATONVM_NO_DEFRAG_PROMOTE` |
 | `exact-refproc-survival` | `CRATONVM_NO_EXACT_REFPROC_SURVIVAL` |
+| `g1-coverage-pin` | `CRATONVM_G1_COVERAGE_PIN` |
 | `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
 | `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
 | `g1-workers` | `CRATONVM_G1_WORKERS` |
@@ -703,6 +706,8 @@ export inherited from a parent shell.
 | `tlab-gc-trigger` | `CRATONVM_TLAB_GC_TRIGGER` |
 | `weakref-clear` | `CRATONVM_WEAKREF_CLEAR` |
 | `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
+| `zgc-startbits` | `CRATONVM_ZGC_STARTBITS` |
+| `zgc-tlab` | `CRATONVM_ZGC_TLAB` |
 | `young-pause-goal-ms` | `CRATONVM_GC_YOUNG_PAUSE_MS` |
 
 ## `CRATONVM_REAL`
@@ -787,6 +792,7 @@ export inherited from a parent shell.
 | `default-watchdog-sec` | `CRATONVM_DEFAULT_WATCHDOG_SEC` |
 | `eqe-sync-execute` | `CRATONVM_EQE_SYNC_EXECUTE` |
 | `exec-depth-ceiling` | `CRATONVM_EXEC_DEPTH_CEILING` |
+| `fjp-eager-fork` | `CRATONVM_FJP_EAGER_FORK` |
 | `inherit-thread-ccl` | `CRATONVM_INHERIT_THREAD_CCL` |
 | `inherit-tl-workaround` | `CRATONVM_INHERIT_TL_WORKAROUND` |
 | `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |

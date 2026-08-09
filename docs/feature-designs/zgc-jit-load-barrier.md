@@ -1,45 +1,16 @@
-# ZGC Phase 1c: the JIT-side load barrier — correctness argument, site inventory and cost
+# The ZGC JIT-side load barrier
 
-Status: **analysis + staged plan. No code change proposed for this pass.**
-Workstream **1c** of [`zgc-production-implementation-plan.md`](zgc-production-implementation-plan.md)
-§2 (Phase 1), the one item in that plan that was listed without a cost.
-Companion to [`zgc-reference-slot-representation.md`](zgc-reference-slot-representation.md),
-which owns the *slot shape* question and explicitly defers barrier emission to
-this document ("the JIT's work is barrier emission (plan doc workstream 1c),
-which is orthogonal to this document", `zgc-reference-slot-representation.md:691-693`).
+**Status:** Designed, not built. No barrier emission exists in the JIT — a
+search of `jit/src` and `jit-api/src` for ZGC finds only two incidental test
+comments.
 
-*Written 2026-08-07, grounded in a read of `gc/src/zgc/{barrier,vaddr}.rs`,
-`gc/src/{compressed_oops,heap}.rs`, `jit/src/x64/{objects,bytecode_walk,arrays,licm,inlining,escape_analysis,simd}.rs`,
-`jit/src/{ir_lower,ir,aarch64_backend,runtime_lowering}.rs`, `vm/src/jit/helpers.rs`
-and `vm/src/vm/vm_init.rs`. Every factual claim carries a `file:line`. Line
-numbers are against `dev` at `59f219757`.*
-
-> **Revision, 2026-08-07 (second pass).** An implementation agent executed the
-> §2.5 half of stage (a) against `vm/src/jit/helpers.rs` and the exercise
-> refuted four claims in the first draft. Folded in below and itemised in §9a:
-> the helper-path site count was **6, not 7**; **one of the six is unreachable**;
-> **three of the six are not barrier sites at all** (the barrier belongs one
-> call frame upstream); a **seventh, differently-shaped filter** was missed; the
-> filters are heuristics over an **unfixed** GC defect rather than settled
-> integrity guards; and all six were feeding **no degradation counter**, so the
-> instrument built to catch this class of bug reads `0` by construction under
-> JIT. Every `vm/src/jit/helpers.rs` anchor was re-verified and is now given in
-> §2.5's table as a **before/after pair**, because the stage-(a) instrumentation
-> is in the working tree but not yet committed.
->
-> **Anchor hygiene warning.** `gc/src/zgc/` is an **untracked** directory under
-> concurrent edit by sibling workstreams (`git status` shows `?? gc/src/zgc/`),
-> so this document's `barrier.rs` line numbers drift without a commit to blame.
-> They have **already drifted** since the first draft: `load_barrier_slow` is
-> now `:1076` (cited here as `:858`), the heal CAS `:1176` (cited as `:937`),
-> `ZBarrierStats` `:306` (cited as `:200-300`), and `ZBarrierContext::forward`
-> `:644` (cited as `:452-454`). Treat every `gc/src/zgc/*` anchor in this
-> document as a **symbol name plus a stale hint** and re-grep it; the
-> `vm/src/jit/helpers.rs`, `jit/src/**` and `types/src/**` anchors were
-> re-verified this pass and are exact. `gc/src/zgc/vaddr.rs`'s cited anchors
-> (`:257-264`, `:276-279`) were spot-checked and are still exact.
-
----
+This document is the correctness argument, the site inventory and the cost
+model for the barrier that a compacting ZGC would need. It is a design, and
+implementing it is gated on
+[`zgc-production-implementation-plan.md`](zgc-production-implementation-plan.md)
+adopting the relocating machinery at all. The slot-shape half of the question
+is owned by
+[`zgc-reference-slot-representation.md`](zgc-reference-slot-representation.md).
 
 ## 0. Verdict, up front
 
@@ -247,7 +218,7 @@ rg -n 'mark_top_operand_as_oop' jit/src --type rust     -> 6, all aarch64_backen
                                                            is #[allow(dead_code)]
 
 # the value-degrading plausibility filters on the helper path
-# CORRECTED 2026-08-07: the first draft said "7 in this file". It is 6 here and
+# CORRECTED the first draft said "7 in this file". It is 6 here and
 # 7 in the tree; the seventh is gc/src/heap.rs. See §2.5 for the full table.
 rg -n 'plausible_heap_pointer\(raw\)' vm/src/jit/helpers.rs   (pre-change tree)
                                                        -> exactly 6, all degrading a LOADED VALUE to 0:
@@ -879,7 +850,7 @@ add the barrier inside the Rust helpers; **relocate or replace** the value-
 degrading plausibility filters on the load path (§2.5); add a coverage
 assertion.
 
-**Corrected 2026-08-07.** This paragraph used to read "remove the seven
+**Corrected.** This paragraph used to read "remove the seven
 value-degrading plausibility filters". Three things were wrong with that. (i)
 There are **six** in `vm/src/jit/helpers.rs`, not seven (§2.5.1). (ii) One of
 the six is **unreachable** and needs a comment, not a barrier (§2.5.2). (iii)
@@ -1068,8 +1039,8 @@ not be set after the first JIT compile.
 | # | Risk | Presents as | Mitigation |
 |---|---|---|---|
 | **J1** | **A missed Category-A site.** The `inline_card_mark_available` failure, replayed. `emit_load_string_value_ptr` was already missed once by exactly this class of gate (`gc/src/compressed_oops.rs:50-58`: an ungated site → "a deterministic wild-pointer SIGSEGV on every inlined `charAt`/`length`/`indexOf`/`hashCode`/`equals`/`compareTo`"). | **Silent heap corruption** if the missed word is degraded to null (§1.1 case 2); a clean SIGSEGV if it is dereferenced. The first is worse. | The source-witness coverage test in stage (a).1. Bit 63 is the tripwire that converts case 2 into case 1 — **do not weaken `plausible_heap_pointer`'s 47-bit check to "fix" a colored-word rejection**; fix the caller. |
-| **J1b** | **The degradation counter is blind under JIT** (added 2026-08-07, §2.5.4). All six `plausible_heap_pointer(raw)` filters in `vm/src/jit/helpers.rs` degrade a live reference to `null` and increment **nothing**; the interpreter's twin feeds `note_object_degradation` (`types/src/compact_value.rs:330`) and a one-shot stderr line. | `object_degradation_count()` reads **`0`** — a clean bill of health — in exactly the configuration where the still-open root-coverage gap of `6a04b0e3c1` is most likely to fire, because JIT'd frames are the ones a deposited root snapshot misses. A silent wrong answer *and* a silent instrument. **This is a live bug on the default collector, not a ZGC risk.** | `JIT_REF_DEGRADATIONS` + `jit_ref_degradation_count()` added on the JIT side (`vm/src/jit/helpers.rs:4928`, `:4935`). Unify with the interpreter's counter by widening `note_object_degradation` to `pub` (`types/src/compact_value.rs:330`) — one word, another crate. Until then read **both** numbers; a counter printed only when non-zero hides "never ran". |
-| **J1c** | **`forward_jit_arg_at` skips the barrier silently** (added 2026-08-07, §2.5.5). Its hand-rolled `raw >= 1<<48` test (`vm/src/jit/helpers.rs:468`) `return`s instead of degrading, so a colored word means "argument not forwarded" with no null, no counter and no diagnostic. It matches no `plausible_heap_pointer` grep. | A stale argument reference surviving a relocation, scoped to the JIT calling boundary. Invisible to every instrument in J1b. | Rests on "arguments arrive already barriered" — an **assumption of the same class as J2**, not a proof. Either prove it or route the check through the same decode chokepoint. It is also the natural home for the D/E/F barrier dispatch, since it already owns this file's `load_and_forward` call for moving collectors (`:475`). |
+| **J1b** | **The degradation counter is blind under JIT** (added §2.5.4). All six `plausible_heap_pointer(raw)` filters in `vm/src/jit/helpers.rs` degrade a live reference to `null` and increment **nothing**; the interpreter's twin feeds `note_object_degradation` (`types/src/compact_value.rs:330`) and a one-shot stderr line. | `object_degradation_count()` reads **`0`** — a clean bill of health — in exactly the configuration where the still-open root-coverage gap of `6a04b0e3c1` is most likely to fire, because JIT'd frames are the ones a deposited root snapshot misses. A silent wrong answer *and* a silent instrument. **This is a live bug on the default collector, not a ZGC risk.** | `JIT_REF_DEGRADATIONS` + `jit_ref_degradation_count()` added on the JIT side (`vm/src/jit/helpers.rs:4928`, `:4935`). Unify with the interpreter's counter by widening `note_object_degradation` to `pub` (`types/src/compact_value.rs:330`) — one word, another crate. Until then read **both** numbers; a counter printed only when non-zero hides "never ran". |
+| **J1c** | **`forward_jit_arg_at` skips the barrier silently** (added §2.5.5). Its hand-rolled `raw >= 1<<48` test (`vm/src/jit/helpers.rs:468`) `return`s instead of degrading, so a colored word means "argument not forwarded" with no null, no counter and no diagnostic. It matches no `plausible_heap_pointer` grep. | A stale argument reference surviving a relocation, scoped to the JIT calling boundary. Invisible to every instrument in J1b. | Rests on "arguments arrive already barriered" — an **assumption of the same class as J2**, not a proof. Either prove it or route the check through the same decode chokepoint. It is also the natural home for the D/E/F barrier dispatch, since it already owns this file's `load_and_forward` call for moving collectors (`:475`). |
 | **J2** | **The scalar-replacement assumption.** `bytecode_walk.rs:3940` reads a frame slot for a scalar-replaced object's field, which is barrier-free *only if* every write into that slot came from a barriered value. Nothing asserts this. | Silent stale reference, scoped to methods where escape analysis fired — i.e. hot methods. | Assert it in stage (a): a scalar-replaced object never escapes, so its fields can only be written from barriered loads or fresh allocations. **Verify, do not assume** — this is an explicit open question (§8). |
 | **J3** | **An in-flight reference in a register at the slow-arm call.** The barrier runs between the load and `mark_top_as_oop()`, and **there is no register oop map** (`jit/src/regalloc.rs:1493-1500`). | A relocating collection during the barrier slow path moves the object whose address is in RAX and nothing rewrites RAX. **Use-after-free, non-deterministic, load-dependent.** | The mechanism already exists: the blind full-GPR spill in `emit_pre_safepoint_spill` (`jit/src/x64/safepoint.rs:131-153`). The risk is *forgetting the bracket*, not lacking one — and half a bracket also silently breaks `fully_oop_covered` (`jit/src/x64/driver.rs:2157-2162`). Moot entirely if open question 4 resolves "the barrier cannot allocate". |
 | **J3b** | **A new required `JitRuntimeHelpers` slot defaults to `0`.** `jit/tests/*` construct the struct with `..Default::default()`. | An unconditional `CALL` through a null pointer, in tests only — so it presents as a test-harness crash, not a VM bug, and gets misfiled. | Make the barrier slot **optional**, with `0` meaning "gate is on, take the helper arm", mirroring `self.getfield == 0` (`jit/src/ir_lower.rs:2295`, `:4490`). Five registration sites must be updated together (§3.3) or the const assertion at `jit-api/src/helpers_abi.rs:826` fails the build — which is the good outcome. |
@@ -1113,56 +1084,3 @@ Marked explicitly rather than guessed.
    be healed with a CAS, so `getstatic` may need the non-healing fallback arm
    that study's option (e) provides per-slot. Not resolved here.
 
----
-
-## 9. Corrections to the commissioning premise
-
-Recorded explicitly, because acting on the original framing would have produced
-the wrong plan and the wrong schedule.
-
-| Claimed | Actual | Anchor |
-|---|---|---|
-| Stage (c) aarch64 is real work, and there are "two backends" to multiply by | aarch64 compiles no method that touches a field, array, object or call. Zero barrier sites. Stage (c) is < 1 day. | `jit/src/aarch64_backend.rs:44-65`, coverage test `:6614-6640` |
-| The `jit_getfield` helper arm is "nearly free — the barrier lands in Rust" | The helper silently degrades any implausible word to `0`, and a colored word is implausible by design. **6** such sites in `vm/src/jit/helpers.rs` (7 in the tree, counting `gc/src/heap.rs`). This is most of stage (a). *Amended 2026-08-07: the count was stated as 7-in-this-file; one of the six is unreachable and three want the barrier upstream — see §9a.* | `vm/src/jit/helpers.rs:4902`, `:5208`, `:5237`, `:5262`, `:6120`, `:6142` (pre-change); `gc/src/zgc/vaddr.rs:257-264` |
-| The fast path is ~3-4 instructions: one AND and one branch | `vaddr` is single-mapped, so the unmask is a real `AND`+`ADD`, and null must be branched around because `base + 0 == base`. 6 instructions with pinned masks, 9 with `imm64`. | `gc/src/zgc/vaddr.rs:1020-1036`, `:276-279`; `gc/src/zgc/barrier.rs:600-606` |
-| "the bad-mask form … null ANDs to zero and so passes with no extra null branch" | True of the *classification*. False of the *machine sequence*, because the classification returns an offset and the JIT needs an address. | `gc/src/zgc/barrier.rs:612-629` vs `vaddr.rs:1034-1036` |
-| Inlining "re-walks opcode `0xb4` with the callee's field info" and therefore multiplies the inline arms | It does re-walk, but **helper-CALL only** — there is no inline raw-load arm in the inliner. It is free under stage (a). | `jit/src/x64/inlining.rs:1088`, `:1101`, `:1107`, `:1123-1127` |
-| Escape analysis is a barrier site | `jit/src/x64/escape_analysis.rs:164-165` is a stack-effect model that emits no code. The materialization at `bytecode_walk.rs:3937-3949` reads a *frame slot*. Barrier-free — conditionally; see J2. | `jit/src/x64/escape_analysis.rs:164-165`, `jit/src/x64/bytecode_walk.rs:3942-3949` |
-| OSR "re-derives a load" | `jit/src/x64/osr.rs` emits no reference load. Reference locals arrive through the ordinary `aload*` path, which reads a frame slot. | `jit/src/x64/osr.rs` (no `emit_ref_aload_regs` / `helpers.getfield` hits) |
-| A barrier needs "a stub-call convention" that does not exist | It exists. Pattern (a) — fast path, `JMP done`, slow arm inline, join — is what every barriered fast path in this backend already uses (`jit/src/x64/objects.rs:479`, `:401`, `:442`, `:456`; `jit/src/x64/bytecode_walk.rs:4265-4300`). Only the *deferred* stub block (`deopt_stubs.rs:737` ff.) lacks a return path, and nothing requires using it. | as cited |
-| "GC-map correctness at each new call site" is a per-site cost | It is a **single yes/no decision** — can the barrier slow path allocate or block? — and the existing `jit_getfield` sites answer "no" for themselves by doing `flush_scratch_registers()` and nothing else (`bytecode_walk.rs:4280`, `:4312`, `:4336`; `inlining.rs:1107`; rationale `ir_lower.rs:3491-3492`). The bracket is `emit_pre_safepoint_spill` + `emit_oop_map_for_safepoint`, and it must be used whole or not at all. | `jit/src/x64/safepoint.rs:30`, `:945`, `:989`; `jit/src/x64/driver.rs:2157-2162` |
-| "zero JIT sites need changing for slot width" | **Survives.** Every arm already branches per object on `GC_FLAG_COMPACT` and issues one aligned 8-byte access. The barrier slots in after the existing address computation, with no change to addressing. | `jit/src/x64/bytecode_walk.rs:4026-4032`, `:4034-4036`, `:4076-4082`, `:4222-4234`; `jit/src/x64/arrays.rs:76-82` |
-| `inline_card_mark_available()` is at `objects.rs:29` and returns `false` | **Survives**, verbatim, including the WildFly reason. | `jit/src/x64/objects.rs:29-45` |
-| `read_prim_element`'s plausibility check is a blocker for barriering array reads | **Survives**, and is one of seven instances of the same pattern, six of which are on the JIT helper path rather than in `gc/src/heap.rs`. **This row was right and §0/§9 row 2 contradicted it**; the six/seven split is now stated consistently everywhere. | `gc/src/heap.rs:1659` (fn), `:1710-1714` (the filter) + the six in §2.2 |
-
----
-
-## 9a. Corrections to *this document*, second pass (2026-08-07)
-
-An implementation agent executed the §2.5 half of stage (a) against
-`vm/src/jit/helpers.rs` and reported seven corrections. **All seven were checked
-against the source independently and all seven hold; none was refuted.** The
-reasoning trail, so a later reader can see what moved and why:
-
-| # | First draft said | Actual | Evidence re-verified this pass |
-|---|---|---|---|
-| **1** | "**7** such value-degrading sites in `vm/src/jit/helpers.rs`" (§9 row 2), while §2.2 listed **six** line numbers | **6 in this file, 7 in the tree.** The seventh is `read_prim_element` — a different crate and a different workstream. The doc contradicted itself; §2.2's six were the correct set. | `rg -n 'plausible_heap_pointer\(raw\)' vm/src/jit/helpers.rs` → exactly 6 (`:4902`, `:5208`, `:5237`, `:5262`, `:6120`, `:6142`); the 7th is `gc/src/heap.rs:1710-1714`, fn at `:1659` |
-| **2** | Site C (`:5237`, the compact **non**-reference `Value::Object` arm) is a barrier site | **Unreachable, so not a barrier site.** Control reaches that `match` only when `storage.is_reference()` was false; `read_compact_field` yields `Value::Object` only from its `Reference` arm. Dead by construction. | `is_reference()` = `matches!(self, Self::Reference)`, `types/src/field_layout.rs:82`; `read_compact_field` `:972`, `Reference` arm `:978-993`, all other kinds `:994-1017`; the early `return` at `helpers.rs:5368` (working tree) |
-| **3** | "These filters are correct *today*" | **Under-stated.** All six landed in one commit whose own message records that the defect they compensate for is **still open**: the root-coverage gap "remains and is the only complete fix". They are heuristics over a live bug, not settled integrity guards — so the stale-bits arm must survive whatever replaces them. | `git blame` → 6/6 = `6a04b0e3c173e5cb4f47287b013fe302a71c0d77` (2026-06-29); commit message closing paragraph |
-| **4** | The six are interchangeable, and the barrier belongs at all of them | **A and B read raw slot words** (`read_ref_slot`) and take the barrier in place. **D, E and F operate on an `ObjectRef` upstream code already fabricated**, so barriering there would process a laundered word — the exact mistake `debug_assert_plain_word` exists to catch. For those the barrier belongs at the slot read (`helpers.rs:5417`) and inside `crate::vm::get_static_shared`. | `helpers.rs:5057` / `:5367` (raw) vs `:5417`, `:6286`, `:6304` (already a `Value`); `gc/src/zgc/vaddr.rs:522`; `vm/src/vm/vm_object.rs:1424` |
-| **5** | (not mentioned) | **A seventh, differently-shaped filter exists.** `forward_jit_arg_at` hand-rolls `raw >= 1<<48` and degrades to **"skip forwarding"**, not to null — so it matches no `plausible_heap_pointer` grep. Left alone because arguments arrive already barriered, which is an assumption of J2's class. | `vm/src/jit/helpers.rs:461` (fn), `:468` (the test), `:475` (`load_and_forward`) |
-| **6** | Anchors against `dev` `59f219757` | The pre-change anchors are **exact at both `59f219757` and `HEAD`**; the reported "+149 uniform shift" is **approximately** right but not uniform, because the arms changed shape as well as position. Re-verified individually rather than by arithmetic. Working-tree anchors: A `:5047-5058`, B `:5354-5368`, C `:5393-5404`, D `:5424-5436`, E `:6289-6295`, F `:6312-6321`. | `git show HEAD:vm/src/jit/helpers.rs`, `git show 59f219757:…`, and `grep -n jit_decode_ref_word` on the working tree |
-| **7** | (not mentioned) | **All six arms fed no counter**, while the interpreter's twin feeds a process-wide one. `object_degradation_count()` therefore reads `0` under JIT by construction. Live bug on the default collector. Fix: widen `note_object_degradation` to `pub`. | `types/src/compact_value.rs:302`, `:325-327`, `:330`; JIT-side counter added at `vm/src/jit/helpers.rs:4928`, `:4935` |
-
-**What moved as a result.** The stage-(a) effort band stays **3-5 days** but its
-composition changed (§5): "seven filter edits" became "two in-place barriers, two
-upstream relocations, one unreachable-site comment, one cross-crate visibility
-change", and the files-touched list gained `vm/src/vm/vm_object.rs` and
-`types/src/compact_value.rs`. The centre of mass moved to the upper half of the
-band, because `get_static_shared` is shared with the interpreter and collides
-with open question 5. Two new risks were registered, **J1b** (the blind counter)
-and **J1c** (`forward_jit_arg_at`), and a fourth stage-(a) test was added.
-
-**What did not move.** The §0 verdict — relocation must refuse to run with the
-JIT enabled until stage (a) lands — is unaffected. So are stages (b) and (c),
-§2.3's Category-A inventory, and every conclusion about the emitted-code side.

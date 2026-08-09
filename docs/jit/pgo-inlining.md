@@ -22,7 +22,7 @@ questions with different guarantees, and the difference is a correctness one.
 | Counter width | `u32`, saturating | `u64` |
 | Concurrency | many OS threads, per-method `Mutex` | single-threaded by construction |
 
-`pgo.rs` states its own unwired status in its module doc, verified 2026-07-26 and
+`pgo.rs` states its own unwired status in its module doc, and that is
 still true: `grep -rn 'pgo::'` finds one doc-comment mention in
 `jit/src/ir_schedule.rs:119` and nothing else. Every counter in it is
 permanently zero at runtime. It is kept as a sketch; §5 of

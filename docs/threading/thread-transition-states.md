@@ -1,6 +1,6 @@
 # Thread transition states
 
-*Last updated 2026-07-31. Implements report item **P1** — "Introduce explicit
+*Implements report item **P1** — "Introduce explicit
 runtime transition states" — and supplies the state vocabulary the P0 items
 "Model safepoint arrival and cancellation" and "Make JIT-frame registration
 atomic with Java-frame visibility" need.*
@@ -433,7 +433,7 @@ is not in the decision path.
 
 ---
 
-## 10. Census reconciliation (2026-07-31 follow-up)
+## 10. Census reconciliation
 
 This section records the follow-up pass that acted on §6.1, §6.3 and §7.2. It
 does not restate them; it says which findings survived verification, what
@@ -458,7 +458,7 @@ fires after 64 stuck takeover rounds and prints, verbatim, "a thread called
 `GcBarrier::enter_blocked()`/`mark_blocked_region_enter()` **WITHOUT** first
 depositing a root snapshot, so it is invisible to the production STW census but
 still occupies an `expected` slot no arrival can ever satisfy". That tripwire
-was added (2026-07-18) for a *different* call site with this exact shape;
+was added for a *different* call site with this exact shape;
 `host_thread_enter_native` was the remaining instance of it.
 
 **Fix.** Both halves now use the sequence `VmNativeThreadBlocker`

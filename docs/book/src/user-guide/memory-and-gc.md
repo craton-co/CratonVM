@@ -78,8 +78,8 @@ launcher with:
 cargo build --release -p cratonvm-cli --features zgc
 ```
 
-It is default-off for pass-rate parity, not because it is unfinished: measured
-2026-08-07 on the 1975-class Spring Boot suite, 1860 PASS against the default
+It is default-off for pass-rate parity, not because it is unfinished: on the
+1975-class Spring Boot suite it measures 1860 PASS against the default
 collector's 1902 (and 49 hangs against 18). It also has none of production
 ZGC's properties — no colored pointers, no load barriers, no concurrency, no
 compaction, no generations, no TLABs.
