@@ -207,7 +207,38 @@ count with it on and off. The resolution it gates never succeeds there, so
 turning it off changes nothing. An inert lever is not an elimination; here it is
 positive evidence that the decode is failing rather than being skipped.
 
-### Measured: repairing it would convert NOTHING in a real workload
+### 2026-08-10, later: `Log4J2LoggingSystemTests` now COMPLETES on dev
+
+Re-run on `cratonvm-mygc-20260810.exe` (dev `3cb0129f6`), twice, `--Xmx 2g`:
+
+```
+SBRUNNER_RESULT tests=61 failed=14 aborted=0 skipped=0 containersFailed=0
+```
+
+— in **under 600s**, the same 61/14 HotSpot reports, where the `6365de194`
+binary did not finish in **3600s**. The row in the table above is therefore
+stale for this class. Something between `6365de194` and `3cb0129f6` fixed it;
+`cb947ffb8` ("retire a worker's TLAB before withdrawing it from tail
+publication") is the plausible candidate but **this has not been attributed by
+bisect** — do not cite it as the cause.
+
+Its fallback count is also **intermittent between runs of the same binary**:
+one run recorded 478 fallback cycles and completed, the next recorded **zero**
+and completed. That is consistent with the binding obligation
+(`xt-helper-window-conservative-scan`) depending on whether peer threads happen
+to be parked inside JIT frames when a collection lands, rather than on anything
+the class does deterministically.
+
+**Consequence for pricing `XT_HELPER_WINDOW`:** the A/B of its kill switch
+(`CRATONVM_JIT=xt-helper-window-scan=0` vs default) on this class was
+**inconclusive** — both arms recorded zero fallbacks, and a reduction cannot be
+measured from a zero baseline. Pricing it needs a workload with a *stable*
+fallback rate AND peer threads. `probes/MovingYoungFallbackCallFormProbe.java`
+has the stable rate (23–45 cycles per 20s run) but is single-threaded, so it
+never produces this reason at all. The missing artifact is that probe plus
+worker threads that park inside JIT frames.
+
+### Measured: repairing the indirect-call path would convert NOTHING in a real workload
 
 `CRATONVM_DBG_GC_FALLBACK_REASONS=1` records the full per-cycle reason **set**
 (the stored reason is first-wins, so it cannot answer "would repairing X have
