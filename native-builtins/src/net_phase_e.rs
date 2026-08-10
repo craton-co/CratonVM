@@ -17099,7 +17099,7 @@ mod tests {
         // HotSpot on the same bytes:
         //   getByAddress("example.invalid", bytes) -> example.invalid/fe80:0:0:0:…
         let named =
-            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e");
+            alloc_inet_address(&mut ctx, "example.invalid", "fe80:0:0:0:67b0:99e:5a9b:287e").unwrap();
         assert_eq!(
             inet_addr_resolve(&ctx, named),
             Some((
@@ -17196,7 +17196,7 @@ mod tests {
     fn re5_handler_tag_classifies_synthetic_vs_real_handlers() {
         let mut ctx = MockNativeContext::new();
         // Synthetic tagged handler -> its tag.
-        let bh = try_alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1)?;
+        let bh = try_alloc_concurrent_synthetic(&mut ctx, "java/net/http/HttpResponse$BodyHandler", 1).unwrap();
         let tag = ctx.create_string("string");
         ctx.set_field(bh, 0, Value::Object(Some(tag)));
         assert_eq!(
@@ -17214,7 +17214,7 @@ mod tests {
             &mut ctx,
             "org/springframework/http/client/JdkClientHttpRequest$DecompressingBodyHandler",
             1,
-        )?;
+        ).unwrap();
         assert_eq!(re5_handler_tag(&ctx, Some(Value::Object(Some(real)))), None);
     }
 
@@ -17242,7 +17242,7 @@ mod tests {
         subscriber: ObjectRef,
     ) -> ObjectRef {
         let subscription =
-            try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS)?;
+            try_alloc_concurrent_synthetic(ctx, RE5_REPLAY_SUBSCRIPTION, RE5_SUB_NUM_FIELDS).unwrap();
         ctx.set_field(
             subscription,
             RE5_SUB_SUBSCRIBER,
@@ -17257,7 +17257,7 @@ mod tests {
     fn re5_replay_subscription_delivers_completion_exactly_once() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
-        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2)?;
+        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2).unwrap();
         let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
 
         // Zero / negative demand: nothing delivered.
@@ -17297,7 +17297,7 @@ mod tests {
     fn re5_replay_subscription_cancel_before_demand_suppresses_delivery() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_recording_subscriber_hook);
-        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2)?;
+        let subscriber = try_alloc_concurrent_synthetic(&mut ctx, "test/RecordingSubscriber", 2).unwrap();
         let subscription = re5_test_replay_subscription(&mut ctx, subscriber);
 
         re5_replay_subscription_cancel(&mut ctx, &[Value::Object(Some(subscription))]).unwrap();
@@ -17352,7 +17352,7 @@ mod tests {
         for (i, b) in bytes.iter().copied().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
-        let bb = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", 5)?;
+        let bb = try_alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", 5).unwrap();
         ctx.set_field(bb, 0, Value::Object(Some(arr)));
         ctx.set_field(bb, 1, Value::Int(0));
         ctx.set_field(bb, 2, Value::Int(bytes.len() as i32));
@@ -17378,8 +17378,14 @@ mod tests {
             Some(Value::Object(Some(s))) => s,
             _ => return Some(Ok(None)),
         };
+        // This helper answers `Option<MethodCallResult>`, so a refused
+        // allocation is reported the same way the `on_subscribe` failure below
+        // is: `Some(Err(..))`. A `?` here would mean "no such method".
         let subscription =
-            try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2)?;
+            match try_alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2) {
+                Ok(o) => o,
+                Err(e) => return Some(Err(e)),
+            };
         if let Err(e) = re5_body_collector_on_subscribe(
             ctx,
             &[
@@ -17415,7 +17421,7 @@ mod tests {
             .expect("fromPublisher native is registered");
 
         let mut ctx = MockNativeContext::new();
-        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0)?;
+        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0).unwrap();
         let body_publisher = match native(&mut ctx, &[Value::Object(Some(publisher))]).unwrap() {
             Some(Value::Object(Some(body_publisher))) => body_publisher,
             other => panic!("expected BodyPublisher object, got {other:?}"),
@@ -17431,7 +17437,7 @@ mod tests {
     fn re5_request_body_bytes_drives_from_publisher_bytebuffers() {
         let mut ctx = MockNativeContext::new();
         ctx.set_invoke_virtual_hook(re5_scripted_publisher_subscribe);
-        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0)?;
+        let publisher = try_alloc_concurrent_synthetic(&mut ctx, "test/SynchronousPublisher", 0).unwrap();
 
         let body = re5_request_body_bytes(&mut ctx, Value::Object(Some(publisher))).unwrap();
 
@@ -17778,8 +17784,8 @@ mod tests {
             Some(Value::Object(Some(builder))) => builder,
             other => panic!("newBuilder returned {other:?}"),
         };
-        let executor = try_alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0)?;
-        let proxy = try_alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0)?;
+        let executor = try_alloc_concurrent_synthetic(&mut ctx, "test/Executor", 0).unwrap();
+        let proxy = try_alloc_concurrent_synthetic(&mut ctx, "test/ProxySelector", 0).unwrap();
 
         for (method, descriptor, value) in [
             (

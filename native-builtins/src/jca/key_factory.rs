@@ -3125,7 +3125,7 @@ mod tests {
             let der = pkcs8_stub(oid);
             let arr = alloc_byte_array(&mut ctx, &der);
             let spec =
-                try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1)?;
+                try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1).unwrap();
             ctx.set_field(spec, 0, Value::Object(Some(arr)));
             let generic = if expected == ALGO_X25519 || expected == ALGO_X448 {
                 ALGO_XDH_GENERIC
@@ -3142,7 +3142,7 @@ mod tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let arr = alloc_byte_array(&mut ctx, &[]);
         let spec =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/security/spec/PKCS8EncodedKeySpec", 1).unwrap();
         ctx.set_field(spec, 0, Value::Object(Some(arr)));
         assert_eq!(
             resolve_curve_algo(&mut ctx, ALGO_ED25519, spec, true),
@@ -3181,7 +3181,7 @@ mod tests {
         };
         let store_id = crate::keystore::keystore_register(store);
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivateKey", 4)?;
+        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivateKey", 4).unwrap();
         let alias_hash = alias.as_bytes().iter().fold(0x811c_9dc5_u32, |hash, byte| {
             (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
         });

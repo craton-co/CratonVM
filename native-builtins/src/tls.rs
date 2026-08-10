@@ -3262,7 +3262,7 @@ mod tls_tests {
         let r = tls_registry();
         let mut ctx = MockNativeContext::new();
         for name in ["SSLv2", "NoSuchThing", "TLSv1.4", "", "TLS "] {
-            let result = get_instance(&r, &mut ctx, name)?;
+            let result = get_instance(&r, &mut ctx, name);
             assert!(
                 result.is_err(),
                 "getInstance({name:?}) must raise, not substitute a TLS context"
@@ -3428,7 +3428,7 @@ mod tls_tests {
 
         // MUST RAISE (default): no cryptography happened, so no OK status.
         set_noncrypto_engine_opt_in(false);
-        let engine = alloc_ssl_engine(&mut ctx);
+        let engine = alloc_ssl_engine(&mut ctx).unwrap();
         let args = [Value::Object(Some(engine))];
         assert!(
             wrap(&mut ctx, &args).is_err(),
@@ -3454,7 +3454,7 @@ mod tls_tests {
 
         // MUST STILL WORK: the explicit opt-in restores the legacy behaviour.
         set_noncrypto_engine_opt_in(true);
-        let legacy = alloc_ssl_engine(&mut ctx);
+        let legacy = alloc_ssl_engine(&mut ctx).unwrap();
         let legacy_args = [Value::Object(Some(legacy))];
         assert!(matches!(
             wrap(&mut ctx, &legacy_args),

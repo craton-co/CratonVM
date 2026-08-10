@@ -11938,7 +11938,7 @@ mod classloader_tests {
     #[test]
     fn new8_define_hidden_class_rejects_null_bytes() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
         let result = lk_define_hidden_class(
             &mut ctx,
             &[
@@ -11961,7 +11961,7 @@ mod classloader_tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         // Build a byte[] of zeros (no magic).
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
         let result = lk_define_hidden_class(
             &mut ctx,
             &[
@@ -11989,7 +11989,7 @@ mod classloader_tests {
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
 
         let result = lk_define_hidden_class(
             &mut ctx,
@@ -12049,7 +12049,7 @@ mod classloader_tests {
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr2, i, Value::Int((*b as i8) as i32));
         }
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
 
         lk_define_hidden_class(
             &mut ctx,
@@ -12104,12 +12104,12 @@ mod classloader_tests {
             &mut ctx,
             "java/lang/invoke/MethodHandles$Lookup$ClassOption",
             1,
-        )?;
+        ).unwrap();
         ctx.set_field(option, 0, Value::Int(0)); // NESTMATE ordinal
         let options_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(options_arr, 0, Value::Object(Some(option)));
 
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
 
         let result = lk_define_hidden_class(
             &mut ctx,
@@ -12348,7 +12348,7 @@ mod classloader_tests {
         // The mock declares no fields for a fresh class, so `allowedModes` is
         // absent and the MOCK's `get_field_by_name` answers `Int(0)` for it.
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let lk = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lk = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
         assert_eq!(lk_modes_of(&ctx, lk), LK_FULL_POWER);
     }
 

@@ -21079,7 +21079,7 @@ mod tests {
             exceptions: Vec::new(),
             signature: None,
         };
-        let method = create_method_object(&mut ctx, &meta);
+        let method = create_method_object(&mut ctx, &meta).unwrap();
         ctx.set_method_return_type_annotations(
             owner,
             "nullableReturn",
@@ -21114,7 +21114,7 @@ mod tests {
             exceptions: Vec::new(),
             signature: None,
         };
-        let method = create_method_object(&mut ctx, &meta);
+        let method = create_method_object(&mut ctx, &meta).unwrap();
         ctx.set_method_parameter_type_annotations(
             owner,
             "nullableParameter",
@@ -23059,7 +23059,7 @@ mod tests {
             signature: None,
         };
 
-        let method_obj = create_method_object(&mut ctx, &meta);
+        let method_obj = create_method_object(&mut ctx, &meta).unwrap();
 
         // getDeclaringClass в†’ returns the String class mirror (name
         // "java/lang/String"), NOT java/lang/Object.
@@ -23851,7 +23851,7 @@ Implementation-Title: opensaml-core-api\r\n\
     fn t19_h10_alloc_byte_array_input_stream_layout() {
         let mut ctx = mock_ctx();
         let bytes = b"hello".to_vec();
-        let stream = t19_h10_alloc_byte_array_input_stream(&mut ctx, &bytes);
+        let stream = t19_h10_alloc_byte_array_input_stream(&mut ctx, &bytes).unwrap();
         let count = ctx.get_field(stream, 3).as_int().unwrap_or(-1);
         assert_eq!(count, 5);
         let pos = ctx.get_field(stream, 1).as_int().unwrap_or(-1);
@@ -24398,7 +24398,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         let v = ctx.get_field_by_name(m, "exceptionTypes");
         match v {
@@ -24430,7 +24430,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         let v = ctx.get_field_by_name(m, "parameterTypes");
         match v {
@@ -24522,7 +24522,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         for field in &["annotations", "parameterAnnotations", "annotationDefault"] {
             match ctx.get_field_by_name(m, field) {
@@ -24641,7 +24641,7 @@ Implementation-Title: opensaml-core-api\r\n\
         // what provides that; exercise it directly, since the mock context has
         // no classpath to drive the synthesis path.
         let mut ctx = mock_ctx();
-        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo");
+        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo").unwrap();
         let handle = ctx.add_global_root(pkg);
         defined_package_memo()
             .lock()
@@ -24791,7 +24791,7 @@ Implementation-Title: opensaml-core-api\r\n\
         ctx.set_superclass(iface_cid, object_cid);
         ctx.set_is_interface(iface_cid, true);
 
-        let methods = collect_public_methods(&mut ctx, iface_cid);
+        let methods = collect_public_methods(&mut ctx, iface_cid).unwrap();
         // Only `doIt` from the interface вЂ” Object methods are skipped.
         let n = ctx.array_length(methods);
         assert_eq!(
@@ -24847,7 +24847,7 @@ Implementation-Title: opensaml-core-api\r\n\
             ],
         );
 
-        let methods = collect_public_methods(&mut ctx, child);
+        let methods = collect_public_methods(&mut ctx, child).unwrap();
         let mut closes = Vec::new();
         let mut shutdowns = Vec::new();
         for i in 0..ctx.array_length(methods) {

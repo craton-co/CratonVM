@@ -41871,7 +41871,7 @@ mod liquibase_checksum_tests {
         } else {
             2
         };
-        let obj = ctx.alloc_object(class_id, fields)?;
+        let obj = ctx.alloc_object(class_id, fields);
         ctx.set_field(obj, 0, Value::Long(millis));
         if let Some(nanos) = nanos {
             ctx.set_field(obj, fields - 1, Value::Int(nanos));
@@ -42042,7 +42042,7 @@ mod t2_random_tests {
         // Random's synthetic layout: field 0 = seed (Long), field 1 =
         // haveNextGaussian (Int). Same layout as SecureRandom so the
         // shared `sr_next_seed` helper works on both.
-        let r = try_alloc_concurrent_synthetic(ctx, "java/util/Random", 2)?;
+        let r = try_alloc_concurrent_synthetic(ctx, "java/util/Random", 2).unwrap();
         ctx.set_field(r, 0, Value::Long(0));
         ctx.set_field(r, 1, Value::Int(0));
         r
@@ -42155,7 +42155,7 @@ mod t2_6_crypto_acceptance_tests {
     /// `2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824`
     #[test]
     fn t2_6_19_sha256_hello_matches_rfc6234() {
-        let digest = compute_digest("SHA-256", b"hello");
+        let digest = compute_digest("SHA-256", b"hello").unwrap();
         let expected = [
             0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa3, 0x0e, 0x26, 0xe8, 0x3b, 0x2a, 0xc5, 0xb9,
             0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e, 0x73, 0x04, 0x33, 0x62,
@@ -42171,7 +42171,7 @@ mod t2_6_crypto_acceptance_tests {
     /// test vector `a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a`.
     #[test]
     fn t2_6_2_sha3_256_empty_matches_fips202() {
-        let digest = compute_digest("SHA3-256", b"");
+        let digest = compute_digest("SHA3-256", b"").unwrap();
         let expected = [
             0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66, 0x51, 0xc1, 0x47, 0x56, 0xa0, 0x61,
             0xd6, 0x62, 0xf5, 0x80, 0xff, 0x4d, 0xe4, 0x3b, 0x49, 0xfa, 0x82, 0xd8, 0x0a, 0x4b,
@@ -42183,7 +42183,7 @@ mod t2_6_crypto_acceptance_tests {
     /// T2.6.2 companion — SHA3-512("abc") matches the FIPS 202 vector.
     #[test]
     fn t2_6_2_sha3_512_abc_matches_fips202() {
-        let digest = compute_digest("SHA3-512", b"abc");
+        let digest = compute_digest("SHA3-512", b"abc").unwrap();
         assert_eq!(digest.len(), 64);
         // First 8 bytes suffice to catch catastrophic backend swaps.
         let expected_prefix = [0xb7, 0x51, 0x85, 0x0b, 0x1a, 0x57, 0x16, 0x8a];

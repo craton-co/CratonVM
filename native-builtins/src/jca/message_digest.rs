@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn compute_digest_matches_hotspot_for_hello_world() {
         // SHA-256 of "hello world" — published HotSpot 25.0.1 result.
-        let hash = compute_digest("SHA-256", b"hello world");
+        let hash = compute_digest("SHA-256", b"hello world").unwrap();
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
@@ -683,11 +683,11 @@ mod tests {
         // normalisation (the `sha-224` Keycloak SD-JWT path).
         let hex = |h: Vec<u8>| -> String { h.iter().map(|b| format!("{b:02x}")).collect() };
         assert_eq!(
-            hex(compute_digest("sha-224", b"hello world")),
+            hex(compute_digest("sha-224", b"hello world").unwrap()),
             "2f05477fc24bb4faefd86517156dafdecec45b8ad3cf2522a563582b"
         );
         assert_eq!(
-            hex(compute_digest("SHA3-224", b"hello world")),
+            hex(compute_digest("SHA3-224", b"hello world").unwrap()),
             "dfb7f18c77e928bb56faeb2da27291bd790bc1045cde45f3210bb6c5"
         );
     }
@@ -701,25 +701,25 @@ mod tests {
         // point of the alternate IV).
         let hex = |h: Vec<u8>| -> String { h.iter().map(|b| format!("{b:02x}")).collect() };
         assert_eq!(
-            hex(compute_digest("SHA-512/256", b"abc")),
+            hex(compute_digest("SHA-512/256", b"abc").unwrap()),
             "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23"
         );
         assert_eq!(
-            hex(compute_digest("SHA-512/256", b"")),
+            hex(compute_digest("SHA-512/256", b"").unwrap()),
             "c672b8d1ef56ed28ab87c3622c5114069bdd3ad7b8f9737498d0c01ecef0967a"
         );
         assert_eq!(
-            hex(compute_digest("SHA-512/224", b"abc")),
+            hex(compute_digest("SHA-512/224", b"abc").unwrap()),
             "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa"
         );
         assert_eq!(
-            hex(compute_digest("SHA-512/224", b"")),
+            hex(compute_digest("SHA-512/224", b"").unwrap()),
             "6ed0dd02806fa89e25de060c19d3ac86cabb87d6a0ddd05c333b84f4"
         );
         // Confirm SHA-512/256 ≠ SHA-256 (alternate IV, not a plain truncation).
         assert_ne!(
-            hex(compute_digest("SHA-512/256", b"abc")),
-            hex(compute_digest("SHA-256", b"abc"))
+            hex(compute_digest("SHA-512/256", b"abc").unwrap()),
+            hex(compute_digest("SHA-256", b"abc").unwrap())
         );
     }
 }

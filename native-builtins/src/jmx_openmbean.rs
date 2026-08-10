@@ -2093,7 +2093,7 @@ mod tests {
     #[test]
     fn test_alloc_identity_mapping_returns_non_null() {
         let mut ctx = mock_ctx();
-        let m = alloc_identity_mapping(&mut ctx)?;
+        let m = alloc_identity_mapping(&mut ctx).unwrap();
         // Should be a real ObjectRef.
         let _ = m;
     }
@@ -2101,7 +2101,7 @@ mod tests {
     #[test]
     fn test_alloc_array_list_from_empty() {
         let mut ctx = mock_ctx();
-        let lst = alloc_array_list_from(&mut ctx, &[]);
+        let lst = alloc_array_list_from(&mut ctx, &[]).unwrap();
         // Slot 1 = size = 0
         match ctx.get_field(lst, 1) {
             Value::Int(0) => {}
@@ -2117,7 +2117,7 @@ mod tests {
         // fallback mirror instead.
         let mut ctx = mock_ctx();
         for desc in ["L", "L;", "Lfoo", "Ljava/lang/String", "[", "[L"] {
-            let m = type_descriptor_to_class_mirror(&mut ctx, desc)?;
+            let m = type_descriptor_to_class_mirror(&mut ctx, desc);
             assert!(
                 !m.as_ptr().is_null(),
                 "malformed descriptor {:?} produced a null mirror",
@@ -2131,7 +2131,7 @@ mod tests {
         // A well-formed object descriptor must still be accepted without
         // panicking after the bounds hardening.
         let mut ctx = mock_ctx();
-        let m = type_descriptor_to_class_mirror(&mut ctx, "Ljava/lang/Object;")?;
+        let m = type_descriptor_to_class_mirror(&mut ctx, "Ljava/lang/Object;");
         assert!(!m.as_ptr().is_null());
     }
 
@@ -2289,7 +2289,7 @@ mod tests {
 
         // Allocate a synthetic Class mirror that resolves to that
         // name via slot 1 (matches Class.name layout).
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2323,7 +2323,7 @@ mod tests {
             stack.push("java.lang.String".to_string());
         });
 
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.String");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2348,7 +2348,7 @@ mod tests {
         reset_visited();
         let mut ctx = mock_ctx();
 
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("com.acme.SomeBean");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2370,7 +2370,7 @@ mod tests {
     fn t19_m1_problematic_type_short_circuits_without_push() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.Class");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2392,7 +2392,7 @@ mod tests {
     fn t19_m1_composite_type_short_circuits_without_recursion() {
         reset_visited();
         let mut ctx = mock_ctx();
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
 
@@ -2417,7 +2417,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let schema =
             composite_schema_for("java.lang.management.MemoryUsage").expect("schema present");
-        let m = alloc_composite_mapping(&mut ctx, schema)?;
+        let m = alloc_composite_mapping(&mut ctx, schema).unwrap();
         // Verify the openType slot is populated.
         match ctx.get_field(m, 1) {
             Value::Object(Some(_)) => {}
@@ -2429,7 +2429,7 @@ mod tests {
     fn t19_m1_alloc_composite_type_carries_item_names() {
         let mut ctx = mock_ctx();
         let schema = composite_schema_for("java.lang.management.LockInfo").expect("schema");
-        let ct = alloc_composite_type(&mut ctx, schema);
+        let ct = alloc_composite_type(&mut ctx, schema).unwrap();
         // The mock NativeContext doesn't map our well-known JMX field
         // names (typeName, description, className, isArray, itemNames)
         // to slots — production resolves these via the loaded class's
@@ -2445,7 +2445,7 @@ mod tests {
     fn t19_m1_alloc_open_converter_with_schema() {
         let mut ctx = mock_ctx();
         let schema = composite_schema_for("java.lang.management.ThreadInfo").expect("schema");
-        let oc = alloc_open_converter(&mut ctx, Some(schema));
+        let oc = alloc_open_converter(&mut ctx, Some(schema)).unwrap();
         // identityConverter flag (slot 3) should be 1.
         match ctx.get_field(oc, 3) {
             Value::Int(1) => {}
@@ -2456,7 +2456,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_open_converter_without_schema_uses_simple_string() {
         let mut ctx = mock_ctx();
-        let oc = alloc_open_converter(&mut ctx, None);
+        let oc = alloc_open_converter(&mut ctx, None).unwrap();
         // openType (slot 1) must be a SimpleType-shaped object (non-null).
         match ctx.get_field(oc, 1) {
             Value::Object(Some(_)) => {}
@@ -2467,7 +2467,7 @@ mod tests {
     #[test]
     fn t19_m1_alloc_mapped_mxbean_type_basic_for_unknown() {
         let mut ctx = mock_ctx();
-        let mt = alloc_mapped_mxbean_type(&mut ctx, None);
+        let mt = alloc_mapped_mxbean_type(&mut ctx, None).unwrap();
         // isBasicType (slot 2) should be 1 (SimpleType-mapped).
         match ctx.get_field(mt, 2) {
             Value::Int(1) => {}
@@ -2479,7 +2479,7 @@ mod tests {
     fn t19_m1_alloc_mapped_mxbean_type_composite_for_known() {
         let mut ctx = mock_ctx();
         let schema = composite_schema_for("java.lang.management.MemoryUsage").expect("schema");
-        let mt = alloc_mapped_mxbean_type(&mut ctx, Some(schema));
+        let mt = alloc_mapped_mxbean_type(&mut ctx, Some(schema)).unwrap();
         // isBasicType should be 0 for composite.
         match ctx.get_field(mt, 2) {
             Value::Int(0) => {}
@@ -2557,7 +2557,7 @@ mod tests {
     #[test]
     fn t19_m1_resolve_type_name_via_class_mirror_slot1() {
         let mut ctx = mock_ctx();
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java.lang.management.MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
@@ -2570,7 +2570,7 @@ mod tests {
     #[test]
     fn t19_m1_resolve_type_name_normalizes_slashes_to_dots() {
         let mut ctx = mock_ctx();
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 4).unwrap();
         let name_str = ctx.create_string("java/lang/management/MemoryUsage");
         ctx.set_field(class_mirror, 1, Value::Object(Some(name_str)));
         let resolved = resolve_type_name(&ctx, class_mirror);
@@ -2627,7 +2627,7 @@ mod tests {
             ("init".to_string(), Value::Long(0)),
             ("used".to_string(), Value::Long(1024)),
         ];
-        let cd = build_composite_data(&mut ctx, None, &items);
+        let cd = build_composite_data(&mut ctx, None, &items).unwrap();
         // The carrier object must be a real allocated object.
         assert!(ctx.object_num_fields(cd) >= 4);
     }
@@ -2635,7 +2635,7 @@ mod tests {
     #[test]
     fn build_tabular_data_returns_non_null() {
         let mut ctx = mock_ctx();
-        let td = build_tabular_data(&mut ctx, None);
+        let td = build_tabular_data(&mut ctx, None).unwrap();
         assert!(ctx.object_num_fields(td) >= 4);
     }
 
@@ -2648,7 +2648,7 @@ mod tests {
         // the synthetic map directly and verify slot layout.
         let mut ctx = mock_ctx();
         // Allocate a synthetic map exactly as the fallback does.
-        let synth = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3)?;
+        let synth = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3).unwrap();
         let keys = ctx.new_ref_array(ClassId::new(0), 1);
         let vals = ctx.new_ref_array(ClassId::new(0), 1);
         let k = ctx.create_string("used");

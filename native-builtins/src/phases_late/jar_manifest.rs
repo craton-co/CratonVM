@@ -4005,7 +4005,7 @@ pub(crate) mod t10_manifest_input_stream_tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         let jar_path = tmp_dir.join("t10.jar");
         {
-            let file = std::fs::File::create(&jar_path).expect("create jar")?;
+            let file = std::fs::File::create(&jar_path).expect("create jar");
             let mut zw = zip::ZipWriter::new(file);
             let opts = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);

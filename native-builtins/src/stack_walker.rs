@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn get_instance_set_depth_rejects_nonpositive() {
         let mut ctx = MockNativeContext::new();
-        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1)?;
+        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1).unwrap();
         let bad_args = [Value::Object(Some(set)), Value::Int(0)];
         let err = native_get_instance_set_depth(&mut ctx, &bad_args).unwrap_err();
         let s = format!("{:?}", err);
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn get_instance_set_depth_sets_fields_correctly() {
         let mut ctx = MockNativeContext::new();
-        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1)?;
+        let set = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Set", 1).unwrap();
         let args = [Value::Object(Some(set)), Value::Int(16)];
         let result = native_get_instance_set_depth(&mut ctx, &args)
             .unwrap()
@@ -698,7 +698,7 @@ mod tests {
     #[test]
     fn get_instance_one_option_sets_retain_flag() {
         let mut ctx = MockNativeContext::new();
-        let option = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1)?;
+        let option = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/StackWalker$Option", 1).unwrap();
         let args = [Value::Object(Some(option))];
         let result = native_get_instance_one_option(&mut ctx, &args)
             .unwrap()

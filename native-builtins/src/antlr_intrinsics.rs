@@ -7119,7 +7119,7 @@ mod antlr_prediction_context_tests {
     fn antlr_double_key_map_insert_releases_temporary_native_pins() {
         let mut ctx = mock_ctx();
         let map = ctx.fresh_object_ref();
-        let data = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3)?;
+        let data = try_alloc_concurrent_synthetic(&mut ctx, "java/util/HashMap", 3).unwrap();
         cratonvm_native_collections::native_map_init(&mut ctx, &[Value::Object(Some(data))])
             .unwrap();
         ctx.set_field(map, 0, Value::Object(Some(data)));

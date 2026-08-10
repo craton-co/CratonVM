@@ -7205,12 +7205,12 @@ mod jmx_tests {
         // invoke_virtual, so object_name_key falls back to reading the
         // name object as a String). Verify isRegistered + count + lookup.
         let mut ctx = crate::test_utils::mock_ctx();
-        let server = alloc_mbean_server(&mut ctx);
+        let server = alloc_mbean_server(&mut ctx).unwrap();
 
         // Name object: a mock String holding the canonical-name text.
         let name = ctx.create_string("com.acme:type=Widget");
         // Bean object: any allocated object.
-        let bean = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2)?;
+        let bean = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2).unwrap();
 
         // Not registered yet.
         assert!(mbs_find(&ctx, server, "com.acme:type=Widget").is_none());
@@ -7244,7 +7244,7 @@ mod jmx_tests {
     #[test]
     fn test_mbean_server_domains_follow_live_registry() {
         let mut ctx = crate::test_utils::mock_ctx();
-        let server = alloc_mbean_server(&mut ctx);
+        let server = alloc_mbean_server(&mut ctx).unwrap();
         let names = ctx.new_ref_array(ClassId::new(0), 4);
         for (i, name) in [
             "org.springframework.integration:type=MessageChannel",
@@ -7343,7 +7343,7 @@ mod jmx_tests {
         let name = object_name_new(
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
-        );
+        ).unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(name))],
@@ -7357,7 +7357,7 @@ mod jmx_tests {
         assert_eq!(s, "type=MBeanServerDelegate");
 
         // Domain-only pattern ("d:*") has no key properties.
-        let pattern_name = object_name_new(&mut ctx, "java.lang:*".to_string());
+        let pattern_name = object_name_new(&mut ctx, "java.lang:*".to_string()).unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(pattern_name))],
@@ -7371,7 +7371,7 @@ mod jmx_tests {
         assert_eq!(s, "");
 
         // Property-list pattern ("d:k=v,*") strips the trailing ",*".
-        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string()).unwrap();
         let result = native_object_name_get_canonical_key_property_list_string(
             &mut ctx,
             &[Value::Object(Some(plist_pattern))],
@@ -7388,7 +7388,7 @@ mod jmx_tests {
     #[test]
     fn test_object_name_key_property_accessors_preserve_quoted_source_text() {
         let mut ctx = crate::test_utils::mock_ctx();
-        let name = object_name_new(&mut ctx, "d:b=2,a=\"x,y\",c=3,*".to_string());
+        let name = object_name_new(&mut ctx, "d:b=2,a=\"x,y\",c=3,*".to_string()).unwrap();
         let key = ctx.create_string("a");
 
         let result = native_object_name_get_key_property(
@@ -7442,7 +7442,7 @@ mod jmx_tests {
         let concrete = object_name_new(
             &mut ctx,
             "JMImplementation:type=MBeanServerDelegate".to_string(),
-        );
+        ).unwrap();
         let is_pattern = |ctx: &mut dyn NativeContext,
                           f: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
                           obj: ObjectRef| {
@@ -7472,7 +7472,7 @@ mod jmx_tests {
             concrete
         ));
 
-        let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string());
+        let domain_pattern = object_name_new(&mut ctx, "java.*:type=Memory".to_string()).unwrap();
         assert!(is_pattern(
             &mut ctx,
             native_object_name_is_pattern,
@@ -7489,7 +7489,7 @@ mod jmx_tests {
             domain_pattern
         ));
 
-        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string());
+        let plist_pattern = object_name_new(&mut ctx, "d:k=v,*".to_string()).unwrap();
         assert!(is_pattern(
             &mut ctx,
             native_object_name_is_pattern,
@@ -7511,7 +7511,7 @@ mod jmx_tests {
             plist_pattern
         ));
 
-        let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string());
+        let value_pattern = object_name_new(&mut ctx, "d:k=*".to_string()).unwrap();
         assert!(is_pattern(
             &mut ctx,
             native_object_name_is_pattern,
