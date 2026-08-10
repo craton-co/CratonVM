@@ -2280,6 +2280,7 @@ pub(super) fn is_elidable_construction(
     // `map_resize` fix makes the fallback capacity correct; this one keeps the
     // native constructor running in the first place.
     //
+    // The §3 item-4 residual of the retired wave-2 markers record.
     // The question is NOT "is a native registered" but "would dispatching this
     // `<init>` reach one" — see [`elidable_ctor_native_would_run`], which is
     // where that distinction and its `bytecode_available` premise are argued.

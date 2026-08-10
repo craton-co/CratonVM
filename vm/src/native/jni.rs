@@ -5160,8 +5160,8 @@ struct JNINativeMethod {
 /// `fn` address inside the host library, called through `dispatch_jni_native`.
 ///
 /// This was the process global `static JNI_NATIVE_METHODS` here until
-/// 2026-08-06 — `JDK-ONLY-WAVE2` §6 of
-/// `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`.
+/// 2026-08-06 — `JDK-ONLY-WAVE2` §6 (retired record:
+/// feature-designs/jdk-only-wave2/additional-wave2-markers-not-in-the-original-inventory.md).
 /// Contract §2 forbids process globals for this feature's state, and the
 /// concrete hazard was that two VMs in one process saw each other's
 /// `RegisterNatives`: a library loaded by VM A bound its pointers for VM B too.

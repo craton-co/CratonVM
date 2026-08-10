@@ -2304,9 +2304,12 @@ fn detect_jdk_feature(java_home: Option<&str>) -> Option<u32> {
 ///   inside `Vm::new`, and the `vm-init` drain immediately follows it, so the
 ///   poll already reports them at their real time of occurrence.
 /// * The three process sinks behind `SharedVm::jdk_only_process_violations` —
-///   these are JIT/dispatch refusals, and they are *process*-global (see
-///   `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`
-///   §2). Giving them a live sink means giving them a VM first; a per-VM sink
+///   these are JIT/dispatch refusals, and they are *process*-global (retired
+///   record: feature-designs/jdk-only-wave2/
+///   additional-wave2-markers-not-in-the-original-inventory.md §2). Note that
+///   §2's own subject — the JIT compatibility latch — is no longer one of
+///   them; what remains process-global here is the violation SINKS, not the
+///   policy. Giving them a live sink means giving them a VM first; a per-VM sink
 ///   hung off process-global state would report another VM's violations as
 ///   this one's, which is worse than reporting them late.
 ///
