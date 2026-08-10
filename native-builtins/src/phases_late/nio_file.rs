@@ -6296,7 +6296,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `char[]` the JDK owns — and left the six BufferedWriter natives below to
     // recognise their own object by asking whether that slot held an `Int`.
     // That is kind 3 in
-    // `docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`:
+    // `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`:
     // a VM value with no real field to live in.
     //
     // It was already default-OFF (real bytecode has been the default since

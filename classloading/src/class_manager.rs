@@ -11935,7 +11935,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // one way no value-tag census can see: a `ThreadGroup` reference over a
         // `String` reference and an `int` over an `int` both type-check. The
         // L4 shadow-layout diff reported all four
-        // (`docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`).
+        // (`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`).
         //
         // The natives in `native-builtins/src/phases_late/concurrent.rs`
         // resolve these by NAME first and only fall back to a hard-coded index,

@@ -143,7 +143,7 @@ unrelated layout, so both reads land on someone else's fields — or off the end
 `handle_of` answers `0`, the `EXIT_NOT_YET` sentinel does not match whatever was
 read, and the native concludes the process exited.
 
-This is the `fabricated-object-layouts-leak-into-native-code.md` family: an
+This is the `jdk-only-fabricated-object-layouts-FIXED-20260810.md` family: an
 indexed field read is only meaningful against the layout it was written for, and
 nothing at the registration site says which receivers that is.
 
