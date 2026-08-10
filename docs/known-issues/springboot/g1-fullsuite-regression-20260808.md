@@ -287,6 +287,21 @@ Two concrete next steps, in order:
   all, and the question becomes: what else advances `region.cursor` over memory
   no object header was ever written into?
 
+  **Every production writer of `region.cursor`** (g1.rs, excluding tests), so
+  the "what else advances it?" question is closed as an enumeration:
+  `G1Region::reset` → `0`; `G1Region::bump_alloc` → `end`;
+  `alloc_humongous_locked` → `size` on the start and `0` on continuations
+  (g1.rs:1944/1947); and the **parallel evacuator's** `retire_tlab`
+  (g1.rs:461) → `tlab.offset`, which is opt-in behind
+  `CRATONVM_G1_PARALLEL_EVAC` and off by default. If a run reproducing this
+  ever has that flag set, suspect g1.rs:461 first — it *assigns* rather than
+  maxes the cursor.
+
+  **And every production site that installs a `Tlab`:**
+  `gc_and_alloc.rs:3245` (retires the outgoing TLAB first, at :3221) and
+  `vm_init.rs:9368` (the main thread's initial install, so nothing prior to
+  leak). So "a TLAB was replaced without retiring" is closed as well.
+
   **Ruled out while forming this:** a humongous region being retyped without a
   reset. `cleanup`'s humongous reclaim calls `region.reset(generation)` on
   every region of the span, so those Free regions do carry `cursor = 0`; and
