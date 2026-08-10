@@ -228,28 +228,33 @@ Two concrete next steps, in order:
   published* skip span. If it does not, the span belongs to no live thread —
   pointing at a TLAB abandoned without a retire (thread teardown) rather than at
   a walker gap.
-* Walk the remaining JIT gates the same way §3b walked the allocation ones —
-  `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1` first, then the inline **array**
-  allocation path (`jit/src/x64/bytecode_walk.rs:10055`, "writes
-  array_length/GC_FLAG_COMPACT inline"), which has no dedicated off-gate yet and
-  is array-shaped like the `slots=65536` / `obj_size=0x100010` misreads.
-* **Look at the inline ARRAY allocator, not the object one.** A trail entry like
-  `0x19188+0x28(cid=0,k=1)` is an **Array** with a valid kind and size but
-  `class_id = 0` — a *partially written* header, not a zeroed one. Note the
-  kind: the misreads are array-shaped throughout (`slots=65536`,
-  `obj_size=0x100010`).
+* Walk the remaining JIT gates the same way §3b walked the allocation ones,
+  starting with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`.
+* **Explain `cid=0,k=1` — an Array header with a valid kind and size but
+  `class_id = 0`.** That is a *partially written* header, not a zeroed one, so
+  it cannot come from a region reset (which zeroes the kind too). It is the
+  sharpest single clue in the trails.
 
-  The object emitter is **not** that window, and a stale comment makes it look
-  like it is. `jit/src/x64/bytecode_walk.rs:10040` still describes the old
-  design — "bumps `thread.tlab.cursor`, writes `class_id` at obj_ptr+0, then
-  tail-calls `jit_post_tlab_init` to finish header". The current
-  `emit_inline_tlab_new` (`jit/src/x64/objects.rs`) does the opposite and says so
-  at the store: *"Commit the bump LAST … x86-64 TSO preserves the required
-  header/body-before-cursor store order"*, with `class_id` **and** `num_slots`
-  written inline before the commit, on both the `skip_post_init_helper` arm and
-  the `tlab_post_init` arm. That is consistent with §3b, where disabling this
-  emitter did not stop the corruption. **Fix that comment while you are there**
-  — it cost this investigation a wrong lead.
+  Two candidate producers are already **excluded**, so do not re-tread them:
+  - The inline object emitter. `emit_inline_tlab_new`
+    (`jit/src/x64/objects.rs`) writes `class_id` **and** `num_slots` inline and
+    then commits the TLAB bump last — *"Commit the bump LAST … x86-64 TSO
+    preserves the required header/body-before-cursor store order"* — on both
+    the `skip_post_init_helper` and `tlab_post_init` arms. Consistent with §3b,
+    where disabling it did not stop the corruption. **The comment at
+    `jit/src/x64/bytecode_walk.rs:10040` still describes the pre-redesign
+    sequence ("writes `class_id` … then tail-calls `jit_post_tlab_init` to
+    finish header") and is stale — delete it; it cost this investigation a
+    wrong lead.**
+  - An inline array allocator. There isn't one: `newarray`
+    (`bytecode_walk.rs:9950`) and `anewarray` (`:10173`) both go through
+    runtime helpers, which allocate via the normal `alloc_array` path.
+
+  So the producer writes an Array header through some path that sets kind and
+  length but leaves `class_id` zero, or zeroes `class_id` afterwards. Grep the
+  writers of `ObjectKind::Array` headers and the evacuation copy path, and
+  consider a `ClassId(0)` argument reaching `alloc_array` rather than a torn
+  write.
 
 **Do not read a single guard's count as a verdict** — the
 `CRATONVM_JIT_DISABLE_INLINE_NEW=1` arm shows `g1::get_field` hits dropping to
