@@ -853,12 +853,27 @@ pub(crate) struct PendingConnectSocket {
     max_protocol: Option<native_tls::Protocol>,
 }
 
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0), on a reading of all three
+/// acquisition sites: `stash_pending_connect_socket` scans for a free id and
+/// inserts, `take_pending_connect_socket` removes, and
+/// `drop_pending_connect_socket_if_any` removes. None touches `ctx`, so the
+/// guard is never held across a re-entry into the VM — which is the whole of
+/// what the level claims.
 fn pending_connect_sockets(
-) -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, PendingConnectSocket>> {
+) -> &'static cratonvm_types::lock_order::OrderedPlMutex<
+    rustc_hash::FxHashMap<i32, PendingConnectSocket>,
+> {
     static T: std::sync::OnceLock<
-        parking_lot::Mutex<rustc_hash::FxHashMap<i32, PendingConnectSocket>>,
+        cratonvm_types::lock_order::OrderedPlMutex<
+            rustc_hash::FxHashMap<i32, PendingConnectSocket>,
+        >,
     > = std::sync::OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+    T.get_or_init(|| {
+        cratonvm_types::lock_order::OrderedPlMutex::new(
+            rustc_hash::FxHashMap::default(),
+            cratonvm_types::lock_order::LockLevel::Scratch,
+        )
+    })
 }
 
 fn stash_pending_connect_socket(entry: PendingConnectSocket) -> i32 {

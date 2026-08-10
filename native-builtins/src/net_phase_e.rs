@@ -163,6 +163,7 @@ fn spring_dbg_enabled() -> bool {
 
 use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
+use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
 
 use cratonvm_native_io::eintr::{is_eintr, retry_eintr, EintrIo, EintrStream};
@@ -742,9 +743,17 @@ pub(crate) struct DsSide {
     pub reuse_address: i32,
 }
 
-fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, DsSide>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// ARCH-2026-08-04 A6 — `LockLevel::Scratch` (L0, the leaf level) because no
+/// lock is ever taken while this one is held, and this one is never held across
+/// a re-entry into the VM. Every acquisition site has been read: `ds_get`
+/// copies a `DsSide` out and drops the guard; `ds_set` runs a closure and every
+/// one of its fourteen callers assigns plain `i32` fields and touches no `ctx`;
+/// `gc_scan_ds_roots` pushes keys into a `Vec`; `gc_remap_ds_roots` calls the
+/// pure `rekey`. The GC scan runs with the heap lock (L8) held, which is
+/// legal — L0 < L8 is the descending order the wrapper asserts.
+fn ds_side_table() -> &'static OrderedPlMutex<HashMap<ObjectRef, DsSide>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<ObjectRef, DsSide>>> = OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
 }
 
 /// The peer a `DatagramSocket` was last `connect`ed to, as `(numeric host,
@@ -755,9 +764,12 @@ fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
 /// cleared by `disconnect`, and deliberately NOT cleared by `close`, because
 /// the JDK specifies `getPort`/`getInetAddress` keep answering after the socket
 /// is closed (same rule that keeps `isConnected()` true).
-fn ds_peer_table() -> &'static Mutex<HashMap<ObjectRef, (String, i32)>> {
-    static T: OnceLock<Mutex<HashMap<ObjectRef, (String, i32)>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// Same `LockLevel::Scratch` claim as [`ds_side_table`], and the same four
+/// call shapes — `ds_peer` clones out, `ds_set_peer`/`ds_clear_peer` are one
+/// statement each, and the two GC hooks read keys or `rekey`.
+fn ds_peer_table() -> &'static OrderedPlMutex<HashMap<ObjectRef, (String, i32)>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<ObjectRef, (String, i32)>>> = OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
 }
 
 /// The connected peer, or `None` when this socket has never connected or has
@@ -866,9 +878,12 @@ const SSC_TAG_CLIENT: u8 = 0;
 const SSC_TAG_SERVER: u8 = 1;
 const SSC_TAG_ORPHAN: u8 = 2;
 
-fn ssc_side_table() -> &'static Mutex<HashMap<SscKey, SscSide>> {
-    static T: OnceLock<Mutex<HashMap<SscKey, SscSide>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// `LockLevel::Scratch`, on the same reading. `ssc_key` — the only `ctx` call
+/// on either path — runs BEFORE the guard is taken in both `ssc_get` and
+/// `ssc_set`, and `ssc_set`'s four callers assign one `i32` field each.
+fn ssc_side_table() -> &'static OrderedPlMutex<HashMap<SscKey, SscSide>> {
+    static T: OnceLock<OrderedPlMutex<HashMap<SscKey, SscSide>>> = OnceLock::new();
+    T.get_or_init(|| OrderedPlMutex::new(HashMap::new(), LockLevel::Scratch))
 }
 
 /// Carrier identity -> the `SscKey` it stands for. `get{Client,Server}
