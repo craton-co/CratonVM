@@ -22,7 +22,7 @@ for both VMs:
 |---|---|---:|
 | HotSpot 25.0.3 | **12.6s**, 45/45 pass | — |
 | CratonVM, JIT on | **no completion in 2400s** (killed) | **#4096** `innermost-rbp-belongs-to-unguarded-callee` |
-| CratonVM, `--nojit` | **262.9s**, run completes | none |
+| CratonVM, `--nojit` | **262.9s**, run completes — but 29/45 failed to `67fadfdd8`, see correction below | none |
 
 That answers the doc's own open question, and not in the direction it expected.
 Its leading hypothesis was *"Throughput, not a hang — a per-test-body cost that
@@ -36,12 +36,28 @@ mechanism, measured the same way, that kills
 `IntegrationAutoConfigurationTests` outright (OOM after 3.8 hours, fallback peak
 #16384).
 
-Caveat on the `--nojit` arm: it reports 29/45 failed, but every failure is
-`ApplicationContextException: Failed to start bean 'webServerStartStop'` from
-`Connector["http-nio-8080"]` failing to bind — port 8080 was held by an
-unrelated process on this shared host. Environmental, and it does not affect the
-timing. Tests that bind port 0 pass. This is also worth keeping in mind when
-reading the doc's historical `FAIL 3/45` and `4/45` rows.
+> **Correction (2026-08-10, after `67fadfdd8`).** This section originally
+> dismissed the `--nojit` arm's 29/45 failures — `ApplicationContextException:
+> Failed to start bean 'webServerStartStop'` from `Connector["http-nio-8080"]` —
+> as port 8080 being held by an unrelated process on this shared host.
+> **That was wrong.** They were a VM defect: an object hashed while its own
+> monitor was held kept that hash after the unlock, so `TomcatWebServer`'s
+> `Map<Service, Connector[]>` filed its entry under `i32::MAX`, the post-unlock
+> lookup missed, the service came back with no connectors, and
+> `Tomcat.getConnector()` fabricated a port-**8080** connector on a factory that
+> had asked for port **0**. Established with a standalone 30-second reproducer
+> (4/4 fail pre-fix, 4/4 pass post-fix) and by reading the corrupted map
+> directly. Fixed in `67fadfdd8`; post-fix the whole-class run logs 0
+> `http-nio-8080` mentions, down from 68.
+>
+> Consequences for this page: the 262.9s `--nojit` figure below is **not** a
+> clean arm and should be re-taken, and the doc's historical `FAIL 3/45` and
+> `4/45` rows may be this defect rather than the class's own failures. The
+> re-measured numbers live in
+> [`moving-young-fallback-turns-four-classes-red-20260810.md`](../../../known-issues/springboot/moving-young-fallback-turns-four-classes-red-20260810.md),
+> where Quartz post-fix OOMs at 8,704s with one Spring context taking 910s to
+> initialise. The retirement verdict — recurring HANG is the fallback, not the
+> class being heavy, and no `slowClasses` entry is warranted — is unchanged.
 
 ## What it got right
 
