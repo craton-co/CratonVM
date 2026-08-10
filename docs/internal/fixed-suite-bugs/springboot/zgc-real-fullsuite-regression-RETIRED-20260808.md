@@ -153,7 +153,7 @@ The page recorded a `CRASH` (a catchable `OutOfMemoryError: Java heap space
 as the mechanism, and said plainly that it had not measured it. On 2026-08-10
 the class's *default*-collector page was rewritten — its GC-pressure reading
 refuted, the cost re-attributed to `java.nio.ByteBuffer` scalar accessors
-([`zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`](../../../known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md),
+([`zipcontenttests-bytebuffer-accessor-call-cost-RETIRED-20260810.md`](zipcontenttests-bytebuffer-accessor-call-cost-RETIRED-20260810.md),
 [`zipcontenttests-gc-pressure-theory-REFUTED-20260810.md`](zipcontenttests-gc-pressure-theory-REFUTED-20260810.md))
 — and that page correctly noted the heap-size A/B behind the refutation had
 **never been run under ZGC**. It has now, one class per process, no 300s

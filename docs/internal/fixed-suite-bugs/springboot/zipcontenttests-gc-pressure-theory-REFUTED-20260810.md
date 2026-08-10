@@ -2,7 +2,7 @@
 
 **Status: RETIRED 2026-08-10 — the GC/allocation-pressure reading below is
 REFUTED by measurement, and the class is root-caused elsewhere. Live page:
-`known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.**
+`fixed-suite-bugs/springboot/zipcontenttests-bytebuffer-accessor-call-cost-RETIRED-20260810.md`.**
 
 What this page got right: the disk-capacity theory does not fit, and it says so
 having actually checked rather than assumed. What it got wrong, and the numbers

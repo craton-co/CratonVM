@@ -685,6 +685,12 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
 pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
     // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
     note_jit_boundary();
+    // Every transfer of control into compiled code passes through here, so this
+    // is the run's interpreter->JIT entry count. Divided into the JIT's measured
+    // CPU delta it gives the per-entry cost, which is the number that decides
+    // whether "compiling short methods an interpreted caller invokes" is what
+    // makes the JIT a net negative on call-dense classes.
+    scan_prof::bump(&scan_prof::JIT_ENTRIES);
     let depth = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         // Resolve the "same place in the Java stack as my caller" sentinel
@@ -1268,6 +1274,97 @@ fn unreg_memo_gc_reset_enabled() -> bool {
             Ok("0") | Ok("false") | Ok("off")
         )
     })
+}
+
+/// `CRATONVM_DBG_JIT_SCAN_PROF` — exit-time tally for the JIT root scan.
+///
+/// [`scan_active_jit_frames`] runs on **every object-returning native call**
+/// (through `update_root_snapshot`), and whenever any chain entry is
+/// conservative it blind-scans the whole band `[scanner_sp, max entry_sp)`.
+/// That band spans the *interpreted callee tree below* the compiled frame, so
+/// its width tracks Java stack depth rather than the compiled method's own
+/// frame — a JUnit stack is 35-70 frames deep where a microbenchmark's is
+/// three, which is exactly the difference between the two workloads where the
+/// JIT wins and where it loses.
+///
+/// Nothing reported how often that path runs or how many words it reads, so
+/// "the JIT costs +83% CPU on `ZipContentTests`" could be neither attributed
+/// to it nor cleared of it. These counters are that attribution: `band_words`
+/// against the run's CPU time is the whole question, and `cache_hits` against
+/// `scans` says whether the boundary-generation key — bumped by
+/// [`note_jit_boundary`] at *every* Rust↔JIT crossing — leaves the cache able
+/// to hit at all.
+///
+/// Off by default and read through one cached bool, so a default run pays a
+/// predictable branch per scan and nothing else.
+pub mod scan_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static SCANS: AtomicU64 = AtomicU64::new(0);
+    pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static BAND_SCANS: AtomicU64 = AtomicU64::new(0);
+    pub static BAND_WORDS: AtomicU64 = AtomicU64::new(0);
+    pub static BAND_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static PRECISE_FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Transfers of control into compiled code (`push_entry_full`). The run's
+    /// interpreter→JIT entry count; the JIT's CPU delta divided by this is the
+    /// per-entry cost.
+    pub static JIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SCAN_PROF").is_some()
+        })
+    }
+
+    #[inline]
+    pub fn bump(ctr: &'static AtomicU64) {
+        if enabled() {
+            ctr.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn add(ctr: &'static AtomicU64, n: u64) {
+        if enabled() {
+            ctr.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn observe_max(ctr: &'static AtomicU64, n: u64) {
+        if enabled() {
+            ctr.fetch_max(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Exit-time line. Prints nothing unless the flag is set, so a run that
+    /// never asks stays silent rather than reporting zeros that read as a
+    /// measured absence.
+    pub fn dump() {
+        if !enabled() {
+            return;
+        }
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        let scans = g(&SCANS);
+        let hits = g(&CACHE_HITS);
+        let hit_pct = if scans == 0 {
+            0.0
+        } else {
+            100.0 * hits as f64 / scans as f64
+        };
+        eprintln!(
+            "[cratonvm] JIT scan prof: scans={scans} cache_hits={hits} ({hit_pct:.1}%) \
+             band_scans={band} band_words={words} band_max_bytes={maxb} \
+             precise_frames={precise} jit_entries={entries}",
+            entries = g(&JIT_ENTRIES),
+            band = g(&BAND_SCANS),
+            words = g(&BAND_WORDS),
+            maxb = g(&BAND_MAX_BYTES),
+            precise = g(&PRECISE_FRAMES),
+        );
+    }
 }
 
 fn jit_scan_cache_enabled() -> bool {
@@ -3259,6 +3356,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // reuse the previous scan's roots verbatim unless a Rust↔JIT boundary
     // was crossed since (generation bump), which is the only way a spill
     // slot can have changed.
+    scan_prof::bump(&scan_prof::SCANS);
     let cache_on = jit_scan_cache_enabled();
     let gen = JIT_BOUNDARY_GEN.with(|g| g.get());
     // Heap collection count: a GC frees/relocates objects WITHOUT bumping the
@@ -3282,6 +3380,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
             }
         });
         if hit {
+            scan_prof::bump(&scan_prof::CACHE_HITS);
             return;
         }
     }
@@ -3329,11 +3428,18 @@ pub fn scan_active_jit_frames_with_sp(scanner_sp: usize, heap: &VmHeap, out: &mu
         let mut conservative_high = 0usize;
         for entry in chain.iter() {
             match entry.precise {
-                Some(info) => scan_one_frame_precise(info, heap, out),
+                Some(info) => {
+                    scan_prof::bump(&scan_prof::PRECISE_FRAMES);
+                    scan_one_frame_precise(info, heap, out)
+                }
                 None => conservative_high = conservative_high.max(entry.entry_sp),
             }
         }
         if conservative_high != 0 {
+            scan_prof::bump(&scan_prof::BAND_SCANS);
+            let band = conservative_high.saturating_sub(scanner_sp) as u64;
+            scan_prof::add(&scan_prof::BAND_WORDS, band / 8);
+            scan_prof::observe_max(&scan_prof::BAND_MAX_BYTES, band);
             scan_one_frame(scanner_sp, conservative_high, heap, out);
         }
     });
