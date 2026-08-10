@@ -11440,51 +11440,83 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         }
         "java/io/FilterInputStream" => vec![named_field("in", "Ljava/io/InputStream;")],
         "java/io/FilterOutputStream" => vec![named_field("out", "Ljava/io/OutputStream;")],
-        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
-        // `lock` and `skipBuffer` from `java.io.Reader`. There is no `in` on it
-        // anywhere — the wrapped stream lives inside the `StreamDecoder`. The
-        // model used to name slot 0 `in`, which is `Reader.lock`.
+        // ── the java.io Reader/Writer chain, and why slot 0 is spelled two
+        //    different ways in the two builds ────────────────────────────────
         //
-        // The synthetic ISR natives (`native_isr_init` and friends, all
-        // `#[cfg(feature = "synthetic-jdk")]`) park an fd-or-stream at slot 0
-        // and the raw stream at slot 1, so neither slot can be named honestly:
-        // both are `_vmN`. That keeps them in the census as kind 3 rather than
-        // silently agreeing with `lock`/`skipBuffer`.
+        // A real `InputStreamReader` declares ONE field, `sd`, and inherits
+        // `lock` and `skipBuffer` from `java.io.Reader`; a real
+        // `OutputStreamWriter` declares `se` under `writeBuffer` and `lock`;
+        // `BufferedReader` and `BufferedWriter` put `in`/`out` at index 2 for
+        // the same reason. Naming any of them at 0 puts it on `Reader.lock` or
+        // `Writer.writeBuffer`, which is what these four models used to do.
+        //
+        // Slot 0 — and, for `InputStreamReader`, slot 1 — is ALSO where the
+        // synthetic Reader/Writer natives park an fd or a wrapped stream. That
+        // is kind 3: a VM-internal value with no real JDK field to live in.
+        // Every one of those writers is `#[cfg(feature = "synthetic-jdk")]`,
+        // the build in which these classes are ALWAYS fabricated stubs and slot
+        // 0 belongs to nobody else. So the honest model differs by build, and
+        // it is split here rather than papered over with one spelling that is
+        // wrong in one of them:
+        //
+        // * under `synthetic-jdk` the slots stay `_vmN`, which is what keeps
+        //   the overlay COUNTED — an anonymous `_fN` reads as an innocuous
+        //   `pad`, and that is how `Files.newBufferedWriter`'s fd hid inside
+        //   `Writer.writeBuffer` for a day;
+        // * in the default build there is no writer AND no reader. The last
+        //   reader was the `BufferedWriter` natives' fd fast path, and it moved
+        //   behind the same gate `bw_delegate_out` already carried (see
+        //   `native-builtins`'s `phases_late::bw_synthetic_fd`). So the model
+        //   names the real fields, and the census is clean because nothing is
+        //   parked there — not because the model stopped saying so.
+        //
+        // Ungating a registration without moving its slot cannot pass silently
+        // as a result: the natives read slot 0 only under the feature, and this
+        // table is what `shadow_layout`'s production-model test diffs against
+        // the JDK's declaration order.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/InputStreamReader" => vec![
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("skipBuffer", "[C"),
+            named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/InputStreamReader" => vec![
             vm_internal_field(0),
             vm_internal_field(1),
             named_field("sd", "Lsun/nio/cs/StreamDecoder;"),
         ],
-        // `in` is at 2 on a real `BufferedReader`: `java.io.Reader` declares
-        // `lock` and `skipBuffer` ahead of it. Naming it at 0 put it on `lock`.
-        // Slot 0 is where `native_br_init` copies the wrapped reader's fd, so it
-        // is `_vm0`, not anonymous.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/BufferedReader" => vec![
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("skipBuffer", "[C"),
+            named_field("in", "Ljava/io/Reader;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/BufferedReader" => vec![
             vm_internal_field(0),
             named_field("skipBuffer", "[C"),
             named_field("in", "Ljava/io/Reader;"),
         ],
-        // Same shape as `InputStreamReader`: a real `OutputStreamWriter`
-        // declares only `se`, and inherits `writeBuffer` and `lock` from
-        // `java.io.Writer`. `native_osw_init` writes an fd Int at slot 0 —
-        // `writeBuffer`, a `char[]` — and `native_osw_write/flush/close` all
-        // read it back expecting an `Int`, returning silently when it is not.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/OutputStreamWriter" => vec![
+            named_field("writeBuffer", "[C"),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("se", "Lsun/nio/cs/StreamEncoder;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/OutputStreamWriter" => vec![
             vm_internal_field(0),
             named_field("lock", "Ljava/lang/Object;"),
             named_field("se", "Lsun/nio/cs/StreamEncoder;"),
         ],
-        // `out` is at 2 on a real `BufferedWriter`: `java.io.Writer` declares
-        // `writeBuffer` and `lock` ahead of it. Naming it at 0 put it on
-        // `writeBuffer`, a `char[]`.
-        //
-        // Slot 0 is `_vm0`, not `writeBuffer` and not anonymous:
-        // `Files.newBufferedWriter` parks a VM-internal fd there and
-        // `bw_delegate_out` uses "is slot 0 an Int?" to tell its own fd-backed
-        // object from a real one. That overlay is a separate defect (kind 3 —
-        // a VM value with no real field, which belongs in a side table); naming
-        // the slot `_vm0` is what keeps it *counted* until it is fixed. It spent
-        // a day as an anonymous `_f0`, which reads as an innocuous `pad`.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        "java/io/BufferedWriter" => vec![
+            named_field("writeBuffer", "[C"),
+            named_field("lock", "Ljava/lang/Object;"),
+            named_field("out", "Ljava/io/Writer;"),
+        ],
+        #[cfg(feature = "synthetic-jdk")]
         "java/io/BufferedWriter" => vec![
             vm_internal_field(0),
             named_field("lock", "Ljava/lang/Object;"),

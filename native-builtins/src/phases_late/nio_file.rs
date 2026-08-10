@@ -6345,9 +6345,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         };
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or_default() as usize;
-        let fd = match ctx.get_field(this, 0) {
-            Value::Int(fd) => fd as u32,
-            _ => return Ok(None),
+        let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
+            Some(fd) => fd,
+            None => return Ok(None),
         };
         let end = off.saturating_add(len).min(text.chars().count());
         let sub: String = text
@@ -6366,9 +6366,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             return Ok(None);
         }
         let c = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u32;
-        let fd = match ctx.get_field(this, 0) {
-            Value::Int(fd) => fd as u32,
-            _ => return Ok(None),
+        let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
+            Some(fd) => fd,
+            None => return Ok(None),
         };
         if let Some(ch) = char::from_u32(c) {
             let mut buf = [0u8; 4];
@@ -6392,9 +6392,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         };
         let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0) as usize;
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) as usize;
-        let fd = match ctx.get_field(this, 0) {
-            Value::Int(fd) => fd as u32,
-            _ => return Ok(None),
+        let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
+            Some(fd) => fd,
+            None => return Ok(None),
         };
         let cap = ctx.array_length(arr);
         let end = off.saturating_add(len).min(cap);
@@ -6423,9 +6423,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             );
             return Ok(None);
         }
-        let fd = match ctx.get_field(this, 0) {
-            Value::Int(fd) => fd as u32,
-            _ => return Ok(None),
+        let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
+            Some(fd) => fd,
+            None => return Ok(None),
         };
         let _ = ctx.fd_table().write_string(fd, &sep);
         Ok(None)
@@ -6448,9 +6448,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
             return Ok(None);
         }
-        let fd = match ctx.get_field(this, 0) {
-            Value::Int(fd) => fd as u32,
-            _ => return Ok(None),
+        let fd = match crate::phases_late::bw_synthetic_fd(ctx, this) {
+            Some(fd) => fd,
+            None => return Ok(None),
         };
         let _ = ctx.fd_table().close(fd);
         ctx.set_field(this, 0, Value::Int(-1));

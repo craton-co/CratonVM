@@ -747,20 +747,10 @@ mod production_model_order_tests {
                 "java/util/Collections$SingletonMap",
                 &["_f0", "_f1", "k", "v"],
             ),
-            // java.io.Reader contributes lock, skipBuffer ahead of `in`.
-            // Slot 0 is `_vm0`, not `_f0`: `native_br_init` copies the wrapped
-            // reader's fd there, over `Reader.lock`.
-            ("java/io/BufferedReader", &["_vm0", "skipBuffer", "in"]),
-            // java.io.Writer contributes writeBuffer, lock ahead of `out`.
-            // Slot 0 is `_vm0`: `Files.newBufferedWriter` parks an fd there,
-            // over `Writer.writeBuffer`.
-            ("java/io/BufferedWriter", &["_vm0", "lock", "out"]),
-            // A real InputStreamReader/OutputStreamWriter declares NO `in`/`out`
-            // — the wrapped stream lives inside the StreamDecoder/StreamEncoder.
-            // The synthetic natives park one at slot 0 (and, for the reader,
-            // slot 1) anyway, so those slots are `_vmN`.
-            ("java/io/InputStreamReader", &["_vm0", "_vm1", "sd"]),
-            ("java/io/OutputStreamWriter", &["_vm0", "lock", "se"]),
+            // The java.io Reader/Writer chain is spelled differently in the two
+            // builds, so it is pinned by `reader_writer_models_match_the_build`
+            // below — a row here can only state one of the two.
+            //
             // Declaration order, NOT the CodeSource(URL, Certificate[]) ctor.
             ("java/security/CodeSource", &["location", "signers", "certs"]),
             // Fixed earlier the same day; pinned here so the whole family is
@@ -895,5 +885,76 @@ mod production_model_order_tests {
             cases.len(),
             wrong.join("\n")
         );
+    }
+
+    /// The `java.io` Reader/Writer chain is the one family whose model is
+    /// `#[cfg]`-split, so it needs a per-build assertion rather than a row in
+    /// the table above.
+    ///
+    /// The split is load-bearing in BOTH directions and this pins both ends:
+    ///
+    /// * in the default build the four models must name the real JDK fields and
+    ///   carry NO `_vmN`. A `_vmN` here would be a claim that CratonVM parks a
+    ///   value on a JDK-owned slot, and after `bw_synthetic_fd` went behind the
+    ///   `synthetic-jdk` gate there is no writer and no reader left to do it.
+    ///   Re-introducing one without moving it off slot 0 fails here.
+    /// * under `synthetic-jdk` slot 0 (and, for `InputStreamReader`, slot 1)
+    ///   must STAY `_vmN`. That is where `native_isr_init`, `native_br_init`,
+    ///   `native_osw_init` and `native_bw_init` park an fd or a wrapped stream,
+    ///   and spelling it anonymously is how `Files.newBufferedWriter`'s fd read
+    ///   as an innocuous `pad` for a day.
+    ///
+    /// Slots 1 and 2 are the real names in both builds, which is what makes the
+    /// two lists comparable at a glance.
+    #[test]
+    fn reader_writer_models_match_the_build() {
+        #[cfg(not(feature = "synthetic-jdk"))]
+        let cases: &[(&str, &[&str])] = &[
+            ("java/io/InputStreamReader", &["lock", "skipBuffer", "sd"]),
+            ("java/io/BufferedReader", &["lock", "skipBuffer", "in"]),
+            ("java/io/OutputStreamWriter", &["writeBuffer", "lock", "se"]),
+            ("java/io/BufferedWriter", &["writeBuffer", "lock", "out"]),
+        ];
+        #[cfg(feature = "synthetic-jdk")]
+        let cases: &[(&str, &[&str])] = &[
+            ("java/io/InputStreamReader", &["_vm0", "_vm1", "sd"]),
+            ("java/io/BufferedReader", &["_vm0", "skipBuffer", "in"]),
+            ("java/io/OutputStreamWriter", &["_vm0", "lock", "se"]),
+            ("java/io/BufferedWriter", &["_vm0", "lock", "out"]),
+        ];
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (class, want) in cases {
+            let got = instance_names(class);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            if got != *want {
+                wrong.push(format!("  {class}\n    model: {got:?}\n    want:  {want:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} java.io Reader/Writer models are wrong for this build \
+             (synthetic-jdk = {}):\n{}",
+            wrong.len(),
+            cases.len(),
+            cfg!(feature = "synthetic-jdk"),
+            wrong.join("\n")
+        );
+
+        // The non-vacuity half: in the default build the claim is specifically
+        // that NOTHING is parked, so no `_vmN` may appear anywhere in these four
+        // models — including at an index this test's prefix does not reach.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        for (class, _) in cases {
+            let vm: Vec<String> = instance_names(class)
+                .into_iter()
+                .filter(|n| is_vm_internal_model_field(n))
+                .collect();
+            assert!(
+                vm.is_empty(),
+                "{class} still parks {vm:?} on a JDK-owned slot in the default \
+                 build; move the value or gate its writer on `synthetic-jdk`"
+            );
+        }
     }
 }
