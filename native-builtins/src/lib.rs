@@ -18143,6 +18143,12 @@ pub fn register_essential_natives_with_shims(
     crate::phases_late::reflect_invoke::register_real_jdk_stackwalker_frame_method_type(registry);
     crate::phases_late::charset_buffers::register_real_jdk_charset_contains(registry);
     crate::phases_late::nio_file::register_real_jdk_files_owner(registry);
+    // Heap-ByteBuffer scalar getters. DEFAULT OFF — this call is a no-op
+    // unless CRATONVM_BYTEBUFFER_INTRINSIC=1. It makes the accessors ~1.4-2.1x
+    // faster and the JIT configuration 6-12% SLOWER, because registering a
+    // native takes the method away from the JIT, whose inlining is worth more
+    // than the shorter path. See the module doc for both measurements.
+    crate::phases_late::nio_buffer::register_heap_byte_buffer_accessors(registry);
     // CGLIB / Spring `ConfigurationClassEnhancer.enhance` minimal bytecode
     // emitter. Registered AFTER `net_phase_e::register_phase_e_networking`
     // so the real emitter at `cglib_enhancer.rs` overrides the older
