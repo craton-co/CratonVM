@@ -549,7 +549,7 @@ impl VmHeap {
             // mutex acquire PER STACK WORD, per root-gathering pass, per
             // thread. `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
             // as a competing explanation for the 35 PASS→HANG classes in
-            // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`,
+            // `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`,
             // whose ApplicationContext boot/teardown shape is exactly deep
             // stacks × many threads. `zgc.rs:1467-1474` records that the same
             // shape already "read as a hang at scale" once — that fix covered
@@ -672,7 +672,7 @@ impl VmHeap {
             // which currently buys a full walk of the heap.
             // `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
             // instrument-separable hypotheses for the 35 PASS→HANG classes in
-            // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`.
+            // `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
             //
             // Why it cannot lose a root. The guard only ever returns `None`
             // sooner; it can never turn a `None` into a `Some`, so no interior
@@ -1091,7 +1091,13 @@ impl VmHeap {
     }
 
     /// Read an array element with auto-unboxing of wrapper types.
-    /// G1 falls back to plain get_array_element (no unboxing support yet).
+    ///
+    /// Only the generational collector needs a separate entry point: G1 and ZGC
+    /// un-box inside their own `get_array_element`, so routing them here would
+    /// double-decode nothing and the plain accessor already satisfies this
+    /// method's contract. Both arms below are therefore un-boxing reads, not
+    /// fallbacks — ZGC's was a genuine fallback until 2026-08-09, which is what
+    /// made `Stream.mapToLong(...).toArray()` return zeros under `-XX:+UseZGC`.
     pub fn get_array_element_unboxing(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         match self {
             VmHeap::Generational(h) => h.get_array_element_unboxing(obj, index),

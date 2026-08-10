@@ -209,7 +209,7 @@ removed. What this branch contributes to the report is content, not the call.
 
 **Status: OPEN — characterized, not root-caused.** Same methodology as the
 companion ZGC-real comparison run the same day
-([`zgc-real-fullsuite-regression-20260807.md`](zgc-real-fullsuite-regression-20260807.md)):
+([`zgc-real-fullsuite-regression-RETIRED-20260807.md`](zgc-real-fullsuite-regression-RETIRED-20260807.md)):
 same binary, same 1975-class Windows-box full suite, same 4-way shard split,
 `-Xmx 2g`, 300s/class timeout, only `-XX:+UseG1GC` vs. the default
 (unspecified → Generational) varies.

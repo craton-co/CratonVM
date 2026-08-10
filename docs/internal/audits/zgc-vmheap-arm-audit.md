@@ -91,7 +91,7 @@ sites, and **9** wildcard `_ =>` arms that also serve ZGC. Full arithmetic in §
 `dev`. `git blame` attributes them to two commits from **2026-08-07**, both of
 which are *after* `275887cb3`, the commit the 2026-08-07 full-suite baseline was
 measured on
-([`zgc-real-fullsuite-regression-20260807.md:10`](../known-issues/springboot/zgc-real-fullsuite-regression-20260807.md)).
+([`zgc-real-fullsuite-regression-RETIRED-20260807.md:10`](../fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md)).
 
 | # | Site | Defect | Introduced by |
 |---|---|---|---|
@@ -286,7 +286,7 @@ per-word mutex was never addressed at all.**
 
 This is a specific, testable, competing explanation for the **35 `PASS → HANG`**
 classes that
-[`zgc-real-fullsuite-regression-20260807.md`](../known-issues/springboot/zgc-real-fullsuite-regression-20260807.md)
+[`zgc-real-fullsuite-regression-RETIRED-20260807.md`](../fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md)
 attributes, as an explicitly-unverified hypothesis, to the missing young
 generation. The two hypotheses predict different instruments: the young-gen
 hypothesis predicts many full-heap GCs with long mark phases; this one predicts

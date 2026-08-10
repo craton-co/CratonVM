@@ -408,8 +408,17 @@ pass either way).
 
 ## Cross-reference: 9 of these 14 are the *identical* change under ZGC too
 
-See the companion doc,
-[`zgc-real-fullsuite-regression-20260808.md`](zgc-real-fullsuite-regression-20260808.md).
+See the companion doc, retired 2026-08-10:
+[`zgc-real-fullsuite-regression-RETIRED-20260808.md`](../../internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md).
+Two **collector-agnostic** defects were root-caused there, and one of them is
+live for G1 too, so this page's own residuals are worth re-measuring before
+being triaged as G1 behaviour: a generated-`$ProxyN` cache that kept handing
+out `ClassId`s after class unloading had removed them, which surfaces as
+`ClassCastException: ? cannot be cast to …` in any collector that reaches
+`memory::roots::conditional_loader_metadata` — G1 included, via
+`gc_quiescence::class_unload_marking()`. (The other, ZGC's missing
+reference-array un-box, is G1's already-fixed `42ce72b18` hole seen from the
+read side, so G1 is unaffected by it.)
 `ConfigurationMetadataAnnotationProcessorTests`, `SpringApplicationTests`,
 `ConfigurationPropertySourcesTests`, `Log4J2LoggingSystemTests`,
 `CloudFoundryActuatorAutoConfigurationTests`,
@@ -444,6 +453,17 @@ None of the 5 G1-only regressions were individually root-caused — this doc
 is a characterization pass, matching the ZGC companion doc's scope. Worth a
 follow-up triage pass the way the earlier 08-06/08-07 default-GC HANG/FAIL
 classes got one.
+
+**Update 2026-08-10** (from the ZGC page's retirement round, same binary,
+`-XX:+UseG1GC`, 2-way parallel): `BindConverterTests` now PASSes (8.9s).
+`ChildManagementContextInitializerAotTests` (296s) and
+`CacheAutoConfigurationTests` (337s, 15 failed) still fail; the latter fails on
+Infinispan JCache context startup
+(`UnsatisfiedDependencyException` behind `infinispanAsJCacheWithConfig`), which
+is a different family from anything on this page. `HikariDataSourceConfiguration-
+Tests` and `SpringApplicationTests` reproduce on the DEFAULT collector too in
+that round, so they are not G1-only either. That leaves this page with two
+genuinely open rows, not five.
 
 ## Affected classes
 

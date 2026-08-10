@@ -40,7 +40,7 @@ Trade-offs at a glance:
   `ZPage` code above it in the same file is a metadata-only simulation with no
   production consumer. On the 1975-class Spring Boot suite:
   1860 PASS vs. Generational's 1902, with 49 HANG vs. 18 — see
-  [`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260808.md`](known-issues/springboot/zgc-real-fullsuite-regression-20260808.md).
+  [`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md).
   **Do not depend on it in production.** The path to a real one is
   [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 - Because the `zgc` feature is default-off, a stock build has only two backends

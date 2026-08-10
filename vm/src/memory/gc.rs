@@ -206,6 +206,21 @@ pub fn unload_dead_class_metadata(
         });
 
     cratonvm_native_builtins::classloader::forget_unloaded_classes(shared.vm_identity, &raw_ids);
+    // The generated-`$ProxyN` cache holds `ClassId`s on BOTH sides of its
+    // rows and nothing else invalidates it, so its rows outlive the classes
+    // they name. A `$ProxyN` unloaded with its loader was handed straight back
+    // out of that cache on the next `Proxy.newProxyInstance` with the same
+    // (loader-namespace, interfaces) key, and the instance was allocated
+    // against a `ClassId` this function had already removed from the class
+    // store — after which its class resolves to nothing and the cast at the
+    // call site fails with `ClassCastException: ? cannot be cast to …`.
+    //
+    // Deliberately here on the ONLY path that actually removed classes, not
+    // inside `forget_unloaded_classes`: the two early exits above call that
+    // helper with the *hints* on paths where nothing was unloaded, and
+    // purging valid rows there would just churn a fresh `$ProxyN` per
+    // collection for classes that are still perfectly alive.
+    cratonvm_native_builtins::forget_unloaded_proxy_classes(shared.vm_identity, &raw_ids);
     shared
         .debug
         .diagnostic_counters

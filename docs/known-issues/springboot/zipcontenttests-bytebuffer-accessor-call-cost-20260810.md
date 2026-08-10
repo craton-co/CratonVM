@@ -41,6 +41,30 @@ the moment it would print the whole summary.
 true here: 178GB free, and the fixture's own
 `assumeTrue(getFreeSpace() > 6GB)` passes — all 29 tests run.
 
+## The heap lever under `-XX:+UseZGC` — added 2026-08-10
+
+The refutation above deliberately speaks only for the default collector, and
+flagged that the ZGC arm's `OutOfMemoryError` (recorded in
+`internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`
+§3) still had no heap-size A/B behind it. It has one now, same host, same
+protocol — one class per process, no 300s ceiling:
+
+| arm | result |
+|---|---|
+| CratonVM default, `-Xmx 2g`, JIT | **PASS 29/29 in 301s** |
+| CratonVM `-XX:+UseZGC`, `-Xmx 2g` | **OOM at 262s** (`native primitive array of length 8192`) |
+| CratonVM `-XX:+UseZGC`, `-Xmx 3g` | **PASS 29/29 in 314s** |
+| CratonVM `-XX:+UseZGC`, `-Xmx 4g` | **PASS 29/29 in 312s** |
+| CratonVM `-XX:+UseZGC`, `-Xmx 8g` | **PASS 29/29 in 263s** |
+
+So the lever this class does **not** respond to under the default collector is
+the difference between an OOM and a pass under ZGC, and the requirement is
+modest and flat: between 2g and 3g, unchanged from 3g to 8g. That is what a
+non-compacting whole-arena sweep costs on this allocation pattern, not a
+fragmentation cliff. It changes nothing about this page's own finding — the
+`ByteBuffer` accessor cost is collector-independent, and is what makes every
+one of those arms 10-14x HotSpot.
+
 ## Where the time goes
 
 `--stack-sample-ms=200` over the `--nojit` arm (1052 leaf samples) gives a flat

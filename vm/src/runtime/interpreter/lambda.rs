@@ -155,7 +155,11 @@ pub(super) fn checkcast_lambda_instantiated_args(
                 .read()
                 .get_class(shared.mem.heap.class_id_of(obj_ref))
                 .map(|c| c.name.to_string())
-                .unwrap_or_else(|| "?".to_string());
+                // Name the id, not just "?" — see the matching note on the
+                // `checkcast` opcode's fallback.
+                .unwrap_or_else(|| {
+                    format!("?class_id={}", shared.mem.heap.class_id_of(obj_ref))
+                });
             let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
             let target_binary = inst_tok
                 .strip_prefix('L')

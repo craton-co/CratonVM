@@ -2277,7 +2277,7 @@ pub struct ZgcRealHeap {
     /// 1902 / 18 / 11 on the default collector — **35 classes PASS -> HANG**,
     /// concentrated on `*AutoConfigurationTests`, i.e. `ApplicationContext`
     /// boot/teardown, the most allocation-heavy workload in the suite
-    /// (`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`).
+    /// (`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
     ///
     /// That record does not attribute the hangs to this lock and neither does
     /// this field: a global lock on every allocation is the wrong answer at
@@ -2672,6 +2672,35 @@ impl ZgcRealHeap {
         } else {
             None
         }
+    }
+
+    /// The primitive inside an auto-box wrapper, or `None` when `candidate` is
+    /// an ordinary object.
+    ///
+    /// The read half of the auto-boxing [`Collector::set_array_element`]
+    /// performs for a non-`Object` value stored into a reference array. Without
+    /// it the caller gets the *wrapper* back — an object of the synthetic
+    /// `AUTOBOX_CLASS_ID`, which has no class name, no methods and no
+    /// relationship to the primitive it carries. `GenerationalHeap` and
+    /// `G1Collector` both un-box on the read side; this collector did not, so
+    /// `Stream.mapToLong(...)`/`mapToDouble(...)` — whose Rust bridge collects
+    /// `Value::Long`/`Value::Double` into a reference array — handed the
+    /// pipeline a wrapper where a primitive belonged, and every consumer
+    /// downstream read either zero or the wrapper's own address.
+    ///
+    /// Validates the address before dereferencing its header: a reference array
+    /// element is a raw word and a stale or garbage one could point anywhere,
+    /// so an unchecked read here would be wild. Mirrors
+    /// `G1Collector::autobox_payload`.
+    fn autobox_payload(&self, candidate: ObjectRef) -> Option<Value> {
+        self.is_object_address(candidate.as_ptr() as usize)?;
+        // SAFETY: `is_object_address` confirmed `candidate` is a registered
+        // live allocation base, so its first HEADER_SIZE bytes are a header.
+        let header = unsafe { &*(candidate.as_ptr() as *const ObjectHeader) };
+        if header.class_id != crate::heap::AUTOBOX_CLASS_ID {
+            return None;
+        }
+        Some(<Self as GarbageCollector>::get_field(self, candidate, 0))
     }
 
     /// Loose containment check returning the base object for any address inside it.
@@ -4954,10 +4983,24 @@ impl GarbageCollector for ZgcRealHeap {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
+        let element_type = header.element_type();
         let val = unsafe {
             let base = obj.as_ptr().add(ARRAY_DATA_OFFSET);
-            read_prim_element(base, index, header.element_type())
+            read_prim_element(base, index, element_type)
         };
+        // Un-box the wrapper `set_array_element` installs for a non-Object
+        // value stored into a reference array — see `autobox_payload`, and
+        // `G1Collector::get_array_element` / `GenerationalHeap::
+        // get_array_element_unboxing` for the same read. A Java-level
+        // `Object[]` never holds an `AUTOBOX_CLASS_ID` object, so this cannot
+        // change what an `aaload` observes.
+        if element_type == ArrayElementType::Reference {
+            if let Value::Object(Some(boxed)) = val {
+                if let Some(inner) = self.autobox_payload(boxed) {
+                    return Ok(inner);
+                }
+            }
+        }
         Ok(val)
     }
 
@@ -7481,5 +7524,97 @@ mod tests {
             heap.is_heap_addr(hi - 4096).is_none(),
             "the unallocated bump tail is not inside any object",
         );
+    }
+
+    // -- Reference arrays as a generic Value store --
+
+    /// A REFERENCE array element is a raw 8-byte pointer, but every backend
+    /// must accept an arbitrary `Value` in one: natives across the tree use a
+    /// reference array as a generic `Value` store, and the generational heap
+    /// has always honoured that by auto-boxing into an `AUTOBOX_CLASS_ID`
+    /// wrapper.
+    ///
+    /// ZGC-real had the WRITE half and no read half, so a `Value::Long(-42)`
+    /// came back as the *wrapper object* — an instance of a synthetic class
+    /// with no name, no methods and no relation to the primitive. In Java that
+    /// made `stream.mapToLong(Long::longValue).toArray()` return all zeros
+    /// under `-XX:+UseZGC`, and `boxed()` yield objects printing as `?@2`. No
+    /// collection was involved: deterministic, identical with `--nojit` and at
+    /// a heap large enough that no GC runs. `mapToInt` survived, because a
+    /// 4-byte element never reached the auto-box arm.
+    #[test]
+    fn reference_array_round_trips_every_value_kind() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let arr = heap.alloc_array(ClassId::new(1), ArrayElementType::Reference, 6);
+        let obj = heap.alloc_object(ClassId::new(2), 1);
+
+        let cases = [
+            Value::Long(-42),
+            Value::Double(2.5),
+            Value::Int(7),
+            Value::Float(1.5),
+            Value::Object(Some(obj)),
+            Value::Object(None),
+        ];
+        for (i, v) in cases.iter().enumerate() {
+            heap.set_array_element(arr, i, *v).expect("in bounds");
+        }
+        for (i, want) in cases.iter().enumerate() {
+            let got = heap.get_array_element(arr, i).expect("in bounds");
+            match (want, got) {
+                (Value::Object(Some(w)), Value::Object(Some(g))) => {
+                    assert_eq!(w.as_ptr(), g.as_ptr(), "element {i}: reference identity")
+                }
+                (w, g) => assert_eq!(*w, g, "element {i} did not round-trip"),
+            }
+        }
+    }
+
+    /// The boxing must not leak into a PRIMITIVE array: those store the value
+    /// directly and a wrapper there would be a wrong-width write.
+    #[test]
+    fn primitive_arrays_are_not_auto_boxed() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let arr = heap.alloc_array(ClassId::new(1), ArrayElementType::Double, 2);
+        heap.set_array_element(arr, 0, Value::Double(3.25))
+            .expect("in bounds");
+        assert_eq!(heap.get_array_element(arr, 0), Ok(Value::Double(3.25)));
+    }
+
+    /// An ordinary object stored in a reference array must come back as
+    /// itself, not be mistaken for a wrapper. The un-box keys on
+    /// `AUTOBOX_CLASS_ID`, so this pins that a real object's class id cannot
+    /// collide with it.
+    #[test]
+    fn an_ordinary_object_is_not_mistaken_for_an_auto_box() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let arr = heap.alloc_array(ClassId::new(1), ArrayElementType::Reference, 1);
+        let obj = heap.alloc_object(ClassId::new(3), 1);
+        heap.set_field(obj, 0, Value::Int(99));
+        heap.set_array_element(arr, 0, Value::Object(Some(obj)))
+            .expect("in bounds");
+        match heap.get_array_element(arr, 0) {
+            Ok(Value::Object(Some(got))) => assert_eq!(got.as_ptr(), obj.as_ptr()),
+            other => panic!("expected the object back, got {other:?}"),
+        }
+    }
+
+    /// A reference-array word that is NOT a live object base must be returned
+    /// as-is rather than dereferenced. `autobox_payload` screens through
+    /// `is_object_address` for exactly this reason; without the screen the
+    /// un-box would read an `ObjectHeader` out of arbitrary memory.
+    #[test]
+    fn a_non_object_word_in_a_reference_array_is_not_dereferenced() {
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        let arr = heap.alloc_array(ClassId::new(1), ArrayElementType::Reference, 1);
+        // SAFETY: never dereferenced — the point of the test is that the
+        // un-box path refuses to dereference an unregistered address.
+        let bogus = unsafe { ObjectRef::from_raw(0x1000 as *mut u8) };
+        heap.set_array_element(arr, 0, Value::Object(Some(bogus)))
+            .expect("in bounds");
+        match heap.get_array_element(arr, 0) {
+            Ok(Value::Object(Some(got))) => assert_eq!(got.as_ptr() as usize, 0x1000),
+            other => panic!("expected the raw word back, got {other:?}"),
+        }
     }
 }

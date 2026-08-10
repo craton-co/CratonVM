@@ -39591,6 +39591,41 @@ static PROXY_CLASS_CACHE: parking_lot::RwLock<
     >,
 > = parking_lot::RwLock::new(None);
 
+/// Drop every generated-proxy-class row this VM's class unloading just
+/// invalidated.
+///
+/// A row is `(vm, loader_namespace, ordered_iface_ids) -> generated_class_id`,
+/// and **class unloading can kill either side**. The value goes first: once
+/// `ClassManager::unload_user_classes` has removed the generated `$ProxyN`,
+/// a later `Proxy.newProxyInstance` with the same key was handed the dead id
+/// straight back out of this cache and allocated an instance against it. Its
+/// class then resolves to nothing — the same
+/// `ClassCastException: ? cannot be cast to …` this cache's `vm_identity`
+/// partition was added to stop, reached the other way round. That is what made
+/// `BatchJdbcAutoConfigurationTests`, `FreeMarkerAutoConfigurationReactive-
+/// IntegrationTests` and `OpenTelemetrySdkAutoConfigurationTests` fail under
+/// `-XX:+UseZGC`, whose every collection is a full mark and therefore runs
+/// loader reclamation on every cycle rather than only in the generational
+/// collector's narrow full-mark windows.
+///
+/// The KEY is purged on the same evidence: an entry keyed on an interface
+/// `ClassId` that no longer exists cannot be matched by a live request except
+/// by id reuse, and matching it by reuse is precisely the bug above.
+pub fn forget_unloaded_proxy_classes(vm_identity: usize, class_ids: &[u32]) {
+    if class_ids.is_empty() {
+        return;
+    }
+    let dead: rustc_hash::FxHashSet<u32> = class_ids.iter().copied().collect();
+    let mut guard = PROXY_CLASS_CACHE.write();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(vm, _, ifaces), cid| {
+            *vm != vm_identity
+                || (!dead.contains(&cid.as_u32())
+                    && !ifaces.iter().any(|i| dead.contains(&i.as_u32())))
+        });
+    }
+}
+
 /// Drop every generated-proxy-class row belonging to `vm_identity`. Called
 /// from `release_vm_native_state`; the rows hold `ClassId`s into a class
 /// manager that is going away.
@@ -39602,6 +39637,76 @@ pub fn forget_vm_proxy_classes(vm_identity: usize) {
     let mut modules = PROXY_LOADER_MODULES.write();
     if let Some(map) = modules.as_mut() {
         map.retain(|(vm, _), _| *vm != vm_identity);
+    }
+}
+
+#[cfg(test)]
+mod proxy_class_cache_unload_tests {
+    use cratonvm_types::ClassId;
+
+    /// The row whose VALUE was unloaded must go: handing that `ClassId` back
+    /// out of the cache is what allocated an instance against a class the
+    /// class manager had already removed.
+    #[test]
+    fn an_unloaded_generated_proxy_class_is_dropped_from_the_cache() {
+        const VM: usize = 0xC0FFEE;
+        {
+            let mut guard = super::PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert((VM, 7, vec![ClassId::new(100)]), ClassId::new(3003));
+            map.insert((VM, 7, vec![ClassId::new(101)]), ClassId::new(3005));
+        }
+        super::forget_unloaded_proxy_classes(VM, &[3003]);
+        let guard = super::PROXY_CLASS_CACHE.read();
+        let map = guard.as_ref().expect("cache populated above");
+        assert!(map.get(&(VM, 7, vec![ClassId::new(100)])).is_none());
+        assert_eq!(
+            map.get(&(VM, 7, vec![ClassId::new(101)])),
+            Some(&ClassId::new(3005)),
+            "a live row must survive the purge",
+        );
+    }
+
+    /// And the row whose KEY names an unloaded interface: it can only be
+    /// matched again through `ClassId` reuse, and matching by reuse is the
+    /// same defect one step removed.
+    #[test]
+    fn a_row_keyed_on_an_unloaded_interface_is_dropped_too() {
+        const VM: usize = 0xC0FFEF;
+        {
+            let mut guard = super::PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert(
+                (VM, 9, vec![ClassId::new(200), ClassId::new(201)]),
+                ClassId::new(4000),
+            );
+        }
+        super::forget_unloaded_proxy_classes(VM, &[201]);
+        let guard = super::PROXY_CLASS_CACHE.read();
+        let map = guard.as_ref().expect("cache populated above");
+        assert!(map
+            .get(&(VM, 9, vec![ClassId::new(200), ClassId::new(201)]))
+            .is_none());
+    }
+
+    /// Another VM's rows are none of this VM's business — the same partition
+    /// the `vm_identity` key component exists to keep.
+    #[test]
+    fn another_vms_rows_are_untouched() {
+        const MINE: usize = 0xD0D0;
+        const THEIRS: usize = 0xE0E0;
+        {
+            let mut guard = super::PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert((THEIRS, 1, vec![ClassId::new(300)]), ClassId::new(5000));
+        }
+        super::forget_unloaded_proxy_classes(MINE, &[5000, 300]);
+        let guard = super::PROXY_CLASS_CACHE.read();
+        let map = guard.as_ref().expect("cache populated above");
+        assert_eq!(
+            map.get(&(THEIRS, 1, vec![ClassId::new(300)])),
+            Some(&ClassId::new(5000)),
+        );
     }
 }
 

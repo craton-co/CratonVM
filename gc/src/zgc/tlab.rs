@@ -56,7 +56,7 @@
 //! The generational and G1 backends have TLABs; ZGC has none. On the most
 //! allocation-heavy workload in the suite (Spring `ApplicationContext` boot and
 //! teardown churn) the ZGC-only regression is 46 classes with 35 PASS -> HANG
-//! (`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`).
+//! (`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
 //!
 //! **This module does not claim to be the cause of that.** The leading
 //! hypothesis is the missing generational split, and a sibling agent is
