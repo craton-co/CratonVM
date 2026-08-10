@@ -1846,13 +1846,24 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Map;)Ljava/util/Map;",
         native_return_first_arg,
     );
-    r.register(
+    // `SyntheticStub` for the same reason as the superseding registration in
+    // `phases_late.rs`: `java.util.Map.entry` is ordinary `java.base` bytecode
+    // and JDK 25 declares no `ACC_NATIVE` on it, so `--jdk-only` must drop this
+    // and let the real method mint the real `KeyValueHolder`. Retagging the
+    // superseding copy alone would have left this one's kind claiming
+    // something nothing uses, which is the ambient-kind trap.
+    r.register_with_kind(
         mi,
         "entry",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
         |ctx, args| {
-            let entry =
-                try_alloc_concurrent_synthetic(ctx, "java/util/AbstractMap$SimpleImmutableEntry", 2)?;
+            // `java/util/KeyValueHolder`, matching the later registration in
+            // `phases_late.rs` that supersedes this one — and matching HotSpot,
+            // which returns that class from `Map.entry`. It was
+            // `AbstractMap$SimpleImmutableEntry`, which is a different class
+            // with a different `getClass()` answer and, being `Serializable`,
+            // a different contract from the one `Map.entry` documents.
+            let entry = try_alloc_concurrent_synthetic(ctx, "java/util/KeyValueHolder", 2)?;
             ctx.set_field(
                 entry,
                 0,
@@ -1865,6 +1876,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             );
             Ok(Some(Value::Object(Some(entry))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // -----------------------------------------------------------------------

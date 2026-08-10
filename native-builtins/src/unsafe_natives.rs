@@ -1391,12 +1391,6 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
     register_consolidated_off_heap_store(r);
 
     // Legacy `sun.misc.Unsafe.defineClass`.
-    r.register(
-        u,
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        native_unsafe_define_class,
-    );
     // Modern `jdk.internal.misc.Unsafe.defineClass0` (post-JDK-9 rename).
     r.register(
         u2,
@@ -1415,12 +1409,6 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
     );
 
     // Legacy `defineAnonymousClass` — JDK 8 surface, ByteBuddy still emits.
-    r.register(
-        u,
-        "defineAnonymousClass",
-        "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;",
-        native_unsafe_define_anonymous_class,
-    );
     r.register(
         u2,
         "defineAnonymousClass",
@@ -1780,12 +1768,6 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     );
     // Legacy sun.misc.Unsafe naming (predates rename to Reference).
     registry.register(
-        u,
-        "weakCompareAndSetObject",
-        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
-        native_unsafe_weak_cas_object,
-    );
-    registry.register(
         u2,
         "weakCompareAndSetObject",
         "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
@@ -1959,12 +1941,6 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     register_consolidated_off_heap_store(registry);
 
     // 6. Real defineClass replacing the stub.
-    registry.register(
-        u,
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        native_unsafe_define_class,
-    );
     registry.register_with_kind(
         u2,
         "defineClass0",

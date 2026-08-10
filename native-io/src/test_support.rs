@@ -819,8 +819,16 @@ impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
     fn is_interface_class(&self, _c: ClassId) -> bool {
         false
     }
-    fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
-        self.ensure_mock_class(name)
+    fn try_ensure_synthetic_class(
+        &mut self,
+        name: &str,
+        _num_fields: usize,
+    ) -> Result<ClassId, cratonvm_native_api::ClassIdentityError> {
+        // The mock has no compatibility policy, so it never refuses — it is
+        // standing in for `Compatible` mode, where a fabrication always
+        // succeeds. It overrode the infallible spelling until that was deleted
+        // by JDK-only wave 2 step 3 (2026-08-10).
+        Ok(self.ensure_mock_class(name))
     }
     fn loaded_class_count(&self) -> usize {
         0

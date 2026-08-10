@@ -1087,27 +1087,65 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
     // their own class's natives. And all three read only slots 0 and 1, which
     // both shapes of this class agree on.
     //
-    // `setValue` is deliberately NOT registered here, and that is the
+    // `setValue` is deliberately NOT registered on this name, and that is the
     // interesting half. `java/util/Map$Entry` is also minted as a THREE-field
     // entry — `key@0, value@1, sourceMap@2` — by the entry-set views in
     // native-collections and properties_sidetable, precisely so that
     // `Entry.setValue` WRITES THROUGH to the backing map, which
-    // `entrySet()` iteration requires. `Map.entry`'s entry is 2-field and
-    // must throw. One synthetic class name, two contradictory contracts,
-    // resolved by last-write-wins.
-    //
-    // An immutable `setValue` registered here loses that race today — and it
-    // must: if it ever won, every `entrySet()` write-through would break,
-    // which is far worse than `Map.entry(...).setValue(v)` being permissive.
-    // Registering a native whose correctness depends on losing a race is the
-    // landmine this lane keeps stepping on, so it is not registered at all.
-    //
-    // Fixing the residual properly means giving `Map.entry` a class of its
-    // own — HotSpot returns `java.util.KeyValueHolder` for exactly this
-    // reason. Measured and rejected as a drive-by: re-pointing the allocation
-    // at `SimpleImmutableEntry` moved the differential from 4 diverging lines
-    // to 6.
+    // `entrySet()` iteration requires. That is the only contract this NAME
+    // carries now.
     register_entry_value_semantics(r, "java/util/Map$Entry");
+
+    // `Map.entry(k, v)` has a class of its own — `java/util/KeyValueHolder`,
+    // which is what HotSpot answers for `Map.entry(..).getClass()`.
+    //
+    // Until it did, `Map.entry`'s 2-field immutable entry and the entry-set
+    // views' 3-field write-through entry were the same synthetic class name
+    // wearing two contradictory contracts, and `setValue` was decided by
+    // last-write-wins. An immutable `setValue` could only ever win that race
+    // by breaking every `entrySet()` write-through, so it was not registered
+    // at all and `Map.entry(..).setValue(v)` stayed permissive — the last
+    // diverging line of `probes/ShadowDifferentialProbe.java` under
+    // `--synthetic-jdk`. A separate class removes the race rather than
+    // choosing a side of it.
+    //
+    // `--real-jdk` is untouched: `java.util.Map.entry` is ordinary bytecode in
+    // `java.base`, so the registry drops the `Map.entry` registration and the
+    // JDK mints its own `KeyValueHolder`, which never reaches these natives.
+    //
+    // `SyntheticStub` rather than this registrar's ambient `Bridge`: the real
+    // `java.util.KeyValueHolder` in `java.base` declares no `ACC_NATIVE`
+    // method, so contract §1.5 cannot call these bridges, and under
+    // `--jdk-only` they must drop so the JDK's own final `key`/`value` fields
+    // and its own `setValue` throw are what run.
+    let kvh_prev = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let kvh = "java/util/KeyValueHolder";
+    r.register(kvh, "getKey", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    r.register(kvh, "getValue", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(
+        kvh,
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| {
+            // `KeyValueHolder.setValue` throws unconditionally in the JDK, and
+            // the silent-success this replaces was the dangerous half: a caller
+            // defensively mutating a copy got no signal that it had mutated
+            // something nobody would read.
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "not supported".into(),
+            }
+            .into())
+        },
+    );
+    register_entry_value_semantics(r, kvh);
+    r.set_category(kvh_prev);
     r.set_category(__prev_cat);
 }
 

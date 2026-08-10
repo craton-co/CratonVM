@@ -45,9 +45,9 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
 
     let (alpha, beta, iface, proxy) = {
         let mut cm = shared.classes.class_manager.write();
-        let alpha = cm.ensure_synthetic_class("cratonvm/test/AastoreAlpha", 0);
-        let beta = cm.ensure_synthetic_class("cratonvm/test/AastoreBeta", 0);
-        let iface = cm.ensure_synthetic_class("cratonvm/test/AastoreIface", 0);
+        let alpha = cm.try_ensure_synthetic_class("cratonvm/test/AastoreAlpha", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let beta = cm.try_ensure_synthetic_class("cratonvm/test/AastoreBeta", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let iface = cm.try_ensure_synthetic_class("cratonvm/test/AastoreIface", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         cm.class_store
             .get_mut(iface)
             .expect("just fabricated")
@@ -55,7 +55,7 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
         // The name is the whole point: the predicate's proxy arm tests
         // `contains("$Proxy")`, which is what admits `jdk/proxy3/$Proxy27` in
         // the `AotIntegrationTests` case without consulting any interface list.
-        let proxy = cm.ensure_synthetic_class("jdk/proxy3/$Proxy27", 0);
+        let proxy = cm.try_ensure_synthetic_class("jdk/proxy3/$Proxy27", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         (alpha, beta, iface, proxy)
     };
 
@@ -156,11 +156,11 @@ fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
     let (alpha, forked, child) = {
         let mut cm = shared.classes.class_manager.write();
         // The parent loader's copy — what the array was created with.
-        let alpha = cm.ensure_synthetic_class(COMPONENT, 0);
+        let alpha = cm.try_ensure_synthetic_class(COMPONENT, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         // The forked loader's copy: fabricated under its own name, then renamed
         // so the store holds two distinct ids for one name.
-        let forked = cm.ensure_synthetic_class("cratonvm/test/SplitAlpha$Forked", 0);
+        let forked = cm.try_ensure_synthetic_class("cratonvm/test/SplitAlpha$Forked", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         cm.class_store
             .get_mut(forked)
             .expect("just fabricated")
@@ -169,7 +169,7 @@ fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
         // A subclass of the FORKED copy, for arm 2. `set_superclass` rather than
         // writing the field: the store maintains a subclass adjacency index that
         // a raw field write would desynchronise.
-        let child = cm.ensure_synthetic_class("cratonvm/test/SplitChild", 0);
+        let child = cm.try_ensure_synthetic_class("cratonvm/test/SplitChild", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         cm.class_store.set_superclass(child, Some(forked));
 
         (alpha, forked, child)
@@ -220,7 +220,7 @@ fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
     // degenerated to `true`.
     let unrelated = {
         let mut cm = shared.classes.class_manager.write();
-        cm.ensure_synthetic_class("cratonvm/test/SplitUnrelated", 0)
+        cm.try_ensure_synthetic_class("cratonvm/test/SplitUnrelated", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
     };
     let unrelated_obj = shared.mem.heap.alloc_object(unrelated, 0);
     assert!(

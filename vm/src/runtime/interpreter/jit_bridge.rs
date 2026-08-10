@@ -2175,6 +2175,64 @@ pub(super) fn resolve_jit_new_site(
     })
 }
 
+/// Would dispatching `class_name.<init>()V` reach a native, rather than the
+/// bytecode constructor?
+///
+/// Split out of [`is_elidable_construction`] so it can be tested directly: the
+/// elision decision is a *compile-time prediction* of what a later dispatch will
+/// do, and a prediction that drifts from the dispatch is exactly the class of
+/// bug the caller's json-smart comment describes.
+///
+/// # Why this is `resolve_native_dispatch_wave1` and not `find(..).is_some()`
+///
+/// It used to be the latter, which is the wrong question under strict policy:
+/// `JdkOnly` sends a non-`Intrinsic` bridge standing in front of concrete
+/// bytecode to the bytecode (§7 step 3), so the native the old check refused
+/// over never runs, and the refusal was pure pessimism — the JIT declined to
+/// elide a constructor that provably does nothing.
+///
+/// The two inputs a name triple cannot supply:
+///
+/// * `compat_native_wins: true` — this site's pre-existing verdict, and a
+///   faithful one: today a registered `<init>()V` native wins over the bytecode
+///   constructor, which is the whole reason the caller checks at all.
+/// * `bytecode_available: true` — established by the caller, not assumed: it
+///   only asks after `init.code()` returned `Some`.
+///
+/// # Why the prediction cannot drift
+///
+/// The dispatch side of this decision — `admit_forced_native`, reached from
+/// `intercept_force_registered_native{,_cached}` — calls the SAME resolver with
+/// the SAME two constants (`compat_native_wins: true`, `bytecode_available:
+/// true`) for the same triple. One function, one pair of inputs, so compile-time
+/// and run-time cannot answer differently. That is the property to preserve if
+/// either side is ever changed.
+///
+/// A `Some(_)` of any shape means "not the trivial bytecode body": `NativeBridge`
+/// and `Intrinsic` both run other code, and a strict `Reject` throws, which
+/// eliding would silently turn into success. `None` means the bytecode is what
+/// executes.
+///
+/// `Compatible` is bit-for-bit the old behaviour: with `compat_native_wins ==
+/// true` the resolver answers `Some` for every registration and `None` for none,
+/// which is `find(..).is_some()` spelled through the policy.
+fn elidable_ctor_native_would_run(shared: &SharedVm, class_name: &str) -> bool {
+    let registered = shared
+        .natives
+        .native_methods
+        .find_with_kind(class_name, "<init>", "()V");
+    crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        class_name,
+        "<init>",
+        "()V",
+        registered,
+        true,
+        true,
+    )
+    .is_some()
+}
+
 /// Whether constructing `class_id` via its no-arg constructor is *elidable* for
 /// JIT escape-analysis scalar replacement — i.e. `new C(); dup; invokespecial
 /// C.<init>()V` may be replaced by a zero-initialised scalar object with no call.
@@ -2198,8 +2256,14 @@ pub(super) fn is_elidable_construction(
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
+    let Some(init) = class.find_method("<init>", "()V") else {
+        return false;
+    };
+    let Some(code) = init.code() else {
+        return false;
+    };
     // A REGISTERED NATIVE SHADOWS THE BYTECODE CONSTRUCTOR. `invokespecial`
-    // always prefers a registered native over bytecode, so a trivial-looking
+    // prefers a registered native over bytecode, so a trivial-looking
     // `<init>()V` body says nothing about what actually runs — and eliding the
     // call skips the native's side effects entirely.
     //
@@ -2215,20 +2279,16 @@ pub(super) fn is_elidable_construction(
     // (jsonsmart-parser-jit-retired-20260727.md). The companion
     // `map_resize` fix makes the fallback capacity correct; this one keeps the
     // native constructor running in the first place.
-    if shared
-        .natives
-        .native_methods
-        .find(&class.name, "<init>", "()V")
-        .is_some()
-    {
+    //
+    // The §3 item-4 residual of the retired wave-2 markers record.
+    // The question is NOT "is a native registered" but "would dispatching this
+    // `<init>` reach one" — see [`elidable_ctor_native_would_run`], which is
+    // where that distinction and its `bytecode_available` premise are argued.
+    // The check sits BELOW the body lookup because that premise is `init.code()`
+    // having returned `Some`.
+    if elidable_ctor_native_would_run(shared, &class.name) {
         return false;
     }
-    let Some(init) = class.find_method("<init>", "()V") else {
-        return false;
-    };
-    let Some(code) = init.code() else {
-        return false;
-    };
     let bc = &code.code;
     // aload_0 (0x2a); invokespecial (0xb7) hi lo; return (0xb1) — exactly 5 bytes.
     if bc.len() != 5 || bc[0] != 0x2a || bc[1] != 0xb7 || bc[4] != 0xb1 {
@@ -7465,4 +7525,97 @@ pub(super) fn execute_jit_call_decoded(
     }
 
     Ok(Some(CachedCallResult::Handled))
+}
+
+#[cfg(test)]
+mod elidable_ctor_policy_tests {
+    use super::elidable_ctor_native_would_run;
+    use crate::vm::SharedVm;
+    use cratonvm_native_api::NativeKind;
+    use cratonvm_types::compat::CompatibilityMode;
+
+    /// Not a real native — never invoked by these tests, which only ask the
+    /// POLICY question. A registration needs a callback, so this is one.
+    fn stub(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[crate::types::Value],
+    ) -> Result<Option<crate::types::Value>, cratonvm_types::error::MethodCallFailed> {
+        Ok(None)
+    }
+
+    fn vm_with(mode: CompatibilityMode, kind: NativeKind) -> SharedVm {
+        let mut config = crate::config::VmConfig::default();
+        config.compatibility_mode = mode;
+        // `JdkOnly` + the synthetic library is a rejected pair (the synthetic
+        // library IS ~5,200 synthetic stubs), and `VmConfig::default()` selects
+        // the synthetic library. Turn it off for BOTH arms rather than only the
+        // strict one, so the two VMs differ in exactly the variable under test.
+        config.use_synthetic_jdk = false;
+        let mut vm = SharedVm::new(config);
+        vm.natives.native_methods.register_with_kind(
+            "cratonvm/test/ElidableCtorFixture",
+            "<init>",
+            "()V",
+            stub,
+            kind,
+        );
+        vm
+    }
+
+    /// The predicate the JIT's constructor elision consults must flip with
+    /// policy for a `Bridge`, and must NOT flip for an `Intrinsic`.
+    ///
+    /// This is the §1.4 rule stated as the JIT sees it. Under `Compatible` a
+    /// registered `<init>()V` native wins over the bytecode constructor, so
+    /// eliding the call would skip it — the json-smart `HashMap` defect. Under
+    /// `JdkOnly` a non-intrinsic bridge in front of concrete bytecode loses (§7
+    /// step 3), so nothing is skipped and the elision is sound. An `Intrinsic`
+    /// is §1.4's reviewed exception and runs in both modes, so refusing to
+    /// elide must survive the mode change.
+    ///
+    /// Both directions are asserted because the one-sided version passes
+    /// against a predicate that has been rewritten to a constant.
+    #[test]
+    fn ctor_elision_asks_policy_not_just_registration() {
+        const FIXTURE: &str = "cratonvm/test/ElidableCtorFixture";
+
+        let compat_bridge = vm_with(CompatibilityMode::Compatible, NativeKind::Bridge);
+        assert!(
+            elidable_ctor_native_would_run(&compat_bridge, FIXTURE),
+            "Compatible must keep the pre-policy behaviour: a registered <init> \
+             native wins, so the constructor call may not be elided"
+        );
+
+        let strict_bridge = vm_with(CompatibilityMode::JdkOnly, NativeKind::Bridge);
+        assert!(
+            !elidable_ctor_native_would_run(&strict_bridge, FIXTURE),
+            "JdkOnly sends a Bridge standing in front of concrete bytecode to the \
+             bytecode (contract §7 step 3), so nothing is skipped by eliding and \
+             the old blanket refusal was pessimism"
+        );
+
+        let strict_intrinsic = vm_with(CompatibilityMode::JdkOnly, NativeKind::Intrinsic);
+        assert!(
+            elidable_ctor_native_would_run(&strict_intrinsic, FIXTURE),
+            "an Intrinsic is §1.4's reviewed exception and still runs under strict \
+             policy, so eliding its constructor would skip it"
+        );
+
+        let compat_intrinsic = vm_with(CompatibilityMode::Compatible, NativeKind::Intrinsic);
+        assert!(elidable_ctor_native_would_run(&compat_intrinsic, FIXTURE));
+    }
+
+    /// A class with NO registered `<init>()V` is answered `false` in both
+    /// modes — otherwise the predicate would refuse every elision and read as
+    /// working while doing nothing.
+    #[test]
+    fn an_unregistered_ctor_never_blocks_elision() {
+        for mode in [CompatibilityMode::Compatible, CompatibilityMode::JdkOnly] {
+            let vm = vm_with(mode, NativeKind::Bridge);
+            assert!(
+                !elidable_ctor_native_would_run(&vm, "cratonvm/test/NoSuchFixture"),
+                "{mode:?}: an unregistered triple must not block elision"
+            );
+        }
+    }
 }

@@ -8718,11 +8718,6 @@ pub fn register_essential_natives_with_shims(
     // std `IsTerminal` impl is the same syscall (`isatty` / `GetConsoleMode`).
     // Redirected/piped/daemon launches still get `false` — but an interactive
     // launch now gets the truthful answer.
-    registry.register("java/io/Console", "istty", "()Z", |_ctx, _args| {
-        use std::io::IsTerminal;
-        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-        Ok(Some(Value::Int(i32::from(tty))))
-    });
 
     // JDK 25 residual (fixed-suite-bugs/springboot/classutils-forname-platform-loader-false-positive.md):
     // JDK 25's `java.io.Console` no longer has `istty()Z` at all -- it was
@@ -14698,12 +14693,6 @@ pub fn register_essential_natives_with_shims(
         native_noop,
         NativeKind::Bridge,
     );
-    registry.register(
-        "jdk/internal/perf/Perf",
-        "attach",
-        "(Ljava/lang/String;I)Ljava/nio/ByteBuffer;",
-        lang_system::native_perf_attach,
-    );
     registry.register_with_kind(
         "jdk/internal/perf/Perf",
         "attach0",
@@ -16620,14 +16609,7 @@ pub fn register_essential_natives_with_shims(
         lang_invoke::native_mhn_init,
         NativeKind::Bridge,
     );
-    registry.register(
-        mhn,
-        "getConstant",
-        "(I)I",
-        lang_invoke::native_mhn_get_constant,
-    );
     registry.register(mhn, "linkMethod", "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/invoke/MemberName;", lang_invoke::native_mhn_link_method);
-    registry.register(mhn, "linkCallSite", "(Ljava/lang/Object;ILjava/lang/invoke/MemberName;Ljava/lang/Object;Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/invoke/MemberName;", lang_invoke::native_mhn_link_call_site);
     registry.register_with_kind(
         mhn,
         "objectFieldOffset",
@@ -18997,12 +18979,6 @@ pub fn register_essential_natives_with_shims(
     // NPE-ing on a module we synthesized.
     registry.register(
         "jdk/internal/logger/DefaultLoggerFinder",
-        "isSystem",
-        "(Ljava/lang/Module;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
-    registry.register(
-        "jdk/internal/logger/AbstractLoggerFinder",
         "isSystem",
         "(Ljava/lang/Module;)Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
@@ -27219,7 +27195,12 @@ fn uuid_get_lsb(ctx: &mut dyn NativeContext, obj: cratonvm_types::ObjectRef) -> 
 fn alloc_uuid(ctx: &mut dyn NativeContext, msb: i64, lsb: i64) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
     let class_id = match ctx.ensure_class_initialized("java/util/UUID") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/util/UUID", 2),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): a 2-slot
+        // synthetic `java.util.UUID` is a compatibility stand-in for a class
+        // `java.base` declares, so a strict run refuses it and the caller sees
+        // a `NoClassDefFoundError` naming it. On a complete image the `Ok` arm
+        // is what runs.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/util/UUID", 2)?,
     };
     let obj = ctx.alloc_object(class_id, 2);
     uuid_set_msb(ctx, obj, msb);
@@ -30581,12 +30562,6 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
         native_shared_secrets_get_jla,
     );
     let ss_old = "jdk/internal/misc/SharedSecrets";
-    registry.register(
-        ss_old,
-        "getJavaLangAccess",
-        "()Ljdk/internal/access/JavaLangAccess;",
-        native_shared_secrets_misc_get_jla,
-    );
 
     // Shim: java.lang.System$1.currentCarrierThread() → Thread.currentThread().
     // `JavaLangAccess` is an interface, and our invokeinterface path dispatches
@@ -30628,12 +30603,6 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
     registry.register(
         jla,
         "currentCarrierThread",
-        "()Ljava/lang/Thread;",
-        native_jla_current_carrier_thread,
-    );
-    registry.register(
-        jla,
-        "currentThread0",
         "()Ljava/lang/Thread;",
         native_jla_current_carrier_thread,
     );
@@ -30808,23 +30777,11 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
     // Legacy overload (historical): `(Class, String[])`.
-    registry.register(
-        refl,
-        "registerFieldsToFilter",
-        "(Ljava/lang/Class;[Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
     // Companion: `registerMethodsToFilter`.
     registry.register(
         refl,
         "registerMethodsToFilter",
         "(Ljava/lang/Class;Ljava/util/Set;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        refl,
-        "registerMethodsToFilter",
-        "(Ljava/lang/Class;[Ljava/lang/String;)V",
         |_ctx, _args| Ok(None),
     );
 
@@ -32363,42 +32320,6 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
     registry.register(cs, "hashCode", "()I", native_charset_hash_code);
 
     // --- StandardCharsets static fields ---
-    registry.register(
-        std_cs,
-        "UTF_8",
-        "()Ljava/nio/charset/Charset;",
-        native_std_charset_utf8,
-    );
-    registry.register(
-        std_cs,
-        "UTF_16",
-        "()Ljava/nio/charset/Charset;",
-        native_std_charset_utf16,
-    );
-    registry.register(
-        std_cs,
-        "UTF_16BE",
-        "()Ljava/nio/charset/Charset;",
-        native_std_charset_utf16be,
-    );
-    registry.register(
-        std_cs,
-        "UTF_16LE",
-        "()Ljava/nio/charset/Charset;",
-        native_std_charset_utf16le,
-    );
-    registry.register(
-        std_cs,
-        "US_ASCII",
-        "()Ljava/nio/charset/Charset;",
-        native_std_charset_ascii,
-    );
-    registry.register(
-        std_cs,
-        "ISO_8859_1",
-        "()Ljava/nio/charset/Charset;",
-        native_std_charset_latin1,
-    );
     registry.register(std_cs, "<clinit>", "()V", |ctx, _args| {
         // Populate the 6 static Charset fields during class initialization.
         // The field order matches the layout in synthetic_stub_fields:

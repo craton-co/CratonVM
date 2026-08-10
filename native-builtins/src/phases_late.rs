@@ -5827,25 +5827,60 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
 
-    // java.util.Map.entry (Java 9) — create immutable entry
-    r.register(
+    // java.util.Map.entry (Java 9) — create immutable entry.
+    //
+    // The class is `java/util/KeyValueHolder`, which is what HotSpot answers
+    // for `Map.entry(..).getClass()`, and giving it a class of its own is the
+    // whole fix for the permissive `setValue` this lane carried as a residual.
+    // While this minted `java/util/Map$Entry` the name had two contradictory
+    // contracts on it — the entry-set views mint the same name with a third
+    // write-through `sourceMap` slot so `setValue` writes back into the map —
+    // and an immutable `setValue` registered for this one could only ever win
+    // the last-write-wins race by breaking every `entrySet()` write-through.
+    // A separate class removes the race instead of choosing a side of it.
+    //
+    // `SyntheticStub`, not this registrar's ambient `Bridge` — the GATE the
+    // record asked for in place of the deletion `21cfa930f` made.
+    // `java.util.Map.entry` is a static interface method with ordinary bytecode
+    // in `java.base` and JDK 25 declares no `ACC_NATIVE` on it, so contract
+    // §1.5 cannot call this a bridge. Tagged this way, `--jdk-only` drops it
+    // and the real bytecode mints the real `KeyValueHolder`; `Compatible` and
+    // `--synthetic-jdk` keep the native, which is what makes deleting it
+    // unnecessary — the reason the deletion cost anything was that it served
+    // one mode only.
+    r.register_with_kind(
         "java/util/Map",
         "entry",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map$Entry;",
         |ctx, args| {
-            let entry = try_alloc_concurrent_synthetic(ctx, "java/util/Map$Entry", 2)?;
-            ctx.set_field(
-                entry,
-                0,
-                args.first().copied().unwrap_or(Value::Object(None)),
-            );
-            ctx.set_field(
-                entry,
-                1,
-                args.get(1).copied().unwrap_or(Value::Object(None)),
-            );
+            let key = args.first().copied().unwrap_or(Value::Object(None));
+            let value = args.get(1).copied().unwrap_or(Value::Object(None));
+            // `KeyValueHolder`'s constructor is two `Objects.requireNonNull`
+            // calls, so `Map.entry(null, v)` is an NPE on HotSpot rather than
+            // an entry with a null component. Checked before the allocation so
+            // the throw happens where the JDK's does.
+            if matches!(key, Value::Object(None)) || matches!(value, Value::Object(None)) {
+                return Err(RuntimeError::NullPointerException { message: None }.into());
+            }
+            // GC-safety: the allocation below can complete a moving young GC,
+            // so the bare `key`/`value` copies would be pre-move addresses by
+            // the time they are stored — publishing dangling references into a
+            // live object. Pin both across it and re-read at the stores.
+            let key_pin = pinned_object_value(ctx, key);
+            let value_pin = pinned_object_value(ctx, value);
+            let entry = try_alloc_concurrent_synthetic(ctx, "java/util/KeyValueHolder", 2)?;
+            let key = read_pinned_object_value(ctx, key_pin, key);
+            let value = read_pinned_object_value(ctx, value_pin, value);
+            if let Some((handle, _)) = key_pin {
+                ctx.unpin_native_roots(handle);
+            } else if let Some((handle, _)) = value_pin {
+                ctx.unpin_native_roots(handle);
+            }
+            ctx.set_field(entry, 0, key);
+            ctx.set_field(entry, 1, value);
             Ok(Some(Value::Object(Some(entry))))
         },
+        cratonvm_native_api::NativeKind::SyntheticStub,
     );
 
     // java.lang.CharSequence.compare (Java 11)

@@ -3429,104 +3429,73 @@ impl ClassManager {
         }]
     }
 
-    /// Register a minimal synthetic class with the given name and field count.
+    /// Register a minimal synthetic class with the given name and field count —
+    /// the **compatibility stand-in** entry point, and the only one.
     ///
     /// If a class with this name is already loaded, returns its existing
     /// ClassId. Otherwise allocates a new ClassId, creates a minimal
     /// `Class` struct, and registers it in the class store.
     ///
-    /// Used by the VM bootstrap to create shim classes (e.g.
-    /// `java/io/PrintStream` for System.out) that dispatch through
-    /// native registrations rather than real JDK bytecode.
-    ///
     /// Prefer real `.class` files for application-visible types; see `docs/jvm-no-synthetic-stubs.md`.
-    ///
-    /// # JDK-only mode
-    ///
-    /// This entry point **records** a `CompatibilityClassRequested` violation
-    /// but fabricates anyway, even under [`CompatibilityMode::JdkOnly`]. That
-    /// is deliberate and temporary.
-    ///
-    // JDK-ONLY-WAVE2: `ensure_synthetic_class` returns a bare `ClassId` — there
-    // is no error channel — and it has ~70 callers across ~33 files, almost all
-    // of them inside `native-builtins` allocation helpers such as
-    // `alloc_concurrent_synthetic`, which likewise return a value rather than a
-    // `Result`. Making this signature fallible in wave 1 would mean rewriting
-    // every one of those call chains in the same change as the policy itself,
-    // in files owned by other agents. So wave 1 measures here and enforces at
-    // the other end: `load_class` → `create_synthetic_stub` is where classes
-    // that genuinely have no bytes anywhere arrive, and that path *does*
-    // refuse. Migration recipe for wave 2, per call site:
-    //   1. If the caller is generating a legitimate VM class (a lambda, a
-    //      proxy, a reflection accessor, an internal allocation shape), switch
-    //      it to [`Self::ensure_generated_class`] with the matching
-    //      [`ClassOrigin`] — it is never refused, in either mode.
-    //   2. If the caller is standing in for a class whose real bytes should
-    //      have been found, switch it to [`Self::try_ensure_synthetic_class`]
-    //      and propagate the `ClassNotFoundException` up through the native's
-    //      own error path.
-    //   3. When no caller remains, delete this method.
-    ///
-    /// # Behaviour when the name is ambiguous
-    ///
-    /// This signature cannot report a failure, and the one failure it can now
-    /// meet is a name that two or more **distinct** classes already carry (see
-    /// [`Self::classify_loaded_name`]). Fabricating for such a name is the
-    /// defect this method is being retired for: the stub lands under
-    /// `(Bootstrap, name)`, the bootstrap loader is probed first, and the stub
-    /// therefore outranks *every* real class that made the name ambiguous.
-    ///
-    /// So the ambiguous case does **not** mint a stub under `name`. It returns
-    /// an [`Self::ambiguity_stand_in`] instead: a distinctly-named,
-    /// correctly-sized `cratonvm/synthetic/AmbiguousName$…` class registered
-    /// under a name nothing else resolves. The caller gets a `ClassId` it can
-    /// allocate against without corrupting the heap, the real classes keep
-    /// resolving, and any `checkcast` / `instanceof` / method lookup against
-    /// the *requested* name fails — loudly, and naming the stand-in. That is a
-    /// refusal wearing an infallible signature; a caller that can do better
-    /// should use [`Self::try_ensure_synthetic_class`], which says so in a
-    /// `Result`.
-    #[track_caller]
-    pub fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        let fabricated = self.fabricate_class(
-            name,
-            num_fields,
-            fabricated_origin_for_name(name),
-            // Record the `--jdk-only` violation, then fabricate anyway — there
-            // is no error channel on this signature. NOTE: `enforce` governs
-            // only the jdk-only refusal. The ambiguity refusal added below is
-            // unconditional (it is a correctness gate, not a policy one), so an
-            // `Err` can still arrive here, and `.expect`ing it would turn a
-            // recoverable identity conflict into a VM abort.
-            false,
-        );
-        match fabricated {
-            Ok(id) => id,
-            Err(_) => self.ambiguity_stand_in(name, num_fields),
-        }
-    }
-
-    /// The enforcing sibling of [`Self::ensure_synthetic_class`].
     ///
     /// Under [`CompatibilityMode::JdkOnly`] this refuses to fabricate and
     /// returns `ClassNotFoundException`, recording a
     /// [`JdkOnlyViolation::CompatibilityClassRequested`]. Under
-    /// [`CompatibilityMode::Compatible`] it behaves exactly like
-    /// `ensure_synthetic_class`.
+    /// [`CompatibilityMode::Compatible`] it fabricates, exactly as the VM
+    /// always has.
     ///
-    /// This is the entry point for compatibility stand-ins whose caller *can*
-    /// report a failure — chiefly the `java/util/function/Function$Identity`
-    /// stand-in minted by the stream/function natives.
+    /// # The infallible twin is GONE — JDK-only wave 2, step 3, 2026-08-10
+    ///
+    /// `ensure_synthetic_class` returned a bare `ClassId`, passed `enforce:
+    /// false`, and so **recorded** the `CompatibilityClassRequested` violation
+    /// and then fabricated anyway. A `--jdk-only` run therefore reported a
+    /// violation while continuing in the exact state contract §5 forbids, and
+    /// no signature in the chain could say otherwise. Wave 1 measured here and
+    /// enforced only at the other end (`load_class` → `create_synthetic_stub`);
+    /// wave 2 migrated the call sites and the three allocation funnels
+    /// (`native-collections::alloc_synthetic`, `native-io::alloc_synthetic`,
+    /// `native-builtins::alloc_concurrent_synthetic`, ~2,300 callers between
+    /// them); step 3 deleted the entry point.
+    ///
+    /// Each surviving caller took one of three shapes, and the shape is the
+    /// decision — a grep of the call name never was:
+    ///
+    ///   1. **A legitimately-generated VM class** (a lambda, a proxy or its
+    ///      `Proxy$Instance` superclass, a reflection accessor, an array
+    ///      shape): [`Self::ensure_generated_class`] with the matching
+    ///      [`ClassOrigin`]. Never refused, in either mode, per contract §1
+    ///      item 6. Natives reach it as
+    ///      `NativeContext::ensure_vm_internal_class`.
+    ///   2. **A stand-in for a class whose real bytes should have been found**:
+    ///      this method, with the refusal propagated up the native's own error
+    ///      path. `native_api::refusal_to_java_failure` turns it into the
+    ///      catchable `NoClassDefFoundError` §5 asks for rather than the
+    ///      uncatchable `MethodCallFailed::InternalError` a bare `?` produces.
+    ///   3. **A caller with no error channel at all** — the VM bootstrap block,
+    ///      a JNI entry point, a `-> Option<..>` helper. Those absorb the
+    ///      refusal at a site that says so and warns, naming the class:
+    ///      `vm_init::ensure_bootstrap_compat_class` and
+    ///      `jni::jni_class_or_refuse` are the two shapes.
+    ///
+    /// # Behaviour when the name is ambiguous
+    ///
+    /// A name that two or more **distinct** classes already carry (see
+    /// [`Self::classify_loaded_name`]) is refused in **both** modes, and that
+    /// is a correctness gate rather than a policy one. Fabricating for such a
+    /// name is the second defect the deleted twin carried: the stub lands under
+    /// `(Bootstrap, name)`, the bootstrap loader is probed first, and the stub
+    /// therefore outranks *every* real class that made the name ambiguous.
+    /// A caller that genuinely has no error channel and must allocate something
+    /// can ask [`Self::ambiguity_stand_in`] for a distinctly-named,
+    /// correctly-sized `cratonvm/synthetic/AmbiguousName$…` class: the heap
+    /// stays well-formed, the real classes keep resolving, and any `checkcast`
+    /// / `instanceof` / method lookup against the *requested* name fails
+    /// loudly, naming the stand-in.
     ///
     /// # Two distinct refusals
     ///
     /// 1. **Policy** — `--jdk-only` forbids compatibility stand-ins at all.
     ///    `ClassFileError::ClassNotFound`. Only under `JdkOnly`.
-    ///    *Migrating a call site from [`Self::ensure_synthetic_class`] to this
-    ///    method therefore also opts that call site into `--jdk-only`
-    ///    enforcement — which is step 2 of the wave-2 recipe above, but it is a
-    ///    second behaviour change riding along with the first, and under the
-    ///    default `Compatible` mode it changes nothing.*
     /// 2. **Identity** — the name is already carried by two or more distinct
     ///    classes, so a stand-in filed under `(Bootstrap, name)` would shadow
     ///    all of them. `LinkageError::IncompatibleClassChangeError`, in **both**
@@ -10510,6 +10479,25 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "java/util/AbstractMap$SimpleEntry" | "java/util/AbstractMap$SimpleImmutableEntry" => {
             &["java/util/Map$Entry", "java/io/Serializable"]
         }
+        // `Map.entry(k, v)`'s product. HotSpot answers `java.util.KeyValueHolder`
+        // for `Map.entry(..).getClass()`, and the reason it has a class of its
+        // own is exactly the one CratonVM ran into: `Map.entry`'s entry is
+        // immutable and `setValue` must throw, while the entry-set views mint
+        // `java/util/Map$Entry` with a third write-through `sourceMap` slot so
+        // that `setValue` writes back into the map. One name cannot carry both
+        // contracts, and last-write-wins decided which one shipped.
+        //
+        // NOT `Serializable`: `Map.entry`'s return is specified as not
+        // serializable, unlike `AbstractMap$SimpleImmutableEntry` above, and
+        // `KeyValueHolder` implements `Map.Entry` only. The interface link is
+        // load-bearing rather than cosmetic — `Map.Entry.equals` is specified
+        // against any other `Map.Entry`, so both `native_entry_equals`
+        // (native-collections) and `register_entry_value_semantics`
+        // (native-builtins) open with an `instanceof Map.Entry` test. Without
+        // this arm a `KeyValueHolder` would compare unequal to an equal
+        // `SimpleEntry` in one direction and equal in the other, which is the
+        // asymmetry that blocked this class from landing on 2026-08-06.
+        "java/util/KeyValueHolder" => &["java/util/Map$Entry"],
         "java/util/AbstractQueue" => &[
             "java/util/Queue",
             "java/util/Collection",
@@ -11401,6 +11389,16 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 named_field("value", "Ljava/lang/Object;"),
             ]
         }
+        // `java.util.KeyValueHolder` — the JDK's own two `final` fields, in the
+        // JDK's own order, which is the layout `Map.entry`'s native writes.
+        // Declared for the same reason the two entries above are: a bytecode
+        // `new` sizes its object from `num_total_fields`, so an undeclared
+        // layout allocates a 0-slot object and every `set_field` is dropped by
+        // the heap's bounds guard, in silence apart from a WARN.
+        "java/util/KeyValueHolder" => vec![
+            named_field("key", "Ljava/lang/Object;"),
+            named_field("value", "Ljava/lang/Object;"),
+        ],
         // LinkedList = 3 fields (head, tail, size)
         "java/util/LinkedList" => instance_fields(3),
         // LinkedHashMap = 5 fields
@@ -16491,14 +16489,14 @@ mod tests {
 
         // Object must be loaded before any synthetic object is allocated;
         // mirror that ordering here.
-        let object_id = cm.ensure_synthetic_class("java/lang/Object", 0);
+        let object_id = cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(
             cm.get_class(object_id).and_then(|c| c.superclass),
             None,
             "java/lang/Object must not have a superclass"
         );
 
-        let anon_id = cm.ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4);
+        let anon_id = cm.try_ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_ne!(anon_id, object_id, "AnonymousObject is a distinct class");
         assert_eq!(
             cm.get_class(anon_id).and_then(|c| c.superclass),
@@ -16513,8 +16511,8 @@ mod tests {
     #[test]
     fn exact_user_class_unload_preserves_live_siblings_in_the_same_namespace() {
         let mut cm = ClassManager::new(&[], &[], &[]);
-        let dead = cm.ensure_synthetic_class("test/proxy/Dead", 0);
-        let live = cm.ensure_synthetic_class("test/proxy/Live", 0);
+        let dead = cm.try_ensure_synthetic_class("test/proxy/Dead", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let live = cm.try_ensure_synthetic_class("test/proxy/Live", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let namespace = ClassLoaderId::UserDefined(77);
         cm.class_store.get_mut(dead).unwrap().loader_id = namespace;
         cm.class_store.get_mut(live).unwrap().loader_id = namespace;
@@ -16537,8 +16535,8 @@ mod tests {
     fn synthetic_array_stub_has_no_superclass() {
         // Array synthetic stubs are special-cased and keep `superclass = None`.
         let mut cm = ClassManager::new(&[], &[], &[]);
-        cm.ensure_synthetic_class("java/lang/Object", 0);
-        let arr_id = cm.ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0);
+        cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let arr_id = cm.try_ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(cm.get_class(arr_id).and_then(|c| c.superclass), None);
     }
 
@@ -16604,10 +16602,10 @@ mod tests {
     #[test]
     fn synthetic_function_identity_implements_function() {
         let mut cm = ClassManager::new(&[], &[], &[]);
-        cm.ensure_synthetic_class("java/lang/Object", 0);
-        let function_id = cm.ensure_synthetic_class("java/util/function/Function", 0);
-        cm.ensure_synthetic_class("java/util/function/UnaryOperator", 0);
-        let identity_id = cm.ensure_synthetic_class("java/util/function/Function$Identity", 0);
+        cm.try_ensure_synthetic_class("java/lang/Object", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let function_id = cm.try_ensure_synthetic_class("java/util/function/Function", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        cm.try_ensure_synthetic_class("java/util/function/UnaryOperator", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
+        let identity_id = cm.try_ensure_synthetic_class("java/util/function/Function$Identity", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         let identity = cm
             .get_class(identity_id)
@@ -17385,7 +17383,7 @@ mod tests {
     #[test]
     fn synthetic_upgrade_resets_embedded_initialization_fast_path() {
         let mut manager = ClassManager::new(&[], &[], &[]);
-        let class_id = manager.ensure_synthetic_class("Foo", 0);
+        let class_id = manager.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         manager.set_class_init_state(class_id, CLASS_INIT_INITIALIZED);
 
         manager
@@ -17424,7 +17422,7 @@ mod tests {
     #[test]
     fn a_user_loader_upgrading_a_bootstrap_stub_takes_the_map_key_with_it() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
-        let id = mgr.ensure_synthetic_class("Foo", 0);
+        let id = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         // Precondition: the stub really is bootstrap-keyed.
         assert_eq!(
@@ -17494,7 +17492,7 @@ mod tests {
         let first = ClassLoaderId::UserDefined(0x5EED_0002);
         let second = ClassLoaderId::UserDefined(0x5EED_0003);
 
-        let id_a = mgr.ensure_synthetic_class("Foo", 0);
+        let id_a = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         mgr.upgrade_synthetic_class(id_a, "Foo", v1.clone().into(), first)
             .expect("first loader upgrades the stub");
 
@@ -17635,12 +17633,18 @@ mod tests {
         );
     }
 
-    /// The infallible spelling has no channel for the refusal, so it must
-    /// degrade to something that is still a *miss*: a distinctly-named,
-    /// correctly-sized stand-in. What it must never do is the thing it used to
-    /// do — mint a stub under the ambiguous name itself.
+    /// A caller with no channel for the refusal has to degrade to something
+    /// that is still a *miss*: a distinctly-named, correctly-sized stand-in.
+    /// What it must never do is the thing the deleted `ensure_synthetic_class`
+    /// used to do — mint a stub under the ambiguous name itself.
+    ///
+    /// The entry point is gone (JDK-only wave 2, step 3, 2026-08-10) and the
+    /// degradation is not: `ensure_generated_class` still reaches it, and so
+    /// does any future caller that genuinely cannot report a failure. This
+    /// exercises `ambiguity_stand_in` directly for that reason — the property
+    /// belongs to the stand-in, not to the spelling that used to ask for it.
     #[test]
-    fn ensure_synthetic_class_hands_back_a_stand_in_not_a_shadowing_stub() {
+    fn the_ambiguity_stand_in_is_a_miss_not_a_shadowing_stub() {
         let v1 = include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class").to_vec();
         let mut mgr = ClassManager::new(&[], &[], &[]);
         let first = ClassLoaderId::UserDefined(0x5EED_0012);
@@ -17648,7 +17652,10 @@ mod tests {
         let id_a = mgr.define_class("Foo", &v1, first).expect("loader A");
         let id_b = mgr.define_class("Foo", &v1, second).expect("loader B");
 
-        let stand_in = mgr.ensure_synthetic_class("Foo", 3);
+        // The fallible spelling refuses outright — that is the row above this
+        // test. This is what a caller that cannot carry the refusal gets.
+        assert!(mgr.try_ensure_synthetic_class("Foo", 3).is_err());
+        let stand_in = mgr.ambiguity_stand_in("Foo", 3);
 
         assert_ne!(stand_in, id_a);
         assert_ne!(stand_in, id_b);
@@ -17693,10 +17700,10 @@ mod tests {
 
         // Idempotent: the same request returns the same stand-in rather than
         // minting one per allocation.
-        assert_eq!(mgr.ensure_synthetic_class("Foo", 3), stand_in);
+        assert_eq!(mgr.ambiguity_stand_in("Foo", 3), stand_in);
         // A different requested shape gets its own stand-in, so a later,
         // larger request is not served an undersized layout.
-        let wider = mgr.ensure_synthetic_class("Foo", 9);
+        let wider = mgr.ambiguity_stand_in("Foo", 9);
         assert_ne!(wider, stand_in);
         assert_eq!(
             mgr.get_class(wider).expect("wider stand-in").num_total_fields,
@@ -17712,13 +17719,13 @@ mod tests {
         let mut mgr = ClassManager::new(&[], &[], &[]);
 
         // Absent → fabricate, filed under the bootstrap loader, memoized.
-        let id = mgr.ensure_synthetic_class("p/Absent", 2);
+        let id = mgr.try_ensure_synthetic_class("p/Absent", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         assert_eq!(&*mgr.get_class(id).expect("minted").name, "p/Absent");
         assert_eq!(
             loaded_classes_probe(&mgr.loaded_classes, ClassLoaderId::Bootstrap, "p/Absent"),
             Some(id),
         );
-        assert_eq!(mgr.ensure_synthetic_class("p/Absent", 2), id);
+        assert_eq!(mgr.try_ensure_synthetic_class("p/Absent", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only"), id);
         assert_eq!(
             mgr.classify_loaded_name("p/Absent"),
             NameResolution::Unique(id),
@@ -17994,7 +18001,7 @@ mod tests {
 
         // Legacy state: the array is synthesised while its component is still
         // a bootstrap-keyed synthetic stub.
-        let component = mgr.ensure_synthetic_class("Foo", 0);
+        let component = mgr.try_ensure_synthetic_class("Foo", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let array = mgr
             .load_class("[LFoo;")
             .expect("array synthesis without I/O");
@@ -18471,7 +18478,7 @@ mod tests {
         // generated proxy — carries the ctor in its method table, so the
         // super-ctor resolution that previously failed now succeeds.
         let mut cm = ClassManager::new(&[], &[], &[]);
-        let super_id = cm.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
+        let super_id = cm.try_ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let registered = cm
             .get_class(super_id)
             .expect("synthetic Proxy$Instance must be registered");
@@ -19360,7 +19367,7 @@ mod tests {
     #[test]
     fn synthetic_stub_has_no_vtable_and_no_dispatchable_body() {
         let mut mgr = ClassManager::new(&[], &[], &[]);
-        let id = mgr.ensure_synthetic_class("java/lang/Throwable", 2);
+        let id = mgr.try_ensure_synthetic_class("java/lang/Throwable", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         assert!(
             mgr.class_store

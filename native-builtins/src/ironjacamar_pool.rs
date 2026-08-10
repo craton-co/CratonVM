@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::agroal_pool::{
@@ -117,17 +117,27 @@ pub fn pool_id_for(this: ObjectRef) -> Option<i32> {
 // Native callbacks
 // ---------------------------------------------------------------------------
 
-fn alloc_object_for(ctx: &mut dyn NativeContext, class_name: &str, min_slots: usize) -> ObjectRef {
+fn alloc_object_for(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    min_slots: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Fall back to a synthetic class (declaring `min_slots` fields) rather
     // than `ClassId::new(0)` when the real class can't be loaded: an object
     // allocated with `java/lang/Object`'s id but a non-zero slot count is an
     // undersized layout the GC's `get_field` bounds guard rejects.
+    //
+    // The fallback is the FALLIBLE spelling (JDK-only wave 2, step 3): under
+    // `--jdk-only` the policy refuses to fabricate rather than recording the
+    // violation and fabricating anyway, and the refusal arrives as the
+    // catchable `NoClassDefFoundError` contract §5 names rather than the
+    // uncatchable `MethodCallFailed::InternalError` the `?` conversion builds.
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class(class_name, min_slots),
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, class_name, min_slots)?,
     };
     let n = ctx.class_num_total_fields(cid).max(min_slots);
-    ctx.alloc_object(cid, n)
+    Ok(ctx.alloc_object(cid, n))
 }
 
 fn obj_arg(args: &[Value], idx: usize) -> Option<ObjectRef> {
@@ -214,7 +224,7 @@ fn native_pool_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
 
     // Allocate Connection wrapper with back-references so release works.
-    let conn = alloc_object_for(ctx, CLS_H2_CONNECTION, 4);
+    let conn = alloc_object_for(ctx, CLS_H2_CONNECTION, 4)?;
     ctx.set_field(conn, 0, Value::Long(conn_id));
     ctx.set_field(conn, 1, Value::Object(Some(this)));
     ctx.set_field(conn, 2, Value::Int(pool_id));
@@ -298,7 +308,7 @@ fn native_mcf_create_managed_connection(
             .into());
         }
     };
-    let mc = alloc_object_for(ctx, CLS_JDBC_LOCAL_MC, 4);
+    let mc = alloc_object_for(ctx, CLS_JDBC_LOCAL_MC, 4)?;
     ctx.set_field(mc, 0, Value::Long(conn_id));
     ctx.set_field(mc, 1, Value::Object(Some(this))); // back-ref to MCF
     ctx.set_field(mc, 2, Value::Int(pool_id));
@@ -323,7 +333,7 @@ fn native_mc_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         }
         .into());
     }
-    let conn = alloc_object_for(ctx, CLS_H2_CONNECTION, 4);
+    let conn = alloc_object_for(ctx, CLS_H2_CONNECTION, 4)?;
     ctx.set_field(conn, 0, Value::Long(conn_id));
     ctx.set_field(conn, 1, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(conn))))

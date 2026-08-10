@@ -82,6 +82,13 @@ def main(argv):
                     help="TSV from scripts/jdk-only-inherited-decl.sh")
     ap.add_argument("--dispatched", nargs="*", default=[],
                     help="censuses whose invocation counts disqualify a row")
+    ap.add_argument("--minted", help="newline-separated class names the SOURCE "
+                                     "passes to a fabrication funnel; every "
+                                     "row on one of them is gated")
+    ap.add_argument("--pinned", help="native-builtins/tests/registry_contracts.rs; "
+                                     "every triple it pins is a deliberate "
+                                     "completion of the synthetic surface and is "
+                                     "gated, whatever an image census says")
     ap.add_argument("--out", help="write the surviving list here as TSV")
     args = ap.parse_args(argv[1:])
 
@@ -110,6 +117,72 @@ def main(argv):
             if r["invocations"]:
                 dispatched[(r["class"], r["name"], r["descriptor"])] += r["invocations"]
 
+    # ------------------------------------------------------------------
+    # THE FIFTH-IMAGE RULE IS A PROPERTY OF THE CLASS, NOT OF THE TRIPLE.
+    #
+    # Added 2026-08-10, and it is a correction rather than a tightening: the
+    # rule below used to be applied per (class, method, descriptor), through
+    # the `synthetic-stub` kind tag and the dispatch filter. Both are
+    # triple-granular, and "this VM mints the class" is not.
+    #
+    # What that cost, measured against the committed baseline: 242 of its 791
+    # rows are on a class this tree fabricates, and among them were
+    # `java/util/HashMap$KeyItr.remove()V` — the write-through `remove()` that
+    # `RChmKeySetView` exercises and that
+    # `ensure-synthetic-class-cannot-enforce-only-record` argues must not be
+    # traded away — plus the whole
+    # `Atomic{Integer,Long,Reference}FieldUpdater$RustJvmImpl` surface, which is
+    # every method those updaters have. The dispatch filter removed `hasNext`
+    # and `next` because the three workloads called them 1,209 times; it left
+    # `remove` because they never did. A method the sample did not reach is not
+    # a dead method, and for a class no image contains the census can say
+    # nothing else — which is exactly what the rule already said.
+    #
+    # So: a class ABSENT from every image, of which ANY triple is dispatched or
+    # tagged `synthetic-stub`, is a class this VM mints. Every row of it is
+    # gated.
+    class_rows = {}
+    for i in range(n):
+        class_rows.setdefault(arms[0][1][i]["class"], []).append(i)
+    minted_classes = set()
+    for cls, idxs in class_rows.items():
+        if not all(
+            all(verdict(rows[i]) == "ABSENT" for _, rows in arms) for i in idxs
+        ):
+            continue                      # some image has this class
+        for i in idxs:
+            row = arms[0][1][i]
+            key = (row["class"], row["name"], row["descriptor"])
+            if dispatched.get(key) or row["kind"] == "synthetic-stub":
+                minted_classes.add(cls)
+                break
+
+    # A second, census-independent answer to the same question, for the classes
+    # no workload happened to touch at all: the tree names them. `--minted`
+    # takes a newline-separated list of class names the source passes to a
+    # fabrication funnel (`try_alloc_synthetic`, `try_alloc_concurrent_synthetic`,
+    # `try_ensure_synthetic_class`, `ensure_vm_internal_class`, …). A class this
+    # VM allocates and no image declares is minted whether or not this run
+    # reached it.
+    source_minted = set()
+    if args.minted:
+        with open(args.minted, encoding="utf-8") as fh:
+            source_minted = {ln.strip() for ln in fh if ln.strip()}
+
+    # And a third answer, for the rows where the class IS in every image and the
+    # METHOD is in none: a method the JDK never declared can still be a
+    # deliberate completion of the synthetic surface, which is what
+    # `StampedLock.isLocked()` is. A contract test pinning the triple is the
+    # statement of intent; the census cannot see it, and deleting such a row
+    # breaks the test that exists to say so.
+    pinned = set()
+    if args.pinned:
+        import re as _re
+        src = open(args.pinned, encoding="utf-8").read()
+        consts = dict(_re.findall(r'const (\w+): &str = "([^"]+)"', src))
+        for c, m, d in _re.findall(r'\((\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)"\)', src):
+            pinned.add((consts.get(c, c.strip('"')), m, d))
+
     absent, nowhere, live, gated = [], [], [], []
     for i in range(n):
         row = arms[0][1][i]
@@ -125,19 +198,28 @@ def main(argv):
             continue
         if dispatched.get(key):
             live.append((row, dispatched[key]))
-        elif row["kind"] == "synthetic-stub":
+        elif (
+            row["kind"] == "synthetic-stub"
+            or row["class"] in minted_classes
+            or row["class"] in source_minted
+            or key in pinned
+        ):
             # THE RULE. A synthetic stub is CratonVM's OWN implementation, and
             # no census of JDK images can adjudicate it: the census scores it
             # ABSENT precisely because no JDK owes us a class this VM mints
-            # (`Comparator$Native`, `Function$Identity`), or a method the JDK
-            # never declared (`StampedLock.isLocked`). It is already gated —
-            # `NativeKind::SyntheticStub` is the one kind `--jdk-only` rejects,
-            # so strict mode drops it and the real bytecode wins — and in
-            # real-JDK mode it is inert rather than wrong, because nothing can
-            # reach a class that only exists when the VM minted it.
+            # (`Comparator$Native`, `Function$Identity`, `HashMap$KeyItr`), or a
+            # method the JDK never declared (`StampedLock.isLocked`). Where the
+            # kind tag is present it is already gated — `NativeKind::SyntheticStub`
+            # is the one kind `--jdk-only` rejects, so strict mode drops it and
+            # the real bytecode wins — and in real-JDK mode it is inert rather
+            # than wrong, because nothing can reach a class that only exists
+            # when the VM minted it. Where the tag is absent (the ambient
+            # `Bridge` default) the class-level test above is what catches it.
             #
             # Deleting one would remove the implementation the SYNTHETIC JDK
-            # depends on, which is the one image this sweep never censuses.
+            # depends on, which is the one image this sweep never censuses —
+            # or, worse, a capability the real one has: `HashMap$KeyItr.remove`
+            # writes through to the map.
             # Gate, never delete.
             gated.append((row, 0))
         else:
@@ -160,16 +242,21 @@ def main(argv):
               "believing a census\n  that says a `java.util` class does not "
               "exist.")
 
-    print("\ngated, and NOT deletion candidates (kind=synthetic-stub): %d" % len(gated))
+    print("\ngated, and NOT deletion candidates (this VM mints the class, or "
+          "the row is\nkind=synthetic-stub): %d" % len(gated))
     for row, _ in sorted(gated, key=lambda t: (t[0]["class"], t[0]["name"],
                                                t[0]["descriptor"])):
         print("  %s.%s%s" % (row["class"], row["name"], row["descriptor"]))
     if gated:
-        print("  These are CratonVM's own implementations. `NativeKind::"
-              "SyntheticStub`\n  already gates them out of `--jdk-only`, and "
-              "no JDK-image census can\n  say whether the synthetic JDK needs "
-              "them — it is not one of the images\n  swept. They are omitted "
-              "from the written list on purpose.")
+        print("  These are CratonVM's own implementations. Where the row is "
+              "tagged\n  `SyntheticStub`, `--jdk-only` already drops it and the "
+              "real bytecode wins;\n  where the class is one this VM mints, no "
+              "JDK-image census can adjudicate\n  it at all — the census scores "
+              "it ABSENT because no JDK owes us the class.\n  A method the "
+              "sampled workloads did not reach is NOT a dead method on such a\n"
+              "  class. They are omitted from the written list on purpose.")
+        print("  classes gated wholesale (image-absent + minted here): %s"
+              % ", ".join(sorted(minted_classes)) if minted_classes else "")
 
     survivors = absent + nowhere
     print("\nby kind: %s" % dict(Counter(r["kind"] for r, _ in survivors)))

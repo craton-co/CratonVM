@@ -175,7 +175,7 @@ fn set_origin_keeps_the_derived_mirror_in_sync() {
     // sees a stub and half sees a real class — so the invariant is checked in
     // both directions, through the only setter allowed to touch either field.
     let mut mgr = ClassManager::new(&[], &[], &[]);
-    let id = mgr.ensure_synthetic_class("com/example/Mirror", 0);
+    let id = mgr.try_ensure_synthetic_class("com/example/Mirror", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
     let class = mgr
         .get_class_mut(id)
         .expect("just-created class must be in the store");
@@ -502,7 +502,7 @@ fn dispatch_predicate_matches_the_stub_bit() {
         "java/net/InetSocketAddress",
         "java/lang/reflect/Proxy$Instance",
     ] {
-        let _ = mgr.ensure_synthetic_class(name, 3);
+        let _ = mgr.try_ensure_synthetic_class(name, 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
     }
     let _ = mgr.load_class("java/lang/Object");
     let _ = mgr.load_class("[Ljava/lang/Object;");
@@ -602,7 +602,7 @@ fn fabricated_generated_names_are_not_compatibility_stubs() {
             ClassOrigin::VmInternal,
         ),
     ] {
-        let id = mgr.ensure_synthetic_class(name, 2);
+        let id = mgr.try_ensure_synthetic_class(name, 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let class = mgr.class_store.get(id).expect("just created");
         assert_eq!(class.origin, expected, "{name} got the wrong origin");
         assert!(
@@ -617,7 +617,7 @@ fn fabricated_generated_names_are_not_compatibility_stubs() {
     }
 
     // The control: an ordinary missing class is still a compatibility stub.
-    let id = mgr.ensure_synthetic_class("com/example/GenuinelyMissing", 2);
+    let id = mgr.try_ensure_synthetic_class("com/example/GenuinelyMissing", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
     assert!(mgr
         .class_store
         .get(id)

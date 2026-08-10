@@ -11226,12 +11226,6 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
         native_paths_get,
     );
-    registry.register(
-        paths,
-        "get",
-        "(Ljava/lang/String;)Ljava/nio/file/Path;",
-        native_paths_get_simple,
-    );
 
     // Path methods
     registry.register(
@@ -16518,7 +16512,6 @@ fn register_nio_channel_extras(registry: &mut NativeMethodRegistry) {
     );
     // Also register unmap directly on MappedByteBuffer as a convenience
     // entry point for `ByteBuffer.clean()` fallbacks.
-    registry.register(mbb, "unmap0", "()V", native_fc_unmap0);
 
     // --- Files.walk / Files.list ---
     let files = "java/nio/file/Files";
@@ -17084,32 +17077,23 @@ const EVENT_CREATE: i32 = 1;
 const EVENT_DELETE: i32 = 2;
 const EVENT_MODIFY: i32 = 4;
 
-/// `#[track_caller]` so the class-origin census's `requested_by` names the
-/// native that wanted the shape, not this one forwarding line — see the
-/// matching note on `NativeContext::ensure_synthetic_class`.
-#[track_caller]
-fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
-    let cid = match ctx.ensure_class_initialized(class_name) {
-        Ok(cid) => cid,
-        Err(_) => match ctx.class_id_by_name(class_name) {
-            Some(cid) => cid,
-            None => ctx.ensure_synthetic_class(class_name, num_fields),
-        },
-    };
-    ctx.alloc_object(cid, num_fields)
-}
+// The infallible `alloc_synthetic` twin is DELETED (JDK-only wave 2, step 3,
+// 2026-08-10). Its 23 call sites moved to `try_alloc_synthetic` on 2026-08-06
+// and it had no callers left, so it survived only as a way back to
+// `ensure_synthetic_class` — which is the entry point step 3 removes. There is
+// no infallible spelling in this crate any more.
 
-/// The fallible spelling of [`alloc_synthetic`] — same operation, with the
+/// Allocate a synthetic object, trying to load the real class first, with the
 /// refusal `--jdk-only` requires.
 ///
-/// [`alloc_synthetic`] reaches `ensure_synthetic_class`, whose signature has no
-/// error channel, so under `--jdk-only` it records a
-/// `CompatibilityClassRequested` violation and then fabricates anyway. This one
+/// The deleted infallible twin reached `ensure_synthetic_class`, whose signature
+/// had no error channel, so under `--jdk-only` it recorded a
+/// `CompatibilityClassRequested` violation and then fabricated anyway. This one
 /// goes through `try_ensure_synthetic_class`, so the refusal reaches the caller
 /// as the `NoClassDefFoundError` contract §5 names.
 ///
-/// Under the default `Compatible` mode the two are byte-for-byte identical:
-/// `try_ensure_synthetic_class` is documented as `ensure_synthetic_class` there.
+/// Under the default `Compatible` mode this is byte-for-byte what the deleted
+/// twin did: `try_ensure_synthetic_class` is documented as identical there.
 ///
 /// `refusal_to_java_failure`, not the `?` conversion: the latter yields
 /// `MethodCallFailed::InternalError`, which is uncatchable and aborts the run.
@@ -17128,13 +17112,31 @@ fn try_alloc_synthetic(
         Ok(cid) => cid,
         Err(_) => match ctx.class_id_by_name(class_name) {
             Some(cid) => cid,
-            None => match ctx.try_ensure_synthetic_class(class_name, num_fields) {
-                Ok(id) => id,
-                Err(err) => return Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
-            },
+            None => refused_class(ctx, class_name, num_fields)?,
         },
     };
     Ok(ctx.alloc_object(cid, num_fields))
+}
+
+/// `try_ensure_synthetic_class`, with the refusal converted to a **catchable**
+/// Java throwable — the shared idiom for this crate's direct callers.
+///
+/// The plain `?` conversion yields `MethodCallFailed::InternalError`, which the
+/// exception model defines as uncatchable and fatal, and that is the wrong shape
+/// for a policy refusal: contract §5 asks for the specification's
+/// `NoClassDefFoundError`. Mirrors `native-collections`' and `native-builtins`'
+/// helpers of the same name deliberately — three funnels that differ in their
+/// real-class preference must not also differ in what a refusal looks like.
+#[track_caller]
+pub(crate) fn refused_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    num_fields: usize,
+) -> Result<cratonvm_types::ClassId, MethodCallFailed> {
+    match ctx.try_ensure_synthetic_class(class_name, num_fields) {
+        Ok(id) => Ok(id),
+        Err(err) => Err(cratonvm_native_api::refusal_to_java_failure(ctx, err)),
+    }
 }
 
 fn obj_arg92(args: &[Value], index: usize) -> Result<ObjectRef, MethodCallFailed> {
@@ -18126,24 +18128,6 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
     // singletons) holds instead of silently failing against a fresh synthetic
     // stand-in.
     let kinds = "java/nio/file/StandardWatchEventKinds";
-    r.register(
-        kinds,
-        "ENTRY_CREATE",
-        "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_CREATE)?)),
-    );
-    r.register(
-        kinds,
-        "ENTRY_DELETE",
-        "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_DELETE)?)),
-    );
-    r.register(
-        kinds,
-        "ENTRY_MODIFY",
-        "()Ljava/nio/file/WatchEvent$Kind;",
-        |ctx, _| Ok(Some(watch_event_kind_object(ctx, EVENT_MODIFY)?)),
-    );
     r.set_category(__prev_cat);
 }
 

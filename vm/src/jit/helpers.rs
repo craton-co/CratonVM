@@ -10414,13 +10414,14 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 // state that cannot occur. If either gate above is ever removed, this comment
 // is the reason these bodies look unguarded.
 //
-// JDK-ONLY-WAVE2: these helpers should not need a policy gate at all. What
-// must replace the arrangement above: the compile-time recognition in
-// `jit::try_compile` should ask the shared resolver whether the triple's
-// registered native may shadow bytecode, instead of the JIT crate carrying a
-// latched process-global mirror of the policy because it cannot see
-// `NativeKind`. That is the same layering fix `jit/src/lib.rs`'s own WAVE2
-// marker on `set_jit_execution_policy` describes.
+// JDK-ONLY-WAVE2 §4, layering half CLOSED 2026-08-06/08-10. The ask was that
+// the compile-time recognition in `jit::try_compile` consult the shared
+// resolver about the triple's registered native, instead of the JIT crate
+// carrying a latched process-global mirror of a policy it could not evaluate
+// because it cannot see `NativeKind`. Both halves landed:
+// `direct_native_helper` takes an `intrinsic_resolver` the VM answers out of
+// the registry's kind, and the policy is threaded per compilation rather than
+// read from the latch. The gates above are those, not a mirror.
 // ---------------------------------------------------------------------------
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
@@ -11386,14 +11387,10 @@ fn matcher_native_arg_count(info: &JitInvokeInfo) -> Option<usize> {
 /// `native_matcher_find()` opt-out and a two-`&'static str` match, nothing
 /// else. No registry access, no lock, no hashing.
 ///
-/// This is the body `matcher_native_callback` used to have, kept verbatim for
-/// the ONE caller that re-decides on every dispatch — `jit_invoke_virtual_mic`'s
-/// exact-receiver Matcher leaf. That caller hoists the JDK-only question out to
-/// a single `dispatch_policy(vm).is_jdk_only()` gate instead of paying policy
-/// per call; see the long comment at its call site for why, and for the
-/// `JDK-ONLY-WAVE2` marker covering the census gap that leaves.
-///
-/// Every *cached* caller must use [`matcher_native_callback`] instead.
+/// This is the callback half of the decision. It is never a dispatch verdict on
+/// its own — every caller pairs it with an admission, either
+/// [`matcher_native_callback`] (cache-fill sites) or
+/// [`admit_matcher_leaf_native`] (the per-dispatch exact-receiver leaf).
 #[inline]
 fn matcher_native_callback_uncached(
     info: &JitInvokeInfo,
@@ -11402,6 +11399,174 @@ fn matcher_native_callback_uncached(
         return None;
     }
     cratonvm_native_builtins::matcher_realjdk_native_callback(info.method_name, info.descriptor)
+}
+
+/// The class the eight `Matcher` leaf triples are registered under.
+const MATCHER_CLASS: &str = "java/util/regex/Matcher";
+
+/// Dense index of the (method, descriptor) pair the exact-receiver `Matcher`
+/// leaf serves, or `None` for anything else.
+///
+/// The eight rows are exactly the triples [`matcher_native_arg_count`] admits.
+/// Keep the two in step: a pair with an index but no arg count would memoize an
+/// admission that `call_matcher_native_raw` then declines, and a pair with an
+/// arg count but no index would dispatch uncounted — which is the defect this
+/// index exists to close.
+#[inline]
+fn matcher_site_index(info: &JitInvokeInfo) -> Option<usize> {
+    Some(match (info.method_name, info.descriptor) {
+        ("find", "()Z") => 0,
+        ("start", "()I") => 1,
+        ("end", "()I") => 2,
+        ("group", "()Ljava/lang/String;") => 3,
+        ("find", "(I)Z") => 4,
+        ("start", "(I)I") => 5,
+        ("end", "(I)I") => 6,
+        ("group", "(I)Ljava/lang/String;") => 7,
+        _ => return None,
+    })
+}
+
+/// The `(method_name, descriptor)` for a [`matcher_site_index`], so the memo
+/// cells can be filled without re-deriving the strings from a `JitInvokeInfo`
+/// that the caller may not have.
+const MATCHER_SITE_TRIPLES: [(&str, &str); 8] = [
+    ("find", "()Z"),
+    ("start", "()I"),
+    ("end", "()I"),
+    ("group", "()Ljava/lang/String;"),
+    ("find", "(I)Z"),
+    ("start", "(I)I"),
+    ("end", "(I)I"),
+    ("group", "(I)Ljava/lang/String;"),
+];
+
+/// ONE STATIC, ONE TRIPLE — the invariant [`cratonvm_native_api::NativeCallSite`]
+/// documents and `debug_assert!`s. Eight cells for eight triples; the array is
+/// indexed by [`matcher_site_index`] and nothing else may borrow a cell.
+///
+/// A `static` is correct here even though the memo is registry-derived: a
+/// `NativeCallSite` memo carries the registry *generation*, which is banded per
+/// registry, so a cell that outlives one VM re-resolves against the next rather
+/// than redeeming a slot index that means something else. The *policy* half of
+/// the decision is per-VM and lives in `NativeRealm::matcher_leaf_admission`
+/// instead — see [`admit_matcher_leaf_native`].
+static MATCHER_LEAF_SITES: [cratonvm_native_api::NativeCallSite; 8] = [
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+    cratonvm_native_api::NativeCallSite::new(),
+];
+
+/// `NativeRealm::matcher_leaf_admission` verdicts.
+const MATCHER_ADMISSION_REFUSED: u64 = 1;
+const MATCHER_ADMISSION_ADMITTED: u64 = 2;
+
+/// Dispatches actually served by the exact-receiver `Matcher` leaf, reported by
+/// `CRATONVM_INTRINSIC_STATS=1` beside the other compiled-code native counters.
+///
+/// It exists because the claim this leaf's memo was built to fix — "this edge
+/// is uncounted for the §4 census" — is a claim about a RATE, and nothing
+/// measured it. Without this number, "the leaf served the call and did not
+/// count it" and "the leaf declined and the generic tail served it, counting it
+/// properly" are indistinguishable from the census alone: both leave the
+/// registry's total looking right on the workloads where the leaf never fires.
+/// A zero here on a regex-hot run says the leaf is not the path that run takes
+/// — which is a different fact from the census being complete, and only this
+/// counter can tell the two apart.
+static MATCHER_LEAF_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dispatches served by the compiled exact-receiver `Matcher` leaf this run.
+pub fn matcher_leaf_hit_count() -> u64 {
+    MATCHER_LEAF_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Policy admission + census handle for the exact-receiver `Matcher` leaf,
+/// memoized per triple so it can run on a per-dispatch path.
+///
+/// # What this replaces, and why the old shape was a gap
+///
+/// This leaf is the one hot by-name native fast path in this file that
+/// re-decides on every dispatch: deciding used to be two `&'static str`
+/// compares, so the three memoized siblings' cache-fill admission had nowhere
+/// to live. Wave 1 therefore hoisted the JDK-only question to a single
+/// `dispatch_policy(vm).is_jdk_only()` gate and **skipped the leaf wholesale**
+/// under strict. That was safe — a disabled optimization cannot invoke a
+/// `SyntheticStub` — but it left two things undone, both of which this closes:
+///
+/// * **`Compatible` dispatched here uncounted.** Every `find`/`start`/`end`/
+///   `group` served by the leaf was missing from the §4 census, and an
+///   uncounted path is an unverifiable one.
+/// * **Strict lost the fast route** rather than being admitted to it. These
+///   natives are registered `NativeKind::Intrinsic` (see the
+///   `keep_real_matcher_find_fastpath` banner in `native-builtins/src/lib.rs`),
+///   so §1.4's reviewed-intrinsic exception admits them; skipping was strictly
+///   conservative, not correct-by-policy.
+///
+/// # The cost, which is what made the old shape necessary
+///
+/// Warm, this is: one dense index from two `&'static str` compares, one relaxed
+/// `AtomicU64` load with a generation compare (the `NativeCallSite`), and — in
+/// strict mode only — one more relaxed load with a generation compare. No lock,
+/// no allocation, and above all no string hashing. The three-string registry
+/// hash and, in strict mode, the class-manager read lock plus hierarchy walk
+/// inside `jit_fast_native_has_bytecode` are paid once per triple per registry
+/// generation.
+///
+/// `Compatible` does not consult the per-VM memo at all: its admission is a
+/// policy field read and a `Some`, so a memo would cost more than it saves.
+#[inline]
+fn admit_matcher_leaf_native(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(
+    cratonvm_native_api::NativeCallback,
+    Option<cratonvm_native_api::NativeMethodId>,
+)> {
+    let callback = matcher_native_callback_uncached(info)?;
+    let index = matcher_site_index(info)?;
+    let registry = &vm.natives.native_methods;
+    let id = MATCHER_LEAF_SITES[index].resolve(
+        registry,
+        MATCHER_CLASS,
+        info.method_name,
+        info.descriptor,
+    );
+    if !crate::vm::dispatch_policy(vm).is_jdk_only() {
+        return Some((callback, id));
+    }
+    let generation = u64::from(registry.generation());
+    let cell = &vm.natives.matcher_leaf_admission[index];
+    let memo = cell.load(std::sync::atomic::Ordering::Relaxed);
+    if memo >> 32 == generation {
+        return if memo & 0xffff_ffff == MATCHER_ADMISSION_ADMITTED {
+            Some((callback, id))
+        } else {
+            None
+        };
+    }
+    let admitted = jdk_only_admit_jit_fast_native(
+        vm,
+        MATCHER_CLASS,
+        info.method_name,
+        info.descriptor,
+        callback,
+        id,
+    );
+    let verdict = if admitted.is_some() {
+        MATCHER_ADMISSION_ADMITTED
+    } else {
+        MATCHER_ADMISSION_REFUSED
+    };
+    cell.store(
+        (generation << 32) | verdict,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    admitted
 }
 
 /// Resolve the real-layout `Matcher` fast-path native for this site, subject
@@ -12240,39 +12405,36 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // generic resolver.
     //
     // §7 routing — this leaf is the one HOT by-name native fast path in this
-    // file that is not memoized per call site: it re-decides on every
-    // dispatch, by design, because deciding used to be two `&'static str`
-    // compares (the `ClassLoader` intercept above is also unmemoized, but only
-    // a null resource name reaches it, so it can afford the real thing). That
-    // is why it gets a **hoisted** policy gate instead of the per-site admission
-    // the other three use. `dispatch_policy(vm).is_jdk_only()` is two field
-    // reads and a compare — no lock, no allocation, and above all no string
-    // hashing — where calling `admit_jit_fast_native` here would put a
-    // three-string registry hash (and, in strict mode, a class-manager read
-    // lock plus a hierarchy walk) on a documented 19x hot path.
+    // file that re-decides on every dispatch rather than at cache-fill time
+    // (the `ClassLoader` intercept above is also unmemoized, but only a null
+    // resource name reaches it, so it can afford the real thing). Wave 1
+    // therefore hoisted the JDK-only question to one
+    // `dispatch_policy(vm).is_jdk_only()` gate and skipped the leaf wholesale
+    // under strict, because calling `admit_jit_fast_native` per dispatch would
+    // put a three-string registry hash — and, in strict mode, a class-manager
+    // read lock plus a hierarchy walk — on a documented 19x hot path.
     //
-    // Under `JdkOnly` the leaf is skipped wholesale and `Matcher.find` falls
-    // through to the generic `invoke_or_native` tail — the same route it took
-    // before this fast path existed, and one that is policy-checked and
-    // resolves the very same registered `Intrinsic`. Skipping is strictly
-    // conservative: a disabled optimization cannot invoke a `SyntheticStub`,
-    // so this edge contributes zero to the acceptance criterion by
-    // construction, no matter what is registered.
-    //
-    // JDK-ONLY-WAVE2: this edge is therefore **uncounted** for the §4 census
-    // in `Compatible` mode (in `JdkOnly` it is unreachable, so there is
-    // nothing to count). What must replace it: a per-call-site memo of the
-    // admitted `(callback, NativeMethodId)` decision — keyed on `info_ptr`
-    // like `OBJECT_NATIVE_DISPATCH_CACHE`, or on eight `NativeCallSite` cells
-    // (one per Matcher triple, which is what that type exists for) — so the
-    // census increment becomes one relaxed add and the strict path regains
-    // the fast route instead of merely being safe without it.
-    if !class_was_redefined(vm, receiver_class_id) && !crate::vm::dispatch_policy(vm).is_jdk_only() {
-        if let Some(callback) = matcher_native_callback_uncached(info) {
+    // Closed 2026-08-10 by [`admit_matcher_leaf_native`], the per-triple memo
+    // the wave-2 record asked for: eight `NativeCallSite` cells for the census
+    // handle and a per-VM generation-keyed verdict cell for the strict
+    // admission. Warm cost is two `&'static str` compares and one (Compatible)
+    // or two (strict) relaxed loads, so the leaf keeps its shape while the
+    // dispatch becomes counted in BOTH modes and strict regains the fast route
+    // instead of merely being safe without it. See that function for the full
+    // argument.
+    if !class_was_redefined(vm, receiver_class_id) {
+        if let Some((callback, native_id)) = admit_matcher_leaf_native(vm, info) {
             if is_exact_matcher_class(vm, receiver_class_id) {
                 if let Some(result) =
                     call_matcher_native_raw(vm, thread, info, receiver_ref, args_slice, callback)
                 {
+                    // §4 census: one `Option` test and one relaxed add, on the
+                    // id resolved by the memo above. Counted here rather than
+                    // before the call because `call_matcher_native_raw`
+                    // declines an arity it cannot build a frame for, and a
+                    // declined fast path is not a dispatch.
+                    count_jit_native_dispatch(vm, native_id);
+                    MATCHER_LEAF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return result;
                 }
             }
@@ -12669,7 +12831,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // once the address was recycled by a later allocation, the
                 // json-smart "re-parse returned another method's result"
                 // corruption.
-                mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
+                mic.update(
+                    receiver_cid,
+                    &class_name,
+                    entry_ptr as u64,
+                    needs_ctx,
+                    crate::vm::dispatch_policy(vm).is_jdk_only(),
+                );
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
@@ -12680,7 +12848,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 // through a null function pointer.
                 if pic_ptr != 0 && entry_ptr != 0 {
                     let pic = &*(pic_ptr as *const JitPICSlot);
-                    pic.install(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
+                    pic.install(
+                        receiver_cid,
+                        &class_name,
+                        entry_ptr as u64,
+                        needs_ctx,
+                        crate::vm::dispatch_policy(vm).is_jdk_only(),
+                    );
                 }
             }
         }
@@ -12832,7 +13006,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     }
     if cacheable_receiver && !callee_barred_by_table && !callee_has_indy_trap {
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
-        mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
+        mic.update(
+            receiver_cid,
+            &class_name,
+            entry_ptr,
+            needs_ctx,
+            crate::vm::dispatch_policy(vm).is_jdk_only(),
+        );
 
         // CRIT-1 — Populate the co-allocated PIC so the inline 4-way
         // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
@@ -12845,7 +13025,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // megamorphic spillover automatically.
         if pic_ptr != 0 && entry_ptr != 0 {
             let pic = &*(pic_ptr as *const JitPICSlot);
-            pic.install(receiver_cid, &class_name, entry_ptr, needs_ctx);
+            pic.install(
+                receiver_cid,
+                &class_name,
+                entry_ptr,
+                needs_ctx,
+                crate::vm::dispatch_policy(vm).is_jdk_only(),
+            );
         }
     }
 
@@ -13277,6 +13463,70 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // The `Matcher` leaf's index and its arg-count table must agree
+    // -----------------------------------------------------------------------
+
+    /// `matcher_site_index` and `matcher_native_arg_count` are two hand-written
+    /// tables over the same eight triples, and each answers half of one
+    /// decision: the index picks the memo cell that carries the census handle,
+    /// the arg count decides whether `call_matcher_native_raw` will build a
+    /// frame at all. A row present in one and absent from the other is silently
+    /// wrong in a direction the type system cannot see — a pair with an index
+    /// but no arg count memoizes an admission nothing ever redeems, and a pair
+    /// with an arg count but no index dispatches **uncounted**, which is the
+    /// exact §4 census gap the memo was added to close.
+    ///
+    /// So pin both directions, plus the index being a permutation of `0..8`
+    /// (a duplicate would make two triples share one `NativeCallSite`, which is
+    /// the misuse that type `debug_assert!`s about).
+    #[test]
+    fn matcher_leaf_index_and_arg_count_cover_the_same_triples() {
+        let mut seen = [false; 8];
+        for (name, descriptor) in MATCHER_SITE_TRIPLES {
+            let info = JitInvokeInfo {
+                class_name: MATCHER_CLASS,
+                method_name: name,
+                descriptor,
+                num_jit_args: 0,
+                return_type: 0,
+                invoke_kind: 0,
+                declaring_class_id: 0,
+            };
+            let index = matcher_site_index(&info)
+                .unwrap_or_else(|| panic!("no site index for Matcher.{name}{descriptor}"));
+            assert!(
+                !seen[index],
+                "two Matcher triples share site index {index}; they would share one \
+                 NativeCallSite cell"
+            );
+            seen[index] = true;
+            assert!(
+                matcher_native_arg_count(&info).is_some(),
+                "Matcher.{name}{descriptor} has a memo cell but no arg count: the \
+                 admission is memoized and then always declined"
+            );
+        }
+        assert!(seen.iter().all(|s| *s), "site indices are not 0..8");
+    }
+
+    /// The other direction: nothing `matcher_native_arg_count` admits may be
+    /// missing from the index, or it dispatches without a census handle.
+    /// Checked over the callback table's own domain rather than a second copy
+    /// of the list, so adding a ninth triple to `native-builtins` without
+    /// adding a cell here fails loudly.
+    #[test]
+    fn every_matcher_fastpath_triple_has_a_site_index() {
+        for (name, descriptor) in MATCHER_SITE_TRIPLES {
+            assert!(
+                cratonvm_native_builtins::matcher_realjdk_native_callback(name, descriptor)
+                    .is_some(),
+                "Matcher.{name}{descriptor} has a site index but native-builtins no longer \
+                 serves it — the memo cell is dead"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // A compiled `invokestatic` must not pick the other loader's copy
     // -----------------------------------------------------------------------
 
@@ -13330,11 +13580,11 @@ mod tests {
 
             // The application loader's copy — what the global name→id map
             // answers with, and what the old by-name dispatch would pick.
-            let app_copy = cm.ensure_synthetic_class(OWNER, 0);
+            let app_copy = cm.try_ensure_synthetic_class(OWNER, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             // The forked loader's copy: fabricated under its own name, renamed,
             // then given that loader's identity and name registration.
-            let fork_copy = cm.ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0);
+            let fork_copy = cm.try_ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
             cm.class_store
                 .get_mut(fork_copy)
                 .expect("just fabricated")
@@ -13346,17 +13596,17 @@ mod tests {
             cm.register_class_name(FORK, OWNER, fork_copy);
 
             // The call SITE's class, once inside the fork and once outside it.
-            let fork_caller = cm.ensure_synthetic_class("cratonvm/test/ForkCaller", 0);
+            let fork_caller = cm.try_ensure_synthetic_class("cratonvm/test/ForkCaller", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
             cm.class_store
                 .get_mut(fork_caller)
                 .expect("just fabricated")
                 .loader_id = FORK;
             cm.register_class_name(FORK, "cratonvm/test/ForkCaller", fork_caller);
-            let app_caller = cm.ensure_synthetic_class("cratonvm/test/AppCaller", 0);
+            let app_caller = cm.try_ensure_synthetic_class("cratonvm/test/AppCaller", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             // A name only ONE loader ever defined — the overwhelmingly common
             // case, and the one that must stay on the old path.
-            let lonely = cm.ensure_synthetic_class(LONELY, 0);
+            let lonely = cm.try_ensure_synthetic_class(LONELY, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             (app_copy, fork_copy, fork_caller, app_caller, lonely)
         };
