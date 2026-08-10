@@ -3435,6 +3435,10 @@ impl SharedVm {
                 upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
                 jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
                 jni_native_methods: crate::native::jni::JniNativeMethodTable::default(),
+                jni_bridge_invocations: std::sync::atomic::AtomicU64::new(0),
+                matcher_leaf_admission: std::array::from_fn(|_| {
+                    std::sync::atomic::AtomicU64::new(0)
+                }),
             },
 
             threads: crate::vm::realms::ThreadRealm {
@@ -5103,9 +5107,31 @@ impl SharedVm {
                 buckets.compatibility
             ));
         }
+        // `bridge_invocations` is registry bridges PLUS JNI dispatches.
+        //
+        // The JNI function-pointer table (`natives.jni_native_methods`) is a
+        // second, parallel registry of `dlsym` results, and it issues no
+        // `NativeMethodId` — so `record_invocation`, which every other dispatch
+        // path calls, cannot count it. Reporting only the registry's own total
+        // made this key silently under-count genuine JNI bridges by exactly the
+        // number of dispatches through that table. A `RegisterNatives` target
+        // is a bridge in §1's sense (a real function in a real library — the
+        // case §11 sanctions), so adding it here is what makes the key mean
+        // what it says rather than "bridges we happened to be able to count".
+        //
+        // The other two keys are unaffected and stay exact:
+        // `synthetic_stub_invocations` cannot gain a JNI row (a
+        // `NativeKind::SyntheticStub` cannot be created in that table at all),
+        // and neither can `intrinsic_invocations`.
         out.push_str(&format!(
             "    \"bridge_invocations\": {},\n",
-            registry.invocations_of_kind(NativeKind::Bridge)
+            registry
+                .invocations_of_kind(NativeKind::Bridge)
+                .saturating_add(
+                    self.natives
+                        .jni_bridge_invocations
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                )
         ));
         out.push_str(&format!(
             "    \"intrinsic_invocations\": {},\n",

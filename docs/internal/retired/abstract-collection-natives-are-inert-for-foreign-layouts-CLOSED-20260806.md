@@ -1,8 +1,21 @@
 # The `java.util.Abstract*` natives are inert for foreign layouts — measured, with the reason
 
-**Status:** CLOSED as a hazard, 2026-08-06. This is a negative result, recorded
-because two records and a working note all treat it as an open worry and it is
-the cheapest thing in the area to keep re-deriving.
+**Status:** RETIRED to this tree 2026-08-10. CLOSED as a hazard 2026-08-06.
+This is a negative result, recorded because two records and a working note all
+treated it as an open worry and it was the cheapest thing in the area to keep
+re-deriving.
+
+**What replaced it.** The probe this page rests on is now a *scheduled*
+regression vector — `regression-suite/src/RForeignLayoutCollections.java`, in
+`CORE_CLASSES`, diffed against HotSpot on every suite run — instead of a loose
+file under `probes/` that nothing ran. Its header carries the durable half of
+this page: the ten registrations, the escape hatch that makes them correct, and
+the `java.lang.Process` contrast that says *why* this family is safe and that
+one is not. Re-verified 2026-08-10 on JDK 25 / Linux: all 42 lines
+byte-identical to HotSpot in **both** `--real-jdk` and `--jdk-only` — this page
+had only ever measured the first.
+
+Everything below is the original record, kept for its reasoning.
 
 Both L5 records flag `native-collections`' abstract-method registrations as the
 reason its 989 `Bridge` rows cannot be reclassified:
@@ -64,8 +77,13 @@ census, not off a grep.
 **Closed:** the foreign-layout hazard on the `Abstract*` family, for the
 inherited-concrete surface, in real-JDK mode. The probe is the regression test.
 
-**Not closed, and the contrast is the useful part:** the identical shape one
-package over *is* broken.
+**Closed as a hazard, and the probe is now scheduled** —
+`regression-suite/src/RForeignLayoutCollections.java` in `CORE_CLASSES`, so a
+native that starts assuming a layout fails the suite rather than waiting for an
+application to find it.
+
+**The contrast is the useful part:** the identical shape one package over *is*
+broken.
 `process-natives-answer-for-user-subclasses-FIXED-20260806.md`
 has `java.lang.Process`'s concrete natives answering for a user subclass out of
 the VM's fixed field layout — `isAlive()` false for a live process, `pid()` 0
