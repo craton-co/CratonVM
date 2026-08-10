@@ -1,6 +1,18 @@
 # G1 vs. Generational, full Spring Boot suite — the 14-class diff re-measured, 2026-08-10
 
-**Status: OPEN, but rewritten — and the defect is now known to be JIT-dependent (§3b).** The 2026-08-08 page (kept verbatim at the
+**Status: the G1 defect is ROOT-CAUSED AND FIXED (2026-08-10, §3c) — page kept
+open only for the re-measurement it implies.** `G1Collector::refill_tlab` carved
+TLABs whose size was not a multiple of 8, orphaning the bytes between
+`region.cursor` and `Tlab::new`'s trimmed `end`; a linear walk read them as an
+all-zero object and desynced, leaving every reference past that point
+un-rewritten by the pause. `GenerationalHeap::refill_tlab` has masked with
+`& !7` since 2026-07-18 and G1's copy never did — **that alone is the entire
+G1-only asymmetry.** Reproducer: FAIL 18/61 → **PASS 61/61 ×2**, zero walk
+breaks. What still needs re-running against the fix is listed at the end of §4;
+until `CacheAutoConfigurationTests`, the Tomcat shard and the Azure full suite
+are re-measured, this page stays open.
+
+The 2026-08-08 page (kept verbatim at the
 bottom) framed this as "14 classes changed status, G1 essentially at parity".
 Re-running all 14 on a fresh `dev` binary, two ABBA-interleaved rounds per
 class, says something different and much narrower:
@@ -14,9 +26,10 @@ class, says something different and much narrower:
   improvement that is really a *Generational* failure.
 * **1 row reproduces but is already owned** by its own open page.
 
-The G1 defect is characterized much further than the original page managed, but
-it is **not fixed**, which is why this page stays open. See §4 for the exact
-open question, the reproducer, and the levers.
+The G1 defect is now fixed (§3c). §3b and §4 are kept as the evidence trail:
+several confident-looking leads were wrong, including two separate levers that
+made the reproducer pass 61/61 without containing the bug, and they are recorded
+so nobody re-treads them.
 
 ## 1. Method
 
@@ -68,6 +81,15 @@ already flip status run-to-run with no collector change at all — e.g.
 PASS×4/FAIL×4/HANG×3, `ChildManagementContextInitializerAotTests` PASS×2/FAIL×3.
 
 ## 3. The one real G1 defect: a live object's header reads back all zeroes
+
+> **ROOT-CAUSED AND FIXED 2026-08-10 — `G1Collector::refill_tlab` carved
+> unaligned TLABs.** The cause is at the bottom of this section
+> ([§3c](#3c-root-cause-an-unaligned-tlab-carve-orphans-the-bytes-between-two-different-ends));
+> everything between here and there is the evidence trail that led to it, kept
+> because several confident-looking leads were wrong and are worth not
+> re-treading. `GenerationalHeap::refill_tlab` has masked carve sizes with
+> `& !7` since 2026-07-18 for this exact reason; G1's copy of the carve never
+> got it, and **that is the whole G1-vs-default asymmetry.**
 
 Three of the classes above are the same bug. Under G1 only:
 
@@ -262,6 +284,95 @@ partially-initialized object made visible to a heap walk, and it is what both th
 `g1::get_field` guard and the `invokevirtual` stale-receiver guard are seeing from
 their two different directions.
 
+## 3c. Root cause: an unaligned TLAB carve orphans the bytes between two different "ends"
+
+`G1Collector::refill_tlab` sized a carve as `requested_size.min(remaining)` —
+**no alignment mask**. Two pieces of code then disagree about where that TLAB
+ends:
+
+* `G1Region::bump_alloc` aligns the carve's **start** to 8 and commits exactly
+  `size` bytes, so `region.cursor` lands wherever the unaligned size puts it;
+* `Tlab::new` rounds its `end` **down** to 8 — its own documented "release-mode
+  safety net ... giving up at most 7 bytes of tail".
+
+The bytes between the two ends belong to nobody, and every mechanism that
+exists to make TLAB memory walkable stops at the *trimmed* end:
+
+| mechanism | covers | stops at |
+|---|---|---|
+| `Tlab::retire`'s `int[]` filler | `[tlab.cursor, tlab.end)` | trimmed end |
+| `Tlab::reserved_tail` → skip span | `[tlab.cursor, tlab.end)` | trimmed end |
+| the next `bump_alloc(_, 8)` | from `region.cursor`, re-aligned **up** | skips past them |
+
+So a linear walk arriving at the trimmed end meets zeroes that no filler, no
+skip span and no object describes. It can only read them as an all-zero 16-byte
+object (`class_id=0`, `num_slots=0`, `kind=Object` decodes to exactly
+`HEADER_SIZE`), which puts every later step off the real grid. The walk desyncs,
+is abandoned, and **every heap reference past that offset goes un-rewritten by
+the pause** — which is what the mutator later dereferences.
+
+The observed instance, from the carve-provenance ring:
+
+```
+carves=[tlab:cur-eden@0xf198+0x11664 ...]      0xf198 + 0x11664 = 0x207fc
+                                               Tlab::new end     = 0x207f8
+                                               next object at    = 0x20800
+trail=[... 0x207f8+0x10(cid=0,k=0)]  break at  0x20808   <- 8 bytes into it
+```
+
+and the hexdump matches byte for byte: `0x207f8 = 0`, then the real object's
+words at `0x20800`/`0x20808`.
+
+**The fix** is `tlab_carve_size(requested, remaining) = requested.min(remaining) & !7`
+at both `refill_tlab` carve sites (`gc/src/g1.rs`). Both sites are already
+guarded by `remaining >= 256`, so the mask can never round a usable carve to
+zero.
+
+**Why it was G1-only.** `GenerationalHeap::refill_tlab:12526` has read
+`requested_size.min(available) & !7` since 2026-07-18, with a comment naming
+this exact failure — *"an unaligned TLAB ... gets its end rounded DOWN by
+`Tlab::new`'s release safety net — leaving an untracked zeroed sliver between
+the TLAB's filler and the next region that derails the non-moving walk"* — and
+citing
+[`../../internal/fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md`](../../internal/fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md).
+G1's copy of the same carve never received it. Nothing about G1's design is
+implicated; it simply missed a fix the other collector got.
+
+No other carve site is exposed: the parallel evacuator's `tlab_alloc` writes
+`region.cursor = tlab.offset` on retire (so the two agree by construction),
+`alloc_in_region` / `alloc_in_type_locked` / `alloc_humongous_locked` all pass
+`object_total_size`, which is always a multiple of 8, and ZGC's `refill_tlab`
+returns `None`.
+
+**Why the JIT was required.** Not because the JIT allocates wrong — because
+`refill_tlab` is the *bulk* carve path, and only a JIT-heavy workload requests
+TLABs at sizes the adaptive sizer picks (`0x11664`, `0x1d7e4`, `0xebf2`,
+`0x8b32`, `0x4599` — all non-multiples of 8). `--nojit` was clean for the same
+reason `NO_JIT_ALLOC_CLASS_CACHE=1` was: it changes which sizes get requested,
+not what is wrong with them.
+
+### Verification
+
+`Log4J2LoggingSystemTests` under `-XX:+UseG1GC`, JIT **on**, alloc-class cache
+**on** — i.e. nothing else disabled:
+
+| arm | binary | result | `gc::guard` | desyncs | `WALKBRK` |
+|---|---|---|---:|---:|---:|
+| before | `cratonvm-g1prov-20260810` | FAIL 18/61, 467.5 s | 252 | 1 | 7 |
+| **after, r1** | `cratonvm-g1align-20260810` | **PASS 61/61**, 533.2 s | **0** | **0** | **0** |
+| **after, r2** | `cratonvm-g1align-20260810` | **PASS 61/61**, 573.8 s | **0** | **0** | **0** |
+
+`Stale pointer` and `[g1][FREE-CURSOR]` are zero on both rounds too — all five
+counters this page has ever used, not a selected one.
+
+The walk breaks are **gone**, not reduced — which is the direct prediction of
+the fix, since with no orphan sliver there is nothing for a walk to desync on.
+
+Both unit tests (`tlab_carve_size_never_leaves_an_unaligned_tail`,
+`a_masked_carve_leaves_region_cursor_equal_to_the_tlab_end`) were confirmed
+**RED with the mask removed** before being trusted green; the geometry test
+reports the orphan span by address.
+
 ## 4. What is ruled out, and the open question
 
 Three hypotheses were tested and **refuted** — each is recorded because each one
@@ -437,7 +548,18 @@ Two concrete next steps, in order:
 
 **Do not read a single guard's count as a verdict** — the
 `CRATONVM_JIT_DISABLE_INLINE_NEW=1` arm shows `g1::get_field` hits dropping to
-zero while the `invokevirtual` stale-receiver guard fires throughout.
+zero while the `invokevirtual` stale-receiver guard fires throughout. Guard
+*counts* also drift badly on unchanged code (563 / 252 / 239 all observed), so
+only the test outcome and the presence/absence of `WALKBRK` carry signal.
+
+**Postscript on the two levers in this section.** Both `--nojit` and
+`NO_JIT_ALLOC_CLASS_CACHE=1` turned out to be **timing probes, not fixes** — see
+[§3c](#3c-root-cause-an-unaligned-tlab-carve-orphans-the-bytes-between-two-different-ends).
+They change which TLAB *sizes* the adaptive sizer requests (and, for the cache,
+whether slow-path allocation serializes on `class_manager.read()`); neither
+touches the unaligned carve that was the actual defect. This is worth
+remembering as a pattern: a gate that makes a corruption vanish has not thereby
+been shown to contain it.
 
 **Reproducer:** `Log4J2LoggingSystemTests` (`core/spring-boot`) under
 `-XX:+UseG1GC` — 445 guard hits, ~510 s, far cheaper and louder than
@@ -542,6 +664,38 @@ already disproved that exact mechanism for a different workload, where forcing
 the run. The A/B/C that would settle it here (default vs
 `CRATONVM_NO_MOVING_YOUNG=1` vs G1, with `--dump-phase-report=` and
 `CRATONVM_GC_STATS=1`) is set up but has not produced a clean set yet.
+
+### What still needs re-measuring against the fix
+
+The fix is verified on the reproducer only. Nothing below has been re-run:
+
+1. **`CacheAutoConfigurationTests`** — the other reproducer (4–8 guard hits, one
+   `EXCEPTION_ACCESS_VIOLATION` at 272 s) and `ChildManagementContextInitializerAotTests`.
+2. **The four Tomcat SIGSEGV classes** (§5b). Their crash needs full-suite
+   conditions — 16 standalone and 4-way-concurrent process-runs produced zero
+   crashes — so they can only be checked by re-running the actual shard.
+3. **The full Spring Boot suite on Azure**, which is where the 14-class diff
+   came from in the first place.
+4. **Whether the walk-abandonment guard should stay.** `candidate_header_is_plausible`
+   + `break` is what turned this from a wild read into a survivable desync, and
+   it should be kept — but with the producer fixed, a break now means a NEW
+   defect rather than a known one, which makes it a much better alarm.
+
+Two things deliberately left open, neither implicated in the corruption:
+
+* **The publish path runs about once per run.** Every walk break in the failing
+  runs reported `ZERO published skip spans`, and `[g1][TLAB-CENSUS]` logged a
+  single line across 453 s. `collect_reserved_tlab_tails` has exactly one caller
+  (`stw_take_over_and_wait`). Either most G1 pauses walk Eden with no TLAB skip
+  protection at all, or it runs often and legitimately computes empty. The
+  census is sequence-numbered now to decide it. This did not cause the
+  corruption — the orphan sliver was outside every TLAB, so no skip span could
+  ever have covered it — but "the safety net appears not to be deployed" is
+  worth settling on its own.
+* **`emit_inline_tlab_new`'s `layout_replace_guard`** is emitted only when
+  `compact_snapshot` is `Some`, so a site compiled before a class has a
+  registered compact layout bakes the legacy size and emits no guard (§3b). A
+  real hole, still unfixed, still not this bug.
 
 ## 5b. The Tomcat G1 SIGSEGVs are very probably this same defect
 
