@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-424 tokens.
+425 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -272,6 +272,7 @@ export inherited from a parent shell.
 | `lambda` | `CRATONVM_DBG_LAMBDA` |
 | `lambda-dispatch` | `CRATONVM_DBG_LAMBDA_DISPATCH` |
 | `lambda-generic` | `CRATONVM_DBG_LAMBDA_GENERIC` |
+| `lambda-prof` | `CRATONVM_DBG_LAMBDA_PROF` |
 | `layout` | `CRATONVM_DBG_LAYOUT` |
 | `ldc-classref-trace` | `CRATONVM_LDC_CLASSREF_TRACE` |
 | `letsgo` | `CRATONVM_DBG_LETSGO` |
