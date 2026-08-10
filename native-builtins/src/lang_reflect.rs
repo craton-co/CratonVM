@@ -177,6 +177,108 @@ pub(crate) fn native_accessible_set_accessible(
 // unaided. Skipping (2) made `canAccess` answer true for a private `java.base`
 // field the caller could not read — `probes/SetAccessibleModuleProbe.java`'s
 // `afterDenied isAccessible` line, where HotSpot 25 says false.
+//
+// Question (1) is not a `false`, though — it is an ARGUMENT error, and HotSpot
+// raises it before question (2) is asked at all. Measured on Temurin 25.0.3
+// (`probes/CanAccessReceiverProbe.java`, the full 28-row static x null x
+// wrong-type x right-type matrix):
+//
+//   instance member, obj == null        -> IAE "null object for <member>"
+//   instance member, not an instance    -> IAE "object is not an instance of <Class>"
+//   static member,   obj != null        -> IAE "non-null object for <member>"
+//   constructor,     obj != null        -> IAE "non-null object for <member>"
+//
+// and `Integer.value.canAccess("x")` THROWS rather than answering the `false`
+// its access check would produce, which is what pins the ordering. All four
+// answered a plain `false` here before this fix. `setAccessible(true)` does not
+// suppress any of them: the argument is validated whether or not the override
+// is set.
+
+/// Does this member require a `null` receiver? Static members do, and so do
+/// constructors — `Modifier.isStatic` is false for a constructor, but HotSpot
+/// groups it with the static arm (measured: `ctor.canAccess(anInstance)` throws
+/// `"non-null object for public Target()"`, it does not answer `false`).
+fn receiver_must_be_null(is_static: bool, is_constructor: bool) -> bool {
+    is_static || is_constructor
+}
+
+/// `member.toString()`, for the two messages that embed it.
+///
+/// Routed through the member's own `toString` rather than rebuilt from the
+/// modifiers and descriptor: the JDK's message is literally `"null object for "
+/// + member`, so reusing the same text keeps the two in step for free. Falls
+/// back to the empty string if the call fails — a message that is missing its
+/// tail is still the right exception, and inventing a DIFFERENT exception out
+/// of a `toString` failure would be worse than the divergence being fixed.
+fn member_display(ctx: &mut dyn NativeContext, member: ObjectRef) -> String {
+    match ctx.invoke_virtual(member, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// HotSpot's receiver-argument validation, run BEFORE any access decision.
+///
+/// `Ok(())` means the receiver is the right shape and the access half may run.
+fn check_can_access_receiver(
+    ctx: &mut dyn NativeContext,
+    member: ObjectRef,
+    obj_arg: Value,
+    must_be_null: bool,
+) -> Result<(), MethodCallFailed> {
+    if must_be_null {
+        if matches!(obj_arg, Value::Object(None)) {
+            return Ok(());
+        }
+        let shown = member_display(ctx, member);
+        return Err(crate::lang_class::illegal_arg_exc(format!(
+            "non-null object for {shown}"
+        )));
+    }
+
+    let Value::Object(Some(receiver)) = obj_arg else {
+        let shown = member_display(ctx, member);
+        return Err(crate::lang_class::illegal_arg_exc(format!(
+            "null object for {shown}"
+        )));
+    };
+
+    let Value::Object(Some(declaring)) = method_clazz_value(ctx, member) else {
+        // No declaring-class mirror to test against. Not knowable, so do not
+        // manufacture an argument error out of it; the access half will fail
+        // this member closed on its own.
+        return Ok(());
+    };
+    let Some(declaring_id) = mirror_class_id(ctx, declaring) else {
+        return Ok(());
+    };
+    let receiver_id = ctx.class_id_of_object(receiver);
+    // `is_subclass` is full assignability — it walks interfaces as well as
+    // superclasses, so a default method's declaring INTERFACE is matched by an
+    // implementing receiver, and lambda proxies route through
+    // `lambda_proxy_satisfies`. That is `Class.isInstance`, which is the test
+    // HotSpot makes.
+    if ctx.is_subclass(receiver_id, declaring_id) {
+        return Ok(());
+    }
+    // A negative from `is_subclass` is only trustworthy when the receiver's
+    // hierarchy is READABLE: `is_subclass_or_unreadable` returns false exactly
+    // when the superclass chain terminated at a real `java/lang/Object` without
+    // meeting the ancestor. Anything else is "cannot tell", and this throw is
+    // new on a path that previously only ever returned `false` — a fabricated
+    // stand-in with no modelled supertype chain must not be the thing that
+    // invents an exception.
+    if is_subclass_or_unreadable(ctx, receiver_id, declaring_id) {
+        return Ok(());
+    }
+    let name = ctx
+        .class_name_of_id(declaring_id)
+        .map(|n| crate::lang_class::dotted_binary_name(&n))
+        .unwrap_or_default();
+    Err(crate::lang_class::illegal_arg_exc(format!(
+        "object is not an instance of {name}"
+    )))
+}
 
 fn can_access_member(
     ctx: &mut dyn NativeContext,
@@ -184,47 +286,49 @@ fn can_access_member(
     obj_arg: Value,
     is_static: bool,
     modifiers: i32,
-) -> bool {
-    // Static member: receiver MUST be null per spec.
+) -> Result<bool, MethodCallFailed> {
+    // Field and Method only — `Constructor.canAccess` has its own entry point,
+    // because its rule is not derivable from `Modifier.isStatic`.
+    check_can_access_receiver(ctx, member, obj_arg, receiver_must_be_null(is_static, false))?;
+
+    // Static member: receiver is null, validated just above.
     if is_static {
-        if !matches!(obj_arg, Value::Object(None)) {
-            return false;
-        }
         let declaring_id = match method_clazz_value(ctx, member) {
             Value::Object(Some(m)) => mirror_class_id(ctx, m),
             _ => None,
         };
         let Some(declaring_id) = declaring_id else {
-            return false;
+            return Ok(false);
         };
         // `None` receiver: a static member has no target type, exactly as
         // `Field.checkAccess` passes `null` for one. Measured on Temurin 25.0.3,
         // the protected STATIC `java.io.PipedInputStream.PIPE_SIZE` reads OK
         // through every receiver, so the refinement must not reach here.
-        return member_is_accessible_here(ctx, member, declaring_id, modifiers, None);
+        return Ok(member_is_accessible_here(
+            ctx,
+            member,
+            declaring_id,
+            modifiers,
+            None,
+        ));
     }
 
-    // Instance member: receiver MUST be non-null AND assignable to the
-    // declaring class.
+    // Instance member: the receiver is non-null and an instance of the
+    // declaring class, both established by `check_can_access_receiver`.
     let receiver = match obj_arg {
         Value::Object(Some(r)) => r,
-        _ => return false,
+        _ => return Ok(false),
     };
 
     let declaring = match method_clazz_value(ctx, member) {
         Value::Object(Some(m)) => m,
-        _ => return false,
+        _ => return Ok(false),
     };
     let declaring_id = match mirror_class_id(ctx, declaring) {
         Some(id) => id,
-        None => return false,
+        None => return Ok(false),
     };
     let receiver_id = ctx.class_id_of_object(receiver);
-    // is_subclass(child, parent) returns true iff `child` is `parent` or a
-    // subclass of it; equivalently, `parent.isAssignableFrom(child)`.
-    if !ctx.is_subclass(receiver_id, declaring_id) {
-        return false;
-    }
     // Carry the receiver's class on to the access half. `canAccess` must answer
     // the question `Field.get` will actually answer, and JLS §6.6.2.1 makes that
     // question receiver-dependent: measured on Temurin 25.0.3 from a classpath
@@ -233,7 +337,13 @@ fn can_access_member(
     // sibling subclass — the same three answers `Field.get` gives. Passing the
     // ClassId rather than the ObjectRef keeps the whole subtree free of object
     // references a moving GC could invalidate.
-    member_is_accessible_here(ctx, member, declaring_id, modifiers, Some(receiver_id))
+    Ok(member_is_accessible_here(
+        ctx,
+        member,
+        declaring_id,
+        modifiers,
+        Some(receiver_id),
+    ))
 }
 
 /// The second half of `canAccess`: the override flag, else the unaided access
@@ -262,7 +372,7 @@ pub(crate) fn native_method_can_access(
     };
     let is_static = (modifiers & 0x0008) != 0;
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = can_access_member(ctx, this, obj, is_static, modifiers);
+    let ok = can_access_member(ctx, this, obj, is_static, modifiers)?;
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -277,7 +387,7 @@ pub(crate) fn native_field_can_access(
     };
     let is_static = (modifiers & 0x0008) != 0;
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
-    let ok = can_access_member(ctx, this, obj, is_static, modifiers);
+    let ok = can_access_member(ctx, this, obj, is_static, modifiers)?;
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
@@ -286,25 +396,26 @@ pub(crate) fn native_constructor_can_access(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Constructors are never static — receiver must be null per spec.
     let obj = args.get(1).copied().unwrap_or(Value::Object(None));
     let modifiers = match ctx.get_field_by_name(this, "modifiers") {
         Value::Int(v) => v,
         _ => 0,
     };
+    // `Modifier.isStatic` is false for a constructor, but HotSpot still
+    // requires a null receiver and raises `"non-null object for <ctor>"` for
+    // anything else rather than answering `false` — measured, not assumed.
+    check_can_access_receiver(ctx, this, obj, receiver_must_be_null(false, true))?;
     let declaring_id = match method_clazz_value(ctx, this) {
         Value::Object(Some(m)) => mirror_class_id(ctx, m),
         _ => None,
     };
-    let ok = matches!(obj, Value::Object(None))
-        && match declaring_id {
-            // A constructor is never static and `obj` is required to be null
-            // (asserted just above), so there is no receiver whose type could
-            // narrow JLS 6.6.2.1's protected rule. `None` is the only correct
-            // argument here, not a fallback.
-            Some(id) => member_is_accessible_here(ctx, this, id, modifiers, None),
-            None => false,
-        };
+    let ok = match declaring_id {
+        // The receiver is required to be null (validated just above), so there
+        // is no receiver whose type could narrow JLS 6.6.2.1's protected rule.
+        // `None` is the only correct argument here, not a fallback.
+        Some(id) => member_is_accessible_here(ctx, this, id, modifiers, None),
+        None => false,
+    };
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
 }
 
