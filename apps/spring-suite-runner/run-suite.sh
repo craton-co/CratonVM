@@ -70,13 +70,27 @@ fi
 # collapses to the same value as JDK25 — no separate Linux default is needed.
 JDK25_WIN="${JDK25_WIN:-$(cygpath -w "$JDK25" 2>/dev/null || printf '%s' "$JDK25")}"
 
-# cratonvm.exe — env override, else common build locations.
+# A JDK tool by name, with or without the Windows `.exe` suffix. Hardcoding
+# `javac.exe`/`java.exe` made `compile_krun` and the whole `hotspot` mode
+# unusable on Linux — the failure was masked for a while because a KRun.class
+# left over from a Windows run made compile_krun return early.
+jdk_tool() {
+  local t
+  for t in "$JDK25/bin/$1.exe" "$JDK25/bin/$1"; do
+    [ -x "$t" ] && { printf '%s' "$t"; return 0; }
+  done
+  return 1
+}
+
+# cratonvm binary — env override, else common build locations (both platforms).
 find_vm() {
   local c
   for c in "${CRATONVM_BIN:-}" \
            "/c/craton/cratonvm/target/release/cratonvm.exe" \
            "/c/craton/cratonvm/target/debug/cratonvm.exe" \
-           "/c/craton/CratonVM/target/release/cratonvm.exe"; do
+           "/c/craton/CratonVM/target/release/cratonvm.exe" \
+           "/data/cratonvm/target/release/cratonvm" \
+           "/data/cratonvm/target/debug/cratonvm"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
@@ -119,12 +133,16 @@ PRIO="spring-core spring-beans spring-expression spring-aop spring-context sprin
 rank() { local b="$1" i=1 p; for p in $PRIO; do [ "$p" = "$b" ] && { printf '%03d' "$i"; return; }; i=$((i+1)); done; echo 050; }
 
 compile_krun() {
-  [ -f "$HERE/KRun.class" ] && return 0
+  # Rebuild when the source is newer — a stale KRun.class silently pins the
+  # launcher's output format (and once hid the fact that `javac.exe` does not
+  # exist on Linux, because the class file had been carried over from Windows).
+  [ -f "$HERE/KRun.class" ] && [ ! "$HERE/KRun.java" -nt "$HERE/KRun.class" ] && return 0
   log "compiling KRun.java (HotSpot javac)"
   local cpf="$SPRING/spring-core/build/cratonvm-testcp.txt"
   [ -f "$cpf" ] || die "no spring-core testcp for compiling KRun: $cpf (build the suite first)"
   local cp; cp="$(tr -d '\r' < "$cpf")"
-  "$JDK25/bin/javac.exe" -cp "$cp" -d "$(cygpath -w "$HERE")" "$(cygpath -w "$HERE/KRun.java")" \
+  local javac; javac="$(jdk_tool javac)" || die "no javac under $JDK25/bin"
+  "$javac" -cp "$cp" -d "$(cygpath -w "$HERE")" "$(cygpath -w "$HERE/KRun.java")" \
     || die "KRun.java failed to compile"
 }
 
@@ -303,7 +321,7 @@ run_mode() {
   local VM JH_ARGS=() JIT_ARGS=() label="$mode"
   local STACK_ARGS=(--stack-dump-on-timeout 0)
   case "$mode" in
-    hotspot)   VM="$JDK25/bin/java.exe"; STACK_ARGS=(); SPRING_JVM_ARGS+=(-Xshare:off) ;;
+    hotspot)   VM="$(jdk_tool java)" || die "no java under $JDK25/bin"; STACK_ARGS=(); SPRING_JVM_ARGS+=(-Xshare:off) ;;
     jit-real)  VM="$(find_vm)" || die "cratonvm.exe not found (set CRATONVM_BIN or build it)"; JH_ARGS=(--java-home "$JDK25_WIN") ;;
     nojit-real)VM="$(find_vm)" || die "cratonvm.exe not found"; JH_ARGS=(--java-home "$JDK25_WIN"); JIT_ARGS=(--nojit) ;;
     jit-syn)   VM="$(find_vm)" || die "cratonvm.exe not found"; JH_ARGS=(--synthetic-jdk) ;;
