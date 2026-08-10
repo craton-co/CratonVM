@@ -233,6 +233,20 @@ Two concrete next steps, in order:
   allocation path (`jit/src/x64/bytecode_walk.rs:10055`, "writes
   array_length/GC_FLAG_COMPACT inline"), which has no dedicated off-gate yet and
   is array-shaped like the `slots=65536` / `obj_size=0x100010` misreads.
+* **Start from the partial-header window the emitter documents itself.**
+  `jit/src/x64/bytecode_walk.rs:10040` describes the non-`skip_helper` path as:
+  "bumps `thread.tlab.cursor`, writes `class_id` at obj_ptr+0, then tail-calls
+  `jit_post_tlab_init` to finish header + primitive defaults + finalizer
+  registration." The cursor is therefore published while the header is
+  incomplete, and the region's `[0, cursor)` — what every linear walker uses —
+  covers that object. The adjacent comment claims safety only for the *pure*
+  inline subset ("publishes a complete canonical header before advancing the
+  TLAB cursor and cannot call into GC"), which is chosen when
+  `skip_helper = !has_prim_init && !has_finalizer`. Sites with primitive-init or
+  finalizers keep the helper path. A trail entry like
+  `0x19188+0x28(cid=0,k=1)` — an Array with a valid kind and size but
+  `class_id = 0` — is a *partially written* header, not a zeroed one, which is
+  the signature this window would produce.
 
 **Do not read a single guard's count as a verdict** — the
 `CRATONVM_JIT_DISABLE_INLINE_NEW=1` arm shows `g1::get_field` hits dropping to
