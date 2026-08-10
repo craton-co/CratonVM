@@ -7438,7 +7438,7 @@ impl G1Collector {
         if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
             let remaining = regions[cur].remaining();
             if remaining >= 256 {
-                let actual = requested_size.min(remaining);
+                let actual = tlab_carve_size(requested_size, remaining);
                 if let Some((ptr, _off)) = regions[cur].bump_alloc(actual, 8, "tlab:cur-eden") {
                     // TLAB contract: every backend returns a fully zeroed
                     // chunk. Inline compiled allocation relies on this for
@@ -7479,7 +7479,7 @@ impl G1Collector {
             self.current_eden.store(idx, Ordering::Relaxed);
             let remaining = regions[idx].remaining();
             if remaining >= 256 {
-                let actual = requested_size.min(remaining);
+                let actual = tlab_carve_size(requested_size, remaining);
                 if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8, "tlab:fresh-eden") {
                     // `bump_alloc` has already zeroed exactly these `actual`
                     // bytes; re-zeroing them here was a second full pass over
@@ -9289,6 +9289,41 @@ fn debug_free_region_cursor(region: &G1Region, idx: usize, site: &'static str) {
     );
 }
 
+/// Size of a TLAB carve: the request, capped by what the region has left, and
+/// **rounded DOWN to a multiple of 8**.
+///
+/// The rounding is the whole point, and its absence was a live heap-corruption
+/// bug (`known-issues/springboot/g1-fullsuite-regression-20260808.md`).
+/// [`G1Region::bump_alloc`] aligns the carve's START to 8 and then commits
+/// exactly `size` bytes, so an unaligned `size` leaves `region.cursor` on an odd
+/// boundary. `Tlab::new` meanwhile rounds its `end` DOWN to 8 — its documented
+/// "release-mode safety net ... giving up at most 7 bytes of tail". The two
+/// disagree, and the bytes between them belong to nobody:
+///
+/// * `Tlab::retire`'s filler covers `[cursor, end)` and stops at the TRIMMED end;
+/// * `Tlab::reserved_tail` publishes `[cursor, end)` and stops there too;
+/// * the next `bump_alloc(_, 8)` re-aligns UP, skipping past them.
+///
+/// So a linear walk arriving at the trimmed end finds zero bytes that no filler,
+/// no skip span and no object describes. It can only read them as an all-zero
+/// 16-byte object, which puts every later step off the real grid — the walk
+/// desyncs, is abandoned, and every heap reference past that offset goes
+/// un-rewritten by the pause.
+///
+/// Observed exactly: a carve of `0x11664` bytes at `0xf198` ends at `0x207fc`,
+/// the TLAB ends at `0x207f8`, the next object starts at `0x20800`, and the
+/// walker strode `0x207f8 -> 0x20808` into its middle.
+///
+/// `GenerationalHeap::refill_tlab` has masked with `& !7` since 2026-07-18
+/// (`internal/fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md`),
+/// for this same reason. G1's copy of the carve never got it, which is precisely
+/// why the corruption reproduced under `-XX:+UseG1GC` and not under the default
+/// collector.
+#[inline]
+fn tlab_carve_size(requested_size: usize, remaining: usize) -> usize {
+    requested_size.min(remaining) & !7
+}
+
 /// Find the first free region.
 fn find_free_region(regions: &[G1Region]) -> Option<usize> {
     regions
@@ -10180,6 +10215,57 @@ mod tests {
         assert!(!ptr2.is_null());
         assert_eq!(offset2, 64);
         assert_eq!(r.cursor, 192);
+    }
+
+    #[test]
+    /// A TLAB carve must end 8-aligned, because `Tlab::new` rounds its `end`
+    /// DOWN to 8 while `bump_alloc` commits the full size to `region.cursor`.
+    /// Any gap between those two is heap no man's land — see
+    /// [`tlab_carve_size`] for what a linear walk does when it arrives there.
+    ///
+    /// `0x11664` is the size actually observed corrupting a walk.
+    #[test]
+    fn tlab_carve_size_never_leaves_an_unaligned_tail() {
+        for (req, rem) in [
+            (0x11664usize, 1 << 20),
+            (0x1d7e4, 1 << 20),
+            (0xebf2, 1 << 20),
+            (0x8b32, 1 << 20),
+            (0x4599, 1 << 20),
+            // The cap side must round too: `remaining` is a cursor delta and
+            // carries the same mod-8 dregs a request does.
+            (1 << 20, 0x207fc),
+            (1 << 20, 261),
+        ] {
+            let actual = tlab_carve_size(req, rem);
+            assert_eq!(actual & 7, 0, "req={req:#x} rem={rem:#x} -> {actual:#x}");
+            assert!(actual <= req && actual <= rem);
+            // Never rounds a usable carve away entirely: both production call
+            // sites are guarded by `remaining >= 256`, so the mask can shave at
+            // most 7 bytes off something already >= 256.
+            assert!(actual > 0, "req={req:#x} rem={rem:#x}");
+        }
+    }
+
+    /// The exact geometry from the failing run, asserted end to end: with the
+    /// mask, the region cursor after a carve is where `Tlab::new` would put the
+    /// TLAB's end, so no orphan sliver exists for a walk to trip on.
+    #[test]
+    fn a_masked_carve_leaves_region_cursor_equal_to_the_tlab_end() {
+        let mut r = G1Region::new(1 << 20);
+        // Put the carve at the observed offset.
+        r.bump_alloc(0xf198, 8, "test").unwrap();
+        let actual = tlab_carve_size(0x11664, r.remaining());
+        let (ptr, off) = r.bump_alloc(actual, 8, "test").unwrap();
+        let tlab_end_addr = (ptr as usize + actual) & !7usize; // what Tlab::new keeps
+        let region_end_addr = ptr as usize + actual; // what the cursor commits
+        assert_eq!(
+            tlab_end_addr, region_end_addr,
+            "carve at {off:#x} of {actual:#x} leaves [{tlab_end_addr:#x},{region_end_addr:#x}) \
+             owned by neither the TLAB nor any object",
+        );
+        assert_eq!(r.cursor, off + actual);
+        assert_eq!(r.cursor & 7, 0);
     }
 
     #[test]
