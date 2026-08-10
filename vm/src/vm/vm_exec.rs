@@ -645,9 +645,17 @@ fn record_native_shadows_bytecode(
 /// bytecode to shadow. `SyntheticStub` is still refused here under `JdkOnly`,
 /// so §1.3 is enforced on this branch too.
 ///
-/// Wave-2 note: the right long-term shape is for the abstract declaration to
-/// resolve to the *implementing* class's method before reaching here, at which
-/// point step 3 covers it and this branch can go.
+/// **Do not "fix" this to match §7's literal wording.** It is a reviewed,
+/// justified, self-documented deviation, and reverting it stops the VM booting
+/// in both modes — which makes it a very fast way to discover that the wording
+/// was the thing that was wrong. The wave-2 record that adjudicated it (§11a)
+/// is retired; this banner is the surviving statement.
+///
+/// The right long-term shape is for the abstract declaration to resolve to the
+/// *implementing* class's method before reaching here, at which point step 3
+/// covers it and this branch can go. That is a **resolution-order** change with
+/// no defect behind it — nothing observable is wrong today — so it is an
+/// architectural cleanup and not a bug to be scheduled.
 pub fn resolve_dispatch<'a>(
     policy: cratonvm_types::compat::ExecutionPolicy,
     class: &crate::classloading::Class,
