@@ -365,6 +365,57 @@ not what is wrong with them.
 `Stale pointer` and `[g1][FREE-CURSOR]` are zero on both rounds too — all five
 counters this page has ever used, not a selected one.
 
+**The other two classes attributed to this defect in §3, re-run against the fix
+(G1, 3 rounds each):**
+
+| Class | before (G1) | after (G1) | guard / desync / `WALKBRK` / SIGSEGV |
+|---|---|---|---|
+| `CacheAutoConfigurationTests` | **5 bad / 6** — FAIL 2/59 ×4, SIGSEGV ×1 | **PASS 3/3**, 59 tests, 485/498/588 s | **0 / 0 / 0 / 0** |
+| `ChildManagementContextInitializerAotTests` | FAIL 3/5 | PASS 2/3 † | **0 / 0 / 0 / 0** |
+
+`CacheAutoConfigurationTests` is the strongest single confirmation available
+short of the Tomcat shard: it is the class that produced the
+`EXCEPTION_ACCESS_VIOLATION`, it failed *identically* on every bad run
+(`infinispanAsJCacheWithConfig`, `infinispanCacheWithConfig`), and it is now
+clean three times over with zero corruption signal of any kind.
+
+† See §3d — the remaining failure is a **different, newly-isolated defect** that
+the corruption was masking.
+
+### 3d. Residual: `ChildManagementContextInitializerAotTests` still fails ~1/3 under G1, WITHOUT corruption
+
+Fixing the carve did not make this class green, and it is worth being exact
+rather than filing it under "known flaky". ABBA control on the fixed binary,
+both collectors, plus the three G1 rounds above — nine runs total:
+
+| arm | result |
+|---|---|
+| default | **PASS 3/3** (305 / 314 / 298 s) |
+| G1 | **PASS 4/6**, FAIL 2/6 (347–453 s) |
+
+Both G1 failures are the *same* error, and it is not a heap-corruption face:
+
+```
+UnsatisfiedDependencyException: Error creating bean with name
+'webEndpointAutoConfiguration': ... Could not bind properties to
+'WebEndpointProperties' : prefix=management.endpoints.web,
+ignoreInvalidFields=false, ignoreUnknownFields=true
+```
+
+`gc::guard`, `DESYNCED` and `WALKBRK` are **zero on all nine runs** — the
+corruption instrumentation is silent straight through both failures. So this is
+a `@ConfigurationProperties` binding failure, not a zeroed header, and the two
+should not be conflated as they were before the carve fix.
+
+**How much to conclude: not much yet.** 2/6 vs 0/3 is underpowered, and §2 lists
+this class among the 11 that already flip run-to-run on the *default* collector
+with no G1 variable (PASS×2/FAIL×3 in the tracked history). The honest reading
+is that the corruption was masking a distinct, lower-frequency failure on this
+class, that it is *possibly* G1-correlated, and that establishing even that
+needs more default-arm rounds than three. It is recorded here so the next person
+starts from the failure text rather than re-deriving it — and so a green
+`Log4J2`/`Cache` pair is not mistaken for "all three §3 classes are fixed".
+
 The walk breaks are **gone**, not reduced — which is the direct prediction of
 the fix, since with no orphan sliver there is nothing for a walk to desync on.
 
@@ -669,8 +720,10 @@ the run. The A/B/C that would settle it here (default vs
 
 The fix is verified on the reproducer only. Nothing below has been re-run:
 
-1. **`CacheAutoConfigurationTests`** — the other reproducer (4–8 guard hits, one
-   `EXCEPTION_ACCESS_VIOLATION` at 272 s) and `ChildManagementContextInitializerAotTests`.
+1. ~~`CacheAutoConfigurationTests` and `ChildManagementContextInitializerAotTests`~~
+   — **done**, see the verification table in §3c: `Cache` is PASS 3/3 with zero
+   corruption signal; `Child` is corruption-free but carries a separate residual
+   (§3d).
 2. **The four Tomcat SIGSEGV classes** (§5b). Their crash needs full-suite
    conditions — 16 standalone and 4-way-concurrent process-runs produced zero
    crashes — so they can only be checked by re-running the actual shard.
