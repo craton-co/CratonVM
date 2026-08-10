@@ -32,10 +32,10 @@ rows said nothing at all.
 | `FloatingDecimal$1`, `ThreadLocalHoldCounter` slot 0 | **One writer, not two defects.** Both classes extend `ThreadLocal`, and `native_tl_init` opened with `set_field(this, 0, Object(None))` — write-only storage over `threadLocalHashCode:I`, the one field the real class declares. **Deleted**, because there is no field to relocate to. | 2 rows → **0** |
 | the five `_vmN` java.io Reader/Writer rows | **FIXED**, and measuring which build could reach them changed the fix — see the retired companion record `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`. | 5 rows → **0** |
 | step 2, the two `unknown` verdicts | **Adjudicated `safe`**, and the question's premise was wrong: the overlay had **eight** readers, not one, and two of them were reading it wrong (every `getLogger(Foo.class)` logger was named `"unknown"`). Fallback hits over five Spring Framework test classes, 87 tests: **zero**. | `CRATONVM_DBG_OVERLAY=1`, all green |
-| step 3, the two `breaks-under-strict` sites | **FIXED.** `FileInputStream` was already guarded by a by-NAME lookup and is re-verdicted `safe` with a witness; the FFM `ValueLayout` preseed is dropped under `--jdk-only` and the real `<clinit>` runs. | `probes/W2ValueLayoutProbe`, Compatible mode byte-identical |
+| step 3, the two `breaks-under-strict` sites | **FIXED.** `FileInputStream` was already guarded by a by-NAME lookup and is re-verdicted `safe` with a witness. The FFM `ValueLayout` preseed is dropped under `--jdk-only` and the `<clinit>` suppression lifted — and doing that exposed a live wrong-field read the preseed had been masking, so a sixth count-based guard went with it. (The constants are still produced by CratonVM's FFM factory rather than by `ValueLayouts$Of*Impl`; that is the `CompatibilityClassRequested` matter this record names separately, not a slot-numbering one.) | `probes/W2ValueLayoutProbe`: both modes byte-identical to the PRE-FIX binary and to HotSpot on all thirteen layout lines |
 | step 4, `safe` verdicts unchecked | **FIXED.** `SAFE_POSITIONAL_CLAIMS` + `check_positional_claims` re-ask the loaded image at every class definition, deliberately not behind a debug flag. | three tests, incl. the pre-9 `String` layout |
 
-## What changed on 2026-08-04## What changed on 2026-08-04 — step 2 of four
+## What changed on 2026-08-04 — step 2, partly (superseded above)
 
 *What specifically must change* lists four steps. Step 2 — **adjudicate the two
 `unknown` verdicts in `vm/src/vm/vm_object.rs`** — is now partly answered, with
@@ -855,7 +855,7 @@ exist.** The marker sweep covered `vm/src/vm/`; `native-builtins`,
 `native-collections` and `native-io` — where the great majority of index-based
 field access lives — were not swept.
 
-## Why it was not fixed in wave 1
+## Why it was not fixed in wave 1 (historical)
 
 Wave 1 is measurement, not deletion (contract §10). Two of the three verdicts
 are also not mechanical:
@@ -916,11 +916,24 @@ Six things, each paid for at least twice:
    masking a live wrong-field read, and dropping it without the by-name
    conversion would have traded a fabricated layout for a wrong byte order.
 
-## How to verify a fix
+## How to check it stays closed
 
+* **The census must stay at zero.** Both standing probes, both modes:
+
+  ```sh
+  CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home "$JAVA_HOME"     -cp . W2ResidualCensusProbe 2>&1 | grep -E "\[OVERLAY-LAYOUT\].*(NAME|VM) "
+  ```
+
+  and the same for `JdkOnlyCensusLoadProbe`. Before 2026-08-10 this printed the
+  five `_vmN` rows; it prints nothing now. Check the class you care about was
+  actually LOADED before reading a quiet run as a verdict —
+  `grep '^\[OVERLAY-LAYOUT\] [a-z]' | awk '{print $2}' | sort -u` lists them.
 * Per site: load the real class and assert `find_field_recursive(cid, name)`
   returns the index the code assumes. A `safe` claim that cannot be expressed as
-  such an assertion is not verified, it is remembered.
+  such an assertion is not verified, it is remembered — which is what
+  `shadow_layout::SAFE_POSITIONAL_CLAIMS` now does automatically, at every class
+  definition, for the claims that existed when it was written. **Adding a new
+  `JDK-ONLY-LAYOUT: safe` marker means adding its row there.**
 * End to end: the five `drop_real_layout_synthetic` classes are the ready-made
   regression corpus. A correct fix should let each of them keep its native
   surface *without* the drop — `StringJoiner.add()` moving `size`,
