@@ -10513,22 +10513,14 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         //
         // Inflate and displace the hash into the monitor instead — HotSpot's
         // answer, and a stable one, since a live object's monitor is never
-        // deflated here. The final `0 => i32::MAX` stays as a last-resort guard
-        // on the "never hand back 0" contract.
-        let hash = match self.shared.mem.heap.identity_hash_code(obj) {
-            0 => {
-                let heap = &self.shared.mem.heap;
-                self.shared
-                    .threads
-                    .monitors
-                    .identity_hash_via_monitor(obj, || heap.next_identity_hash())
-            }
-            h => h,
-        };
-        match hash {
-            0 => i32::MAX,
-            h => h,
-        }
+        // deflated here. `java_identity_hash` also keeps the last-resort
+        // "never hand back 0" guard.
+        let heap = &self.shared.mem.heap;
+        let heap_answer = heap.identity_hash_code(obj);
+        self.shared
+            .threads
+            .monitors
+            .java_identity_hash(obj, heap_answer, || heap.next_identity_hash())
     }
 
     fn register_var_handle_root(&mut self, vh: ObjectRef) {
