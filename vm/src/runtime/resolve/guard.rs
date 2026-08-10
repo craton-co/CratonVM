@@ -156,14 +156,17 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
     // Unit tests that exercise the primitives directly.
     // ---------------------------------------------------------------
     (
-        "vm/src/vm.rs",
+        // Was `vm/src/vm.rs` until 2026-08-10, when that file's 72k-line
+        // `#[cfg(all(test, feature = "synthetic-jdk"))] mod tests` moved to
+        // its own file. Same sites, same count, new path.
+        "vm/src/vm/tests.rs",
         ".resolution_cache",
         4,
         "unit test: `ResolutionCache` call-site put/get round trip. A test of \
          the cache must touch the cache.",
     ),
     (
-        "vm/src/vm.rs",
+        "vm/src/vm/tests.rs",
         "find_method_recursive(",
         1,
         "unit test: `m2_default_interface_method_resolution` pins that the \

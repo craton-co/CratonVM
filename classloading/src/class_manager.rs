@@ -11977,12 +11977,29 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
             2,
         ),
 
-        // Atomic types: 1 field (value=0)
-        "java/util/concurrent/atomic/AtomicInteger"
-        | "java/util/concurrent/atomic/AtomicLong"
-        | "java/util/concurrent/atomic/AtomicBoolean"
-        | "java/util/concurrent/atomic/AtomicReference"
-        | "java/util/concurrent/atomic/AtomicStampedReference"
+        // Atomic types: 1 field at slot 0, and it is `value` — the name and
+        // descriptor the real classes declare, not an `_f0` placeholder.
+        //
+        // The slot INDEX is unchanged, so every native that addresses it
+        // positionally is unaffected; what changes is that a by-NAME lookup
+        // now resolves. `findVarHandle(AtomicLong.class, "value", long.class)`
+        // used to be answered by a by-name fallback that laundered a failed
+        // resolution (removed in a01ccc442), and once that laundering was gone
+        // the honest answer here was `NoSuchFieldException` — because the stub
+        // declared no field by that name to find.
+        //
+        // `AtomicStampedReference` / `AtomicMarkableReference` keep the
+        // placeholder: their real single field is `pair`, a reference to a
+        // private `Pair` record this VM does not model, so naming the slot
+        // `value` would be a fabrication rather than a correction.
+        "java/util/concurrent/atomic/AtomicInteger" => vec![named_field("value", "I")],
+        "java/util/concurrent/atomic/AtomicLong" => vec![named_field("value", "J")],
+        // Real `AtomicBoolean.value` is an `int`, not a `boolean`.
+        "java/util/concurrent/atomic/AtomicBoolean" => vec![named_field("value", "I")],
+        "java/util/concurrent/atomic/AtomicReference" => {
+            vec![named_field("value", "Ljava/lang/Object;")]
+        }
+        "java/util/concurrent/atomic/AtomicStampedReference"
         | "java/util/concurrent/atomic/AtomicMarkableReference" => instance_fields(1),
         // Atomic arrays: 2 fields (array=0, length=1)
         "java/util/concurrent/atomic/AtomicIntegerArray"

@@ -6970,7 +6970,11 @@ unsafe fn jit_typecheck_resolve(
     // the JIT'd lambda body because `checkcast [I` after the clone() return
     // hit the false branch below and zeroed the result. With this branch
     // in place, the cast succeeds and the array round-trips correctly.
-    if vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+    // Read once and reused by both array branches and by the compile-time
+    // target check below. The slow path can refresh `*obj_ref` across a moving
+    // GC, but a relocation does not change what kind of object it is.
+    let recv_is_array = vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array;
+    if recv_is_array {
         if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, *obj_ref) {
             // AUTHORITATIVE for an array receiver — do NOT fall through on a
             // negative answer.
@@ -7039,7 +7043,6 @@ unsafe fn jit_typecheck_resolve(
     // does not has its own carve-outs at the bottom of this function
     // (`Object`/`Serializable`/`Cloneable`, and `Object[]`), which an id
     // comparison cannot reproduce.
-    let recv_is_array = vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array;
     if let Some(recorded) = cratonvm_jit::typecheck_target_for_site(class_name.as_ptr())
         .filter(|_| !recv_is_array)
     {
@@ -7254,7 +7257,7 @@ unsafe fn jit_typecheck_resolve(
     // ScannerTest / PackagedEntityManagerTest / SimpleTests). Gating the strict
     // path on the element kind fixes it. The lenient (`checkcast`) leniency is
     // preserved unchanged (SBR-03 keeps native `Object[]`→`T[]` casts working).
-    if vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+    if recv_is_array {
         if class_name == "java/lang/Object"
             || class_name == "java/io/Serializable"
             || class_name == "java/lang/Cloneable"
