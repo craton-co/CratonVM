@@ -165,6 +165,16 @@ pub mod mic_prof {
         *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
     }
 
+    /// `CRATONVM_DBG_MIC_TRACE` — the per-call `[DISP_TRACE]` line, separate
+    /// from [`enabled`] because one `eprintln` per dispatched call is only
+    /// affordable when dispatch is cold. It is not cold on a call-dense
+    /// workload, where it buries the counters it shares a switch with under
+    /// hundreds of megabytes of stderr.
+    pub fn trace_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_TRACE").is_some())
+    }
+
     #[inline]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
@@ -9132,6 +9142,100 @@ fn handle_jit_dispatch_error(
     }
 }
 
+/// The loader-faithful owner of a compiled `invokestatic` — but ONLY when it is
+/// a different class from the one the flat global binary-name map would hand
+/// back. `None` means "the by-name answer is already right; take the path this
+/// arm has always taken".
+///
+/// Returning `None` for the agreeing case is not an optimization, it is the
+/// safety property: `invoke_or_native` carries a large amount of behaviour that
+/// the on-class form does not reproduce (the native-registry override order, the
+/// `SyntheticStub`-yields-to-real-bytecode rule, the `DowncallHandle` and
+/// signature-polymorphic intercepts). Diverting every static dispatch through a
+/// second path to fix the case where they disagree would be trading a rare wrong
+/// answer for a common one.
+///
+/// The gates are ordered cheapest-first, because this sits on every compiled
+/// static call:
+///
+/// 1. no call-site class (`0`) — synthetic call sites naming JDK classes that
+///    have exactly one definition, per `JitInvokeInfo::declaring_class_id`;
+/// 2. no user-defined loader has ever defined ANY class in this process — one
+///    relaxed atomic, and it is the precondition for a name to have two
+///    definitions at all;
+/// 3. this NAME has one definition — `classify_loaded_name` is O(1) against the
+///    definition-count index, and `Unique`/`Absent` both mean the by-name answer
+///    cannot be the wrong copy.
+///
+/// Only past all three does it ask the caller's own loader, via the same
+/// `find_class_by_name_for_class` the direct-call path's `callee_compiler`
+/// already uses to pick a callee — a pure lookup, so unlike
+/// `resolve_class_loader_aware` it cannot re-enter Java `loadClass` from a
+/// dispatch helper.
+fn jit_static_owner_override(vm: &SharedVm, info: &JitInvokeInfo) -> Option<ClassId> {
+    if info.declaring_class_id == 0 {
+        return None;
+    }
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
+    let caller = ClassId::new(info.declaring_class_id);
+    let owner = {
+        let cm = vm.classes.class_manager.read();
+        loader_faithful_static_owner(&cm, caller, info.class_name)?
+    };
+    // DIAG (`CRATONVM_DBG=coerce`, the loader-split diagnostic this shares a
+    // subject with): a silent fix cannot be told from a fix that never fires.
+    // This line is what proves the arm ran on the run that went green.
+    if crate::runtime::env_cache::dbg_coerce() {
+        let by_name = vm
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(info.class_name);
+        eprintln!(
+            "[DBG_COERCE] jit invokestatic: {}.{}{} from cid={:?} -- by-name owner {by_name:?} \
+is NOT the caller's loader's copy {owner:?}; dispatching on the caller's",
+            info.class_name, info.method_name, info.descriptor, caller,
+        );
+    }
+    Some(owner)
+}
+
+/// The decision inside [`jit_static_owner_override`], without the two
+/// process-wide pre-gates.
+///
+/// Split out so it can be tested: the gates it drops are a `0` call-site class
+/// and the `any_defining_loader_registered` latch, both of which are pure
+/// short-circuits onto the `None` this returns anyway. The latch in particular
+/// is a process-global that a unit test would have to arm for the whole test
+/// binary, which is a worse trade than testing the decision it guards. That
+/// the wrapper still consults them is a source-level fact, and
+/// `jit_invokestatic_owner_override_is_gated_before_it_is_consulted` is what
+/// holds it.
+fn loader_faithful_static_owner(
+    cm: &crate::classloading::ClassManager,
+    caller: ClassId,
+    class_name: &str,
+) -> Option<ClassId> {
+    // A name with one definition cannot resolve to the wrong copy, and this is
+    // O(1) against the definition-count index — so it runs before the two
+    // lookups below rather than after them.
+    if !matches!(
+        cm.classify_loaded_name(class_name),
+        cratonvm_classloading::NameResolution::Ambiguous { .. }
+    ) {
+        return None;
+    }
+    let owner = cm.find_class_by_name_for_class(class_name, caller)?;
+    // The caller's loader agrees with the global map: nothing to correct, and
+    // the previous path is the one with all the special cases.
+    if cm.get_loaded_class_id(class_name) == Some(owner) {
+        return None;
+    }
+    Some(owner)
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo (heap-allocated, outlives this call).
 // args_ptr/num_args form a valid i64 slice of JIT-encoded arguments.
@@ -9153,10 +9257,18 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     jit_safepoint_flush_satb(vm_ptr);
     mic_prof::dump_maybe_disp();
     let _cyc_disp = mic_prof::CycGuard::new(&mic_prof::CYC_DISP_TOTAL);
-    // WS1 diagnostic: per-call dispatch trace (the dispatch helper is cold
-    // enough on the kafka repro — ~15 calls — that an eprintln per call is
-    // affordable and names the callee that encloses the lost wall time).
-    let _disp_trace = if mic_prof::enabled() {
+    // WS1 diagnostic: per-call dispatch trace, naming the callee that encloses
+    // the lost wall time.
+    //
+    // This used to ride on `mic_prof::enabled()`, justified by "the dispatch
+    // helper is cold enough on the kafka repro — ~15 calls — that an eprintln
+    // per call is affordable". On a call-dense workload it is not cold: on
+    // `ZipContentTests` the same switch wrote **268 MB of stderr in 73 seconds**
+    // and had to be killed, so the COUNTERS — which are the reason to reach for
+    // MIC_PROF at all, and are cheap — could not be read on the one workload
+    // that needed them. A per-call `eprintln` and a set of atomic counters do
+    // not belong on one switch. The trace now has its own.
+    let _disp_trace = if mic_prof::trace_enabled() {
         let info = &*(info_ptr as *const JitInvokeInfo);
         struct DispTrace {
             label: String,
@@ -10016,17 +10128,57 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             }
         }
         3 => {
-            // invokestatic: no receiver, no retarget concern. The historical
-            // `invoke_or_native` path is correct here (static method lookup
-            // by class name with native-override priority and superclass walk).
-            let r = crate::vm::invoke_or_native(
-                vm,
-                thread,
-                info.class_name,
-                info.method_name,
-                info.descriptor,
-                &values,
-            );
+            // invokestatic: no receiver, so no dispatch retarget can happen —
+            // but the OWNER is still constant-pool text, and a class NAME is
+            // not a class identity. This arm used to read "no retarget
+            // concern. The historical `invoke_or_native` path is correct
+            // here", which was true of the DISPATCH and false of the
+            // IDENTITY: `invoke_or_native` resolves `info.class_name` through
+            // the flat global binary-name map, so when two loaders define
+            // that name it binds the call to whichever copy the map holds.
+            // Exactly the defect the `invoke_kind == 1` arm above was fixed
+            // for (BUG-JIT-INVOKESPECIAL-LOADER-20260726) — the fix landed on
+            // invokespecial and stopped there.
+            //
+            // Measured 2026-08-10 on `AotIntegrationTests
+            // .endToEndTestsForBeanOverrides` (spring-test, under
+            // `@CompileWithForkedClassLoader`, which defines its own copy of
+            // every `org.springframework.*` class): a compiled static call
+            // made from the FORKED copy of `ResolvableType` landed in the
+            // APPLICATION copy, so the `ResolvableType` it returned belonged
+            // to the other class. `ResolvableType$WildcardBounds.get` then
+            // ran `while (…) candidate = candidate.resolveType()` against a
+            // `NONE` singleton from the wrong copy, `candidate == NONE` could
+            // never hold, and one core spun for as long as the machine was
+            // given — the hang this test was known for. The same method
+            // passes under `--nojit`, because the interpreter resolves the
+            // owner through the caller's own loader.
+            //
+            // STRICTLY ADDITIVE, by construction: the loader-faithful owner
+            // is consulted only behind `jit_static_owner_override`'s gates
+            // and used only when it DIFFERS from the global by-name answer,
+            // so a process with one copy of the name takes the identical
+            // previous path — including every special case
+            // `invoke_or_native` carries that the on-class form does not.
+            let r = match jit_static_owner_override(vm, info) {
+                Some(owner) => crate::vm::invoke_static_shared_on_class(
+                    vm,
+                    thread,
+                    owner,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+                None => crate::vm::invoke_or_native(
+                    vm,
+                    thread,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+            };
             match r {
                 Ok(v) => v,
                 Err(e) => {
@@ -13125,6 +13277,168 @@ mod tests {
     use super::*;
 
     // -----------------------------------------------------------------------
+    // A compiled `invokestatic` must not pick the other loader's copy
+    // -----------------------------------------------------------------------
+
+    /// Two loaders define one binary name; a compiled static call made from
+    /// inside the SECOND loader's copy must dispatch on that loader's copy, not
+    /// on whichever one the flat global name→id map happens to hold.
+    ///
+    /// # Why this is not a hypothetical
+    ///
+    /// `AotIntegrationTests.endToEndTestsForBeanOverrides` runs everything under
+    /// `@CompileWithForkedClassLoader`, which defines its own copy of every
+    /// `org.springframework.*` class it is asked for. A compiled static call out
+    /// of the forked copy of `ResolvableType` landed in the APPLICATION copy, so
+    /// the `ResolvableType` handed back belonged to the other class;
+    /// `WildcardBounds.get` then ran
+    /// `while (…) candidate = candidate.resolveType()` with a `NONE` from the
+    /// wrong copy, `candidate == NONE` could never hold, and one core spun until
+    /// the run was killed. `--nojit` passed the same method, because the
+    /// interpreter resolves the owner through the caller's own loader.
+    ///
+    /// # Three assertions, because one would pass against a stub
+    ///
+    /// The positive alone is satisfied by "always return the caller-loader
+    /// answer", which is the change that would have to be rejected for
+    /// `invoke_or_native`'s special cases (native-override order, the
+    /// `SyntheticStub` yield rule, the signature-polymorphic intercepts) to keep
+    /// working on every ordinary call. So the two negatives — a name with ONE
+    /// definition, and a caller whose loader agrees with the global map — are
+    /// asserted alongside it. `None` there is what keeps the previous path.
+    ///
+    /// # The two-copy state
+    ///
+    /// Built the way `aastore_fails_open_across_a_split_loaders_two_copies_of_one_name`
+    /// builds it: `ensure_synthetic_class` dedupes by name, so the second copy is
+    /// fabricated under its own name and renamed in place, then registered under
+    /// the user loader with `register_class_name` (the class manager's own
+    /// documented test side-door for exactly this).
+    #[test]
+    fn a_compiled_invokestatic_resolves_its_owner_in_the_callers_own_loader() {
+        use cratonvm_types::ClassLoaderId;
+
+        const OWNER: &str = "cratonvm/test/SplitStaticOwner";
+        const LONELY: &str = "cratonvm/test/LonelyStaticOwner";
+        const FORK: ClassLoaderId = ClassLoaderId::UserDefined(4242);
+
+        let shared =
+            std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+
+        let (app_copy, fork_copy, fork_caller, app_caller, lonely) = {
+            let mut cm = shared.classes.class_manager.write();
+
+            // The application loader's copy — what the global name→id map
+            // answers with, and what the old by-name dispatch would pick.
+            let app_copy = cm.ensure_synthetic_class(OWNER, 0);
+
+            // The forked loader's copy: fabricated under its own name, renamed,
+            // then given that loader's identity and name registration.
+            let fork_copy = cm.ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0);
+            cm.class_store
+                .get_mut(fork_copy)
+                .expect("just fabricated")
+                .name = cratonvm_types::intern_arc(OWNER);
+            cm.class_store
+                .get_mut(fork_copy)
+                .expect("just fabricated")
+                .loader_id = FORK;
+            cm.register_class_name(FORK, OWNER, fork_copy);
+
+            // The call SITE's class, once inside the fork and once outside it.
+            let fork_caller = cm.ensure_synthetic_class("cratonvm/test/ForkCaller", 0);
+            cm.class_store
+                .get_mut(fork_caller)
+                .expect("just fabricated")
+                .loader_id = FORK;
+            cm.register_class_name(FORK, "cratonvm/test/ForkCaller", fork_caller);
+            let app_caller = cm.ensure_synthetic_class("cratonvm/test/AppCaller", 0);
+
+            // A name only ONE loader ever defined — the overwhelmingly common
+            // case, and the one that must stay on the old path.
+            let lonely = cm.ensure_synthetic_class(LONELY, 0);
+
+            (app_copy, fork_copy, fork_caller, app_caller, lonely)
+        };
+        assert_ne!(app_copy, fork_copy, "the two copies must be distinct ids");
+
+        let cm = shared.classes.class_manager.read();
+        assert!(
+            matches!(
+                cm.classify_loaded_name(OWNER),
+                cratonvm_classloading::NameResolution::Ambiguous { .. }
+            ),
+            "the fixture must actually produce two definitions of one name — \
+             without that this test measures nothing",
+        );
+
+        // THE FIX. A call site inside the fork gets the fork's copy.
+        assert_eq!(
+            loader_faithful_static_owner(&cm, fork_caller, OWNER),
+            Some(fork_copy),
+            "a compiled invokestatic from a fork-loaded class must dispatch on \
+             the fork's copy of the owner, not on the application copy the \
+             global name map holds",
+        );
+
+        // Negative 1: the caller's loader agrees with the global map. Nothing to
+        // correct, and `None` is what keeps `invoke_or_native`'s path.
+        assert_eq!(
+            loader_faithful_static_owner(&cm, app_caller, OWNER),
+            None,
+            "when the caller's loader resolves to the same class the global map \
+             does, the override must decline so the ordinary dispatch path runs",
+        );
+
+        // Negative 2: one definition of the name. This is every call in a
+        // single-loader process, and it must not pay for or take the new path.
+        assert_eq!(
+            loader_faithful_static_owner(&cm, fork_caller, LONELY),
+            None,
+            "an unambiguous name must decline before any lookup — otherwise \
+             every static dispatch in every ordinary process changes route",
+        );
+        let _ = lonely;
+    }
+
+    /// The wrapper the dispatch helper actually calls must keep its two
+    /// process-wide pre-gates, which the test above deliberately does not arm.
+    ///
+    /// A source witness rather than a behavioural test: arming
+    /// `any_defining_loader_registered` is a process-global latch that would
+    /// leak into every other test in this binary. Matched on text inside the
+    /// function's own bounds, never on line numbers.
+    #[test]
+    fn jit_invokestatic_owner_override_is_gated_before_it_is_consulted() {
+        let src = include_str!("helpers.rs");
+        let start = src
+            .find("fn jit_static_owner_override")
+            .expect("jit_static_owner_override must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .expect("a top-level function must follow it")
+            + 1;
+        let body = &body[..end];
+        assert!(
+            body.contains("info.declaring_class_id == 0"),
+            "a call site with no class id must decline — those are the synthetic \
+             sites naming JDK classes with one definition",
+        );
+        assert!(
+            body.contains("any_defining_loader_registered()"),
+            "the process-wide latch must be the first real gate: with no user \
+             loader there can be no second copy, and this sits on every compiled \
+             static call",
+        );
+        assert!(
+            body.contains("loader_faithful_static_owner"),
+            "the wrapper must delegate the decision to the function the test \
+             above covers, or that coverage vouches for nothing",
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Leaf natives: the set, and the one thing that could make skipping
     // `invoke_or_native` wrong
     // -----------------------------------------------------------------------
@@ -14699,7 +15013,20 @@ mod tests {
         // Build the SharedVm via Box so we can take a `&mut` to enable
         // concurrent GC before sharing it. The JIT helper only requires
         // a raw `*const SharedVm` pointer, so no Arc is needed.
-        let mut vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        //
+        // The collector is PINNED, not defaulted. This test is about the
+        // GENERATIONAL backend's `satb_barrier` (as its own comment below
+        // says), and SATB does not exist on ZGC at all — that backend is a
+        // stop-the-world non-concurrent mark-sweep with no marking phase to
+        // keep a snapshot for. Naming the subject rather than inheriting
+        // `VmConfig::default()` is what makes the test survive a
+        // default-collector change; it did not survive the 2026-08-10 flip to
+        // `Zgc`, which is how this line came to be written.
+        let cfg = VmConfig {
+            gc_algorithm: crate::config::GcAlgorithm::Generational,
+            ..VmConfig::default()
+        };
+        let mut vm_box: Box<SharedVm> = Box::new(SharedVm::new(cfg));
 
         // Wire up the SATB queue + concurrent GC state on the heap. The
         // generational backend's `satb_barrier` is a hard no-op until

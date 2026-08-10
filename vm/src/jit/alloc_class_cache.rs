@@ -21,7 +21,9 @@
 //! fixed array of `AtomicPtr<Chunk>`; chunks hold `AtomicPtr<ClassAllocInfo>`
 //! entries published with a `null -> ptr` CAS. Entries are immutable once
 //! published and freed only on VM drop, so `get` can hand out `&` borrows
-//! tied to the cache's lifetime. The cache lives on `SharedVm` (NOT a process
+//! tied to the cache's lifetime — see [`JitAllocClassCache::invalidate`], which
+//! unpublishes without freeing precisely to keep that sentence true. The cache
+//! lives on `SharedVm` (NOT a process
 //! global): it is populated lazily from `ClassManager` state, and a process
 //! global would serve stale entries to a second VM in the same test process.
 //!
@@ -90,7 +92,21 @@ impl Chunk {
 /// Lock-free `ClassId -> ClassAllocInfo` side table (see module docs).
 pub struct JitAllocClassCache {
     chunks: Box<[AtomicPtr<Chunk>; TOP_LEN]>,
+    /// Entries unpublished by [`Self::invalidate`], held until `Drop`.
+    ///
+    /// Keeps "published entries are freed only on VM drop" — the invariant
+    /// [`Self::get`]'s borrow depends on — literally true. Touched only on the
+    /// STW unload path, so the mutex is never contended on an allocation.
+    retired: std::sync::Mutex<Vec<*mut ClassAllocInfo>>,
 }
+
+// SAFETY: `retired` holds `*mut ClassAllocInfo` only as deferred-free
+// bookkeeping — the pointers are never dereferenced while in the vector, and
+// `ClassAllocInfo` is `Send + Sync` by construction (a `bool` and a boxed slice
+// of `Copy` scalars). The rest of the cache is already shared across threads
+// through atomics.
+unsafe impl Send for JitAllocClassCache {}
+unsafe impl Sync for JitAllocClassCache {}
 
 impl Default for JitAllocClassCache {
     fn default() -> Self {
@@ -102,6 +118,7 @@ impl JitAllocClassCache {
     pub fn new() -> Self {
         JitAllocClassCache {
             chunks: Box::new([const { AtomicPtr::new(std::ptr::null_mut()) }; TOP_LEN]),
+            retired: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -169,10 +186,37 @@ impl JitAllocClassCache {
         }
     }
 
-    /// Remove and reclaim the immutable recipe for an unloaded class.
+    /// Unpublish the recipe for an unloaded class.
     ///
     /// Called only from the stop-the-world loader-unload transaction, after
     /// reachability proved that no instance or activation of the class remains.
+    ///
+    /// # Why this does not free the entry
+    ///
+    /// [`Self::get`] returns `&ClassAllocInfo` borrowed from `&self`, and its
+    /// SAFETY comment justifies that with "entries ... are only freed in `Drop`
+    /// (which takes `&mut self`)". This method used to `drop(Box::from_raw(..))`
+    /// immediately, which made that sentence false and the borrow a
+    /// use-after-free — the reader holds a plain `&`, so nothing at the type
+    /// level connects it to the swap here.
+    ///
+    /// The STW argument does not rescue it. The unload transaction's guarantee
+    /// is about *instances and activations of the unloaded class*, not about
+    /// which line of `jit_post_alloc_init` some other thread is parked on; and
+    /// the collector reaches its stop-the-world state partly by FORCIBLY
+    /// freezing in-JIT peers (`stw_take_over_and_wait`), which stops a thread at
+    /// an arbitrary instruction — including between `get()` and the
+    /// `info.prim_inits` walk it feeds. Such a thread resumes and reads a freed
+    /// `Box<[(u32, PrimKind)]>`: garbage field indices into `set_field` (dropped
+    /// by its bounds check, but only after the allocator has reused the memory)
+    /// and a garbage `has_finalizer` that can register an arbitrary object as
+    /// finalizable.
+    ///
+    /// So the entry is unpublished (no later `get` can find it, which is all
+    /// invalidation is FOR) and moved to `retired`, which `Drop` reclaims. The
+    /// leak is one recipe per unloaded class — a `bool` plus a boxed slice of
+    /// `(u32, PrimKind)` — bounded by classes actually unloaded, and paid only
+    /// on a path that already takes a VM-wide write lock.
     pub fn invalidate(&self, class_id: u32) -> bool {
         let idx = class_id as usize;
         let Some(chunk_slot) = self.chunks.get(idx / CHUNK_LEN) else {
@@ -188,9 +232,13 @@ impl JitAllocClassCache {
         if entry.is_null() {
             false
         } else {
-            // SAFETY: the STW unload transaction proved the class has no live
-            // users, and the swap gives this caller sole ownership.
-            drop(unsafe { Box::from_raw(entry) });
+            // Ownership moves to `retired`, NOT to a `drop` here: a concurrent
+            // (or forcibly-frozen) reader may still hold a `&` to it. See the
+            // doc comment above.
+            self.retired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(entry);
             true
         }
     }
@@ -212,6 +260,20 @@ impl Drop for JitAllocClassCache {
                     drop(unsafe { Box::from_raw(entry) });
                 }
             }
+        }
+        // The deferred-free list from `invalidate`. `&mut self` here means no
+        // `get` borrow can still be live, which is exactly the condition that
+        // was missing at the `invalidate` call site.
+        for entry in self
+            .retired
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            // SAFETY: unpublished by `invalidate` (so unreachable via `get`)
+            // and owned by this list ever since; pointer came from
+            // `Box::into_raw` in `insert`.
+            drop(unsafe { Box::from_raw(entry) });
         }
     }
 }
@@ -305,6 +367,63 @@ mod tests {
             assert_eq!(got.has_finalizer, id % 2 == 0);
             assert_eq!(got.prim_inits.as_ref(), &[(id, PrimKind::Double)]);
         }
+    }
+
+    /// `invalidate` must unpublish WITHOUT freeing: a reader that already has
+    /// the `&` — a thread frozen between `get()` and its `prim_inits` walk — is
+    /// unreachable from here and must not have its recipe reclaimed underneath.
+    ///
+    /// This asserts on the entry's CONTENT after the invalidate, so it fails
+    /// (loudly under Miri/ASan, and by mismatch once the allocator reuses the
+    /// block) if the entry is freed rather than retired. It also fixes the
+    /// direction of the other half: `get` must report the class as gone.
+    #[test]
+    fn invalidate_unpublishes_but_does_not_free_a_live_borrow() {
+        let cache = JitAllocClassCache::new();
+        cache.insert(
+            9,
+            ClassAllocInfo {
+                has_finalizer: true,
+                prim_inits: vec![(11, PrimKind::Long), (12, PrimKind::Double)].into_boxed_slice(),
+            },
+        );
+        // Stand in for the frozen reader: take the borrow BEFORE invalidating.
+        let borrowed = cache.get(9).expect("published");
+        assert!(cache.invalidate(9), "entry was published, so it unpublishes");
+        assert!(cache.get(9).is_none(), "invalidate must unpublish");
+        assert!(borrowed.has_finalizer);
+        assert_eq!(
+            borrowed.prim_inits.as_ref(),
+            &[(11, PrimKind::Long), (12, PrimKind::Double)],
+            "a borrow taken before invalidate must still read its own recipe",
+        );
+    }
+
+    #[test]
+    fn invalidate_is_idempotent_and_reinsertable() {
+        let cache = JitAllocClassCache::new();
+        cache.insert(
+            5,
+            ClassAllocInfo {
+                has_finalizer: false,
+                prim_inits: Box::new([(1, PrimKind::Int)]),
+            },
+        );
+        assert!(cache.invalidate(5));
+        assert!(!cache.invalidate(5), "second invalidate has nothing to take");
+        // The id is free again: a reloaded class with the same id must be able
+        // to publish a fresh recipe rather than inherit the retired one.
+        let fresh = cache
+            .insert(
+                5,
+                ClassAllocInfo {
+                    has_finalizer: true,
+                    prim_inits: Box::new([(2, PrimKind::Float)]),
+                },
+            )
+            .expect("slot is empty again");
+        assert!(fresh.has_finalizer);
+        assert_eq!(cache.get(5).unwrap().prim_inits.as_ref(), &[(2, PrimKind::Float)]);
     }
 
     #[test]

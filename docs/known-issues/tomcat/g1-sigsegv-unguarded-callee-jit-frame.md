@@ -106,9 +106,73 @@ fix. (`…DeploymentModification` times out on *both* arms, so it carries no
 signal at all here; and `…DeploymentWarXml`'s EXIT=1 is an ordinary test
 failure on both arms, not a crash.)
 
-Next attempt should therefore reproduce under suite-like conditions — several
-of these classes concurrently, or the shard that contained them — before
-reaching for any lever.
+### 4-way concurrency is not enough either
+
+Follow-up on the same binary: all 4 classes launched **simultaneously** under
+G1, each with its own `-Xmx2g`, 900 s cap, two rounds — the cheapest
+approximation of the shard pressure.
+
+| | r1 | r2 |
+|---|---|---|
+| `…AutomaticDeploymentModification` | TIMEOUT | TIMEOUT |
+| `…AutomaticDeploymentWar` | EXIT=0 | EXIT=0 |
+| `…AutomaticDeploymentWarXml` | EXIT=0 | EXIT=0 |
+| `TestHttpServletDoHead…` | EXIT=0 | EXIT=0 |
+| **crash reports** | **0** | **0** |
+
+Zero `EXCEPTION_ACCESS_VIOLATION` in 8 more process-runs (16 total across both
+experiments). Note `…DeploymentWarXml` passes here where it returned EXIT=1
+standalone, so these classes' *ordinary* outcomes are load-dependent too — but
+the crash never appeared.
+
+So the trigger needs more than these 4 classes and more than 4-way
+concurrency: something about the 651-class run itself — cumulative allocation
+across many classes, the specific shard composition and ordering, or a
+neighbour class that primes the condition. Reproducing it will most likely
+require re-running the actual shard rather than a subset, which also means
+`CRATONVM_G1_COVERAGE_PIN` can only be applied at that scale (and its cost —
+measured above at roughly 2-7x — makes a full pinned shard expensive but not
+obviously impossible).
+
+**What is worth carrying forward regardless:** all 4 classes are named in
+`gc young-gen last incomplete-coverage reason: innermost-rbp-belongs-to-unguarded-callee`,
+and the Spring Boot G1 page's corruption is `--nojit`-clean. If the two are one
+defect, the cheaper Spring Boot reproducer (`Log4J2LoggingSystemTests`, ~9 min,
+200-560 zeroed-header reads per run) is a far better vehicle for the fix than
+a 651-class Tomcat shard, and a fix validated there should be re-checked here.
+
+## 2026-08-10: the Spring Boot G1 corruption is ROOT-CAUSED — re-test before investigating further
+
+[`../springboot/g1-fullsuite-regression-20260808.md`](../springboot/g1-fullsuite-regression-20260808.md)
+§3c: `G1Collector::refill_tlab` carved TLABs whose size was not a multiple of 8.
+`bump_alloc` commits the full size to `region.cursor` while `Tlab::new` rounds
+its `end` DOWN to 8, so the bytes between the two ends were covered by no
+filler, no skip span and no object. A linear walk read them as an all-zero
+16-byte object, desynced 8 bytes off the real grid, and abandoned the walk —
+leaving every heap reference past that offset un-rewritten by the pause.
+`GenerationalHeap::refill_tlab` has masked with `& !7` since 2026-07-18; G1's
+copy never got it, which is exactly why it was G1-only. Fixed; the reproducer
+goes FAIL 18/61 → **PASS 61/61** with zero walk breaks.
+
+**This is very likely these crashes too, and the fix is cheap to test.** The
+symptom here — a read through a stale pointer under G1 where the default
+collector is merely slow — is what "references past the desync point are never
+rewritten" produces: the pause moves an object, the reference in the un-walked
+tail still names the old address, and the region is later reset and reused.
+
+**Before spending anything else on this page, re-run the shard on a binary with
+the fix** (`gc/src/g1.rs`, `tlab_carve_size`). Everything below was written
+before the root cause was known.
+
+**The mechanism this page proposes is now positively refuted, not merely
+doubted.** Root scanning was never the problem: the frame's roots are
+enumerated correctly, and the fix touches neither root scanning nor frame
+registration. `innermost-rbp-belongs-to-unguarded-callee` is a real condition
+and it is what pushes the collector onto the *linear-walk* path — which is where
+the unaligned carve bites. So the reason string is a genuine **precondition**
+for reaching the bug, which is why it correlates so well, but "an unguarded JIT
+frame's root points at freed memory" is the wrong story and the suggested fix
+(conservative treatment in G1's root scanner) would not have fixed it.
 
 ## Very likely the same defect as the Spring Boot G1 corruption — and the mechanism above may be the wrong one
 

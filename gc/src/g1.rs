@@ -1133,6 +1133,21 @@ pub struct G1Region {
     /// (only zero-filled by `reset`), so the bitmap base remains stable
     /// for the entire collector lifetime.
     pub mark_bitmap: MarkBitmap,
+    /// Diagnostic-only provenance ring for this region's cursor advances
+    /// (`CRATONVM_G1_DBG_REACH=1`). See [`BumpTrail`] for why a walk break needs
+    /// it: the trail of walked objects names the victim, this names the call
+    /// that committed the bytes.
+    bump_trail: BumpTrail,
+    /// The same, restricted to `tlab:*` carves.
+    ///
+    /// A shared ring cannot answer the question it exists for. TLAB carves are
+    /// rare and huge (one `0x1fa78`-byte carve observed) while per-object
+    /// advances are constant and small, so by the time a walk breaks inside a
+    /// carve, hundreds of `obj:*` entries have evicted it — which is exactly
+    /// what happened on all four breaks of the first run. Keeping carves in
+    /// their own ring makes the owner of a large committed hole recoverable no
+    /// matter how much per-object traffic followed it.
+    tlab_trail: BumpTrail,
 }
 
 impl G1Region {
@@ -1156,6 +1171,8 @@ impl G1Region {
             reuse_epoch: 0,
             recycled_in_generation: 0,
             mark_bitmap,
+            bump_trail: BumpTrail::default(),
+            tlab_trail: BumpTrail::default(),
         }
     }
 
@@ -1220,7 +1237,19 @@ impl G1Region {
 
     /// Bump-allocate `size` bytes (with alignment) in this region.
     /// Returns `(pointer, offset_within_region)` or `None` if region is full.
-    fn bump_alloc(&mut self, size: usize, align: usize) -> Option<(*mut u8, usize)> {
+    ///
+    /// `site` is a stable `&'static str` naming the caller, recorded in
+    /// [`Self::bump_trail`] under `CRATONVM_G1_DBG_REACH=1`. A per-object carve
+    /// and a TLAB carve leave indistinguishable bytes behind but carry entirely
+    /// different obligations afterwards (write a header now vs. retire/publish
+    /// the tail later), so the tag has to come from the call site — nothing left
+    /// in the region recovers it.
+    fn bump_alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        site: &'static str,
+    ) -> Option<(*mut u8, usize)> {
         let base = self.data.as_mut_ptr() as usize;
         let current = base + self.cursor;
         let aligned = (current + align - 1) & !(align - 1);
@@ -1232,6 +1261,14 @@ impl G1Region {
         }
 
         self.cursor = end;
+        if gc_flags().g1_dbg_reach {
+            self.bump_trail
+                .record(self.reuse_epoch, offset_in_region, size, site);
+            if site.starts_with("tlab:") {
+                self.tlab_trail
+                    .record(self.reuse_epoch, offset_in_region, size, site);
+            }
+        }
         let ptr = aligned as *mut u8;
         // Zero-init the allocated area. This is the SINGLE establishment of
         // the TLAB zeroing contract — `refill_tlab`'s carves used to repeat it
@@ -1875,16 +1912,17 @@ impl G1Collector {
         // Try current Eden region
         let cur = self.current_eden.load(Ordering::Relaxed);
         if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
-            if let Some(result) = regions[cur].bump_alloc(size, 8) {
+            if let Some(result) = regions[cur].bump_alloc(size, 8, "obj:cur-eden") {
                 return Some((result.0, cur));
             }
         }
 
         // Find a new free region for Eden
         if let Some(idx) = find_free_region(&regions) {
+            debug_free_region_cursor(&regions[idx], idx, "alloc_in_region");
             regions[idx].region_type = RegionType::Eden;
             self.current_eden.store(idx, Ordering::Relaxed);
-            if let Some(result) = regions[idx].bump_alloc(size, 8) {
+            if let Some(result) = regions[idx].bump_alloc(size, 8, "obj:fresh-eden") {
                 self.note_region_consumed_locked(&regions);
                 return Some((result.0, idx));
             }
@@ -1992,7 +2030,7 @@ impl G1Collector {
         // generational collector and the Step-9 parallel TLAB path already honour.
         for i in 0..regions.len() {
             if regions[i].region_type == target_type && !cset.contains(&i) {
-                if let Some((ptr, _)) = regions[i].bump_alloc(size, 8) {
+                if let Some((ptr, _)) = regions[i].bump_alloc(size, 8, "evac:cur-dest") {
                     return Some(ptr);
                 }
             }
@@ -2000,11 +2038,12 @@ impl G1Collector {
 
         // Allocate a new free region (Free regions are never in the CSet).
         if let Some(idx) = find_free_region(regions) {
+            debug_free_region_cursor(&regions[idx], idx, "alloc_in_type_locked");
             regions[idx].region_type = target_type;
             if target_type == RegionType::Survivor {
                 regions[idx].age = 1;
             }
-            if let Some((ptr, _)) = regions[idx].bump_alloc(size, 8) {
+            if let Some((ptr, _)) = regions[idx].bump_alloc(size, 8, "evac:fresh-dest") {
                 return Some(ptr);
             }
         }
@@ -4555,8 +4594,11 @@ impl G1Collector {
                         trail.render(),
                     );
                     eprintln!(
-                        "[g1][DESYNC-COVER] {}",
-                        describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor)
+                        "[g1][DESYNC-COVER] {} {} bumps=[{}]",
+                        describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
+                        r.tlab_trail
+                            .describe_owner_or(&r.bump_trail, r.reuse_epoch, offset),
+                        r.bump_trail.render(),
                     );
                 }
                 break;
@@ -4580,10 +4622,19 @@ impl G1Collector {
                         header.num_slots(),
                         trail.render(),
                     );
+                    let r = &regions[source_idx];
                     eprintln!(
-                        "[g1][WALKBRK-COVER] {} {}",
+                        "[g1][WALKBRK-COVER] {} {} {}",
                         describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
+                        r.tlab_trail
+                            .describe_owner_or(&r.bump_trail, r.reuse_epoch, offset),
                         hexdump_around(base, cursor, offset),
+                    );
+                    eprintln!(
+                        "[g1][WALKBRK-BUMPS] region={source_idx} epoch={} carves=[{}] bumps=[{}]",
+                        r.reuse_epoch,
+                        r.tlab_trail.render(),
+                        r.bump_trail.render(),
                     );
                 }
                 break;
@@ -4772,6 +4823,16 @@ impl G1Collector {
                             header.array_length(),
                             header.num_slots(),
                             trail.render(),
+                        );
+                        eprintln!(
+                            "[g1][WALKBRK-BUMPS] phase4 region={i} {} carves=[{}] bumps=[{}]",
+                            regions[i].tlab_trail.describe_owner_or(
+                                &regions[i].bump_trail,
+                                regions[i].reuse_epoch,
+                                offset,
+                            ),
+                            regions[i].tlab_trail.render(),
+                            regions[i].bump_trail.render(),
                         );
                     }
                     break;
@@ -7377,8 +7438,8 @@ impl G1Collector {
         if cur < regions.len() && regions[cur].region_type == RegionType::Eden {
             let remaining = regions[cur].remaining();
             if remaining >= 256 {
-                let actual = requested_size.min(remaining);
-                if let Some((ptr, _off)) = regions[cur].bump_alloc(actual, 8) {
+                let actual = tlab_carve_size(requested_size, remaining);
+                if let Some((ptr, _off)) = regions[cur].bump_alloc(actual, 8, "tlab:cur-eden") {
                     // TLAB contract: every backend returns a fully zeroed
                     // chunk. Inline compiled allocation relies on this for
                     // JVM default field values and zero-valued header words.
@@ -7413,12 +7474,13 @@ impl G1Collector {
             return None;
         }
         if let Some(idx) = find_free_region(&regions) {
+            debug_free_region_cursor(&regions[idx], idx, "refill_tlab");
             regions[idx].region_type = RegionType::Eden;
             self.current_eden.store(idx, Ordering::Relaxed);
             let remaining = regions[idx].remaining();
             if remaining >= 256 {
-                let actual = requested_size.min(remaining);
-                if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8) {
+                let actual = tlab_carve_size(requested_size, remaining);
+                if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8, "tlab:fresh-eden") {
                     // `bump_alloc` has already zeroed exactly these `actual`
                     // bytes; re-zeroing them here was a second full pass over
                     // the TLAB. See the sibling carve above.
@@ -9193,6 +9255,75 @@ fn count_young_regions_pinned_out(
     (jni, jit)
 }
 
+/// Assert, under `CRATONVM_G1_DBG_REACH=1`, the invariant every `Free` region
+/// is retyped on: **`Free` implies `cursor == 0`**.
+///
+/// [`find_free_region`] filters on `region_type == RegionType::Free` and nothing
+/// else, and none of its three callers resets the cursor before allocating from
+/// the region they just claimed. So the whole design rests on `reset` being the
+/// only way to become `Free` — and a violation would produce, in one step,
+/// exactly the shape under investigation: a region whose `cursor` commits a span
+/// no object header was ever written into. That makes the invariant worth
+/// stating where it is relied on rather than inferring it from the reset sites.
+///
+/// Diagnostic only: it reports and continues, because the retype itself is not
+/// the defect and aborting here would replace a walk break with a crash.
+#[inline]
+fn debug_free_region_cursor(region: &G1Region, idx: usize, site: &'static str) {
+    if !gc_flags().g1_dbg_reach || region.cursor == 0 {
+        return;
+    }
+    eprintln!(
+        "[g1][FREE-CURSOR] {site}: claimed Free region={idx} with cursor={:#x} != 0 \
+         (reuse_epoch={} recycled_in_generation={} live_bytes={} pinned={} age={}) — \
+         this region became Free without `reset`, so [0,{:#x}) is committed with no \
+         object grid. bumps=[{}]",
+        region.cursor,
+        region.reuse_epoch,
+        region.recycled_in_generation,
+        region.live_bytes,
+        region.pinned,
+        region.age,
+        region.cursor,
+        region.bump_trail.render(),
+    );
+}
+
+/// Size of a TLAB carve: the request, capped by what the region has left, and
+/// **rounded DOWN to a multiple of 8**.
+///
+/// The rounding is the whole point, and its absence was a live heap-corruption
+/// bug (`known-issues/springboot/g1-fullsuite-regression-20260808.md`).
+/// [`G1Region::bump_alloc`] aligns the carve's START to 8 and then commits
+/// exactly `size` bytes, so an unaligned `size` leaves `region.cursor` on an odd
+/// boundary. `Tlab::new` meanwhile rounds its `end` DOWN to 8 — its documented
+/// "release-mode safety net ... giving up at most 7 bytes of tail". The two
+/// disagree, and the bytes between them belong to nobody:
+///
+/// * `Tlab::retire`'s filler covers `[cursor, end)` and stops at the TRIMMED end;
+/// * `Tlab::reserved_tail` publishes `[cursor, end)` and stops there too;
+/// * the next `bump_alloc(_, 8)` re-aligns UP, skipping past them.
+///
+/// So a linear walk arriving at the trimmed end finds zero bytes that no filler,
+/// no skip span and no object describes. It can only read them as an all-zero
+/// 16-byte object, which puts every later step off the real grid — the walk
+/// desyncs, is abandoned, and every heap reference past that offset goes
+/// un-rewritten by the pause.
+///
+/// Observed exactly: a carve of `0x11664` bytes at `0xf198` ends at `0x207fc`,
+/// the TLAB ends at `0x207f8`, the next object starts at `0x20800`, and the
+/// walker strode `0x207f8 -> 0x20808` into its middle.
+///
+/// `GenerationalHeap::refill_tlab` has masked with `& !7` since 2026-07-18
+/// (`internal/fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md`),
+/// for this same reason. G1's copy of the carve never got it, which is precisely
+/// why the corruption reproduced under `-XX:+UseG1GC` and not under the default
+/// collector.
+#[inline]
+fn tlab_carve_size(requested_size: usize, remaining: usize) -> usize {
+    requested_size.min(remaining) & !7
+}
+
 /// Find the first free region.
 fn find_free_region(regions: &[G1Region]) -> Option<usize> {
     regions
@@ -9516,6 +9647,156 @@ impl WalkTrail {
             out.push_str(&format!("{off:#x}+{size:#x}(cid={cid},k={kind})"));
         }
         out
+    }
+}
+
+/// How many cursor advances [`BumpTrail`] keeps per region.
+///
+/// Sized from the first run that used it: a 12-entry ring resolved `OWNER` on
+/// none of four breaks, because a region takes hundreds of `obj:*` advances
+/// after the `tlab:*` carve that actually committed the span, and they evict it.
+/// Widening alone does not fix that (the ratio, not the depth, is the problem) —
+/// see [`G1Region::tlab_trail`] for the half that does.
+const BUMP_TRAIL_LEN: usize = 32;
+
+static NEXT_BUMP_TID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// Dense per-thread id for [`BumpTrail`]. Not an OS tid — it exists only so
+    /// a rendered trail can say "these two carves came from the SAME thread"
+    /// without a syscall or an allocation on the allocation path.
+    static BUMP_TID: u64 = NEXT_BUMP_TID.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn bump_tid() -> u64 {
+    BUMP_TID.with(|t| *t)
+}
+
+/// One recorded cursor advance: who moved `region.cursor`, from where, by how
+/// much, and in which incarnation of the region.
+#[derive(Default, Clone, Copy)]
+struct BumpEntry {
+    epoch: u64,
+    offset: usize,
+    size: usize,
+    tid: u64,
+    site: &'static str,
+}
+
+/// The last few [`G1Region::bump_alloc`] calls against one region.
+///
+/// [`WalkTrail`] names the last objects a broken walk CONSUMED; this names the
+/// calls that COMMITTED the span the walk broke inside. The two answer different
+/// halves of the same question, and only this half can distinguish the possible
+/// producers of a committed-but-headerless span:
+///
+/// * `bump_alloc` is the only production writer that advances `cursor` upward
+///   (`reset` sets 0, the humongous path sets `size`/0, and the parallel
+///   evacuator's `retire_tlab` is opt-in and off), and it zero-fills exactly
+///   what it hands out. So a zeroed span below `cursor` is always a chunk some
+///   caller took and never wrote a header into.
+/// * A per-object carve (`site="obj:*"`) is followed by a header write by the
+///   same caller, so it can only leave a hole if that write did not happen.
+/// * A TLAB carve (`site="tlab:*"`) is EXPECTED to be headerless above its
+///   owner's private cursor — but then the owner must either retire it (filler)
+///   or publish it (`reserved_tail`). A hole inside a `tlab:*` extent with zero
+///   published skip spans names an owner that did neither.
+///
+/// Recorded only under `CRATONVM_G1_DBG_REACH=1`. The ring is fixed-size so it
+/// never allocates under the regions lock, and entries carry `epoch` so a trail
+/// surviving a [`G1Region::reset`] cannot be misread as describing the current
+/// incarnation.
+#[derive(Default)]
+struct BumpTrail {
+    entries: [BumpEntry; BUMP_TRAIL_LEN],
+    len: usize,
+    next: usize,
+}
+
+impl BumpTrail {
+    #[inline]
+    fn record(&mut self, epoch: u64, offset: usize, size: usize, site: &'static str) {
+        self.entries[self.next] = BumpEntry {
+            epoch,
+            offset,
+            size,
+            tid: bump_tid(),
+            site,
+        };
+        self.next = (self.next + 1) % BUMP_TRAIL_LEN;
+        self.len = (self.len + 1).min(BUMP_TRAIL_LEN);
+    }
+
+    fn iter_oldest_first(&self) -> impl Iterator<Item = &BumpEntry> {
+        let start = if self.len == BUMP_TRAIL_LEN {
+            self.next
+        } else {
+            0
+        };
+        (0..self.len).map(move |i| &self.entries[(start + i) % BUMP_TRAIL_LEN])
+    }
+
+    /// Oldest-first rendering, `site@off+size(e=epoch,t=tid)` per advance.
+    fn render(&self) -> String {
+        let mut out = String::new();
+        for (i, e) in self.iter_oldest_first().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&format!(
+                "{}@{:#x}+{:#x}(e={},t={})",
+                e.site, e.offset, e.size, e.epoch, e.tid
+            ));
+        }
+        out
+    }
+
+    /// The recorded advance whose extent contains `offset` in incarnation
+    /// `epoch` — i.e. the call that committed the bytes a walk broke on.
+    ///
+    /// `None` is not "nobody committed it": the ring is short, so an old enough
+    /// advance is simply gone. The rendering says which, so a missing owner is
+    /// never read as evidence.
+    fn owner_of(&self, epoch: u64, offset: usize) -> Option<&BumpEntry> {
+        self.iter_oldest_first()
+            .find(|e| e.epoch == epoch && offset >= e.offset && offset < e.offset + e.size)
+    }
+
+    /// `describe_owner` against `self` first, falling back to `other`.
+    ///
+    /// Used to ask the `tlab:*`-only ring before the shared one: a large hole's
+    /// owner is a carve, and the shared ring is the one that loses it.
+    fn describe_owner_or(&self, other: &BumpTrail, epoch: u64, offset: usize) -> String {
+        if self.owner_of(epoch, offset).is_some() {
+            return self.describe_owner(epoch, offset);
+        }
+        other.describe_owner(epoch, offset)
+    }
+
+    fn describe_owner(&self, epoch: u64, offset: usize) -> String {
+        match self.owner_of(epoch, offset) {
+            Some(e) => format!(
+                "OWNER={} extent=[{:#x},{:#x}) size={:#x} tid={} epoch={}",
+                e.site,
+                e.offset,
+                e.offset + e.size,
+                e.size,
+                e.tid,
+                e.epoch
+            ),
+            None if self.len == 0 => {
+                "OWNER=unknown (no bump advances recorded for this region)".to_string()
+            }
+            None => format!(
+                "OWNER=unknown (not in the last {} advances; oldest kept starts at {:#x})",
+                self.len,
+                self.iter_oldest_first()
+                    .next()
+                    .map(|e| e.offset)
+                    .unwrap_or(0)
+            ),
+        }
     }
 }
 
@@ -9925,30 +10206,81 @@ mod tests {
     #[test]
     fn region_bump_alloc() {
         let mut r = G1Region::new(4096);
-        let (ptr, offset) = r.bump_alloc(64, 8).unwrap();
+        let (ptr, offset) = r.bump_alloc(64, 8, "test").unwrap();
         assert!(!ptr.is_null());
         assert_eq!(offset, 0);
         assert_eq!(r.cursor, 64);
 
-        let (ptr2, offset2) = r.bump_alloc(128, 8).unwrap();
+        let (ptr2, offset2) = r.bump_alloc(128, 8, "test").unwrap();
         assert!(!ptr2.is_null());
         assert_eq!(offset2, 64);
         assert_eq!(r.cursor, 192);
     }
 
     #[test]
+    /// A TLAB carve must end 8-aligned, because `Tlab::new` rounds its `end`
+    /// DOWN to 8 while `bump_alloc` commits the full size to `region.cursor`.
+    /// Any gap between those two is heap no man's land — see
+    /// [`tlab_carve_size`] for what a linear walk does when it arrives there.
+    ///
+    /// `0x11664` is the size actually observed corrupting a walk.
+    #[test]
+    fn tlab_carve_size_never_leaves_an_unaligned_tail() {
+        for (req, rem) in [
+            (0x11664usize, 1 << 20),
+            (0x1d7e4, 1 << 20),
+            (0xebf2, 1 << 20),
+            (0x8b32, 1 << 20),
+            (0x4599, 1 << 20),
+            // The cap side must round too: `remaining` is a cursor delta and
+            // carries the same mod-8 dregs a request does.
+            (1 << 20, 0x207fc),
+            (1 << 20, 261),
+        ] {
+            let actual = tlab_carve_size(req, rem);
+            assert_eq!(actual & 7, 0, "req={req:#x} rem={rem:#x} -> {actual:#x}");
+            assert!(actual <= req && actual <= rem);
+            // Never rounds a usable carve away entirely: both production call
+            // sites are guarded by `remaining >= 256`, so the mask can shave at
+            // most 7 bytes off something already >= 256.
+            assert!(actual > 0, "req={req:#x} rem={rem:#x}");
+        }
+    }
+
+    /// The exact geometry from the failing run, asserted end to end: with the
+    /// mask, the region cursor after a carve is where `Tlab::new` would put the
+    /// TLAB's end, so no orphan sliver exists for a walk to trip on.
+    #[test]
+    fn a_masked_carve_leaves_region_cursor_equal_to_the_tlab_end() {
+        let mut r = G1Region::new(1 << 20);
+        // Put the carve at the observed offset.
+        r.bump_alloc(0xf198, 8, "test").unwrap();
+        let actual = tlab_carve_size(0x11664, r.remaining());
+        let (ptr, off) = r.bump_alloc(actual, 8, "test").unwrap();
+        let tlab_end_addr = (ptr as usize + actual) & !7usize; // what Tlab::new keeps
+        let region_end_addr = ptr as usize + actual; // what the cursor commits
+        assert_eq!(
+            tlab_end_addr, region_end_addr,
+            "carve at {off:#x} of {actual:#x} leaves [{tlab_end_addr:#x},{region_end_addr:#x}) \
+             owned by neither the TLAB nor any object",
+        );
+        assert_eq!(r.cursor, off + actual);
+        assert_eq!(r.cursor & 7, 0);
+    }
+
+    #[test]
     fn region_bump_alloc_full() {
         let mut r = G1Region::new(128);
-        assert!(r.bump_alloc(64, 8).is_some());
-        assert!(r.bump_alloc(64, 8).is_some());
-        assert!(r.bump_alloc(1, 8).is_none()); // full
+        assert!(r.bump_alloc(64, 8, "test").is_some());
+        assert!(r.bump_alloc(64, 8, "test").is_some());
+        assert!(r.bump_alloc(1, 8, "test").is_none()); // full
     }
 
     #[test]
     fn region_remaining() {
         let mut r = G1Region::new(1024);
         assert_eq!(r.remaining(), 1024);
-        r.bump_alloc(100, 8);
+        r.bump_alloc(100, 8, "test");
         assert_eq!(r.remaining(), 924);
     }
 
@@ -14944,7 +15276,7 @@ mod tests {
             let mut regions = gc.regions.lock();
             regions[far_region].region_type = RegionType::Old;
             let (ptr, _) = regions[far_region]
-                .bump_alloc(HEADER_SIZE, 8)
+                .bump_alloc(HEADER_SIZE, 8, "test")
                 .expect("room in a fresh region");
             ptr as usize
         };

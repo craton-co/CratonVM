@@ -282,9 +282,31 @@ mod tests {
     // Each test pins distinct addresses and fully unpins them so the global
     // table is left empty for the next test (tests in a module run on the same
     // process; keep them order-independent by balancing pin/unpin).
+    //
+    // Distinct addresses and balanced pin/unpin are NOT sufficient, because
+    // these tests run in PARALLEL, not in sequence. `update_after_gc` rewrites
+    // the whole global table, so a test calling it remaps or drops pins a
+    // concurrently-running sibling is asserting on — and `pinned_addrs()` is a
+    // snapshot of what EVERY test has pinned right now, not of this test's own
+    // pins. `chained_pointer_map_keeps_every_pin` failed about 1 in 10
+    // whole-crate runs on that race (as `pinned.rs:394 assertion failed`)
+    // before this lock existed; it is pre-existing and was merely made more
+    // visible when the `zgc` feature joined the crate's default set.
+    //
+    // So: **every test in this module holds `pin_test_lock()` for its whole
+    // body**, not only the ones that call `update_after_gc`. The state is
+    // process-global, so a reader races the writers exactly as much as the
+    // writers race each other.
+    fn pin_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn pin_then_unpin_roundtrips() {
+        let _guard = pin_test_lock();
         let a = 0x1_0000_usize;
         assert!(!is_pinned(a));
         pin(a);
@@ -295,6 +317,7 @@ mod tests {
 
     #[test]
     fn refcount_is_balanced() {
+        let _guard = pin_test_lock();
         let a = 0x2_0000_usize;
         pin(a);
         pin(a); // overlapping critical section on the same array
@@ -308,6 +331,7 @@ mod tests {
 
     #[test]
     fn zero_addr_is_ignored() {
+        let _guard = pin_test_lock();
         pin(0);
         assert!(!is_pinned(0));
         unpin(0); // no-op, must not panic
@@ -315,6 +339,7 @@ mod tests {
 
     #[test]
     fn unbalanced_unpin_is_noop() {
+        let _guard = pin_test_lock();
         let a = 0x3_0000_usize;
         unpin(a); // never pinned — tolerated
         assert!(!is_pinned(a));
@@ -344,6 +369,7 @@ mod tests {
     /// Hence: pin DESCENDING, and replay over many address sets.
     #[test]
     fn chained_pointer_map_keeps_every_pin() {
+        let _guard = pin_test_lock();
         for run in 0..64usize {
             // Three live old-gen objects each sliding down one 32-byte slot,
             // exactly the shape `OldGen::compact_with_drop_flags` emits:
@@ -399,6 +425,7 @@ mod tests {
     /// rather than lose one, and `PINNED_COUNT` must track distinct keys.
     #[test]
     fn colliding_destinations_merge_refcounts() {
+        let _guard = pin_test_lock();
         let x = 0x52_0000_usize;
         let y = 0x52_0020_usize;
         let dest = 0x52_1000_usize;
@@ -422,6 +449,7 @@ mod tests {
     /// A map that moves nothing this table holds must leave it untouched.
     #[test]
     fn update_after_gc_ignores_an_unrelated_map() {
+        let _guard = pin_test_lock();
         let a = 0x53_0000_usize;
         pin(a);
         let mut map = cratonvm_types::PointerMap::default();
@@ -434,6 +462,7 @@ mod tests {
 
     #[test]
     fn pinned_addrs_snapshots_set() {
+        let _guard = pin_test_lock();
         let a = 0x4_0000_usize;
         let b = 0x4_1000_usize;
         pin(a);
@@ -455,6 +484,7 @@ mod tests {
     /// ever tightened into something that would mask the difference.
     #[test]
     fn a_token_releases_the_pin_after_the_object_moved() {
+        let _guard = pin_test_lock();
         let old = 0x61_0000_usize;
         let new = 0x61_8000_usize;
 
@@ -486,6 +516,7 @@ mod tests {
     /// no-op rather than an underflow.
     #[test]
     fn a_token_survives_repeated_moves_and_a_double_release() {
+        let _guard = pin_test_lock();
         let a = 0x62_0000_usize;
         let b = 0x62_4000_usize;
         let c = 0x62_8000_usize;
@@ -507,6 +538,7 @@ mod tests {
     /// so releasing one must not drop the other's keep-alive.
     #[test]
     fn tokened_and_untokened_pins_of_one_address_nest() {
+        let _guard = pin_test_lock();
         let a = 0x63_0000_usize;
         pin(a);
         let token = pin_tokened(a).expect("token");
@@ -520,6 +552,7 @@ mod tests {
     /// A zero address is not pinnable, and must not consume a token either.
     #[test]
     fn a_null_address_yields_no_token() {
+        let _guard = pin_test_lock();
         assert!(pin_tokened(0).is_none());
         assert!(!is_pinned(0));
     }

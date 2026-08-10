@@ -1680,6 +1680,27 @@ pub fn execute(
                 .is_some()
             {
                 true
+            } else if !crate::runtime::env_cache::jit_native_shadow_caller_seal() {
+                // MEASUREMENT LEVER ONLY — `CRATONVM_JIT=-native-shadow-caller-seal`.
+                //
+                // This seal is a CORRECTNESS guard: a compiled direct call
+                // bypasses the interpreter's native-vs-bytecode decision, so a
+                // caller compiled in spite of it can enter JDK bytecode the VM
+                // deliberately replaced. Running with it off is expected to
+                // MISBEHAVE, and it must never be a shipping configuration.
+                //
+                // It exists because the seal excludes 1,281 methods from the JIT
+                // on a Spring Boot context startup — more than the 1,155 that
+                // reach C2 — and the per-arm census shows the population is
+                // dominated by PRECISE hits (`direct=1015`), not by the
+                // class-blind arm (169, whose removal was measured worth
+                // nothing). So the question is no longer "is the detection too
+                // wide" but "is the per-METHOD granularity worth replacing with
+                // per-SITE", and that is a large compiler change. Pricing the
+                // ceiling first is cheaper than building it: if the whole seal
+                // is worth ~0 on this workload, the change should not be
+                // attempted at all.
+                false
             } else {
                 jit_method_calls_native_shadowed(
                     shared,
@@ -3403,6 +3424,35 @@ pub fn execute(
                                         method_name,
                                         method_descriptor,
                                     );
+                                    // The stash belongs to a DIFFERENT method — a
+                                    // nested compiled callee (often an INLINEE:
+                                    // `caller_frames` is empty and the key names the
+                                    // inlined body, so no call site on the dispatch
+                                    // path can attribute it) whose sentinel bubbled
+                                    // out to here. THIS method never trapped, so the
+                                    // "refusing side-effecting replay" arm below does
+                                    // not apply to it: that refusal is about a frame
+                                    // proving OUR OWN native code ran past bci 0, and
+                                    // a foreign frame proves nothing of the sort.
+                                    //
+                                    // Raising a fatal `InternalError` here also made
+                                    // an orphan permanent in a second way: the frame
+                                    // had already been TAKEN, so every later
+                                    // `has_last_deopt()` was clean, but only because
+                                    // the VM had died. Before the take it poisoned the
+                                    // sentinel disambiguation
+                                    // (`jit_dispatch_threw`) for unrelated call sites.
+                                    //
+                                    // Do what the sibling tier-up sink
+                                    // (`jit-callsite-b`, jit_bridge.rs) already does
+                                    // for exactly this case: de-speculate the frame's
+                                    // real owner so it stops re-trapping, drop the
+                                    // frame, and fall through to interpreted
+                                    // execution of this (innocent) method. Measured on
+                                    // `org.h2.test.scripts.TestScript`, which the
+                                    // fatal error killed at ~212 s with
+                                    // `stashed key "org/h2/util/StringUtils.cache:..."`
+                                    // while running `StringFunction1.getValue`.
                                     let mut materialize_failed = false;
                                     if resume_gate_ok && key_matches {
                                         let cached = Arc::new(CachedBytecodeMethod {
@@ -3455,6 +3505,49 @@ pub fn execute(
                                         }
                                         thread.native_pin_roots.truncate(pin_base);
                                     }
+                                    if !key_matches {
+                                        // The stash is a DIFFERENT method's — a
+                                        // nested compiled callee whose sentinel
+                                        // bubbled out to here, in practice an
+                                        // INLINEE (`caller_frames` empty, key naming
+                                        // the inlined body, so no call site on the
+                                        // dispatch path can attribute it and
+                                        // `try_resume_trapped_callee` leaves it
+                                        // stashed for an "outer consumer that CAN
+                                        // attribute it" — which for an inlinee never
+                                        // arrives).
+                                        //
+                                        // The refusal below does NOT apply to it: it
+                                        // exists because a frame belonging to THIS
+                                        // method proves this method's native code ran
+                                        // past bci 0, and a foreign frame proves
+                                        // nothing about this method at all. Raising a
+                                        // fatal `InternalError` for someone else's
+                                        // orphan killed the whole VM run — measured on
+                                        // `org.h2.test.scripts.TestScript`, dead at
+                                        // ~212 s with `stashed key
+                                        // "org/h2/util/StringUtils.cache:(...)"`
+                                        // while running
+                                        // `StringFunction1.getValue`, and on
+                                        // `TestCrashAPI` the same way.
+                                        //
+                                        // Do exactly what the sibling tier-up sink
+                                        // already does for this case
+                                        // (`jit-callsite-b`, jit_bridge.rs): the
+                                        // frame's real owner is de-speculated above
+                                        // via `DeoptimizationController::deoptimize`
+                                        // so it stops re-trapping, the orphan is
+                                        // dropped (it was taken at the top of this
+                                        // block, which is also what stops it
+                                        // poisoning `has_last_deopt`'s sentinel
+                                        // disambiguation at unrelated later call
+                                        // sites), and this innocent method falls
+                                        // through to interpreted execution.
+                                        despeculate_stashed_frame_method(
+                                            shared,
+                                            &rframe_for_despec,
+                                        );
+                                    } else {
                                     // Precise reconstruction is a correctness
                                     // requirement once native code has executed
                                     // past bci 0. Refuse a whole-method replay:
@@ -3463,8 +3556,6 @@ pub fn execute(
                                     let why = if !resume_gate_ok {
                                         "can_deopt_resume=false (no deopt points, \
                                          or an elided monitor)"
-                                    } else if !key_matches {
-                                        "the stashed frame belongs to a different method"
                                     } else if materialize_failed {
                                         "the frame could not be materialised from its map"
                                     } else {
@@ -3488,6 +3579,7 @@ pub fn execute(
                                             ),
                                         },
                                     ));
+                                    }
                                 }
                                 // Deoptimized — pending-NPE drain was hoisted above the
                                 // i64::MIN branch (round-8 CRIT fix); fall through to
@@ -4344,6 +4436,19 @@ pub(crate) fn try_osr_with_backoff(
             // Strictly a waste-elimination change: it removes compiles, never
             // adds compiled execution. The loop runs interpreted either way.
             if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
+                // Counted, because this path is why `osr_entered=0` can appear
+                // next to `osr_refused_entry=0` and a non-zero `osr=` compile
+                // count — a combination that reads like "OSR was never even
+                // tried" when in fact an artifact was built and found
+                // un-enterable at this pc. `osr_refused_entry` is only recorded
+                // inside `try_osr`, which this arm returns before reaching, so
+                // without these two the whole OSR lifecycle line is silent about
+                // the most common way OSR fails to happen.
+                cratonvm_jit::metrics::record_osr_event(if published_but_unenterable {
+                    "osr_published_but_unenterable"
+                } else {
+                    "osr_method_denied"
+                });
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }

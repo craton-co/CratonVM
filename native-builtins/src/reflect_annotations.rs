@@ -3287,6 +3287,30 @@ fn annotation_member_return_descriptor(
 }
 
 fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `CRATONVM_DBG=ann-proxy-prof` counts this entry too.
+    //
+    // The first version of that profiler instrumented only
+    // `annotation_proxy_dispatch_impl` — the INTERPRETER's hook — and reported
+    // ~100k dispatches on a Spring context startup, which would have made the
+    // whole annotation path worth <0.5s of a 305s run. But this native is a
+    // SECOND call site with its own AnnotationProxy routing (see the comment
+    // below: the by-name path here deliberately does not reach the interpreter
+    // hook's arms), so a workload whose proxies are reached through generated
+    // `$ProxyN` bodies is invisible to that counter. Counting one branch of a
+    // two-branch funnel is how a ceiling gets under-reported by the exact factor
+    // that matters.
+    let prof = crate::proxy_dispatch_prof_on();
+    let prof_entry = prof.then(std::time::Instant::now);
+    struct ProxyDispatchProfGuard(Option<std::time::Instant>);
+    impl Drop for ProxyDispatchProfGuard {
+        fn drop(&mut self) {
+            if let Some(t0) = self.0 {
+                crate::note_proxy_dispatch_ns(t0.elapsed().as_nanos() as u64);
+            }
+        }
+    }
+    let _proxy_dispatch_prof_guard = ProxyDispatchProfGuard(prof_entry);
+
     let proxy = match args.first() {
         Some(Value::Object(Some(p))) => *p,
         _ => {

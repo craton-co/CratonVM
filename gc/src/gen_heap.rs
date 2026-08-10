@@ -487,6 +487,21 @@ pub static LIVE_IN_DEAD_SPANS: AtomicU64 = AtomicU64::new(0);
 /// H2-CID0 — bounded report counter for [`LIVE_IN_DEAD_SPANS`].
 static LIVE_IN_DEAD_REPORTS: AtomicU64 = AtomicU64::new(0);
 
+/// H2-GCVAR (2026-08-10) — headers whose claimed extent SUBSUMED a live
+/// (marked) object, caught DURING the non-moving sweep walk rather than by the
+/// end-of-sweep [`LIVE_IN_DEAD_SPANS`] merge.
+///
+/// The merge is a safety net: it retains the span, but by the time it runs the
+/// walk has already strided the phantom and everything after it was decided on
+/// a grid that never resynchronised. Catching it at the header lets the walk
+/// re-anchor on an allocator-recorded object start and keep reclaiming, which
+/// is the difference between "this cycle freed the tail of the arena" and
+/// "this cycle freed nothing past the first phantom".
+pub static SWEEP_PHANTOM_EXTENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Bounded report counter for [`SWEEP_PHANTOM_EXTENTS`].
+static SWEEP_PHANTOM_REPORTS: AtomicU64 = AtomicU64::new(0);
+
 /// H2-CID0 — reclaim spans the sweep refused to publish because they already
 /// overlapped a free block. Publishing one is a double free: the allocator can
 /// hand the same bytes to two objects, and the second allocation zeroes them
@@ -9363,6 +9378,14 @@ impl GenerationalHeap {
         // (walk start, or the end of a known free block). Entries above the
         // watermark were collected while striding an unverified stretch.
         let mut dead_watermark: usize = 0;
+        // H2-GCVAR: where the walk was last standing on ground truth (walk
+        // start, the parallel prefix's verified end, or a free block's end),
+        // and the object it strode immediately before the current cursor.
+        // The phantom-extent report needs both: it fires where the break is
+        // DETECTED, and the stride that caused it is upstream of that.
+        let mut last_anchor_off: usize = 0;
+        let mut objects_since_anchor: usize = 0;
+        let mut prev_obj: (usize, usize, u32, u8) = (0, 0, 0, 0);
         let mut objects_live: usize = 0;
 
         let mut cursor: usize = 0;
@@ -9373,6 +9396,12 @@ impl GenerationalHeap {
         // whose headers were never written; the walk must retain them
         // without touching gc_flags/gc_age.
         let mut side_iter = side_sorted.iter().peekable();
+        // H2-GCVAR: monotone probe into the SAME ascending mark set, used by the
+        // phantom-extent check below. Separate from `side_iter` because that one
+        // answers "is THIS base marked" (equality) while this one answers "does a
+        // marked base fall strictly INSIDE the extent" — and the two questions
+        // leave the cursor in different places.
+        let mut live_probe: usize = 0;
         // H2-CID0: conservative candidates that NEITHER the anchor oracle NOR
         // the late grid walk could place. Lockstep exactly like `side_iter`:
         // an object whose span contains one of these must not be reclaimed,
@@ -9441,6 +9470,7 @@ impl GenerationalHeap {
                 used,
                 existing_free: &existing_free,
                 side_bits: &side_bits,
+                side_sorted: &side_sorted,
                 old_lo,
                 old_hi,
                 watched: watched.as_ref(),
@@ -9475,6 +9505,8 @@ impl GenerationalHeap {
                 // sequential walk's trustworthy anchor for any later unwind.
                 dead_watermark = dead_regions.len();
                 cursor = sweep_anchors[sweep_anchors.len() - 1];
+                last_anchor_off = cursor;
+                objects_since_anchor = 0;
             }
         }
         report_phase("sweep-walk-parallel-prefix");
@@ -9521,6 +9553,8 @@ impl GenerationalHeap {
                 if resynced {
                     // A free block's end is ground truth — a fresh anchor.
                     dead_watermark = dead_regions.len();
+                    last_anchor_off = cursor;
+                    objects_since_anchor = 0;
                     continue;
                 }
             }
@@ -9912,6 +9946,109 @@ impl GenerationalHeap {
                 }
             }
 
+            // ----- Phantom extent: a header that SUBSUMES a live object ------
+            //
+            // `side_sorted` is this cycle's mark set — object BASES, ascending —
+            // and live objects never nest. So a marked address strictly inside
+            // `(cursor, cursor + total_size)` is proof that this header's extent
+            // is not an object's: the walk left the object grid HERE.
+            //
+            // Until this check the only thing that noticed was the end-of-sweep
+            // `dead_regions` × `side_sorted` merge (`LIVE_IN_DEAD_SPANS`). That
+            // merge is sound — it RETAINS the span rather than zeroing it — but
+            // it runs after the walk has already strided the phantom, so every
+            // decision from the phantom to the end of the arena was taken on a
+            // grid that never resynchronised, and the unwind then throws all of
+            // them away. Measured on the 2026-08-10 three-collector H2 sweep:
+            // eight classes reported `spans=1 span_bytes=197216
+            // span_head_class_id=4044482304` — one ~192 KB "object" swallowing
+            // live ones — the same victim address repeatedly, milliseconds
+            // apart, and all eight then blew the 300 s per-class cap.
+            //
+            // Same reasoning as the G1 sibling's `scan_source_region_for_cset_refs`
+            // desync check (see `docs/known-issues/hibernate/g1-collector-fullsuite-*.md`):
+            // a desynchronised linear walk cannot resynchronise itself, so stop
+            // trusting it and re-anchor on ground truth.
+            //
+            // Cost is one monotone index advance per object over a list the mark
+            // phase already built and sorted — no allocation, no search.
+            {
+                let abs = from_base + cursor;
+                while live_probe < side_sorted.len() && side_sorted[live_probe] <= abs {
+                    live_probe += 1;
+                }
+                if side_sorted
+                    .get(live_probe)
+                    .is_some_and(|&a| a < abs + total_size)
+                {
+                    let victim = side_sorted[live_probe];
+                    SWEEP_PHANTOM_EXTENTS.fetch_add(1, Ordering::Relaxed);
+                    if SWEEP_PHANTOM_REPORTS.fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::error!(
+                            target: "cratonvm::gc::guard",
+                            offset = cursor,
+                            span_bytes = total_size,
+                            span_head_class_id = header.class_id.as_u32(),
+                            // RAW kind byte: a corrupt header can hold an
+                            // out-of-range discriminant, and `{:?}` on one indexes
+                            // a static name table past its end.
+                            kind_byte = ObjectHeader::kind_tag(
+                                header.mark_word.load(Ordering::Relaxed)
+                            ),
+                            num_slots = header.num_slots(),
+                            victim = format!("{victim:#x}"),
+                            victim_interior_offset = victim - abs,
+                            // Where the walk last stood on ground truth, and the
+                            // stride that took it from there to here. The break is
+                            // upstream of the detection: if `prev_*` sizes an object
+                            // that does not end at this offset, `prev_` IS the
+                            // mis-sized stride; if it does, look further back, and
+                            // `objects_since_anchor` says how far there is to look.
+                            last_anchor_off,
+                            objects_since_anchor,
+                            prev_off = prev_obj.0,
+                            prev_size = prev_obj.1,
+                            prev_class_id = prev_obj.2,
+                            prev_kind_byte = prev_obj.3,
+                            "young non-moving sweep: the header at this offset claims an \
+                             extent that SUBSUMES a live (marked) object. Live objects never \
+                             nest, so the walk is off the object grid here. Re-anchoring at \
+                             the next allocator-recorded object start rather than striding \
+                             the phantom and deciding the rest of the arena on a broken grid.",
+                        );
+                    }
+                    // Everything reclaimed since the last anchor was decided on a
+                    // grid this header calls into question — unwind it
+                    // (over-retention is always safe under this sweep), then
+                    // re-anchor exactly as the unlisted-zero-span path does.
+                    dead_regions.truncate(dead_watermark);
+                    if let Some(a) = next_grid_anchor(&grid_anchors, cursor) {
+                        if a > cursor && a < used {
+                            while free_iter.peek().is_some_and(|&&(off, sz)| off + sz <= a) {
+                                free_iter.next();
+                            }
+                            cursor = a;
+                            last_anchor_off = cursor;
+                            objects_since_anchor = 0;
+                            continue;
+                        }
+                    }
+                    if resync_to_next_free_block(&mut cursor, &mut free_iter) {
+                        last_anchor_off = cursor;
+                        objects_since_anchor = 0;
+                        continue;
+                    }
+                    break;
+                }
+            }
+
+            prev_obj = (
+                cursor,
+                total_size,
+                header.class_id.as_u32(),
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+            );
+            objects_since_anchor += 1;
             walked_count += 1;
             if retain_full_walk {
                 walked.push_back((
@@ -15120,6 +15257,11 @@ struct SweepCtx<'a> {
     used: usize,
     existing_free: &'a [(usize, usize)],
     side_bits: &'a crate::young_mark::YoungMarkBits,
+    /// The same mark set as `side_bits`, materialised as ascending absolute
+    /// addresses. Used only by the phantom-extent check, which asks "is any
+    /// marked base strictly inside this extent" — a range question the bitmap
+    /// would answer one word at a time.
+    side_sorted: &'a [usize],
     /// Old-gen extent as raw integers — `OldGen` itself is not `Sync`
     /// (it owns a `Vec<u8>` behind a `MutexGuard`), but `OldGen::contains`
     /// is exactly this range test.
@@ -15148,6 +15290,11 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         .existing_free
         .partition_point(|&(off, sz)| off + sz <= lo);
     let mut free_iter = ctx.existing_free[start..].iter().peekable();
+
+    // H2-GCVAR: monotone probe into the ascending mark set for the
+    // phantom-extent check below. One `partition_point` to enter this chunk's
+    // window, then a forward-only advance per object.
+    let mut live_probe = ctx.side_sorted.partition_point(|&a| a < from_base + lo);
 
     let mut cursor = lo;
     while cursor < hi {
@@ -15207,6 +15354,22 @@ fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkRes
         }
 
         let abs = from_base + cursor;
+
+        // A header whose extent subsumes a live (marked) object proves the walk
+        // is off the object grid — live objects never nest. The sequential walk
+        // owns the report and the re-anchor policy, so just abandon the attempt
+        // (this path has written nothing).
+        while live_probe < ctx.side_sorted.len() && ctx.side_sorted[live_probe] <= abs {
+            live_probe += 1;
+        }
+        if ctx
+            .side_sorted
+            .get(live_probe)
+            .is_some_and(|&a| a < abs + total_size)
+        {
+            return None;
+        }
+
         if header.is_forwarded() {
             // Evacuated to old gen by selective promotion: reclaim the young
             // slot, unless the forwarding target is not actually in old gen

@@ -85,7 +85,10 @@ optional = true
 package = "cratonvm-cuda-bridge"
 
 [features]
-default = ["mimalloc"]
+# `zgc` is in the default set as of 2026-08-10 — the launcher's default
+# collector IS ZGC now, so the feature is no longer opt-in. See
+# `vm/src/config.rs`'s `VmConfig::default` and `docs/gc-tuning.md`.
+default = ["mimalloc", "zgc"]
 # Round-7 cross-cutting Fix 2: opt-in global allocator. Enabled by default
 # because the gains on Windows are large and there is no downside on Linux
 # or macOS, but kept as a feature so musl / exotic targets can disable it

@@ -97,7 +97,7 @@ mostly just shuffled between HANG/FAIL/CRASH flavors (e.g. some h2-G1
 classes moved CRASH→HANG) — which is the expected shape for classes whose
 real problem was never this guard in the first place. See:
 
-- `../../../known-issues/h2/gc-variant-fullsuite-crashes-hangs-fails-20260810.md` — what's
+- `gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` (this folder) — what's
   still broken on h2 post-merge (a separate, still-open shared-SIGSEGV
   defect, plus a GC-specific object-grid-desync guard).
 - `../../../known-issues/spring/gc-variant-fullsuite-classpath-gap-and-fails-20260810.md` —

@@ -39068,60 +39068,106 @@ fn reflect_array_element_assignable(
     // had been created FROM. `adapt` is generic over the component type, so it
     // must go through `Array.set` where ordinary code emits `aastore` and sails
     // past. That asymmetry, not the loader split on its own, is why this
-    // surfaced here and nowhere else. See
-    // `docs/known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md`.
+    // surfaced here and nowhere else.
+    //
+    // The split itself was found and fixed on 2026-08-10 — a compiled
+    // `invokestatic` bound its owner class by name, so `createProxy` ran in the
+    // wrong loader's copy. See
+    // `fixed-suite-bugs/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md`.
+    // This check stays: it is the lenient rule `aastore` has always applied,
+    // and `Array.set` is supposed to apply the same one.
     //
     // `None` means the context models no hierarchy (mocks): keep the exact-only
     // answer above rather than widening it.
-    if ctx.aastore_element_assignable(arr, value).unwrap_or(false) {
-        return true;
-    }
-    let comp_name = ctx.class_name_of_id(component);
+    let admitted = ctx.aastore_element_assignable(arr, value).unwrap_or(false);
     // DIAG (`CRATONVM_DBG=coerce`): the refusal carries no detail of its own --
     // HotSpot's wording is the bare "array element type mismatch" and source
     // witnesses pin it -- so name both sides here instead. Mirrors the sibling
     // "argument type mismatch" diagnostic in `lang_class.rs`, including the
-    // loader ids, because the two are read together. See
-    // `field-set-argument-type-mismatch-is-a-loader-split-use-dbg-coerce`.
+    // loader ids, because the two are read together.
     //
-    // The value's INTERFACE list is the evidence that separates the two
-    // remaining explanations once the name fallback above has also declined:
-    // a proxy that lists the component's name means the walk is broken, and a
-    // proxy that lists nothing means its interfaces were never recorded at
-    // definition time (a different defect, in the proxy-definition path).
+    // This fires on every store the EXACT check could not prove, whether or not
+    // the shared predicate then admitted it, and says which happened. A
+    // diagnostic that only printed on the final refusal went silent the moment
+    // the fallback started working, which is exactly when the underlying
+    // question -- why are there two `ContextConfiguration`s? -- became
+    // unanswerable from a run. `admitted=` is the fallback's own signal.
     if crate::nbflags().dbg_coerce {
-        let comp_name = comp_name.unwrap_or_else(|| "<unnamed>".to_string());
-        let value_name = ctx
-            .class_name_of_id(value_class)
-            .unwrap_or_else(|| "<unnamed>".to_string());
-        let arr_name = ctx
-            .class_name_of_id(arr_class)
-            .unwrap_or_else(|| "<unnamed>".to_string());
-        let mut chain = String::new();
-        let mut cur = Some(value_class);
-        let mut hops = 0;
-        while let Some(c) = cur {
-            if hops > 16 {
-                chain.push_str(" -> ...");
-                break;
-            }
-            hops += 1;
-            let n = ctx.class_name_of_id(c).unwrap_or_default();
-            chain.push_str(&format!(
-                " -> {n}(cid={c:?},loader={:?})",
-                ctx.loader_id_of_class(c)
-            ));
-            cur = ctx.superclass_of(c);
-        }
-        eprintln!(
-            "[DBG_COERCE] Array.set: rejecting -- array={arr_name} component={comp_name} \
-(cid={component:?}, loader={:?}) value_class={value_name} (cid={value_class:?}, loader={:?}) \
-supers:{chain}",
-            ctx.loader_id_of_class(component),
-            ctx.loader_id_of_class(value_class),
-        );
+        reflect_array_store_diagnostic(&*ctx, arr_class, component, value_class, admitted);
     }
-    false
+    admitted
+}
+
+/// The `CRATONVM_DBG=coerce` witness for a reflective array store that the
+/// exact `ClassId` check could not prove.
+///
+/// Three facts decide between the explanations, and none of them is legible
+/// from the exception alone:
+///
+/// * **The component name's `NameLookup`.** `Ambiguous { definitions: n }` IS
+///   the loader split, counted. `Unique` means one class carries the name and
+///   the mismatch is something else entirely.
+/// * **The value's recorded interfaces.** A proxy listing a
+///   *different-`ClassId`* class of the component's own name says the two
+///   copies are real and the proxy picked the other one. A proxy listing
+///   NOTHING says its interfaces were never recorded at definition time — a
+///   different defect, in the proxy-definition path, and one that would make
+///   any interface-list-based repair silently do nothing.
+/// * **Both loader ids**, which name *which* copy each side holds.
+fn reflect_array_store_diagnostic(
+    ctx: &dyn NativeContext,
+    arr_class: ClassId,
+    component: ClassId,
+    value_class: ClassId,
+    admitted: bool,
+) {
+    let name_of = |c: ClassId| {
+        ctx.class_name_of_id(c)
+            .unwrap_or_else(|| "<unnamed>".to_string())
+    };
+    let comp_name = name_of(component);
+    let mut chain = String::new();
+    let mut cur = Some(value_class);
+    let mut hops = 0;
+    while let Some(c) = cur {
+        if hops > 16 {
+            chain.push_str(" -> ...");
+            break;
+        }
+        hops += 1;
+        chain.push_str(&format!(
+            " -> {}(cid={c:?},loader={})",
+            name_of(c),
+            ctx.loader_id_of_class(c)
+        ));
+        cur = ctx.superclass_of(c);
+    }
+    let mut ifaces = String::new();
+    for i in ctx.class_interfaces(value_class) {
+        ifaces.push_str(&format!(
+            " {}(cid={i:?},loader={})",
+            name_of(i),
+            ctx.loader_id_of_class(i)
+        ));
+    }
+    if ifaces.is_empty() {
+        ifaces.push_str(" <none recorded>");
+    }
+    eprintln!(
+        "[DBG_COERCE] Array.set: {} -- array={} component={comp_name} (cid={component:?}, \
+loader={}) value_class={} (cid={value_class:?}, loader={}) component_name_lookup={:?} \
+value_interfaces:{ifaces} supers:{chain}",
+        if admitted {
+            "admitted by the shared aastore predicate"
+        } else {
+            "rejecting"
+        },
+        name_of(arr_class),
+        ctx.loader_id_of_class(component),
+        name_of(value_class),
+        ctx.loader_id_of_class(value_class),
+        ctx.classify_class_name(&comp_name),
+    );
 }
 
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -42527,6 +42573,47 @@ pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
 /// probe cost 130M `getenv` calls per CratonBench `hashmap` run before
 /// `c258662e4`. Keep these reads as the LEFT operand of any `&&` whose right
 /// operand is a string compare, exactly as that fix required.
+
+/// Volume and cost of the NATIVE proxy-dispatch entry
+/// (`Proxy$Dispatch.invokeProxy`), armed by `CRATONVM_DBG=ann-proxy-prof`.
+///
+/// The companion counter in `annotation_proxy_dispatch_impl` covers only the
+/// interpreter's hook. This is the other half of the funnel, and on a workload
+/// whose annotations are reached through generated `$ProxyN` bodies it is the
+/// half that carries the traffic. Printed on the same flag so one run reports
+/// both.
+static PROXY_DISPATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROXY_DISPATCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn proxy_dispatch_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANN_PROXY_PROF").is_ok())
+}
+
+pub(crate) fn note_proxy_dispatch_ns(ns: u64) {
+    use std::sync::atomic::Ordering;
+    PROXY_DISPATCH_NS.fetch_add(ns, Ordering::Relaxed);
+    let n = PROXY_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100_000 == 0 {
+        eprintln!(
+            "[PROXY-DISPATCH-PROF] native invokeProxy calls={n} total={}ns/call cumulative={}ms",
+            PROXY_DISPATCH_NS.load(Ordering::Relaxed) / n,
+            PROXY_DISPATCH_NS.load(Ordering::Relaxed) / 1_000_000,
+        );
+    }
+}
+
+/// Final tally, for the exit dump — the number that turns "this call is 1000x
+/// too slow" into "and it is worth N seconds of the run".
+pub fn proxy_dispatch_prof_summary() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    let calls = PROXY_DISPATCH_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return None;
+    }
+    Some((calls, PROXY_DISPATCH_NS.load(Ordering::Relaxed)))
+}
+
 #[inline(always)]
 pub(crate) fn nbflags() -> &'static cratonvm_types::flags::NativeFlags {
     &cratonvm_types::flags().natives

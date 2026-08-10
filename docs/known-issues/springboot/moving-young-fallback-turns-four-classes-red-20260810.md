@@ -207,7 +207,135 @@ count with it on and off. The resolution it gates never succeeds there, so
 turning it off changes nothing. An inert lever is not an elimination; here it is
 positive evidence that the decode is failing rather than being skipped.
 
-### Measured: repairing it would convert NOTHING in a real workload
+### 2026-08-10, later: `Log4J2LoggingSystemTests` now COMPLETES on dev
+
+Re-run on `cratonvm-mygc-20260810.exe` (dev `3cb0129f6`), twice, `--Xmx 2g`:
+
+```
+SBRUNNER_RESULT tests=61 failed=14 aborted=0 skipped=0 containersFailed=0
+```
+
+— in **under 600s**, the same 61/14 HotSpot reports, where the `6365de194`
+binary did not finish in **3600s**. The row in the table above is therefore
+stale for this class. Something between `6365de194` and `3cb0129f6` fixed it;
+`cb947ffb8` ("retire a worker's TLAB before withdrawing it from tail
+publication") is the plausible candidate but **this has not been attributed by
+bisect** — do not cite it as the cause.
+
+Its fallback count is also **intermittent between runs of the same binary**:
+one run recorded 478 fallback cycles and completed, the next recorded **zero**
+and completed. That is consistent with the binding obligation
+(`xt-helper-window-conservative-scan`) depending on whether peer threads happen
+to be parked inside JIT frames when a collection lands, rather than on anything
+the class does deterministically.
+
+**Consequence for pricing `XT_HELPER_WINDOW`:** the A/B of its kill switch
+(`CRATONVM_JIT=xt-helper-window-scan=0` vs default) on this class was
+**inconclusive** — both arms recorded zero fallbacks, and a reduction cannot be
+measured from a zero baseline. Pricing it needs a workload with a *stable*
+fallback rate AND peer threads. `probes/MovingYoungFallbackCallFormProbe.java`
+has the stable rate (23–45 cycles per 20s run) but is single-threaded, so it
+never produces this reason at all. The missing artifact is that probe plus
+worker threads that park inside JIT frames.
+
+### Priced: `XT_HELPER_WINDOW` is also worth ZERO — the binding obligation is `cross-thread-jit-peer`
+
+`probes/MovingYoungFallbackPeerParkProbe.java` supplies what was missing: peers
+parked *under compiled frames* (each worker warms a recursive method until it is
+compiled, then re-enters it and blocks at the bottom of that chain) plus a main
+thread allocating hard enough to force collections while they sit there. It
+produces `xt-helper-window-conservative-scan` in every cycle, which no
+single-threaded probe can do, at a stable rate.
+
+Interleaved A/B of the existing kill switch, `CRATONVM_JIT=xt-helper-window-scan=0`:
+
+| arm | iters | cycles | with `xt-helper-window` | with `cross-thread-jit-peer` | rate /Miter |
+|---|---:|---:|---:|---:|---:|
+| on | 7.25M | 27 | 27 | 27 | 3.73 |
+| **off** | 7.61M | 28 | **0** | 28 | 3.68 |
+| on | 7.70M | 28 | 28 | 28 | 3.63 |
+| **off** | 9.07M | 33 | **0** | 33 | 3.64 |
+
+The lever **works** — the reason disappears entirely, 27/28 → 0 — so this is not
+the inert-lever ambiguity that made `CRATONVM_GC_NO_CALLEE_RESOLVE` unreadable.
+The measurement is sensitive and the answer is still zero: the fallback rate is
+flat across all four arms, because `cross-thread-jit-peer` is in **100% of
+cycles in both**.
+
+### Priced: pinning is CHEAP — ~50 conservative roots per parked peer, linear
+
+The one structural option that can be priced without building it, because the
+conservative root set is already counted (`XT_HELPER_WINDOW_ROOTS`, exposed by
+`CRATONVM_DBG=xt-jit-root-scan`). The pin set is exactly that set: the objects a
+pinning collector would have to leave in place while compacting everything else.
+
+`MovingYoungFallbackPeerParkProbe`, 15s per arm, `--Xmx 512m`, roots per
+helper-window pass:
+
+| parked peers | roots / pass | per peer | passes |
+|---:|---:|---:|---:|
+| 1 | 41 | 41.0 | 22 |
+| 2 | 85 | 42.5 | 22 |
+| 4 | 190 | 47.5 | 19 |
+| 8 | 403 | 50.4 | 18 |
+
+Dead linear at **~50 roots per parked peer**, and stable run to run (the 4-peer
+figure reproduced at 194 in a separate 25s run, every one of its 28 passes
+identical).
+
+Extrapolating: a Spring app with 40 threads parked in JIT frames pins ~2,000
+objects per collection; 200 threads pins ~10,000. For a compactor those are
+small numbers — a region- or block-based young collector marks the blocks
+holding them non-evacuable and compacts the rest. **The comparison that matters
+is against the status quo, where a SINGLE parked peer forces the entire
+collection to be non-moving.** Trading "compact nothing" for "leave ~50 objects
+per peer in place" is the whole prize on this page.
+
+Three caveats on the number:
+
+- These are conservative **candidates** — stack/register words that resolve to a
+  live object, including duplicates and false positives. Distinct pinned objects
+  is `<=` the figure, so ~50/peer is an upper bound.
+- A false positive pins a dead object, retaining garbage until the next cycle.
+  That is safe, and bounded by the same ~50/peer.
+- The per-peer constant is workload-shaped: this probe parks each peer under a
+  depth-12 recursion of one compiled method. Deeper or wider frames scan more
+  words. **The linearity is the robust finding; the constant is not.** A real
+  workload should be measured before the number is used for sizing.
+
+### The actual root: any peer thread with live JIT frames blocks compaction
+
+`CROSS_THREAD_JIT_PEER` is *"another thread holds live JIT frames whose coverage
+this thread's scan cannot verify and whose registers/stack are not rewritable."*
+That is not a decoding bug, and no per-reason repair reaches it. It explains
+every result on this page:
+
+- **single-threaded probes** have no peers, so they fall back only for
+  `innermost-rbp` — which is why repairing that looked like a 100% win there;
+- **every real workload here** is multithreaded Spring, so a peer holds JIT
+  frames essentially always, and moving-young is unreachable *regardless* of any
+  other obligation being repaired.
+
+So the honest framing is not "there is a bug making these four classes fall
+back". It is that **moving-young does not currently survive contact with a
+multithreaded workload**, and the four classes are just where that showed up as
+a timeout. Three separate repairs were priced against real cycles and all three
+came back at zero (`innermost-rbp` 0%, `xt-helper-window` 0%, and the
+`CRATONVM_GC_NO_CALLEE_RESOLVE` path inert).
+
+The only directions that can move this are structural, and should be priced
+before being built:
+
+1. **Bring blocked peers to a precise safepoint** so their roots become
+   rewritable — principled, and the largest.
+2. **Pin conservatively-found objects and compact around them** rather than
+   declining the whole collection. This is what production collectors do with
+   conservative roots, and it is the only option that converts a whole-heap
+   refusal into a bounded cost.
+3. **Keep threads out of JIT frames while blocked** — narrows the window without
+   closing it.
+
+### Measured: repairing the indirect-call path would convert NOTHING in a real workload
 
 `CRATONVM_DBG_GC_FALLBACK_REASONS=1` records the full per-cycle reason **set**
 (the stored reason is first-wins, so it cannot answer "would repairing X have

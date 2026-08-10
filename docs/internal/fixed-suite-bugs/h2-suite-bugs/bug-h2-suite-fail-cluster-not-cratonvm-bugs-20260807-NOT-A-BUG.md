@@ -1,6 +1,30 @@
-# Five FAILs from the 2026-08-07 sweep that likely are NOT CratonVM bugs
+# Five FAILs from the 2026-08-07 sweep that are NOT CratonVM bugs — CONFIRMED against HotSpot 2026-08-10
 
 ## Status
+**NOT-A-BUG, CONFIRMED 2026-08-10.** All five now have the HotSpot control this
+page asked for, and **stock HotSpot 25 fails all five identically** on the same
+host, same H2 build, same classpath, same 300 s per-class cap:
+
+| class | HotSpot 25 result | same failure as under CratonVM? |
+|---|---|---|
+| `TestClassLoaderLeak` | FAIL `ClassCastException: jdk.internal.loader.ClassLoaders$AppClassLoader` | yes, verbatim |
+| `TestExit` | FAIL (non-zero exit, no exception) | yes |
+| `TestJoin` | FAIL `PSQLException: Connection to localhost:5432 refused` | yes |
+| `TestMulti` | FAIL `JdbcSQLSyntaxErrorException: Syntax error in SQL statement "CREATE …` | yes |
+| `TestRecoverKillLoop` | FAIL `Failed: error! renaming file` | yes, verbatim |
+
+Run: `apps/h2database-suite-runner` `hotspot` mode over the 62-class
+non-passing union of the 2026-08-10 three-GC-variant sweep, JDK 25 at
+`/data/toolchain/jdk-25`. 44 PASS / 15 FAIL / 6 HANG. None of these five
+depends on timing, so the fact that the control shared the host with three
+concurrent CratonVM runs does not bear on them.
+
+Each explanation below stood up. Retained as written; only the status changed.
+
+---
+
+*Original text (2026-08-07), unchanged:*
+
 **LIKELY NOT-A-BUG, unconfirmed** — found 2026-08-07 in the same full-suite
 sweep as the rest of this batch. Each has a specific, plausible non-VM
 explanation below. None has been confirmed against real HotSpot yet — that
@@ -86,12 +110,41 @@ main() once" model doesn't match what this test needs to run meaningfully**
 VM defect. Unconfirmed: would need to read `TestRecoverKillLoop.java` to
 verify it truly expects external process-kill orchestration.
 
-## Next steps (applies to all five)
-Confirm each against real HotSpot + the same H2 jar/test-classes before
-treating any as fully closed:
+## Next steps (applies to all five) — DONE 2026-08-10
+Ran exactly this control (through the suite runner's `hotspot` mode, which
+builds the same classpath):
 ```bash
-$JAVA_HOME/bin/java -cp "target/classes:target/test-classes:$(cat craton-testcp.txt)" <class>
+cd apps/h2database-suite-runner
+JDK25=/data/toolchain/jdk-25 ./run-h2-suite.sh hotspot --category all \
+  --only '<the non-passing union>' --class-to 300 --max-heap 1g
 ```
-If HotSpot fails identically, retitle to `...-NOT-A-BUG.md` per convention
-and move to ``. If HotSpot passes any of them, that one is
-retracted from this doc and re-opened as a genuine CratonVM-specific defect.
+HotSpot fails all five identically, so all five are closed as NOT-A-BUG (see
+the Status table at the top). None is retracted.
+
+## The same control closed ten more, outside this page's five
+
+The 2026-08-10 run covered the whole 62-class non-passing union, and HotSpot 25
+also fails or hangs on these — so they are H2-suite / environment issues too,
+not CratonVM defects:
+
+| class | HotSpot 25 |
+|---|---|
+| `TestFunctions` | FAIL `AssertionError: Failure` (already had its own NOT-A-BUG page) |
+| `TestLob` | FAIL `MVStoreException: Chunk 6 not found` — matches `!bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md` |
+| `TestOutOfMemory` | FAIL `AssertionError: Failure` |
+| `TestCachedQueryResults` | FAIL `Expected: 100000 actual: 99995` |
+| `TestWeb` | FAIL `assertContains` |
+| `TestMVStore` | FAIL `Cache 1Mb, reads: 2872 expected: 1750 …` |
+| `TestTimer` | FAIL `NULL not allowed for …` |
+| `TestMemoryUnmapper` | FAIL `Expected: 2 actual: 1` |
+| `TestTools` | FAIL `Connection is broken` |
+| `TestPowerOffFs2` | HANG (then `Database is already closed`) |
+
+**Read the load caveat before reusing these.** That control shared an 8-core
+host with three concurrent CratonVM suite runs (load average ~20). For the
+exception-shaped rows above that changes nothing. For anything timing-shaped it
+might: `TestSubqueryPerformanceOnLazyExecutionMode` ("Lazy execution too slow"),
+`TestMVStore`'s cache-ratio assertion, and the six HANGs (`TestBenchmark`,
+`TestKill`, `TestMultiThreaded`, `TestPowerOffFs`, `TestPowerOffFs2`,
+`TestSynth`) are exactly the shape a loaded host manufactures. Re-run those on
+an idle host before quoting them as evidence of anything.

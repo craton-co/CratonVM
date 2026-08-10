@@ -30,7 +30,7 @@ harness edge case in this specific rerun rather than a new finding.)
 
 Zero `cratonvm::gc::guard` hits of any kind (`HIB-CV-32`/corrupt-Value-cell
 or otherwise) across all three variants' postmerge logs — unlike H2 (see
-`h2/gc-variant-fullsuite-crashes-hangs-fails-20260810.md`), Spring
+`../../internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md`), Spring
 Framework's non-passing set is **not** dominated by the GC-corruption
 family at all, in any of its manifestations.
 
@@ -170,10 +170,14 @@ clears.
 - `gc-corruption-guard-fixed-by-dev-merge-20260810.md` (this folder's
   sibling in `h2/`) — the before/after `dev`-merge story that prompted this
   run; also documents the h2 side of the same GC-variant sweep.
-- `../h2/gc-variant-fullsuite-crashes-hangs-fails-20260810.md` — H2's
+- `../../internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` — H2's (RETIRED: its shared SIGSEGV was a NIO view-storage defect, not a GC one)
   results from the identical run, where (unlike here) the non-passing set
   IS dominated by real CratonVM-level defects (a shared SIGSEGV site, a
   GC-guard near-miss) rather than a harness gap.
-- `aotintegration-hangs-after-the-unmodifiable-get-fix.md` (this folder) —
-  an earlier Spring AOT-related finding; check for overlap with the
-  `org/springframework/aot/` classpath-gap cluster above once that's fixed.
+- `aotintegration-hangs-after-the-unmodifiable-get-fix.md` — an earlier Spring
+  AOT finding, **closed 2026-08-10** and retired to the internal archive. Its
+  root cause was a compiled `invokestatic` binding its owner class by binary
+  NAME, so under `@CompileWithForkedClassLoader` it called into the other
+  loader's copy. Anything in the `org/springframework/aot/` cluster above that
+  involves two loaders defining one name should be re-run against a binary
+  carrying that fix before being investigated on its own.
