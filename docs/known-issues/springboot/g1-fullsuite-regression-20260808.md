@@ -387,6 +387,26 @@ the run. The A/B/C that would settle it here (default vs
 `CRATONVM_NO_MOVING_YOUNG=1` vs G1, with `--dump-phase-report=` and
 `CRATONVM_GC_STATS=1`) is set up but has not produced a clean set yet.
 
+## 5b. The Tomcat G1 SIGSEGVs are very probably this same defect
+
+[`../tomcat/g1-sigsegv-unguarded-callee-jit-frame.md`](../tomcat/g1-sigsegv-unguarded-callee-jit-frame.md)
+reports 4 of 651 Tomcat classes taking a native `EXCEPTION_ACCESS_VIOLATION`
+under `-XX:+UseG1GC` — three at the *same* JIT-compiled address — where the same
+classes pass or merely slow down under the default collector, with
+`gc young-gen last incomplete-coverage reason: innermost-rbp-belongs-to-unguarded-callee`
+and "the faulting thread had an UNREGISTERED JIT frame on its native stack".
+
+Every axis matches §3/§3b: G1-only, JIT-correlated, default collector merely
+slow, and a crash from dereferencing a stale pointer. §3 has its own
+`0xC0000005` with class-name ASCII in shadow-stack slots.
+
+That page attributes it to an unguarded JIT frame's *root* pointing at freed
+memory. §3b's measured chain is different — a JIT-**pinned** Eden region held
+out of the CSet is walked linearly, the walk is abandoned at a hole, and the
+**heap** references past it are never rewritten. Same crash signature, different
+fix. `CRATONVM_G1_COVERAGE_PIN=1` discriminates: a crash that survives it is not
+a relocation the root set failed to cover.
+
 ## 6. Cross-references
 
 * `QuartzEndpointWebIntegrationTests` — its own open page,
