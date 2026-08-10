@@ -109,21 +109,22 @@ fn aastore_refuses_a_real_mismatch_and_still_fails_open_where_it_must() {
 /// 2. the value is a SUBCLASS whose recorded superclass edge points at the
 ///    other loader's copy of the component.
 ///
-/// # One arm serves both, and the other is subsumed
+/// # One walk serves both arms
 ///
-/// The predicate spells these as two consecutive checks: an explicit
+/// The predicate used to spell these as two consecutive checks: an explicit
 /// `value_class.name == comp_name && value_class_id != comp_id`, then a by-name
-/// superclass walk. **Mutation testing says only the walk is load-bearing.**
+/// superclass walk. **Mutation testing said only the walk was load-bearing.**
 /// Disabling the walk fails scenario 2 as expected; disabling the explicit
-/// same-name check changes nothing at all, because the walk starts at
+/// same-name check changed nothing at all, because the walk starts at
 /// `value_class_id` itself, so its first iteration already tests
-/// `class.name == comp_name`. Anything the fast path accepts, the walk accepts
-/// one line later.
+/// `class.name == comp_name`. Anything the fast path accepted, the walk
+/// accepted one line later.
 ///
-/// That is recorded rather than acted on: the fast path is a redundant early
-/// return, not a wrong one, and deleting code in this predicate is a separate
-/// decision from covering it. If someone does remove it, this test should stay
-/// green — and if it does not, the two were less equivalent than they look.
+/// The fast path has since been removed and this test stayed green, which is
+/// the confirmation the equivalence argument needed. Both assertions below now
+/// run against the walk alone; scenario 1 is its first iteration and scenario 2
+/// is a later one. If a future change reintroduces a same-name early return,
+/// note that this test cannot tell the two apart — only mutating them can.
 ///
 /// # Building the pathological state
 ///
@@ -198,7 +199,7 @@ fn aastore_fails_open_across_a_split_loaders_two_copies_of_one_name() {
 
     // Scenario 1: the value IS the component, under the other copy. Served by
     // the by-name walk's first iteration (see the note above on why the
-    // explicit same-name fast path above it is subsumed).
+    // explicit same-name fast path that used to precede it was subsumed).
     assert!(
         aastore_element_assignable(&shared, alpha_arr, forked_obj),
         "the other loader's copy of the component must be storable — refusing \
@@ -247,9 +248,15 @@ fn array_set_routes_through_the_shared_aastore_predicate() {
     // Bound the search to this function so a coincidental match elsewhere in a
     // 39k-line file cannot vouch for it.
     let body = &src[start..];
-    let end = body
-        .find("\nfn native_array_get_length")
-        .expect("the function that follows it must exist");
+    // End at the next top-level `fn` rather than at a named neighbour: the
+    // function that follows this one has already changed once (a diagnostic
+    // helper was inserted between them), and a witness that has to be edited
+    // whenever a sibling is added is a witness that will one day be edited
+    // wrongly. `\nfn ` at column 0 cannot match an inner item.
+    let end = body[1..]
+        .find("\nfn ")
+        .expect("a top-level function must follow it")
+        + 1;
     let body = &body[..end];
     assert!(
         body.contains("ctx.aastore_element_assignable(arr, value)"),

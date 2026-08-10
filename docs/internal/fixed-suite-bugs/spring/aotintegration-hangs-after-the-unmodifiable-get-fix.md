@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | **OPEN.** The failure mode changed from FAIL to HANG. Both are wrong against HotSpot, but a hang costs a machine for hours, so read this before running the class. |
+| **Status** | **CLOSED 2026-08-10**, retired here out of `known-issues/spring/`. Both live methods pass under CratonVM with the JIT on. The hang was a JIT defect: a compiled `invokestatic` bound its owner class by NAME, so under `@CompileWithForkedClassLoader` it called into the *other* loader's copy. Read the last section first — everything above it is the investigation as it stood, including two readings this closed out as wrong. |
 | **Scope** | `org.springframework.test.context.aot.AotIntegrationTests` (spring-framework, `spring-test`). |
 | **Oracle** | HotSpot `found=4 succ=2 fail=0 skip=2`, 63 s. |
-| **Cap your timeout.** | It will not finish. 90 min is enough to observe everything below; 5.5 h buys nothing. |
+| **Cap your timeout** | Applied to every binary before `3f8c53583`. It no longer does. |
 
 ## What changed
 
@@ -328,3 +328,193 @@ which five other paths depend on and none of which had such a test.
 * **Not the per-`get` cost, confirmed independently.** A build carrying the
   variant of the collections fix that *does* pay a `size()` dispatch per `get`
   hung identically to one that does not, on the same host, same method.
+
+---
+
+## 2026-08-10: closed. The hang was a compiled `invokestatic` binding its owner by NAME
+
+Azure `20.80.105.49`, worktree `/data/cratonvm-aot-20260810`, real JDK 25
+(`/data/toolchain/jdk-25`), repaired classpath (0 of 253 missing), one process
+per method.
+
+| method | before (`58ffc3e60`) | after (`3f8c53583`) | HotSpot, same host |
+|---|---|---|---|
+| `endToEndTests` | `found=1 succ=1` | `found=1 succ=1` | agrees |
+| `endToEndTestsForBeanOverrides` | **hang** (killed at 16 min and again at 22 min, one core at 98 %) | **`found=1 succ=1`**, 8 m 15 s | `found=1 succ=1`, 175 nested tests, < 5 min |
+
+### The `Array.set` fix works, and it unmasked the next defect
+
+Verified end-to-end, which the entry above could not: a full run under
+`CRATONVM_DBG=coerce` produced **zero** `Array.set` rejections. (The 28
+`DBG_COERCE` lines it did produce are all `Field.set`, on
+`org/apache/logging/log4j/Level` — a *different* site, and a separate finding
+left open below.)
+
+And with the refusal gone, the method ran on into a phase it had never reached
+and spun — the same unmasking shape the top of this page predicted for the
+*previous* fix, one layer down.
+
+### Two readings above are wrong, and both cost real time
+
+* **"The nested suite is discovering nothing and then spinning."** It is not.
+  The `alter` / `onStart` / `onFinish`-with-no-`onTestStart` sequence is where
+  the *log* stops, not where the *run* stops: `LoggingListener` is the TestNG
+  engine's, and everything after that point is JUnit Jupiter, which logs
+  nothing at that level. `--stack-sample-ms 10000` showed the run moving
+  through 26 distinct Spring test classes after it.
+* **"Zero stack samples with a core pinned means the loop is in JIT-compiled
+  code."** The sampler produced **82 records in 13 minutes at a 10 s interval**
+  — ~100 % of expected. Whatever produced zero samples on the older binary, the
+  loop this page is about is fully visible to it. Read sampler *coverage*
+  (serviced/expected) before concluding anything from an empty result.
+
+### Where it actually spun
+
+15 consecutive samples at an identical 244-frame depth, leaf cycling among
+three methods of one class:
+
+```
+GenericTypeAwareAutowireCandidateResolver.isAutowireCandidate
+  ResolvableType.isAssignableFrom            (x2)
+    ResolvableType$WildcardBounds.get        <- the loop lives here
+      ResolvableType.resolveType / getType / isUnresolvableTypeVariable
+```
+
+`WildcardBounds.get` is
+
+```java
+ResolvableType candidate = type;
+while (!(candidate.getType() instanceof WildcardType || candidate.isUnresolvableTypeVariable())) {
+    if (candidate == NONE) return null;
+    candidate = candidate.resolveType();
+}
+```
+
+An instrumented copy of `ResolvableType.java` compiled against the fixture and
+prepended to the classpath (`/data/aot-runs/shadowcls`) printed the state at
+iteration 65+:
+
+```
+candEqNone=false  candClass=…  noneClass=…  sameClass=false
+candLoader=jdk.internal.loader.ClassLoaders$AppClassLoader
+noneLoader=org.springframework.core.test.tools.CompileWithForkedClassLoaderClassLoader
+```
+
+`candidate` **was** `NONE` — the application copy's `NONE`, while `get` was
+running in the forked copy, whose `NONE` is a different object. The reference
+comparison could never hold. HotSpot has the same two copies (the forked loader
+extends `testClassLoader.getParent()`, so `org.springframework.*` misses the
+parent and it defines its own) and never mixes them.
+
+The instrumented run also converted the hang into a failure and completed,
+showing exactly **3** occurrences — this is a small, specific defect, not a
+pervasive one.
+
+### Root cause
+
+`--nojit` passes the same method with the loop-detector never firing. That is
+the arm the top of this page asked for and never ran, and it is decisive: the
+interpreter resolves a field/method owner through the caller's own loader, and
+the JIT did not.
+
+`jit_invoke_dispatch`'s `invoke_kind == 3` (`invokestatic`) arm resolved its
+callee through `invoke_or_native(info.class_name, …)` — the flat global
+binary-name map. `JitInvokeInfo::declaring_class_id` exists precisely so this
+cannot happen, and the `invoke_kind == 1` (`invokespecial`) arm has used it
+since BUG-JIT-INVOKESPECIAL-LOADER-20260726. The fix landed on invokespecial and
+stopped, leaving behind a comment — *"invokestatic: no receiver, no retarget
+concern"* — that is true of the DISPATCH and false of the IDENTITY.
+
+So a static call made from the forked `ResolvableType` landed in the
+application copy and handed back an application-copy `ResolvableType`.
+
+### What landed (`3f8c53583`)
+
+`jit_static_owner_override` in `vm/src/jit/helpers.rs`, consulted by the
+`invoke_kind == 3` arm, plus `invoke_static_shared_on_class` in `vm_exec.rs`
+(the `invoke_special_shared_impl` body, whose "walk to the declaring class and
+dispatch on exactly that class" is also JVMS §5.4.3.3's static lookup once
+there is no receiver to retarget).
+
+**Strictly additive by construction.** Three gates, cheapest first — no
+call-site class id; the process-wide `any_defining_loader_registered` latch;
+and `classify_loaded_name` reporting anything but `Ambiguous` — and then the
+loader-faithful owner is used *only when it differs from the global by-name
+answer*. A process with one copy of the name takes the identical previous path,
+including everything `invoke_or_native` carries that the on-class form does not
+(native-override order, the `SyntheticStub`-yields-to-real-bytecode rule, the
+signature-polymorphic intercepts).
+
+The same commit resolves the "separate decision" the entry above left: the
+subsumed `value_class.name == comp_name && value_class_id != comp_id` early
+return in `aastore_element_assignable` is gone, folded into the by-name walk
+whose first iteration already covered it. The split-loader test stayed green,
+which is the confirmation that argument needed.
+
+### It is not a silent fix
+
+Under `CRATONVM_DBG=coerce` the override prints when it fires. On this method
+it fired **97 695 times in 87 s**, and the callees are exactly the machinery in
+question:
+
+```
+158318  Assert.notNull(Object,String)V
+ 15887  MergedAnnotation.missing()
+  8808  ClassUtils.isInnerClass(Class)Z
+   763  SynthesizedMergedAnnotationInvocationHandler.createProxy(MergedAnnotation,Class)
+   626  SerializableTypeWrapper.unwrap(Type)
+```
+
+`createProxy` is the call that mints the `jdk/proxy3/$Proxy27` whose store into
+a `ContextConfiguration[]` is what the whole first half of this page is about.
+**The loader split this page could only hypothesise is the same defect**, and
+`Array.set` adopting the lenient `aastore` predicate was a mitigation at the
+point of surfacing, exactly as it said.
+
+### Coverage
+
+* `a_compiled_invokestatic_resolves_its_owner_in_the_callers_own_loader`
+  (`vm/src/jit/helpers.rs`) — two copies of one name, a call site inside each,
+  and **three** assertions: the fix, plus the two negatives (`Unique` name, and
+  a caller whose loader agrees with the global map) that are what keeps every
+  ordinary dispatch on the old path. Shown to fail three ways: making the
+  override never fire, making it always fire, and dropping the latch gate each
+  fail the corresponding test.
+* `jit_invokestatic_owner_override_is_gated_before_it_is_consulted` — a source
+  witness for the two process-wide pre-gates, which a behavioural test cannot
+  arm without leaking a global latch into the whole test binary.
+
+### A/B regression sweep
+
+The change can only reach a process that has a user-defined loader AND a name
+with two definitions, so the sweep targeted exactly that population rather than
+a random slice: every spring-framework test class that uses
+`@CompileWithForkedClassLoader` (13 of them), plus
+`BeanRegistrationsAotContributionTests`, `MergedAnnotationsTests` and
+`ResolvableTypeTests`. One process per class, 900 s cap, both binaries on the
+same host in the same window.
+
+**16 classes: 15 byte-identical, 1 improved, 0 regressed.**
+
+| | base `58ffc3e60` | fix `3f8c53583` |
+|---|---|---|
+| `TestContextAotGeneratorIntegrationTests` | `found=4 succ=3 fail=1` | **`found=4 succ=4 fail=0`** |
+| `ApplicationContextAotGeneratorTests` | `found=40 succ=33 fail=7` | same 33/40 — pre-existing, untouched |
+| `BeanRegistrationsAotContributionTests` | timeout at 900 s | timeout at 900 s — same in both, and the box was running six of these at once |
+| the other 13 | all `status=OK` | identical |
+
+The improvement is the same defect: `processAheadOfTimeWithXmlTests` failed on
+base with `TestContextAotException` and passes with the owner resolved in the
+caller's loader.
+
+Raw output: `/data/aot-runs/ab-{base,fix}/`.
+
+### Still open, and NOT this page's defect
+
+`Field.set` refuses 26+2 times per run on
+`org/apache/logging/log4j/Level` — `expected` cid 5003 (loader 2) vs `arg_class`
+cid 1454 (loader 3), one binary name with two definitions, the caller being
+`LoggerConfig$Builder`. Same family, different site: the `Field.set` path has
+no loader-faithful owner resolution either. It does not affect this class's
+verdict (both methods pass with it happening), so it is recorded rather than
+fixed here.

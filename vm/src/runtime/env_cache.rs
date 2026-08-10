@@ -1012,6 +1012,19 @@ cached_is_ok!(dbg_arrlen, "CRATONVM_DBG_ARRLEN");
 /// the call sites; they are equivalent here (the flag is never set to
 /// non-UTF-8), so one predicate serves both.
 cached_is_ok!(dbg_loader_trace, "CRATONVM_DBG_LOADER_TRACE");
+/// `CRATONVM_DBG=coerce` — the loader-split coercion diagnostic.
+///
+/// The flag lives in `NativeFlags` because `native-builtins`' `Array.set` /
+/// `Field.set` refusals were its only readers. The JIT's `invokestatic`
+/// loader-faithful owner override prints under the SAME token deliberately: it
+/// is the same subject — one binary name, two loaders — seen from the other
+/// end, and someone who turns the token on to ask "is a loader split behind
+/// this?" wants both halves of the answer in one run. Read from the parsed
+/// flags rather than the environment, so the grouped spelling is what decides.
+#[inline]
+pub fn dbg_coerce() -> bool {
+    cratonvm_types::flags().natives.dbg_coerce
+}
 /// `CRATONVM_DBG_ISOLATED_CNF` — narrow trace for the isolated-URLClassLoader
 /// "class not found" hard-fail in [`resolve_class_loader_aware`]: prints the
 /// name, the referencing class, and the Java frames whenever an isolating

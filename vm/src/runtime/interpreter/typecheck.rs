@@ -676,22 +676,28 @@ pub(crate) fn aastore_element_assignable(
     // The element class must exist in the hierarchy; if not, fail open.
     {
         let cm = shared.classes.class_manager.read();
-        let Some(value_class) = cm.get_class(value_class_id) else {
+        if cm.get_class(value_class_id).is_none() {
             return true;
-        };
+        }
+        // ONE by-name walk, not two checks.
+        //
         // `array_descriptor_of` preserves only the component *name*, not its
         // defining-loader ClassId. When a forked loader owns a same-named copy,
         // the global lookup above can resolve the app copy and make a valid
-        // `ChildSegment[] <- ChildSegment` store look incompatible. The
-        // component identity is ambiguous here, so preserve this predicate's
-        // documented fail-open posture rather than manufacture a false ASE.
-        if &*value_class.name == comp_name && value_class_id != comp_id {
-            return true;
-        }
-        // The array header provides only a component name. With split class
-        // loaders, the stored value can be a subclass whose recorded
-        // superclass edge points to another same-named mirror. Walk that
-        // structural chain by name before treating the store as invalid.
+        // `ChildSegment[] <- ChildSegment` store look incompatible — so the
+        // component identity is ambiguous here and the predicate's documented
+        // fail-open posture applies. The same is true one level up: the stored
+        // value can be a *subclass* whose recorded superclass edge points at
+        // another same-named mirror.
+        //
+        // This walk covers both, because it starts at `value_class_id` itself:
+        // its first iteration is exactly the `value_class.name == comp_name`
+        // test that used to sit above it as a separate early return. That early
+        // return was measured to be dead weight — disabling the walk fails
+        // `aastore_fails_open_across_a_split_loaders_two_copies_of_one_name`,
+        // disabling the early return changes nothing — and two checks that read
+        // as independent defences when only one of them can ever fire is worse
+        // than one check that says what it does.
         let mut current = Some(value_class_id);
         while let Some(id) = current {
             let Some(class) = cm.get_class(id) else {
