@@ -746,6 +746,28 @@ impl Default for VmConfig {
             system_properties: Vec::new(),
             skip_verification: false,
             xverify_mode: XverifyMode::Remote,
+            // ZGC is the default collector as of 2026-08-10. The evidence is
+            // the 651-class Tomcat suite under all three backends on one
+            // commit: ZGC 604 PASS / 29 HANG / 0 CRASH in 247 min against
+            // Generational's 519 / 115 / 1 in 356 min, and the 63 classes that
+            // are non-PASS under Generational while passing under BOTH other
+            // backends — 62 of which log `[moving-young] fallback`, against 9%
+            // of the classes that pass on that arm. See
+            // `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`.
+            //
+            // The known cost, accepted deliberately: ZGC does not compact, so
+            // it needs roughly 1.5x the heap on buffer-churning workloads
+            // (`ZipContentTests` OOMs at `-Xmx 2g` and passes from 3g, where
+            // the generational collector passes at 2g). `docs/gc-tuning.md`
+            // says so where operators will read it.
+            //
+            // `-XX:+UseGenerationalGC` is the escape hatch, available in every
+            // build — including `--no-default-features`, which takes the
+            // `cfg(not(...))` arm because the `Zgc` variant does not exist
+            // there.
+            #[cfg(feature = "zgc")]
+            gc_algorithm: GcAlgorithm::Zgc,
+            #[cfg(not(feature = "zgc"))]
             gc_algorithm: GcAlgorithm::Generational,
             g1_ihop_percent: None,
             g1_region_size: None,
@@ -1756,7 +1778,14 @@ mod tests {
         assert!(config.boot_classpath.is_empty());
         assert!(config.ext_classpath.is_empty());
         assert!(config.java_home.is_none());
-        // Generational is the default and the safety net during G1 maturation.
+        // ZGC is the default collector as of 2026-08-10 (see `VmConfig::default`
+        // for the measurement behind the flip). A `--no-default-features` build
+        // has no `Zgc` variant at all and falls back to `Generational`, so this
+        // assertion is cfg'd the same way the field is — otherwise it would be
+        // asserting on a value that cannot exist in that configuration.
+        #[cfg(feature = "zgc")]
+        assert_eq!(config.gc_algorithm, GcAlgorithm::Zgc);
+        #[cfg(not(feature = "zgc"))]
         assert_eq!(config.gc_algorithm, GcAlgorithm::Generational);
     }
 
