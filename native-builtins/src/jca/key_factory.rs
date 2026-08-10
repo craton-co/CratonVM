@@ -2979,12 +2979,6 @@ pub fn register(r: &mut NativeMethodRegistry) {
     // <clinit> shim for sun.security.jca.GetInstance — the bytecode-side
     // helper that throws our NPE.  No-opping is safe because we never
     // dispatch into this class once getInstance() is intercepted.
-    r.register(
-        "sun/security/jca/GetInstance",
-        "<clinit>",
-        "()V",
-        clinit_noop,
-    );
     r.register("sun/security/jca/JCAUtil", "<clinit>", "()V", clinit_noop);
 
     // Signature also goes through `Signature.<clinit>` -> Debug; shim it

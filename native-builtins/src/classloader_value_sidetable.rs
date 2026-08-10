@@ -288,12 +288,6 @@ pub fn register_classloader_value_sidetable(registry: &mut NativeMethodRegistry)
     );
     registry.register(
         class,
-        "remove",
-        "(Ljava/lang/ClassLoader;)Ljava/lang/Object;",
-        native_aclv_remove,
-    );
-    registry.register(
-        class,
         "computeIfAbsent",
         "(Ljava/lang/ClassLoader;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
         native_aclv_compute_if_absent,

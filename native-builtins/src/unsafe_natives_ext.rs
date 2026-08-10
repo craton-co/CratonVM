@@ -427,7 +427,6 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // CratonVM binds them at registry-build time, so there is nothing left to
     // do — an empty body is what HotSpot's own `Unsafe_RegisterNatives` amounts
     // to once the table is already populated.
-    r.register(u, "registerNatives", "()V", native_noop);
     r.register(u, "<clinit>", "()V", |ctx, _args| {
         let class_name = "sun/misc/Unsafe";
         let unsafe_obj = try_alloc_concurrent_synthetic(ctx, class_name, 0)?;
@@ -1281,18 +1280,6 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // monitorEnter / monitorExit — manual synchronization. These take the
     // VM's real monitor, not a no-op: see `native_unsafe_monitor_enter`.
     r.register(
-        u,
-        "monitorEnter",
-        "(Ljava/lang/Object;)V",
-        native_unsafe_monitor_enter,
-    );
-    r.register(
-        u,
-        "monitorExit",
-        "(Ljava/lang/Object;)V",
-        native_unsafe_monitor_exit,
-    );
-    r.register(
         u2,
         "monitorEnter",
         "(Ljava/lang/Object;)V",
@@ -1476,7 +1463,6 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // function here removes that ordering dependency: ByteBuddy's class
     // injection no longer silently gets `null` back if a future registrar lands
     // after this one.
-    r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
     r.register_with_kind(
         u2,
         "defineClass0",
@@ -1522,12 +1508,6 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
             None => Ok(Some(Value::Object(None))),
         }
     }
-    r.register(
-        u,
-        "defineAnonymousClass",
-        "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;",
-        native_unsafe_define_anonymous_class,
-    );
     r.register(
         u2,
         "defineAnonymousClass",

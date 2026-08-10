@@ -4305,6 +4305,42 @@ extern "C" fn jni_from_reflected_field(_env: JNIEnv, field: JObject) -> JFieldID
     .unwrap_or(0)
 }
 
+/// Resolve a class a JNI entry point needs to allocate against, refusing rather
+/// than fabricating under `--jdk-only`.
+///
+/// The "refuse diagnosably" shape of `vm_init::ensure_bootstrap_compat_class`,
+/// adapted to a caller with no Java-side error channel: a JNI function cannot
+/// throw from here, and its documented failure value is NULL, so a refusal
+/// returns `None` and the caller returns null after this has warned and named
+/// the class. The real class is preferred first, exactly as before, so on any
+/// complete image nothing about this path changes.
+///
+/// Added 2026-08-10 with JDK-only wave 2 step 3, which deleted the infallible
+/// `ensure_synthetic_class` these three sites used to reach.
+fn jni_class_or_refuse(shared: &SharedVm, name: &str, num_fields: usize) -> Option<ClassId> {
+    if let Ok(id) = shared.load_class_concurrent(name) {
+        return Some(id);
+    }
+    match shared
+        .classes
+        .class_manager
+        .write()
+        .try_ensure_synthetic_class(name, num_fields)
+    {
+        Ok(id) => Some(id),
+        Err(err) => {
+            tracing::warn!(
+                class = name,
+                error = %err,
+                "--jdk-only: refusing to fabricate this class for a JNI entry point. The \
+                 call returns NULL, which is JNI's documented failure value, and the \
+                 caller sees it at its own call site."
+            );
+            None
+        }
+    }
+}
+
 // ---- Index 9: ToReflectedMethod ----
 // Convert a JMethodID to a java.lang.reflect.Method object.
 extern "C" fn jni_to_reflected_method(
@@ -4329,15 +4365,10 @@ extern "C" fn jni_to_reflected_method(
         // force the load. Allocating with `ClassId::new(0)` (`java/lang/Object`,
         // zero declared fields) but 4 slots produces an undersized object the
         // GC's `get_field` bounds guard rejects.
-        let method_class_id = shared
-            .load_class_concurrent("java/lang/reflect/Method")
-            .unwrap_or_else(|_| {
-                shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .ensure_synthetic_class("java/lang/reflect/Method", 4)
-            });
+        let Some(method_class_id) = jni_class_or_refuse(shared, "java/lang/reflect/Method", 4)
+        else {
+            return 0;
+        };
         let num_fields = shared
             .classes
             .class_manager
@@ -4380,15 +4411,9 @@ extern "C" fn jni_to_reflected_field(
         // comment in `jni_to_reflected_method`): allocating with
         // `ClassId::new(0)` + 4 slots produces an undersized object the GC's
         // `get_field` bounds guard rejects.
-        let field_class_id = shared
-            .load_class_concurrent("java/lang/reflect/Field")
-            .unwrap_or_else(|_| {
-                shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .ensure_synthetic_class("java/lang/reflect/Field", 4)
-            });
+        let Some(field_class_id) = jni_class_or_refuse(shared, "java/lang/reflect/Field", 4) else {
+            return 0;
+        };
         let num_fields = shared
             .classes
             .class_manager
@@ -7015,15 +7040,9 @@ extern "C" fn jni_new_direct_byte_buffer(
         // with `ClassId::new(0)` (`java/lang/Object`, zero declared fields)
         // yields an undersized object that the GC's `get_field` bounds guard
         // rejects on every access.
-        let dbb_class_id = shared
-            .load_class_concurrent("java/nio/DirectByteBuffer")
-            .unwrap_or_else(|_| {
-                shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .ensure_synthetic_class("java/nio/DirectByteBuffer", 2)
-            });
+        let Some(dbb_class_id) = jni_class_or_refuse(shared, "java/nio/DirectByteBuffer", 2) else {
+            return 0;
+        };
         let num_fields = shared
             .classes
             .class_manager

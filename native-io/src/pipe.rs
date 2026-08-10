@@ -800,7 +800,6 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;)I",
         source_read_buffer,
     );
-    r.register(source, "read", "([BII)I", source_read_bytes);
     r.register(source, "isOpen", "()Z", channel_is_open);
     r.register(source, "close", "()V", channel_close);
     r.register(
@@ -825,7 +824,6 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
     // SinkChannelImpl
     let sink = "sun/nio/ch/SinkChannelImpl";
     r.register(sink, "write", "(Ljava/nio/ByteBuffer;)I", sink_write_buffer);
-    r.register(sink, "write", "([BII)I", sink_write_bytes);
     r.register(sink, "isOpen", "()Z", channel_is_open);
     r.register(sink, "close", "()V", channel_close);
     r.register(

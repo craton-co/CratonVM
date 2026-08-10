@@ -7085,19 +7085,38 @@ impl SharedVm {
         // present (pure synthetic-jdk mode) the load fails harmlessly
         // and we fall back to the 1-field synthetic stub below.
         let _ = self.load_class_concurrent("java/io/PrintStream");
-        let ps_class_id = self.classes.class_manager_write().ensure_synthetic_class(
-            "java/io/PrintStream",
-            1, // 1 field: fd_id — used only when the real class isn't loaded
-        );
+        // JDK-only wave 2, step 3 (2026-08-10): the fallible spelling, through
+        // this file's own "refuse diagnosably" helper. On any complete image
+        // the load above has already put the real `java.io.PrintStream` in the
+        // store, so this resolves to it and fabricates nothing — the refusal
+        // arm is reachable only where `java.base` is absent, and there
+        // `System.out` was never going to work.
+        let ps_class_id = {
+            let mut cm = self.classes.class_manager_write();
+            // 1 field: fd_id — used only when the real class isn't loaded.
+            ensure_bootstrap_compat_class(&mut cm, "java/io/PrintStream", 1)
+        };
         // WP0.1 fix: size the allocation to the class's declared field count
         // so real-JDK `PrintStream.println` bytecode's `getfield` accesses
         // stay in-bounds. `max(1)` guarantees slot 0 (our fd tag) is always
         // writable even for synthetic stub classes declared with 0 fields.
-        let num_fields = {
-            let cm = self.classes.class_manager.read();
-            cm.get_class(ps_class_id)
-                .map(|c| c.num_total_fields.max(1))
-                .unwrap_or(1)
+        //
+        // On a refusal, zero-slot `java/lang/Object` streams rather than an
+        // undersized 1-slot layout: the GC's field guard rejects every access
+        // on the latter, so the failure would surface as a stream of dropped
+        // writes instead of at whatever first tries to USE `System.out`.
+        // `ensure_bootstrap_compat_class` has already warned and named it.
+        let (ps_class_id, num_fields) = match ps_class_id {
+            Some(id) => {
+                let n = {
+                    let cm = self.classes.class_manager.read();
+                    cm.get_class(id)
+                        .map(|c| c.num_total_fields.max(1))
+                        .unwrap_or(1)
+                };
+                (id, n)
+            }
+            None => (ClassId::new(0), 0),
         };
         let out_obj = self.mem.heap.alloc_object(ps_class_id, num_fields);
         let err_obj = self.mem.heap.alloc_object(ps_class_id, num_fields);
@@ -7121,7 +7140,7 @@ impl SharedVm {
         let slot0_is_ref = cratonvm_gc::class_layout(ps_class_id.as_u32())
             .and_then(|l| l.field_is_ref(0))
             .unwrap_or(false);
-        if !slot0_is_ref {
+        if !slot0_is_ref && num_fields > 0 {
             self.mem.heap.set_field(out_obj, 0, Value::Int(1));
             self.mem.heap.set_field(err_obj, 0, Value::Int(2));
         }
@@ -9291,7 +9310,7 @@ mod tests {
             .classes
             .class_manager
             .write()
-            .ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3);
+            .try_ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let object_id = shared
             .classes
             .class_manager

@@ -13580,11 +13580,11 @@ mod tests {
 
             // The application loader's copy — what the global name→id map
             // answers with, and what the old by-name dispatch would pick.
-            let app_copy = cm.ensure_synthetic_class(OWNER, 0);
+            let app_copy = cm.try_ensure_synthetic_class(OWNER, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             // The forked loader's copy: fabricated under its own name, renamed,
             // then given that loader's identity and name registration.
-            let fork_copy = cm.ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0);
+            let fork_copy = cm.try_ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
             cm.class_store
                 .get_mut(fork_copy)
                 .expect("just fabricated")
@@ -13596,17 +13596,17 @@ mod tests {
             cm.register_class_name(FORK, OWNER, fork_copy);
 
             // The call SITE's class, once inside the fork and once outside it.
-            let fork_caller = cm.ensure_synthetic_class("cratonvm/test/ForkCaller", 0);
+            let fork_caller = cm.try_ensure_synthetic_class("cratonvm/test/ForkCaller", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
             cm.class_store
                 .get_mut(fork_caller)
                 .expect("just fabricated")
                 .loader_id = FORK;
             cm.register_class_name(FORK, "cratonvm/test/ForkCaller", fork_caller);
-            let app_caller = cm.ensure_synthetic_class("cratonvm/test/AppCaller", 0);
+            let app_caller = cm.try_ensure_synthetic_class("cratonvm/test/AppCaller", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             // A name only ONE loader ever defined — the overwhelmingly common
             // case, and the one that must stay on the old path.
-            let lonely = cm.ensure_synthetic_class(LONELY, 0);
+            let lonely = cm.try_ensure_synthetic_class(LONELY, 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
             (app_copy, fork_copy, fork_caller, app_caller, lonely)
         };

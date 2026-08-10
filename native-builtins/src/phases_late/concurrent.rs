@@ -7743,15 +7743,6 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
     }, cratonvm_native_api::NativeKind::Bridge);
 
     // isPinned()Z — static in the real JDK; both forms register.
-    r.register(
-        cls,
-        "isPinned",
-        "(Ljdk/internal/vm/ContinuationScope;)I",
-        |ctx, _args| {
-            let pinned = if ctx.vt_pin_count() > 0 { 1 } else { 0 };
-            Ok(Some(Value::Int(pinned)))
-        },
-    );
 
     // static getCurrentContinuation(ContinuationScope) — the innermost
     // continuation of `scope` mounted on the calling thread. `run()` above now

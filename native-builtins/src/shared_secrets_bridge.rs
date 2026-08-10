@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::try_alloc_concurrent_synthetic;
@@ -188,20 +188,33 @@ fn alloc_owner_instance(ctx: &mut dyn NativeContext, owner_class: &str) -> Optio
     Some(ctx.alloc_object(cid, real_fields.max(1)))
 }
 
-fn alloc_named_synthetic_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef {
-    let cid = ctx.ensure_synthetic_class(owner_class, 1);
+/// Fallible since 2026-08-10 (JDK-only wave 2, step 3). This is only reached
+/// when NEITHER real `java.nio.Buffer$2` nor `Buffer$1` is loadable, i.e. on an
+/// image with no `java.base`; fabricating a `java/nio/Buffer$2` stand-in there
+/// is the compatibility substitution contract §5 refuses, so a strict run gets
+/// the `NoClassDefFoundError` instead.
+fn alloc_named_synthetic_singleton(
+    ctx: &mut dyn NativeContext,
+    owner_class: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let cid = crate::util_concurrent_ext::refused_class(ctx, owner_class, 1)?;
     let fields = ctx.class_num_total_fields(cid).max(1);
-    ctx.alloc_object(cid, fields)
+    Ok(ctx.alloc_object(cid, fields))
 }
 
-fn alloc_java_nio_access_singleton(ctx: &mut dyn NativeContext) -> ObjectRef {
+fn alloc_java_nio_access_singleton(
+    ctx: &mut dyn NativeContext,
+) -> Result<ObjectRef, MethodCallFailed> {
     // JDK 25 implements JavaNioAccess as Buffer$2; JDK 17 implements it as
     // Buffer$1. If neither class is loadable, keep a named owner so
     // invokeinterface resolves against registered JavaNioAccess bridge methods
     // instead of the generic AnonymousObject$1 fallback.
-    alloc_owner_instance(ctx, "java/nio/Buffer$2")
+    match alloc_owner_instance(ctx, "java/nio/Buffer$2")
         .or_else(|| alloc_owner_instance(ctx, "java/nio/Buffer$1"))
-        .unwrap_or_else(|| alloc_named_synthetic_singleton(ctx, "java/nio/Buffer$2"))
+    {
+        Some(obj) => Ok(obj),
+        None => alloc_named_synthetic_singleton(ctx, "java/nio/Buffer$2"),
+    }
 }
 
 /// Register the `SharedSecrets.getJavaXxxAccess()` factories.
@@ -261,7 +274,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
     gen_factory!(f_jurb, "java/util/ResourceBundle$1");
 
     fn f_jnio(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        let obj = alloc_java_nio_access_singleton(ctx);
+        let obj = alloc_java_nio_access_singleton(ctx)?;
         Ok(Some(Value::Object(Some(obj))))
     }
 
@@ -1460,12 +1473,6 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         iface,
-        "currentThread0",
-        "()Ljava/lang/Thread;",
-        jla_current_carrier_thread,
-    );
-    registry.register(
-        iface,
         "blockedOn",
         "(Lsun/nio/ch/Interruptible;)V",
         jla_blocked_on,
@@ -1597,24 +1604,6 @@ fn jlia_make_class_value_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 
 fn register_java_lang_invoke_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/invoke/MethodHandleImpl$1";
-    registry.register(
-        owner,
-        "findMethodHandleType",
-        "(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;",
-        jlia_find_method_handle_type,
-    );
-    registry.register(
-        owner,
-        "linkMethodHandleConstant",
-        "(Ljava/lang/Class;ILjava/lang/Class;Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        jlia_link_method_handle_constant,
-    );
-    registry.register(
-        owner,
-        "makeClassValueMap",
-        "()Ljava/util/Map;",
-        jlia_make_class_value_map,
-    );
 }
 
 // JavaLangRefAccess -----------------------------------------------------------
@@ -1728,18 +1717,6 @@ fn register_java_lang_reflect_access(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         owner,
-        "newParameter",
-        "(Ljava/lang/reflect/Executable;ILjava/lang/String;I)Ljava/lang/reflect/Parameter;",
-        jlrefa_new_parameter,
-    );
-    registry.register(
-        owner,
-        "newAccessibleObject",
-        "()Ljava/lang/reflect/AccessibleObject;",
-        jlrefa_new_accessible_object,
-    );
-    registry.register(
-        owner,
         "getExecutableTypeAnnotationBytes",
         "(Ljava/lang/reflect/Executable;)[B",
         jlrefa_get_executable_type_annotation_bytes,
@@ -1768,12 +1745,6 @@ fn jioa_charset(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
 fn register_java_io_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/io/Console$1";
     registry.register(owner, "console", "()Ljava/io/Console;", jioa_console);
-    registry.register(
-        owner,
-        "charset",
-        "()Ljava/nio/charset/Charset;",
-        jioa_charset,
-    );
 }
 
 // JavaIORandomAccessFileAccess ------------------------------------------------
@@ -1997,12 +1968,6 @@ fn jniaa_get_original_host_name(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 fn register_java_net_inet_address_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/net/InetAddress$1";
-    registry.register(
-        owner,
-        "getHostFromNameService",
-        "(Ljava/net/InetAddress;Z)Ljava/lang/String;",
-        jniaa_get_host_from_name_service,
-    );
     registry.register(
         owner,
         "getOriginalHostName",
@@ -2311,12 +2276,6 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // Some real-JDK builds expose the JavaNioAccess anonymous implementation as
     // Buffer$1 rather than Buffer$2; register both owners to avoid linkage drift.
     registry.register(
-        "java/nio/Buffer$1",
-        "scaleShifts",
-        "(Ljava/nio/Buffer;)I",
-        jnio_scale_shifts,
-    );
-    registry.register(
         owner,
         "isThreadConfined",
         "(Ljava/nio/Buffer;)Z",
@@ -2430,18 +2389,6 @@ fn jsec_get_protect_domains(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn register_java_security_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/security/AccessController$1";
-    registry.register(
-        owner,
-        "doIntersectionPrivilege",
-        "(Ljava/security/PrivilegedAction;Ljava/security/AccessControlContext;Ljava/security/AccessControlContext;)Ljava/lang/Object;",
-        jsec_do_intersection_privilege,
-    );
-    registry.register(
-        owner,
-        "getProtectDomains",
-        "(Ljava/security/AccessControlContext;)[Ljava/security/ProtectionDomain;",
-        jsec_get_protect_domains,
-    );
 }
 
 // JavaUtilJarAccess -----------------------------------------------------------
@@ -2511,18 +2458,6 @@ fn juzf_get_manifest_name(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 
 fn register_java_util_zip_file_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/util/zip/ZipFile$1";
-    registry.register(
-        owner,
-        "getEntry",
-        "(Ljava/util/zip/ZipFile;Ljava/lang/String;Ljava/util/function/Function;)Ljava/util/zip/ZipEntry;",
-        juzf_get_entry,
-    );
-    registry.register(
-        owner,
-        "entryLocalNameEncoding",
-        "(Ljava/util/zip/ZipEntry;)Z",
-        juzf_entry_local_name_encoding,
-    );
     registry.register(
         owner,
         "getManifestName",

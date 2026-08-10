@@ -14972,49 +14972,43 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         self.shared.system_properties.write().remove(&normalized)
     }
 
+    /// Mint a VM-generated class — contract §1 item 6's shapes, which are legal
+    /// in every mode.
+    ///
+    /// Infallible on purpose: `ClassManager::ensure_generated_class` records no
+    /// violation and refuses nothing, because a lambda body, a `$ProxyN` and
+    /// its `Proxy$Instance` superclass, an array shape or a reflection accessor
+    /// is a class a conforming JVM creates without a class file. This is NOT a
+    /// way around the policy — see the warning on the trait declaration.
     #[track_caller]
-    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        // Prefer the real class if it can be loaded — `ensure_synthetic_class`
-        // returns the existing id when the name is already registered, so a
-        // successful load here keeps native allocations on the real layout.
+    fn ensure_vm_internal_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        // Same real-class preference as the fallible sibling: a name that
+        // resolves to real bytes is not a fabrication at all.
         if let Ok(cid) = self.shared.load_class_concurrent(name) {
             return cid;
         }
-        // Real class unavailable: register a minimal synthetic class that
-        // declares `num_fields` instance fields. This guarantees the object
-        // header's `class_id` points at a class whose `num_total_fields`
-        // matches the allocated slot count, instead of `ClassId::new(0)`
-        // (`java/lang/Object`, zero declared fields) which the GC's
-        // `get_field` bounds guard rejects as an undersized layout.
-        //
-        // Still the infallible spelling: this signature has no way to report
-        // the one case the class manager now refuses (a name two or more
-        // distinct classes already carry). For that case `ClassManager::
-        // ensure_synthetic_class` hands back a distinctly-named, correctly
-        // sized `cratonvm/synthetic/AmbiguousName$…` stand-in instead of a
-        // stub filed under the ambiguous name — see its doc comment, and
-        // `docs/feature-designs/synthetic-class-fallibility.md` for the migration
-        // that removes this method's callers.
         self.shared
             .classes
             .class_manager
             .write()
-            .ensure_synthetic_class(name, num_fields)
+            .ensure_generated_class(
+                name,
+                num_fields,
+                cratonvm_classloading::ClassOrigin::VmInternal,
+            )
     }
 
-    /// The fallible spelling: the same operation, with the refusal the
-    /// infallible one cannot express.
+    /// Mint a compatibility stand-in, with the refusal `--jdk-only` requires.
     ///
-    /// Two differences from [`Self::ensure_synthetic_class`], both intended:
+    /// The infallible `ensure_synthetic_class` twin this used to sit beside was
+    /// deleted on 2026-08-10 (JDK-only wave 2, step 3). It recorded the
+    /// violation and fabricated anyway, so:
     ///
-    /// 1. it can return [`ClassIdentityError::AmbiguousName`] instead of a
-    ///    stand-in, so a native that can fail gets to fail;
+    /// 1. this can return [`ClassIdentityError::AmbiguousName`] instead of a
+    ///    silently-substituted stand-in, so a native that can fail gets to fail;
     /// 2. it goes through `ClassManager::try_ensure_synthetic_class`, which
-    ///    **enforces** `--jdk-only` (the infallible one only records the
-    ///    violation and fabricates anyway). Under the default `Compatible`
-    ///    mode the two are identical; under `--jdk-only` a call site migrated
-    ///    to this spelling starts refusing, which is exactly step 2 of the
-    ///    JDK-ONLY-WAVE2 recipe in `class_manager.rs`.
+    ///    **enforces** `--jdk-only`. Under the default `Compatible` mode the
+    ///    behaviour is byte-for-byte what the twin did.
     ///
     /// The error is re-derived from the name index rather than pattern-matched
     /// out of the returned `VmError`: the classifier is the authority on
@@ -27531,7 +27525,7 @@ mod tests {
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
             let mut cm = shared.classes.class_manager_write();
-            cm.ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
+            cm.try_ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
         };
         // Sanity: that class is a stub.
         {

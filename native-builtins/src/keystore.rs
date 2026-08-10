@@ -2611,7 +2611,15 @@ pub(crate) fn engine_get_certificate_chain(
 
     let cls_id = match ctx.ensure_class_initialized("java/security/cert/X509Certificate") {
         Ok(c) => c,
-        Err(_) => ctx.ensure_synthetic_class("java/security/cert/X509Certificate", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): this is the
+        // element class of the returned `Certificate[]`, and a fabricated
+        // stand-in for a `java.security.cert` class is the compatibility
+        // substitution contract §5 refuses. On a complete image the `Ok` arm is
+        // what runs, so this changes nothing outside `--jdk-only` on a broken
+        // image.
+        Err(_) => {
+            crate::util_concurrent_ext::refused_class(ctx, "java/security/cert/X509Certificate", 8)?
+        }
     };
     let arr = ctx.new_ref_array(cls_id, chain.len());
     for (i, der) in chain.iter().enumerate() {
@@ -2635,7 +2643,11 @@ pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
     let cls_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(c) => c,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). `java.lang.String`
+        // is in every image, so the `Ok` arm is what runs; a run that reaches
+        // this one has no `java.base` at all and fabricating a `String` stand-in
+        // is not a recovery, it is a second failure wearing the first one's name.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/String", 8)?,
     };
     let arr = ctx.new_ref_array(cls_id, aliases.len());
     for (i, a) in aliases.iter().enumerate() {

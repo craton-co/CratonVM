@@ -3137,18 +3137,6 @@ fn register_pkix_validator(r: &mut NativeMethodRegistry) {
     // engineValidate(Certificate[] chain) -> Certificate[]  (the validated
     // path, leaf-first). Real-JDK has a longer overload too; the single-arg
     // form is what Keycloak / EJBCA actually call.
-    r.register(
-        FQN_PKIX_VALIDATOR,
-        "engineValidate",
-        "([Ljava/security/cert/Certificate;)[Ljava/security/cert/Certificate;",
-        pkix_engine_validate,
-    );
-    r.register(
-        FQN_PKIX_VALIDATOR,
-        "engineValidate",
-        "([Ljava/security/cert/Certificate;Ljava/util/Collection;Ljava/security/AlgorithmConstraints;Ljava/lang/Object;)[Ljava/security/cert/Certificate;",
-        pkix_engine_validate,
-    );
 }
 
 fn register_kmf(r: &mut NativeMethodRegistry) {

@@ -1434,7 +1434,11 @@ fn native_pattern_split_impl(
 
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). `java.lang.String`
+        // is in every image, so the `Ok` arm is what runs; a run reaching this
+        // one has no `java.base`, and fabricating a `String` stand-in there is
+        // a second failure wearing the first one's name.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/String", 8)?,
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {

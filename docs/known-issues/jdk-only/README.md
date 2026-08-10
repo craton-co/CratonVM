@@ -138,7 +138,9 @@ measured rather than assumed — that the tree's only `bridge` marker outside
 `native-collections` has **zero** rows a migration could ever state, and that
 `ABSENT` on a platform-named class means "not measured here", not "dead".
 
-[`census-asks-one-class-on-one-platform.md`](census-asks-one-class-on-one-platform.md)
+The census asks one class, on one platform — **RETIRED 2026-08-10**, its five
+open items closed under
+`fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`
 — and then the two instruments that answer both of those. The census asks about
 one class in one image, so **1,939 of the 2,542 "method not declared" rows are
 actually inherited** (19 of them from an `ACC_NATIVE` supertype) and **59
@@ -296,7 +298,7 @@ behaviour** — no exception, no log line, no failing test.
 |---|---|---|
 | 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: 9,571 unadjudicated `Bridge` registrations, now in [`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md). |
 | 2 | [Fabricated object layouts leak into native code](fabricated-object-layouts-leak-into-native-code.md) | Index-based field access against assumed synthetic layouts. On real bytes the index still resolves and points at a different field. `StringJoiner.add()` silently no-ops; `EnumSet.of()` returns an object with a null iterator. Two `breaks-under-strict` and two `unknown` sites are marked; three whole crates were never swept. |
-| 4 | [`ensure_synthetic_class` cannot enforce policy, only record it](ensure-synthetic-class-cannot-enforce-only-record.md) | Returns a bare `ClassId`, so under `--jdk-only` it records the violation and fabricates anyway, across 52 live non-test call sites in 27 files. The fallible siblings now exist but have **zero callers**, so nothing changed operationally. Strict boot *silently loses* `Enumeration$Impl` / `Comparator$Native` instead of failing. |
+| 4 | `ensure_synthetic_class` cannot enforce policy, only record it — **RETIRED 2026-08-10** | Returned a bare `ClassId`, so under `--jdk-only` it recorded the violation and fabricated anyway. The entry point is deleted, along with the `NativeSystemAccess` trait method, the `NativeContextImpl` override and all three infallible allocation funnels; the grep gate matches zero sites, tests included. See `fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`. |
 
 Items 5 and 7 left this table on 2026-08-06, together with wave-2 lanes L10 and
 L11 item 7:

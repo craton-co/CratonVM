@@ -3791,10 +3791,20 @@ pub(crate) fn define_or_get_proxy_class(
     // `Proxy$Instance` (no generated member bodies) → annotation accessors hit
     // `AbstractMethodError: <Ann>.value() has no Code` / `NoSuchMethodError
     // Proxy$Instance.value()`. (Every proxy AFTER the first worked, because the
-    // fallback's allocation registered the stub.) `ensure_synthetic_class`
-    // never fails — it registers the 3-field stub (handler/interfaces/identity)
-    // directly — so `$Proxy0` now generates a real proxy exactly like `$Proxy1+`.
-    let _ = ctx.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
+    // fallback's allocation registered the stub.) Registering the 3-field stub
+    // (handler/interfaces/identity) directly makes `$Proxy0` generate a real
+    // proxy exactly like `$Proxy1+`.
+    //
+    // `ensure_vm_internal_class`, not the compatibility door (JDK-only wave 2,
+    // step 3, 2026-08-10). `java/lang/reflect/Proxy$Instance` is the SUPERCLASS
+    // OF A GENERATED PROXY, which contract §1 item 6 lists among the shapes the
+    // VM legitimately mints and which are never refused in either mode — the
+    // proxy classes that extend it are generated too. Routing it through the
+    // compatibility entry point was the mislabel: it made a §1-item-6 shape
+    // look like a §5 substitution, and refusing it under `--jdk-only` would
+    // break every dynamic proxy with a failure that reads as "strict mode
+    // doesn't work" (the first entry in this record's *Blast radius*).
+    ctx.ensure_vm_internal_class("java/lang/reflect/Proxy$Instance", 3);
 
     // Failure mode (1): spec build. `build_proxy_spec_for` returns `None`
     // only when an interface ClassId fails to resolve to a name (a
