@@ -9170,30 +9170,58 @@ fn jit_static_owner_override(vm: &SharedVm, info: &JitInvokeInfo) -> Option<Clas
         return None;
     }
     let caller = ClassId::new(info.declaring_class_id);
-    let cm = vm.classes.class_manager.read();
-    if !matches!(
-        cm.classify_loaded_name(info.class_name),
-        cratonvm_classloading::NameResolution::Ambiguous { .. }
-    ) {
-        return None;
-    }
-    let owner = cm.find_class_by_name_for_class(info.class_name, caller)?;
-    if cm.get_loaded_class_id(info.class_name) == Some(owner) {
-        return None;
-    }
+    let owner = {
+        let cm = vm.classes.class_manager.read();
+        loader_faithful_static_owner(&cm, caller, info.class_name)?
+    };
     // DIAG (`CRATONVM_DBG=coerce`, the loader-split diagnostic this shares a
     // subject with): a silent fix cannot be told from a fix that never fires.
     // This line is what proves the arm ran on the run that went green.
     if crate::runtime::env_cache::dbg_coerce() {
+        let by_name = vm
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(info.class_name);
         eprintln!(
-            "[DBG_COERCE] jit invokestatic: {}.{}{} from cid={:?} -- by-name owner {:?} \
+            "[DBG_COERCE] jit invokestatic: {}.{}{} from cid={:?} -- by-name owner {by_name:?} \
 is NOT the caller's loader's copy {owner:?}; dispatching on the caller's",
-            info.class_name,
-            info.method_name,
-            info.descriptor,
-            caller,
-            cm.get_loaded_class_id(info.class_name),
+            info.class_name, info.method_name, info.descriptor, caller,
         );
+    }
+    Some(owner)
+}
+
+/// The decision inside [`jit_static_owner_override`], without the two
+/// process-wide pre-gates.
+///
+/// Split out so it can be tested: the gates it drops are a `0` call-site class
+/// and the `any_defining_loader_registered` latch, both of which are pure
+/// short-circuits onto the `None` this returns anyway. The latch in particular
+/// is a process-global that a unit test would have to arm for the whole test
+/// binary, which is a worse trade than testing the decision it guards. That
+/// the wrapper still consults them is a source-level fact, and
+/// `jit_invokestatic_owner_override_is_gated_before_it_is_consulted` is what
+/// holds it.
+fn loader_faithful_static_owner(
+    cm: &crate::classloading::ClassManager,
+    caller: ClassId,
+    class_name: &str,
+) -> Option<ClassId> {
+    // A name with one definition cannot resolve to the wrong copy, and this is
+    // O(1) against the definition-count index — so it runs before the two
+    // lookups below rather than after them.
+    if !matches!(
+        cm.classify_loaded_name(class_name),
+        cratonvm_classloading::NameResolution::Ambiguous { .. }
+    ) {
+        return None;
+    }
+    let owner = cm.find_class_by_name_for_class(class_name, caller)?;
+    // The caller's loader agrees with the global map: nothing to correct, and
+    // the previous path is the one with all the special cases.
+    if cm.get_loaded_class_id(class_name) == Some(owner) {
+        return None;
     }
     Some(owner)
 }
@@ -13229,6 +13257,168 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // A compiled `invokestatic` must not pick the other loader's copy
+    // -----------------------------------------------------------------------
+
+    /// Two loaders define one binary name; a compiled static call made from
+    /// inside the SECOND loader's copy must dispatch on that loader's copy, not
+    /// on whichever one the flat global name→id map happens to hold.
+    ///
+    /// # Why this is not a hypothetical
+    ///
+    /// `AotIntegrationTests.endToEndTestsForBeanOverrides` runs everything under
+    /// `@CompileWithForkedClassLoader`, which defines its own copy of every
+    /// `org.springframework.*` class it is asked for. A compiled static call out
+    /// of the forked copy of `ResolvableType` landed in the APPLICATION copy, so
+    /// the `ResolvableType` handed back belonged to the other class;
+    /// `WildcardBounds.get` then ran
+    /// `while (…) candidate = candidate.resolveType()` with a `NONE` from the
+    /// wrong copy, `candidate == NONE` could never hold, and one core spun until
+    /// the run was killed. `--nojit` passed the same method, because the
+    /// interpreter resolves the owner through the caller's own loader.
+    ///
+    /// # Three assertions, because one would pass against a stub
+    ///
+    /// The positive alone is satisfied by "always return the caller-loader
+    /// answer", which is the change that would have to be rejected for
+    /// `invoke_or_native`'s special cases (native-override order, the
+    /// `SyntheticStub` yield rule, the signature-polymorphic intercepts) to keep
+    /// working on every ordinary call. So the two negatives — a name with ONE
+    /// definition, and a caller whose loader agrees with the global map — are
+    /// asserted alongside it. `None` there is what keeps the previous path.
+    ///
+    /// # The two-copy state
+    ///
+    /// Built the way `aastore_fails_open_across_a_split_loaders_two_copies_of_one_name`
+    /// builds it: `ensure_synthetic_class` dedupes by name, so the second copy is
+    /// fabricated under its own name and renamed in place, then registered under
+    /// the user loader with `register_class_name` (the class manager's own
+    /// documented test side-door for exactly this).
+    #[test]
+    fn a_compiled_invokestatic_resolves_its_owner_in_the_callers_own_loader() {
+        use cratonvm_types::ClassLoaderId;
+
+        const OWNER: &str = "cratonvm/test/SplitStaticOwner";
+        const LONELY: &str = "cratonvm/test/LonelyStaticOwner";
+        const FORK: ClassLoaderId = ClassLoaderId::UserDefined(4242);
+
+        let shared =
+            std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
+
+        let (app_copy, fork_copy, fork_caller, app_caller, lonely) = {
+            let mut cm = shared.classes.class_manager.write();
+
+            // The application loader's copy — what the global name→id map
+            // answers with, and what the old by-name dispatch would pick.
+            let app_copy = cm.ensure_synthetic_class(OWNER, 0);
+
+            // The forked loader's copy: fabricated under its own name, renamed,
+            // then given that loader's identity and name registration.
+            let fork_copy = cm.ensure_synthetic_class("cratonvm/test/SplitStaticOwner$Fork", 0);
+            cm.class_store
+                .get_mut(fork_copy)
+                .expect("just fabricated")
+                .name = cratonvm_types::intern_arc(OWNER);
+            cm.class_store
+                .get_mut(fork_copy)
+                .expect("just fabricated")
+                .loader_id = FORK;
+            cm.register_class_name(FORK, OWNER, fork_copy);
+
+            // The call SITE's class, once inside the fork and once outside it.
+            let fork_caller = cm.ensure_synthetic_class("cratonvm/test/ForkCaller", 0);
+            cm.class_store
+                .get_mut(fork_caller)
+                .expect("just fabricated")
+                .loader_id = FORK;
+            cm.register_class_name(FORK, "cratonvm/test/ForkCaller", fork_caller);
+            let app_caller = cm.ensure_synthetic_class("cratonvm/test/AppCaller", 0);
+
+            // A name only ONE loader ever defined — the overwhelmingly common
+            // case, and the one that must stay on the old path.
+            let lonely = cm.ensure_synthetic_class(LONELY, 0);
+
+            (app_copy, fork_copy, fork_caller, app_caller, lonely)
+        };
+        assert_ne!(app_copy, fork_copy, "the two copies must be distinct ids");
+
+        let cm = shared.classes.class_manager.read();
+        assert!(
+            matches!(
+                cm.classify_loaded_name(OWNER),
+                cratonvm_classloading::NameResolution::Ambiguous { .. }
+            ),
+            "the fixture must actually produce two definitions of one name — \
+             without that this test measures nothing",
+        );
+
+        // THE FIX. A call site inside the fork gets the fork's copy.
+        assert_eq!(
+            loader_faithful_static_owner(&cm, fork_caller, OWNER),
+            Some(fork_copy),
+            "a compiled invokestatic from a fork-loaded class must dispatch on \
+             the fork's copy of the owner, not on the application copy the \
+             global name map holds",
+        );
+
+        // Negative 1: the caller's loader agrees with the global map. Nothing to
+        // correct, and `None` is what keeps `invoke_or_native`'s path.
+        assert_eq!(
+            loader_faithful_static_owner(&cm, app_caller, OWNER),
+            None,
+            "when the caller's loader resolves to the same class the global map \
+             does, the override must decline so the ordinary dispatch path runs",
+        );
+
+        // Negative 2: one definition of the name. This is every call in a
+        // single-loader process, and it must not pay for or take the new path.
+        assert_eq!(
+            loader_faithful_static_owner(&cm, fork_caller, LONELY),
+            None,
+            "an unambiguous name must decline before any lookup — otherwise \
+             every static dispatch in every ordinary process changes route",
+        );
+        let _ = lonely;
+    }
+
+    /// The wrapper the dispatch helper actually calls must keep its two
+    /// process-wide pre-gates, which the test above deliberately does not arm.
+    ///
+    /// A source witness rather than a behavioural test: arming
+    /// `any_defining_loader_registered` is a process-global latch that would
+    /// leak into every other test in this binary. Matched on text inside the
+    /// function's own bounds, never on line numbers.
+    #[test]
+    fn jit_invokestatic_owner_override_is_gated_before_it_is_consulted() {
+        let src = include_str!("helpers.rs");
+        let start = src
+            .find("fn jit_static_owner_override")
+            .expect("jit_static_owner_override must exist");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\nfn ")
+            .expect("a top-level function must follow it")
+            + 1;
+        let body = &body[..end];
+        assert!(
+            body.contains("info.declaring_class_id == 0"),
+            "a call site with no class id must decline — those are the synthetic \
+             sites naming JDK classes with one definition",
+        );
+        assert!(
+            body.contains("any_defining_loader_registered()"),
+            "the process-wide latch must be the first real gate: with no user \
+             loader there can be no second copy, and this sits on every compiled \
+             static call",
+        );
+        assert!(
+            body.contains("loader_faithful_static_owner"),
+            "the wrapper must delegate the decision to the function the test \
+             above covers, or that coverage vouches for nothing",
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Leaf natives: the set, and the one thing that could make skipping
