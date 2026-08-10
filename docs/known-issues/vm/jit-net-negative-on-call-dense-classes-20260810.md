@@ -146,6 +146,57 @@ you compile 215 more short, call-dense methods while entry count barely moves.
 says whether the inline cache ever learns a target or re-pays the compile probe
 on every call.
 
+## The funnel, and the inline cache that never publishes
+
+`CRATONVM_DBG_MIC_PROF=1` on the two thresholds (this needed its own fix first —
+see "levers" below — because the per-call trace on that switch wrote 268 MB of
+stderr in 73 s and buried the counters):
+
+| | thresh 500 | thresh 500 000 |
+|---|---:|---:|
+| `mic_calls` | 26 362 938 | 16 414 119 |
+| `hit_entry` | 387 110 (1.5%) | 256 132 (1.6%) |
+| `hit_noentry` | 5 359 501 | 3 995 148 |
+| `miss` | 1 173 523 | 280 143 |
+| `disp_calls` | **15 254 558** | **2 658 968** |
+| `pub_probe_none` | 5 359 501 | 3 995 148 |
+| `pub_barred` | 0 | 0 |
+| **`pub_published`** | **0** | **0** |
+
+Two things to read here, and one not to.
+
+**`pub_published = 0`.** The megamorphic inline cache never publishes a callable
+entry, in either configuration. `pub_probe_none` is *exactly* equal to
+`hit_noentry`, so the uniform reason is that `try_jit_compile_callee` handed
+back nothing — not `pub_barred` (0), not a downgrade inside
+`jit_entry_publishable`. 93% of MIC hits therefore find an empty slot. This is
+the pathology the source already anticipated in `mic_prof`'s own doc comment
+("`hit_entry == 0` while `hit_noentry` climbs means the slot never learns a
+target"); it is now measured on a real workload. **No call site out of compiled
+code ever becomes a direct jump.** Every one keeps paying the helper.
+
+**`disp_calls` 5.7x.** Compiling the ~215 additional methods multiplies calls
+through the *generic* dispatcher — the slowest path — from 2.66 M to 15.25 M,
+while `jit_entries` moved only 24%. That is the quantity that tracks the cost:
+not how often compiled code is *entered*, but how many calls compiled code
+*makes*, each one funnelled.
+
+**What NOT to read: the cycle totals.** `cyc_mic_total` and `cyc_disp_total` are
+`CycGuard` spans covering the whole helper *including execution of the callee*,
+so they are inclusive and they nest — a JIT→JIT call inside a callee is counted
+at both levels. At threshold 500 they sum to 2.9e12 cycles against a run of
+~260 s CPU, which is impossible and is exactly what "inclusive and nested"
+predicts. They are useful as ratios between arms, not as a share of run time.
+`cyc_compile_probe` (4.35e9 vs 2.31e9 cycles, ~1.8 s at 2.4 GHz) is small — the
+re-probing itself is not the bill.
+
+So the direction of the fix is publication, not the threshold: make a warm call
+site out of compiled code resolve to a direct entry once, instead of re-entering
+`jit_invoke_virtual_mic` / `jit_invoke_dispatch` on every call forever. Until it
+does, every method admitted to the JIT converts its call sites from interpreter
+dispatch into a permanently-cold helper funnel, which is why admitting more of
+them makes this class monotonically slower.
+
 ## What NOT to do
 
 **Do not raise the default `CRATONVM_JIT_THRESHOLD` on this evidence.** One
@@ -173,7 +224,8 @@ produced a confident wrong answer read on CPU time alone.
 | lever | works? | note |
 |---|---|---|
 | `CRATONVM_JIT_THRESHOLD` | **yes** | the sweep above |
-| `CRATONVM_DBG=jit-scan-prof` | **yes** | added for this page |
+| `CRATONVM_DBG=jit-scan-prof` | **yes** | added for this page; also counts `jit_entries` |
+| `CRATONVM_DBG_MIC_PROF` | **yes, after a fix** | its counters are what named `pub_published=0`, but the per-call `[DISP_TRACE]` used to ride the same switch and wrote 268 MB of stderr in 73 s here (15.25 M `disp_calls`, one `eprintln` each). Split onto `CRATONVM_DBG_MIC_TRACE`; MIC_PROF is counters-only. Read the `mic_calls=` line, not the trailing `gc_collections=` one, and note `total_dispatches` on it is a separate `CRATONVM_DBG_LETSGO` counter that reads 0 unless that flag is set |
 | `CRATONVM_NO_JIT_SCAN_CACHE` | yes, but uninformative | 266.21 vs 265.19; the cache never hits anyway (`cache_hits=0`), so "free" means "the cache was doing nothing", not "the scan is cheap" |
 | `CRATONVM_TIER_C2_THRESHOLD` | **INERT** | C2 entry is structural; still `c2=97` at 2e9 |
 | `CRATONVM_NO_PRECISE_JIT_MAPS` | **INERT** | `jit/src/x64.rs:1895` computes `precise_maps = precise_jit_maps_enabled() \|\| moving_young_enabled()` and moving-young is default-ON (`types/src/flags.rs:884`), so the opt-out cannot turn safepoint emission off |
