@@ -17201,18 +17201,29 @@ fn try_compile_inner(
                         && descriptor
                             == "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;"
                     {
-                        // JDK-ONLY-WAVE2: hard-coded (class, method,
-                        // descriptor) exception list. Seven of these ladders
-                        // bake a thin VM-side reimplementation of a registered
-                        // native straight into the emitted CALL, bypassing
-                        // `vm_exec::resolve_dispatch` entirely. Wave 1 gates
-                        // them on policy via `direct_native_helper`; wave 2
-                        // should replace the name matching with a resolver
-                        // callback that asks `resolve_dispatch` whether this
-                        // triple is an approved `NativeKind::Intrinsic`, and
-                        // delete the literals. Do NOT delete the list before
-                        // that resolver exists — every entry here is a measured
-                        // hot path.
+                        // JDK-ONLY-WAVE2 §4 — the policy half is CLOSED, the
+                        // "delete the literals" half is NOT ACHIEVABLE, and the
+                        // second verdict is the one worth reading.
+                        //
+                        // The original ask was to replace the name matching with
+                        // a resolver that asks whether the triple is an approved
+                        // `NativeKind::Intrinsic`, and delete the literals.
+                        // Half of that landed: `direct_native_helper` takes an
+                        // `intrinsic_resolver` and the VM answers it out of the
+                        // registry's kind, so the BIND decision is no longer
+                        // name-based in either mode.
+                        //
+                        // The literals cannot follow, because they are not the
+                        // policy — they are the RECOGNITION. Each triple picks
+                        // which `*_DIRECT_FN` cell this site maps to, and that
+                        // is a triple-to-helper-address map the native registry
+                        // has never held: a kind says whether a native may be
+                        // bound, not which of seven thin VM-side helpers
+                        // reimplements it. Deleting them would delete the
+                        // mapping, not a name check. Do NOT "finish" this by
+                        // removing the list; every entry is a measured hot path
+                        // and the resolver it was meant to defer to cannot
+                        // answer the question the list answers.
                         //
                         // The `String.toLowerCase(Locale)` ladder that used to
                         // sit beside this one IS gone (2026-08-04). It was the

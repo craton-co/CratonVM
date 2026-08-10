@@ -4293,6 +4293,18 @@ fn run() -> Result<()> {
             "[cratonvm] compiled site-cached native dispatches (non-leaf): {}",
             cratonvm_vm::jit::helpers::site_cached_native_hit_count()
         );
+        // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
+        // the two above: it is the one by-name fast path that decides per
+        // dispatch rather than at cache-fill time. Reported separately because
+        // its number is the only thing that distinguishes "the leaf served this
+        // call" from "the leaf declined and the generic tail served it, counting
+        // it properly" — the two are indistinguishable in the native census,
+        // which is what left the §4 gap this leaf was filed for unfalsifiable
+        // for as long as it stood.
+        eprintln!(
+            "[cratonvm] compiled Matcher-leaf dispatches: {}",
+            cratonvm_vm::jit::helpers::matcher_leaf_hit_count()
+        );
         // A zero above is ambiguous — "nothing here is a leaf" and "every site
         // was refused for a reason nobody intended" look identical — so the
         // fill-time refusal reasons are reported alongside it.

@@ -11465,6 +11465,25 @@ static MATCHER_LEAF_SITES: [cratonvm_native_api::NativeCallSite; 8] = [
 const MATCHER_ADMISSION_REFUSED: u64 = 1;
 const MATCHER_ADMISSION_ADMITTED: u64 = 2;
 
+/// Dispatches actually served by the exact-receiver `Matcher` leaf, reported by
+/// `CRATONVM_INTRINSIC_STATS=1` beside the other compiled-code native counters.
+///
+/// It exists because the claim this leaf's memo was built to fix — "this edge
+/// is uncounted for the §4 census" — is a claim about a RATE, and nothing
+/// measured it. Without this number, "the leaf served the call and did not
+/// count it" and "the leaf declined and the generic tail served it, counting it
+/// properly" are indistinguishable from the census alone: both leave the
+/// registry's total looking right on the workloads where the leaf never fires.
+/// A zero here on a regex-hot run says the leaf is not the path that run takes
+/// — which is a different fact from the census being complete, and only this
+/// counter can tell the two apart.
+static MATCHER_LEAF_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Dispatches served by the compiled exact-receiver `Matcher` leaf this run.
+pub fn matcher_leaf_hit_count() -> u64 {
+    MATCHER_LEAF_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Policy admission + census handle for the exact-receiver `Matcher` leaf,
 /// memoized per triple so it can run on a per-dispatch path.
 ///
@@ -12414,6 +12433,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                     // declines an arity it cannot build a frame for, and a
                     // declined fast path is not a dispatch.
                     count_jit_native_dispatch(vm, native_id);
+                    MATCHER_LEAF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return result;
                 }
             }
