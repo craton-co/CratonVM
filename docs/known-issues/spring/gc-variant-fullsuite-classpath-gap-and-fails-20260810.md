@@ -30,7 +30,7 @@ harness edge case in this specific rerun rather than a new finding.)
 
 Zero `cratonvm::gc::guard` hits of any kind (`HIB-CV-32`/corrupt-Value-cell
 or otherwise) across all three variants' postmerge logs — unlike H2 (see
-`h2/gc-variant-fullsuite-crashes-hangs-fails-20260810.md`), Spring
+`../../internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md`), Spring
 Framework's non-passing set is **not** dominated by the GC-corruption
 family at all, in any of its manifestations.
 
@@ -170,7 +170,7 @@ clears.
 - `gc-corruption-guard-fixed-by-dev-merge-20260810.md` (this folder's
   sibling in `h2/`) — the before/after `dev`-merge story that prompted this
   run; also documents the h2 side of the same GC-variant sweep.
-- `../h2/gc-variant-fullsuite-crashes-hangs-fails-20260810.md` — H2's
+- `../../internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` — H2's (RETIRED: its shared SIGSEGV was a NIO view-storage defect, not a GC one)
   results from the identical run, where (unlike here) the non-passing set
   IS dominated by real CratonVM-level defects (a shared SIGSEGV site, a
   GC-guard near-miss) rather than a harness gap.
