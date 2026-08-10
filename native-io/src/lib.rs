@@ -3401,7 +3401,7 @@ const BAOS_DEFAULT_CAPACITY: usize = 32;
 fn receiver_is_baos(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     let mut cid = Some(ctx.class_id_of_object(this));
     while let Some(c) = cid {
-        if ctx.class_name_of_id(c).as_deref() == Some("java/io/ByteArrayOutputStream") {
+        if ctx.class_name_arc_of_id(c).as_deref() == Some("java/io/ByteArrayOutputStream") {
             return true;
         }
         cid = ctx.superclass_of(c);
@@ -3414,7 +3414,7 @@ const PROCESS_PIPE_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputSt
 fn receiver_is_process_pipe_output(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     let mut cid = Some(ctx.class_id_of_object(this));
     while let Some(c) = cid {
-        if ctx.class_name_of_id(c).as_deref() == Some(PROCESS_PIPE_OUTPUT_STREAM) {
+        if ctx.class_name_arc_of_id(c).as_deref() == Some(PROCESS_PIPE_OUTPUT_STREAM) {
             return true;
         }
         cid = ctx.superclass_of(c);
@@ -5102,7 +5102,7 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // declare a field called `closed`. Ask what the receiver actually IS;
     // `java.util.Scanner` is final, so an exact class match is exact.
     let class_id = ctx.class_id_of_object(this);
-    if ctx.class_name_of_id(class_id).as_deref() != Some("java/util/Scanner") {
+    if ctx.class_name_arc_of_id(class_id).as_deref() != Some("java/util/Scanner") {
         return Ok(None);
     }
     scan_set_closed(ctx, this, true);

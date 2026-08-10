@@ -1955,7 +1955,7 @@ fn lucene_data_output_write_byte_direct(
     byte: u8,
 ) -> MethodCallResult {
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("org/apache/lucene/store/ByteBuffersDataOutput")
     {
@@ -1981,7 +1981,7 @@ fn lucene_data_output_write_vint_raw(
     buf[len] = v as u8;
     len += 1;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("org/apache/lucene/store/ByteBuffersDataOutput")
     {
@@ -2010,7 +2010,7 @@ fn lucene_data_output_write_signed_vlong_raw(
     buf[len] = v as u8;
     len += 1;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("org/apache/lucene/store/ByteBuffersDataOutput")
     {

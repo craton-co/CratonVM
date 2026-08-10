@@ -131,7 +131,7 @@ fn hibernate_annotation_usage_map(
 }
 
 fn hibernate_is_orm_annotation_descriptor(ctx: &dyn NativeContext, target: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(target))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(target))
         .as_deref()
         == Some(HIBERNATE_ORM_ANNOTATION_DESCRIPTOR)
 }
@@ -874,7 +874,7 @@ fn native_hibernate_navigable_path_get_parent(
     // constructor asserts this), so reading that parent directly avoids a
     // recursive native dispatch while retaining the exact observable result.
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(parent))
+        .class_name_arc_of_id(ctx.class_id_of_object(parent))
         .as_deref()
         == Some("org/hibernate/spi/TreatedNavigablePath")
     {
@@ -884,13 +884,13 @@ fn native_hibernate_navigable_path_get_parent(
 }
 
 fn hibernate_navigable_path_is_entity_identifier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref()
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref()
         == Some(HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH)
 }
 
 fn hibernate_navigable_path_is_path(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref(),
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref(),
         Some(
             HIBERNATE_NAVIGABLE_PATH
                 | HIBERNATE_ENTITY_IDENTIFIER_NAVIGABLE_PATH
@@ -960,7 +960,7 @@ fn native_hibernate_navigable_path_equals(
     }
 
     let other_is_path = hibernate_navigable_path_is_path(ctx, other);
-    let other_is_role = ctx.class_name_of_id(ctx.class_id_of_object(other)).as_deref()
+    let other_is_role = ctx.class_name_arc_of_id(ctx.class_id_of_object(other)).as_deref()
         == Some(HIBERNATE_NAVIGABLE_ROLE);
     if !other_is_path && !other_is_role {
         return Ok(Some(Value::Int(0)));

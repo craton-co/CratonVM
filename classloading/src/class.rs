@@ -1068,19 +1068,32 @@ impl Class {
     ///
     /// Exists for JIT `checkcast`/`instanceof` (`jit_typecheck_resolve` in
     /// `vm/src/jit/helpers.rs`): the compiled artifact carries only the target
-    /// class NAME, and resolving it through the flat global
-    /// `find_class_by_name` can land on a *different* `ClassId` than the
-    /// receiver's when the same class got defined twice by two loaders (e.g.
-    /// Spring's AOT-processing/`CompileWithForkedClassLoader` child loaders
-    /// re-defining app classes — the exact shape behind
-    /// `SpringBootContextLoaderAotTests`' Residual 6, where a JIT-compiled
-    /// `checkcast org/codehaus/groovy/reflection/ClassInfo` refused the cast
-    /// between two same-named `ClassInfo` copies and silently nulled Groovy's
-    /// registry lookups). Same accepted tradeoff as
-    /// [`Self::is_subclass_of_by_name`]: in CratonVM's flat class store,
-    /// treating identically-named classes as assignable is far less harmful
-    /// than failing a cast the interpreter's loader-faithful CP resolution
-    /// would have passed.
+    /// class NAME, and resolving that name at run time can land on a
+    /// *different* `ClassId` than the receiver's when the same class got
+    /// defined twice by two loaders (e.g. Spring's
+    /// AOT-processing/`CompileWithForkedClassLoader` child loaders re-defining
+    /// app classes — the exact shape behind `SpringBootContextLoaderAotTests`'
+    /// Residual 6, where a JIT-compiled `checkcast
+    /// org/codehaus/groovy/reflection/ClassInfo` refused the cast between two
+    /// same-named `ClassInfo` copies and silently nulled Groovy's registry
+    /// lookups).
+    ///
+    /// **This is now the LAST resort, not the first.** The justification used
+    /// to be "CratonVM has a flat global class store, so identically-named
+    /// classes may as well be the same class". That premise is gone: the class
+    /// dictionary is keyed by `(ClassLoaderId, name)`, and the JIT compiler
+    /// resolves each type-check site's `CONSTANT_Class` entry through the
+    /// compiling class's own loader and interns the site under the resulting
+    /// `ClassId` (`cratonvm_jit::intern_typecheck_target`). A site with a
+    /// recorded target answers by identity and never reaches this function —
+    /// so a same-named class from a different loader is refused, which is what
+    /// loader isolation means.
+    ///
+    /// What still reaches here is a site whose target was NOT loaded when the
+    /// method was compiled, so the compiler had no id to record. For those the
+    /// old tradeoff stands: accepting an identically-named class is less
+    /// harmful than failing a cast the interpreter's loader-faithful CP
+    /// resolution would have passed.
     pub fn is_assignable_to_name(&self, target_name: &str, store: &ClassStore) -> bool {
         let mut visited: FxHashSet<ClassId> = FxHashSet::default();
         self.is_assignable_to_name_inner(target_name, store, 0, &mut visited)

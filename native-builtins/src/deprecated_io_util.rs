@@ -1756,7 +1756,7 @@ mod tests {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
         // year=70 (1970), month=0 (Jan), day=1 => epoch 0
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let result = call_native(
             &reg,
             &mut ctx,
@@ -1780,7 +1780,7 @@ mod tests {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
         // year=70, month=0, day=1, hrs=1, min=0 => 3_600_000 ms
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let result = call_native(
             &reg,
             &mut ctx,
@@ -1806,7 +1806,7 @@ mod tests {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
         // year=70, month=0, day=1, hrs=0, min=0, sec=30 => 30_000 ms
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let result = call_native(
             &reg,
             &mut ctx,
@@ -1832,7 +1832,7 @@ mod tests {
     fn test_date_init_string() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let str_obj = ctx.create_string("2000/01/01");
         let result = call_native(
             &reg,
@@ -1853,7 +1853,7 @@ mod tests {
         // Date.toString form: "EEE MMM dd HH:mm:ss zzz yyyy"
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let str_obj = ctx.create_string("Sat Jan 01 00:00:00 GMT 2000");
         let result = call_native(
             &reg,
@@ -1872,7 +1872,7 @@ mod tests {
         // RFC-1123 form: "EEE, dd MMM yyyy HH:mm:ss zzz"
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let str_obj = ctx.create_string("Sat, 01 Jan 2000 00:00:00 GMT");
         let result = call_native(
             &reg,
@@ -1891,7 +1891,7 @@ mod tests {
         // "+0100" means local is one hour ahead of UTC → 01:00 local == 00:00 UTC.
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let str_obj = ctx.create_string("Sat, 01 Jan 2000 01:00:00 +0100");
         let result = call_native(
             &reg,
@@ -1911,7 +1911,7 @@ mod tests {
         // NOT silently fall back to epoch 0.
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let str_obj = ctx.create_string("not a date at all");
         let result = call_native(
             &reg,
@@ -1947,7 +1947,7 @@ mod tests {
     fn test_date_get_year() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         // Set to 2000-06-15 12:30:45
         let ms = to_epoch_millis(2000, 5, 15, 12, 30, 45);
         set_date_millis(&mut ctx, date_obj, ms);
@@ -1967,7 +1967,7 @@ mod tests {
     fn test_date_get_month_and_date() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let ms = to_epoch_millis(2000, 5, 15, 12, 30, 45);
         set_date_millis(&mut ctx, date_obj, ms);
 
@@ -1996,7 +1996,7 @@ mod tests {
     fn test_date_get_hours_min_sec() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let ms = to_epoch_millis(2000, 5, 15, 12, 30, 45);
         set_date_millis(&mut ctx, date_obj, ms);
 
@@ -2035,7 +2035,7 @@ mod tests {
     fn test_date_get_day_of_week() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         // 1970-01-01 = Thursday = 4
         set_date_millis(&mut ctx, date_obj, 0);
         let dow = call_native(
@@ -2053,7 +2053,7 @@ mod tests {
     fn test_date_set_year() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let ms = to_epoch_millis(2000, 5, 15, 12, 30, 45);
         set_date_millis(&mut ctx, date_obj, ms);
 
@@ -2083,7 +2083,7 @@ mod tests {
     fn test_date_set_month() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         let ms = to_epoch_millis(2000, 5, 15, 12, 30, 45);
         set_date_millis(&mut ctx, date_obj, ms);
 
@@ -2112,7 +2112,7 @@ mod tests {
     fn test_date_to_locale_string() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         // Epoch 0 = 1970-01-01 00:00:00
         set_date_millis(&mut ctx, date_obj, 0);
 
@@ -2137,7 +2137,7 @@ mod tests {
     fn test_date_to_gmt_string() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4)?;
+        let date_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4).unwrap();
         set_date_millis(&mut ctx, date_obj, 0);
 
         let result = call_native(
@@ -2163,7 +2163,7 @@ mod tests {
     fn test_string_hibyte_constructor() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let this = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4)?;
+        let this = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/String", 4).unwrap();
         // Create byte array [65, 66, 67] = "ABC" with hibyte=0
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 3);
         ctx.set_array_element(arr, 0, Value::Int(65));
@@ -2315,7 +2315,7 @@ mod tests {
         // in for that dispatch.
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let num = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4)?;
+        let num = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4).unwrap();
         ctx.set_field(num, 0, Value::Int(300));
         ctx.set_invoke_virtual_result(Ok(Some(Value::Int(300))));
 
@@ -2335,7 +2335,7 @@ mod tests {
     fn test_number_short_value() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let num = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4)?;
+        let num = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Number", 4).unwrap();
         ctx.set_field(num, 0, Value::Int(70000));
         ctx.set_invoke_virtual_result(Ok(Some(Value::Int(70000))));
 
@@ -2357,8 +2357,8 @@ mod tests {
     fn test_properties_save_delegates() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let props = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Properties", 4)?;
-        let out = try_alloc_concurrent_synthetic(&mut ctx, "java/io/OutputStream", 0)?;
+        let props = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Properties", 4).unwrap();
+        let out = try_alloc_concurrent_synthetic(&mut ctx, "java/io/OutputStream", 0).unwrap();
         let comment = ctx.create_string("test");
 
         // Pre-arm invoke_virtual to return Ok(None) for store()
@@ -2387,7 +2387,7 @@ mod tests {
     fn test_hashtable_elements_and_keys() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let ht = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 4)?;
+        let ht = try_alloc_concurrent_synthetic(&mut ctx, "java/util/Hashtable", 4).unwrap();
 
         let elements = call_native(
             &reg,
@@ -2424,7 +2424,7 @@ mod tests {
     fn test_string_buffer_input_stream() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let sbis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4)?;
+        let sbis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("AB");
 
         // init
@@ -2508,7 +2508,7 @@ mod tests {
     fn test_string_buffer_input_stream_read_array() {
         let reg = setup();
         let mut ctx = MockNativeContext::new();
-        let sbis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4)?;
+        let sbis = try_alloc_concurrent_synthetic(&mut ctx, "java/io/StringBufferInputStream", 4).unwrap();
         let str_obj = ctx.create_string("Hello");
 
         call_native(

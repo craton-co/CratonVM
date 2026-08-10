@@ -1427,7 +1427,7 @@ mod tests {
 
         let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
         let mirror = ctx.get_class_mirror(host_cid);
-        let lookup = alloc_lookup_for(&mut ctx, mirror);
+        let lookup = alloc_lookup_for(&mut ctx, mirror).unwrap();
 
         assert!(
             matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
@@ -1470,7 +1470,7 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         let host_cid = ctx.ensure_class_initialized("p/Host").expect("host cid");
         let mirror = ctx.get_class_mirror(host_cid);
-        let lookup = alloc_lookup_for(&mut ctx, mirror);
+        let lookup = alloc_lookup_for(&mut ctx, mirror).unwrap();
         assert!(
             matches!(ctx.get_field(lookup, 0), Value::Object(Some(m)) if m == mirror),
             "synthetic slot 0 is lookupClass"

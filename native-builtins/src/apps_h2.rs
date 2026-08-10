@@ -1028,7 +1028,7 @@ fn h2_cardinality_expression_get_value(
         match value_type {
             38 => {
                 let json = if ctx
-                    .class_name_of_id(ctx.class_id_of_object(value))
+                    .class_name_arc_of_id(ctx.class_id_of_object(value))
                     .as_deref()
                     == Some("org/h2/value/ValueJson")
                 {

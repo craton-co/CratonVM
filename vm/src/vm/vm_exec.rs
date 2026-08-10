@@ -6958,6 +6958,18 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|c| c.name.to_string())
     }
 
+    /// The whole point of the override: `Class::name` is already an
+    /// `Arc<str>`, so the answer is a refcount bump rather than the fresh
+    /// `String` the default (and `class_name_of_id`) allocates.
+    fn class_name_arc_of_id(&self, class_id: ClassId) -> Option<std::sync::Arc<str>> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| std::sync::Arc::clone(&c.name))
+    }
+
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
         self.shared.mem.heap.class_id_of(obj)
     }
@@ -13352,7 +13364,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // its physical class name.
         let lock_class_name = if contended.is_none() {
             waiting.and_then(|object| {
-                (self.class_name_of_id(self.class_id_of_object(object)).as_deref()
+                (self.class_name_arc_of_id(self.class_id_of_object(object)).as_deref()
                     == Some("java/util/concurrent/CountDownLatch"))
                     .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
             })

@@ -906,7 +906,7 @@ fn discover_providers(
     };
     let loader_is_jboss_module = loader_ref_opt
         .map(|r| {
-            ctx.class_name_of_id(ctx.class_id_of_object(r)).as_deref()
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(r)).as_deref()
                 == Some("org/jboss/modules/ModuleClassLoader")
         })
         .unwrap_or(false);

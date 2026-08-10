@@ -667,14 +667,35 @@ Injection-tested: adding one raw `static Mutex` to `native-builtins/src/lib.rs`
 moves the count to 441 and fails the gate; `grep -c` confirmed the injection
 landed, and confirmed its removal.
 
+## Later conversions
+
+**2026-08-05, 438 -> 432.** Six conversions that arrived on `dev` without the
+same-change re-freeze this ratchet asks for; recorded in the test's own doc
+rather than silently absorbed.
+
+**2026-08-10, 436 -> 432.** The gate had gone red: four raw locks landed after
+the freeze. Paid back rather than re-baselined, per the gate's own instruction
+-- `ds_side_table`, `ds_peer_table` and `ssc_side_table` (`net_phase_e.rs`) and
+`pending_connect_sockets` (`phases_late/ssl_security.rs`), all `Scratch`, each
+earned by reading every acquisition site: no `ctx` call under any guard.
+
+Two of the four newcomers were deliberately left raw. `boot_layer_memo`
+(`jboss_jdkspecific.rs`) and `p60_current_handle_memo` (`phases_late.rs`) both
+hold their guard across `ctx.add_global_root` -- the re-entrant shape a level
+exists to forbid. Stamping `Scratch` on either would encode exactly the false
+hierarchy this section argues against; they need their publish restructured to
+drop the guard before the VM call, and until then they belong here, not under a
+level.
+
 ## Remaining backlog
 
-438 locks. The unit of work is per-lock: decide whether it can be held across a
+432 locks. The unit of work is per-lock: decide whether it can be held across a
 re-entry into the VM, and pick the level from the answer. Most are leaf caches
 belonging at `Scratch`; **the interesting minority are those held across a
 `NativeContext` callback, and those are the actual latent deadlocks this program
-should surface.** The heaviest files are `t27_tls.rs` (33), `lib.rs` (27),
-`xnio_io_thread.rs` (16), `net_phase_e.rs` (16).
+should surface** -- the two memos named above are the first two found. The
+heaviest files are `t27_tls.rs` (33), `lib.rs` (27), `xnio_io_thread.rs` (16),
+`net_phase_e.rs` (13).
 
 ---
 

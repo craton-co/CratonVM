@@ -520,7 +520,7 @@ fn obj_slot(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize) -> Option<
 }
 
 fn class_name_is(ctx: &dyn NativeContext, obj: ObjectRef, want: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
         .as_deref()
         == Some(want)
 }

@@ -2370,7 +2370,7 @@ mod tests {
             },
         );
         let mut ctx = mock_ctx();
-        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &w);
+        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &w).unwrap();
         register_worker(w.clone());
         let runnable = ctx.fresh_object_ref();
         NATIVE_EXECUTE_EXPECTED_RUNNABLE.store(runnable.as_ptr() as usize, Ordering::SeqCst);
@@ -2397,7 +2397,7 @@ mod tests {
         assert_eq!(res, Err(ExecuteError::Rejected));
         // And through the Java mirror path:
         let mut ctx = mock_ctx();
-        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &w);
+        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &w).unwrap();
         register_worker(w.clone());
         let err = native_worker_execute(&mut ctx, &[Value::Object(Some(mirror))]);
         assert!(err.is_err(), "execute on shutdown worker must fail");
@@ -2543,7 +2543,7 @@ mod tests {
     fn wf_domain_real_nio_worker_is_adopted_without_slot_handle() {
         let mut ctx = mock_ctx();
         let realish =
-            try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_XNIO_WORKER, WORKER_NUM_SLOTS + 1)?;
+            try_alloc_concurrent_synthetic(&mut ctx, CLS_NIO_XNIO_WORKER, WORKER_NUM_SLOTS + 1).unwrap();
         ctx.set_field(realish, WORKER_FIELD_OPTIONS_HANDLE, Value::Object(None));
 
         let worker = read_worker(&ctx, realish).expect("adopt real worker");
@@ -2625,12 +2625,12 @@ mod tests {
         let mut ctx = mock_ctx();
         let worker = XnioWorker::new("wf_domain_tcp_server", OptionMap::default());
         register_worker(worker.clone());
-        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
-        let bind_addr = try_alloc_concurrent_synthetic(&mut ctx, "java/net/InetSocketAddress", 2)?;
+        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker).unwrap();
+        let bind_addr = try_alloc_concurrent_synthetic(&mut ctx, "java/net/InetSocketAddress", 2).unwrap();
         let host = ctx.create_string("127.0.0.1");
         ctx.set_field(bind_addr, 0, Value::Object(Some(host)));
         ctx.set_field(bind_addr, 1, Value::Int(0));
-        let listener = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/ChannelListener", 0)?;
+        let listener = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/ChannelListener", 0).unwrap();
 
         let channel = match native_xnio_create_tcp_connection_server(
             &mut ctx,
@@ -2707,9 +2707,9 @@ mod tests {
         let pipe = Arc::new(Pipe::new(1024));
         pipe.push(b"x");
         let source_id = register_source_channel(ConduitTransport::Pipe(pipe));
-        let source = alloc_source_channel_obj(&mut ctx, source_id);
+        let source = alloc_source_channel_obj(&mut ctx, source_id).unwrap();
         ctx.set_field(source, SRC_FIELD_READ_SUSPENDED, Value::Int(0));
-        let listener = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/ChannelListener", 0)?;
+        let listener = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/ChannelListener", 0).unwrap();
         ctx.set_field(
             source,
             SRC_FIELD_READ_LISTENER,
@@ -2717,7 +2717,7 @@ mod tests {
         );
         ctx.set_invoke_virtual_hook(mark_source_read_listener_invoked);
 
-        let channel = try_alloc_concurrent_synthetic(&mut ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS)?;
+        let channel = try_alloc_concurrent_synthetic(&mut ctx, CLS_ACCEPTING_CHANNEL, ACCEPT_NUM_SLOTS).unwrap();
         let retained = accept_pump_blocked_sleep(&mut ctx, channel, Duration::from_millis(0));
 
         assert_eq!(retained, channel);
@@ -2772,7 +2772,7 @@ mod tests {
             },
         );
         register_worker(worker.clone());
-        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
+        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker).unwrap();
         let io_thread =
             match native_worker_get_io_thread(&mut ctx, &[Value::Object(Some(worker_mirror))])
                 .unwrap()
@@ -2781,7 +2781,7 @@ mod tests {
                 Value::Object(Some(o)) => o,
                 other => panic!("expected XnioIoThread mirror, got {:?}", other),
             };
-        let destination = try_alloc_concurrent_synthetic(&mut ctx, "java/net/InetSocketAddress", 2)?;
+        let destination = try_alloc_concurrent_synthetic(&mut ctx, "java/net/InetSocketAddress", 2).unwrap();
         let host = ctx.create_string("127.0.0.1");
         ctx.set_field(destination, 0, Value::Object(Some(host)));
         ctx.set_field(destination, 1, Value::Int(addr.port() as i32));
@@ -2817,7 +2817,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let worker = XnioWorker::new("wf_domain_stream_worker_identity", OptionMap::default());
         register_worker(worker.clone());
-        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
+        let worker_mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker).unwrap();
 
         let io_thread =
             match native_worker_get_io_thread(&mut ctx, &[Value::Object(Some(worker_mirror))])
@@ -2848,7 +2848,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let worker = XnioWorker::new("t19_7_b_mirror", OptionMap::default());
         register_worker(worker.clone());
-        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker);
+        let mirror = alloc_worker_mirror(&mut ctx, CLS_XNIO_WORKER, &worker).unwrap();
         // isShutdown → false pre-shutdown.
         let r = native_worker_is_shutdown(&mut ctx, &[Value::Object(Some(mirror))])
             .unwrap()

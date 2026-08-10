@@ -44,6 +44,11 @@ use identity_hash::seed as ih_seed;
 // (versus 2.2-2.9x on arithmetic / sieve / matrix) and of its sub-linear
 // scaling: a large fixed per-op constant, not a fragmentation signature.
 //
+// (`NativeContext::class_name_arc_of_id` has since removed the *allocation*
+// half of that cost for every caller in the workspace — it hands back a clone
+// of the `Arc<str>` the class already owns. It does not remove the lock, which
+// is why these memos still exist and still pay for themselves.)
+//
 // THE FIX. Every one of those questions is a pure function of the receiver's
 // `ClassId`: it depends only on the class's own name and its superclass chain,
 // both immutable after linking (JVMTI redefinition may not change either — the
@@ -291,7 +296,7 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     {
         let mut cur = cid;
         for _ in 0..FACTS_WALK_LIMIT {
-            if ctx.class_name_of_id(cur).as_deref() == Some("java/util/IdentityHashMap") {
+            if ctx.class_name_arc_of_id(cur).as_deref() == Some("java/util/IdentityHashMap") {
                 flags |= CF_IDENTITY_MAP;
                 break;
             }
@@ -305,7 +310,7 @@ fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
     // `WellKnownClass` chain walk above answers — it is an exact-class test on
     // one name — so it gets the same one-name treatment as `IdentityHashMap`
     // rather than a 17th variant. Paid once per `ClassId`, then cached forever.
-    if ctx.class_name_of_id(cid).as_deref() == Some(KSV_CLASS) {
+    if ctx.class_name_arc_of_id(cid).as_deref() == Some(KSV_CLASS) {
         flags |= CF_KEY_SET_VIEW;
     }
     ClassFacts(flags)
@@ -456,7 +461,11 @@ fn class_name_rc(ctx: &dyn NativeContext, cid: ClassId) -> Option<std::rc::Rc<st
     if hit.is_some() {
         return hit;
     }
-    let name: std::rc::Rc<str> = std::rc::Rc::from(ctx.class_name_of_id(cid)?.as_str());
+    // `class_name_arc_of_id`, not `class_name_of_id`: the miss path used to
+    // allocate a `String` purely to copy it straight into the `Rc`. The `Arc`
+    // deref feeds `Rc::from(&str)` the same bytes with one allocation instead
+    // of two.
+    let name: std::rc::Rc<str> = std::rc::Rc::from(&*ctx.class_name_arc_of_id(cid)?);
     RECEIVER_NAMES.with(|cell| {
         let mut cache = cell.borrow_mut();
         if cache.0 == Some(vm) {
@@ -6947,7 +6956,7 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
 }
 
 fn class_name_is(ctx: &dyn NativeContext, obj: ObjectRef, expected: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(expected)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(expected)
 }
 
 /// Check if two keys are equal.
@@ -10789,7 +10798,7 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn exc_is_cce_or_npe(ctx: &mut dyn NativeContext, exc: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(exc);
     matches!(
-        ctx.class_name_of_id(class_id).as_deref(),
+        ctx.class_name_arc_of_id(class_id).as_deref(),
         Some("java/lang/ClassCastException") | Some("java/lang/NullPointerException")
     )
 }
@@ -12889,7 +12898,7 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // backing resolves as a LinkedHashMap.
     let backing_is_lhm = hs_is_insertion_ordered(ctx, this)
         || matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(backing))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(backing))
                 .as_deref(),
             Some("java/util/LinkedHashMap")
         );
@@ -17461,14 +17470,14 @@ fn stream_new_pull_state(chain_len: usize) -> StreamPullState {
 fn value_is_exact_class(ctx: &dyn NativeContext, v: Value, class_name: &str) -> bool {
     match v {
         Value::Object(Some(o)) => {
-            ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
         }
         _ => false,
     }
 }
 
 fn object_is_exact_class(ctx: &dyn NativeContext, o: ObjectRef, class_name: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref() == Some(class_name)
 }
 
 fn is_placeholder_object_class_cast(
@@ -21476,7 +21485,7 @@ fn is_known_collector_tag(tag: i32) -> bool {
 /// objects; if so, returns its tag.
 fn collector_tag_of(ctx: &mut dyn NativeContext, v: Value) -> Option<i32> {
     if let Value::Object(Some(c)) = v {
-        let is_named_collector = ctx.class_name_of_id(ctx.class_id_of_object(c)).as_deref()
+        let is_named_collector = ctx.class_name_arc_of_id(ctx.class_id_of_object(c)).as_deref()
             == Some("java/util/stream/Collector");
         let has_collector_layout = ctx.object_num_fields(c) >= COLLECTOR_NUM_FIELDS;
         if (is_named_collector || has_collector_layout)
@@ -22601,7 +22610,7 @@ fn collect_via_collector_protocol(
     // sequential fallback is the standard list accumulation shape used by
     // Collectors.toCollection(ArrayList::new) in ReflectionUtils.
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(collector))
+        .class_name_arc_of_id(ctx.class_id_of_object(collector))
         .as_deref()
         == Some("java/lang/Object")
         && collector_tag_of(ctx, Value::Object(Some(collector))).is_none()
@@ -44583,7 +44592,7 @@ fn alloc_key_set_view_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, M
     // stand-in, so check the resolved name rather than trusting `Ok`.
     let mut real_cid = None;
     if let Ok(cid) = ctx.ensure_class_initialized(KSV_CLASS) {
-        if ctx.class_name_of_id(cid).as_deref() == Some(KSV_CLASS) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(KSV_CLASS) {
             real_cid = Some(cid);
         }
     }
@@ -44604,7 +44613,7 @@ fn alloc_key_set_view_object(ctx: &mut dyn NativeContext) -> Result<ObjectRef, M
 fn alloc_backing_chm(ctx: &mut dyn NativeContext, initial_capacity: Option<i32>) -> Result<ObjectRef, MethodCallFailed> {
     let mut real_cid = None;
     if let Ok(cid) = ctx.ensure_class_initialized(CHM_CLASS) {
-        if ctx.class_name_of_id(cid).as_deref() == Some(CHM_CLASS) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(CHM_CLASS) {
             real_cid = Some(cid);
         }
     }
@@ -53866,7 +53875,7 @@ fn cf_is_real_jdk(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 fn cf_is_alt_result(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(obj);
     matches!(
-        ctx.class_name_of_id(cid).as_deref(),
+        ctx.class_name_arc_of_id(cid).as_deref(),
         Some(CF_ALT_RESULT_CLASS)
     )
 }

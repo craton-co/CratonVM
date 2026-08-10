@@ -2315,7 +2315,7 @@ fn is_abstract_method_error(
 ) -> bool {
     match result {
         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
-            ctx.class_name_of_id(ctx.class_id_of_object(*exc))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(*exc))
                 .as_deref()
                 == Some("java/lang/AbstractMethodError")
         }
@@ -5829,7 +5829,7 @@ mod tests {
         for i in 0..16 {
             ctx.set_array_element(arr, i, Value::Int(i as i32));
         }
-        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8)?;
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8).unwrap();
         ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
         ctx.set_field_by_name(bb, "position", Value::Int(1));
         ctx.set_field_by_name(bb, "limit", Value::Int(4));
@@ -5865,7 +5865,7 @@ mod tests {
     fn bb_view_direct_named_reads_and_writes_native_memory() {
         let mut ctx = crate::test_utils::mock_ctx();
         let mut native: Vec<u8> = (0u8..32).collect();
-        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8)?;
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8).unwrap();
         ctx.set_field_by_name(
             bb,
             "address",
@@ -5900,7 +5900,7 @@ mod tests {
     fn bb_view_direct_clamps_to_capacity() {
         let mut ctx = crate::test_utils::mock_ctx();
         let mut native: Vec<u8> = (10u8..18).collect(); // 8 bytes
-        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8)?;
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/DirectByteBuffer", 8).unwrap();
         ctx.set_field_by_name(
             bb,
             "address",
@@ -5934,7 +5934,7 @@ mod tests {
         }
         // A class OUTSIDE the mock's java/nio/*ByteBuffer named-field map,
         // so only slot-indexed reads can resolve it.
-        let bb = try_alloc_concurrent_synthetic(&mut ctx, "javax/net/ssl/SyntheticBuf", 4)?;
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "javax/net/ssl/SyntheticBuf", 4).unwrap();
         ctx.set_field(bb, 0, Value::Object(Some(arr)));
         ctx.set_field(bb, 1, Value::Int(1)); // pos
         ctx.set_field(bb, 2, Value::Int(3)); // limit
@@ -5971,7 +5971,7 @@ mod tests {
         for i in 0..4 {
             ctx.set_array_element(arr, i, Value::Int((10 + i) as i32));
         }
-        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8)?;
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/nio/HeapByteBuffer", 8).unwrap();
         ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
         ctx.set_field_by_name(bb, "position", Value::Int(0));
         ctx.set_field_by_name(bb, "limit", Value::Int(16));
@@ -6004,7 +6004,7 @@ mod tests {
     #[test]
     fn bb_view_unresolved_moves_zero_bytes() {
         let mut ctx = crate::test_utils::mock_ctx();
-        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 3)?;
+        let bb = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 3).unwrap();
         let mut out = Vec::new();
         assert_eq!(bb_read_into(&mut ctx, bb, &mut out, 64), 0);
         assert!(out.is_empty());
@@ -6023,16 +6023,16 @@ mod tests {
         let ctx = fake_object_ref(1);
         let mut mock_ctx = crate::test_utils::mock_ctx();
         set_pending_tm_trust_roots(vec![ca_der.clone()]);
-        attach_pending_identity_to_ctx(&mut mock_ctx, ctx, None);
+        attach_pending_identity_to_ctx(&mut mock_ctx, ctx, None).unwrap();
 
-        assert!(ctx_identity(&mut mock_ctx, ctx).is_none());
+        assert!(ctx_identity(&mut mock_ctx, ctx).unwrap().is_none());
         let selected = selected_context_trust_roots().expect("context trust roots selected");
         assert_eq!(selected.root_ders, vec![ca_der]);
         let root_store = root_store_for_trust_roots(Some(&selected));
         assert_eq!(root_store.roots.len(), 1);
 
         let other_ctx = fake_object_ref(2);
-        assert!(ctx_identity(&mut mock_ctx, other_ctx).is_none());
+        assert!(ctx_identity(&mut mock_ctx, other_ctx).unwrap().is_none());
         assert!(selected_context_trust_roots().is_none());
     }
 

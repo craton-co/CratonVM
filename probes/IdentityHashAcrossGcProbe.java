@@ -3,77 +3,108 @@ import java.util.IdentityHashMap;
 import java.util.Map;
 
 /**
- * `Object.hashCode()`/`System.identityHashCode` must answer the same value for
- * the lifetime of an object, whatever the collector does to its address —
- * otherwise every `HashMap` keyed by an object that does not override
- * `hashCode` silently loses its entries at the next collection.
+ * Paired probe for identity-hash stability across garbage collection, and for
+ * {@code HashMap} lookups keyed on objects that do not override
+ * {@code hashCode}, diffed against the host JDK.
  *
- * Spring Boot's `TomcatWebServer` is exactly such a map: it parks the service's
- * connectors in a `Map<Service, Connector[]>` while the context starts, then
- * looks them up again by the same `StandardService` instance. A miss there
- * leaves the service with no connectors, so `Tomcat.getConnector()` fabricates
- * a fresh port-8080 one and the server fails to start.
+ * {@code System.identityHashCode} must return the SAME value for the same
+ * object for that object's whole life — including across a collection that
+ * moves it. A collector that derives the hash from the address and does not
+ * preserve it on copy breaks every hash container keyed by identity, and it
+ * breaks them *silently*: `put` lands in one bucket, the object moves, and
+ * `get` looks in another and returns null.
+ *
+ * Concretely, Spring Boot's `TomcatWebServer` parks the connectors it
+ * temporarily removed in a `Map<Service, Connector[]>` and restores them from
+ * it on `start()`. `Service` does not override `hashCode`. If that `get`
+ * misses, the connectors are never restored, and `Tomcat.getConnector()` then
+ * *fabricates* a replacement on port 8080 — which is exactly what CratonVM was
+ * observed doing while HotSpot bound an ephemeral port.
+ *
+ * Every line prints a value, and the GC arms allocate hard enough to force
+ * real collections rather than trusting `System.gc()`.
  */
-public final class IdentityHashAcrossGcProbe {
+public class IdentityHashAcrossGcProbe {
 
-	public static void main(String[] args) {
-		Object plain = new Object();
-		Holder holder = new Holder("held");
+    /** No hashCode/equals override — identity semantics, like Tomcat's Service. */
+    static final class Key {
+        final int id;
 
-		int plainBefore = System.identityHashCode(plain);
-		int holderBefore = System.identityHashCode(holder);
-		int plainHashBefore = plain.hashCode();
+        Key(int id) {
+            this.id = id;
+        }
+    }
 
-		Map<Object, String> hashMap = new HashMap<>();
-		hashMap.put(plain, "plain-value");
-		hashMap.put(holder, "holder-value");
-		Map<Object, String> identityMap = new IdentityHashMap<>();
-		identityMap.put(plain, "plain-value");
-		identityMap.put(holder, "holder-value");
+    static void churn(int mb) {
+        // Allocate and drop, to make the collector actually run and move things.
+        Object sink = null;
+        for (int i = 0; i < mb * 32; i++) {
+            byte[] b = new byte[32 * 1024];
+            b[0] = (byte) i;
+            if ((i & 1023) == 0) {
+                sink = b;
+            }
+        }
+        if (sink == null) {
+            System.out.print("");
+        }
+    }
 
-		churn();
+    public static void main(String[] args) {
+        final int n = 200;
+        Key[] keys = new Key[n];
+        int[] hashBefore = new int[n];
+        Map<Key, String> hash = new HashMap<>();
+        Map<Key, String> ident = new IdentityHashMap<>();
 
-		int plainAfter = System.identityHashCode(plain);
-		int holderAfter = System.identityHashCode(holder);
-		int plainHashAfter = plain.hashCode();
+        for (int i = 0; i < n; i++) {
+            keys[i] = new Key(i);
+            hashBefore[i] = System.identityHashCode(keys[i]);
+            hash.put(keys[i], "v" + i);
+            ident.put(keys[i], "v" + i);
+        }
 
-		System.out.println("identityHashCode(plain)  before=" + plainBefore + " after=" + plainAfter + " stable="
-				+ (plainBefore == plainAfter));
-		System.out.println("Object.hashCode(plain)   before=" + plainHashBefore + " after=" + plainHashAfter
-				+ " stable=" + (plainHashBefore == plainHashAfter));
-		System.out.println("identityHashCode(holder) before=" + holderBefore + " after=" + holderAfter + " stable="
-				+ (holderBefore == holderAfter));
-		System.out.println("HashMap.get(plain)=" + hashMap.get(plain));
-		System.out.println("HashMap.get(holder)=" + hashMap.get(holder));
-		System.out.println("HashMap.size=" + hashMap.size());
-		System.out.println("IdentityHashMap.get(plain)=" + identityMap.get(plain));
-		System.out.println("IdentityHashMap.get(holder)=" + identityMap.get(holder));
-	}
+        System.out.println("initial hash.size()      = " + hash.size());
+        System.out.println("initial ident.size()     = " + ident.size());
 
-	/** Allocate enough short-lived garbage to force several collections. */
-	private static void churn() {
-		long sink = 0;
-		for (int i = 0; i < 4096; i++) {
-			byte[] block = new byte[64 * 1024];
-			block[0] = (byte) i;
-			sink += block[0];
-		}
-		System.gc();
-		if (sink == Long.MIN_VALUE) {
-			System.out.println("unreachable " + sink);
-		}
-	}
+        churn(256);
+        System.gc();
+        churn(256);
 
-	/** A class with no `hashCode` override — identity hashing, like `StandardService`. */
-	static final class Holder {
+        int hashChanged = 0;
+        int hashMapMiss = 0;
+        int identMapMiss = 0;
+        int firstChanged = -1;
+        for (int i = 0; i < n; i++) {
+            if (System.identityHashCode(keys[i]) != hashBefore[i]) {
+                hashChanged++;
+                if (firstChanged < 0) {
+                    firstChanged = i;
+                }
+            }
+            if (!("v" + i).equals(hash.get(keys[i]))) {
+                hashMapMiss++;
+            }
+            if (!("v" + i).equals(ident.get(keys[i]))) {
+                identMapMiss++;
+            }
+        }
 
-		@SuppressWarnings("unused")
-		private final String name;
+        System.out.println("expect 0: identityHashCode changed after GC = " + hashChanged
+                + (firstChanged >= 0 ? " (first at index " + firstChanged + ")" : ""));
+        System.out.println("expect 0: HashMap.get misses after GC       = " + hashMapMiss);
+        System.out.println("expect 0: IdentityHashMap.get misses        = " + identMapMiss);
+        System.out.println("expect 200: hash.size() after GC            = " + hash.size());
 
-		Holder(String name) {
-			this.name = name;
-		}
-
-	}
-
+        // Second round, to catch a collector that only moves on a later cycle.
+        churn(384);
+        System.gc();
+        int lateMiss = 0;
+        for (int i = 0; i < n; i++) {
+            if (!("v" + i).equals(hash.get(keys[i]))) {
+                lateMiss++;
+            }
+        }
+        System.out.println("expect 0: HashMap.get misses, 2nd round     = " + lateMiss);
+    }
 }

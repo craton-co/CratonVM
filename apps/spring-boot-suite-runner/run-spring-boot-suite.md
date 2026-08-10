@@ -158,7 +158,9 @@ every CratonVM child process.
 
 `passed` means the class had `status=PASS` in a CratonVM reference result
 file. Every other discovered class is `others`, including `FAIL`, `CRASH`,
-`HANG`, `LOADFAIL`, `EMPTY`, and classes absent from the reference.
+`HANG`, `LOADFAIL`, `EMPTY`, `BOTH-FAIL`, and classes absent from the reference.
+`BOTH-FAIL` stays in `others` on purpose: it is not a pass, and a fresh HotSpot
+baseline should be able to flip it without a list rebuild.
 
 Reference file lookup order: `-RefCsv <path>` → `.suite\reference.tsv` →
 `.suite\reference.csv`.
@@ -185,7 +187,32 @@ tests, failed, aborted, skipped, containersFailed, stdoutLog, stderrLog, note`.
 Status values: `PASS`, `FAIL` (failed/aborted tests or failed containers),
 `EMPTY` (ran, zero tests), `LOADFAIL` (class load failed), `HANG` (hit
 `-TimeoutSec`), `CRASH` (crash/panic fingerprint or non-zero exit with no
-`SBRUNNER_RESULT` line), `NOSUMMARY` (neither).
+`SBRUNNER_RESULT` line), `NOSUMMARY` (neither), plus `BOTH-FAIL` — a `FAIL` the
+HotSpot baseline shares, and therefore **not** a CratonVM defect.
+
+`BOTH-FAIL` requires a same-scope `-Vm hotspot` run and is deliberately strict
+(see `Resolve-BothFailStatus`): a `CRASH`/`HANG`/`LOADFAIL` is never
+reclassified, and CratonVM must come out no worse than the reference on **every**
+counter the `FAIL` verdict is built from — `failed`, `aborted` *and*
+`containersFailed`. Comparing `failed` alone previously excused a row where
+CratonVM aborted 5 tests and HotSpot aborted 1, because `0 -gt 0` is false; the
+counters that make a class like `ApplicationTempTests` a `FAIL` in the first
+place (`failed=0 aborted=1`) were exactly the ones it was not looking at.
+
+The baseline it reads, `.suite\baseline\hotspot-baseline-latest.tsv`, **merges**
+on `module + class` rather than being replaced (`Merge-HotspotBaselineLatest`).
+Every `-Vm hotspot` run used to blind-copy its own results over it, so "latest"
+meant *most recent* rather than *best*: a 5-class ad-hoc check on 2026-08-01
+replaced an 81-class baseline, leaving the reclassifier with five irrelevant
+rows. A narrow rerun now refreshes the classes it covered and leaves the rest
+standing.
+
+When a class aborts or skips tests, `SbRunner` prints one
+`SBRUNNER_ABORTED_DETAIL <test> : <reason>` / `SBRUNNER_SKIPPED_DETAIL <test> :
+<reason>` line per test. JUnit's `SummaryGeneratingListener` counts these but
+carries no reason for either, so before this existed a row could read
+`aborted=1` with no explanatory text anywhere in its logs, triageable only by
+reading the upstream test source.
 
 Runs are resumable — existing rows in `results.tsv` are skipped when
 rerunning the same `-RunName` and mode.

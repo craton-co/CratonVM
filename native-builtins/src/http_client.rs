@@ -2058,7 +2058,7 @@ mod http_client_tests {
             body: b"hello".to_vec(),
             keep_alive: true,
         };
-        let obj = alloc_response(&mut ctx, &resp, req, "http://example.com/");
+        let obj = alloc_response(&mut ctx, &resp, req, "http://example.com/").unwrap();
         assert_eq!(ctx.get_field(obj, HRS_STATUS), Value::Int(200));
         assert_eq!(
             ctx.get_field(obj, HRS_VERSION),

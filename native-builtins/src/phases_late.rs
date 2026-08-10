@@ -4895,6 +4895,7 @@ pub fn gc_scan_classvalue_cache_roots(
                     .and_then(cratonvm_types::loader_pin::loader_pin_addr)
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        vm_identity,
                         loader,
                         entry.value.as_ptr() as usize,
                     );
@@ -8444,11 +8445,11 @@ mod ffm_p67_layout_tests {
         let mut ctx = mock_ctx();
 
         let ptr_name = ctx.create_string("ptr");
-        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8);
+        let ptr_layout = p67_layout_object(&mut ctx, "java/lang/foreign/AddressLayout", 8, 8).unwrap();
         ctx.set_field(ptr_layout, 3, Value::Object(Some(ptr_name)));
 
         let size_name = ctx.create_string("size");
-        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8);
+        let size_layout = p67_layout_object(&mut ctx, "java/lang/foreign/ValueLayout$OfLong", 8, 8).unwrap();
         ctx.set_field(size_layout, 3, Value::Object(Some(size_name)));
 
         let members = ctx.new_array(ArrayElementType::Reference, 2);
@@ -8471,7 +8472,7 @@ mod ffm_p67_layout_tests {
 
         let path_name = ctx.create_string("size");
         let path_elem =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemoryLayout$PathElement", 2).unwrap();
         ctx.set_field(path_elem, 0, Value::Object(Some(path_name)));
         ctx.set_field(path_elem, 1, Value::Int(0));
         let path = ctx.new_array(ArrayElementType::Reference, 1);
