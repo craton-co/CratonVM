@@ -257,6 +257,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "aioobe3", on_key: Some("CRATONVM_DBG_AIOOBE3"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "altrace", on_key: Some("CRATONVM_DBG_ALTRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ann-proxy-dispatch-trace", on_key: Some("CRATONVM_ANN_PROXY_DISPATCH_TRACE"), off_key: None, off_word: None },
+    // Per-phase timing for `annotation_proxy_dispatch_impl` (total / walk /
+    // flagread / namecmp), printed every 100k dispatches. Reading one annotation
+    // attribute costs ~10.5 us against ~10 ns on HotSpot; this splits it.
+    E { group: Group::DBG, token: "ann-proxy-prof", on_key: Some("CRATONVM_DBG_ANN_PROXY_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ann-trace", on_key: Some("CRATONVM_ANN_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "annproxy-wrap", on_key: Some("CRATONVM_DBG_ANNPROXY_WRAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "anonalloc", on_key: Some("CRATONVM_DBG_ANONALLOC"), off_key: None, off_word: None },

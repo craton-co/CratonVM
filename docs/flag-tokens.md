@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-425 tokens.
+426 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -84,6 +84,7 @@ export inherited from a parent shell.
 | `aioobe3` | `CRATONVM_DBG_AIOOBE3` |
 | `altrace` | `CRATONVM_DBG_ALTRACE` |
 | `ann-proxy-dispatch-trace` | `CRATONVM_ANN_PROXY_DISPATCH_TRACE` |
+| `ann-proxy-prof` | `CRATONVM_DBG_ANN_PROXY_PROF` |
 | `ann-trace` | `CRATONVM_ANN_TRACE` |
 | `annproxy-wrap` | `CRATONVM_DBG_ANNPROXY_WRAP` |
 | `anonalloc` | `CRATONVM_DBG_ANONALLOC` |
