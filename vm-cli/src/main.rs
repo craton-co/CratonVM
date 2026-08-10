@@ -5582,71 +5582,11 @@ fn parse_size(s: &str) -> Option<usize> {
 
 /// Total physical RAM in bytes, or `None` if it can't be determined.
 ///
-/// Used for HotSpot-style ergonomic default-heap sizing when the user did not
-/// pass an explicit `-Xmx`. Mirrors the platform probes in
-/// `vm::runtime::crash_handler` but returns the raw byte count.
+/// Re-exported from `cratonvm_vm::runtime::container`, which owns the platform
+/// probes now that both the launcher and `SharedVm::new` size the default heap
+/// through the same code.
 fn physical_ram_bytes() -> Option<u64> {
-    #[cfg(target_os = "windows")]
-    {
-        #[repr(C)]
-        struct MemoryStatusEx {
-            dw_length: u32,
-            dw_memory_load: u32,
-            ull_total_phys: u64,
-            ull_avail_phys: u64,
-            ull_total_page_file: u64,
-            ull_avail_page_file: u64,
-            ull_total_virtual: u64,
-            ull_avail_virtual: u64,
-            ull_avail_extended_virtual: u64,
-        }
-        extern "system" {
-            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
-        }
-        let mut status = MemoryStatusEx {
-            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
-            dw_memory_load: 0,
-            ull_total_phys: 0,
-            ull_avail_phys: 0,
-            ull_total_page_file: 0,
-            ull_avail_page_file: 0,
-            ull_total_virtual: 0,
-            ull_avail_virtual: 0,
-            ull_avail_extended_virtual: 0,
-        };
-        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        if ok != 0 && status.ull_total_phys > 0 {
-            return Some(status.ull_total_phys);
-        }
-        None
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-                return Some(kb * 1024);
-            }
-        }
-        None
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let out = std::process::Command::new("sysctl")
-            .args(["-n", "hw.memsize"])
-            .output()
-            .ok()?;
-        String::from_utf8(out.stdout)
-            .ok()?
-            .trim()
-            .parse::<u64>()
-            .ok()
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-    {
-        None
-    }
+    cratonvm_vm::runtime::container::physical_ram_bytes()
 }
 
 /// HotSpot-style ergonomic default max heap, applied only when the user did
@@ -5677,42 +5617,12 @@ fn physical_ram_bytes() -> Option<u64> {
 /// Opt out with `CRATONVM_DEFAULT_HEAP_ERGONOMICS=0` (fixed 256 MB default), or
 /// override the cap with `CRATONVM_DEFAULT_HEAP_MAX_MB=<N>`. An explicit `-Xmx`
 /// always wins over all of this.
-fn ergonomic_default_max_heap(container_mem_limit: Option<u64>) -> Option<usize> {
-    if std::env::var("CRATONVM_DEFAULT_HEAP_ERGONOMICS").as_deref() == Ok("0") {
-        return None;
-    }
-    let cap = std::env::var("CRATONVM_DEFAULT_HEAP_MAX_MB")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|mb| mb.saturating_mul(1024 * 1024))
-        .unwrap_or(MAX_ERGONOMIC_HEAP);
-    let phys = physical_ram_bytes()?;
-    // Inside a memory-constrained container, size from the smaller of host RAM
-    // and the cgroup limit so the default heap never overshoots the container.
-    let basis = match container_mem_limit {
-        Some(limit) => phys.min(limit),
-        None => phys,
-    };
-    Some(clamp_ergonomic_heap(basis, cap))
-}
-
-/// Floor for the ergonomic default heap (the historical 256 MB baseline).
-const ERGONOMIC_HEAP_FLOOR: u64 = 256 * 1024 * 1024;
-/// Default cap for the ergonomic default heap (4 GiB). See
-/// [`ergonomic_default_max_heap`] for why the cap exists (eager arena commit).
-const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024;
-
-/// Pure clamp for the ergonomic default heap: take 1/4 of `basis`, cap it at
-/// `cap` (itself floored so a tiny `CRATONVM_DEFAULT_HEAP_MAX_MB` can't drop
-/// below the 256 MB floor), floor it at 256 MB, and finally bound it by `basis`
-/// itself so a tiny container is never handed more than its whole limit.
-fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
-    let quarter = basis / 4;
-    let capped = quarter.min(cap.max(ERGONOMIC_HEAP_FLOOR));
-    let floored = capped.max(ERGONOMIC_HEAP_FLOOR);
-    let bounded = floored.min(basis);
-    usize::try_from(bounded).unwrap_or(usize::MAX)
-}
+/// The sizing itself lives in `cratonvm_vm::runtime::container` so the launcher
+/// and `SharedVm::new` cannot drift apart again — they used to disagree by 2x
+/// at the top end and disagree entirely about whether host RAM is a basis.
+use cratonvm_vm::runtime::container::{
+    clamp_ergonomic_heap, ergonomic_default_max_heap, MAX_ERGONOMIC_HEAP,
+};
 
 #[cfg(test)]
 mod tests {

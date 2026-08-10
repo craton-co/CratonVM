@@ -7015,6 +7015,71 @@ unsafe fn jit_typecheck_resolve(
         // historical best-effort fall-through rather than hard-failing.
     }
 
+    // Loader-faithful target, resolved at COMPILE time.
+    //
+    // The compiler resolves this site's `CONSTANT_Class` entry through the
+    // compiling class's own defining loader — the same resolution the
+    // interpreter performs — and interns the site's name under the resulting
+    // `ClassId` (`cratonvm_jit::intern_typecheck_target`). When that id is
+    // available, the cast is an identity question and this function answers it
+    // without ever consulting a name: no `find_unique_class_by_name`, and
+    // critically no `is_assignable_to_name` fallback, so a same-named class
+    // from a DIFFERENT loader is refused, which is the whole point of a
+    // `(ClassLoaderId, name)`-keyed dictionary.
+    //
+    // The recorded id is validated first. `ClassId`s are per-VM and the intern
+    // table is process-wide, so in a two-VM process an id recorded by one VM
+    // could name something else in the other; and a redefinition can retire an
+    // id outright. Confirming the id still names this site's class in THIS VM
+    // costs one `&str` comparison on a class we had to look up anyway, and a
+    // failed check simply falls through to the paths below.
+    //
+    // An array receiver is excluded: the branch above already answered
+    // authoritatively for every array that carries a descriptor, and one that
+    // does not has its own carve-outs at the bottom of this function
+    // (`Object`/`Serializable`/`Cloneable`, and `Object[]`), which an id
+    // comparison cannot reproduce.
+    let recv_is_array = vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array;
+    if let Some(recorded) = cratonvm_jit::typecheck_target_for_site(class_name.as_ptr())
+        .filter(|_| !recv_is_array)
+    {
+        let target_class_id = ClassId::new(recorded);
+        let names_this_site = {
+            let cm = vm.classes.class_manager.read();
+            cm.get_class(target_class_id)
+                .is_some_and(|c| &*c.name == class_name)
+        };
+        if names_this_site {
+            if obj_class_id == target_class_id {
+                return true;
+            }
+            if jit_is_subclass_of_cached(vm, obj_class_id, target_class_id) {
+                return true;
+            }
+            if crate::runtime::interpreter::lambda_proxy_satisfies_public(
+                vm,
+                obj_class_id,
+                target_class_id,
+            ) {
+                return true;
+            }
+            // The receiver's class genuinely is not this target. Synthetic and
+            // annotation-proxy admission still apply — those encode their
+            // relationships outside the class hierarchy, so an id comparison
+            // cannot see them — but the loader-blind name walk does not.
+            if crate::runtime::interpreter::synthetic_implements_public(vm, obj_class_id, class_name)
+            {
+                return true;
+            }
+            if crate::runtime::interpreter::annotation_proxy_satisfies_target(
+                vm, *obj_ref, class_name,
+            ) {
+                return true;
+            }
+            return false;
+        }
+    }
+
     // Fast path: target already loaded. Most call sites hit this.
     //
     // IMPORTANT: bind the result to a local so the `RwLockReadGuard` temporary
@@ -7135,18 +7200,23 @@ unsafe fn jit_typecheck_resolve(
     }
 
     // Loader-duplication fallback (Residual 6,
-    // `SpringBootContextLoaderAotTests`): this helper resolves the target by
-    // NAME through the flat global `find_class_by_name`, which returns ONE
-    // winner even when the same class was defined twice by two loaders (e.g.
-    // Spring's AOT-processing child loader re-defining Groovy's `ClassInfo`).
-    // The receiver's `ClassId` then never equals the resolved target's and the
-    // id-based checks above wrongly refuse a cast the interpreter's
-    // loader-faithful CP resolution would pass — under `checkcast` that
-    // surfaced as a SILENT null (see `jit_checkcast`), observed live as
-    // `ClassInfo.getClassInfo()` returning null only under `-Jit on`. Fall
-    // back to a name-based hierarchy walk (supers + interfaces), mirroring
-    // the accepted `is_subclass_of_by_name` tradeoff used for exception
-    // catch_type resolution.
+    // `SpringBootContextLoaderAotTests`), now reachable ONLY for a site whose
+    // target class was not loaded when the method was compiled.
+    //
+    // For every other site the block near the top of this function already
+    // answered by identity, against the `ClassId` the compiler resolved through
+    // the compiling class's own loader. This path is what is left when there
+    // was no id to record: the helper has to resolve a bare NAME against a
+    // dictionary keyed by `(ClassLoaderId, name)`, which returns one winner
+    // even when two loaders defined the name (e.g. Spring's AOT-processing
+    // child loader re-defining Groovy's `ClassInfo`). The receiver's `ClassId`
+    // then never equals the resolved target's and the id-based checks above
+    // wrongly refuse a cast the interpreter's loader-faithful CP resolution
+    // would pass — under `checkcast` that surfaced as a SILENT null (see
+    // `jit_checkcast`), observed live as `ClassInfo.getClassInfo()` returning
+    // null only under `-Jit on`. Fall back to a name-based hierarchy walk
+    // (supers + interfaces), mirroring the accepted `is_subclass_of_by_name`
+    // tradeoff used for exception catch_type resolution.
     if vm
         .classes
         .class_manager

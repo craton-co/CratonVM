@@ -2057,9 +2057,20 @@ pub fn execute(
                             // in thread-locals that outlive the compiled
                             // method, so a recycled address would answer for
                             // the class that used to live there. See
-                            // `cratonvm_jit::intern_typecheck_class_name`.
+                            // `cratonvm_jit::intern_typecheck_target`.
+                            //
+                            // Resolved here through THIS class's own defining
+                            // loader, exactly as the interpreter's constant-pool
+                            // resolution would, and interned under that
+                            // identity. The class dictionary is keyed by
+                            // `(ClassLoaderId, name)`, so handing the runtime
+                            // helper a bare name left it guessing between two
+                            // loaders' same-named copies.
+                            let target_id = cm_lock
+                                .find_class_by_name_for_class(class_name, class_id)
+                                .map(|id| id.as_u32());
                             let (ptr, len) =
-                                cratonvm_jit::intern_typecheck_class_name(class_name);
+                                cratonvm_jit::intern_typecheck_target(class_name, target_id);
                             typecheck_info.push((pc, ptr, len));
                         }
                     }
