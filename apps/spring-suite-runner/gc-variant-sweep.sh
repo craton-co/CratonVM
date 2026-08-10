@@ -17,8 +17,9 @@
 # Every run refuses to start unless run-suite.sh's `check-cp` passes — the
 # 2026-08-10 sweep this script replaces was measured against a classpath whose
 # entries did not exist, which turned 789 harness-induced NoClassDefFoundErrors
-# into what looked like a 87% CratonVM pass rate. See
-# docs/internal/fixed-suite-bugs/spring-testcp-jar-artifacts-20260810.md.
+# into what looked like a 87% CratonVM pass rate. The record is
+# fixed-suite-bugs/spring/gc-variant-fullsuite-classpath-gap-and-fails-20260810-FIXED.md
+# in the internal docs tree.
 ###############################################################################
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
