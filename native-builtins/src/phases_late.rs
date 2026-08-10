@@ -63,6 +63,7 @@ pub mod jar_manifest;
 pub mod jdbc;
 pub mod management;
 pub mod net_channels;
+pub mod nio_buffer;
 pub mod nio_file;
 pub mod reflect_invoke;
 pub mod ssl_security;

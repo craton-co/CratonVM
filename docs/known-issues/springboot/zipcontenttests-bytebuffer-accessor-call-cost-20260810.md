@@ -134,30 +134,71 @@ This is also why `--nojit` is **faster than JIT** for the class as a whole
 (219.1s vs 315.5s): the JIT is not what makes these accessors slow, and it
 carries costs of its own here.
 
-## What to fix
+## What to fix — and the attempt that says where
 
-Two independent levers, in order of leverage for this class:
+The accessors were intrinsified as registered natives on
+`java/nio/HeapByteBuffer` and measured end to end. The implementation is in
+`native-builtins/src/phases_late/nio_buffer.rs`, **default OFF**, enabled with
+`CRATONVM_BYTEBUFFER_INTRINSIC=1`. It is off by default because of this:
 
-1. **Intrinsify the `HeapByteBuffer` absolute scalar accessors**
-   (`getShort/getInt/getLong/getChar(int)` and the `put` mirrors) as a single
-   native that reads the backing `hb` array at `offset + index` in the buffer's
-   byte order. That collapses both layers at once for the exact shape a zip or
-   protocol header reader uses. Watch the contract: bounds are checked against
-   `limit` (not `capacity`), the exception is `IndexOutOfBoundsException`, and
-   `HeapByteBufferR` shares the read path — verify per shape against a HotSpot
-   control rather than assuming one rule covers them.
-2. **The per-call dispatch floor** (layer 1) is the general problem and reaches
-   far past NIO; `perf/per-call-dispatch-floor-20260803` is the existing work.
+| arm | intrinsic ON | intrinsic OFF | |
+|---|---:|---:|---|
+| `--nojit` | **187.0s** | 206.5s | intrinsic **9.4% faster** |
+| JIT, round 1 | 464.3s | 413.7s | intrinsic 12.2% slower |
+| JIT, round 2 | 375.8s | 353.8s | intrinsic 6.2% slower |
+| JIT, earlier pair | 477.3s | 450.7s | intrinsic 5.9% slower |
 
-Fixing only (2) leaves ~900 ns of layer 2. Fixing only (1) still leaves every
-other NIO caller paying layer 1.
+The accessors themselves get faster exactly as predicted —
+`getShort()` 1.42x, `getInt()` 1.5x, `getShort(int)` 2.09x, `getInt(int)`
+2.14x — and the class still gets slower under the JIT, in three independent
+interleaved pairs.
+
+**Registering a native takes the method away from the JIT.** With
+`CRATONVM_DBG_JIT_COMPILED=1` and no native registered, the JIT compiles the
+entire chain — `HeapByteBuffer.getShort(I)S`, `getInt(I)I`, `checkIndex(I)I`,
+`checkIndex(II)I`, `ix(I)I`, `byteOffset(J)J` — and can inline it into callers.
+A registered native replaces all of that with a funnel crossing the JIT cannot
+inline. For code that calls these accessors from many small sites — the zip
+header reader calls `getShort()` eleven times and `getInt()` six times per
+central-directory record — the lost inlining costs more than the shorter path
+saves. In the interpreter there is no inlining to lose, and the same code wins
+by the margin the microbenchmark predicts.
+
+So the conclusion is not "the accessors are fine". It is:
+
+1. **The intrinsic belongs in the JIT**, as a compiled inlinable intrinsic
+   rather than a registered native. The contract is already pinned by
+   `probes/ByteBufferAccessorMatrixProbe.java` (119 lines, identical to HotSpot
+   in both arms) and the byte assembly is written and unit-tested; what has to
+   change is the layer, not the logic.
+2. **The per-call dispatch floor** is the general problem underneath both
+   numbers and reaches far past NIO —
+   `perf/per-call-dispatch-floor-20260803` is the existing work. A compiled
+   `HeapByteBuffer.get(int)` with no native anywhere on its path still costs
+   ~300 ns against HotSpot's 1.54.
+
+Two smaller findings worth keeping:
+
+* `get(int)` and `get()` are deliberately NOT intrinsified. They are the only
+  accessors here whose Java body makes no native call, so a crossing makes them
+  *slower* (0.76x measured). Intrinsifying everything that looked alike would
+  have cost throughput on the commonest accessor of the set.
+* The first version covered only the ABSOLUTE forms and moved this class not at
+  all — its header reader calls `getShort()`/`getInt()` and the absolute forms
+  never. Reach before speed: a shape the hot code never executes cannot show a
+  win however fast it is.
 
 ## Reproducers
 
 - `probes/ZipContentTermsProbe.java` — prices every term the sampler named.
-- `probes/ByteBufferScalarSplitProbe.java` — splits accessor cost by layer.
+- `probes/ByteBufferScalarSplitProbe.java` — splits accessor cost by layer, and
+  covers both the absolute and relative forms.
+- `probes/ByteBufferAccessorMatrixProbe.java` — the HotSpot-diffed contract:
+  every buffer shape, both byte orders, bounds against `limit`, exception class
+  and message per width, and NaN/`-0.0` bit patterns. 119 lines, and the diff
+  against HotSpot is the test.
 
-Both print CSV and run in under a minute on either VM.
+All three print plain text and run in under a minute on either VM.
 
 ## Affected classes
 
