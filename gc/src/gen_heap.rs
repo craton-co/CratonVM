@@ -9351,6 +9351,34 @@ impl GenerationalHeap {
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
         let existing_free = merge_skips(young_from.free_blocks_sorted());
+        // MARKWHY: which SKIP ARM covers the watched address? The walk never
+        // stopped at the evicted JSP loader's base, so its span is inside a
+        // stretch the walk strides over. There are three candidates and they
+        // want three different fixes, so name the one that actually applies
+        // instead of inferring it from the absence of desync markers.
+        //
+        // `existing_free` is already the MERGE of the arena free list and the
+        // JIT TLAB reservations, so the two are tested separately here — a
+        // reserved TLAB tail and a genuine free block are not the same finding.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base && w < from_base + young_from.used() {
+                let off = w - from_base;
+                let in_free = young_from
+                    .free_blocks_sorted()
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                let in_jit = jit_skips
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                eprintln!(
+                    "[MARKWHY] skip-arm probe: watch={w:#x} off={off:#x} used={:#x}                      in_free_block={in_free:?} in_jit_tlab_skip={in_jit:?}",
+                    young_from.used(),
+                );
+            }
+        }
         // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
         // sweep start? `existing_free` is built only from prior sweeps' coalesced
         // output + the alloc/split bookkeeping between sweeps. A self-overlap here
@@ -10455,6 +10483,20 @@ impl GenerationalHeap {
                         "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
                     );
                 }
+            }
+        }
+
+        // MARKWHY: where did the walk actually END? If the watched offset is
+        // above this, the walk abandoned before reaching it and the span was
+        // retained by the "skipped stretch retained until a moving cycle
+        // resets from-space" arm rather than by any skip list.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} objects_swept={objects_swept}",
+                    w - from_base,
+                );
             }
         }
 
