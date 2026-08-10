@@ -230,10 +230,30 @@ Two concrete next steps, in order:
   a walker gap.
 * Walk the remaining JIT gates the same way §3b walked the allocation ones,
   starting with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`.
-* **Explain `cid=0,k=1` — an Array header with a valid kind and size but
-  `class_id = 0`.** That is a *partially written* header, not a zeroed one, so
-  it cannot come from a region reset (which zeroes the kind too). It is the
-  sharpest single clue in the trails.
+* **Explain the ~16 zero bytes that sit immediately after a TLAB filler.** This
+  is the one invariant across every trail, and it is the desync point:
+
+  ```
+  region=119  0x191b0+0x20(cid=4044482304,k=1)   int[] TLAB-retire filler, ends 0x191d0
+              0x191d0+0x10(cid=0,k=0)            16 all-zero bytes
+              break at 0x191e0
+  region=7    0x5f120+0x28(filler)  0x5f148+0x10  0x5f158+0x10  break at 0x5f168
+  region=117  0x207f0+0x8(k=71 gap sentinel)  0x207f8+0x10  break at 0x20808
+  ```
+
+  A retired TLAB's filler covers `[cursor, end)`; the next allocation in the
+  region should begin exactly at `end`. Instead there is a whole-`HEADER_SIZE`
+  multiple of zeroes first, and then live data. `Tlab::new` trims `end` down to
+  8-alignment, which can only account for ≤7 bytes — so the gap between a
+  TLAB's `end` and the region's next object is the thing to instrument.
+  Compare `G1Collector::refill_tlab`'s `actual = requested_size.min(remaining)`
+  and `G1Region::bump_alloc`'s start-alignment against what `Tlab::new` then
+  claims to own.
+
+  **Not the clue it first looks like:** a trail entry such as
+  `0x19188+0x28(cid=0,k=1)` — an Array with kind and size but `class_id = 0` —
+  is *strode correctly* (0x19188 + 0x28 = 0x191b0) and is not the desync point.
+  Worth explaining eventually, but it is not what breaks the walk.
 
   Two candidate producers are already **excluded**, so do not re-tread them:
   - The inline object emitter. `emit_inline_tlab_new`
