@@ -419,9 +419,16 @@ is now known, and what the next attempt should not repeat:
      clock. Do not rebuild it per-site for this workload's sake.
   3. ~~The annotation-proxy entry path.~~ **CLOSED 2026-08-10 at ~1%** (§4).
      ~300-400k dispatches at ~9.5 us = ~3 s of a 357 s run.
-  4. **OSR-only loops at 7-16x**, which is not this class's problem but is
-     probably somebody's — the one item on this page still worth someone's time,
-     and it belongs to whoever owns tier-up, not to this class.
+  4. ~~OSR-only loops at 7-16x.~~ **Split out 2026-08-10 to
+     `jit/osr-refused-for-a-loop-inline-in-main-20260810.md`**, where it is
+     reproduced at **180x** (1 ns/iter for a loop in a called method against
+     180 ns/iter for the identical loop inline in `main`) and the refusal is
+     named: `osr-entry-unresumable-exit`, from a deopt point in the method's own
+     prologue that the OSR entry cannot reach. It is not this class's problem —
+     WebFlux has no loop hot enough for OSR to matter — but it is a **measurement
+     integrity** problem for every probe written with its loop in `main`, which
+     is how two probes in this very investigation ended up measuring the
+     interpreter.
 
   The pattern across all three closed leads: every headline number ("69 refused
   compiles", "more sealed than compiled", "1000x per call") looked like a cause
