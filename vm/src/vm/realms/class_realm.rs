@@ -398,6 +398,31 @@ pub struct ClassRealm {
     /// T10.9.B: FxHashMap — ClassId-keyed.
     pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
 
+    /// Resolved implementation-owner `ClassId` for each lambda proxy id, on the
+    /// **globally-resolved** path only.
+    ///
+    /// `try_lambda_dispatch` used to re-resolve its target *by name* on every
+    /// single SAM call — `invoke_shared`'s `load_class_concurrent` for the
+    /// `InvokeStatic` arm, and a `class_manager.write()` + `load_class` for the
+    /// `InvokeSpecial` / `NewInvokeSpecial` arms. `CRATONVM_DBG=lambda-prof`
+    /// priced it: of ~3,000-3,900 ns per dispatch of an **empty** lambda,
+    /// **2,300-3,080 ns was the target invoke** — and with a no-op body, that is
+    /// all resolution — against ~130 ns for the proxy-table lookup and ~230-300
+    /// ns for argument coercion. It is what made a lambda's interface call cost
+    /// ~4,200 ns against ~18 ns for the identical call on a named class, and why
+    /// the JIT was worth only 17% on Spring context startup: the cost sits in
+    /// Rust dispatch machinery that compiled Java bodies never enter.
+    ///
+    /// Only the *global* answer is memoised. The loader-faithful override
+    /// (`lambda_impl_dispatch_override_driven`) is still consulted first on
+    /// every call and is not cached here, so a user-loader-local copy keeps
+    /// winning exactly as before; this table is only ever reached once that
+    /// override has declined, which means the by-name answer is the stable
+    /// global copy. Grow-only, for the same reason `initiating_resolution_cache`
+    /// is: CratonVM does not unload classes, and in-place `redefine_class` keeps
+    /// the `ClassId`.
+    pub lambda_impl_owner_memo: RwLock<FxHashMap<ClassId, ClassId>>,
+
     /// Defining class (the class whose `invokedynamic` created this lambda /
     /// method-ref) for each lambda proxy id — what HotSpot names the proxy after
     /// and reports as its nest host. Kept as a side table so the reflection name

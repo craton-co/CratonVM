@@ -818,6 +818,94 @@ pub(crate) fn lambda_impl_dispatch_override_driven(
     drive_defining_loader_load(shared, thread, host, name).filter(|cid| *cid != ClassId::new(0))
 }
 
+/// The memoised global implementation-owner `ClassId` for `call_site`, or
+/// `None` on the first dispatch (before anything has resolved it).
+///
+/// See `ClassRealm::lambda_impl_owner_memo` for why this exists — in short, the
+/// by-name resolution it replaces was measured at ~2,300-3,080 ns of a
+/// ~3,000-3,900 ns lambda dispatch. Callers must consult
+/// [`lambda_impl_dispatch_override_driven`] FIRST: this table holds only the
+/// answer the loader-blind path would produce, and must never pre-empt a
+/// loader-faithful one.
+#[inline]
+fn lambda_global_impl_owner(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Option<ClassId> {
+    shared
+        .classes
+        .lambda_impl_owner_memo
+        .read()
+        .get(&call_site.proxy_class_id)
+        .copied()
+}
+
+/// Record the global implementation owner for `call_site` after a by-name
+/// dispatch has already succeeded through it.
+///
+/// Resolves the name through the *loaded* table only (never a load): the call
+/// that just returned proves the class is loaded and initialised, so a miss here
+/// means something raced or the name is not globally visible, and the right
+/// answer is to memoise nothing and let the next call take the slow path again.
+fn record_lambda_global_impl_owner(
+    shared: &SharedVm,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) {
+    if lambda_global_impl_owner(shared, call_site).is_some() {
+        return;
+    }
+    let resolved = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loaded_class_id(&call_site.impl_handle.class_name);
+    let Some(cid) = resolved.filter(|c| *c != ClassId::new(0)) else {
+        return;
+    };
+    shared
+        .classes
+        .lambda_impl_owner_memo
+        .write()
+        .insert(call_site.proxy_class_id, cid);
+}
+
+/// The implementation-owner `ClassId` for `call_site`: the loader-faithful
+/// override when one applies, otherwise the global by-name answer — resolved
+/// once, then served from `lambda_impl_owner_memo`.
+///
+/// Replaces four identical `class_manager.write().load_class(name)` sites, one
+/// per lambda kind that needs an owner up front (`InvokeSpecial`,
+/// `NewInvokeSpecial`, `GetStatic`, `PutStatic`). Each of them took the VM-wide
+/// class-manager **write** lock on every dispatch; `load_class` is idempotent
+/// for an already-loaded name, so from the second dispatch onward that lock was
+/// being held to re-derive a constant — and holding a global write lock per
+/// lambda call serialises every other thread against it.
+fn lambda_impl_owner_class_id(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    call_site: &crate::classloading::resolution::LambdaCallSite,
+) -> Result<ClassId, MethodCallFailed> {
+    if let Some(cid) = lambda_impl_dispatch_override_driven(shared, thread, call_site) {
+        return Ok(cid);
+    }
+    if let Some(cid) = lambda_global_impl_owner(shared, call_site) {
+        return Ok(cid);
+    }
+    let cid = shared
+        .classes
+        .class_manager
+        .write()
+        .load_class(&call_site.impl_handle.class_name)?;
+    if cid != ClassId::new(0) {
+        shared
+            .classes
+            .lambda_impl_owner_memo
+            .write()
+            .insert(call_site.proxy_class_id, cid);
+    }
+    Ok(cid)
+}
+
 /// Resolve a lambda implementation that is private in its declaring class.
 ///
 /// LambdaMetafactory may encode a private synthetic lambda body as an
@@ -1106,12 +1194,24 @@ pub(super) fn try_invoke_cached_lambda_impl(
             {
                 return Ok(None);
             }
-            if method.is_static() || method.is_synchronized() || method.is_native() {
+            // `synchronized` needs the monitor enter/exit this frame builder does
+            // not do, and `native` has no bytecode to cache. `static` used to be
+            // refused here too, which excluded the single most common lambda
+            // shape in Java: javac compiles a NON-capturing lambda body to a
+            // private *static* synthetic method, so every `() -> ...` that
+            // captures nothing missed this fast path and took the generic
+            // by-name invoke on every single call. Statics are cacheable — the
+            // frame builder is receiver-agnostic (`init_locals_pooled` copies
+            // `args` into locals from slot 0, which is already how both shapes
+            // arrive) — provided the class is initialised, which the caller
+            // guarantees by only reaching here after a full dispatch has run.
+            if method.is_synchronized() || method.is_native() {
                 return Ok(None);
             }
             let Some(code_attr) = method.code() else {
                 return Ok(None);
             };
+            let is_static = method.is_static();
             let c = Arc::new(CachedBytecodeMethod {
                 declaring_class_id: declaring_id,
                 class_name: Arc::clone(&class.name),
@@ -1124,7 +1224,7 @@ pub(super) fn try_invoke_cached_lambda_impl(
                 max_locals: code_attr.max_locals,
                 num_params: count_method_params(descriptor) as u16,
                 is_synchronized: false,
-                is_static: false,
+                is_static,
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
                 invoc_key: std::sync::OnceLock::new(),
@@ -1139,14 +1239,17 @@ pub(super) fn try_invoke_cached_lambda_impl(
             c
         }
     };
-    if args.len() != cached.num_params as usize + 1 {
+    // An instance impl takes the receiver in `args[0]`; a static one does not.
+    let expected_args = cached.num_params as usize + usize::from(!cached.is_static);
+    if args.len() != expected_args {
         return Ok(None);
     }
     // TDigest's lambda adapter repeatedly invokes the concrete array accessor
     // `(I)D`. When that leaf is already compiled and has no dispatch helpers,
     // enter it directly instead of materializing an interpreter frame per get.
     // Other lambda implementations retain the generic cached-frame path below.
-    if !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+    if !cached.is_static
+        && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
         && &*cached.method_name == "get"
         && &*cached.method_descriptor == "(I)D"
     {
@@ -1681,15 +1784,53 @@ pub(crate) fn try_lambda_dispatch(
                     &call_site.impl_handle.descriptor,
                     &full_args,
                 )?
+            } else if let Some(owner) = lambda_global_impl_owner(shared, &call_site) {
+                // Steady state. Reaching here at all means a previous dispatch
+                // already went through `invoke_shared` below, which loaded the
+                // class, ran `<clinit>`, and dispatched — so from the second call
+                // on, everything `invoke_shared` does before the actual invoke is
+                // re-derivation of a constant, and `lambda-prof` measured that
+                // re-derivation plus the by-name method lookup at ~2.8 us of a
+                // ~3.6 us dispatch.
+                //
+                // The cached-bytecode path is the same one the
+                // Virtual/Interface arm already uses; it enters the impl body
+                // with a pooled prebuilt frame and no name lookup at all. It
+                // declines (`Ok(None)`) for anything it cannot serve — a native
+                // shadow, a `synchronized` or abstract body, an arity mismatch, a
+                // redefined class — and then the generic path below runs.
+                match try_invoke_cached_lambda_impl(
+                    shared,
+                    thread,
+                    obj_class_id,
+                    owner,
+                    &call_site.impl_handle.member_name,
+                    &call_site.impl_handle.descriptor,
+                    &full_args,
+                )? {
+                    Some(v) => v,
+                    None => invoke_on_class_shared(
+                        shared,
+                        thread,
+                        owner,
+                        &call_site.impl_handle.member_name,
+                        &call_site.impl_handle.descriptor,
+                        &full_args,
+                    )?,
+                }
             } else {
-                invoke_shared(
+                let r = invoke_shared(
                     shared,
                     thread,
                     &call_site.impl_handle.class_name,
                     &call_site.impl_handle.member_name,
                     &call_site.impl_handle.descriptor,
                     &full_args,
-                )?
+                )?;
+                // Only after it succeeded: a name that failed to resolve or
+                // whose `<clinit>` threw must not be remembered as an answer.
+                record_lambda_global_impl_owner(shared, &call_site);
+                r
             };
             if let Some(t) = target_start {
                 lambda_prof::add(&lambda_prof::TARGET_NS, t.elapsed().as_nanos() as u64);
@@ -2018,14 +2159,7 @@ pub(crate) fn try_lambda_dispatch(
             )?;
             // Loader-faithful owner resolution (gated): prefer the enclosing
             // loader's copy of the impl class when it diverges from the global.
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             // A REF_invokeSpecial lambda target is statically bound to its
             // implementation owner.  In particular, an Interface.crate::runtime::m
             // method reference must reach that interface default method even
@@ -2062,14 +2196,7 @@ pub(crate) fn try_lambda_dispatch(
             // the same loader-blind fallback and minted an Application-loader
             // copy instead of the fork's own. (Independently fixed upstream on
             // origin/dev with the same shape; kept in sync here.)
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             // Array-constructor reference (`SomeType[]::new`, e.g. as an
             // `IntFunction<SomeType[]>` — the mechanism behind
             // `Collection.toArray(SomeType[]::new)` and any direct user code).
@@ -2211,14 +2338,7 @@ pub(crate) fn try_lambda_dispatch(
             }
         }
         MethodHandleKind::GetStatic => {
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.classes.class_manager.read();
@@ -2282,14 +2402,7 @@ pub(crate) fn try_lambda_dispatch(
                 }
                 .into());
             }
-            let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
-                Some(cid) => cid,
-                None => shared
-                    .classes
-                    .class_manager
-                    .write()
-                    .load_class(&call_site.impl_handle.class_name)?,
-            };
+            let class_id = lambda_impl_owner_class_id(shared, thread, &call_site)?;
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
                 let cm = shared.classes.class_manager.read();

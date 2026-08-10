@@ -1,15 +1,17 @@
-# `WebFluxAutoConfigurationTests` — recurring full-timeout HANG: **not a hang**. Measured: no stall, the JIT buys 17%, and lambda SAM dispatch costs ~220x a named-class call
+# `WebFluxAutoConfigurationTests` — recurring full-timeout HANG: **not a hang**, and not one dominant term
 
-**Status: root-caused as a throughput defect, 2026-08-09. The class does not
-stall** — it completes all 70 tests, every time it is given enough budget. Its
-cost is flat per test method, and half of it sits under Spring's annotation
-machinery. The reason the JIT cannot rescue it is a specific, reproducible VM
-defect: **invoking a lambda's SAM costs ~4,200 ns against ~18 ns for the
-identical interface call on a named class**, so a lambda-dense workload runs in
-interpreter-side Rust dispatch machinery that compiled code never enters.
+**Status: OPEN as a throughput item, but no longer un-triaged (2026-08-09).**
+The class does **not** stall — it completes all 70 tests every time it is given
+enough budget, its cost is flat per test method, and 99.1% of stack-sample
+requests are serviced across a full run. It is ~10-30x HotSpot on a workload
+that is 70 full Spring context startups, which is what makes a fixed 300s budget
+a coin flip.
 
-The remaining work is that dispatch defect, which is **not specific to this
-class** — it is suite-wide. See [What is left](#what-is-left).
+One concrete VM defect was found and fixed while investigating this
+(lambda SAM dispatch, ~4x), and it **did not move this class at all** — see
+[A fix that did not help](#a-fix-that-did-not-help-recorded-so-nobody-re-runs-it).
+That is the most useful thing on this page: the cost here is diffuse, and the
+next person should not expect a single term to explain it.
 
 ## Answers to the two questions this page asked
 
@@ -72,13 +74,16 @@ histogram is correspondingly diffuse: the largest single leaf is
 are all Spring annotation-merging or bean-factory methods. There is no hotspot
 to fix in the ordinary sense.
 
-## Root cause: lambda SAM dispatch is ~220x a named-class interface call
+## A fix that did not help, recorded so nobody re-runs it
 
-A diffuse profile over lambda-dense code plus a JIT that buys 17% points at the
-call mechanism rather than the call*ees*. Measured directly (`LambdaProbe2`),
-with each arm on its **own monomorphic call site** and every arm measured in
-**both orders** so neither call-site polymorphism nor warm-up can explain the
-result:
+A diffuse profile over lambda-dense code plus a JIT worth 17% looks exactly like
+"the call mechanism, not the callees". That hypothesis was followed all the way
+to a real, fixed defect — and the defect turned out **not** to be this class's
+problem.
+
+Measured directly (`LambdaProbe2`), with each arm on its **own monomorphic call
+site** and every arm measured in **both orders** so neither call-site
+polymorphism nor warm-up can explain the result:
 
 | Call shape (empty body) | HotSpot | CratonVM |
 |---|---:|---:|
@@ -89,34 +94,44 @@ result:
 
 CratonVM's ordinary dispatch is healthy — 15-20 ns for virtual, interface, and
 anonymous-class calls alike, all within a factor of 10 of HotSpot. The lambda
-row is **207x-226x** the named-class row *in the same process*, and HotSpot has
+row was **207x-226x** the named-class row *in the same process*, and HotSpot has
 no such penalty. Because the ratio is measured inside one run, host load cannot
 produce it.
 
-A second probe separates dispatch from body compilation: with a 200-iteration
-integer loop as the body, the named-class arm costs 413 ns of body and the
-lambda arm 1311 ns — a 3.2x body penalty on top of a ~250x *dispatch* penalty.
-The overwhelming term is fixed per-call dispatch overhead, not an uncompiled
-body.
+`CRATONVM_DBG=lambda-prof` (added for this) then priced the phases of
+`try_lambda_dispatch` in the same run: of ~3,600 ns per dispatch of an **empty**
+lambda, **~2,820 ns was the target invoke** — and with a no-op body, that is all
+resolution — against ~145 ns for the proxy-table lookup and ~290 ns for argument
+coercion. The cause was `try_invoke_cached_lambda_impl`'s
+`if method.is_static() … return Ok(None)`: javac compiles a **non-capturing**
+lambda body to a private *static* synthetic method, so the single most common
+lambda shape in Java was refused by the very fast path built for lambda impls
+and fell back to a by-name invoke on every call.
 
-This matters for Spring specifically because Spring's context startup is
-lambda-dense — `ConcurrentReferenceHashMap.computeIfAbsent`, the
-`Supplier`/`Function` callbacks throughout `AbstractBeanFactory.doGetBean`,
-`AutowiredAnnotationBeanPostProcessor.lambda$buildAutowiringMetadata$1`,
-`InitDestroyAnnotationBeanPostProcessor.lambda$buildLifecycleMetadata$0`,
-`PropertiesPropertySource.lambda$getPropertyNames$0` — all of which appear by
-name in this class's own profile.
+**Fixed** — statics are now cacheable (the frame builder was already
+receiver-agnostic), plus a per-proxy memo for the four `class_manager.write()
+.load_class(name)` sites that were taking the VM-wide class-manager **write**
+lock once per dispatch. Result on the probe: **2080-3260 ns → 638-674 ns**, a
+3.5-5x improvement, with the run-to-run spread collapsing too.
 
-`try_lambda_dispatch` (`vm/src/runtime/interpreter/lambda.rs`) is where the
-overhead lives. It is not on the compiled path at all: a `--stack-sample-ms 200`
-run of the lambda probe serviced **2** sample requests over a run of tens of
-seconds, i.e. the thread is essentially never at an interpreter safepoint —
-it is inside Rust dispatch machinery. Reading that function offers several
-candidate terms (the `LambdaCallSite` clone under the `lambda_proxies` lock,
-`coerce_lambda_args`, the by-name `invoke_shared` class resolution taken once
-per call, and the target invoke itself), and source-reading cannot rank them —
-so `CRATONVM_DBG=lambda-prof` now measures the total and the parts in the same
-run.
+**And it changed this class by nothing.** Interleaved, HotSpot-bracketed:
+
+| Arm | Seconds |
+|---|---:|
+| HotSpot | 10.12 |
+| CratonVM, before the lambda fix | 323.1 |
+| CratonVM, after | 312.7 |
+| CratonVM, after (repeat) | 327.9 |
+| HotSpot | 10.12 |
+
+70/70 in every arm; the spread is noise. So lambda dispatch is a genuine ~4x VM
+defect **and** it is not this workload's dominant term — the inference from
+"diffuse profile + JIT worth 17%" to "the call mechanism" does not survive its
+own A/B. Recorded because the reasoning is seductive and the experiment is
+expensive to repeat.
+
+The lambda work still lands on its own merits (2460/2460 `vm --lib`, six Spring
+classes byte-identical before and after), but it is not a fix for this page.
 
 ## What this is not
 
@@ -138,22 +153,32 @@ run.
 
 ## What is left
 
-The lambda dispatch defect, which is **suite-wide, not this class's**. Every
-timing row above is a consequence of it; fixing it is not a `WebFluxAutoConfigurationTests`
-change and should not be tracked under this class's name.
+A ~10-30x gap on Spring context startup with **no single dominant term**. What
+is now known, and what the next attempt should not repeat:
 
-Reproduction is a single self-contained probe, no Spring involved: compile
-`LambdaProbe2` (four call shapes, monomorphic sites, both orders) and run it on
-both VMs. The lambda row is the defect; every other row is the control.
+- The profile is genuinely diffuse (largest leaf 3.9%), so leaf-chasing will not
+  pay. The useful shape is the inclusive table above: annotation merging and
+  bean-factory metadata, not I/O, not class loading, not GC.
+- "It must be the call mechanism" was tested and refuted (above). Whatever else
+  gets hypothesised, **A/B it on this class before believing it** — the
+  microbenchmark that motivates a change and the workload that has to improve
+  are different measurements, and here they disagreed by 4x versus 0%.
+- The two remaining unmeasured angles: (a) how much of the annotation machinery
+  is CratonVM-side reflection cost versus interpreted Spring code — a
+  per-accessor probe diffed against the host JDK, the same technique that
+  produced the `Method.getModifiers()` finding, would separate them; (b) why the
+  JIT is worth only 17% here, which is a question about *reach*, not speed.
+- Do **not** change `try_lambda_dispatch` on the strength of reading it. That
+  function carries a long list of named correctness regressions in its own
+  comments (`ProcessInfoTests.memoryInfoIsAvailable`,
+  `NoSuchMethodFailureAnalyzerTests`, Flink's `getRawValueFromOption`, Spring
+  Data's duplicate `lambda$new$2`, the Scala `JFunction` ping-pong), each caused
+  by a change to how it picks a target.
 
-Next step for whoever picks it up: run any lambda-dense workload with
-`CRATONVM_DBG=lambda-prof`, which prints `total / lookup / prep / target / other`
-ns-per-dispatch every 200k dispatches, and fix the term it names. Do **not**
-change `try_lambda_dispatch` on the strength of reading it — that function
-carries a long list of named correctness regressions in its own comments
-(`ProcessInfoTests.memoryInfoIsAvailable`, `NoSuchMethodFailureAnalyzerTests`,
-Flink's `getRawValueFromOption`, Spring Data's duplicate `lambda$new$2`, the
-Scala `JFunction` ping-pong), each caused by a change to how it picks a target.
+Tooling left behind for whoever picks this up: `CRATONVM_DBG=lambda-prof` prints
+`total / lookup / prep / target / other` ns-per-dispatch every 200k dispatches,
+and `--stack-sample-ms N` plus the sample-coverage count is what settled the
+stall question in one run.
 
 ## Affected classes
 
