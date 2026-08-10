@@ -2556,12 +2556,80 @@ impl ZgcRealHeap {
         }
     }
 
+    /// One-shot report of an arena allocation failure, with the occupancy that
+    /// says whether the heap was full or merely fragmented.
+    ///
+    /// One-shot on purpose: the failure repeats for every subsequent request
+    /// once the arena is out, and a per-failure line would bury the run in
+    /// stderr exactly when it is least readable.
+    fn warn_alloc_failed_once(
+        size: usize,
+        used: usize,
+        capacity: usize,
+        free_list_bytes: usize,
+        largest_free_block: usize,
+    ) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if WARNED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            target: "cratonvm::gc::guard",
+            request = size,
+            used,
+            capacity,
+            free_list_bytes,
+            largest_free_block,
+            "zgc: arena allocation failed — this heap does not compact, so the \
+             bump cursor never rewinds and reclaimed space returns only as \
+             free-list holes. `largest_free_block < request` with a large \
+             `free_list_bytes` means fragmentation, not exhaustion.",
+        );
+    }
+
     /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
     /// base address. Returns `None` on OOM.
     fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
         let ptr = {
             let mut arena = self.arena.lock();
-            let ptr = arena.alloc(size, 8)?;
+            let ptr = match arena.alloc(size, 8) {
+                Some(p) => p,
+                None => {
+                    // Allocation failure on a NON-COMPACTING heap is not the
+                    // same event as "full of live data", and the two want
+                    // different fixes. Say which, once, with the numbers that
+                    // separate them:
+                    //
+                    //   used ~ capacity, free list small  -> genuinely full
+                    //   used ~ capacity, free list LARGE  -> fragmented: the
+                    //                                        bytes are there,
+                    //                                        no hole this big
+                    //   largest_free_block < size         -> why THIS request
+                    //                                        failed
+                    //
+                    // Without it an `OutOfMemoryError` raised from here is
+                    // undiagnosable after the fact, which is what it was when
+                    // `ZipContentTests` began failing at the Spring Boot
+                    // suite's default `-Xmx 2g` on the day ZGC became the
+                    // default collector.
+                    Self::warn_alloc_failed_once(
+                        size,
+                        arena.used(),
+                        arena.capacity(),
+                        arena.free_list_bytes(),
+                        arena.largest_free_block(),
+                    );
+                    // Ask for a collection at the next safepoint. A native
+                    // cannot collect where it stands, but `vm_exec`'s
+                    // native-boundary hook acts on this latch — and a request
+                    // that just failed is stronger evidence that a cycle is due
+                    // than the `allocated >= gc_threshold` predicate, which
+                    // counts LIVE bytes and therefore cannot see the bump space
+                    // this heap never rewinds.
+                    self.native_alloc_pressure.store(true, Ordering::Relaxed);
+                    return None;
+                }
+            };
             // The arena bump path hands out memory from a zeroed Vec, but a
             // reused free-list block may contain stale bytes — zero it so a
             // fresh header/fields start clean.
