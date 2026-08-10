@@ -38,11 +38,27 @@ below was the **Generational** collector — it took no flag, the other two took
   reports **0 hits across all three variants** (was: 8 classes, repeatedly, on
   the same victim address).
 
-Re-verified after merging current `dev` in: 8 of the previously-crashing classes
-across all three collectors give an identical PASS=6 / HANG=3 / **CRASH=0**, with
-zero `addr=0x10` faults and zero precise-deopt `InternalError`s.
-`cargo test -p cratonvm-native-builtins --lib` 3396 passed,
-`cargo test -p cratonvm-gc --lib` 1006 passed.
+Re-verified twice more after merging current `dev` in (including its flip to
+ZGC-as-default): 8 of the previously-crashing classes under all three
+collectors, **CRASH=0**, zero `addr=0x10` faults, zero precise-deopt
+`InternalError`s. `cargo test -p cratonvm-native-builtins --lib` 3396 passed,
+`cargo test -p cratonvm-gc` 1461 + 63 passed across every target.
+
+One caveat worth stating rather than hiding: in the second of those smokes
+`TestIndex` came back HANG on all three arms, which looked like a merge
+regression. It was not — that smoke shared the host with two `cargo test` runs.
+A/B'd sequentially afterwards on the same host, pre-merge binary vs post-merge
+binary, generational collector:
+
+```
+post-merge  PASS  151.5 s        pre-merge  PASS  157.7 s
+post-merge  PASS  139.8 s
+```
+
+The lesson generalises to every HANG figure in this document: at a 300 s cap
+with classes that legitimately take 150-340 s, **host load decides the verdict**.
+Read the HANG counts as "did not finish inside the cap on a loaded 8-core box",
+not as "hung".
 
 ## 1. The SIGSEGV — a real-JDK `ByteBufferAs<T>Buffer` view read `address` as a pointer
 
