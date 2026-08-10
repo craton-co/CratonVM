@@ -29,7 +29,7 @@
 //! Prerequisites: `javac` on PATH so `build.rs` has compiled both test
 //! Java classes (`ModuleTarget.class`, `TckModule.class`).
 
-use cratonvm_vm::classloading::module::{ModuleDescriptor, UNNAMED_MODULE};
+use cratonvm_vm::classloading::module::{ModuleDescriptor, ALL_UNNAMED_TARGET, UNNAMED_MODULE};
 use cratonvm_vm::classloading::ClassLoaderId;
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::types::Value;
@@ -171,8 +171,18 @@ fn new19_direct_deny_cross_module_without_opens() {
 fn new19_direct_allow_cross_module_with_add_opens_unqualified() {
     require_classes!();
     let mut vm = test_vm();
-    // --add-opens test.named/cratonvm=ALL-UNNAMED  (empty target = unqualified)
-    setup_modules(&mut vm, &[("test.named", "cratonvm", "")]);
+    // The launcher spells this `--add-opens test.named/cratonvm=ALL-UNNAMED`,
+    // and the token reaches `add_opens` verbatim: `""` here would be a
+    // genuinely *unqualified* open, which grants every module and would let
+    // this test pass without the ALL-UNNAMED path working at all.
+    setup_modules(
+        &mut vm,
+        &[(
+            "test.named",
+            "cratonvm",
+            ALL_UNNAMED_TARGET,
+        )],
+    );
 
     let accessor_mod = module_name_of(&vm, "cratonvm/TckModule");
     let target_mod = module_name_of(&vm, "cratonvm/ModuleTarget");
