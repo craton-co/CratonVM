@@ -463,6 +463,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "loadclass", on_key: Some("CRATONVM_DBG_LOADCLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loader-chain", on_key: Some("CRATONVM_DBG_LOADER_CHAIN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loader-trace", on_key: Some("CRATONVM_DBG_LOADER_TRACE"), off_key: None, off_word: None },
+    // Restores the pre-fix load-time transform behaviour: offer every class to
+    // the `ClassFileTransformer` chain on every constant-pool resolution rather
+    // than once per name. The red control for the load-time-transform rescan
+    // fix (see `runtime::instrument::LoadTimeOffered`) — with it set, a Spring
+    // Boot `@ClassPathExclusions` test under Mockito's inline mock maker hangs
+    // instead of passing.
+    E { group: Group::DBG, token: "load-transform-no-memo", on_key: Some("CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "logprov", on_key: Some("CRATONVM_DBG_LOGPROV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "longroot", on_key: Some("CRATONVM_DBG_LONGROOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lookup", on_key: Some("CRATONVM_DBG_LOOKUP"), off_key: None, off_word: None },

@@ -9,6 +9,7 @@
 //! is byte-identical to before the split.
 
 use super::*;
+use cratonvm_classloading::module::ALL_UNNAMED_TARGET;
 
 // ---------------------------------------------------------------------------
 // java.lang.reflect extras: Parameter, Executable
@@ -2889,18 +2890,36 @@ pub(crate) fn module_add_exports_or_opens_void(
     open: bool,
     target_index: Option<usize>,
 ) -> MethodCallResult {
+    let target = dynamic_edge_target(ctx, args, target_index);
+    module_add_exports_or_opens_void_to(ctx, args, open, &target)
+}
+
+/// The body of [`module_add_exports_or_opens_void`] with the target already
+/// decided.
+///
+/// Split out for the `…ToAllUnnamed` entry points, whose target is not an
+/// argument to read but the fixed token
+/// [`cratonvm_classloading::module::ALL_UNNAMED_TARGET`]. They previously came
+/// through the `target_index: None` path, which yields `""` — and `""` is
+/// `ModuleRegistry`'s *unqualified* marker, i.e. "grant every module", which is
+/// strictly more than the unnamed one HotSpot grants.
+pub(crate) fn module_add_exports_or_opens_void_to(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    open: bool,
+    target: &str,
+) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let module_name = read_module_name(ctx, this);
     let pkg_name = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(None),
     };
-    let target = dynamic_edge_target(ctx, args, target_index);
     let pkg_slash = pkg_name.replace('.', "/");
     if open {
-        ctx.module_add_opens(&module_name, &pkg_slash, &target);
+        ctx.module_add_opens(&module_name, &pkg_slash, target);
     } else {
-        ctx.module_add_exports(&module_name, &pkg_slash, &target);
+        ctx.module_add_exports(&module_name, &pkg_slash, target);
     }
     Ok(None)
 }
@@ -2931,6 +2950,32 @@ pub(crate) fn native_module_impl_add_opens_to_module(
     args: &[Value],
 ) -> MethodCallResult {
     module_add_exports_or_opens_void(ctx, args, true, Some(2))
+}
+
+/// `Module.implAddExportsToAllUnnamed(String)` — and, through the
+/// `java.lang.System$1` (`JavaLangAccess`) bridge in `shared_secrets_bridge.rs`,
+/// `JavaLangAccess.addExportsToAllUnnamed(Module, String)`.
+///
+/// Distinct from `implAddExports(String)`: "to all unnamed modules" is a
+/// *qualified* edge, and HotSpot reports it as one —
+/// `Module.isExported(pkg)` stays false after it. Sharing the
+/// `implAddExports(String)` implementation (which records the unqualified
+/// edge) is what this pair used to do.
+pub(crate) fn native_module_impl_add_exports_to_all_unnamed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_add_exports_or_opens_void_to(ctx, args, false, ALL_UNNAMED_TARGET)
+}
+
+/// `Module.implAddOpensToAllUnnamed(String)` / `JavaLangAccess
+/// .addOpensToAllUnnamed(Module, String)` — the `opens` half of
+/// [`native_module_impl_add_exports_to_all_unnamed`].
+pub(crate) fn native_module_impl_add_opens_to_all_unnamed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    module_add_exports_or_opens_void_to(ctx, args, true, ALL_UNNAMED_TARGET)
 }
 
 pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {

@@ -58,6 +58,7 @@ param(
   [string]$Exe       = '',            # CratonVM exe (default: target\release\cratonvm.exe)
   [string]$RefCsv    = '',            # results CSV used to classify passed vs failed
   [string]$MaxHeap   = '2g',
+  [string]$GcFlag    = '',            # extra JVM GC-selection flag, e.g. '-XX:+UseG1GC' or '-XX:+UseZGC' (craton only; empty = default GC)
   [switch]$AllModes,                  # run the 4 craton modes concurrently
   [switch]$Setup,                     # (re)compile tests + build classpath + class list
   [switch]$RefreshClasspath,          # rebuild cp.txt + all-tests.txt only (no ant recompile)
@@ -335,6 +336,7 @@ function Invoke-Mode {
   if ($Vm -eq 'craton') {
     if ($NoJit)     { $jvmArgs += '--nojit' }
     if ($Synthetic) { $jvmArgs += '--synthetic-jdk' }
+    if ($GcFlag)    { $jvmArgs += $GcFlag }
   } elseif ($Vm -eq 'hotspot') {
     # HotSpot's JIT-off equivalent is the interpreter-only flag -Xint.
     if ($NoJit) { $jvmArgs += '-Xint' }

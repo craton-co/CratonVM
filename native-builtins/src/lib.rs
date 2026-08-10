@@ -8587,11 +8587,15 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;Ljava/lang/Module;)V",
         crate::phases_late::native_module_impl_add_exports_to_module,
     );
+    // NOT `native_module_impl_add_exports_all`: "to all unnamed modules" is a
+    // qualified edge on HotSpot (`Module.isExported(pkg)` stays false after
+    // it), and the `…_all` fn records the unqualified one. See
+    // `native_module_impl_add_exports_to_all_unnamed`.
     registry.register(
         "java/lang/Module",
         "implAddExportsToAllUnnamed",
         "(Ljava/lang/String;)V",
-        crate::phases_late::native_module_impl_add_exports_all,
+        crate::phases_late::native_module_impl_add_exports_to_all_unnamed,
     );
     registry.register(
         "java/lang/Module",
@@ -8617,11 +8621,13 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;Ljava/lang/Module;)V",
         crate::phases_late::native_module_impl_add_opens_to_module,
     );
+    // Qualified to the unnamed module, same as `implAddExportsToAllUnnamed`
+    // above — not `native_module_impl_add_opens_all`.
     registry.register(
         "java/lang/Module",
         "implAddOpensToAllUnnamed",
         "(Ljava/lang/String;)V",
-        crate::phases_late::native_module_impl_add_opens_all,
+        crate::phases_late::native_module_impl_add_opens_to_all_unnamed,
     );
 
     registry.register(

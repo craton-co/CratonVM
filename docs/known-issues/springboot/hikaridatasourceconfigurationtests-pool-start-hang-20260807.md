@@ -103,18 +103,25 @@ point is not one of them, and the symptom (a genuine multi-minute stall, not
 an immediate discovery error) does not match regardless.
 
 **Not the same signature as `DevToolsEmbeddedDataSourceAutoConfigurationTests`'s
-hang in this same run** (see
-[`devtoolsembeddeddatasourceautoconfigurationtests-silent-hang-20260807.md`](devtoolsembeddeddatasourceautoconfigurationtests-silent-hang-20260807.md)),
-despite both being JDBC/DataSource-adjacent autoconfiguration classes hanging
-for the first time on this Windows run. That class produces **zero** output
-on both streams and **zero** GC activity for the entire 300s (consistent
-with a tight, non-allocating spin). This class produces 2 lines of real
-progress, reaches an actual HikariCP connection-pool-start call, and shows
-periodic GC activity throughout the stall (consistent with some live,
-allocating work continuing). The two logs do not share a mechanism as far as
-this session could tell from static log evidence — documented separately
-rather than merged, per this triage's instruction not to force a merge
-without a confirmed shared cause.
+hang in this same run** — that one is now root-caused and FIXED (2026-08-09),
+see
+`fixed-suite-bugs/springboot/devtoolsembeddeddatasourceautoconfigurationtests-load-time-transform-rescan-FIXED.md`.
+It was the `java.lang.instrument` load-time transform hook re-offering every
+class to Mockito's self-attached `ClassFileTransformer` on every constant-pool
+resolution, which only reaches classes loaded through a **user loader** — that
+class carries class-level `@ClassPathExclusions`, so all of its work runs under
+`ModifiedClassPathClassLoader`. `HikariDataSourceConfigurationTests` carries no
+such annotation and runs on the application loader, where the hook's
+already-defined early-out fires normally, so the mechanism does not reach it.
+
+Two claims this page inherited from that one's original triage were **wrong**
+and should not be reused as discriminators: its "zero GC activity ⇒ a tight,
+non-allocating spin" reading (the hung process in fact allocates ~2.4 MB/s and
+does zero file I/O — no `[moving-young]` line means no *fallback*, not no
+allocation), and its "Windows-specific" framing (the Aug-05 binary passes that
+class on the same Windows box in 21s). The contrast that does still hold is
+the one about *this* class: 2 lines of real progress and an actual HikariCP
+connection-pool-start call, which no part of the fixed mechanism explains.
 
 ## Prior timings for this exact class
 
