@@ -1,7 +1,9 @@
 # The SSL/PEM/JKS + http-client cluster — three defects, none of them SSL
 
-**Status: FIXED.** The 23-class cluster went 17 FAIL → 0 on Windows against a
-HotSpot control that passes all 23.
+**Status: FIXED.** The 23-class cluster went 17 FAIL → 1 on Windows against a
+HotSpot control that passes all 23. The one remaining class is a heap-pressure
+case that passes at `-Xmx 8g` and belongs to the already-open GC docket; the
+three defects below are fixed and verified.
 
 The cluster arrived looking like a TLS story: `PemContentTests`,
 `PemCertificateParserTests`, `PemSslStoreBundleTests`, `JksSslStoreBundleTests`,
@@ -136,16 +138,77 @@ the extraction differently.
 ## Measured
 
 23-class cluster, `apps/spring-boot-suite-runner/.suite/ssl-pem-cluster-20260809.tsv`,
-Windows, JIT on, `-Parallel 4`:
+Windows, JIT on, `-Parallel 4`, default `-MaxHeap 2g`:
 
 | run | binary | FAIL/HANG |
 |---|---|---:|
 | `sslpem-20260809-pre` | dev @ 681b5c1f1 | 17 |
 | `sslpem-20260809-post` | + classpath dedup | 11 |
 | `sslpem-20260809-post2` | + identity hash | 2 |
-| `sslpem-20260809-post3` | + blocking handoff | 0 |
+| `sslpem-20260809-final` | + blocking handoff | 1 |
 
 HotSpot control on the same host: all 23 PASS.
+
+The one remaining class is **not an SSL failure and not a hang** — see below.
+
+## The last class is heap pressure, and it belongs to the GC docket
+
+`HttpComponentsClientHttpConnectorBuilderTests` still exceeds the 300s budget at
+`-Xmx 2g`. It is not stuck; it is grinding. Four arms, same binary, same class:
+
+| arm | result |
+|---|---|
+| `-Xmx 2g`, JIT | HANG at 300s (17 servers started, each start slower than the last) |
+| `-Xmx 2g`, `--nojit` | FAIL 2/28 in 30.5s |
+| `-Xmx 8g`, `--nojit` | **PASS 28/28 in 24.3s** |
+| `-Xmx 8g`, JIT | **PASS 28/28 in 125.4s** |
+| HotSpot | PASS 28/28 in 14.0s |
+
+Giving it headroom makes both failures and the overrun disappear, so neither is
+in the TLS or HTTP path. The `-Xmx 2g` `.err.log` says what is actually
+happening:
+
+```
+[moving-young] fallback #N: reason=unregistered-jit-frame-on-stack | active-safepoint-map-incomplete | compiled-frame-oop-not-published
+ERROR cratonvm::gc::guard: young non-moving sweep was about to ZERO a span containing a LIVE (marked) object ... span_head_class_id=65
+[GC-ARRAY-GUARD] array_length(non-array): kind_byte=0 class_id=0 elem_byte=0 stored_len=0
+```
+
+Every young collection degrades to the non-moving sweep because a live JIT
+frame cannot prove a complete rewritable root map, and the sweep then reaches
+live objects. `stored_len=0` on a zeroed header is what surfaced as
+
+```
+IllegalArgumentException: Private key must be accompanied by certificate chain
+  at java.security.KeyStore.setKeyEntry
+```
+
+— a `Certificate[]` chain whose header had been zeroed reads back as length 0,
+and `setKeyEntry` refuses an empty chain. The second failure
+(`WebClientRequestException: Connection closed by peer`) is the client's view of
+the server that could not start.
+
+This is the same signature as
+`known-issues/springboot/zipcontenttests-gc-pressure-timeout-not-disk-capacity-20260807.md`
+and `known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md`.
+It is tracked there, not here: nothing in this cluster's three defects touches
+it, and no SSL change can fix it.
+
+## Blast radius, measured
+
+Twelve further `@WithPackageResources` / embedded-server classes
+(`.suite/wpr-blastradius-20260809.tsv`), CratonVM vs a HotSpot control that
+passes all twelve:
+
+- 9 PASS, 3 exceed the 300s budget (`TomcatServletWebServerFactoryTests`,
+  `JettyServletWebServerFactoryTests`,
+  `CloudFoundryReactiveActuatorAutoConfigurationTests`) — the same throughput
+  axis as above, already filed as
+  `known-issues/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-20260807.md`.
+- `FileAlreadyExistsException`: **0 occurrences** across the run (was every
+  `@WithPackageResources` class).
+- `listen on port 8080`: **0 occurrences** across the run (was every
+  embedded-Tomcat class).
 
 ## Affected classes
 
