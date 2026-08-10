@@ -1121,6 +1121,35 @@ pub fn jit_scalar_new() -> bool {
 /// hit). `=0`/`false` keeps every method at its first-published tier (the
 /// pre-supersede behaviour) — the safety net while the upgrade soaks.
 #[inline]
+/// The native-shadow CALLER seal, as a whole.
+///
+/// Default ON and load-bearing for correctness — see the call site. Off is a
+/// MEASUREMENT configuration (`CRATONVM_JIT=-native-shadow-caller-seal`) for
+/// pricing the seal's ceiling before anyone rebuilds it per-site; a run with it
+/// off may misbehave and must never ship.
+pub fn jit_native_shadow_caller_seal() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL")
+            .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
+/// The `interface_blind_possible_shadow` arm of the native-shadow seal.
+///
+/// Default ON — it is a correctness guard. `CRATONVM_JIT=-native-shadow-interface-blind`
+/// turns it off so its cost can be measured against a real workload: it is the
+/// class-blind arm ("does ANY registered native have this (name, descriptor)"),
+/// and on a Spring Boot startup the seal it belongs to excludes more methods
+/// from the JIT than reach C2.
+pub fn jit_native_shadow_interface_blind() -> bool {
+    static CACHE: MemoSlot = MemoSlot::new();
+    slot_bool(&CACHE, || {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND")
+            .map_or(true, |v| v != "0" && v != "false")
+    })
+}
+
 pub fn c2_supersede() -> bool {
     static CACHE: MemoSlot = MemoSlot::new();
     slot_bool(&CACHE, || {

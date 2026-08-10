@@ -234,13 +234,58 @@ native shadow** — more than the 1,155 that reach C2 in the same run. Nothing
 from the static policy table, nothing from the `ForkJoinTask` rule. This is the
 largest single population touching the gap and it was invisible before today.
 
-Not yet established: how much of the 20x it is worth. The obvious probe
-(`SealProbe`) shows a JDK-leaf call costs ~50 ns/iter against 8 ns/iter for pure
-integer work, and `String.charAt` ~460 ns/iter — but it did **not** reproduce
-the caller-sealing at scale (only `main` was sealed), so "1279 sealed methods"
-and "calls to JDK leaves are slow" are two facts that are not yet joined. Join
-them before acting: an A/B that narrows the seal on this class is the experiment,
-not another microbenchmark.
+### 1c. …and it is worth nothing. Measured, 2026-08-10.
+
+That headline — "more sealed than compiled" — is exactly the kind that gets a
+large compiler change funded. It was tested first, in two steps, and it does not
+survive either.
+
+**Step 1: which arm fires?** The predicate has three, and they do not have equal
+standing: `direct` and `inherited` are precise facts about the call, while
+`interface_blind_possible_shadow` is a class-blind *"does ANY registered native
+have this (name, descriptor)"* probe whose own comment concedes it "can only ever
+ADD conservatism". The obvious suspicion was that the class-blind arm was
+over-matching common signatures (`get()`, `size()`, `equals`) in Spring code.
+
+```
+JIT native-shadow verdicts by arm: direct=1015  interface-blind=169  inherited=81
+```
+
+It is not. The class-blind arm is 13%. Suppressing it
+(`CRATONVM_JIT=-native-shadow-interface-blind`) frees 126 methods and moves 9
+more to C2 — and moves wall clock not at all: 228.6s / 269.6s with it against
+256.6s / 266.8s without, interleaved and HotSpot-bracketed. The seal is dominated
+by **precise, correct** hits: Spring really does call natively-shadowed JDK
+methods nearly everywhere.
+
+**Step 2: price the ceiling.** If narrowing the detection is not the lever, the
+only remaining one is the *granularity* — the seal disqualifies the whole caller
+rather than just refusing the direct-call optimisation at that one site — and
+rebuilding it per-site is a large, correctness-critical compiler change. So
+rather than build it, price its best case by removing the seal entirely
+(`CRATONVM_JIT=-native-shadow-caller-seal`, a measurement-only lever; it
+disables a correctness guard and must never ship):
+
+| | seal on | seal off |
+|---|---:|---:|
+| sealed for `calls-native-shadowed-method` | 1281 | **17** |
+| methods reaching C2 | 1156 | **1212** |
+| wall clock | 245.97s | **253.92s / 249.73s** |
+| tests | 70/70 | 70/70 |
+
+**Freeing 1,264 methods to compile buys nothing** — if anything it is marginally
+slower, since the extra compiles are not free. The ceiling on this lead is zero,
+so the per-site rebuild should not be attempted for this workload's sake.
+
+Why zero is consistent with everything else on this page: the profile is diffuse,
+the JIT already reaches 1,156 methods in 166 ms, and compiling 56 more changes
+nothing because the time is not in the methods the seal was holding back. The
+largest measured single term remains the annotation-proxy entry path (~94% of a
+~14 us attribute read), which no amount of tier-up touches.
+
+`SealProbe` remains as the shape probe: a JDK-leaf call costs ~50 ns/iter against
+8 for pure integer work, and `String.charAt` ~460. That per-call cost is real —
+it is simply not paid for by compiling the *caller*.
 
 ### 2. Annotation *attribute reads* cost ~10.5 us — and 94% of that is not where it looks
 
@@ -307,18 +352,22 @@ is now known, and what the next attempt should not repeat:
   1. ~~Name the 26 `reason=unrecorded` compile refusals.~~ **DONE 2026-08-10** —
      63 of the 69 were policy verdicts mislabelled as codegen failures; 7 real
      ones remain, each with a named bail site.
-  2. **The skip seal: 1,279 methods excluded for `calls-native-shadowed-method`,
-     against 1,155 that reach C2.** Now the largest measured population, and the
-     natural successor to lead 1. The question to answer first is not "how do we
-     narrow it" but "how much is it worth" — see the caveat in 1b: the
-     microbenchmark did not reproduce caller-sealing, so the two facts are not
-     yet joined. A/B a narrowed seal on this class.
+  2. ~~The skip seal: 1,279 methods excluded for `calls-native-shadowed-method`.~~
+     **CLOSED 2026-08-10, ceiling measured at zero** (§1c). Removing the seal
+     entirely frees 1,264 methods, moves 56 more to C2, and does not improve wall
+     clock. Do not rebuild it per-site for this workload's sake.
   3. **The annotation-proxy entry path**, which is ~94% of a ~14 us attribute
-     read. `ann-proxy-prof` already brackets the dispatcher, so the next probe
-     only has to bracket what comes before it: the generated `$ProxyN` body and
-     the native proxy dispatch.
+     read — now the largest *unexplained* single term on this page, and the next
+     lead by default. `ann-proxy-prof` already brackets the dispatcher, so the
+     next probe only has to bracket what comes before it: the generated `$ProxyN`
+     body and the native proxy dispatch.
   4. **OSR-only loops at 7-16x**, which is not this class's problem but is
      probably somebody's.
+
+  Note the pattern across leads 1 and 2: both headline numbers ("69 refused
+  compiles", "more sealed than compiled") looked like causes and were not. Price
+  the ceiling with a lever before building the fix — twice now that has cost one
+  build and saved a large one.
 - Do **not** change `try_lambda_dispatch` on the strength of reading it. That
   function carries a long list of named correctness regressions in its own
   comments (`ProcessInfoTests.memoryInfoIsAvailable`,
