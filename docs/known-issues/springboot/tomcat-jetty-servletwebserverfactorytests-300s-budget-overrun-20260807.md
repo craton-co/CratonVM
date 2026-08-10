@@ -1,6 +1,45 @@
 # `TomcatServletWebServerFactoryTests` / `JettyServletWebServerFactoryTests` HANG at 300s — steady forward progress, not a stall; the class needs ~2x the per-class budget
 
-**Status: OPEN — throughput/budget gap, not a deadlock. Filed 2026-08-07.**
+**Status: OPEN — but the Tomcat half is NOT a budget problem. Root-caused
+2026-08-10 to a `HashMap` defect with a ten-second reproducer; see
+`hashmap-get-misses-a-key-its-own-entryset-yields-20260810.md`. Filed 2026-08-07.**
+
+## 2026-08-10 update — the Tomcat half was misdiagnosed
+
+Run to natural completion (no 300s ceiling), `TomcatServletWebServerFactoryTests`
+**finishes in 813.7s with 132 tests — and 90 of them fail.** The class does not
+hang, and giving it more budget does not make it pass. HotSpot on the same host:
+129 tests, **0 failures**, 94.9s.
+
+82 of those 90 failures are
+`ConnectorStartFailedException: Connector configured to listen on port 8080
+failed to start` — on a fixture whose `getFactory()` is
+`new TomcatServletWebServerFactory(0)`, i.e. "pick an ephemeral port". CratonVM
+starts a connector on **8080** anyway, 99 times over; HotSpot's log never
+mentions 8080 at all.
+
+Root cause, reproduced standalone in ~10 seconds: Spring parks the connectors it
+temporarily removed in a `Map<Service, Connector[]>` and restores them on
+`start()`. On CratonVM that `get` **misses a key the same map's `entrySet()`
+yields** — one-entry map, `==`-identical key, equal `hashCode`. The connectors
+are never restored, and `Tomcat.getConnector()` then *fabricates* one on port
+8080, which collides and fails. Full evidence, and five refuted alternative
+mechanisms, in the linked doc.
+
+So the "~4-4.5x HotSpot, budget runs out" framing below describes a real
+throughput gap that is still open, but it is not why these tests fail. The
+extrapolation under "What the logs actually show" assumed every cycle was
+productive work; most of the Tomcat cycles were failing connector starts.
+
+**The Jetty half is not settled either way.** A 2400s run with
+`--stack-sample-ms=200` produced `tests=0` — it never reported a single test,
+having spent ~20 minutes inside one `ContextHandler`/TLD-scan start
+(`04:27:30` → `04:47:28` for a single context) and reaching only 19 server
+cycles. That is the opposite of the "no single outlier cycle" claim below, but
+the sampler's own overhead is uncontrolled in that run and the host was carrying
+14 concurrent CratonVM processes from 6 worktrees, so it does not stand as a
+measurement. Jetty needs an unsampled run on an idle host before anything is
+concluded about it.
 
 ## Symptom
 
