@@ -107,6 +107,12 @@ fn maybe_dump_shutdown_reports() {
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
 
+    // The JIT root-scan tally, self-gated the same way. It answers what the
+    // method-stats line below cannot: those counters price the COMPILER, and a
+    // run where compilation costs 3 ms while the JIT still costs +83% CPU has
+    // its cost somewhere the compiler statistics do not reach.
+    cratonvm_vm::jit::conservative_roots::scan_prof::dump();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The bytecode loop rewriter's admission tally, on the same switch and
