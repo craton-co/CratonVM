@@ -3323,7 +3323,7 @@ fn native_spring_annotation_filter_matches_class(
     };
 
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("org/springframework/core/annotation/PackagesAnnotationFilter")
     {
@@ -3524,7 +3524,7 @@ fn native_spring_extension_resolve_parameter(
     };
 
     if scope
-        .class_name_of_id(scope.class_id_of_object(executable))
+        .class_name_arc_of_id(scope.class_id_of_object(executable))
         .as_deref()
         == Some("java/lang/reflect/Constructor")
     {
@@ -5898,7 +5898,7 @@ fn native_xsd_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Int(0))),
     };
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(other))
+        .class_name_arc_of_id(ctx.class_id_of_object(other))
         .as_deref()
         != Some(XERCES_XSD_KEY)
     {
@@ -11175,7 +11175,7 @@ pub fn register_essential_natives_with_shims(
             if ctx.heap_kind_of(this) != cratonvm_types::ObjectKind::Array {
                 let cid = ctx.class_id_of_object(this);
                 let is_reflect_type = matches!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("java/lang/reflect/GenericArrayType")
                         | Some("java/lang/reflect/ParameterizedType")
                         | Some("java/lang/reflect/WildcardType")
@@ -11256,7 +11256,7 @@ pub fn register_essential_natives_with_shims(
             }
             let cid = ctx.class_id_of_object(this);
             let is_reflect = matches!(
-                ctx.class_name_of_id(cid).as_deref(),
+                ctx.class_name_arc_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
                     | Some("java/lang/reflect/TypeVariable")
@@ -17192,7 +17192,7 @@ pub fn register_essential_natives_with_shims(
                 let is_synthetic = matches!(
                     ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                     Value::Object(Some(name))
-                        if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                             == Some("java/lang/String")
                 );
                 if is_synthetic {
@@ -17220,7 +17220,7 @@ pub fn register_essential_natives_with_shims(
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                         == Some("java/lang/String")
             );
             if is_synthetic {
@@ -17447,7 +17447,7 @@ pub fn register_essential_natives_with_shims(
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                         == Some("java/lang/String")
             );
             if is_synthetic {
@@ -17494,7 +17494,7 @@ pub fn register_essential_natives_with_shims(
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                         == Some("java/lang/String")
             );
             if is_synthetic {
@@ -22306,7 +22306,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         // Instead, copy the intern data: field 0 (value array) + field 1 (hash).
         let val = ctx.get_field(str_obj, 0);
         ctx.set_field(_this, 0, val);
-        let hash = ctx.get_field(str_obj, 1)?;
+        let hash = ctx.get_field(str_obj, 1);
         ctx.set_field(_this, 1, hash);
         Ok(None)
     });
@@ -22332,7 +22332,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         let str_obj = ctx.create_string(&s);
         let val = ctx.get_field(str_obj, 0);
         ctx.set_field(_this, 0, val);
-        let hash = ctx.get_field(str_obj, 1)?;
+        let hash = ctx.get_field(str_obj, 1);
         ctx.set_field(_this, 1, hash);
         Ok(None)
     });
@@ -24796,7 +24796,7 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     {
         let cid = ctx.class_id_of_object(this);
         if matches!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some("java/lang/reflect/GenericArrayType")
                 | Some("java/lang/reflect/ParameterizedType")
                 | Some("java/lang/reflect/WildcardType")
@@ -25309,7 +25309,7 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
-    if ctx.class_name_of_id(class_id).as_deref() == Some("org/apache/tomcat/util/buf/MessageBytes")
+    if ctx.class_name_arc_of_id(class_id).as_deref() == Some("org/apache/tomcat/util/buf/MessageBytes")
     {
         return native_message_bytes_to_string(ctx, args);
     }
@@ -26143,7 +26143,7 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
     // `PrintStream` path is unbuffered, so flushing it every line would be
     // pure overhead on a very hot path.
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         != Some("java/io/PrintWriter")
     {
@@ -28293,7 +28293,7 @@ fn native_method_handle_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let has_downcall_layout = matches!(ctx.get_field(*receiver, 0), Value::Long(ptr) if ptr != 0)
             && match ctx.get_field(*receiver, 1) {
                 Value::Object(Some(descriptor)) => {
-                    ctx.class_name_of_id(ctx.class_id_of_object(descriptor))
+                    ctx.class_name_arc_of_id(ctx.class_id_of_object(descriptor))
                         .as_deref()
                         == Some("java/lang/foreign/FunctionDescriptor")
                 }
@@ -28472,7 +28472,7 @@ fn native_method_handle_link_to(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return link_to_unsupported("call carries no trailing MemberName appendix");
     };
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(member))
+        .class_name_arc_of_id(ctx.class_id_of_object(member))
         .as_deref()
         != Some("java/lang/invoke/MemberName")
     {
@@ -28840,7 +28840,7 @@ fn native_objects_value_hash_code(
         return Ok(ctx.identity_hash_code(obj));
     }
 
-    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+    match ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() {
         Some("java/lang/String") => {
             match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
                 Some(Value::Int(v)) => Ok(v),
@@ -29657,7 +29657,7 @@ fn native_spring_is_using_forked_class_path_loader(
             .flatten();
         ctx.unpin_native_roots(thread_pin);
         matches!(loader, Some(Value::Object(Some(loader)))
-            if ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(loader)).as_deref()
                 == Some("org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader"))
     })();
     let this = ctx.read_native_pin(this_pin, this);
@@ -37446,7 +37446,7 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // when it actually holds a `java/lang/String`.
     if ctx.object_num_fields(this) >= 1 {
         if let v @ Value::Object(Some(o)) = ctx.get_field(this, 0) {
-            if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                 == Some("java/lang/String")
             {
                 return Ok(Some(v));
@@ -38460,7 +38460,11 @@ fn native_synthetic_instant_is_after(
 /// default-feature build — which is what the blocking `cargo test --workspace`
 /// CI job runs, while every check in this module's own CI job passes
 /// `--features synthetic-jdk` and so never saw it.
-pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> Result<(i32, i32, i32), MethodCallFailed> {
+///
+/// Infallible, and narrowed back to a plain tuple: the funnel migration widened
+/// it to `Result` although every path ends in `Ok`, which cost its `synthetic-jdk`
+/// caller a `?` it could not use (that build was red).
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
     let z = epoch_day + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -38471,7 +38475,7 @@ pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> Result<(i32, i32, i32), Method
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    Ok((y as i32, m as i32, d as i32))
+    (y as i32, m as i32, d as i32)
 }
 
 /// `Instant.toString()` — ISO-8601, per `DateTimeFormatter.ISO_INSTANT`.
@@ -38487,7 +38491,7 @@ fn iso_instant_string(sec: i64, nano: i32) -> Result<String, MethodCallFailed> {
     // day rather than truncating toward zero.
     let days = sec.div_euclid(86_400);
     let secs_of_day = sec.rem_euclid(86_400);
-    let (y, m, d) = epoch_day_to_ymd(days)?;
+    let (y, m, d) = epoch_day_to_ymd(days);
     let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
     // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
     let mut s = if (0..=9999).contains(&y) {
@@ -41887,7 +41891,7 @@ mod liquibase_checksum_tests {
         _args: &[Value],
     ) -> Option<MethodCallResult> {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(receiver))
+            .class_name_arc_of_id(ctx.class_id_of_object(receiver))
             .as_deref()
             != Some(ABSTRACT_CHANGE)
             || method_name != "getExcludedFieldFilters"
