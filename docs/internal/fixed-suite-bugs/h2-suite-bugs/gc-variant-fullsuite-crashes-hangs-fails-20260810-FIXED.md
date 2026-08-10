@@ -19,6 +19,11 @@ regex resolves it), rerun under all three collectors from one `--features zgc`
 binary selecting the collector by runtime flag, plus a stock-HotSpot-25 control
 over the same list, same host, same classpath, 300 s per class, `--Xmx 1g`.
 
+(The runs predate `dev`'s later flip to ZGC-as-default, so the "default" arm
+below was the **Generational** collector — it took no flag, the other two took
+`-XX:+UseG1GC` / `-XX:+UseZGC`. On current `dev` that arm needs
+`-XX:+UseGenerationalGC` explicitly.)
+
 | variant | CRASH before | CRASH after | PASS before | PASS after |
 |---|---:|---:|---:|---:|
 | default (Generational) | 18 | **0** | 2 | **19** |
