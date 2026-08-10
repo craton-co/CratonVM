@@ -197,7 +197,7 @@ a real layout they would be **silent no-ops** — a write that reports success a
 produces no bytes. That is the failure mode to expect first if these
 registrations are ever ungated.
 
-## How to reproduce
+## How to check it stays closed
 
 ```sh
 CRATONVM_DBG=overlay,overlay-all,overlay-bt=BufferedWriter \
@@ -214,9 +214,20 @@ For the whole family at once, the `VM` rows of the shadow-layout census:
 CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home "$JAVA_HOME" -cp . JdkOnlyCensusLoadProbe 2>&1 | grep '\[OVERLAY-LAYOUT\].* VM '
 ```
 
+The second command is the standing check: it must print **nothing**. Before
+2026-08-10 it printed five rows, one per slot in the table above.
+
 `probes/ReaderWriterLayoutProbe.java` is the behavioural companion: it prints
 paired properties for all four classes (including the KIND actually found in
 `lock` / `writeBuffer` / `skipBuffer` at each stage) so a transcript can be
-diffed byte-for-byte against HotSpot. It currently agrees with Temurin 25.0.3 on
-every line, which is the point — the overlay is not yet observable from Java,
-and this probe is what will notice when it becomes so.
+diffed byte-for-byte against HotSpot. It agreed with Temurin 25.0.3 on every
+line before the fix and after it, which is worth stating plainly: **it was never
+the instrument that would have caught this**, because the overlay was never
+observable from Java. The census was. A behavioural probe that is green on both
+arms of an A/B is not evidence of a fix — it is evidence that the defect lives
+somewhere the probe cannot see, and the two facts look identical if you only
+run the probe.
+
+`probes/W2ResidualCensusProbe` is the workload that reaches this family
+(`readerWriter()` deliberately calls `bw.write(String)`, the JDK path that
+ALLOCATES `writeBuffer` and so would have collided with an fd sitting there).
