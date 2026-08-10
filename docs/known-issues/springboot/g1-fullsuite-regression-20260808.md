@@ -252,20 +252,35 @@ Two concrete next steps, in order:
   a walker gap.
 * Walk the remaining JIT gates the same way §3b walked the allocation ones,
   starting with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`.
-* **Check whether a humongous region is being retyped without a reset.**
-  Unverified, but it is the one hypothesis that explains a cursor covering
-  memory that was never object-allocated, which is what the hexdump shows.
-  `alloc_humongous_locked` sets the START region's `cursor` to the FULL object
-  size (spanning continuation regions) and gives continuations `cursor = 0`;
-  `G1Region::reset` is what returns a cursor to 0. Two data points to test it
-  against, both from regions reported `type=Eden reuse_epoch=0`:
-  region 167 broke on bytes decoding to `obj_size=0x1500010` (21 MiB — a
-  humongous-scale size) with `cursor=0x100000` exactly equal to `region_size`,
-  and region 117's cursor was likewise exactly `0x100000`. A region whose
-  cursor equals the region size, or exceeds what was ever bump-allocated into
-  it, would present precisely as "committed span with no object grid, claimed
-  by no thread". Instrument `region.cursor` at every retype/free site and
-  assert it is `0` on the Free→Eden transition.
+* **START HERE: is the reserved-TLAB-tail publication reached on every G1
+  pause?** This is the best-founded remaining hypothesis and it is consistent
+  with every measurement above.
+
+  `G1Collector::refill_tlab` carves `actual = requested_size.min(remaining)`,
+  so a single refill can take an entire region's remainder — driving
+  `region.cursor` to exactly `region_size`. Both problem regions show precisely
+  that: 117 and 167 each report `cursor=0x100000` with `region_size` = 1 MiB.
+  Such a chunk is covered by exactly two things: `Tlab::retire()` (stamps a
+  filler) or `collect_reserved_tlab_tails` → `set_jit_tlab_skip_regions`
+  (publishes the span so walkers stride it). The hexdump shows **neither** —
+  ~900 KB of zeroes below the cursor and *"ZERO published skip spans this
+  pause"*.
+
+  The publication lives in `vm/src/runtime/interpreter/gc_and_alloc.rs`
+  (~line 485) inside **`stw_take_over_and_wait`**, behind
+  `if taken.count() > 0 || helper_windows > 0 || !regions.is_empty()`. If a G1
+  pause can run without going through `stw_take_over_and_wait`, then no span is
+  published on that pause even when a live thread is holding a large
+  un-retired TLAB — which is exactly the observed state. Check whether every
+  G1 collection path reaches that publication, and if not, hoist it so it runs
+  unconditionally before any region is walked.
+
+  **Ruled out while forming this:** a humongous region being retyped without a
+  reset. `cleanup`'s humongous reclaim calls `region.reset(generation)` on
+  every region of the span, so those Free regions do carry `cursor = 0`; and
+  the problem regions report `reuse_epoch=0`, meaning `reset()` was never
+  called on them at all (they came fresh from the arena), which is
+  incompatible with the humongous-recycle story.
 * **Explain the ~16 zero bytes that sit immediately after a TLAB filler.** This
   is the one invariant across every trail, and it is the desync point:
 
