@@ -2397,13 +2397,35 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // same-descriptor native for a genuinely unrelated interface is rare and
     // merely costs a missed tier-up opportunity for that one caller, never a
     // correctness bug).
+    // `CRATONVM_JIT=-native-shadow-interface-blind` suppresses this arm, so its
+    // cost can be A/B'd on a real workload before anyone decides whether to make
+    // it precise. Default-on: it is a CORRECTNESS guard (a compiled direct call
+    // bypasses the interpreter's native-vs-bytecode choice), and the shape it
+    // covers is real — `GroovyClassValueJava7 implements GroovyClassValue,
+    // extends java.lang.ClassValue` inheriting a natively-registered `get()`.
+    // The lever exists to measure the arm, not to be shipped off.
     let interface_blind_possible_shadow = is_interface_ref
         && !direct
         && !inherited
+        && crate::runtime::env_cache::jit_native_shadow_interface_blind()
         && shared
             .natives
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
+    // Which arm fired, counted. The three have very different standing:
+    // `direct`/`inherited` are precise facts about THIS call, while
+    // `interface_blind` is a class-blind "does ANY registered native have this
+    // (name, descriptor)" probe whose own comment concedes it "can only ever ADD
+    // conservatism". On a Spring Boot context startup this whole predicate seals
+    // 1,279 methods out of the JIT — more than the 1,155 that reach C2 — and
+    // until now nothing said which arm was responsible for them.
+    if direct {
+        cratonvm_jit::note_jit_native_shadow_cause("direct");
+    } else if inherited {
+        cratonvm_jit::note_jit_native_shadow_cause("inherited");
+    } else if interface_blind_possible_shadow {
+        cratonvm_jit::note_jit_native_shadow_cause("interface-blind");
+    }
     if (direct || inherited || interface_blind_possible_shadow)
         && crate::runtime::env_cache::dbg_jitc()
     {

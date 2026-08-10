@@ -781,6 +781,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "enable-inline-new", on_key: Some("CRATONVM_JIT_ENABLE_INLINE_NEW"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "exc-table-c2", on_key: None, off_key: Some("CRATONVM_JIT_NO_EXC_TABLE_C2"), off_word: None },
     E { group: Group::JIT, token: "force-c2", on_key: Some("CRATONVM_JIT_FORCE_C2"), off_key: None, off_word: None },
+    // The class-blind arm of the native-shadow seal. Default ON (correctness
+    // guard); `-native-shadow-interface-blind` measures its cost.
+    E { group: Group::JIT, token: "native-shadow-interface-blind", on_key: Some("CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND"), off_key: None, off_word: Some("0") },
+    // The whole native-shadow caller seal. Default ON and load-bearing for
+    // CORRECTNESS; off is a measurement configuration only, for pricing the
+    // seal's ceiling. Never ship with it off.
+    E { group: Group::JIT, token: "native-shadow-caller-seal", on_key: Some("CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "full-self-call-spill", on_key: Some("CRATONVM_JIT_FULL_SELF_CALL_SPILL"), off_key: None, off_word: None },
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },
