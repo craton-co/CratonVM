@@ -52,6 +52,31 @@ specifically for this case, not the pre-fix `UnsupportedOperationException`), an
 No regression: this is the same, already-accepted residual, not a new or different failure
 mode.
 
+## Reconfirmed 2026-08-10 — collector-agnostic (Generational, G1, and ZGC)
+
+Reconciling the 139-class union of non-passed classes from the three
+2026-08-08f full-suite reruns (`craton-nonpassed-{default,g1,zgc}-20260808f`)
+on `dev@6365de194`, `core/spring-boot-autoconfigure` `FileWatcherTests` is
+FAIL under **all three** GC backends, byte-identical signature in every run:
+5 of 15 tests failed, all `java.nio.file.FileSystemException`, exactly the
+same 5 symlink-dependent test names as above:
+
+| GC | Shard | Seconds | Log |
+|---|---|---:|---|
+| default (Generational) | s1 | 6.613 | `craton-nonpassed-default-20260808f-s1/all-jit/logs/core_spring-boot-autoconfigure.org.springframework.boot.autoconfigure.ssl.-dbf93449bdcf.{out,err}.log` |
+| G1 | s1 | 6.734 | `craton-nonpassed-g1-20260808f-s1/all-jit/logs/core_spring-boot-autoconfigure.org.springframework.boot.autoconfigure.ssl.FileWatcherTests.{out,err}.log` |
+| ZGC | s1 | 7.434 | `craton-nonpassed-zgc-20260808f-s1/all-jit/logs/core_spring-boot-autoconfigure.org.springframework.boot.autoconfigure.ssl.FileWatcherTests.{out,err}.log` |
+
+(all under `apps/spring-boot-suite-runner/.suite/results/`). Same `15 tests
+started`, `10 tests successful`, `5 tests failed`, same failing test
+identifiers, same bare `=> java.nio.file.FileSystemException` (no message —
+consistent with the `reason`-field-drop finding recorded in
+`fixed-suite-bugs/springboot/configtree-applicationtemp-windows-symlink-privilege-RETIRED-20260809.md`
+§4). This is the same host-environment gap across all three collectors, not
+a GC-specific defect — expected, since the root cause (host lacks
+`SeCreateSymbolicLinkPrivilege`/Developer Mode) has nothing to do with the
+collector. No action needed; conclusion below stands unchanged.
+
 ## Conclusion
 
 Not a CratonVM bug and not a regression — this is the documented Windows-host-without-

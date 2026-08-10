@@ -495,7 +495,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-169 tokens.
+171 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -536,6 +536,8 @@ export inherited from a parent shell.
 | `enable-inline-new` | `CRATONVM_JIT_ENABLE_INLINE_NEW` |
 | `exc-table-c2` | `CRATONVM_JIT_NO_EXC_TABLE_C2` |
 | `force-c2` | `CRATONVM_JIT_FORCE_C2` |
+| `native-shadow-interface-blind` | `CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND` |
+| `native-shadow-caller-seal` | `CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL` |
 | `full-self-call-spill` | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` |
 | `gc-inert-selfrec` | `CRATONVM_JIT_GC_INERT_SELFREC` |
 | `getfield-helper` | `CRATONVM_JIT_GETFIELD_HELPER` |

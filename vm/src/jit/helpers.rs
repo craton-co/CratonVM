@@ -14717,7 +14717,20 @@ mod tests {
         // Build the SharedVm via Box so we can take a `&mut` to enable
         // concurrent GC before sharing it. The JIT helper only requires
         // a raw `*const SharedVm` pointer, so no Arc is needed.
-        let mut vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        //
+        // The collector is PINNED, not defaulted. This test is about the
+        // GENERATIONAL backend's `satb_barrier` (as its own comment below
+        // says), and SATB does not exist on ZGC at all — that backend is a
+        // stop-the-world non-concurrent mark-sweep with no marking phase to
+        // keep a snapshot for. Naming the subject rather than inheriting
+        // `VmConfig::default()` is what makes the test survive a
+        // default-collector change; it did not survive the 2026-08-10 flip to
+        // `Zgc`, which is how this line came to be written.
+        let cfg = VmConfig {
+            gc_algorithm: crate::config::GcAlgorithm::Generational,
+            ..VmConfig::default()
+        };
+        let mut vm_box: Box<SharedVm> = Box::new(SharedVm::new(cfg));
 
         // Wire up the SATB queue + concurrent GC state on the heap. The
         // generational backend's `satb_barrier` is a hard no-op until

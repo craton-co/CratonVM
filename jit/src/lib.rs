@@ -12479,6 +12479,35 @@ pub fn note_jit_skip_seal_reason(reason: &'static str) {
     *jit_skip_seal_reasons().write().entry(reason).or_insert(0) += 1;
 }
 
+/// Census of native-shadow seal decisions by which arm fired.
+static JIT_NATIVE_SHADOW_CAUSES: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>>,
+> = std::sync::OnceLock::new();
+
+fn jit_native_shadow_causes(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>> {
+    JIT_NATIVE_SHADOW_CAUSES
+        .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Count one native-shadow verdict, by arm (`direct` / `inherited` /
+/// `interface-blind`). Called from the caller-scan, which runs once per method
+/// before it is sealed — not per invocation.
+pub fn note_jit_native_shadow_cause(cause: &'static str) {
+    *jit_native_shadow_causes().write().entry(cause).or_insert(0) += 1;
+}
+
+/// The native-shadow arm census, highest count first.
+pub fn jit_native_shadow_cause_census() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = jit_native_shadow_causes()
+        .read()
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
 /// The seal census, highest count first, for the stats dump.
 pub fn jit_skip_seal_census() -> Vec<(&'static str, u64)> {
     let mut v: Vec<(&'static str, u64)> = jit_skip_seal_reasons()
