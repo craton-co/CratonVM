@@ -238,6 +238,11 @@ produced a confident wrong answer read on CPU time alone.
   compiles. The deny list is the only lever that holds one side of a call at a
   chosen tier, and the probe prints which of its own methods compiled so a
   vacuous arm is visible rather than averaged in.
+  **Not yet run under CratonVM.** It was written to test the per-invocation
+  entry hypothesis, which the `jit_entries` counter refuted first, so it is
+  filed as the instrument for the next person rather than as evidence for
+  anything on this page. It compiles and runs on HotSpot (0.48 ns/call — fully
+  inlined, which is the control that its measured loop is not optimized away).
 * `probes/ByteBufferScalarSplitProbe.java` — run it under `--nojit` too; that
   control is what refuted the dispatch-floor reading.
 
