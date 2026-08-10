@@ -79,7 +79,7 @@ JDKONLY_MODULE="cratonvm.jdkonly.svc"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull"
+CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout RJitArrayTypecheck RArraysMismatch RExecutorShutdown RBlockingQueue RChmKeySetView RChannelInterrupt RSocketChannelInterrupt RAtomicArray RDirectBufferElem RMapResizeGc RMapGcStress RForNameGcStress ROverlaySystemGcStress RFileTimes RNioNoFollow RSyncMethodJit RFieldSiteCache RMethodSiteCache RDataInputFastPull RCanAccessRules RLockedIdentityHash"
 
 # The JDK-only corpus (docs/feature-designs/jdk-only-mode.md). Not in the
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
@@ -105,6 +105,13 @@ JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJ
 #                    during the walk at all. It must NOT get --nojit: it
 #                    reproduces with the JIT on, so registering it keeps the
 #                    compiling config under test. See class_cv_args.
+#   RCanAccessOutsider
+#                    not a vector: it has no main. It is the FOREIGN-package
+#                    half of RCanAccessRules, which lives in the unnamed
+#                    package and therefore cannot be named from any other
+#                    package — the "caller is not in the declaring class's
+#                    runtime package" arm has to be asked from a file that
+#                    declares one.
 #
 # Both GC vectors pass on HotSpot 25 with byte-identical output over repeated
 # runs, so they are sound vectors; what is missing is a CratonVM run under the
@@ -115,7 +122,7 @@ JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJ
 # in CLASSES with a cv_extra_args hook when their fixes landed (6cd01bcba,
 # b2e13e441) and both were validated FAIL-then-PASS under it. A later run.sh
 # merge resolution silently discarded the registrations and the hook.
-UNREGISTERED_CLASSES="RConcurrent RPriorityQueueGc RTreeRangeGc"
+UNREGISTERED_CLASSES="RConcurrent RPriorityQueueGc RTreeRangeGc RCanAccessOutsider"
 
 # ---- list hygiene, computed before anything is pruned --------------------
 #
