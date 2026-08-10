@@ -153,18 +153,51 @@ The accessors themselves get faster exactly as predicted —
 2.14x — and the class still gets slower under the JIT, in three independent
 interleaved pairs.
 
-**Registering a native takes the method away from the JIT.** With
-`CRATONVM_DBG_JIT_COMPILED=1` and no native registered, the JIT compiles the
-entire chain — `HeapByteBuffer.getShort(I)S`, `getInt(I)I`, `checkIndex(I)I`,
-`checkIndex(II)I`, `ix(I)I`, `byteOffset(J)J` — and can inline it into callers.
-A registered native replaces all of that with a funnel crossing the JIT cannot
-inline. For code that calls these accessors from many small sites — the zip
-header reader calls `getShort()` eleven times and `getInt()` six times per
-central-directory record — the lost inlining costs more than the shorter path
-saves. In the interpreter there is no inlining to lose, and the same code wins
-by the margin the microbenchmark predicts.
+### The mechanism is NOT established — an earlier claim here was wrong
 
-So the conclusion is not "the accessors are fine". It is:
+This page first said the loss was the JIT no longer being able to INLINE these
+accessors once a native was registered. **That explanation does not hold.** The
+single-pass emitter "bails on any callee invoke that is not a resolver-proven
+elidable super-`<init>`" (`jit/src/lib.rs:5239`), and
+`HeapByteBuffer.getShort()`'s body is four invokes — `scope()`, `checkIndex`,
+`byteOffset`, and the `ScopedMemoryAccess` call. It was never inlined into its
+callers, so there was no inlining to lose. The JIT does COMPILE all of those
+methods (`CRATONVM_DBG_JIT_COMPILED=1` lists them), which is a different thing.
+
+The class-level numbers also deserve less weight than they were given. Across
+one session the SAME configuration — intrinsic OFF, JIT — measured 315.5s,
+353.8s, 413.7s and 450.7s on this host. That is a ±20% spread, and the three
+ON-vs-OFF deltas (5.9%, 6.2%, 12.2%) sit inside it. The pairs were run back to
+back, which controls for slow drift, but each pair is a single run: the
+direction is consistent, the magnitude is not established.
+
+What IS solid is the microbenchmark — small, repeated, interleaved, min-of-3,
+with the deliberately-excluded arms measuring 1.00x and 0.97x, which shows the
+lever is scoped to exactly the accessors it claims.
+
+So the open question is why a strictly shorter path did not show a class-level
+win, and the honest answer is that nobody has measured it yet. Candidates worth
+separating: run-to-run variance swamping a real small gain; inline-cache /
+dispatch differences at a native call site versus a compiled Java one; or the
+accessors simply not being a large enough share of this class's time for a 2x
+on them to move the total (they were ~18% of leaf samples, so the ceiling is
+about 9%). The last one is arithmetic and can be checked without a build.
+
+The arithmetic is worth doing before any more runs, because it bounds the whole
+question. The accessors were ~18% of leaf samples. Making them 2.4x faster
+removes `18% x (1 - 1/2.4)` = **~10%** of total time, and that is the CEILING.
+The measured deltas are 6-12% against a configuration whose own spread is ±20%
+— so this experiment could never have separated a 10% win from a 10% loss. It
+was underpowered by construction, and reading a mechanism out of it was the
+mistake.
+
+The `--nojit` arm is the one that lands where the arithmetic predicts: **9.4%
+faster** against a ~10% ceiling. That agreement is the strongest evidence on
+this page that the intrinsic does what it claims, and it is why the JIT arm's
+sign should not be trusted without a properly powered measurement (repeated
+pairs, or per-process CPU time rather than wall clock).
+
+Whatever the reason, the conclusion for this page is unchanged:
 
 1. **The intrinsic belongs in the JIT**, as a compiled inlinable intrinsic
    rather than a registered native. The contract is already pinned by

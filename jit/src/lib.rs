@@ -7455,6 +7455,32 @@ pub enum JitIntrinsic {
     ArraycopyPrimitive,
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
+    // ===== INTRINSIC REGION BEGIN: SCOPED_MEMORY_UNALIGNED =====
+    // `jdk.internal.misc.ScopedMemoryAccess.get{Short,Char,Int,Long}Unaligned`
+    // over a `byte[]` base — the leaf every `HeapByteBuffer` scalar getter
+    // bottoms out in.
+    //
+    // Why here and not as a registered native: registering a native takes the
+    // method away from the JIT, and the whole `HeapByteBuffer.getShort()` chain
+    // above this leaf (`checkIndex`, `nextGetIndex`, `ix`, `byteOffset`) is
+    // already inlinable compiled code. Replacing that chain with a native
+    // funnel measured 6-12% SLOWER on `ZipContentTests` even though the
+    // accessor itself got 1.4-2.1x faster — see
+    // `known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+    // Intrinsifying only this leaf leaves every caller inlinable.
+    //
+    // The base is the buffer's backing array and the incoming offset already
+    // includes `ARRAY_DATA_OFFSET`, so the load is `[base + offset]`, byte-
+    // swapped when the caller asks for big-endian. Every guard failure — null
+    // base, non-array, non-`byte[]` element type, out-of-range offset — falls
+    // back to ordinary dispatch, which runs the registered native and reports
+    // exactly what the interpreter would.
+    ScopedMemoryGetShortUnaligned,
+    ScopedMemoryGetCharUnaligned,
+    ScopedMemoryGetIntUnaligned,
+    ScopedMemoryGetLongUnaligned,
+    // ===== INTRINSIC REGION END: SCOPED_MEMORY_UNALIGNED =====
+
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
     // java.lang.String access intrinsics (Phase 3a). The foundation waves
     // (commits 06bfac0 / 544cbea) added inline getfield + array-access
@@ -8287,6 +8313,20 @@ pub fn try_resolve_intrinsic(
         return Some((JitIntrinsic::ArraycopyPrimitive.as_entry(), 5, b'V'));
     }
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION BEGIN: SCOPED_MEMORY_UNALIGNED =====
+    // NOT MATCHED YET — deliberately. The `ScopedMemoryGet*Unaligned` variants
+    // are declared (see the enum) but nothing registers them, because the
+    // codegen arm that would emit their inline body does not exist yet.
+    // Registering a sentinel the codegen cannot emit is the one failure mode
+    // this matcher must never have: `try_compile` would push a `direct_calls`
+    // entry whose `entry` no arm recognises.
+    //
+    // The design and the measurement that motivates it are on the enum
+    // variants. What has to be true before this is switched on is written
+    // there too, and one claim in it is NOT yet verified — see
+    // `known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+    // ===== INTRINSIC REGION END: SCOPED_MEMORY_UNALIGNED =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
     // java.lang.String access intrinsics (length/charAt/isEmpty/hashCode).
