@@ -3,7 +3,7 @@
 **Status: OPEN — measured 2026-08-10. Supersedes the "margin exhausted",
 "recurring timeout" and "cumulative `ModifiedClassPathExtension` cost" framings
 of the classes below, whose own docs are retired to
-`docs/internal/fixed-suite-bugs/springboot/`.**
+`fixed-suite-bugs/springboot/`.**
 
 > **The conclusion holds; three of the four rows were re-measured after
 > `67fadfdd8` and their numbers changed.** The `f695ca875` binary the Flyway,
@@ -507,9 +507,9 @@ CP="$(cat module/spring-boot-integration/build/cratonvm-test-cp.txt);<sb>/sb-run
 - `docs/known-issues/h2/h2-update-path-throughput-20260802.md` — names the
   non-moving fallback as a scaling target on an unrelated workload; same
   mechanism seen as throughput rather than as failure.
-- `docs/internal/fixed-suite-bugs/springboot/flyway-integration-300s-margin-RETIRED-20260810.md`
-- `docs/internal/fixed-suite-bugs/springboot/quartzendpointwebintegrationtests-recurring-timeout-RETIRED-20260810.md`
-- `docs/internal/fixed-suite-bugs/springboot/log4j2-logback-loggingsystemtests-RETIRED-20260810.md`
+- `fixed-suite-bugs/springboot/flyway-integration-300s-margin-RETIRED-20260810.md`
+- `fixed-suite-bugs/springboot/quartzendpointwebintegrationtests-recurring-timeout-RETIRED-20260810.md`
+- `fixed-suite-bugs/springboot/log4j2-logback-loggingsystemtests-RETIRED-20260810.md`
 
 ## Affected classes
 

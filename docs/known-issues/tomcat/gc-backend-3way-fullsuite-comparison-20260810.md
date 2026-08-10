@@ -79,7 +79,7 @@ say ZGC is *not* simply more correct:
 
 - two ZGC-only defects were root-caused and fixed on 2026-08-10 (a missing
   reference-array un-box, and a stale generated-`$ProxyN` cache) — see
-  [`zgc-real-fullsuite-regression-RETIRED-20260808.md`](../../internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md),
+  `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`,
   which replaces the dead `springboot/zgc-real-fullsuite-regression-20260807.md`
   link this page used to carry;
 - ZGC needs measurably more heap for the same work: `ZipContentTests` OOMs at
