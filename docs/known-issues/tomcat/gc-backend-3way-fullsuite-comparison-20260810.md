@@ -39,22 +39,215 @@ though not an isolated-host measurement).
   The same underlying JIT-frame root-coverage gap that makes the default GC
   slow makes G1 unsafe instead.
 - **ZGC currently looks healthiest**: fewest hangs, fastest wall time, zero
-  crashes. Treat this with some caution rather than as "ZGC is production
-  -ready" — `gc/Cargo.toml`'s own comments (as of this session) describe
-  ZGC's newer `src/zgc/` modules as compiling and unit-tested but **not
-  wired into the real allocator yet** ("the whole-heap allocator is still
-  linear mark-sweep"), and separately note a known regression at
-  `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`.
-  A simpler/more conservative allocator would plausibly dodge the exact
-  moving-young-collector pathology hurting the other two backends without
-  that meaning ZGC's own design is more correct or complete.
+  crashes. The caution is right; the reason first given for it was not, and is
+  corrected in "Why ZGC dodges it" below.
+
+## Why ZGC dodges it — corrected 2026-08-10
+
+The first version of this page discounted ZGC's result on the grounds that its
+newer `src/zgc/` modules were "**not wired into the real allocator yet**",
+quoting `gc/Cargo.toml`, which in turn quoted the "Production-ZGC submodules"
+banner in `gc/src/zgc.rs`. **That chain was stale at both ends.** Counted in
+`src/zgc.rs` outside its `mod tests`, on the commit these runs used:
+
+| adopted by `ZgcRealHeap` | uses | not adopted |
+|---|---:|---|
+| `census` | 24 | `barrier` (named in comments only) |
+| `mark` | 15 | `forwarding` |
+| `tlab` | 12 | `remembered` |
+| `vaddr` | 7 | `generation` |
+| `page` | 2 | `relocate` |
+| `metrics` | 1 | `adapters` |
+
+Six of twelve, not zero — and the allocator is the *wrong* example to pick:
+the ZGC TLAB is default-ON and serves `alloc_object`/`alloc_array` through
+`alloc_raw_tlab`. (The module count was also 11, not 12; `adapters` has since
+been declared.) Both upstream comments are fixed.
+
+**What is still true, and is the actual reason:** `ZgcRealHeap` is a
+stop-the-world **non-moving** mark-sweep. The six unadopted modules are exactly
+the moving/generational/concurrent machinery, and `vm_init.rs` hard-codes
+`RELOCATION_REQUESTED = false`. The pathology hurting the other two backends is
+a *moving* collector's JIT-frame root-coverage gap — the default GC falls back
+to a non-moving sweep to stay safe (slow), G1 evacuates anyway (SIGSEGV). A
+collector that never relocates anything cannot be exposed to it at all.
+
+So the caution stands, restated: ZGC's lead here is **a narrower guarantee, not
+a broader correctness**. It is not evidence that ZGC is more complete — it is
+evidence that the defect is specific to relocation. Three independent findings
+say ZGC is *not* simply more correct:
+
+- two ZGC-only defects were root-caused and fixed on 2026-08-10 (a missing
+  reference-array un-box, and a stale generated-`$ProxyN` cache) — see
+  `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`,
+  which replaces the dead `springboot/zgc-real-fullsuite-regression-20260807.md`
+  link this page used to carry;
+- ZGC needs measurably more heap for the same work: `ZipContentTests` OOMs at
+  `-Xmx 2g` under ZGC and passes at 3g, where the default collector passes at
+  2g — the price of not compacting;
+- it still has 29 HANGs and 18 FAILs here.
+
+## The ZGC half of the class-list diff — done 2026-08-10
+
+Diffing the three `results.csv` files (the item below), the ZGC column holds
+**47 non-PASS classes, of which exactly 2 are ZGC-only** (PASS under both the
+default collector and G1):
+
+| class | ZGC | verdict |
+|---|---|---|
+| `org.apache.el.util.TestMessageFactory` | FAIL 0.6s | **the reference-array un-box defect — fixed** |
+| `org.apache.coyote.http2.TestHttp2Section_6_8` | FAIL 95s | socket resets under the 3-way concurrent load; unattributed |
+
+**These runs predate both ZGC fixes.** The result directories were created
+2026-08-09 23:24; the fixes merged to `dev` at 05:09 on 08-10, so this page's
+ZGC column was measured on a binary without them.
+
+`TestMessageFactory` is the interesting one and it is a clean catch.
+`testFormatChoice` asserted `100 is enough` and got `100 is too many` — the
+bundle entry is a `ChoiceFormat` pattern, `ChoiceFormat` keeps its thresholds
+in a `double[]`, and a zeroed limits array makes every branch match so the last
+one wins. `probes/ChoiceFormatProbe.java` shows it directly:
+
+```
+ChoiceFormat("0#too few|99#enough|100<too many").getLimits()
+  HotSpot / default collector -> [0.0, 99.0, 100.00000000000001]
+  -XX:+UseZGC, pre-fix        -> [0.0, 0.0, 0.0]           -> format(100) = "too many"
+```
+
+Deterministic, `--nojit`, any heap size. Re-run on current `dev` under
+`-XX:+UseZGC`, both classes **PASS** (`TestMessageFactory` 0.6s,
+`TestHttp2Section_6_8` 37.9s) — run
+`zgconly2-zgc-20260810`.
+
+The other 45 non-PASS classes are shared with at least one other backend, so
+none of them is a ZGC signal. Worth noting for the reruns below: 25 of them are
+300s HANGs on **all three** backends (the `TestHostConfigAutomaticDeployment*`
+and `TestDefaultServletEncoding*` families), i.e. collector-independent.
+
+## The default-only column — 63 classes, and 98% of them name the same cause
+
+**63 classes are non-PASS under the default collector and PASS under BOTH G1
+and ZGC** — 59 HANGs and 4 FAILs. That is over half of the default arm's 115
+HANGs, and it is not 63 separate problems:
+
+| group | n | shape |
+|---|---:|---|
+| `jakarta.servlet.http.TestHttpServletDoHeadInvalidWrite*ValidWrite*` | 44 | one parameterized family; 44 of its 64 classes hang under default only |
+| other 300s HANGs | 15 | `TestAsyncContextImpl`, `TestRateLimitFilter{,WithExactRateLimiter}`, `TestVirtualContext`, `TestJNDIRealmIntegration`, `TestDefaultServletOptions`, `TestWebdavServletOptionCollection`, `TestCachedResource`, `TestHttp11Processor`, `TestAsync`, `TestStreamProcessor`, `TestStreamQueryString`, `TestEncodingDetector`, `TestParser`, `TestWarDirContext` |
+| HTTP/2 FAILs | 3 | `TestHttp2Limits`, `TestHttp2Section_5_1`, `TestHttp2Section_8_1` |
+| `TestCharChunkLargeHeap` | 1 | a different defect — see below |
+
+**The attribution is quantified, not asserted.** Counting
+`[moving-young] fallback` lines in each class's own `.log.err`:
+
+| | logs a fallback |
+|---|---|
+| the 63 default-only non-PASS classes | **62 / 63 (98%)** |
+| the default arm's 519 PASSing classes | 47 / 519 (9%) |
+| the same 63 classes on the **G1** arm | **0** |
+| the same 63 classes on the **ZGC** arm | **0** |
+
+The counter reaches **#1024** within a single class, across seven reasons:
+`xt-helper-window-conservative-scan` (289 lines), `unregistered-jit-frame-on-stack`
+(256), `innermost-rbp-belongs-to-unguarded-callee` (209),
+`compiled-frame-oop-not-published` (53), `active-safepoint-map-incomplete` (52),
+`compiled-frame-band-unbounded` (4), `cross-thread-jit-peer` (4). The logs show
+these classes making *progress* the whole time — Tomcat starting, servicing,
+stopping — just far too slowly to finish inside 300s. Throughput, not deadlock.
+
+This is [gc-moving-young-persistent-nonmoving-fallback-regression.md](gc-moving-young-persistent-nonmoving-fallback-regression.md)
+at class-list scale, and the 0-vs-0 rows are why the other two backends are
+clean here: the mechanism is generational-only by construction, so a collector
+that does not have that young-generation copying path cannot exhibit it.
+
+### It reproduces on current dev, unchanged
+
+All 63 re-run under the default collector on current `dev`, one class per
+process, 400s budget (not 300s), 2-parallel — run `defonly63-default-20260810`:
+
+| | |
+|---|---:|
+| HANG | **51** |
+| PASS | 11 |
+| FAIL | 1 |
+
+**The `TestHttpServletDoHead*` family is 44 HANG out of 44** — not one of them
+moved, at a budget a third larger than the one that produced the original
+column. The 11 that now pass are all from the "other HANGs" and "HTTP/2 FAILs"
+groups, i.e. the classes that were merely near the boundary. `TestCharChunk-
+LargeHeap` still FAILs in 3.1s, exactly as before, because it is the separate
+allocation-size defect below and nothing about it has changed.
+
+So this is not a stale measurement being kept alive by an old binary: the
+generational collector's largest single behaviour gap in this suite is
+untouched by everything that landed between 2026-08-09 and 2026-08-10. **That
+is the finding this page's default flip rests on** — see
+[`docs/gc-tuning.md`](../../gc-tuning.md).
+
+### `TestCharChunkLargeHeap` is a separate default-only defect
+
+FAIL in 2.9s, not a hang, and no fallback involved:
+
+```
+java.lang.OutOfMemoryError: Java heap space (alloc_array length 2147483639)
+  at org.apache.tomcat.util.buf.CharChunk.makeSpace(CharChunk.java:425)
+```
+
+The test asks for a ~2 GB `char[]` (4 GB of payload) at `-Xmx 2g`. G1 and ZGC
+both serve it and pass in ~6.4s — G1 through humongous regions, ZGC out of its
+single arena — while the generational heap cannot, because a semi-space young
+generation is a fraction of `-Xmx` and the array has to fit in one space. Note
+the direction: this is the **mirror image** of ZGC's `ZipContentTests` heap
+floor. Each collector has an allocation shape it serves worst, and neither is
+"the correct one".
+
+## The G1-only column — 6 classes, plus the 4 CRASHes
+
+**6 classes are non-PASS under G1 and PASS under both default and ZGC.** The 4
+CRASHes are not among them (those classes hang under the other backends), so
+they are carried here too. Re-run on current `dev` under `-XX:+UseG1GC`, with a
+3-arm control for everything that stayed bad:
+
+| class | 08-10 G1 | G1 now | default now | ZGC now | verdict |
+|---|---|---|---|---|---|
+| `TestDigestAuthenticatorAlgorithms` | HANG | **PASS 29.6s** | — | — | gone |
+| `TestXmlValidationUsingContext` | FAIL | **PASS 56.3s** | — | — | gone |
+| `TestChunkedTransferEncodingWithProxy` | HANG | **PASS 314.5s** | — | — | gone (but 314s — budget-bound) |
+| `TestCoyoteAdapterCanonicalization` | FAIL | FAIL 26.6s | PASS 38.8s | PASS 36.9s | **G1-only — the zeroed-header defect** |
+| `TestSwallowAbortedUploads` | FAIL | FAIL 68.9s | PASS 45.8s | PASS 41.1s | G1-only, unattributed |
+| `TestEncryptInterceptorLargeHeap` | HANG | HANG 400s | PASS 215.6s | PASS 147.4s | **G1-only, not root-caused** |
+| `TestHostConfigAutomaticDeploymentModification` | CRASH | HANG 400s | HANG 400s | HANG 400s | no longer G1-specific |
+| `TestHostConfigAutomaticDeploymentWar` | CRASH | FAIL 274.4s | HANG 400s | PASS 158.2s | crash gone |
+| `TestHostConfigAutomaticDeploymentWarXml` | CRASH | **PASS 134.4s** | — | — | crash gone |
+| `TestHttpServletDoHeadInvalidWrite1ValidWrite511` | CRASH | **PASS 102.3s** | — | — | crash gone |
+
+**Zero CRASHes on the rerun** — all four are PASS/FAIL/HANG now. The G1-only
+column is down from 6 to 3.
+
+`TestCoyoteAdapterCanonicalization` is the one that belongs to
+[g1-sigsegv-unguarded-callee-jit-frame.md](g1-sigsegv-unguarded-callee-jit-frame.md)
+and is worth adding to its evidence: **166** `g1::get_field: out-of-bounds field
+read dropped … num_slots=0 class_id=ClassId(0)` guard hits, **0** on both other
+arms of the same class. That is the same zeroed-header-on-a-live-object
+signature that page documents, presenting here as a cascade of
+`LifecycleException: lifecycleBase.stopFail` rather than as a SIGSEGV.
+
+The other two are **not** that defect and should not be filed under it:
+`TestSwallowAbortedUploads` logs zero guard hits and fails on
+`SocketException: Connection aborted (os error 10053)` — the load-flake shape,
+same as the ZGC `TestHttp2Section_6_8` above. `TestEncryptInterceptorLargeHeap`
+logs zero guard hits and produces no output past the JUnit banner, i.e. it
+stalls before the first test reports; given the name and G1's humongous path
+that is where to look, but nothing here establishes it.
 
 ## Not yet done
 
 - The default-GC run's `NOSUMMARY` was `org.apache.catalina.tribes.test.channel.TestDataIntegrity` — already part of the known-environmental multicast family (see [tribes-multicast-family-still-environmental.md](tribes-multicast-family-still-environmental.md)), but a VM abort with no JUnit summary at all is a stronger symptom than that family's usual assertion failures. Not yet checked whether this is a distinct VM-abort defect or the same environmental flakiness manifesting differently under load.
-- Diff the FAIL/HANG class lists across the three backends (not all 3 runs'
-  non-PASS classes are the same 15-35 classes; a class that hangs under
-  default but passes under G1/ZGC is a much stronger signal than one that
-  fails everywhere).
+- ~~Diff the FAIL/HANG class lists across the three backends.~~ **DONE
+  2026-08-10**, all three columns — see the three sections above. Summary:
+  default-only 63, G1-only 6, ZGC-only 2. The asymmetry is the finding: the
+  default arm's problem is one mechanism replicated across a parameterized
+  family, G1's is a handful of classes plus a crash mode that is now gone, and
+  ZGC's was two defects that are fixed.
 - Isolated (non-concurrent) reruns per backend, since these three shared the
   host with each other.

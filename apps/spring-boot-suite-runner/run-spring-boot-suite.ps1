@@ -888,7 +888,7 @@ function New-ProcessRecord {
   # flag on HotSpot started failing 100% on CratonVM -- a harness asymmetry that
   # had been invisible only because the VM was wrong in a compensating direction.
   # Keep the argument in one variable so a future arm cannot silently omit it. See
-  # docs/internal/fixed-suite-bugs/springboot/dirtiesurlfactories-craton-launcher-missing-add-opens-FIXED-20260809.md.
+  # fixed-suite-bugs/springboot/dirtiesurlfactories-craton-launcher-missing-add-opens-FIXED-20260809.md.
   $addOpensJavaNet = '--add-opens=java.base/java.net=ALL-UNNAMED'
 
   if ($Vm -eq 'hotspot') {

@@ -3131,6 +3131,24 @@ fn s2_bb_order(ctx: &dyn NativeContext, buf: ObjectRef) -> i32 {
     if s2_bb_synthetic_layout(ctx, buf) {
         return ctx.get_field(buf, BB_ORDER).as_int().unwrap_or(0);
     }
+    // A real-JDK `java/nio/ByteBufferAs<T>Buffer{B,L}` carries its order in
+    // the CLASS, not in a field: the JDK compiles one concrete view class per
+    // endianness and `order()` is a constant return. It has no `bigEndian`
+    // field, so the `BB_ARRAY`/`mark`-slot fallback below would decide by
+    // whatever `mark` happens to hold — BIG_ENDIAN for the usual `mark == -1`,
+    // which silently byteswaps every read through a `...BufferL` view. The
+    // class name is exact; use it.
+    let cname = ctx.class_name_arc_of_id(ctx.class_id_of_object(buf));
+    if let Some(n) = cname.as_deref() {
+        if let Some(tail) = n.strip_prefix("java/nio/ByteBufferAs") {
+            if tail.ends_with('L') {
+                return 1;
+            }
+            if tail.ends_with('B') {
+                return 0;
+            }
+        }
+    }
     match ctx.get_field_by_name(buf, "bigEndian") {
         Value::Int(v) => {
             if v != 0 {
@@ -3233,16 +3251,34 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
 /// address field. Guard here so callers can consult this helper directly
 /// without repeating the array check.
 fn s2_bb_direct_addr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<i64> {
-    if s2_bb_arr(ctx, buf).is_some() {
+    if s2_bb_heap_window(ctx, buf).is_some() {
         return None;
     }
     match ctx.get_field_by_name(buf, "address") {
-        Value::Long(v) if v > 0 => Some(v),
+        Value::Long(v) if is_plausible_native_addr(v) => Some(v),
         _ => match ctx.get_field(buf, 4) {
-            Value::Long(v) if v > 0 => Some(v),
+            Value::Long(v) if is_plausible_native_addr(v) => Some(v),
             _ => None,
         },
     }
+}
+
+/// A `Buffer.address` below the first mappable page is never a process
+/// pointer: Linux refuses to map below `vm.mmap_min_addr` (65536 by default)
+/// and Windows reserves the low 64 KiB of every address space. What DOES live
+/// down there is an array-relative `Unsafe` offset —
+/// `ARRAY_BYTE_BASE_OFFSET + offset` — belonging to a HEAP-backed buffer whose
+/// array the caller failed to resolve.
+///
+/// This is a backstop, not the contract: `s2_bb_heap_window` above is what
+/// actually resolves those buffers. It earns its place because dereferencing
+/// such an "address" is an immediate, unrecoverable SIGSEGV — `addr=0x10`,
+/// i.e. exactly `ARRAY_BYTE_BASE_OFFSET`, on 51 of the 53 crashes in the
+/// 2026-08-10 three-GC-variant H2 sweep — whereas answering "no storage"
+/// degrades to this module's existing benign zero, which a caller can survive.
+#[inline]
+fn is_plausible_native_addr(v: i64) -> bool {
+    v >= 0x1_0000
 }
 
 /// Array-base offset of a heap buffer — the real-JDK `ByteBuffer.offset`
@@ -3258,6 +3294,72 @@ fn s2_bb_heap_base(ctx: &dyn NativeContext, buf: ObjectRef) -> usize {
     }
 }
 
+/// `Unsafe.ARRAY_BYTE_BASE_OFFSET` as this VM publishes it — the value
+/// `bb_write_hb` seeds into a heap `Buffer.address`, and the value the real
+/// JDK's own `HeapByteBuffer` ctor adds to its array-base `offset`. Element 0
+/// of a `byte[]` sits at this unsafe offset, so subtracting it turns a
+/// `Buffer.address` back into a plain byte index.
+const ARRAY_BYTE_BASE_OFFSET: i64 = 16;
+
+/// Backing array + byte index of element 0 for a real-JDK
+/// `java/nio/ByteBufferAs<T>Buffer{B,L}` — the concrete view class
+/// `ByteBuffer.as<T>Buffer()` returns.
+///
+/// `asLongBuffer` and friends are NOT in `force_native_over_real_jdk_bytecode`,
+/// so against a real JDK they run the JDK's own bytecode and hand back one of
+/// these. Its storage lives on the backing `bb` ByteBuffer; the view's own `hb`
+/// is null, and `Buffer.address` holds `bb.address + bb.position()` — an
+/// `Unsafe` offset (`ARRAY_BYTE_BASE_OFFSET + byteIndex`), **not** a process
+/// pointer.
+///
+/// The bulk `get([JII)`/`put([JII)` accessors, on the other hand, ARE forced:
+/// they are declared on the abstract `java/nio/LongBuffer`, which these views
+/// do not override, so such a receiver lands in `s2_lb_get_bulk` and from there
+/// in `s2_bb_get_byte`. Before this helper existed that path found no array
+/// (`s2_bb_arr` looks at `hb`, slot 0 and `Buffer.segment`, none of which the
+/// view populates), fell through to `s2_bb_direct_addr`, and dereferenced the
+/// `address` value as a pointer: `copy_from_native_memory(0x10, 1)` →
+/// SIGSEGV at `addr=0x10`. `org.h2.mvstore.Chunk.readToC`'s
+/// `buff.asLongBuffer().get(toc)` does exactly this on every MVStore chunk
+/// read, which is why 16-18 H2 classes crashed identically under all three
+/// collectors.
+///
+/// Mirrors `bbacb_read_underlying_bytes` (native-builtins/src/lib.rs), which
+/// already resolves the `ByteBufferAsCharBuffer{B,L}` family the same way.
+/// `None` for a view over a DIRECT ByteBuffer — there the view's `address`
+/// genuinely IS a process pointer and the direct path handles it correctly.
+fn s2_bb_view_backing(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<(ObjectRef, usize)> {
+    let bb = match ctx.get_field_by_name(buf, "bb") {
+        Value::Object(Some(b)) => b,
+        _ => return None,
+    };
+    let arr = s2_bb_arr(ctx, bb)?;
+    let base = match ctx.get_field_by_name(buf, "address") {
+        Value::Long(a) if a >= ARRAY_BYTE_BASE_OFFSET => (a - ARRAY_BYTE_BASE_OFFSET) as usize,
+        Value::Int(a) if i64::from(a) >= ARRAY_BYTE_BASE_OFFSET => {
+            (i64::from(a) - ARRAY_BYTE_BASE_OFFSET) as usize
+        }
+        // No usable `address` (a synthetic-layout source): fall back to the
+        // backing buffer's own array-base offset, as the char-view helper does.
+        // This drops the source's position-at-creation, but a stale window is
+        // recoverable where a wild pointer is not.
+        _ => s2_bb_heap_base(ctx, bb),
+    };
+    Some((arr, base))
+}
+
+/// Heap storage of ANY buffer this module handles: `(array, byte index of the
+/// buffer's logical byte 0)`. Covers the buffer's own array plus its
+/// array-base `offset` (heap ByteBuffers, synthetic typed views) and the
+/// backing array of a real-JDK `ByteBufferAs<T>Buffer{B,L}` view. `None` for
+/// direct and storage-less buffers.
+fn s2_bb_heap_window(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<(ObjectRef, usize)> {
+    if let Some(arr) = s2_bb_arr(ctx, buf) {
+        return Some((arr, s2_bb_heap_base(ctx, buf)));
+    }
+    s2_bb_view_backing(ctx, buf)
+}
+
 /// Resolved backing storage of an s2-managed buffer: a heap array plus the
 /// buffer's array-base offset, OR a direct native address. This is the
 /// single storage-view helper the residual doc
@@ -3271,8 +3373,7 @@ enum S2BbStorage {
 }
 
 fn s2_bb_storage(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<S2BbStorage> {
-    if let Some(arr) = s2_bb_arr(ctx, buf) {
-        let base = s2_bb_heap_base(ctx, buf);
+    if let Some((arr, base)) = s2_bb_heap_window(ctx, buf) {
         return Some(S2BbStorage::Heap { arr, base });
     }
     s2_bb_direct_addr(ctx, buf).map(|addr| S2BbStorage::Direct { addr })
@@ -3409,8 +3510,8 @@ fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
     if idx < 0 {
         return 0;
     }
-    if let Some(arr) = s2_bb_arr(ctx, buf) {
-        let i = s2_bb_heap_base(ctx, buf).saturating_add(idx as usize);
+    if let Some((arr, base)) = s2_bb_heap_window(ctx, buf) {
+        let i = base.saturating_add(idx as usize);
         if i >= ctx.array_length(arr) {
             return 0;
         }
@@ -3445,8 +3546,8 @@ fn s2_bb_put_byte(ctx: &mut dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) 
     if idx < 0 {
         return;
     }
-    if let Some(arr) = s2_bb_arr(ctx, buf) {
-        let i = s2_bb_heap_base(ctx, buf).saturating_add(idx as usize);
+    if let Some((arr, base)) = s2_bb_heap_window(ctx, buf) {
+        let i = base.saturating_add(idx as usize);
         if i >= ctx.array_length(arr) {
             return;
         }
@@ -5954,9 +6055,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     .and_then(|b| bs.checked_add(b))
                     .unwrap_or(bs);
                 let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
-                if let Some(arr) = s2_bb_arr(ctx, this) {
+                // `s2_bb_heap_window`, not `s2_bb_arr`: the receiver may be a
+                // real-JDK `ByteBufferAs<T>Buffer{B,L}`, whose array lives on
+                // its backing `bb` and whose byte start is carried in
+                // `address` rather than in the `BB_MARK` marker. The derived
+                // view is abstract-stamped with base 0, so fold the resolved
+                // window base into the marker it WILL read back.
+                if let Some((arr, base)) = s2_bb_heap_window(ctx, this) {
                     ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
-                    ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                    let abs = (base as i32).saturating_add(new_bs);
+                    ctx.set_field(vb, BB_MARK, Value::Int(-(abs + 1)));
                 } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
                     // DIRECT view: alias the native storage at the sliced
                     // element position (residual-doc item 3).
@@ -5985,9 +6093,12 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                     .and_then(|b| bs.checked_add(b))
                     .unwrap_or(bs);
                 let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
-                if let Some(arr) = s2_bb_arr(ctx, this) {
+                // See `$slice` for why this resolves through
+                // `s2_bb_heap_window` and folds the window base in.
+                if let Some((arr, base)) = s2_bb_heap_window(ctx, this) {
                     ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
-                    ctx.set_field(vb, BB_MARK, Value::Int(-(new_bs + 1)));
+                    let abs = (base as i32).saturating_add(new_bs);
+                    ctx.set_field(vb, BB_MARK, Value::Int(-(abs + 1)));
                 } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
                     ctx.set_field_by_name(
                         vb,
@@ -6007,11 +6118,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
                 let pos = s2_bb_pos(ctx, this);
                 let lim = s2_bb_limit(ctx, this);
                 let cap = s2_bb_cap(ctx, this);
-                let bs_field = ctx.get_field(this, BB_MARK);
                 let vb = try_alloc_concurrent_synthetic(ctx, $cls, 6)?;
-                if let Some(arr) = s2_bb_arr(ctx, this) {
+                // Re-derive the marker rather than copying `BB_MARK` raw: on a
+                // real-JDK `ByteBufferAs<T>Buffer{B,L}` receiver that slot is
+                // `Buffer.mark` (-1), and the byte start lives in `address`.
+                // For an abstract-stamped synthetic view this reproduces the
+                // old copy exactly (base 0, byte start already the marker).
+                if let Some((arr, base)) = s2_bb_heap_window(ctx, this) {
                     ctx.set_field(vb, BB_SEGMENT_SLOT, Value::Object(Some(arr)));
-                    ctx.set_field(vb, BB_MARK, bs_field);
+                    let abs = (base as i32).saturating_add(s2_typed_view_byte_start(ctx, this));
+                    ctx.set_field(vb, BB_MARK, Value::Int(-(abs + 1)));
                 } else if let Some(addr) = s2_bb_direct_addr(ctx, this) {
                     // DIRECT duplicate: same native storage, same window.
                     ctx.set_field_by_name(vb, "address", Value::Long(addr));
@@ -7972,5 +8088,154 @@ mod tests {
         assert_eq!(ctx.get_field(buf, BB_LIMIT), Value::Int(32));
         assert_eq!(ctx.get_field(buf, BB_CAP), Value::Int(32));
         assert_eq!(ctx.get_field(buf, BB_MARK), Value::Int(-1));
+    }
+
+    // =======================================================================
+    // Real-JDK `ByteBufferAs<T>Buffer{B,L}` views (2026-08-10).
+    //
+    // `ByteBuffer.as<T>Buffer()` is not force-listed over real JDK bytecode, so
+    // on a real JDK it hands back one of these concrete view classes: storage on
+    // the backing `bb`, `hb` null on the view itself, and `Buffer.address`
+    // holding an UNSAFE offset (`ARRAY_BYTE_BASE_OFFSET + byteIndex`) rather
+    // than a process pointer. The bulk `get([JII)`/`put([JII)` accessors ARE
+    // force-listed (they are declared on the abstract `java/nio/LongBuffer`,
+    // which these views do not override), so such a receiver reaches
+    // `s2_bb_get_byte`, which used to read `address` as a pointer and hand 0x10
+    // to `copy_from_native_memory`. SIGSEGV at addr=0x10 on every
+    // `org.h2.mvstore.Chunk.readToC`.
+    // =======================================================================
+
+    /// Build a real-JDK-shaped `ByteBufferAs<T>Buffer{B,L}` over a heap
+    /// ByteBuffer: 10 slots (so `s2_bb_synthetic_layout` reads it as a real
+    /// layout, not the bare 6-field synthetic carrier) with the real
+    /// `Buffer`/`ByteBufferAsXBuffer` field names declared, `bb` pointing at the
+    /// backing buffer and `address` seeded the way the JDK's own
+    /// `as<T>Buffer()` seeds it: `bb.address + bb.position()`.
+    fn make_real_typed_view(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        view_class: &str,
+        byte_start: i64,
+    ) -> (ObjectRef, ObjectRef, ObjectRef) {
+        use cratonvm_native_api::FieldMetadata;
+
+        let bb_class = ctx
+            .ensure_class_initialized("java/nio/ByteBuffer")
+            .expect("class init");
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 64);
+        let bb = ctx.alloc_object(bb_class, 10);
+        bb_write_hb(ctx, bb, arr, 64);
+
+        let view_class_id = ctx.ensure_class_initialized(view_class).expect("class init");
+        let names = [
+            ("mark", "I"),
+            ("position", "I"),
+            ("limit", "I"),
+            ("capacity", "I"),
+            ("address", "J"),
+            ("segment", "Ljava/lang/foreign/MemorySegment;"),
+            ("bb", "Ljava/nio/ByteBuffer;"),
+            ("hb", "[J"),
+            ("offset", "I"),
+            ("isReadOnly", "Z"),
+        ];
+        ctx.set_declared_fields(
+            view_class_id,
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, (name, descriptor))| FieldMetadata {
+                    name: (*name).to_string(),
+                    descriptor: (*descriptor).to_string(),
+                    access_flags: 0,
+                    slot_index: i,
+                    declaring_class_id: view_class_id,
+                    is_static: false,
+                })
+                .collect(),
+        );
+        let view = ctx.alloc_object(view_class_id, 10);
+        ctx.set_field_by_name(view, "bb", Value::Object(Some(bb)));
+        ctx.set_field_by_name(view, "mark", Value::Int(-1));
+        ctx.set_field_by_name(view, "position", Value::Int(0));
+        ctx.set_field_by_name(view, "limit", Value::Int(4));
+        ctx.set_field_by_name(view, "capacity", Value::Int(4));
+        ctx.set_field_by_name(
+            view,
+            "address",
+            Value::Long(ARRAY_BYTE_BASE_OFFSET + byte_start),
+        );
+        (view, bb, arr)
+    }
+
+    /// The crash precondition, stated directly: a view over a HEAP buffer must
+    /// never be classified as direct. Before the fix `s2_bb_direct_addr`
+    /// answered `Some(16 + byte_start)` here and the byte accessors
+    /// dereferenced it as a process pointer.
+    #[test]
+    fn real_typed_view_over_a_heap_buffer_is_not_direct() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (view, _bb, _arr) =
+            make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsLongBufferB", 0);
+
+        assert!(
+            s2_bb_heap_window(&ctx, view).is_some(),
+            "the view's storage must resolve through its backing `bb` — this is the \
+             mechanism, the address guard below is only the backstop"
+        );
+        assert_eq!(
+            s2_bb_direct_addr(&ctx, view),
+            None,
+            "a ByteBufferAs<T>Buffer over a HEAP buffer carries an array-relative \
+             Unsafe offset in `address`, not a native pointer — reading it as one \
+             is the addr=0x10 SIGSEGV"
+        );
+        assert!(
+            !is_plausible_native_addr(ARRAY_BYTE_BASE_OFFSET),
+            "ARRAY_BYTE_BASE_OFFSET is below the first mappable page and must never \
+             be accepted as a process pointer"
+        );
+    }
+
+    /// And the positive half: the view reads the bytes it aliases. `address`
+    /// folds in the source's array-base offset AND its position at the moment
+    /// the view was taken, so element 0 lives at `address - ARRAY_BYTE_BASE_OFFSET`.
+    #[test]
+    fn real_typed_view_reads_through_its_backing_bytebuffer() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (view, _bb, arr) =
+            make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsLongBufferB", 4);
+        for i in 0..16usize {
+            ctx.set_array_element(arr, i, Value::Int(i as i32));
+        }
+
+        assert_eq!(
+            s2_bb_get_byte(&ctx, view, 0),
+            4,
+            "the view's byte 0 is `address - ARRAY_BYTE_BASE_OFFSET` into the backing array"
+        );
+        assert_eq!(s2_bb_get_byte(&ctx, view, 3), 7);
+
+        s2_bb_put_byte(&mut ctx, view, 1, 99);
+        assert_eq!(
+            ctx.get_array_element(arr, 5).as_int(),
+            Some(99),
+            "a write through the view must land in the SHARED backing array — a view is \
+             not a copy"
+        );
+    }
+
+    /// The JDK compiles one concrete view class per endianness and `order()` is
+    /// a constant return, so the class name is the exact answer. The old
+    /// `mark`-slot fallback answered BIG_ENDIAN for every such view, which would
+    /// byteswap every read through a `...BufferL`.
+    #[test]
+    fn real_typed_view_endianness_comes_from_its_class_name() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (be, _, _) = make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsLongBufferB", 0);
+        assert_eq!(s2_bb_order(&ctx, be), 0, "…BufferB is BIG_ENDIAN");
+
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (le, _, _) = make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsIntBufferL", 0);
+        assert_eq!(s2_bb_order(&ctx, le), 1, "…BufferL is LITTLE_ENDIAN");
     }
 }

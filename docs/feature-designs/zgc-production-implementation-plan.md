@@ -362,7 +362,7 @@ anything that adds a `VmHeap` method. Serialize them or hold the file.
 * **G1 maturation** — owned by [`concurrent-gc-maturation.md`](concurrent-gc-maturation.md),
   which picks G1 as its target and explicitly defers production ZGC to its §8.
 * **The regression record** —
-  [`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`](../internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md)
+  `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`
   is a run record. It is history. Phase 5 adds new records beside it rather than
   editing it.
 * **`gc/src/zgc.rs`'s address-keyed state has never been reviewed.** The

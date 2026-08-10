@@ -570,21 +570,49 @@ impl ThreadRegistry {
     pub fn collect_reserved_tlab_tails(&self) -> Vec<(usize, usize)> {
         let threads = self.threads.read();
         let mut out = Vec::new();
+        // Census counters for the `CRATONVM_G1_DBG_REACH` line below. An empty
+        // result has three very different causes and the G1 walk-break reports
+        // ("ZERO published skip spans this pause") cannot tell them apart:
+        // nobody is registered, everybody is registered but retired, or this
+        // function was never reached at all. Counting the population separates
+        // the first two, and the absence of the line entirely settles the third.
+        let (mut total, mut dead, mut unregistered, mut retired) = (0usize, 0, 0, 0);
         for entry in threads.values() {
+            total += 1;
             if !entry.alive.load(Ordering::Acquire) {
+                dead += 1;
                 continue;
             }
             let addr = entry.tlab_addr.load(Ordering::Acquire);
             if addr == 0 {
+                unregistered += 1;
                 continue;
             }
             // SAFETY: see method contract — the owning thread is parked /
             // blocked / OS-suspended, so the `Tlab` at `addr` is live and not
             // being mutated.
             let tlab = unsafe { &*(addr as *const cratonvm_gc::Tlab) };
-            if let Some(tail) = tlab.reserved_tail() {
-                out.push(tail);
+            match tlab.reserved_tail() {
+                Some(tail) => out.push(tail),
+                None => retired += 1,
             }
+        }
+        if cratonvm_types::flags().gc.g1_dbg_reach {
+            // Sequence number, not a pause id: the walk-break reports carry no
+            // pause identity either, so the only thing that can be compared is
+            // "how many times did the publish path run" against "how many
+            // breaks reported ZERO published skip spans". The first run
+            // produced exactly ONE census line across 453 s and four
+            // zero-span breaks, which is the fact this counter is here to
+            // confirm or kill.
+            static CENSUS_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq = CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "[g1][TLAB-CENSUS] #{seq} entries={total} dead={dead} \
+                 alive_no_tlab_addr={unregistered} alive_retired={retired} published={}",
+                out.len()
+            );
         }
         out
     }

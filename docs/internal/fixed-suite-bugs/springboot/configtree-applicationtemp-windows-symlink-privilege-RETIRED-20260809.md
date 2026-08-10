@@ -194,6 +194,83 @@ running the suite from an elevated token makes all three classes pass on Windows
 too. That remains host configuration, not a VM change. The difference is that
 the suite no longer *reports* it as a CratonVM failure while it is absent.
 
+## Reconfirmed 2026-08-10 — still reproduces on `dev`, collector-agnostic, and this doc's §4/§5 fixes are NOT present on `dev`
+
+Reconciling the 139-class union of non-passed classes from the three
+2026-08-08f full-suite reruns (`craton-nonpassed-{default,g1,zgc}-20260808f`)
+on `dev@6365de194`, both classes are still FAIL under **all three** GC
+backends, with the exact pre-retirement signature this doc's §2 quotes as
+"every figure in it checks out":
+
+| Class | GC | Shard | Result | Log |
+|---|---|---|---|---|
+| `ConfigTreePropertySourceTests` | default | s1 | FAIL 3.085s, tests=23 failed=3 | `craton-nonpassed-default-20260808f-s1/all-jit/logs/core_spring-boot.org.springframework.boot.env.ConfigTreePropertySourceTests.{out,err}.log` |
+| `ConfigTreePropertySourceTests` | G1 | s1 | FAIL 2.882s, tests=23 failed=3 | `craton-nonpassed-g1-20260808f-s1/all-jit/logs/...ConfigTreePropertySourceTests.{out,err}.log` |
+| `ConfigTreePropertySourceTests` | ZGC | s1 | FAIL 3.718s, tests=23 failed=3 | `craton-nonpassed-zgc-20260808f-s1/all-jit/logs/...ConfigTreePropertySourceTests.{out,err}.log` |
+| `ApplicationTempTests` | default | s1 | FAIL 1.251s, tests=5 failed=0 aborted=1 skipped=1 | `craton-nonpassed-default-20260808f-s1/all-jit/logs/core_spring-boot.org.springframework.boot.system.ApplicationTempTests.{out,err}.log` |
+| `ApplicationTempTests` | G1 | s1 | FAIL 1.230s, tests=5 failed=0 aborted=1 skipped=1 | `craton-nonpassed-g1-20260808f-s1/all-jit/logs/...ApplicationTempTests.{out,err}.log` |
+| `ApplicationTempTests` | ZGC | s1 | FAIL 1.669s, tests=5 failed=0 aborted=1 skipped=1 | `craton-nonpassed-zgc-20260808f-s1/all-jit/logs/...ApplicationTempTests.{out,err}.log` |
+
+(all under `apps/spring-boot-suite-runner/.suite/results/`). `ConfigTreePropertySourceTests`'
+3 failing tests are the same symlink-tree cases
+(`getPropertyNamesFromNestedWithSymlinkInPathReturnsPropertyNames`,
+`getPropertyNamesFromFlatWithSymlinksIgnoresHiddenFiles`,
+`getPropertyNamesFromNestedWithSymlinksIgnoresHiddenFiles`), all bare `=>
+java.nio.file.FileSystemException` with no message. Same host-gap
+mechanism across all three collectors — not GC-specific, as expected for a
+host-privilege limitation.
+
+**However, checking `dev@6365de194`'s actual code against what this doc
+claims was fixed turns up a discrepancy worth flagging explicitly, since
+the doc's "RETIRED" framing could otherwise be read as "resolved":**
+
+- **§4's native fix is not present on `dev`.** §4 diagnoses
+  `native-builtins/src/phases_late/nio_file.rs`'s `p57_filesystem_exception`
+  writing the reason string to a nonexistent `"reason"` field via
+  `set_field_by_name` (a silent no-op, since the real
+  `java.nio.file.FileSystemException` has no `reason` field — `getReason()`
+  reads `Throwable.detailMessage`), and says the fix (write to
+  `detailMessage` instead) "land[s] on `fix/filewatcher-symlink-surface-
+  20260809`, not on this branch." On `dev@6365de194` today,
+  `native-builtins/src/phases_late/nio_file.rs:8942-8963`
+  (`p57_filesystem_exception`) still calls
+  `ctx.set_field_by_name(exc, "reason", Value::Object(Some(reason_str)))` —
+  the exact pre-fix code this doc's §4 describes. `git log --all -S'p57_filesystem_exception'`
+  and `-S'set_field_by_name(exc, "reason"'` over the whole repo find no commit
+  that ever changed this function's field-write target; the local
+  `fix/filewatcher-symlink-surface-20260809` branch tip
+  (`681b5c1f1`) is just a merge of `origin/dev` into itself and carries no
+  Rust changes at all. So the reason-field plumbing bug §4 identifies is
+  still live on `dev`, unrelated to whether these two test classes pass —
+  it does not change the FAIL/PASS verdict here (the JUnit-level
+  aborted/failed counts are what the runner scores), but it does mean any
+  future reader who lands here expecting the message-plumbing fix to exist
+  should not assume it does.
+- **§5's runner-side `ENV-GATED` reclassification is also not present on
+  `dev`.** `apps/spring-boot-suite-runner/run-spring-boot-suite.ps1` on
+  `dev@6365de194` has `Resolve-BothFailStatus` (line 480) and
+  `Merge-HotspotBaselineLatest` (line 416) — those two land, matching this
+  doc's §5 — but has no `Resolve-EnvGatedStatus` or
+  `Test-HostSymlinkSupport` function anywhere in the file, and no run in this
+  rerun reports `ENV-GATED`; both classes still arrive as raw `FAIL`. The
+  `c01dbfcd1` commit this doc's §5 describes ("report abort/skip reasons,
+  stop baseline clobbering, retire symlink-privilege doc") **is** an
+  ancestor of `dev@6365de194`, and `SBRUNNER_ABORTED_DETAIL`/
+  `SBRUNNER_SKIPPED_DETAIL` printing does exist in
+  `apps/spring-boot/sb-runner/SbRunnerMethod.java:33-34` — but today's
+  `ApplicationTempTests` out-log (`tests=5 failed=0 aborted=1 skipped=1`)
+  has **no** `SBRUNNER_ABORTED_DETAIL`/`SBRUNNER_SKIPPED_DETAIL` line at all,
+  so whatever wires those reason strings into this particular "all-jit"
+  runner invocation is not firing here either.
+
+**Net effect: this doc's headline conclusion — Windows host lacks symlink
+privilege, not a CratonVM bug — is still correct and still reproduces
+identically today.** But treat the "RETIRED" status as covering the
+*investigation*, not as evidence the companion code/harness changes shipped
+to `dev`: they have not, as of `6365de194`. Nothing here contradicts §6
+("still not a code problem"); this is a documentation-vs-code gap, not a
+regression in VM behavior.
+
 ## Related
 
 - `files-createsymboliclink-unsupported-FIXED.md` — the 2026-08-01 fix that made

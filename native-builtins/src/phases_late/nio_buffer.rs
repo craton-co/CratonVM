@@ -15,9 +15,10 @@
 //! ns/op, JIT on): `get(int)` 1.54 on HotSpot vs 242.24 here; `getShort(int)`
 //! 1.44 vs 1161.77; `getInt(int)` 1.60 vs 1334.90.
 //!
-//! `ZipContentTests` spends ~18% of its samples in these accessors because a
-//! zip reader pulls every header field through one, which is most of why that
-//! class runs 14x HotSpot
+//! `ZipContentTests` spends ~18% of its leaf samples in these accessors,
+//! because a zip reader pulls every header field through one. That bounds what
+//! speeding them up can buy the class at roughly 10%, which is worth knowing
+//! before reading anything into a class-level A/B
 //! (`known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`).
 //!
 //! # The contract these must keep
@@ -65,11 +66,11 @@
 //!
 //! # DEFAULT OFF — `CRATONVM_BYTEBUFFER_INTRINSIC=1` enables it
 //!
-//! This makes the accessors faster and the JIT configuration SLOWER, because
-//! registering a native removes them from the JIT's reach and its inlining is
-//! worth more than the shorter path. Measured both ways on
-//! [`register_heap_byte_buffer_accessors`] — read that before enabling this,
-//! and before lifting the logic into the JIT, which is where it belongs.
+//! It makes the accessors measurably faster and is off because its effect on
+//! the JIT configuration is UNPROVEN, not because it is known to hurt. The
+//! numbers, the ceiling arithmetic that bounds them, and a mechanism claim that
+//! turned out to be wrong are all on
+//! [`register_heap_byte_buffer_accessors`]. Read that before enabling this.
 
 use super::*;
 
@@ -148,7 +149,7 @@ fn unreadable_receiver(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCa
     MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::IllegalStateException {
         message: format!(
             "HeapByteBuffer intrinsic: receiver of class {class} has no readable \
-             `hb`/`limit` field pair; set CRATONVM_NO_BYTEBUFFER_INTRINSIC=1 to \
+             `hb`/`limit` field pair; unset CRATONVM_BYTEBUFFER_INTRINSIC to \
              run the Java accessors instead"
         ),
     }))
@@ -351,22 +352,31 @@ fn decode_double(bytes: [u8; 8], big_endian: bool) -> Value {
 /// `getShort()` 1.42x, `getInt()` 1.5x, `getShort(int)` 2.09x, `getInt(int)`
 /// 2.14x (`probes/ByteBufferScalarSplitProbe.java`).
 ///
-/// The reason is that REGISTERING A NATIVE TAKES THE METHOD AWAY FROM THE JIT.
-/// With `CRATONVM_DBG_JIT_COMPILED=1` and no native registered, the JIT
-/// compiles the whole chain — `HeapByteBuffer.getShort(I)S`, `getInt(I)I`,
-/// `checkIndex(I)I`, `checkIndex(II)I`, `ix(I)I`, `byteOffset(J)J` — and can
-/// inline it into callers. A registered native replaces all of that with a
-/// funnel crossing the JIT cannot inline, and for code that calls these
-/// accessors from many small sites (a zip header reader calls `getShort()`
-/// eleven times per record) the lost inlining costs more than the shorter
-/// path saves. In the interpreter there is no inlining to lose, so the same
-/// code wins by the margin the microbenchmark predicts.
+/// THE MECHANISM IS NOT ESTABLISHED, and an earlier version of this comment
+/// asserted one that is wrong. It said a registered native loses because the
+/// JIT can no longer INLINE the accessor. It never inlined it: the single-pass
+/// emitter "bails on any callee invoke that is not a resolver-proven elidable
+/// super-`<init>`" (`jit/src/lib.rs:5239`), and `HeapByteBuffer.getShort()` is
+/// four invokes. The JIT does COMPILE those methods, which is a different
+/// thing.
 ///
-/// So the accessors ARE worth intrinsifying and this is the wrong layer to do
-/// it at: the fix belongs in the JIT, as a compiled intrinsic that keeps the
-/// call inlinable. What lands here is the measurement, the HotSpot-diffed
-/// contract (`probes/ByteBufferAccessorMatrixProbe.java`, 119 lines identical
-/// in both arms), and a working implementation to lift.
+/// The JIT-arm numbers also carry less weight than they look. The SAME
+/// configuration (intrinsic OFF, JIT) measured 315.5s / 353.8s / 413.7s /
+/// 450.7s across one session — ±20%, wider than the 6-12% deltas. And the
+/// ceiling was always small: the accessors were ~18% of leaf samples, so a
+/// 2.4x on them removes at most `18% x (1 - 1/2.4)` ≈ 10% of total time. An
+/// experiment with a 10% ceiling and ±20% noise cannot resolve its own sign.
+///
+/// The `--nojit` arm lands exactly where that arithmetic predicts — 9.4%
+/// against a ~10% ceiling — which is the best evidence that the code does what
+/// it claims.
+///
+/// So this stays OFF because its benefit under the JIT is unproven, NOT
+/// because it is known to hurt. What lands here is the measurement, the
+/// HotSpot-diffed contract (`probes/ByteBufferAccessorMatrixProbe.java`, 119
+/// lines identical in both arms), and a working implementation. Settling the
+/// JIT arm needs a properly powered measurement (repeated pairs, or
+/// per-process CPU time instead of wall clock), not another single pair.
 ///
 /// The flag is read once, at registration: a registered native has no way to
 /// decline an individual call (module header), so the switch has to be here.

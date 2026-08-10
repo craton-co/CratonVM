@@ -107,6 +107,12 @@ fn maybe_dump_shutdown_reports() {
     // reports `hit=0` here rather than hiding inside a timing wash.
     cratonvm_vm::runtime::interpreter::site_cache::site_stats::dump();
 
+    // The JIT root-scan tally, self-gated the same way. It answers what the
+    // method-stats line below cannot: those counters price the COMPILER, and a
+    // run where compilation costs 3 ms while the JIT still costs +83% CPU has
+    // its cost somewhere the compiler statistics do not reach.
+    cratonvm_vm::jit::conservative_roots::scan_prof::dump();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The bytecode loop rewriter's admission tally, on the same switch and
@@ -1498,9 +1504,13 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         // option (rather than acting here) means a later `-XX:+Use...GC`
         // overrides an earlier one via clap last-wins, matching HotSpot.
         //
-        // `-XX:-UseG1GC` explicitly turns G1 off -> revert to the default
-        // Generational. Other `-XX:-Use<Name>GC` ("do not use collector X")
-        // select nothing and fall through to the silent-ignore arm below.
+        // `-XX:-UseG1GC` / `-XX:-UseZGC` explicitly turn that collector off ->
+        // select Generational. Note this is "off means the copying collector",
+        // NOT "off means whatever the default is" — as of 2026-08-10 the
+        // default IS ZGC, so resolving `-XX:-UseZGC` to the default would make
+        // the flag select the very collector it disables. Other
+        // `-XX:-Use<Name>GC` ("do not use collector X") select nothing and fall
+        // through to the silent-ignore arm below.
         //
         // Guarded so `-XX:+UseStringDeduplication`, `-XX:+UseCompressedOops`,
         // etc. (no `GC` suffix) do NOT match and keep their existing handling.
@@ -1512,7 +1522,7 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             out.push("--XX:UseGc".into());
             out.push(name.to_string());
             i += 1;
-        } else if a == "-XX:-UseG1GC" {
+        } else if a == "-XX:-UseG1GC" || a == "-XX:-UseZGC" {
             out.push("--XX:UseGc".into());
             out.push("Generational".into());
             i += 1;
@@ -3345,32 +3355,41 @@ fn run() -> Result<()> {
 
     // Garbage-collector selection (`-XX:+UseG1GC` / `-XX:-UseG1GC` / any other
     // `-XX:+Use*GC`, normalized to `--XX:UseGc <name>`). Absent → keep the
-    // default (`Generational`, the safety net during collector maturation). A
-    // recognized selector (`g1` | `z`/`zgc` | `generational`) sets `gc_algorithm`; an
-    // unsupported collector (Serial/Parallel/Shenandoah/Epsilon) warns and
-    // falls back to Generational so a `java` drop-in keeps booting. G1 is
-    // wired into the safepoint driver; ZGC-real is a non-moving STW backend. See
-    // docs/feature-designs/concurrent-gc-maturation.md §3.1.
+    // default, which is **ZGC** as of 2026-08-10 (see `VmConfig::default` for
+    // the measurement). A recognized selector (`g1` | `z`/`zgc` |
+    // `generational`) sets `gc_algorithm`; an unsupported collector
+    // (Serial/Parallel/Shenandoah/Epsilon) warns and falls back to Generational
+    // so a `java` drop-in keeps booting.
+    //
+    // The unsupported-collector fallback deliberately stays **Generational**
+    // rather than following the default: someone who asked for
+    // `-XX:+UseSerialGC` asked for a collector this VM does not have, and the
+    // conservative copying collector is the safer thing to hand them than
+    // whichever backend happens to be default that month.
     if let Some(sel) = &args.gc_selector {
         match cratonvm_vm::config::parse_gc_algorithm(sel) {
             Some(algo) => config.gc_algorithm = algo,
             None => {
                 eprintln!(
                     "Warning: unsupported garbage collector -XX:+Use{sel}GC; CratonVM \
-                     implements G1 (-XX:+UseG1GC), ZGC-real (-XX:+UseZGC), and the \
-                     default Generational collector. Falling back to Generational."
+                     implements ZGC-real (the default, -XX:+UseZGC), G1 \
+                     (-XX:+UseG1GC) and Generational (-XX:+UseGenerationalGC). \
+                     Falling back to Generational."
                 );
                 config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
             }
         }
-    } else if args.nojit {
-        // Keep interpreter-only runs on the same copying Generational path as
-        // the normal launcher default. The non-moving G1 reference path can
-        // retain stale reference slots across repeated application-context
-        // refreshes; explicit -XX:+UseG1GC remains authoritative for callers
-        // that intentionally select and validate G1.
-        config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
     }
+    // `--nojit` used to force Generational here. That override is GONE as of
+    // 2026-08-10, and its removal is part of the default flip rather than an
+    // aside: with ZGC as the default, leaving it in place would have made
+    // `--nojit` silently change the COLLECTOR as well as the compiler. Every
+    // A/B that uses `--nojit` to isolate a JIT effect would then have been
+    // varying two things at once — and it would have put interpreter-only runs
+    // on the arm carrying the 63-class HANG column this flip exists to escape.
+    // Its stated reason was a G1 reference-slot concern, which never applied to
+    // the generational-vs-ZGC choice; `-XX:+UseGenerationalGC` expresses it
+    // explicitly for callers who still want it.
 
     // G1 tuning knobs (§7 item 4). Parsed from the normalized `--XX:*` value
     // args and stored on the config; applied to `G1CollectorConfig` only when

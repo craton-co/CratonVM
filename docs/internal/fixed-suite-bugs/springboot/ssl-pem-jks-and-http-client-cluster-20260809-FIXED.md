@@ -196,7 +196,7 @@ no SSL change can fix it.
 Note that `ZipContentTests`, long filed alongside it as the other GC-pressure
 case, turned out **not** to be one — quadrupling its heap changes its runtime by
 2%. See
-`known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+`fixed-suite-bugs/springboot/zipcontenttests-bytebuffer-accessor-call-cost-RETIRED-20260810.md`.
 The heap-size A/B is what separates the two, and it is one run.
 
 ## Blast radius, measured
