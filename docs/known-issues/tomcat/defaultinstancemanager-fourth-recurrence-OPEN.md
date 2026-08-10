@@ -116,10 +116,10 @@ The live loader is the control that proves the instrument can fire. So:
 
 1. The **marker is correct** — it never marks the evicted loader. Every root
    source eliminated across four investigations was eliminated correctly.
-2. The **sweep walk never reaches that span at all.** It is inside a stretch the
-   walk skips — a free block, a TLAB reservation, or an abandoned stretch. No
-   desync/abandon markers appear in the run, so the skip list is the leading
-   candidate.
+2. The **sweep walk never stops at that base.** I expected a skip list here — a
+   free block, a TLAB reservation, or an abandoned stretch — and the next
+   section measures that it is **none of them**. The walk covers the address
+   and strides over it.
 3. A span the walk never visits is **never zeroed**.
 4. `is_live_young_survivor` is literally `word0 != 0`, resting on "the young
    sweep writes an ALL-ZERO header over every span it reclaims". An unvisited
@@ -137,19 +137,62 @@ these predicates were rewritten onto the mark word "WEAKER, not equivalent".
 The connection is consistent but **not yet proven**; the open question is now
 narrow and mechanical.
 
+## Which skip arm? NONE — and the sweep reclaims nothing at all
+
+`CRATONVM_DBG_MARK_WHY_CLASS` now also classifies the watched address against
+every stretch the walk can stride over, and reports where the walk ended.
+Measured on the failing run:
+
+```
+[MARKWHY] skip-arm probe: watch=0x28b16267140 off=0x4267140 used=0x603e118
+                          in_free_block=None in_jit_tlab_skip=None
+[MARKWHY] walk ended: cursor=0x603e118 used=0x603e118 watch_off=0x4267140
+                      objects_live=119985 objects_swept=0
+```
+
+All three candidates are eliminated:
+
+* **not a free block** — `in_free_block=None`;
+* **not a reserved TLAB tail** — `in_jit_tlab_skip=None` (consistent with
+  `--nojit` failing too);
+* **not an abandoned stretch** — the walk ran to completion, `cursor == used`,
+  and the watched offset is well inside the walked range.
+
+So the walk *covers* the address and still never stops at it. Its object grid
+strides over that base: some earlier object's computed size swallows the span.
+
+And the headline number: **`objects_swept=0`**. That counter is incremented in
+the publication loop over `dead_regions` — the real reclamation path, not a
+diagnostic one — so this sweep reclaimed NOTHING. 119,985 objects walked, zero
+dead, in a run that started Tomcat and compiled three JSPs. The same is true in
+the control run on a live JSP, so it is the whole sweep, not this object.
+
+That subsumes the earlier framing. The mirror is not being retained by a rooting
+decision, a side-table edge, or a skip list. **No young object is reclaimed at
+all**, so no span is ever zeroed, so `is_live_young_survivor` (`word0 != 0`)
+answers "live" for every young address, and class unloading cannot work by
+construction.
+
 ## The open question
 
-Why does the sweep walk skip that span? `existing_free` (free blocks from prior
-sweeps), `jit_skips` (reserved TLAB tails — unlikely, `--nojit` fails too), or a
-walk that abandoned early. The probe to write next reports which skip arm covers
-the watched address, at the top of the walk loop.
+Why is `dead_regions` empty? Two shapes, distinguishable:
 
-The second question, independent of the first and arguably the more important
-one: **`is_live_young_survivor` infers liveness from a side effect.** "The span
-was not zeroed" is not the same proposition as "the object is live", and the
-sweep has at least three legitimate ways to leave a dead span unzeroed. A
-verdict that reads a byte pattern where a mark bit exists will keep producing
-this class of bug regardless of which skip arm is responsible here.
+1. the walk classifies every object LIVE (its grid is desynced, so it never
+   lands on a dead object's base — which is exactly what the watched address
+   shows), or
+2. the walk collects dead spans and then UNWINDS them: `dead_regions.truncate`
+   back to `dead_watermark` on an anomaly, which is silent without a debug gate.
+
+Both are consistent with the bisected commit, whose layout changes moved
+`ARRAY_LENGTH_OFFSET`/`NUM_SLOTS_OFFSET` 12 -> 8 and whose own message records
+the walk's plausibility screen getting weaker. The probe to write next reports
+`dead_regions.len()` at the watermark and after each truncate, plus the walk's
+per-object stride around the watched offset.
+
+Note the scope this changes: if the young non-moving sweep reclaims nothing,
+`TestDefaultInstanceManager` is the symptom that happened to have an assertion
+on it. This is a young-generation reclamation failure on the `System.gc()` path
+and should be expected to cost throughput and footprint everywhere else.
 
 ## Do not close this without a regression pin
 
