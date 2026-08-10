@@ -146,6 +146,7 @@ write-up of this page. Same binary, same class, G1 throughout:
 | G1 + JIT, `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` | FAIL 16/61 | 307 | 12 |
 | G1 + JIT, `CRATONVM_NO_JIT_TLAB_ZERO_ELISION=1` | **SIGSEGV** | 97 | 8 |
 | G1 + JIT, `CRATONVM_JIT_DISABLE_INLINE_NEW=1` | still corrupt † | 0 † | 8 |
+| G1 + JIT, **`CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`** | **PASS 61/61**, 628.9 s | **0** | **0** |
 
 † this arm produced **zero** `g1::get_field` guard hits but is not clean: a
 *different* guard fires instead —
@@ -164,6 +165,64 @@ noting for whoever picks this up: that emitter's `layout_replace_guard` is emitt
 REGISTRATIONS don't bump it, only replacements do" — a site compiled while the
 class had no registered compact layout bakes the LEGACY size and emits no guard
 at all. That is a real hole; it is simply not the one causing this.
+
+### 2026-08-10: `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1` is the first JIT-on green
+
+The fourth allocation gate — the only one from this table left unbisected —
+makes the reproducer **pass 61/61 with the JIT on**, with every counter at zero.
+All three were checked together, because the `JIT_DISABLE_INLINE_NEW` arm above
+is the standing lesson that one counter alone can read as a fix:
+
+| counter | G1 + JIT baseline | + `NO_JIT_ALLOC_CLASS_CACHE=1` |
+|---|---:|---:|
+| `gc::guard` (the zeroed-header reads) | 563 | **0** |
+| `interpreter::invoke` stale-receiver | present | **0** |
+| `[g1] rset-source walk DESYNCED` | many | **0** |
+| tests failed | 18/61 | **0/61** |
+
+One `[g1][WALKBRK]` remains (a single break in region 117, `type=Eden
+reuse_epoch=0`, `cursor=0x100000`, immediately after a correctly-installed
+retire filler, with zero published skip spans). So a walk break by itself is
+survivable; what this gate removes is the corruption downstream of it.
+
+The gate is **not** a JIT-off in disguise: `alloc_class_cache_enabled()` is read
+only inside `jit_post_alloc_init` (`vm/src/jit/helpers.rs:4393`), never by the
+compiler. Codegen, inline TLAB allocation and tier-up are byte-identical across
+the two arms; the only difference is whether the post-allocation field-init
+recipe comes from the cache or is recomputed under `class_manager.read()`.
+
+**What the module actually got wrong.** `JitAllocClassCache::get` returns
+`&ClassAllocInfo` borrowed from `&self`, and its SAFETY comment justifies that
+with "entries ... are only freed in `Drop` (which takes `&mut self`)". The
+module header says the same. But `invalidate` — called from the loader-unload
+transaction (`vm/src/memory/gc.rs:176`) — freed the entry immediately, so the
+sentence both safety arguments rest on was false and the borrow was a
+use-after-free.
+
+The stop-the-world framing is what made it look safe, and it does not hold: the
+unload transaction proves things about *instances and activations of the
+unloaded class*, not about which instruction another thread is parked on — and
+the collector reaches STW partly by **forcibly freezing in-JIT peers**
+(`stw_take_over_and_wait`), which stops a thread at an arbitrary instruction,
+including between `get()` and the `info.prim_inits` walk it feeds. That thread
+resumes into a freed `Box<[(u32, PrimKind)]>`: garbage indices into `set_field`
+(which the bounds check drops — the 11 `g1::set_field: out-of-bounds` hits in
+the baseline log) and a garbage `has_finalizer` that can register an arbitrary
+object as finalizable.
+
+Fixed by unpublishing without freeing (`invalidate` retires the entry to a list
+`Drop` reclaims), which is all invalidation is for and restores the documented
+invariant verbatim.
+
+**Not yet claimed: that this is THE defect.** A use-after-free is a defect on
+its own terms and this one is now closed, but the causal step — cache ON, fix
+applied, corruption gone — is a separate measurement, recorded below when it
+lands. Two things would have to be true and neither is established yet: that the
+freed recipe is what zeroes an object *header* (the UAF's own writes are field
+writes, and the bounds check drops the out-of-range ones), and that 552 of the
+563 guard hits, which are `get_field` reads rather than writes, follow from it.
+Until then the honest reading of the green above is "the fault needs this
+module", not "the fault is this module".
 
 ### The shape the trails converge on
 
@@ -370,6 +429,43 @@ zero while the `invokevirtual` stale-receiver guard fires throughout.
 Other levers: `CRATONVM_DBG_G1DIAG=1` (region census),
 `CRATONVM_G1_COVERAGE_PIN=1` (if the failure survives G1 moving nothing, it is
 not a relocation the root set failed to cover).
+
+### Three instruments added 2026-08-10, all under `CRATONVM_G1_DBG_REACH=1`
+
+Added because the question above — *what advances `region.cursor` over memory no
+object header was ever written into?* — had been answered as far as reading can
+answer it. The production writers of `cursor` are exactly three (`reset` → 0,
+`bump_alloc` → `+size` with a `write_bytes(ptr, 0, size)` of what it hands out,
+and the humongous path → `size`/0; the parallel evacuator's `retire_tlab` is
+`CRATONVM_G1_PARALLEL_EVAC` and off). So a committed zeroed span is *always* a
+`bump_alloc` chunk some caller never wrote a header into, and the remaining
+question is which caller — which only a run can say.
+
+1. **`[g1][WALKBRK-BUMPS]` / `OWNER=` — per-region bump provenance.**
+   `G1Region::bump_alloc` now takes a `&'static str` site tag and records
+   `(reuse_epoch, offset, size, thread, site)` into a fixed 12-entry ring per
+   region. A break prints the advance whose extent *contains* the break offset.
+   The tags separate the two producers that leave identical bytes behind but
+   have opposite obligations afterwards: `obj:*` must write a header
+   immediately, `tlab:*` is *expected* to be headerless above its owner's
+   private cursor and must instead be retired (filler) or published
+   (`reserved_tail`). Entries carry the epoch so a trail surviving a `reset` is
+   not misread; `OWNER=unknown` distinguishes "ring too short" from "nothing
+   recorded" rather than reading as evidence.
+2. **`[g1][FREE-CURSOR]` — the `Free ⇒ cursor == 0` invariant, checked where it
+   is relied on.** `find_free_region` filters on `region_type == Free` and
+   nothing else, and none of its three callers resets the cursor of the region
+   it just claimed, so the whole design rests on `reset` being the only way to
+   become `Free`. A violation would produce the shape under investigation in one
+   step. It reports and continues — the retype is not the defect, and aborting
+   would replace a walk break with a crash.
+3. **`[g1][TLAB-CENSUS]` — the producer side of "zero published skip spans".**
+   `ThreadRegistry::collect_reserved_tlab_tails` now prints
+   `entries/dead/alive_no_tlab_addr/alive_retired/published` per pause. An empty
+   publication has three causes the consumer-side message cannot tell apart —
+   nobody registered, everybody registered but retired, or this function never
+   reached — and the counts separate the first two while the line's *absence*
+   settles the third.
 
 ## 5. `CloudFoundryActuatorAutoConfigurationTests` — the page has this backwards
 
