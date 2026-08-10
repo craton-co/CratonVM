@@ -5557,36 +5557,85 @@ impl Compiler {
                             self.emit_test_r64_r64(RCX);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x84)); // JZ
 
-                            // --- Guard 3: both are arrays (ObjectHeader.kind
-                            // at offset 4 == ObjectKind::Array == 1) ---
-                            // MOVZX EDX, BYTE [RAX + 4]  (src kind)
-                            self.buf.emit(&[0x0F, 0xB6, 0x50, 0x04]);
-                            // CMP EDX, 1
-                            self.buf.emit(&[0x83, 0xFA, 0x01]);
-                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
-                                                                                // MOVZX EDX, BYTE [RCX + 4]  (dst kind)
-                            self.buf.emit(&[0x0F, 0xB6, 0x51, 0x04]);
-                            self.buf.emit(&[0x83, 0xFA, 0x01]);
+                            // --- Guards 3 and 4: both are arrays, of the SAME
+                            // PRIMITIVE element kind ---
+                            //
+                            // `kind` and `element_type` are BOTH in the one
+                            // byte at `KIND_TAGS_BYTE_OFFSET` — `kind` in bits
+                            // 0..2 (`KIND_TAG_BYTE_MASK`), `element_type` in
+                            // bits 2..6. They used to be separate bytes at
+                            // offsets 4 and 5, and this code still read those
+                            // two literals after the header shrank 24 -> 16 on
+                            // 2026-08-07 and the quartet moved into the mark
+                            // word.
+                            //
+                            // Offset 4 is now `shape` — an ARRAY'S LENGTH. The
+                            // same function reads the length from that very
+                            // offset (via `ARRAY_LENGTH_OFFSET`) forty lines
+                            // below, so the "is this an array" guard was
+                            // testing the length's low byte and the "element
+                            // type" was the next length byte. That does not
+                            // fail safe: for a length whose low byte is 1 and
+                            // whose second byte is >= 4 — 1025 = 0x0401 — both
+                            // tests PASS and the element width comes out as
+                            // `1 << ((4 - 4) & 3)` = one byte. `arraycopy` on a
+                            // `long[1025]` moved 1025 bytes instead of 8200 and
+                            // returned normally: no exception, no crash, a
+                            // silently truncated copy.
+                            // `probes/ArraycopyHeaderOffsetProbe.java` is the
+                            // repro — mismatch at index 128 for `long[1025]`
+                            // and 256 for `int[1025]`, while 1024 / 300 / 257
+                            // pass, which is why this hid.
+                            //
+                            // Read the constants, as every other header access
+                            // in this file already does.
+                            const KIND_TAGS: u8 = cratonvm_types::KIND_TAGS_BYTE_OFFSET as u8;
+
+                            // MOVZX EDX, BYTE [RAX + KIND_TAGS]  (src tags)
+                            self.buf.emit(&[0x0F, 0xB6, 0x50, KIND_TAGS]);
+                            // MOV R10D, EDX — keep the whole byte; EDX is about
+                            // to be masked down to the kind bits.
+                            self.buf.emit(&[0x41, 0x89, 0xD2]);
+                            // AND EDX, KIND_TAG_BYTE_MASK
+                            self.buf
+                                .emit(&[0x83, 0xE2, cratonvm_types::KIND_TAG_BYTE_MASK]);
+                            // CMP EDX, ObjectKind::Array
+                            self.buf
+                                .emit(&[0x83, 0xFA, cratonvm_types::ObjectKind::Array as u8]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
 
-                            // --- Guard 4: same element kind AND primitive ---
-                            // ObjectHeader.element_type is the byte at
-                            // offset 5. ArrayElementType: Reference=0,
-                            // Boolean=4, Char=5, Float=6, Double=7, Byte=8,
-                            // Short=9, Int=10, Long=11.
-                            // MOVZX EDX, BYTE [RAX + 5]  (src element_type)
-                            self.buf.emit(&[0x0F, 0xB6, 0x50, 0x05]);
-                            // MOVZX R10D, BYTE [RCX + 5] (dst element_type)
-                            self.buf.emit(&[0x44, 0x0F, 0xB6, 0x51, 0x05]);
-                            // CMP EDX, R10D  → element kinds must be equal
-                            self.buf.emit(&[0x44, 0x3B, 0xD2]);
+                            // MOVZX EDX, BYTE [RCX + KIND_TAGS]  (dst tags)
+                            self.buf.emit(&[0x0F, 0xB6, 0x51, KIND_TAGS]);
+                            // MOV R11D, EDX
+                            self.buf.emit(&[0x41, 0x89, 0xD3]);
+                            self.buf
+                                .emit(&[0x83, 0xE2, cratonvm_types::KIND_TAG_BYTE_MASK]);
+                            self.buf
+                                .emit(&[0x83, 0xFA, cratonvm_types::ObjectKind::Array as u8]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
-                                                                                // CMP EDX, 4 → primitive kinds are 4..=11; a
+
+                            // element_type = (tags >> 2) & 0xF. ArrayElementType:
+                            // Reference=0, Boolean=4, Char=5, Float=6, Double=7,
+                            // Byte=8, Short=9, Int=10, Long=11 — four bits.
+                            // SHR R10D, 2 ; AND R10D, 0xF   (src)
+                            self.buf.emit(&[0x41, 0xC1, 0xEA, 0x02]);
+                            self.buf.emit(&[0x41, 0x83, 0xE2, 0x0F]);
+                            // SHR R11D, 2 ; AND R11D, 0xF   (dst)
+                            self.buf.emit(&[0x41, 0xC1, 0xEB, 0x02]);
+                            self.buf.emit(&[0x41, 0x83, 0xE3, 0x0F]);
+                            // CMP R10D, R11D → element kinds must be equal
+                            self.buf.emit(&[0x45, 0x39, 0xDA]);
+                            bail_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                                                                                // CMP R10D, 4 → primitive kinds are 4..=11; a
                                                                                 // value < 4 means Reference (0) — bail (the GC
                                                                                 // store barrier / ArrayStoreException make
                                                                                 // reference copies unsafe to inline).
-                            self.buf.emit(&[0x83, 0xFA, 0x04]);
+                            self.buf.emit(&[0x41, 0x83, 0xFA, 0x04]);
                             bail_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB (unsigned <)
+                                                                                // MOV EDX, R10D — the shift math below operates
+                                                                                // on EDX, as it did when EDX held the element
+                                                                                // type directly.
+                            self.buf.emit(&[0x44, 0x89, 0xD2]);
 
                             // shift = (element_type - 4) & 3, where
                             //   width == 1 << shift  for every primitive
