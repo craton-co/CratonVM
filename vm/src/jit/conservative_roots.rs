@@ -685,6 +685,12 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
 pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
     // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
     note_jit_boundary();
+    // Every transfer of control into compiled code passes through here, so this
+    // is the run's interpreter->JIT entry count. Divided into the JIT's measured
+    // CPU delta it gives the per-entry cost, which is the number that decides
+    // whether "compiling short methods an interpreted caller invokes" is what
+    // makes the JIT a net negative on call-dense classes.
+    scan_prof::bump(&scan_prof::JIT_ENTRIES);
     let depth = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         // Resolve the "same place in the Java stack as my caller" sentinel
@@ -1300,6 +1306,10 @@ pub mod scan_prof {
     pub static BAND_WORDS: AtomicU64 = AtomicU64::new(0);
     pub static BAND_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
     pub static PRECISE_FRAMES: AtomicU64 = AtomicU64::new(0);
+    /// Transfers of control into compiled code (`push_entry_full`). The run's
+    /// interpreter→JIT entry count; the JIT's CPU delta divided by this is the
+    /// per-entry cost.
+    pub static JIT_ENTRIES: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1347,7 +1357,8 @@ pub mod scan_prof {
         eprintln!(
             "[cratonvm] JIT scan prof: scans={scans} cache_hits={hits} ({hit_pct:.1}%) \
              band_scans={band} band_words={words} band_max_bytes={maxb} \
-             precise_frames={precise}",
+             precise_frames={precise} jit_entries={entries}",
+            entries = g(&JIT_ENTRIES),
             band = g(&BAND_SCANS),
             words = g(&BAND_WORDS),
             maxb = g(&BAND_MAX_BYTES),
