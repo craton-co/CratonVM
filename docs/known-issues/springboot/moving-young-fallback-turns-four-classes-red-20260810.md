@@ -238,6 +238,62 @@ has the stable rate (23–45 cycles per 20s run) but is single-threaded, so it
 never produces this reason at all. The missing artifact is that probe plus
 worker threads that park inside JIT frames.
 
+### Priced: `XT_HELPER_WINDOW` is also worth ZERO — the binding obligation is `cross-thread-jit-peer`
+
+`probes/MovingYoungFallbackPeerParkProbe.java` supplies what was missing: peers
+parked *under compiled frames* (each worker warms a recursive method until it is
+compiled, then re-enters it and blocks at the bottom of that chain) plus a main
+thread allocating hard enough to force collections while they sit there. It
+produces `xt-helper-window-conservative-scan` in every cycle, which no
+single-threaded probe can do, at a stable rate.
+
+Interleaved A/B of the existing kill switch, `CRATONVM_JIT=xt-helper-window-scan=0`:
+
+| arm | iters | cycles | with `xt-helper-window` | with `cross-thread-jit-peer` | rate /Miter |
+|---|---:|---:|---:|---:|---:|
+| on | 7.25M | 27 | 27 | 27 | 3.73 |
+| **off** | 7.61M | 28 | **0** | 28 | 3.68 |
+| on | 7.70M | 28 | 28 | 28 | 3.63 |
+| **off** | 9.07M | 33 | **0** | 33 | 3.64 |
+
+The lever **works** — the reason disappears entirely, 27/28 → 0 — so this is not
+the inert-lever ambiguity that made `CRATONVM_GC_NO_CALLEE_RESOLVE` unreadable.
+The measurement is sensitive and the answer is still zero: the fallback rate is
+flat across all four arms, because `cross-thread-jit-peer` is in **100% of
+cycles in both**.
+
+### The actual root: any peer thread with live JIT frames blocks compaction
+
+`CROSS_THREAD_JIT_PEER` is *"another thread holds live JIT frames whose coverage
+this thread's scan cannot verify and whose registers/stack are not rewritable."*
+That is not a decoding bug, and no per-reason repair reaches it. It explains
+every result on this page:
+
+- **single-threaded probes** have no peers, so they fall back only for
+  `innermost-rbp` — which is why repairing that looked like a 100% win there;
+- **every real workload here** is multithreaded Spring, so a peer holds JIT
+  frames essentially always, and moving-young is unreachable *regardless* of any
+  other obligation being repaired.
+
+So the honest framing is not "there is a bug making these four classes fall
+back". It is that **moving-young does not currently survive contact with a
+multithreaded workload**, and the four classes are just where that showed up as
+a timeout. Three separate repairs were priced against real cycles and all three
+came back at zero (`innermost-rbp` 0%, `xt-helper-window` 0%, and the
+`CRATONVM_GC_NO_CALLEE_RESOLVE` path inert).
+
+The only directions that can move this are structural, and should be priced
+before being built:
+
+1. **Bring blocked peers to a precise safepoint** so their roots become
+   rewritable — principled, and the largest.
+2. **Pin conservatively-found objects and compact around them** rather than
+   declining the whole collection. This is what production collectors do with
+   conservative roots, and it is the only option that converts a whole-heap
+   refusal into a bounded cost.
+3. **Keep threads out of JIT frames while blocked** — narrows the window without
+   closing it.
+
 ### Measured: repairing the indirect-call path would convert NOTHING in a real workload
 
 `CRATONVM_DBG_GC_FALLBACK_REASONS=1` records the full per-cycle reason **set**
