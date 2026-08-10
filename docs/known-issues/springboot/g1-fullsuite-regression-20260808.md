@@ -275,6 +275,18 @@ Two concrete next steps, in order:
   G1 collection path reaches that publication, and if not, hoist it so it runs
   unconditionally before any region is walked.
 
+  Two sub-cases are already excluded, which sharpens the question a lot.
+  `collect_reserved_tlab_tails` only sees threads that registered a
+  `tlab_addr`, and spawned workers **do** register (`vm_exec.rs:12637` and
+  `:12733`, alongside main at `:4371`, JNI at `jni.rs:598`, init at
+  `vm_init.rs:7731`) — so an unregistered owner is out. And `reserved_tail`
+  returns `None` only for `cursor == 0`, `end == 0`, or `cursor >= end`, none
+  of which fit a barely-used 900 KB chunk. So if the span really is a live
+  TLAB, publication should have seen it; and if its owner had retired, a filler
+  would be there. **Neither holds** — which means the span may not be a TLAB at
+  all, and the question becomes: what else advances `region.cursor` over memory
+  no object header was ever written into?
+
   **Ruled out while forming this:** a humongous region being retyped without a
   reset. `cleanup`'s humongous reclaim calls `region.reset(generation)` on
   every region of the span, so those Free regions do carry `cursor = 0`; and
