@@ -7726,15 +7726,28 @@ pub use math_intrinsic_aliases::*;
 // any emitted instruction sequence, so compiled Compatible code is
 // byte-for-byte what it was.
 //
-// # Process-global, deliberately
+// # Process-global — and what is left of it
 //
-// §2 of the design forbids process globals for this feature. This one is a
-// concession to a pre-existing shape, not a new one: the helper addresses it
-// gates (`INTEGER_VALUE_OF_DIRECT_FN` et al.) are ALREADY process-global
-// `AtomicUsize`s written by `build_helpers`, so a per-VM policy could not gate
-// them coherently anyway. The monotone latch is the only shape that stays
-// correct when two VMs disagree. Making both VM-scoped together is the real
-// fix; see the WAVE2 marker on [`set_jit_execution_policy`].
+// §2 of the design forbids process globals for this feature's state. Both
+// dispatch-affecting readers are gone:
+//
+//   * the `*_DIRECT_FN` helper addresses are registered **unconditionally**
+//     (2026-08-06) — they are process-invariant Rust `fn` pointers, so
+//     withholding them was never per-VM protection — and the bind decision is
+//     threaded per compilation as an argument instead;
+//   * [`jit_entry_publishable`] read this latch until 2026-08-10 and now takes
+//     the policy as an argument, from the VM call sites in
+//     `vm/src/jit/helpers.rs` that publish MIC/PIC entries.
+//
+// What still reads it is the legacy [`try_compile`] wrapper, for callers with
+// no VM in scope (this crate's tests, and any VM site not yet threading a
+// policy). No test latches it, so those read `Compatible`. Deleting the static
+// means giving that wrapper a policy parameter, which is a caller-side change.
+//
+// The monotone latch remains the only correct shape for whatever still reads
+// it: it can only move `Compatible -> JdkOnly`, so the worst a second VM can do
+// is make a `Compatible` VM over-strict — which costs throughput and can never
+// execute a callback the policy forbids.
 // ===========================================================================
 
 /// Latched JIT-visible compatibility mode. `0` = never set (treated as
@@ -7748,21 +7761,25 @@ const JIT_MODE_JDK_ONLY: u8 = 2;
 /// Publish the VM's execution policy to the JIT. Called once per VM from
 /// `vm/src/jit/helpers.rs::build_helpers`, **before** the first compilation.
 ///
-/// JDK-ONLY-WAVE2: this is process-global where §2 wants per-VM state. It is
-/// latched toward strict so it cannot mis-execute (see the module comment
-/// above), but a Compatible VM sharing a process with a JdkOnly one silently
-/// loses the thin direct-call helpers. The wave-2 replacement is to move the
-/// `*_DIRECT_FN` helper addresses AND this policy into a single per-VM struct
-/// that the compile path already threads, and delete this static with them.
+/// JDK-ONLY-WAVE2 §2, CLOSED 2026-08-10 for everything that decides dispatch.
+/// This static is process-global where §2 wants per-VM state, and it used to
+/// gate two things: the `*_DIRECT_FN` binds (moved to a per-compilation
+/// argument, 2026-08-06) and `jit_entry_publishable`'s inline-cache refusal
+/// (moved to a per-publication argument, 2026-08-10). Neither reads it now.
+///
+/// It survives only as the fallback for [`try_compile`]'s legacy wrapper, which
+/// has no VM in scope. That is a caller-side gap, not a policy leak: the value
+/// it hands out there is `Compatible`, because nothing latches it in a build
+/// without a VM.
 ///
 /// # Do not call this from a unit test in this crate
 ///
 /// The latch is process-global and irreversible, and this crate's `mod tests`
-/// shares one test binary. A test that latched `JdkOnly` would make
-/// `jit_entry_publishable` start refusing native inline-cache entries for
-/// every test that happened to run after it — an order-dependent failure. The
-/// policy transition is covered end-to-end by the `--jdk-only` launcher tests
-/// instead, which get a fresh process.
+/// shares one test binary. A test that latched `JdkOnly` would change what the
+/// legacy `try_compile` wrapper compiles for every test that happened to run
+/// after it — an order-dependent failure. The policy transition is covered
+/// end-to-end by the `--jdk-only` launcher tests instead, which get a fresh
+/// process.
 pub fn set_jit_execution_policy(policy: cratonvm_types::compat::ExecutionPolicy) {
     let requested = if policy.is_jdk_only() {
         JIT_MODE_JDK_ONLY
@@ -8786,7 +8803,14 @@ impl JitMICSlot {
     }
 
     /// Update all cached fields after a cache miss.
-    pub fn update(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_context: bool) {
+    pub fn update(
+        &self,
+        class_id: u32,
+        class_name: &str,
+        entry_ptr: u64,
+        needs_context: bool,
+        jdk_only: bool,
+    ) {
         use std::sync::atomic::Ordering;
 
         // A raw inline MIC has no helper boundary between its guard load and
@@ -8854,7 +8878,7 @@ impl JitMICSlot {
         // `prepopulate` leaves) rather than published — see
         // `jit_entry_publishable`.
         let owner = resolve_jit_entry_owner(entry_ptr as usize);
-        let (entry_ptr, needs_context) = if jit_entry_publishable(entry_ptr, &owner) {
+        let (entry_ptr, needs_context) = if jit_entry_publishable(entry_ptr, &owner, jdk_only) {
             (entry_ptr, needs_context)
         } else {
             (0, false)
@@ -9150,7 +9174,7 @@ impl JitPICSlot {
     /// Seed the PIC from an existing MIC. Used during MIC → PIC
     /// promotion so the single MIC entry lands in slot 0 of the PIC
     /// and no cache warm-up is lost.
-    pub fn seed_from_mic(&self, mic: &JitMICSlot) {
+    pub fn seed_from_mic(&self, mic: &JitMICSlot, jdk_only: bool) {
         let class_id = mic
             .cached_class_id
             .load(std::sync::atomic::Ordering::Acquire);
@@ -9183,7 +9207,7 @@ impl JitPICSlot {
         // lies inside a live JIT region, is a body we failed to retain — not a
         // native trampoline. Copying it forward would launder a refusal the MIC
         // itself would make today.
-        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner) {
+        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner, jdk_only) {
             (entry_ptr, needs_ctx)
         } else {
             (0, false)
@@ -9245,8 +9269,15 @@ impl JitPICSlot {
     ///   evicted entry's class_id is cleared first so concurrent
     ///   readers can't accidentally dispatch to a stale pointer with
     ///   a new class id.
-    pub fn install(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_ctx: bool) {
-        self.install_megamorphic(class_id, class_name, entry_ptr, needs_ctx);
+    pub fn install(
+        &self,
+        class_id: u32,
+        class_name: &str,
+        entry_ptr: u64,
+        needs_ctx: bool,
+        jdk_only: bool,
+    ) {
+        self.install_megamorphic(class_id, class_name, entry_ptr, needs_ctx, jdk_only);
         // Refresh an existing mapping in place. Re-inserting the same class in
         // a second slot wastes associativity and, once full, causes a stable
         // polymorphic site to evict a different receiver on every helper miss.
@@ -9254,7 +9285,7 @@ impl JitPICSlot {
             if self.class_ids[i].load(std::sync::atomic::Ordering::Acquire) == class_id {
                 self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
                 defer_jit_owner(self.compiled_owners[i].lock().take());
-                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx);
+                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx, jdk_only);
                 return;
             }
         }
@@ -9262,7 +9293,7 @@ impl JitPICSlot {
         // existing entries aren't perturbed.
         for i in 0..JIT_PIC_ENTRIES {
             if self.class_ids[i].load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx);
+                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx, jdk_only);
                 return;
             }
         }
@@ -9280,7 +9311,7 @@ impl JitPICSlot {
         // the new class_id during the atomic update window.
         self.class_ids[victim].store(0, std::sync::atomic::Ordering::Release);
         defer_jit_owner(self.compiled_owners[victim].lock().take());
-        self.write_entry(victim, class_id, class_name, entry_ptr, needs_ctx);
+        self.write_entry(victim, class_id, class_name, entry_ptr, needs_ctx, jdk_only);
     }
 
     fn install_megamorphic(
@@ -9289,6 +9320,7 @@ impl JitPICSlot {
         class_name: &str,
         entry_ptr: u64,
         needs_context: bool,
+        jdk_only: bool,
     ) {
         use std::sync::atomic::Ordering;
         let base = Self::mega_base_index(class_id);
@@ -9308,7 +9340,7 @@ impl JitPICSlot {
                     .is_ok()
             {
                 let owner = resolve_jit_entry_owner(entry_ptr as usize);
-                if !jit_entry_publishable(entry_ptr, &owner) {
+                if !jit_entry_publishable(entry_ptr, &owner, jdk_only) {
                     // Release the reservation and leave the way empty: the
                     // helper's own resolution path stays correct.
                     self.mega_class_ids[index].store(0, Ordering::Release);
@@ -9359,11 +9391,12 @@ impl JitPICSlot {
         class_name: &str,
         entry_ptr: u64,
         needs_ctx: bool,
+        jdk_only: bool,
     ) {
         // See `JitMICSlot::update`: never publish a compiled target this slot
         // cannot keep mapped.
         let owner = resolve_jit_entry_owner(entry_ptr as usize);
-        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner) {
+        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner, jdk_only) {
             (entry_ptr, needs_ctx)
         } else {
             (0, false)
@@ -9465,9 +9498,9 @@ impl JitPICSlot {
 /// [`JitPICSlot::seed_from_mic`]) so no cache warm-up is lost. Cold
 /// MICs (`cached_class_id == 0`) produce an empty PIC, which is still
 /// valid — its first miss fills slot 0 naturally.
-pub fn promote_mic_to_pic(mic: &JitMICSlot) -> Box<JitPICSlot> {
+pub fn promote_mic_to_pic(mic: &JitMICSlot, jdk_only: bool) -> Box<JitPICSlot> {
     let pic = Box::new(JitPICSlot::new());
-    pic.seed_from_mic(mic);
+    pic.seed_from_mic(mic, jdk_only);
     pic
 }
 
@@ -9909,7 +9942,29 @@ pub fn unowned_ic_entry_refusals() -> u64 {
 /// escaped to the caller as if it were the caller's own deopt and the callee's
 /// stashed frame was mis-attributed by an unrelated sink — see
 /// `handle_compiled_callee_deopt_sentinel` in `vm/src/jit/helpers.rs`.
-fn jit_entry_publishable(entry: u64, owner: &Option<Arc<CompiledMethod>>) -> bool {
+///
+/// # `jdk_only` is an argument, not a latch read
+///
+/// This function took its policy from the process-global
+/// `JIT_COMPATIBILITY_MODE` until 2026-08-10, which was the last
+/// dispatch-affecting reader of that static and the remaining half of
+/// `JDK-ONLY-WAVE2` §2. It is now passed in by whoever is publishing, so a
+/// `Compatible` VM sharing a process with a strict one publishes under its own
+/// policy. Every production caller has a `SharedVm` two frames up and passes
+/// `dispatch_policy(vm).is_jdk_only()`; unit tests that install synthetic
+/// sentinels pass `false`.
+///
+/// The strict branch is measured unreachable in both modes — every MIC/PIC
+/// publication takes its entry from `try_jit_compile_callee`, which is owned,
+/// so the `owner.is_some()` early return above fires first. Threading the
+/// policy does not change that; it changes *whose* policy would decide if a
+/// native trampoline ever did reach here, which is what §2 is about. The
+/// invariant, per the `JitMICSlot` note, is the refusal itself.
+fn jit_entry_publishable(
+    entry: u64,
+    owner: &Option<Arc<CompiledMethod>>,
+    jdk_only: bool,
+) -> bool {
     if entry == 0 || owner.is_some() {
         return true;
     }
@@ -9955,7 +10010,7 @@ fn jit_entry_publishable(entry: u64, owner: &Option<Arc<CompiledMethod>>) -> boo
     // only on an inline-cache MISS (which already takes two mutexes), and only
     // after the `owner.is_some()` early return has let every JIT-compiled Java
     // callee through.
-    if jit_is_jdk_only() {
+    if jdk_only {
         record_jdk_only_ic_native_refusal();
         return false;
     }
@@ -15741,7 +15796,12 @@ fn try_compile_inner(
                                 }
                             }
                             let pic = Box::new(JitPICSlot::new());
-                            pic.seed_from_mic(&mic);
+                            // `mic` was just built by `JitMICSlot::new()`, so its
+                            // `cached_entry_ptr` is 0 and `jit_entry_publishable`
+                            // short-circuits before it reads the policy at all —
+                            // `prepopulate` above sets only the class id. `false`
+                            // is therefore not a policy claim, it is unreachable.
+                            pic.seed_from_mic(&mic, false);
                             let mic_addr = &*mic as *const JitMICSlot as usize;
                             let pic_addr = &*pic as *const JitPICSlot as usize;
                             ir_mic_boxes.push(mic);
@@ -17830,7 +17890,10 @@ fn try_compile_inner(
                 // first dispatch still rings the helper, which
                 // installs entry_ptr; thereafter the cascade hits).
                 let pic = Box::new(JitPICSlot::new());
-                pic.seed_from_mic(&mic);
+                // Fresh MIC: `cached_entry_ptr` is 0, so the seeded entry
+                // short-circuits `jit_entry_publishable` before any policy
+                // branch. See the matching note on the IR planner's seed.
+                pic.seed_from_mic(&mic, false);
 
                 let mic_ptr: *const JitMICSlot = &*mic;
                 owned_mic_slots.push(mic);
@@ -23221,9 +23284,9 @@ mod tests {
     #[test]
     fn test_jit_pic_slot_install_and_hit() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(2, "B", 0x2000, true);
-        pic.install(3, "C", 0x3000, false);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(2, "B", 0x2000, true, false);
+        pic.install(3, "C", 0x3000, false, false);
         assert_eq!(pic.entries_used(), 3);
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
         assert_eq!(pic.lookup(2), Some((0x2000, true)));
@@ -23234,9 +23297,9 @@ mod tests {
     #[test]
     fn test_jit_pic_slot_clear_entries_drops_compiled_targets() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(2, "B", 0x2000, true);
-        pic.install(3, "C", 0x3000, false);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(2, "B", 0x2000, true, false);
+        pic.install(3, "C", 0x3000, false, false);
         assert_eq!(pic.entries_used(), 3);
 
         pic.clear_entries();
@@ -23258,17 +23321,17 @@ mod tests {
     #[test]
     fn test_jit_pic_slot_lru_evicts_least_hit() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(2, "B", 0x2000, false);
-        pic.install(3, "C", 0x3000, false);
-        pic.install(4, "D", 0x4000, false);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(2, "B", 0x2000, false, false);
+        pic.install(3, "C", 0x3000, false, false);
+        pic.install(4, "D", 0x4000, false, false);
         // Hit class 1 many times so class 2 and 4 look less warm.
         for _ in 0..10 {
             pic.lookup(1);
         }
         pic.lookup(3); // give class 3 at least one hit
                        // Hit counters: [10, 0, 1, 0] → first LFU is class 2.
-        pic.install(5, "E", 0x5000, true);
+        pic.install(5, "E", 0x5000, true, false);
         // Classes 1, 3, and 4 remain; class 2 is evicted; class 5 is installed.
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
         assert!(pic.lookup(2).is_none());
@@ -23280,11 +23343,11 @@ mod tests {
     #[test]
     fn test_jit_pic_slot_seed_from_mic() {
         let mic = JitMICSlot::new();
-        mic.update(7, "Seven", 0x7000, true);
+        mic.update(7, "Seven", 0x7000, true, false);
         mic.record_hit();
         mic.record_hit();
         let pic = JitPICSlot::new();
-        pic.seed_from_mic(&mic);
+        pic.seed_from_mic(&mic, false);
         assert_eq!(pic.entries_used(), 1);
         assert_eq!(pic.lookup(7), Some((0x7000, true)));
         let name = pic.class_names[0].lock();
@@ -23295,17 +23358,17 @@ mod tests {
     fn test_jit_pic_slot_seed_empty_mic_noop() {
         let mic = JitMICSlot::new();
         let pic = JitPICSlot::new();
-        pic.seed_from_mic(&mic);
+        pic.seed_from_mic(&mic, false);
         assert_eq!(pic.entries_used(), 0);
     }
 
     #[test]
     fn test_jit_pic_slot_megamorphic_detection() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(2, "B", 0x2000, false);
-        pic.install(3, "C", 0x3000, false);
-        pic.install(4, "D", 0x4000, false);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(2, "B", 0x2000, false, false);
+        pic.install(3, "C", 0x3000, false, false);
+        pic.install(4, "D", 0x4000, false, false);
         // Not megamorphic yet — full but no misses.
         assert!(!pic.is_megamorphic());
         // Pound it with misses.
@@ -23318,8 +23381,8 @@ mod tests {
     #[test]
     fn test_jit_pic_slot_duplicate_install_keeps_published_mega_target() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(1, "A2", 0x2000, true);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(1, "A2", 0x2000, true, false);
         assert_eq!(pic.entries_used(), 1);
         assert_eq!(pic.lookup(1), Some((0x2000, true)));
         // The generated hashed table is immutable after publication: changing
@@ -23355,6 +23418,7 @@ mod tests {
                 &format!("C{class_id}"),
                 0x1000 + u64::from(class_id),
                 class_id % 2 == 0,
+                false,
             );
         }
         assert_eq!(pic.entries_used(), JIT_PIC_ENTRIES);
@@ -23389,10 +23453,10 @@ mod tests {
     #[test]
     fn t17_b_pic_all_entries_hit() {
         let pic = JitPICSlot::new();
-        pic.install(11, "A", 0xAAAA_0000, false);
-        pic.install(22, "B", 0xBBBB_0000, true);
-        pic.install(33, "C", 0xCCCC_0000, false);
-        pic.install(44, "D", 0xDDDD_0000, true);
+        pic.install(11, "A", 0xAAAA_0000, false, false);
+        pic.install(22, "B", 0xBBBB_0000, true, false);
+        pic.install(33, "C", 0xCCCC_0000, false, false);
+        pic.install(44, "D", 0xDDDD_0000, true, false);
         assert_eq!(pic.entries_used(), JIT_PIC_ENTRIES);
 
         // Each receiver class_id is one of the 3 probed slots.
@@ -23425,10 +23489,10 @@ mod tests {
     #[test]
     fn t17_b_pic_miss_falls_through() {
         let pic = JitPICSlot::new();
-        pic.install(11, "A", 0xAAAA_0000, false);
-        pic.install(22, "B", 0xBBBB_0000, false);
-        pic.install(33, "C", 0xCCCC_0000, false);
-        pic.install(44, "D", 0xDDDD_0000, false);
+        pic.install(11, "A", 0xAAAA_0000, false, false);
+        pic.install(22, "B", 0xBBBB_0000, false, false);
+        pic.install(33, "C", 0xCCCC_0000, false, false);
+        pic.install(44, "D", 0xDDDD_0000, false, false);
 
         // 5th receiver type — no slot matches.
         let res = pic.lookup(55);
@@ -23466,17 +23530,17 @@ mod tests {
     #[test]
     fn t17_b_pic_lfu_eviction() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(2, "B", 0x2000, false);
-        pic.install(3, "C", 0x3000, false);
-        pic.install(4, "D", 0x4000, false);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(2, "B", 0x2000, false, false);
+        pic.install(3, "C", 0x3000, false, false);
+        pic.install(4, "D", 0x4000, false, false);
         // Class 1 is hot, class 2 is cold, class 3 has 1 hit.
         for _ in 0..10 {
             pic.lookup(1);
         }
         pic.lookup(3);
         // Evict LFU → slot 1 (class 2) goes, class 5 lands there.
-        pic.install(5, "E", 0x5000, true);
+        pic.install(5, "E", 0x5000, true, false);
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
         assert!(pic.lookup(2).is_none(), "class 2 was the LFU victim");
         assert_eq!(pic.lookup(3), Some((0x3000, false)));
@@ -23509,19 +23573,19 @@ mod tests {
     #[test]
     fn t17_b_promote_mic_to_pic_preserves_cached_entry() {
         let mic = JitMICSlot::new();
-        mic.update(7, "Seven", 0x7000, true);
+        mic.update(7, "Seven", 0x7000, true, false);
         // Pump misses past threshold.
         for _ in 0..=MIC_TO_PIC_THRESHOLD {
             mic.record_miss();
         }
         assert!(mic.needs_pic_promotion());
 
-        let pic = promote_mic_to_pic(&mic);
+        let pic = promote_mic_to_pic(&mic, false);
         assert_eq!(pic.entries_used(), 1);
         assert_eq!(pic.lookup(7), Some((0x7000, true)));
 
         // A new receiver lands in a fresh slot, not over the seeded one.
-        pic.install(8, "Eight", 0x8000, false);
+        pic.install(8, "Eight", 0x8000, false, false);
         assert_eq!(pic.entries_used(), 2);
         assert_eq!(pic.lookup(7), Some((0x7000, true)));
         assert_eq!(pic.lookup(8), Some((0x8000, false)));
@@ -23533,10 +23597,10 @@ mod tests {
     #[test]
     fn t17_b_pic_deopts_to_mega_on_miss_flood() {
         let pic = JitPICSlot::new();
-        pic.install(1, "A", 0x1000, false);
-        pic.install(2, "B", 0x2000, false);
-        pic.install(3, "C", 0x3000, false);
-        pic.install(4, "D", 0x4000, false);
+        pic.install(1, "A", 0x1000, false, false);
+        pic.install(2, "B", 0x2000, false, false);
+        pic.install(3, "C", 0x3000, false, false);
+        pic.install(4, "D", 0x4000, false, false);
         assert!(!pic.should_deopt_to_mega());
 
         // Pound with misses until the threshold is crossed.
@@ -24218,7 +24282,7 @@ mod tests {
         drop(published);
 
         let slot = JitMICSlot::new();
-        slot.update(cid.as_u32(), &class, entry as u64, false);
+        slot.update(cid.as_u32(), &class, entry as u64, false, false);
         assert_eq!(
             slot.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire) as usize,
@@ -24265,7 +24329,7 @@ mod tests {
         }
 
         let slot = JitMICSlot::new();
-        slot.update(21, "DeadOwner", DEAD_ENTRY as u64, false);
+        slot.update(21, "DeadOwner", DEAD_ENTRY as u64, false, false);
         assert_eq!(
             slot.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -24274,7 +24338,7 @@ mod tests {
         );
 
         let native_slot = JitMICSlot::new();
-        native_slot.update(22, "NativeOwner", NATIVE_ENTRY, false);
+        native_slot.update(22, "NativeOwner", NATIVE_ENTRY, false, false);
         assert_eq!(
             native_slot
                 .cached_entry_ptr
@@ -24284,7 +24348,7 @@ mod tests {
         );
 
         let pic = JitPICSlot::new();
-        pic.install(21, "DeadOwner", DEAD_ENTRY as u64, false);
+        pic.install(21, "DeadOwner", DEAD_ENTRY as u64, false, false);
         assert!(
             pic.lookup_megamorphic(21).is_none(),
             "the hashed overflow table must refuse a dead entry too"
@@ -24319,7 +24383,7 @@ mod tests {
             .expect("target")
             .entry_ptr() as usize;
         let slot = JitMICSlot::new();
-        slot.update(cid.as_u32(), &class, entry as u64, false);
+        slot.update(cid.as_u32(), &class, entry as u64, false, false);
 
         jit_execution_enter();
         slot.clear_compiled_entry();
@@ -25433,7 +25497,7 @@ mod tests {
     #[test]
     fn s33_mic_slot_update_all_fields() {
         let mic = JitMICSlot::new();
-        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true);
+        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true, false);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -25456,7 +25520,7 @@ mod tests {
     #[test]
     fn s33_mic_slot_clear_compiled_entry_keeps_receiver_cache() {
         let mic = JitMICSlot::new();
-        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true);
+        mic.update(7, "com/example/MyClass", 0xDEAD_BEEF, true, false);
         mic.clear_compiled_entry();
 
         assert_eq!(
@@ -25544,8 +25608,8 @@ mod tests {
     #[test]
     fn s33_mic_slot_update_first_install_wins_no_retarget() {
         let mic = JitMICSlot::new();
-        mic.update(1, "A", 100, false);
-        mic.update(2, "B", 200, true);
+        mic.update(1, "A", 100, false, false);
+        mic.update(2, "B", 200, true, false);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -25567,8 +25631,8 @@ mod tests {
     #[test]
     fn s33_mic_slot_update_same_class_is_idempotent() {
         let mic = JitMICSlot::new();
-        mic.update(1, "A", 100, false);
-        mic.update(1, "A", 999, true);
+        mic.update(1, "A", 100, false, false);
+        mic.update(1, "A", 999, true, false);
         assert_eq!(
             mic.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -25593,7 +25657,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
-        mic.update(7, "Hinted", 0x4242, true);
+        mic.update(7, "Hinted", 0x4242, true, false);
         assert_eq!(
             mic.cached_class_id
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -25661,7 +25725,7 @@ mod tests {
             0
         );
         // After update with non-zero entry, it's resolved
-        mic.update(5, "Foo", 0x1234, false);
+        mic.update(5, "Foo", 0x1234, false, false);
         assert_ne!(
             mic.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -26855,7 +26919,7 @@ mod code_cache_lifetime_tests {
         // `compiled_owner` deliberately left empty — the residue of the race.
 
         let pic = JitPICSlot::new();
-        pic.seed_from_mic(&mic);
+        pic.seed_from_mic(&mic, false);
 
         assert_eq!(
             pic.class_ids[0].load(Ordering::Acquire),
@@ -26892,7 +26956,7 @@ mod code_cache_lifetime_tests {
         mic.cached_class_id.store(9, Ordering::Release);
 
         let pic = JitPICSlot::new();
-        pic.seed_from_mic(&mic);
+        pic.seed_from_mic(&mic, false);
 
         assert_eq!(pic.class_ids[0].load(Ordering::Acquire), 9);
         assert_eq!(pic.entry_ptrs[0].load(Ordering::Acquire), sentinel);

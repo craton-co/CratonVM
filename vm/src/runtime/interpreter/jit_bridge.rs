@@ -2198,8 +2198,14 @@ pub(super) fn is_elidable_construction(
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
+    let Some(init) = class.find_method("<init>", "()V") else {
+        return false;
+    };
+    let Some(code) = init.code() else {
+        return false;
+    };
     // A REGISTERED NATIVE SHADOWS THE BYTECODE CONSTRUCTOR. `invokespecial`
-    // always prefers a registered native over bytecode, so a trivial-looking
+    // prefers a registered native over bytecode, so a trivial-looking
     // `<init>()V` body says nothing about what actually runs — and eliding the
     // call skips the native's side effects entirely.
     //
@@ -2215,20 +2221,48 @@ pub(super) fn is_elidable_construction(
     // (jsonsmart-parser-jit-retired-20260727.md). The companion
     // `map_resize` fix makes the fallback capacity correct; this one keeps the
     // native constructor running in the first place.
-    if shared
+    //
+    // The question this asks is NOT "is a native registered" but "would
+    // dispatching this `<init>` reach one" — the §3 item-4 residual of
+    // `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`,
+    // which asked for `resolve_dispatch` treatment here. A bare `find` is the
+    // wrong question in strict mode: under `JdkOnly` a non-`Intrinsic` bridge
+    // in front of concrete bytecode LOSES (§7 step 3), so the native this used
+    // to refuse over never runs and the refusal was pure pessimism.
+    //
+    // The two inputs the name-only adapter cannot derive:
+    //
+    //  * `compat_native_wins: true` — this site's pre-existing verdict, and it
+    //    is exactly what the paragraph above describes: today, a registered
+    //    `<init>()V` native wins over the bytecode constructor.
+    //  * `bytecode_available: true` — established, not assumed: `init.code()`
+    //    above returned `Some`, so there is concrete bytecode to shadow. This
+    //    is why the check moved BELOW the body lookup.
+    //
+    // A `Some(_)` decision (`NativeBridge`, `Intrinsic`, or a strict `Reject`)
+    // all mean the same thing here: something other than the trivial body runs,
+    // or throws, so the call may not be elided. `None` means the bytecode is
+    // what executes — which is precisely the premise the shape check below
+    // verifies. `Compatible` is bit-for-bit unchanged: with
+    // `compat_native_wins == true` the adapter returns `Some` for every
+    // registration and `None` for none, i.e. the old `find(..).is_some()`.
+    let registered = shared
         .natives
         .native_methods
-        .find(&class.name, "<init>", "()V")
-        .is_some()
+        .find_with_kind(&class.name, "<init>", "()V");
+    if crate::vm::resolve_native_dispatch_wave1(
+        crate::vm::dispatch_policy(shared),
+        &class.name,
+        "<init>",
+        "()V",
+        registered,
+        true,
+        true,
+    )
+    .is_some()
     {
         return false;
     }
-    let Some(init) = class.find_method("<init>", "()V") else {
-        return false;
-    };
-    let Some(code) = init.code() else {
-        return false;
-    };
     let bc = &code.code;
     // aload_0 (0x2a); invokespecial (0xb7) hi lo; return (0xb1) — exactly 5 bytes.
     if bc.len() != 5 || bc[0] != 0x2a || bc[1] != 0xb7 || bc[4] != 0xb1 {

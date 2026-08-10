@@ -5176,12 +5176,15 @@ struct JNINativeMethod {
 /// `vm/src/vm/vm_exec.rs` consult `resolve_dispatch` before falling through to
 /// [`find_jni_native`].
 ///
-/// The census gap the move does NOT close: these invocations are still outside
-/// the §4 per-kind totals, because `record_invocation` keys on a
-/// `NativeMethodId` and only `NativeMethodRegistry` issues one — there is no
-/// honest way to mint one for a `dlsym` result. `synthetic_stub_invocations`
-/// stays exact (a stub can never be here); `bridge_invocations` under-counts
+/// The census gap the move left, CLOSED 2026-08-10 without minting a fake id.
+/// `record_invocation` keys on a `NativeMethodId` and only
+/// `NativeMethodRegistry` issues one, so there is still no honest way to give a
+/// `dlsym` result an id — and none is invented. Instead both dispatch sites in
+/// `vm/src/vm/vm_exec.rs` increment `NativeRealm::jni_bridge_invocations`, and
+/// `--jdk-only-report` adds that to `bridge_invocations`, which is where a real
+/// function in a real library belongs. Until then that key under-counted
 /// genuine JNI bridges by exactly the number of dispatches through this table.
+/// `synthetic_stub_invocations` was and stays exact: a stub can never be here.
 pub type JniNativeMethodTable = parking_lot::RwLock<HashMap<u64, usize>>;
 
 /// Compute a hash key for a (class, method, descriptor) triple.

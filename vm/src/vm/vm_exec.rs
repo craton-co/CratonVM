@@ -24730,6 +24730,16 @@ fn invoke_on_class_shared_inner(
                 )));
             }
 
+            // §4 census — the JNI half. `record_invocation` cannot serve this
+            // edge (it keys on a `NativeMethodId`, and only
+            // `NativeMethodRegistry` issues one; a `dlsym` result has none), so
+            // the count lives on the table's own realm and the report adds it
+            // to `bridge_invocations`. Counted here, after the arity check, so
+            // a refused unsafe dispatch is not counted as one.
+            shared
+                .natives
+                .jni_bridge_invocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Safety: fn_ptr was stored from a trusted RegisterNatives / JNI_OnLoad call.
             let result_value = unsafe {
                 crate::native::jni::dispatch_jni_native(
@@ -24819,6 +24829,13 @@ fn invoke_on_class_shared_inner(
                 )));
             }
 
+            // §4 census — the auto-resolved (dlsym) half of the same edge; see
+            // the `RegisterNatives` arm above for why the count lives on the
+            // realm rather than going through `record_invocation`.
+            shared
+                .natives
+                .jni_bridge_invocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let result_value = unsafe {
                 crate::native::jni::dispatch_jni_native(
                     fn_ptr, env, receiver, call_args, descriptor,
