@@ -1,6 +1,20 @@
 # `HashMap.get` returns null for a key the same map's `entrySet()` just yielded — one-entry map, `==` key, equal `hashCode`
 
-**Status: OPEN — CratonVM correctness bug, root-caused to a minimal reproducer. Filed 2026-08-10.**
+**Status: FIXED 2026-08-10.** Filed and closed the same day. The "open work"
+this page names — *what condition the parked map hits that a generic `HashMap`
+across a GC does not* — is answered in "The condition, found" at the bottom.
+`HashMap` was never at fault: the key's identity hash **changed between `put`
+and `get`**, because the key was first hashed while its own monitor was held.
+
+Verified with this page's own reproducer, unchanged, on the fixed binary:
+
+```
+parked.get(service)     = len=1 [0@92574]     (was: null)
+parked.containsKey      = true                (was: false)
+re-get by entry key     = len=1 [0@92574]     (was: null)
+```
+
+which is what HotSpot prints on the same classpath.
 
 This is the root cause of 82 of the 90 test failures in
 `TomcatServletWebServerFactoryTests`, which had been on file as a throughput
@@ -117,16 +131,73 @@ The last one matters most: the generic version of this bug does **not**
 reproduce. Whatever condition the parked map hits is more specific than "a
 HashMap across a GC", and finding it is the open work.
 
-## Not yet established
+## The condition, found
 
-* The mechanism. A one-entry map missing its only key is consistent with the
-  hash used at `put` differing from the hash used at `get`, and with table
-  corruption; nothing here distinguishes them. Instrumenting
-  `HashMap.putVal`/`getNode` to log `(key identity, hash, bucket index)` on both
-  paths would, in one run.
-* Whether `java.util.HashMap` runs as real JDK bytecode here or hits a
-  CratonVM-side intrinsic/native — that decides which layer to instrument, and
-  it was not checked.
-* Blast radius. Any `HashMap` keyed on objects that do not override
-  `hashCode` is exposed, which is a large surface across the suites. No census
-  was taken.
+The first bullet above was the right instinct — *the hash used at `put` differed
+from the hash used at `get`* — and this is the condition that makes it happen:
+
+**the key was first hashed while its own monitor was held.**
+
+`TomcatWebServer.initialize()` parks the connectors from inside the `Context`
+`START_EVENT` listener, which runs inside `StandardService.startInternal()`,
+which runs inside `LifecycleBase.start()` — and that method is
+`public final synchronized void start()`, synchronized on the `StandardService`
+that is about to become the map key. So the `put` happens with the key
+THIN_LOCKED. By the time `addPreviouslyRemovedConnectors()` does the `get`, the
+lock is long released.
+
+CratonVM keeps the identity hash in the upper bits of a NEUTRAL mark word. A
+`THIN_LOCKED` payload is an owner plus a recursion count and an `INFLATED`
+payload is a monitor pointer, so neither has room for one; the accessor
+correctly declined to decode them and returned `0`, and the VM's
+"identityHashCode must never be 0" guard turned that `0` into `i32::MAX` and
+handed it out. The `put` therefore filed the entry under `i32::MAX`, and the
+`get` — by then NEUTRAL, so a real hash was minted — looked in a different
+bucket.
+
+That also explains the observation in "The invariant that breaks" that
+`hashCode()` reads the same 92563 from both references *now*: it does. The
+divergence is between insertion time and now, exactly as this page suspected,
+and reading the hash twice after the fact can never show it.
+
+Two of the recorded refutations are now explained rather than merely refuted:
+the `HashMap<Service, Connector[]>` round-trip in `TomcatFindConnectorsProbe`
+passed because it never took the key's lock, and `IdentityHashAcrossGcProbe`
+found zero misses across 200 keys and ~900MB of churn because a moving GC was
+never the mechanism. The generic version could not reproduce because the
+condition is not "a HashMap across a GC" but "hash it inside `synchronized`".
+
+Three lines are enough (`probes/IdentityHashWhileLockedProbe.java`):
+
+```java
+Object p = new Object();
+synchronized (p) { inside = System.identityHashCode(p); }
+afterUnlock = System.identityHashCode(p);
+```
+
+| | HotSpot | before | after |
+|---|---|---|---|
+| `inside` / `afterUnlock` | equal | `2147483647` then `16` | equal |
+| `HashMap.put` under the key's own lock, then `put` again | size 1 | size 2 | size 1 |
+
+**Fix:** `MonitorTable::identity_hash_via_monitor` inflates and displaces the
+hash into the monitor, which is what HotSpot's
+`ObjectSynchronizer::FastHashCode` does for a stack-locked object, and it is
+stable for the object's life because nothing here deflates a live object's
+monitor. Fences in `vm/src/threading/monitor.rs`:
+`the_identity_hash_of_a_thin_locked_object_survives_the_unlock` and
+`locked_objects_do_not_all_share_one_identity_hash` — both verified red against
+the pre-fix code (`left: 2147483647, right: 2147483647`) before being trusted.
+
+**Blast radius, answered.** Two shapes, both of them ordinary Java:
+
+1. Any `HashMap`/`HashSet` keyed on an object whose hash was first taken inside
+   its own `synchronized` block loses the entry.
+2. Every locked-then-hashed object in the process shared the single value
+   `i32::MAX`, so such keys also collided with each other.
+
+Measured effect beyond this class: the SSL/PEM/JKS + http-client cluster went
+17 FAIL → 1 (see
+[`ssl-pem-jks-and-http-client-cluster-20260809-FIXED.md`](ssl-pem-jks-and-http-client-cluster-20260809-FIXED.md),
+where this is defect 2 of 3), and a twelve-class embedded-server sample went
+from "every class reports port 8080" to **zero** occurrences.

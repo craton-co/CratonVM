@@ -1,8 +1,17 @@
 # `TomcatServletWebServerFactoryTests` / `JettyServletWebServerFactoryTests` HANG at 300s — steady forward progress, not a stall; the class needs ~2x the per-class budget
 
-**Status: OPEN — but the Tomcat half is NOT a budget problem. Root-caused
-2026-08-10 to a `HashMap` defect with a ten-second reproducer; see
-`hashmap-get-misses-a-key-its-own-entryset-yields-20260810.md`. Filed 2026-08-07.**
+**Status: OPEN for the throughput gap only. The 82-of-90 `port 8080` failures
+described below are FIXED (2026-08-10): the `HashMap` miss was an identity hash
+that changed between `put` and `get`, because the key was first hashed inside
+its own `synchronized` block. The diagnosis page is retired to
+`internal/fixed-suite-bugs/springboot/hashmap-get-misses-a-key-its-own-entryset-yields-FIXED-20260810.md`,
+which carries the trigger and the fix. Filed 2026-08-07.**
+
+A twelve-class embedded-server sample re-run after the fix reports **zero**
+`listen on port 8080` occurrences, where every such class reported them before.
+`TomcatServletWebServerFactoryTests` and `JettyServletWebServerFactoryTests`
+still exceed 300s, so what remains here is the throughput gap the rest of this
+page describes — and it is now the whole of what this page is about.
 
 ## 2026-08-10 update — the Tomcat half was misdiagnosed
 
