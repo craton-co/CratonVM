@@ -1262,9 +1262,25 @@ fn discover_providers(
     // META-INF/services FQNs. Providers that fail to load/instantiate are
     // skipped by the iterator, so a module-declared provider CratonVM cannot
     // construct is harmless.
-    let service_slash = service_name.replace('.', "/");
-    for mp in ctx.service_providers_from_modules(&service_slash) {
-        providers.push(mp.replace('/', "."));
+    //
+    // `service_providers_from_modules` reads ONE VM-global module registry, with
+    // no notion of which loader is asking — the third flavour of the same
+    // exclusion leak. It is also not what a real JVM does here: a modular jar
+    // reached through the CLASS path is an unnamed-module citizen whose
+    // `module-info` the JDK ignores outright, so `ServiceLoader` sees only its
+    // `META-INF/services`. `logback-classic.jar` is exactly that — it declares
+    // `provides SLF4JServiceProvider with LogbackServiceProvider`, and CratonVM
+    // was handing that declaration to a loader built to exclude the jar.
+    //
+    // A loader with its own recorded URL list IS a class-path loader, so skip
+    // the module source for it. Every other caller — notably the null/builtin
+    // loader behind `ToolProvider.getSystemJavaCompiler()`, the case this source
+    // exists for — is untouched.
+    if !loader_view_is_exhaustive {
+        let service_slash = service_name.replace('.', "/");
+        for mp in ctx.service_providers_from_modules(&service_slash) {
+            providers.push(mp.replace('/', "."));
+        }
     }
 
     providers.sort();
@@ -3507,6 +3523,14 @@ mod tests {
         ctx.set_resource(
             &resource,
             b"ch.qos.logback.classic.spi.LogbackServiceProvider\n".to_vec(),
+        );
+        // `logback-classic.jar` also DECLARES this provider in its `module-info`.
+        // On a real JVM that declaration is invisible to a class-path loader; the
+        // VM-global module registry offered it to every caller, so the same
+        // provider leaked back through a second door after the flat scan closed.
+        ctx.set_module_providers(
+            "org/slf4j/spi/SLF4JServiceProvider",
+            vec!["ch/qos/logback/classic/spi/LogbackServiceProvider"],
         );
 
         let loader = modified_classpath_loader(&mut ctx, dir.path());
