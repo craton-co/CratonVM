@@ -6116,6 +6116,7 @@ impl ClassManager {
         // its name, the two layouts are now both known and can be diffed once,
         // here, instead of guessed at per access.
         self.report_shadow_layout(id);
+        self.check_safe_positional_claims(id);
 
         // T10.5 — Build this class's vtable descriptor layout, cache it on
         // `self.vtable_descriptors`, and fire the install hook so the VM
@@ -6622,6 +6623,41 @@ impl ClassManager {
             return;
         }
         eprint!("{}", diff.render());
+    }
+
+    /// Re-check every `JDK-ONLY-LAYOUT: safe` positional claim about a class
+    /// that has just been defined from real bytes.
+    ///
+    /// Wave-2 step 4. A `safe` verdict is an assertion about one specific JDK
+    /// image, made once by a person reading `javap`, and nothing in the build
+    /// re-checked it -- so a JDK upgrade that reordered a private field would
+    /// not fail a test, it would silently corrupt an object.
+    ///
+    /// Deliberately NOT behind `CRATONVM_DBG_OVERLAY`, unlike the census next
+    /// door. The census is a research instrument you switch on when you are
+    /// already looking for something; this is a tripwire, and a tripwire that
+    /// only fires while you are watching is not one. It costs a name compare
+    /// against a six-row table per class definition, and only a class named in
+    /// that table walks any fields at all.
+    ///
+    /// `debug_assert` on top of the log, so a broken claim fails the test suite
+    /// rather than merely printing during it.
+    fn check_safe_positional_claims(&self, id: ClassId) {
+        let broken = crate::shadow_layout::check_positional_claims(&self.class_store, id);
+        for message in &broken {
+            tracing::error!(
+                target: "cratonvm::layout",
+                "JDK-ONLY-LAYOUT `safe` claim broken by this image: {message}"
+            );
+            eprintln!("[LAYOUT-CLAIM] BROKEN: {message}");
+        }
+        debug_assert!(
+            broken.is_empty(),
+            "a JDK-ONLY-LAYOUT `safe` claim does not hold for the loaded image:
+{}",
+            broken.join("
+")
+        );
     }
 
     /// Re-parent a loaded class.
@@ -9853,6 +9889,7 @@ impl ClassManager {
         // The ClassId is deliberately reused, so every native holding a
         // positional index for the old model now addresses the new one.
         self.report_shadow_layout(id);
+        self.check_safe_positional_claims(id);
 
         Ok(())
     }
@@ -11932,15 +11969,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
                 attributes: vec![],
             },
         ],
-        // ThreadLocal native semantics live in side tables, but slot 0 remains
-        // part of the synthetic compatibility layout.
+        // ThreadLocal native semantics live in side tables keyed by identity
+        // hash; the object itself carries nothing.
+        //
+        // The model used to name slot 0 `value:Ljava/lang/Object;`, which a
+        // real `java.lang.ThreadLocal` declares as `threadLocalHashCode:I` --
+        // its ONE instance field, and the int the real `ThreadLocalMap` hashes
+        // with. Naming the real field is what it is: the fabricated stub gets
+        // one unused int, and the shadow-layout diff agrees with the image
+        // instead of reporting a slot nobody uses.
         "java/lang/ThreadLocal" | "java/lang/InheritableThreadLocal" => {
-            vec![ClassFileField {
-                access_flags: FieldAccessFlags::empty(),
-                name: cratonvm_types::intern_arc("value"),
-                descriptor: cratonvm_types::intern_arc("Ljava/lang/Object;"),
-                attributes: vec![],
-            }]
+            vec![named_field("threadLocalHashCode", "I")]
         }
         "java/lang/Thread$State" => pad_to(
             vec![

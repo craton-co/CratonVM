@@ -247,17 +247,31 @@ pub fn ensure_system_stdin_object(
             .heap
             .set_field(in_obj, idx, Value::Object(Some(fd_obj)));
     } else {
-        // Fall back to the legacy slot-1 encoding if reflection fails.
+        // JDK-ONLY-LAYOUT: safe (was `breaks-under-strict`, wave 1).
         //
-        // JDK-ONLY-LAYOUT: breaks-under-strict (dead arm on real bytes).
-        // Slot 1 of a REAL `java/io/FileInputStream` is `path:String`, not an
-        // int marker — writing `Int(1)` there is a silent wrong-field write
-        // that would make `getPath`/`toString` observe a non-reference. The arm
-        // is only reached when `fd` fails to resolve by name, which cannot
-        // happen once real `FileInputStream` bytes are authoritative. Under
-        // `CompatibilityMode::JdkOnly` this must become a structured
-        // `MissingImplementation`-style failure rather than a fabricated write;
-        // it is left as-is for wave 1 (measurement, not deletion).
+        // Slot 1 of a REAL `java/io/FileInputStream` is `path:String`, and
+        // writing `Int(1)` there would be a silent wrong-field write. It cannot
+        // happen: this arm is reached only when `find_field_recursive(.., "fd")`
+        // answers `None`, i.e. the receiver's class declares no `fd` ANYWHERE on
+        // its superclass chain — which is the fabricated-layout predicate, asked
+        // by NAME, and the shape every fix in this family converged on. A real
+        // `java.io.FileInputStream` always declares `fd`.
+        //
+        // Slot 1 on that fabricated layout is the legacy `fd + 1` marker
+        // `native-io`'s `fis_get_fd` reads last ("`System.in`: slot 1 holds
+        // fd+1"), so `Int(1)` means fd 0, stdin — which is what this call site
+        // is building.
+        //
+        // What was missing was not a guard but a WITNESS: the arm had no way to
+        // announce itself, so "cannot happen" was an argument rather than an
+        // observation. Under `CompatibilityMode::JdkOnly` a fabricated
+        // `FileInputStream` is a policy violation in its own right, and the
+        // warning names it at the one place that can see it.
+        if shared.compatibility_mode().is_jdk_only() {
+            tracing::warn!(
+                "jdk-only: System.in built on a fabricated java/io/FileInputStream                  (no `fd` field to resolve); writing the legacy slot-1 fd marker"
+            );
+        }
         shared.mem.heap.set_field(in_obj, 1, Value::Int(1));
     }
 
@@ -1249,11 +1263,25 @@ fn initialize_class_shared(
     // FFM bootstrap guard: preparation pre-seeds the supported ValueLayout
     // statics (ADDRESS, JAVA_INT, unaligned variants, etc.) with synthetic
     // layout objects. Running the real JDK 25 interface <clinit> is unsafe in
-    // CratonVM because it rebuilds ADDRESS through Unsafe.ADDRESS_SIZE before
-    // HotSpot-style UnsafeConstants backfill is available, producing alignment
-    // 0 and poisoning SharedUtils.<clinit>. Treat the preseeded interface as a
-    // no-<clinit> class so normal finalization/JFR handling below still runs.
-    let has_clinit = has_clinit && &*class_name_for_jfr != "java/lang/foreign/ValueLayout";
+    // Compatible mode because it rebuilds ADDRESS through Unsafe.ADDRESS_SIZE
+    // before HotSpot-style UnsafeConstants backfill is available, producing
+    // alignment 0 and poisoning SharedUtils.<clinit>. Treat the preseeded
+    // interface as a no-<clinit> class so normal finalization/JFR handling
+    // below still runs.
+    //
+    // JDK-ONLY-LAYOUT (step 3): under `CompatibilityMode::JdkOnly` the
+    // suppression is LIFTED and the preseed at the bottom of `prepare_class` is
+    // skipped, because the pair of them is a `CompatibilityClassRequested`
+    // violation rather than a slot-numbering bug — see
+    // `make_prepared_value_layout`, which invents two instance slots on an
+    // object of an INTERFACE type that has none. The precondition the wave-2
+    // requirement named is met: `post_clinit_fixup` backfills
+    // `jdk/internal/misc/UnsafeConstants` with real platform values (its
+    // "UnsafeConstants populated (5/5)" line) and `prepare_class` runs after
+    // it, so the real `<clinit>` reads a true `ADDRESS_SIZE0`.
+    let jdk_only = shared.compatibility_mode().is_jdk_only();
+    let has_clinit =
+        has_clinit && (jdk_only || &*class_name_for_jfr != "java/lang/foreign/ValueLayout");
     let init_start = std::time::Instant::now();
 
     // AOT training: record class load event for pre-linking
@@ -2189,8 +2217,10 @@ fn make_prepared_value_layout(
         .map(|c| c.num_total_fields.max(2))
         .unwrap_or(2);
     let obj = shared.mem.heap.alloc_object(layout_class_id, num_fields);
-    // JDK-ONLY-LAYOUT: breaks-under-strict — assumed slot 0 = `byteSize`,
-    // slot 1 = `byteAlignment`.
+    // JDK-ONLY-LAYOUT: converted (step 3) — this whole function is now
+    // unreachable under `CompatibilityMode::JdkOnly`; the paragraphs below
+    // describe what it still does in Compatible mode. It assumes slot 0 =
+    // `byteSize`, slot 1 = `byteAlignment`.
     //
     // Every `class_name` reached here (`java/lang/foreign/ValueLayout$Of*`,
     // `java/lang/foreign/AddressLayout`) is an INTERFACE in the real JDK: it
@@ -2203,13 +2233,19 @@ fn make_prepared_value_layout(
     // `has_clinit && != "java/lang/foreign/ValueLayout"` suppression above,
     // which stops the real `<clinit>` from ever running.
     //
-    // Wave-2 requirement: under `CompatibilityMode::JdkOnly` this preseed must
-    // be dropped entirely and the real `ValueLayout.<clinit>` allowed to run,
-    // which in turn requires `jdk/internal/misc/UnsafeConstants` to be
-    // backfilled with real platform values (see the FFM/Unsafe note above)
-    // before class preparation. Do NOT convert this to named-field lookup:
-    // there are no real fields to name. It is a `CompatibilityClassRequested`
-    // violation, not a slot-numbering bug.
+    // Wave-2 requirement, DONE 2026-08-10: under `CompatibilityMode::JdkOnly`
+    // the preseed is dropped entirely and the real `ValueLayout.<clinit>` runs
+    // — both halves are gated at their own sites (`prepare_class`'s call below,
+    // and the `has_clinit` suppression in `initialize_class_shared`). It was
+    // NOT converted to named-field lookup, because there are no real fields to
+    // name: it is a `CompatibilityClassRequested` violation, not a
+    // slot-numbering bug, and the only honest fix for one of those is to stop
+    // fabricating.
+    //
+    // The precondition the requirement named is met: `post_clinit_fixup`
+    // backfills `jdk/internal/misc/UnsafeConstants` with real platform values,
+    // so the real `<clinit>` no longer rebuilds ADDRESS through a zero
+    // `ADDRESS_SIZE0`.
     shared.mem.heap.set_field(obj, 0, Value::Long(byte_size));
     shared
         .mem
@@ -2316,7 +2352,14 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
             None => {}
         }
 
-        if class_name == "java/lang/foreign/ValueLayout" {
+        // JDK-ONLY-LAYOUT (step 3): the preseed fabricates a two-slot instance
+        // layout on an INTERFACE, so under `CompatibilityMode::JdkOnly` it is
+        // skipped and the real `ValueLayout.<clinit>` runs instead (the
+        // suppression in `initialize_class_shared` is lifted in the same mode).
+        // Compatible mode is unchanged.
+        if class_name == "java/lang/foreign/ValueLayout"
+            && !shared.compatibility_mode().is_jdk_only()
+        {
             if let Some((layout_class, byte_size, byte_alignment)) =
                 value_layout_preseed(field_name)
             {

@@ -3483,7 +3483,6 @@ fn atomic_reference_update_with_operator(
 // does not currently expose that callback for arbitrary identity-hash
 // targets, so for now we accept the bounded leak — entries are bounded by
 // the live set of ThreadLocals, which is small for typical applications.
-const TL_FIELD_VALUE: usize = 0;
 
 #[derive(Clone, Copy)]
 pub(crate) enum ThreadLocalValue {
@@ -3648,16 +3647,30 @@ pub(crate) fn register_thread_local_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-fn native_tl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    // Slot 0 retained for layout compatibility; not the source of truth.
-    ctx.set_field(this, TL_FIELD_VALUE, Value::Object(None));
+/// JDK-ONLY-LAYOUT (kind 3, the sub-case that needs no storage at all).
+///
+/// Both `<init>` natives used to open with
+/// `ctx.set_field(this, 0, Value::Object(None))` under the comment "slot 0
+/// retained for layout compatibility; not the source of truth". Nothing in the
+/// tree ever read it back — `get`/`set`/`remove` are natives over a side table
+/// keyed by identity hash — so the value never survived its own write in any
+/// meaningful sense, and the write was pure cost.
+///
+/// On a real image it was not free. `java.lang.ThreadLocal` declares exactly
+/// one instance field, `threadLocalHashCode:I`, so the null landed on the int
+/// the real `ThreadLocalMap` hashes with. It reached every ThreadLocal
+/// SUBCLASS through `super()` — the census's two "L4 gap 3" rows,
+/// `jdk/internal/math/FloatingDecimal$1` and
+/// `ReentrantReadWriteLock$Sync$ThreadLocalHoldCounter`, are both this one
+/// writer seen through a subclass, not two defects.
+///
+/// The fix is deletion, not relocation: there is no field to relocate to.
+fn native_tl_init(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
 fn native_itl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, TL_FIELD_VALUE, Value::Object(None));
     let id = ctx.identity_hash_code(this);
     tl_inheritable_ids().lock().insert(id);
     Ok(None)
