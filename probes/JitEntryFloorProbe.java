@@ -52,7 +52,11 @@ public final class JitEntryFloorProbe {
 			best = Math.min(best, ns);
 		}
 		System.out.println("arm,ops,millis,ns_per_call");
-		System.out.printf("interp->jit call ,%d,%d,%.2f%n", OPS, best / 1_000_000, (double) best / OPS);
+		// Locale.ROOT, not the default: on a comma-decimal locale `%.2f` prints
+		// "0,48" and silently turns this CSV row into four columns instead of
+		// three. Caught on the first HotSpot run of this probe.
+		System.out.printf(java.util.Locale.ROOT, "interp->jit call ,%d,%d,%.2f%n", OPS, best / 1_000_000,
+				(double) best / OPS);
 		System.out.println("sink=" + sink);
 	}
 
