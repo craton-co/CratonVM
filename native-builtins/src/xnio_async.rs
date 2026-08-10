@@ -2416,7 +2416,7 @@ mod tests {
 
     fn new_future(ctx: &mut crate::test_utils::MockNativeContext) -> (ObjectRef, ObjectRef) {
         // Allocate a FutureResult and init it; read back its future.
-        let fr = try_alloc_concurrent_synthetic(ctx, "org/xnio/FutureResult", 1)?;
+        let fr = try_alloc_concurrent_synthetic(ctx, "org/xnio/FutureResult", 1).unwrap();
         native_future_result_init(ctx, &[Value::Object(Some(fr))]).unwrap();
         let fut = match native_future_result_get_future(ctx, &[Value::Object(Some(fr))])
             .unwrap()
@@ -2781,7 +2781,7 @@ mod tests {
         let mut ctx = mock_ctx();
         let (fr, fut) = new_future(&mut ctx);
         // Build a synthetic IOException with a message field.
-        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/io/IOException", 2)?;
+        let exc = try_alloc_concurrent_synthetic(&mut ctx, "java/io/IOException", 2).unwrap();
         let msg = ctx.create_string("disk full");
         ctx.set_field(exc, 0, Value::Object(Some(msg)));
         native_future_result_set_exception(
@@ -2856,7 +2856,7 @@ mod tests {
         // Build a synthetic Notifier object. Our invoke() in MockNativeContext
         // always returns Ok(None) without dispatching, so we test the
         // wiring by observing the notifier list before/after completion.
-        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1)?;
+        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         // addNotifier while still WAITING → should stash.
         native_iof_add_notifier(
             &mut ctx,
@@ -2885,7 +2885,7 @@ mod tests {
 
         // addNotifier AFTER completion → fires synchronously (and the
         // list stays empty).
-        let n2 = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1)?;
+        let n2 = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         native_iof_add_notifier(
             &mut ctx,
             &[
@@ -3081,7 +3081,7 @@ mod tests {
             Arc::new(OptionMapInner {
                 entries: Mutex::new(entries),
             }),
-        );
+        ).unwrap();
 
         let got = native_option_map_get_bool(
             &mut ctx,
@@ -3112,7 +3112,7 @@ mod tests {
     fn t19_7_e_gc_scan_reports_pending_notifier_and_attachment() {
         let mut ctx = mock_ctx();
         let (_fr, fut) = new_future(&mut ctx);
-        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1)?;
+        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         let attachment = ctx.create_string("att");
         // addNotifier while WAITING stashes (notifier, attachment).
         native_iof_add_notifier(
@@ -3162,7 +3162,7 @@ mod tests {
     fn t19_7_e_gc_remap_repoints_notifier_attachment_and_result() {
         let mut ctx = mock_ctx();
         let (fr, fut) = new_future(&mut ctx);
-        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1)?;
+        let notifier = try_alloc_concurrent_synthetic(&mut ctx, "org/xnio/IoFuture$Notifier", 1).unwrap();
         let attachment = ctx.create_string("att");
         native_iof_add_notifier(
             &mut ctx,

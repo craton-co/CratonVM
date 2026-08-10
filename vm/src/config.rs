@@ -644,16 +644,23 @@ pub enum AotMode {
 /// `skip_verification`, which the verifier dispatcher in `vm/src/vm/vm_util.rs`
 /// reads.
 ///
-/// **`All` is not implemented.** This field is written at CLI parse time and
-/// never read: the dispatcher branches on `skip_verification`, and whether a
-/// boot class is skipped is decided by `verifier_skip_eligible(&Class)`, which
-/// takes no configuration and so cannot observe this mode.
-/// `classloading::bytecode_verifier::verify_bytecode_strict` — documented as the
-/// `-Xverify:all` entry point — has no production caller. `Remote` and `All`
-/// therefore behave identically, which is why the launcher warns when `All` is
-/// requested rather than accepting it silently. Wiring it up would turn strict
-/// typestate verification on for the whole JDK boot image; that is a product
-/// decision with real regression surface, not a mechanical change.
+/// `All` is propagated to `ClassManager::set_strict_verification` at VM init
+/// (`vm_init`, before any class is loaded) and withdraws three shortcuts:
+///
+/// * `bytecode_verifier::class_is_bootstrap_trusted` stops earning the lenient
+///   branch-target path, so the boot image is checked against the spec-literal
+///   JVMS §4.10.1 rule via `verify_bytecode_strict` — which is what that
+///   function was documented as being for, and now actually is;
+/// * `class_manager`'s `defer_loader_sensitive_pass3` stops withholding the
+///   Pass-3 type-state verdict for user-loader classes, i.e. for every
+///   Spring / Tomcat / H2 application class;
+/// * `vm_util::verifier_skip_eligible` stops skipping link-time Pass 2 for
+///   bootstrap classes.
+///
+/// This is genuinely stricter than the default and can reject class files
+/// HotSpot's own `-Xverify:all` also rejects, plus — until the verifier's
+/// remaining gaps close — some it does not. That is the point of the flag, and
+/// it is why `Remote` remains the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum XverifyMode {
     /// Equivalent to `-Xverify:none` / `-noverify`.
@@ -1098,21 +1105,33 @@ impl VmConfig {
     /// Parse an `--add-exports` or `--add-opens` value:
     /// `"module/package=target_module"`.
     ///
-    /// `target_module` may be `ALL-UNNAMED` (the JDK convention), which we
-    /// store as an empty string (our unnamed-module sentinel).
-    /// Multiple targets can be comma-separated.
+    /// `target_module` may be `ALL-UNNAMED` (the JDK convention). It is passed
+    /// through **verbatim**, not folded into the empty string: the empty string
+    /// is `ModuleRegistry`'s *unqualified* marker — open to every module in the
+    /// process — and `ALL-UNNAMED` opens to the unnamed module only.
+    /// `ModuleRegistry::add_opens` resolves the token
+    /// (`classloading::module::ALL_UNNAMED_TARGET`).
+    ///
+    /// Folding it here was a real over-grant, measured 2026-08-09 by
+    /// `probes/AddOpensFlagProbe.java` against Temurin 25: under
+    /// `--add-opens=java.base/java.net=ALL-UNNAMED`, HotSpot answers
+    /// `Module.isOpen("java.net")` **false** and CratonVM answered **true**,
+    /// and any *named* module got the deep-reflection grant along with the
+    /// unnamed one. Same conflation the `Module.addOpens(String, Module)`
+    /// native already had to fix with its own sentinel — see
+    /// `native-builtins/.../reflect_invoke.rs`'s `UNRESOLVED_TARGET_MODULE`.
+    ///
+    /// Note this is deliberately NOT symmetric with `parse_add_reads`, which
+    /// does map `ALL-UNNAMED` to the empty string: a *read* edge names a source
+    /// module rather than a target set, and `""` is the unnamed module's own
+    /// name there, not a wildcard.
     pub fn parse_add_exports(s: &str) -> Option<(String, String, String)> {
         let (left, target) = s.split_once('=')?;
         let (module, pkg) = left.split_once('/')?;
-        let target = if target.trim() == "ALL-UNNAMED" {
-            String::new()
-        } else {
-            target.trim().to_string()
-        };
         Some((
             module.trim().to_string(),
             pkg.trim().replace('.', "/"),
-            target,
+            target.trim().to_string(),
         ))
     }
 }
@@ -2216,13 +2235,17 @@ mod tests {
 
     #[test]
     fn parse_add_exports_all_unnamed() {
+        // `ALL-UNNAMED` survives parsing verbatim. Collapsing it to `""` here
+        // is what made `--add-opens ...=ALL-UNNAMED` an unqualified open, so
+        // this assertion is the guard on the over-grant, not a formatting
+        // preference: `""` is `ModuleRegistry`'s open-to-everyone marker.
         let result = VmConfig::parse_add_exports("java.base/java.lang=ALL-UNNAMED");
         assert_eq!(
             result,
             Some((
                 "java.base".to_string(),
                 "java/lang".to_string(),
-                String::new()
+                "ALL-UNNAMED".to_string()
             ))
         );
     }

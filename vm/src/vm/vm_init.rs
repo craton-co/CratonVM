@@ -1031,6 +1031,13 @@ impl SharedVm {
         // this repo has already paid for process-global native state leaking
         // across VM instances more than once.
         class_manager.set_compatibility_mode(config.compatibility_mode);
+        // `-Xverify:all`. Same placement rule as the line above: before any
+        // class is loaded, so no class escapes the policy it was started under.
+        // `XverifyMode::None` is carried by `skip_verification` (which the
+        // dispatcher in `vm_util` reads) and `Remote` is the default, so `All`
+        // is the only mode this line has to say anything about.
+        class_manager
+            .set_strict_verification(config.xverify_mode == crate::config::XverifyMode::All);
         let native_shim_selection =
             cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(|resource| {
                 class_manager.application_contains_resource(resource)
@@ -3375,6 +3382,7 @@ impl SharedVm {
                 class_mirrors_reverse: RwLock::new(FxHashMap::default()),
                 initiating_resolution_cache: RwLock::new(FxHashMap::default()),
                 lambda_proxies: RwLock::new(FxHashMap::default()),
+                lambda_impl_owner_memo: RwLock::new(FxHashMap::default()),
                 lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
                 next_lambda_id: AtomicU32::new(0x8000_0000),
                 primitive_mirrors: RwLock::new(FxHashMap::default()),
@@ -15279,6 +15287,42 @@ mod tests {
         assert_ne!(
             a.vm_identity, b.vm_identity,
             "two concurrently-live VMs must not share a vm_identity"
+        );
+    }
+
+    /// `-Xverify:all` reaches the class manager.
+    ///
+    /// The verifier's own behaviour under the flag is pinned by
+    /// `bytecode_verifier::tests::xverify_all_makes_a_trusted_class_reject_what_remote_accepts`.
+    /// What THAT test cannot see is the wire: `XverifyMode::All` spent its whole
+    /// life being parsed, stored on `VmConfig`, and read by nobody. This asserts
+    /// the one hop that made it inert — config to `ClassManager` — on a really
+    /// booted VM, and that the default is still `remote`.
+    ///
+    /// Per-VM, not process-global: two live VMs must be able to disagree, which
+    /// is also what makes this test safe to run beside every other VM-building
+    /// test in this binary.
+    #[test]
+    fn xverify_all_reaches_the_class_manager_and_only_that_vm() {
+        let strict = SharedVm::new(
+            VmConfig::default().with_xverify_mode(crate::config::XverifyMode::All),
+        );
+        let lenient = SharedVm::new(VmConfig::default());
+        assert!(
+            strict
+                .classes
+                .class_manager
+                .read()
+                .strict_verification(),
+            "-Xverify:all must arrive at the class manager, or the flag is inert              again — which is exactly the state it was in before being wired"
+        );
+        assert!(
+            !lenient
+                .classes
+                .class_manager
+                .read()
+                .strict_verification(),
+            "the default is -Xverify:remote, and a second live VM must not              inherit the first's policy"
         );
     }
 

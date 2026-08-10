@@ -1247,6 +1247,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
             );
         }
         cratonvm_types::mirror_pin::add_mirror_pin(
+            shared.vm_identity,
             loader.as_ptr() as usize,
             mirror.as_ptr() as usize,
         );

@@ -4071,7 +4071,7 @@ fn implements_smart_class_loader(
         if !seen.insert(cid.as_u32()) {
             continue;
         }
-        if ctx.class_name_of_id(cid).as_deref() == Some(SMART_CLASS_LOADER_IFACE) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(SMART_CLASS_LOADER_IFACE) {
             return true;
         }
         for iface in ctx.class_interfaces(cid) {

@@ -845,6 +845,20 @@ fn register_handle(h: NetSocketHandle) -> i32 {
 /// The Java `Socket` remains logically closed after this handoff: its original
 /// registry entry is replaced with `Closed`, while the returned `TcpStream`
 /// owns a duplicated OS handle when another transient Arc still exists.
+///
+/// THE STREAM IS RETURNED IN BLOCKING MODE. `NioSocketImpl` implements
+/// `SO_TIMEOUT` by configuring the fd non-blocking and polling around it, so a
+/// perfectly ordinary client `Socket` — the shape Apache HttpClient hands to
+/// `SSLSocketFactory.createSocket(Socket, host, port, autoClose)` for a
+/// layered TLS upgrade — arrives here non-blocking. The rustls handshake that
+/// takes ownership next is synchronous: it calls `read_tls` and expects it to
+/// wait. Handing it a non-blocking socket instead surfaced the very first
+/// handshake read as an error, which reached Java as
+/// `SSLHandshakeException: handshake read: ... (os error 10035)` on Windows
+/// (`WSAEWOULDBLOCK`) and `os error 11` (`EAGAIN`) on Unix. Restoring blocking
+/// mode is the handoff's job because the new owner has no other way to know
+/// what mode it inherited, and the fd is retired from this registry here
+/// anyway — nothing else will ever consult the non-blocking record again.
 pub fn take_stream_for_tls(fd: i32) -> Result<TcpStream, String> {
     let stream = {
         let mut map = net_sockets().write();
@@ -857,9 +871,14 @@ pub fn take_stream_for_tls(fd: i32) -> Result<TcpStream, String> {
             None => return Err(format!("Net fd {fd:#x} is not registered")),
         }
     };
-    Arc::try_unwrap(stream)
+    net_pending_nonblocking().write().remove(&fd);
+    let stream = Arc::try_unwrap(stream)
         .or_else(|shared| shared.try_clone())
-        .map_err(|e| format!("clone Net fd {fd:#x} for TLS: {e}"))
+        .map_err(|e| format!("clone Net fd {fd:#x} for TLS: {e}"))?;
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| format!("restore blocking mode on Net fd {fd:#x} for TLS: {e}"))?;
+    Ok(stream)
 }
 
 fn close_net_fd(fd: i32) {
@@ -2595,6 +2614,7 @@ mod sockopt_sys {
 
     pub(super) const SOL_SOCKET: i32 = libc::SOL_SOCKET as i32;
     pub(super) const SO_LINGER: i32 = libc::SO_LINGER as i32;
+    pub(super) const SO_REUSEADDR: i32 = libc::SO_REUSEADDR as i32;
     pub(super) const IPPROTO_IP: i32 = 0;
     pub(super) const IP_MULTICAST_TTL: i32 = libc::IP_MULTICAST_TTL as i32;
     pub(super) const IP_MULTICAST_LOOP: i32 = libc::IP_MULTICAST_LOOP as i32;
@@ -2657,6 +2677,7 @@ mod sockopt_sys {
     // generated with these on Windows, so this is what arrives from Java.
     pub(super) const SOL_SOCKET: i32 = 0xffff;
     pub(super) const SO_LINGER: i32 = 0x0080;
+    pub(super) const SO_REUSEADDR: i32 = 0x0004;
     pub(super) const IPPROTO_IP: i32 = 0;
     pub(super) const IP_MULTICAST_TTL: i32 = 10;
     pub(super) const IP_MULTICAST_LOOP: i32 = 11;
@@ -2719,6 +2740,7 @@ mod sockopt_sys {
 
     pub(super) const SOL_SOCKET: i32 = 1;
     pub(super) const SO_LINGER: i32 = 13;
+    pub(super) const SO_REUSEADDR: i32 = 2;
     pub(super) const IPPROTO_IP: i32 = 0;
     pub(super) const IP_MULTICAST_TTL: i32 = 33;
     pub(super) const IP_MULTICAST_LOOP: i32 = 34;
@@ -2794,6 +2816,48 @@ fn with_net_raw_socket<R>(fd: i32, f: impl FnOnce(sockopt_sys::RawSock) -> R) ->
 /// `SO_LINGER` is a `struct linger`, not an int — see `Net.c`.
 fn opt_is_linger(level: i32, opt: i32) -> bool {
     level == sockopt_sys::SOL_SOCKET && opt == sockopt_sys::SO_LINGER
+}
+
+/// Set `SO_REUSEADDR` on a live listener, and read it back from the OS.
+///
+/// `socket_channel.rs` owns the NIO `ServerSocketChannel` and has no raw-socket
+/// FFI of its own; this crate's only `getsockopt`/`setsockopt` shim lives here,
+/// so the two entry points are exposed rather than duplicated. Both take
+/// `&TcpListener` and go through `sockopt_sys::raw_of`, which is defined per
+/// platform with the matching `AsRawFd`/`AsRawSocket` bound, so no `#[cfg]` is
+/// needed at the call site.
+///
+/// Reading the value back from the socket rather than from a remembered copy is
+/// the point: `ServerSocketChannel.getOption(SO_REUSEADDR)` used to answer a
+/// recorded value (and, before a bind, a hardcoded `0`), which is how
+/// `setOption(true)` came to read back `false` with nothing in between to
+/// notice. See `docs/known-issues/springboot/serversocketchannel-binds-loopback-for-the-wildcard-and-drops-so-reuseaddr-20260810.md`.
+pub(crate) fn listener_set_reuseaddr(l: &TcpListener, on: bool) -> std::io::Result<()> {
+    let v: i32 = i32::from(on);
+    sockopt_sys::set_raw(
+        sockopt_sys::raw_of(l),
+        sockopt_sys::SOL_SOCKET,
+        sockopt_sys::SO_REUSEADDR,
+        &v.to_ne_bytes(),
+    )
+}
+
+/// Read `SO_REUSEADDR` back off a live listener. `None` when the platform shim
+/// cannot answer, so the caller can fall back to what Java asked for rather
+/// than inventing a `false`.
+pub(crate) fn listener_get_reuseaddr(l: &TcpListener) -> Option<bool> {
+    let mut buf = [0u8; 4];
+    let n = sockopt_sys::get_raw(
+        sockopt_sys::raw_of(l),
+        sockopt_sys::SOL_SOCKET,
+        sockopt_sys::SO_REUSEADDR,
+        &mut buf,
+    )
+    .ok()?;
+    if n == 0 {
+        return None;
+    }
+    Some(i32::from_ne_bytes(buf) != 0)
 }
 
 /// The two IPv4 multicast options are carried as a single `u_char` on Unix.

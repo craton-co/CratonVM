@@ -1430,7 +1430,7 @@ fn spring_configuration_cglib_display_name(
         return None;
     }
     let is_enhanced_configuration = ctx.class_interfaces(class_id).iter().any(|iface_id| {
-        ctx.class_name_of_id(*iface_id).as_deref() == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
+        ctx.class_name_arc_of_id(*iface_id).as_deref() == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
     });
     if !is_enhanced_configuration {
         return None;
@@ -2492,7 +2492,7 @@ pub(crate) fn class_for_name_one_arg_caller_loader(
 ) -> Option<ObjectRef> {
     for caller_cid in ctx.frame_class_ids() {
         if matches!(
-            ctx.class_name_of_id(caller_cid).as_deref(),
+            ctx.class_name_arc_of_id(caller_cid).as_deref(),
             Some("java/lang/Class")
         ) {
             continue;
@@ -3429,7 +3429,7 @@ pub(crate) fn loader_aware_reflect_assignable(
         return false;
     }
 
-    if ctx.class_name_of_id(source_class_id).as_deref() == Some(target_class_name) {
+    if ctx.class_name_arc_of_id(source_class_id).as_deref() == Some(target_class_name) {
         return true;
     }
 
@@ -3441,7 +3441,7 @@ pub(crate) fn loader_aware_reflect_assignable(
         // global copy.  The ids legitimately differ, but the superclass edge
         // is an exact loader-resolved relation.  Treat the matching binary
         // name as assignable just as the same-name receiver case above does.
-        if ctx.class_name_of_id(class_id).as_deref() == Some(target_class_name) {
+        if ctx.class_name_arc_of_id(class_id).as_deref() == Some(target_class_name) {
             return true;
         }
         queue.extend(ctx.class_interfaces(class_id));
@@ -3458,7 +3458,7 @@ pub(crate) fn loader_aware_reflect_assignable(
             continue;
         }
         seen.push(iface_id);
-        if ctx.class_name_of_id(iface_id).as_deref() == Some(target_class_name) {
+        if ctx.class_name_arc_of_id(iface_id).as_deref() == Some(target_class_name) {
             return true;
         }
         queue.extend(ctx.class_interfaces(iface_id));
@@ -5403,7 +5403,7 @@ pub(crate) fn accessible_override_is_set(ctx: &dyn NativeContext, obj: ObjectRef
         }
     }
     match ctx
-        .class_name_of_id(ctx.class_id_of_object(obj))
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
         .as_deref()
     {
         Some("java/lang/reflect/Field") => read_field_accessible(ctx, obj),
@@ -5420,6 +5420,44 @@ fn package_of_class_id(ctx: &dyn NativeContext, cid: ClassId) -> Option<String> 
         Some(i) => name[..i].to_string(),
         None => String::new(),
     })
+}
+
+/// JEP 181 nestmate test: do `a` and `b` belong to the same nest?
+///
+/// `Reflection.areNestMates(currentClass, memberClass)` is
+/// `currentClass.getNestHost() == memberClass.getNestHost()`, and a class with
+/// no `NestHost` attribute is its own nest host — which is exactly the shape
+/// [`NativeContext::nest_host_name`] reports (`None` == "I am my own host").
+///
+/// Compared by NAME plus defining loader, not by `ClassId`: `nest_host_name`
+/// answers with the attribute's class name, and resolving that name back to an
+/// id is the loader-ambiguous step this does not need to take. JVMS §5.4.4
+/// requires every nest member to be in the same run-time package as its host,
+/// so two classes with the same host NAME and the same defining loader are in
+/// the same nest; a name match across two different loaders is two distinct
+/// nests and must not be conflated.
+fn are_nestmates(ctx: &mut dyn NativeContext, a: ClassId, b: ClassId) -> bool {
+    if a == b {
+        return true;
+    }
+    if ctx.loader_id_of_class(a) != ctx.loader_id_of_class(b) {
+        return false;
+    }
+    let host_a = match ctx.nest_host_name(a) {
+        Some(n) => n,
+        None => match ctx.class_name_of_id(a) {
+            Some(n) => n,
+            None => return false,
+        },
+    };
+    let host_b = match ctx.nest_host_name(b) {
+        Some(n) => n,
+        None => match ctx.class_name_of_id(b) {
+            Some(n) => n,
+            None => return false,
+        },
+    };
+    host_a == host_b
 }
 
 /// Would the current caller reach a member with these `modifiers`, declared by
@@ -5470,13 +5508,44 @@ pub(crate) fn verify_member_access(
     {
         return false;
     }
-    // Modifier half (JLS 6.6.1).
-    if (modifiers & SA_ACC_PUBLIC) != 0 {
-        return (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) != 0;
+    // Class half (JLS 6.6.1's first clause, `Reflection.verifyMemberAccess`'s
+    // `if (!Modifier.isPublic(getClassAccessFlags(memberClass)))` block). This
+    // runs BEFORE any member modifier is consulted and it asks ONE question:
+    // when the declaring class is not public, is the caller in its runtime
+    // package? A non-public declaring class is not a denial by itself — it is
+    // a denial only from another package.
+    //
+    // Previously the public-member arm answered `class is public` directly,
+    // which refused a `public static` member of a package-private class from a
+    // class in the SAME package. `jakarta.el.TestStaticFieldELResolver`'s
+    // `testGetValue09`/`testGetType09` are the witness: the enum constant
+    // `MethodUnderTest.GET_TYPE` is `public static final` on a *private nested*
+    // enum, and `jakarta.el.Util.canAccess(null, field)` answered `false` while
+    // `Field.get(null)` — which asks the same question through
+    // `public_member_class_is_reachable`, and asks it correctly — answered with
+    // the value. `StaticFieldELResolver.getValue` consults `canAccess`, so the
+    // disagreement surfaced as `PropertyNotFoundException` with a null cause.
+    // See docs/internal/tomcat/teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
+    let declaring_is_public =
+        (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) != 0;
+
+    // A public member of a public class needs no package at all, and it is the
+    // overwhelmingly common answer. `package_of_class_id` allocates two Strings
+    // per call, and `jakarta.el.Util.canAccess` sits on EL's method-resolution
+    // path — computing the package before this test made every EL invocation
+    // pay for a question it never asks.
+    if declaring_is_public && (modifiers & SA_ACC_PUBLIC) != 0 {
+        return true;
     }
-    if (modifiers & SA_ACC_PRIVATE) != 0 {
-        return false;
-    }
+
+    // Package NAME only, deliberately, and not `Reflection.isSameClassPackage`'s
+    // name-plus-defining-loader pair. This is the same comparison the sibling
+    // gate `public_member_class_is_reachable` (the one `Field.get` asks) already
+    // makes, and the two must not disagree — that disagreement is the whole
+    // defect this reordering fixes. Two classes sharing a package NAME under
+    // different loaders are distinct run-time packages to HotSpot and would be
+    // refused there; tightening both gates together needs its own witness, so
+    // it is not done here.
     let same_package = match (
         package_of_class_id(ctx, caller_id),
         package_of_class_id(ctx, declaring_id),
@@ -5484,6 +5553,23 @@ pub(crate) fn verify_member_access(
         (Some(a), Some(b)) => a == b,
         _ => false,
     };
+    if !declaring_is_public && !same_package {
+        return false;
+    }
+
+    // Modifier half (JLS 6.6.1). The caller can reach the declaring class
+    // itself by the time we get here, so a public member is reachable.
+    if (modifiers & SA_ACC_PUBLIC) != 0 {
+        return true;
+    }
+    if (modifiers & SA_ACC_PRIVATE) != 0 {
+        // JEP 181: a private member is reachable from a NESTMATE, which is how
+        // an outer class reaches its nested class's private members (and vice
+        // versa) without `setAccessible`. `Reflection.verifyMemberAccess` runs
+        // exactly this test (`areNestMates`) before falling through to the
+        // package/protected arms, and a private member never reaches those.
+        return are_nestmates(ctx, caller_id, declaring_id);
+    }
     if same_package {
         return true;
     }
@@ -6957,7 +7043,7 @@ fn synthetic_declared_field_alias(
     ctx: &dyn NativeContext,
     class_id: ClassId,
 ) -> Option<FieldMetadata> {
-    match ctx.class_name_of_id(class_id).as_deref() {
+    match ctx.class_name_arc_of_id(class_id).as_deref() {
         Some("java/util/Collections$UnmodifiableMap" | "cratonvm/internal/UnmodifiableMap") => {
             Some(FieldMetadata {
                 name: "m".to_string(),
@@ -8616,7 +8702,7 @@ pub(crate) fn native_method_invoke(
         // including array receivers) is exempt.
         if let Some(declaring_id) = mirror_class_id(ctx, declaring_mirror) {
             let declaring_is_object =
-                ctx.class_name_of_id(declaring_id).as_deref() == Some("java/lang/Object");
+                ctx.class_name_arc_of_id(declaring_id).as_deref() == Some("java/lang/Object");
             if !declaring_is_object {
                 let is_instance = matches!(
                     native_class_is_instance(
@@ -13307,7 +13393,7 @@ fn is_annotation_type(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
         return true;
     }
     ctx.class_interfaces(class_id).into_iter().any(|i| {
-        ctx.class_name_of_id(i).as_deref() == Some("java/lang/annotation/Annotation")
+        ctx.class_name_arc_of_id(i).as_deref() == Some("java/lang/annotation/Annotation")
     })
 }
 
@@ -14365,7 +14451,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 };
                 if sentinel_index.is_none() {
                     if let Value::Object(Some(o)) = v_cur {
-                        if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                        if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                             == Some("java/lang/TypeNotPresentException")
                         {
                             sentinel_index = Some(i);
@@ -17652,7 +17738,7 @@ pub(crate) fn unnamed_module_for_loader(
     // constructor already built its unnamed module hands back THAT object.
     if let Value::Object(Some(existing)) = ctx.get_field_by_name(loader, "unnamedModule") {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(existing))
+            .class_name_arc_of_id(ctx.class_id_of_object(existing))
             .as_deref()
             == Some("java/lang/Module")
         {
@@ -18184,7 +18270,7 @@ fn class_is_declared_enum(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
         return parent_id == enum_id;
     }
     matches!(
-        ctx.class_name_of_id(parent_id).as_deref(),
+        ctx.class_name_arc_of_id(parent_id).as_deref(),
         Some("java/lang/Enum")
     )
 }
@@ -21079,7 +21165,7 @@ mod tests {
             exceptions: Vec::new(),
             signature: None,
         };
-        let method = create_method_object(&mut ctx, &meta);
+        let method = create_method_object(&mut ctx, &meta).unwrap();
         ctx.set_method_return_type_annotations(
             owner,
             "nullableReturn",
@@ -21114,7 +21200,7 @@ mod tests {
             exceptions: Vec::new(),
             signature: None,
         };
-        let method = create_method_object(&mut ctx, &meta);
+        let method = create_method_object(&mut ctx, &meta).unwrap();
         ctx.set_method_parameter_type_annotations(
             owner,
             "nullableParameter",
@@ -23059,7 +23145,7 @@ mod tests {
             signature: None,
         };
 
-        let method_obj = create_method_object(&mut ctx, &meta);
+        let method_obj = create_method_object(&mut ctx, &meta).unwrap();
 
         // getDeclaringClass в†’ returns the String class mirror (name
         // "java/lang/String"), NOT java/lang/Object.
@@ -23851,7 +23937,7 @@ Implementation-Title: opensaml-core-api\r\n\
     fn t19_h10_alloc_byte_array_input_stream_layout() {
         let mut ctx = mock_ctx();
         let bytes = b"hello".to_vec();
-        let stream = t19_h10_alloc_byte_array_input_stream(&mut ctx, &bytes);
+        let stream = t19_h10_alloc_byte_array_input_stream(&mut ctx, &bytes).unwrap();
         let count = ctx.get_field(stream, 3).as_int().unwrap_or(-1);
         assert_eq!(count, 5);
         let pos = ctx.get_field(stream, 1).as_int().unwrap_or(-1);
@@ -24398,7 +24484,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         let v = ctx.get_field_by_name(m, "exceptionTypes");
         match v {
@@ -24430,7 +24516,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         let v = ctx.get_field_by_name(m, "parameterTypes");
         match v {
@@ -24522,7 +24608,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         for field in &["annotations", "parameterAnnotations", "annotationDefault"] {
             match ctx.get_field_by_name(m, field) {
@@ -24641,7 +24727,7 @@ Implementation-Title: opensaml-core-api\r\n\
         // what provides that; exercise it directly, since the mock context has
         // no classpath to drive the synthesis path.
         let mut ctx = mock_ctx();
-        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo");
+        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo").unwrap();
         let handle = ctx.add_global_root(pkg);
         defined_package_memo()
             .lock()
@@ -24791,7 +24877,7 @@ Implementation-Title: opensaml-core-api\r\n\
         ctx.set_superclass(iface_cid, object_cid);
         ctx.set_is_interface(iface_cid, true);
 
-        let methods = collect_public_methods(&mut ctx, iface_cid);
+        let methods = collect_public_methods(&mut ctx, iface_cid).unwrap();
         // Only `doIt` from the interface вЂ” Object methods are skipped.
         let n = ctx.array_length(methods);
         assert_eq!(
@@ -24847,7 +24933,7 @@ Implementation-Title: opensaml-core-api\r\n\
             ],
         );
 
-        let methods = collect_public_methods(&mut ctx, child);
+        let methods = collect_public_methods(&mut ctx, child).unwrap();
         let mut closes = Vec::new();
         let mut shutdowns = Vec::new();
         for i in 0..ctx.array_length(methods) {

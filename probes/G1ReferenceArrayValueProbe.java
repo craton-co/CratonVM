@@ -9,18 +9,29 @@ import java.util.stream.*;
  * a generic value store, and the generational heap has always honoured that by
  * auto-boxing into a one-field wrapper and un-boxing on read.
  *
- * G1 had neither half: its encoder wrote `0` for any non-reference value. The
- * stream pipeline is the loudest victim, because `mapToLong`/`mapToDouble`
- * collect primitives into exactly such an array:
+ * G1 had neither half: its encoder wrote `0` for any non-reference value.
+ * ZGC-real had the write half and no read half, so the same store came back as
+ * the *wrapper object* rather than as zero. The stream pipeline is the loudest
+ * victim of both, because `mapToLong`/`mapToDouble` collect primitives into
+ * exactly such an array:
  *
  *   stream.mapToDouble(Double::doubleValue).toArray()
  *     default collector -> [1.0, 2.5, 3.75, 100.0]
  *     -XX:+UseG1GC      -> [0.0, 0.0, 0.0, 0.0]
+ *     -XX:+UseZGC       -> [0.0, 0.0, 0.0, 0.0], and `boxed()` yields objects
+ *                          that print as `?@2` — the un-named wrapper class
+ *                          leaking into Java, which also surfaced as
+ *                          `ClassCastException: ? cannot be cast to ...`
  *
- * 4-byte elements (`mapToInt`) survived, which is what made this read as a
- * width bug rather than a missing arm.
+ * 4-byte elements (`mapToInt`) survived on both, which is what made this read
+ * as a width bug rather than a missing arm.
  *
  *   cratonvm --java-home $JDK25 -XX:+UseG1GC -c . G1ReferenceArrayValueProbe
+ *   cratonvm --java-home $JDK25 -XX:+UseZGC  -c . G1ReferenceArrayValueProbe
+ *
+ * (the ZGC arm needs a launcher built with `--features zgc`; without it
+ * `-XX:+UseZGC` falls back to the generational collector and the run is
+ * vacuous — check stderr for the "unsupported garbage collector" warning.)
  *
  * Broken build: `PROBE-FAILURES=<n>`. Fixed build: `PROBE-OK`. Deterministic,
  * unchanged by `--nojit`, and unchanged at a heap large enough that no
@@ -93,6 +104,33 @@ public class G1ReferenceArrayValueProbe {
         String[] refs = { "a", "b", "c" };
         List<String> got = Arrays.stream(refs).map(String::toUpperCase).collect(Collectors.toList());
         check("reference elements still round-trip", got.equals(List.of("A", "B", "C")), got);
+
+        // ZGC's half of the defect had a different face from G1's: the store
+        // side DID box, so the read handed the pipeline the wrapper object
+        // instead of zero. That leaks a class with no name into Java, which is
+        // what `?@2` and `ClassCastException: ? cannot be cast to ...` were.
+        // Assert on the CLASS, not just the value — a value check alone passes
+        // vacuously if some future backend boxes into a real `java.lang.Long`.
+        Object[] reboxed = Arrays.stream(new Long[] { 7L, 8L }).mapToLong(Long::longValue).boxed().toArray();
+        boolean classesOk = reboxed.length == 2;
+        for (Object o : reboxed) {
+            classesOk &= (o instanceof Long);
+        }
+        check("mapToLong.boxed elements are java.lang.Long",
+                classesOk && reboxed[0].equals(7L) && reboxed[1].equals(8L),
+                Arrays.toString(reboxed) + " classes="
+                        + (reboxed.length > 0 ? reboxed[0].getClass().getName() : "<empty>"));
+
+        // The same leak, reached through a cast rather than through toString.
+        long viaCast = -1L;
+        try {
+            Object one = Arrays.stream(new Long[] { 42L }).mapToLong(Long::longValue).boxed().findFirst().orElse(null);
+            viaCast = ((Long) one).longValue();
+        }
+        catch (ClassCastException ex) {
+            viaCast = -2L;
+        }
+        check("mapToLong.boxed element casts to Long", viaCast == 42L, viaCast);
 
         if (failures == 0) {
             System.out.println("PROBE-OK");

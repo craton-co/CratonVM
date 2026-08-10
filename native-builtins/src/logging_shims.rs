@@ -659,7 +659,7 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
         // `NoSuchMethodError` into whatever Java frame invoked the logging
         // native (observed killing the WildFly boot thread outright).
         let receiver_classed = matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(out)).as_deref(),
             Some(n) if n != "java/lang/Object"
         );
         // WildFly's `org.jboss.stdio` override streams REDIRECT stdout back
@@ -673,7 +673,7 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
         // output). Route framework records straight to the canonical fd-backed
         // stream for these redirect streams.
         let is_stdio_redirect = matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(out)).as_deref(),
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(out)).as_deref(),
             Some(n) if n.starts_with("org/jboss/stdio/")
         );
         if !is_canonical && receiver_classed && !is_stdio_redirect && depth < 2 {

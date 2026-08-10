@@ -7202,7 +7202,7 @@ mod wp02_tests {
             .ensure_class_initialized("java/lang/reflect/Constructor")
             .unwrap();
         let incoming =
-            create_constructor_object(&mut ctx, &mm("<init>", "()V", ACC_PUBLIC, target));
+            create_constructor_object(&mut ctx, &mm("<init>", "()V", ACC_PUBLIC, target)).unwrap();
         let target_mirror = ctx.get_class_mirror(target);
 
         let result = native_reflection_factory_new_constructor_for_serialization(
@@ -7270,6 +7270,7 @@ mod wp02_tests {
     fn osc_lookup_returns_non_null_for_serializable() {
         let (mut ctx, foo) = build_foo_ctx();
         let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
             .expect("lookup of a Serializable class must return a descriptor");
         // Slot 2 is field_count = 3 (a, b, c — skip is transient).
         assert_eq!(ctx.get_field(desc, 2), Value::Int(3));
@@ -7285,7 +7286,7 @@ mod wp02_tests {
     fn osc_lookup_returns_none_for_non_serializable() {
         let (mut ctx, _foo) = build_foo_ctx();
         let base = ctx.class_id_by_name("Base").unwrap();
-        let result = build_object_stream_class(&mut ctx, base, false);
+        let result = build_object_stream_class(&mut ctx, base, false).unwrap();
         assert!(
             result.is_none(),
             "lookup(non-Serializable) must return None"
@@ -7297,6 +7298,7 @@ mod wp02_tests {
         let (mut ctx, _foo) = build_foo_ctx();
         let base = ctx.class_id_by_name("Base").unwrap();
         let desc = build_object_stream_class(&mut ctx, base, true)
+            .unwrap()
             .expect("lookupAny must return a descriptor even for non-Serializable");
         // field_count == 0 for non-Serializable lookupAny.
         assert_eq!(ctx.get_field(desc, 2), Value::Int(0));
@@ -7306,7 +7308,9 @@ mod wp02_tests {
     #[test]
     fn osc_fields_are_in_declaration_order() {
         let (mut ctx, foo) = build_foo_ctx();
-        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         let arr = match ctx.get_field(desc, 6) {
             Value::Object(Some(a)) => a,
             other => panic!("expected fields[] array, got {:?}", other),
@@ -7333,8 +7337,12 @@ mod wp02_tests {
     #[test]
     fn osc_cache_identity_two_lookups_same_ref() {
         let (mut ctx, foo) = build_foo_ctx();
-        let d1 = build_object_stream_class(&mut ctx, foo, false).unwrap();
-        let d2 = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let d1 = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
+        let d2 = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         assert_eq!(
             d1, d2,
             "two lookup(cls) calls for the same class must return the same ObjectRef"
@@ -7378,7 +7386,9 @@ mod wp02_tests {
     #[test]
     fn osc_has_write_object_slot_set_when_present() {
         let (mut ctx, foo) = build_foo_ctx();
-        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         assert_eq!(ctx.get_field(desc, 4), Value::Int(1)); // has_write_object
         assert_eq!(ctx.get_field(desc, 5), Value::Int(0)); // has_read_object
     }
@@ -7386,7 +7396,9 @@ mod wp02_tests {
     #[test]
     fn osc_for_class_returns_class_mirror() {
         let (mut ctx, foo) = build_foo_ctx();
-        let desc = build_object_stream_class(&mut ctx, foo, false).unwrap();
+        let desc = build_object_stream_class(&mut ctx, foo, false)
+            .unwrap()
+            .expect("descriptor");
         let mirror_val = ctx.get_field(desc, 7);
         assert!(
             matches!(mirror_val, Value::Object(Some(_))),

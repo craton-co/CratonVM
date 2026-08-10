@@ -388,9 +388,11 @@ function Import-HotspotBaseline {
   foreach ($row in @(Import-Csv -Path $path -Delimiter "`t")) {
     if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
     $map["$($row.module)`t$($row.class)"] = [pscustomobject]@{
-      status = Get-RowStatus $row
-      failed = [int]([string]$row.failed -replace '[^0-9]', '' -replace '^$', '0')
-      tests  = [int]([string]$row.tests  -replace '[^0-9]', '' -replace '^$', '0')
+      status           = Get-RowStatus $row
+      failed           = [int]([string]$row.failed  -replace '[^0-9]', '' -replace '^$', '0')
+      tests            = [int]([string]$row.tests   -replace '[^0-9]', '' -replace '^$', '0')
+      aborted          = [int]([string]$row.aborted -replace '[^0-9]', '' -replace '^$', '0')
+      containersFailed = [int]([string]$row.containersFailed -replace '[^0-9]', '' -replace '^$', '0')
     }
   }
   # Say the size out loud: a baseline that silently loaded zero rows is
@@ -400,24 +402,93 @@ function Import-HotspotBaseline {
   return $map
 }
 
+# `hotspot-baseline-latest.tsv` is what `Import-HotspotBaseline` reads by
+# default, and every `-Vm hotspot` run used to blind-copy its own results over
+# it. That makes "latest" mean "most recent", not "best", so any ad-hoc
+# few-class HotSpot check destroys the coverage of a full-suite one: on
+# 2026-08-01 a 5-class run replaced an 81-class baseline, and the reclassifier
+# has been running against 5 irrelevant rows ever since -- which is one reason
+# host-caused Windows failures kept being attributed to CratonVM.
+#
+# Merge on `module + class` instead, newest row winning per key, so a narrow
+# rerun refreshes the classes it actually covered and leaves the rest standing.
+# Returns the resulting class count for the caller to log.
+function Merge-HotspotBaselineLatest {
+  param([string]$BaselineDir, [string]$ResultsPath)
+  $latest = Join-Path $BaselineDir 'hotspot-baseline-latest.tsv'
+  $fresh = @(Import-Csv -Path $ResultsPath -Delimiter "`t")
+  $merged = [ordered]@{}
+  if (Test-Path $latest) {
+    foreach ($row in @(Import-Csv -Path $latest -Delimiter "`t")) {
+      if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
+      $merged["$($row.module)`t$($row.class)"] = $row
+    }
+  }
+  foreach ($row in $fresh) {
+    if (-not ($row.PSObject.Properties.Name -contains 'class')) { continue }
+    $merged["$($row.module)`t$($row.class)"] = $row
+  }
+  # Write the file the same way every other results TSV in .suite/ is written --
+  # a header line plus tab-joined fields. `Export-Csv` would quote every field,
+  # and the free-text `note` column routinely contains quotes and tabs of its
+  # own, so round-tripping through it corrupts exactly the rows that carry the
+  # most diagnostic text. The fresh results file defines the current schema;
+  # older rows are projected onto it and any column they lack comes out empty.
+  $header = (Get-Content -Path $ResultsPath -TotalCount 1)
+  $columns = $header -split "`t"
+  $out = New-Object System.Collections.Generic.List[string]
+  $out.Add($header)
+  $i = 1
+  foreach ($row in $merged.Values) {
+    $fields = foreach ($col in $columns) {
+      if ($col -eq 'index') {
+        [string]$i
+      } else {
+        $v = ''
+        if ($row.PSObject.Properties.Name -contains $col) { $v = [string]$row.$col }
+        # A stray tab or newline in a note would shift every later column.
+        ($v -replace "`t", ' ') -replace "`r|`n", ' '
+      }
+    }
+    $out.Add(($fields -join "`t"))
+    $i++
+  }
+  Set-Content -Path $latest -Value $out -Encoding ascii
+  return $merged.Count
+}
+
 # Returns 'BOTH-FAIL' when the reference VM fails this class the same way or
 # worse, otherwise ''. Conservative on purpose:
 #
 #   * only a CratonVM `FAIL` is eligible. A CRASH/HANG/LOADFAIL is categorically
 #     worse than an assertion failure and must never be excused by one.
 #   * the baseline row must itself be `FAIL`, for the same reason in reverse.
-#   * CratonVM must not fail MORE tests than HotSpot did. If it fails 5 where
-#     HotSpot fails 2, three of those are ours and the row stays `FAIL`.
+#   * CratonVM must not come out WORSE than HotSpot on any counter the `FAIL`
+#     verdict is built from. If it fails 5 where HotSpot fails 2, three of
+#     those are ours and the row stays `FAIL`.
+#
+# That last rule has to cover every counter line ~883 tests, not just `failed`.
+# Comparing `failed` alone let a row where CratonVM aborted 5 tests and HotSpot
+# aborted 1 come out `BOTH-FAIL` on the strength of `0 -gt 0` being false --
+# four extra aborts excused by a reference VM that never had them. `aborted` and
+# `containersFailed` are what made `ApplicationTempTests` a `FAIL` in the first
+# place (`failed=0 aborted=1`), so they are exactly the counters that must be
+# compared for this class of row.
 #
 # Anything that does not qualify keeps its own status and gets the baseline
 # appended to its note, so a near-miss is visible rather than silently dropped.
 function Resolve-BothFailStatus {
-  param([object]$Baseline, [string]$Module, [string]$Class, [string]$Status, [int]$Failed)
+  param(
+    [object]$Baseline, [string]$Module, [string]$Class, [string]$Status,
+    [int]$Failed, [int]$Aborted, [int]$ContainersFailed
+  )
   if (-not $Baseline) { return '' }
   $row = $Baseline["$Module`t$Class"]
   if (-not $row) { return '' }
   if ($Status -ne 'FAIL' -or $row.status -ne 'FAIL') { return '' }
   if ($Failed -gt $row.failed) { return '' }
+  if ($Aborted -gt $row.aborted) { return '' }
+  if ($ContainersFailed -gt $row.containersFailed) { return '' }
   return 'BOTH-FAIL'
 }
 
@@ -426,7 +497,11 @@ function Get-BaselineNote {
   if (-not $Baseline) { return '' }
   $row = $Baseline["$Module`t$Class"]
   if (-not $row) { return '' }
-  return "hotspot-baseline: $($row.status) $($row.failed)/$($row.tests)"
+  $note = "hotspot-baseline: $($row.status) $($row.failed)/$($row.tests)"
+  if ($row.aborted -gt 0 -or $row.containersFailed -gt 0) {
+    $note += " aborted=$($row.aborted) containersFailed=$($row.containersFailed)"
+  }
+  return $note
 }
 
 # ---------------------------------------------------------------------------
@@ -795,23 +870,36 @@ function New-ProcessRecord {
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
 
+  # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
+  # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
+  # websocket -- reflective field reset in their web-server test fixtures, via
+  # @DirtiesUrlFactories -> ReflectionTestUtils.setField(URL.class, "factory", null)).
+  # This runner launches SbRunner directly instead of through Gradle's test task,
+  # so none of those per-module jvmArgs apply; without it those classes fail with
+  # "IllegalStateException: Unable to reset field", which is a harness gap, not a
+  # genuine VM behavior difference. Apply it universally -- opens are additive and
+  # harmless for modules that don't need it.
+  #
+  # "Universally" has to mean BOTH launch arms, and for three weeks it did not:
+  # the flag was added (948df715a, 2026-07-17) to the hotspot branch only,
+  # deliberately, because CratonVM did not enforce the module boundary at all and
+  # the flag was moot there. Commit 7c92363bd (2026-08-06) closed that
+  # encapsulation hole, and the same seven-plus classes that had always needed the
+  # flag on HotSpot started failing 100% on CratonVM -- a harness asymmetry that
+  # had been invisible only because the VM was wrong in a compensating direction.
+  # Keep the argument in one variable so a future arm cannot silently omit it. See
+  # docs/internal/fixed-suite-bugs/springboot/dirtiesurlfactories-craton-launcher-missing-add-opens-FIXED-20260809.md.
+  $addOpensJavaNet = '--add-opens=java.base/java.net=ALL-UNNAMED'
+
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
-    # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
-    # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
-    # websocket -- reflective field reset in their web-server test fixtures). This
-    # runner launches SbRunner directly instead of through Gradle's test task, so
-    # none of those per-module jvmArgs apply; without it those classes fail with
-    # "IllegalStateException: Unable to reset field" on real HotSpot too, which is
-    # a harness gap, not a genuine VM behavior difference. Apply it universally --
-    # opens are additive and harmless for modules that don't need it.
-    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '--add-opens=java.base/java.net=ALL-UNNAMED')
+    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', $addOpensJavaNet)
     if ($NoJit) { $args += '-Xint' }
     if ($LaunchSpec.kind -eq 'jar') { $args += @('-jar', $LaunchSpec.value, $class) }
     else { $args += @('-cp', $LaunchSpec.value, 'SbRunner', $class) }
   } else {
     $file = $ExePath
-    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap)
+    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap, $addOpensJavaNet)
     # The suite normally disables the VM watchdog because it owns the
     # per-class timeout.  Preserve that default, but let a caller provide a
     # real watchdog value through -CratonArgs for a diagnostic run.
@@ -893,7 +981,38 @@ function Complete-ProcessRecord {
     $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|SBRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
     if ($noteMatch.Success) { $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ') }
   }
-  if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
+  # Record how far the [moving-young] GC fallback escalated, because that count
+  # is what distinguishes the two very different rows that both surface as a
+  # 300s HANG:
+  #
+  #   * a handful of fallbacks is harmless -- FlywayAutoConfigurationTests hits
+  #     7 and still completes (496s standalone, 73/73);
+  #   * a count in the thousands is a death spiral -- the young free list
+  #     fragments until allocation fails. IntegrationAutoConfigurationTests
+  #     reaches #16384 and dies of OutOfMemoryError after 3.8 HOURS;
+  #     QuartzEndpointWebIntegrationTests reaches #4096 and does not finish in
+  #     2400s. Both pass in ~220-260s under `--nojit`, with zero fallbacks.
+  #
+  # Without this, all three read as "the class is slow, raise its timeout" --
+  # which is the wrong fix for the latter two and costs a multi-hour standalone
+  # rerun to discover. Same mechanism as the ZipContentTests OOM (512
+  # consecutive fallbacks, clean under `--nojit`).
+  $fallbacks = [regex]::Matches($combined, '\[moving-young\] fallback #(\d+)')
+  if ($fallbacks.Count -gt 0) {
+    $peak = 0
+    foreach ($m in $fallbacks) {
+      $n = [int]$m.Groups[1].Value
+      if ($n -gt $peak) { $peak = $n }
+    }
+    $reason = ''
+    $rm = [regex]::Match($combined, '\[moving-young\] fallback #\d+: reason=([a-z-]+)')
+    if ($rm.Success) { $reason = " $($rm.Groups[1].Value)" }
+    $gcNote = "moving-young-fallback peak=#$peak$reason"
+    $note = if ($note) { "$gcNote | $note" } else { $gcNote }
+  }
+  # Truncate AFTER the GC note is prepended, so a long exception string cannot
+  # push the fallback count out of the row.
+  if ($note.Length -gt 240) { $note = $note.Substring(0, 240) }
 
   # Reclassify a failure the reference VM shares, and in every other case still
   # record what HotSpot did, so a row that stayed FAIL despite a failing
@@ -901,7 +1020,7 @@ function Complete-ProcessRecord {
   if ($status -ne 'PASS' -and $status -ne 'EMPTY') {
     $baselineNote = Get-BaselineNote -Baseline $script:HotspotBaselineMap -Module $Record.module -Class $Record.class
     $bothFail = Resolve-BothFailStatus -Baseline $script:HotspotBaselineMap -Module $Record.module `
-      -Class $Record.class -Status $status -Failed $failed
+      -Class $Record.class -Status $status -Failed $failed -Aborted $aborted -ContainersFailed $containersFailed
     if ($bothFail) { $status = $bothFail }
     if ($baselineNote) { $note = if ($note) { "$note | $baselineNote" } else { $baselineNote } }
   }
@@ -1023,9 +1142,9 @@ function Invoke-Mode {
     $baselineBase = "hotspot-baseline-$run"
     Copy-Item -Path $results -Destination (Join-Path $baselineDir "$baselineBase.tsv") -Force
     Copy-Item -Path $summaryPath -Destination (Join-Path $baselineDir "$baselineBase.md") -Force
-    Copy-Item -Path $results -Destination (Join-Path $baselineDir 'hotspot-baseline-latest.tsv') -Force
     Copy-Item -Path $summaryPath -Destination (Join-Path $baselineDir 'hotspot-baseline-latest.md') -Force
-    Write-Info "baseline copied to $baselineDir\$baselineBase.tsv"
+    $latestCount = Merge-HotspotBaselineLatest -BaselineDir $baselineDir -ResultsPath $results
+    Write-Info "baseline copied to $baselineDir\$baselineBase.tsv; hotspot-baseline-latest.tsv now covers $latestCount classes"
   }
   Write-Info "DONE mode=$mode wall=${elapsed}s summary=$summaryPath"
 }

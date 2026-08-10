@@ -1471,7 +1471,7 @@ mod tests {
     use crate::test_utils::mock_ctx;
 
     fn make_charset(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
-        let cs = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1)?;
+        let cs = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/Charset", 1).unwrap();
         let n = ctx.create_string(name);
         ctx.set_field(cs, CHARSET_FIELD_NAME, Value::Object(Some(n)));
         cs
@@ -1509,7 +1509,7 @@ mod tests {
         // real-layout slot fallback is only for buffers whose state cannot be
         // read, not for a known empty remaining range.
         let mut ctx = mock_ctx();
-        let bb = alloc_byte_buffer(&mut ctx, b"ABCD");
+        let bb = alloc_byte_buffer(&mut ctx, b"ABCD").unwrap();
         ctx.set_field(bb, BUF_FIELD_POS, Value::Int(2));
         ctx.set_field(bb, BUF_FIELD_LIMIT, Value::Int(2));
         assert!(read_and_consume_bytebuffer(&mut ctx, bb).is_empty());
@@ -1610,7 +1610,7 @@ mod tests {
     /// Build a synthetic `CharsetEncoder` whose charset (slot 0) is `name`.
     fn make_encoder(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         let cs = make_charset(ctx, name);
-        let enc = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3)?;
+        let enc = try_alloc_concurrent_synthetic(ctx, "java/nio/charset/CharsetEncoder", 3).unwrap();
         ctx.set_field(enc, 0, Value::Object(Some(cs)));
         enc
     }
@@ -1641,8 +1641,8 @@ mod tests {
         // before it), and report UNDERFLOW — NOT substitute U+FFFD.
         let mut ctx = mock_ctx();
         let enc = make_encoder(&mut ctx, "UTF-8");
-        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800]);
-        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]);
+        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800]).unwrap();
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]).unwrap();
         // alloc_byte_buffer sets limit/pos to the data length (8) with pos 0;
         // that's the writable window we need.
         let r = native_encoder_encode(
@@ -1667,8 +1667,8 @@ mod tests {
         // mistakenly hold back a well-paired surrogate.
         let mut ctx = mock_ctx();
         let enc = make_encoder(&mut ctx, "UTF-8");
-        let cb = alloc_char_buffer(&mut ctx, &[0xD800, 0xDC00]); // U+10000
-        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]);
+        let cb = alloc_char_buffer(&mut ctx, &[0xD800, 0xDC00]).unwrap(); // U+10000
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]).unwrap();
         let r = native_encoder_encode(
             &mut ctx,
             &[
@@ -1694,8 +1694,8 @@ mod tests {
         // corrupting Tomcat's supplementary-char response body).
         let mut ctx = mock_ctx();
         let enc = make_encoder(&mut ctx, "UTF-8");
-        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800, 0xDC00]);
-        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 3]);
+        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800, 0xDC00]).unwrap();
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 3]).unwrap();
         let r = native_encoder_encode(
             &mut ctx,
             &[
@@ -1725,8 +1725,8 @@ mod tests {
         // can complete it, so it is genuinely MALFORMED (matches the JDK).
         let mut ctx = mock_ctx();
         let enc = make_encoder(&mut ctx, "UTF-8");
-        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800]);
-        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]);
+        let cb = alloc_char_buffer(&mut ctx, &[0x0041, 0xD800]).unwrap();
+        let bb = alloc_byte_buffer(&mut ctx, &[0u8; 8]).unwrap();
         let r = native_encoder_encode(
             &mut ctx,
             &[

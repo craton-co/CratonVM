@@ -4487,7 +4487,7 @@ fn native_construct_message_logger(
             // generic Object here fails the caller's typed checkcast.
             match ctx.new_object(&impl_name) {
                 Ok(Some(Value::Object(Some(o))))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                         == Some(impl_name.as_str()) =>
                 {
                     Value::Object(Some(o))

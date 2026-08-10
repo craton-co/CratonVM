@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-423 tokens.
+426 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -84,6 +84,7 @@ export inherited from a parent shell.
 | `aioobe3` | `CRATONVM_DBG_AIOOBE3` |
 | `altrace` | `CRATONVM_DBG_ALTRACE` |
 | `ann-proxy-dispatch-trace` | `CRATONVM_ANN_PROXY_DISPATCH_TRACE` |
+| `ann-proxy-prof` | `CRATONVM_DBG_ANN_PROXY_PROF` |
 | `ann-trace` | `CRATONVM_ANN_TRACE` |
 | `annproxy-wrap` | `CRATONVM_DBG_ANNPROXY_WRAP` |
 | `anonalloc` | `CRATONVM_DBG_ANONALLOC` |
@@ -272,6 +273,7 @@ export inherited from a parent shell.
 | `lambda` | `CRATONVM_DBG_LAMBDA` |
 | `lambda-dispatch` | `CRATONVM_DBG_LAMBDA_DISPATCH` |
 | `lambda-generic` | `CRATONVM_DBG_LAMBDA_GENERIC` |
+| `lambda-prof` | `CRATONVM_DBG_LAMBDA_PROF` |
 | `layout` | `CRATONVM_DBG_LAYOUT` |
 | `ldc-classref-trace` | `CRATONVM_LDC_CLASSREF_TRACE` |
 | `letsgo` | `CRATONVM_DBG_LETSGO` |
@@ -283,6 +285,7 @@ export inherited from a parent shell.
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
+| `load-transform-no-memo` | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` |
 | `logprov` | `CRATONVM_DBG_LOGPROV` |
 | `longroot` | `CRATONVM_DBG_LONGROOT` |
 | `lookup` | `CRATONVM_DBG_LOOKUP` |
@@ -489,7 +492,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_JIT`
 
-169 tokens.
+171 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -530,6 +533,8 @@ export inherited from a parent shell.
 | `enable-inline-new` | `CRATONVM_JIT_ENABLE_INLINE_NEW` |
 | `exc-table-c2` | `CRATONVM_JIT_NO_EXC_TABLE_C2` |
 | `force-c2` | `CRATONVM_JIT_FORCE_C2` |
+| `native-shadow-interface-blind` | `CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND` |
+| `native-shadow-caller-seal` | `CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL` |
 | `full-self-call-spill` | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` |
 | `gc-inert-selfrec` | `CRATONVM_JIT_GC_INERT_SELFREC` |
 | `getfield-helper` | `CRATONVM_JIT_GETFIELD_HELPER` |

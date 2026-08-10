@@ -6958,6 +6958,18 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|c| c.name.to_string())
     }
 
+    /// The whole point of the override: `Class::name` is already an
+    /// `Arc<str>`, so the answer is a refcount bump rather than the fresh
+    /// `String` the default (and `class_name_of_id`) allocates.
+    fn class_name_arc_of_id(&self, class_id: ClassId) -> Option<std::sync::Arc<str>> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| std::sync::Arc::clone(&c.name))
+    }
+
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
         self.shared.mem.heap.class_id_of(obj)
     }
@@ -10492,13 +10504,35 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
         // for the bug this produced in `keystore.rs`'s `store_id_by_identity`.
         //
-        // What remains here is now just a last-resort guard against a 0
-        // making it back out of the heap at all (it shouldn't, but this
-        // keeps the "never 0" contract airtight regardless).
-        match self.shared.mem.heap.identity_hash_code(obj) {
-            0 => i32::MAX,
-            h => h,
-        }
+        // A `0` from the heap is not "no hash yet" — it is "this object's mark
+        // word cannot hold one and nothing is displaced": the word is
+        // THIN_LOCKED (payload = owner + recursion) or INFLATED (payload = a
+        // monitor pointer) and the object had never been hashed before it got
+        // there. Mapping that to `i32::MAX` and returning was wrong twice over:
+        // every locked-then-hashed object answered the SAME value, and the
+        // answer CHANGED to a freshly minted one as soon as the lock was
+        // released and the word went back to NEUTRAL.
+        //
+        // A `HashMap` keyed by such an object then cannot find its own entry —
+        // `put` filed it under `i32::MAX`, `get` looks under the new hash — and
+        // re-putting the same key grows a second entry. That is how Spring
+        // Boot's `TomcatWebServer` lost the connectors it parks in a
+        // `Map<Service, Connector[]>` from inside `LifecycleBase.start()`
+        // (`synchronized` on that same `StandardService`), leaving
+        // `Tomcat.getConnector()` to fabricate a port-8080 connector on a
+        // running service. `probes/IdentityHashWhileLockedProbe.java` is the
+        // three-line repro.
+        //
+        // Inflate and displace the hash into the monitor instead — HotSpot's
+        // answer, and a stable one, since a live object's monitor is never
+        // deflated here. `java_identity_hash` also keeps the last-resort
+        // "never hand back 0" guard.
+        let heap = &self.shared.mem.heap;
+        let heap_answer = heap.identity_hash_code(obj);
+        self.shared
+            .threads
+            .monitors
+            .java_identity_hash(obj, heap_answer, || heap.next_identity_hash())
     }
 
     fn register_var_handle_root(&mut self, vh: ObjectRef) {
@@ -13358,7 +13392,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // its physical class name.
         let lock_class_name = if contended.is_none() {
             waiting.and_then(|object| {
-                (self.class_name_of_id(self.class_id_of_object(object)).as_deref()
+                (self.class_name_arc_of_id(self.class_id_of_object(object)).as_deref()
                     == Some("java/util/concurrent/CountDownLatch"))
                     .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
             })
@@ -19480,6 +19514,78 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
     }
 }
 
+/// Per-phase timing for [`annotation_proxy_dispatch_impl`], armed by
+/// `CRATONVM_DBG=ann-proxy-prof`.
+///
+/// Exists because reading one annotation attribute measures ~10.5 us on this VM
+/// against ~10 ns on HotSpot — 660-1000x, and 7x worse than any neighbouring
+/// reflection accessor in the same probe (`ReflProbe2`). Spring's annotation
+/// machinery reads attributes constantly, so this is the largest single
+/// per-operation gap found on that surface. Reading the source offers three
+/// candidate terms — the `runtime_var_os` flag read on the hot path, the
+/// per-element `read_java_string` materialisation used only to compare a name,
+/// and the dispatch into this function at all — and cannot rank them.
+///
+/// `walk` is the element-accessor tail; `total - walk` is the entry plus the
+/// match. `flagread` and `namecmp` are sub-phases *inside* `walk`, so
+/// `walk - flagread - namecmp` is the rest of the loop.
+pub(crate) mod ann_proxy_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static CALLS_WALK: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static WALK_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static FLAGREAD_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static NAMECMP_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) const REPORT_EVERY: u64 = 100_000;
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANN_PROXY_PROF").is_ok()
+        })
+    }
+
+    #[inline]
+    pub(crate) fn add(counter: &AtomicU64, ns: u64) {
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub(crate) fn report() {
+        let calls = CALLS.load(Ordering::Relaxed).max(1);
+        let walks = CALLS_WALK.load(Ordering::Relaxed).max(1);
+        eprintln!(
+            "[ANN-PROXY-PROF] calls={calls} walks={walks} | total={}ns/call \
+             walk={}ns/walk (flagread={} namecmp={} rest={})",
+            TOTAL_NS.load(Ordering::Relaxed) / calls,
+            WALK_NS.load(Ordering::Relaxed) / walks,
+            FLAGREAD_NS.load(Ordering::Relaxed) / walks,
+            NAMECMP_NS.load(Ordering::Relaxed) / walks,
+            WALK_NS
+                .load(Ordering::Relaxed)
+                .saturating_sub(FLAGREAD_NS.load(Ordering::Relaxed))
+                .saturating_sub(NAMECMP_NS.load(Ordering::Relaxed))
+                / walks,
+        );
+    }
+}
+
+/// `CRATONVM_ANN_PROXY_DISPATCH_TRACE`, latched.
+///
+/// Read from the annotation-proxy element walk, which is hot enough that a
+/// per-call environment lookup showed up as 21% of the dispatch. The flag
+/// surface is immutable once any flag has been read, so one answer per process
+/// is the whole truth.
+fn ann_proxy_dispatch_trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some()
+    })
+}
+
 /// Spec-compliant dispatcher for any method invoked on an annotation proxy.
 pub(crate) fn annotation_proxy_dispatch_impl(
     shared: &SharedVm,
@@ -19487,6 +19593,26 @@ pub(crate) fn annotation_proxy_dispatch_impl(
     method_name: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    // `CRATONVM_DBG=ann-proxy-prof` — see [`ann_proxy_prof`]. Reading one
+    // annotation attribute (`@Marker.value()`) measures ~10.5 us here against
+    // ~10 ns on HotSpot, and against ~1.5 us for `annotationType()`, which takes
+    // the same entry path but returns from the top of this match. That ~9 us
+    // gap is what these timers split.
+    let prof = ann_proxy_prof::on();
+    let prof_entry = prof.then(std::time::Instant::now);
+    struct AnnProfGuard(Option<std::time::Instant>);
+    impl Drop for AnnProfGuard {
+        fn drop(&mut self) {
+            let Some(t0) = self.0 else { return };
+            ann_proxy_prof::add(&ann_proxy_prof::TOTAL_NS, t0.elapsed().as_nanos() as u64);
+            let n = ann_proxy_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % ann_proxy_prof::REPORT_EVERY == 0 {
+                ann_proxy_prof::report();
+            }
+        }
+    }
+    let _ann_prof_guard = AnnProfGuard(prof_entry);
+
     match method_name {
         // InvocationHandler.invoke(Object proxy, Method method, Object[] args):
         // Under CRATONVM_REAL_ANNOTATIONS an annotation instance is a real
@@ -19591,6 +19717,19 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         _ => {}
     }
 
+    // Everything above returned from the match; reaching here means this is an
+    // ELEMENT ACCESSOR, the shape that measures ~9 us more than the fast arms.
+    let walk_start = prof.then(std::time::Instant::now);
+    struct AnnWalkGuard(Option<std::time::Instant>);
+    impl Drop for AnnWalkGuard {
+        fn drop(&mut self) {
+            let Some(t0) = self.0 else { return };
+            ann_proxy_prof::add(&ann_proxy_prof::WALK_NS, t0.elapsed().as_nanos() as u64);
+            ann_proxy_prof::CALLS_WALK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _ann_walk_guard = AnnWalkGuard(walk_start);
+
     // Element accessor: walk the parallel arrays for a matching name.
     let names_arr = match shared.mem.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
@@ -19600,9 +19739,19 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some()
-        && method_name == "value"
-    {
+    // This was `runtime_var_os(...).is_some() && method_name == "value"`, and
+    // `&&` evaluates left to right — so the env lookup ran on EVERY element
+    // access, not only on the traced one. `ann-proxy-prof` priced it at ~155 ns
+    // of a ~750 ns dispatch, 21% of the walk, to answer a question whose answer
+    // cannot change after startup. Latched once per process instead; the
+    // `method_name` test now runs first as well, so an unarmed run pays a
+    // string compare against a `bool` load.
+    let flagread_start = prof.then(std::time::Instant::now);
+    let trace_on = ann_proxy_dispatch_trace_on();
+    if let Some(t) = flagread_start {
+        ann_proxy_prof::add(&ann_proxy_prof::FLAGREAD_NS, t.elapsed().as_nanos() as u64);
+    }
+    if method_name == "value" && trace_on {
         let type_desc = match shared.mem.heap.get_field(proxy, 0) {
             Value::Object(Some(s)) => {
                 super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
@@ -19621,7 +19770,15 @@ pub(crate) fn annotation_proxy_dispatch_impl(
     let n = shared.mem.heap.array_length(names_arr);
     for i in 0..n {
         if let Ok(Value::Object(Some(name_ref))) = shared.mem.heap.get_array_element(names_arr, i) {
-            if let Some(name) = super::read_java_string(&shared.mem.heap, name_ref) {
+            // `read_java_string` materialises a whole Rust `String` (bulk array
+            // copy + UTF-8/UTF-16 decode + allocation) for a name we only ever
+            // compare. Timed separately because that is the obvious suspect.
+            let namecmp_start = prof.then(std::time::Instant::now);
+            let decoded = super::read_java_string(&shared.mem.heap, name_ref);
+            if let Some(t) = namecmp_start {
+                ann_proxy_prof::add(&ann_proxy_prof::NAMECMP_NS, t.elapsed().as_nanos() as u64);
+            }
+            if let Some(name) = decoded {
                 if name == method_name {
                     if let Ok(val) = shared.mem.heap.get_array_element(values_arr, i) {
                         // Deferred `TypeNotPresentException`: a Class-valued member
@@ -19670,7 +19827,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
     // `AnnotationDescription$ForLoadedAnnotation.getValue` NPEs on it, Spring's
     // `AnnotationsScanner` treats the annotation as absent), so name the
     // annotation and the member when the dispatch trace is on.
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() {
+    if trace_on {
         let type_desc = match shared.mem.heap.get_field(proxy, 0) {
             Value::Object(Some(s)) => {
                 super::read_java_string(&shared.mem.heap, s).unwrap_or_default()

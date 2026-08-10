@@ -1076,25 +1076,86 @@ static UNQUEUED_PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
 /// Entries are never freed. The table is bounded by the number of DISTINCT
 /// class names that appear at a type-check site in the program, not by the
 /// number of compilations.
+/// # Interning by (name, resolved target), not by name
+///
+/// A type-check site carries only a class NAME to the runtime helper, and the
+/// class dictionary is keyed by `(ClassLoaderId, name)` — so a name alone does
+/// not name a class. When two loaders each define `Foo`, resolving the site's
+/// name at run time picks a winner that may not be the copy the compiling
+/// method's own constant pool meant, and the helper then had to fall back to a
+/// loader-blind name walk to avoid refusing a cast the interpreter would pass.
+///
+/// The compiler already knows the answer: `cp_new_resolver` resolves the site's
+/// `CONSTANT_Class` entry through the compiling class's loader and hands back
+/// the exact `ClassId`. Interning by `(name, that id)` gives each resolved
+/// target its own pointer and records the id in [`TYPECHECK_TARGET_BY_SITE`],
+/// so the helper can compare identities instead of spelling. `None` — a site
+/// whose target was not loaded at compile time — keeps the old name-only
+/// identity and the old behaviour.
 static TYPECHECK_NAME_INTERN: std::sync::OnceLock<
-    parking_lot::Mutex<rustc_hash::FxHashSet<&'static str>>,
+    parking_lot::Mutex<rustc_hash::FxHashMap<Option<u32>, rustc_hash::FxHashSet<&'static str>>>,
 > = std::sync::OnceLock::new();
+
+/// `interned name pointer -> the `ClassId` that site's target resolved to at
+/// compile time`. Read by `vm::jit::helpers::jit_typecheck_resolve`.
+///
+/// Entries are never removed, for the same reason the intern table's are not:
+/// the pointer is leaked for the life of the process, so a row can never come
+/// to describe a different site.
+///
+/// A `ClassId` is per-VM, and this table is process-wide, so the reader must
+/// confirm the recorded id still names the site's class in *its* VM before
+/// trusting it — see the check in `jit_typecheck_resolve`.
+static TYPECHECK_TARGET_BY_SITE: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<usize, u32>>,
+> = std::sync::OnceLock::new();
+
+fn typecheck_target_table() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<usize, u32>> {
+    TYPECHECK_TARGET_BY_SITE.get_or_init(|| parking_lot::RwLock::new(Default::default()))
+}
 
 /// Intern `name` and return the stable `(ptr, len)` pair for it. Repeated calls
 /// with equal contents return the identical pointer, for the life of the
 /// process.
+///
+/// Equivalent to [`intern_typecheck_target`] with no resolved target: the site
+/// answers "I could not resolve this name at compile time".
 pub fn intern_typecheck_class_name(name: &str) -> (*const u8, usize) {
+    intern_typecheck_target(name, None)
+}
+
+/// Intern `name` under the identity of the `ClassId` its `CONSTANT_Class` entry
+/// resolved to through the compiling class's own loader.
+///
+/// Two loaders' same-named copies get two distinct pointers, so the per-thread
+/// memos keyed on that pointer stay exact, and the runtime helper recovers the
+/// resolved id with [`typecheck_target_for_site`].
+pub fn intern_typecheck_target(name: &str, target_class_id: Option<u32>) -> (*const u8, usize) {
     let table = TYPECHECK_NAME_INTERN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
     let mut table = table.lock();
-    let interned: &'static str = match table.get(name) {
+    let names = table.entry(target_class_id).or_default();
+    let interned: &'static str = match names.get(name) {
         Some(existing) => existing,
         None => {
             let leaked: &'static str = Box::leak(String::from(name).into_boxed_str());
-            table.insert(leaked);
+            names.insert(leaked);
+            if let Some(id) = target_class_id {
+                typecheck_target_table()
+                    .write()
+                    .insert(leaked.as_ptr() as usize, id);
+            }
             leaked
         }
     };
     (interned.as_ptr(), interned.len())
+}
+
+/// The `ClassId` the site whose class name lives at `name_ptr` resolved to at
+/// compile time, if it resolved at all.
+#[inline]
+pub fn typecheck_target_for_site(name_ptr: *const u8) -> Option<u32> {
+    let table = TYPECHECK_TARGET_BY_SITE.get()?;
+    table.read().get(&(name_ptr as usize)).copied()
 }
 
 /// Published bodies unmapped, and how many of those bypassed the retirement
@@ -7394,6 +7455,32 @@ pub enum JitIntrinsic {
     ArraycopyPrimitive,
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
+    // ===== INTRINSIC REGION BEGIN: SCOPED_MEMORY_UNALIGNED =====
+    // `jdk.internal.misc.ScopedMemoryAccess.get{Short,Char,Int,Long}Unaligned`
+    // over a `byte[]` base — the leaf every `HeapByteBuffer` scalar getter
+    // bottoms out in.
+    //
+    // Why here and not as a registered native: registering a native takes the
+    // method away from the JIT, and the whole `HeapByteBuffer.getShort()` chain
+    // above this leaf (`checkIndex`, `nextGetIndex`, `ix`, `byteOffset`) is
+    // already inlinable compiled code. Replacing that chain with a native
+    // funnel measured 6-12% SLOWER on `ZipContentTests` even though the
+    // accessor itself got 1.4-2.1x faster — see
+    // `known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+    // Intrinsifying only this leaf leaves every caller inlinable.
+    //
+    // The base is the buffer's backing array and the incoming offset already
+    // includes `ARRAY_DATA_OFFSET`, so the load is `[base + offset]`, byte-
+    // swapped when the caller asks for big-endian. Every guard failure — null
+    // base, non-array, non-`byte[]` element type, out-of-range offset — falls
+    // back to ordinary dispatch, which runs the registered native and reports
+    // exactly what the interpreter would.
+    ScopedMemoryGetShortUnaligned,
+    ScopedMemoryGetCharUnaligned,
+    ScopedMemoryGetIntUnaligned,
+    ScopedMemoryGetLongUnaligned,
+    // ===== INTRINSIC REGION END: SCOPED_MEMORY_UNALIGNED =====
+
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
     // java.lang.String access intrinsics (Phase 3a). The foundation waves
     // (commits 06bfac0 / 544cbea) added inline getfield + array-access
@@ -8226,6 +8313,20 @@ pub fn try_resolve_intrinsic(
         return Some((JitIntrinsic::ArraycopyPrimitive.as_entry(), 5, b'V'));
     }
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION BEGIN: SCOPED_MEMORY_UNALIGNED =====
+    // NOT MATCHED YET — deliberately. The `ScopedMemoryGet*Unaligned` variants
+    // are declared (see the enum) but nothing registers them, because the
+    // codegen arm that would emit their inline body does not exist yet.
+    // Registering a sentinel the codegen cannot emit is the one failure mode
+    // this matcher must never have: `try_compile` would push a `direct_calls`
+    // entry whose `entry` no arm recognises.
+    //
+    // The design and the measurement that motivates it are on the enum
+    // variants. What has to be true before this is switched on is written
+    // there too, and one claim in it is NOT yet verified — see
+    // `known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+    // ===== INTRINSIC REGION END: SCOPED_MEMORY_UNALIGNED =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
     // java.lang.String access intrinsics (length/charAt/isEmpty/hashCode).
@@ -12301,6 +12402,123 @@ pub fn take_jit_bail_site() -> Option<(&'static str, u32, u32)> {
     JIT_BAIL_SITE.with(|c| c.take())
 }
 
+thread_local! {
+    /// The furthest stage of the compile pipeline this thread has entered for
+    /// the compile currently running.
+    ///
+    /// # Why this exists
+    ///
+    /// `jit-method-stats` reported `reason=unrecorded` for **26 of the top 30**
+    /// hot-but-permanently-interpreted methods on a Spring Boot context-startup
+    /// workload — the compiler was asked, refused, bail-listed the method for
+    /// the life of the process, and recorded nothing about why. Every bail that
+    /// goes through `jitc_bail!` / `jitc_permanent_bail!` / the backend's own
+    /// `note_jit_bail_site*` calls is named; the unnamed ones come from
+    /// somewhere those macros do not cover, and reading the ~40 `None` exits of
+    /// `try_compile_inner` did not find it.
+    ///
+    /// So instead of auditing exits, bound the answer: each pipeline stage
+    /// stamps its own name on entry, and a `None` with no explicit site reports
+    /// the last stage reached. That cannot miss a path, present or future — a
+    /// new exit added tomorrow is still attributed to whichever stage was
+    /// running. The site name is deliberately shaped `no-site-after-<stage>` so
+    /// it is obvious in a report that this is the FALLBACK, not a diagnosis:
+    /// it localises the refusal to one stage, and the stage's owner then names
+    /// the specific exit.
+    static JIT_PIPELINE_STAGE: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new(JIT_STAGE_ENTRY) };
+}
+
+/// Stage names. `&'static str` because a bail site is one, so a stage can be
+/// reported as a site without formatting.
+pub const JIT_STAGE_ENTRY: &str = "no-site-after-entry";
+pub const JIT_STAGE_SCAN: &str = "no-site-after-scan";
+pub const JIT_STAGE_BUILD: &str = "no-site-after-ir-build";
+pub const JIT_STAGE_OPTIMIZE: &str = "no-site-after-ir-optimize";
+pub const JIT_STAGE_EA: &str = "no-site-after-escape-analysis";
+pub const JIT_STAGE_SCHEDULE: &str = "no-site-after-schedule";
+pub const JIT_STAGE_LOWER: &str = "no-site-after-lower";
+pub const JIT_STAGE_SINGLE_PASS: &str = "no-site-after-single-pass-backend";
+
+/// Stamp the stage the compile pipeline is entering. One `Cell` store.
+#[inline]
+pub fn note_jit_pipeline_stage(stage: &'static str) {
+    JIT_PIPELINE_STAGE.with(|c| c.set(stage));
+}
+
+/// The last stage stamped, resetting to `entry` for the next compile.
+pub fn take_jit_pipeline_stage() -> &'static str {
+    JIT_PIPELINE_STAGE.with(|c| c.replace(JIT_STAGE_ENTRY))
+}
+
+/// Census of methods sealed out of JIT compilation before any compile was
+/// attempted, by reason.
+///
+/// Separate from the compile-failure table because the two populations are
+/// different sizes and want different fixes: a Spring Boot context startup
+/// seals **856** methods here against **69** whose compile was attempted and
+/// refused. Until 2026-08-10 every one of the 856 was labelled
+/// `static-policy-or-native-shadow`, which cannot distinguish a policy-table
+/// entry (a list somebody can shorten) from a native-shadow scan hit (a scan
+/// that may be over-matching) from a `ForkJoinTask` subclass from a `<clinit>`.
+static JIT_SKIP_SEAL_REASONS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>>,
+> = std::sync::OnceLock::new();
+
+fn jit_skip_seal_reasons(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>> {
+    JIT_SKIP_SEAL_REASONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Count one method sealed out of compilation for `reason`.
+///
+/// Called once per method (the seal is permanent and the caller checks the
+/// skip-set first), so the write lock is taken once per sealed method for the
+/// life of the process, not once per invocation.
+pub fn note_jit_skip_seal_reason(reason: &'static str) {
+    *jit_skip_seal_reasons().write().entry(reason).or_insert(0) += 1;
+}
+
+/// Census of native-shadow seal decisions by which arm fired.
+static JIT_NATIVE_SHADOW_CAUSES: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>>,
+> = std::sync::OnceLock::new();
+
+fn jit_native_shadow_causes(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>> {
+    JIT_NATIVE_SHADOW_CAUSES
+        .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Count one native-shadow verdict, by arm (`direct` / `inherited` /
+/// `interface-blind`). Called from the caller-scan, which runs once per method
+/// before it is sealed — not per invocation.
+pub fn note_jit_native_shadow_cause(cause: &'static str) {
+    *jit_native_shadow_causes().write().entry(cause).or_insert(0) += 1;
+}
+
+/// The native-shadow arm census, highest count first.
+pub fn jit_native_shadow_cause_census() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = jit_native_shadow_causes()
+        .read()
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
+/// The seal census, highest count first, for the stats dump.
+pub fn jit_skip_seal_census() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = jit_skip_seal_reasons()
+        .read()
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
 /// The one bail site that is a MEASUREMENT rather than a verdict: the
 /// single-pass backend emitted past its code-buffer estimate.
 ///
@@ -13480,8 +13698,16 @@ pub fn try_compile_with_invokespecial_resolver(
     // the compile). This used to be taken AFTER the bail-list decision, which
     // is why that decision could not consult it.
     let site = if result.is_none() {
-        take_jit_bail_site()
+        // A refusal with no explicit site is still a refusal, and it is about to
+        // bail-list the method permanently. Attribute it to the last pipeline
+        // stage entered rather than reporting `unrecorded` — see
+        // [`JIT_PIPELINE_STAGE`] for why the fallback is a stage and not an
+        // audit of every exit.
+        Some(take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0)))
     } else {
+        // Reset the stamp even on success, so a compile that succeeds cannot
+        // leave its last stage behind for the next one to report.
+        let _ = take_jit_pipeline_stage();
         None
     };
     // A code-buffer overflow is a MEASUREMENT, not a verdict: the backend now
@@ -14301,6 +14527,7 @@ fn try_compile_inner(
     // Phase 1 (scan/parse). The guard also covers the `return None` arm below:
     // a scan reject is a real compilation that spent real time, and its report
     // should say so.
+    note_jit_pipeline_stage(JIT_STAGE_SCAN);
     let metrics_scan = metrics.phase(metrics::Phase::Scan);
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
@@ -15005,11 +15232,21 @@ fn try_compile_inner(
                 let mut cc_im = std::collections::HashMap::new();
                 let mut io_im = std::collections::HashMap::new();
                 for &(pc, cp_idx) in &scan.typecheck_ops {
-                    if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
+                    if let Some(JitNewSite::Resolved {
+                        class_id: target_id,
+                        ..
+                    }) = new_resolver(cp_idx)
+                    {
                         if let Some(name) = name_resolver(cp_idx) {
                             // Interned process-wide, NOT owned by this
-                            // compilation — see `intern_typecheck_class_name`.
-                            let (ptr, len) = intern_typecheck_class_name(&name);
+                            // compilation — see `intern_typecheck_target`.
+                            //
+                            // `class_id` is the copy this method's OWN constant
+                            // pool resolves to, through its own loader. It was
+                            // previously discarded, leaving the runtime helper
+                            // to re-resolve a bare name against a dictionary
+                            // keyed by `(ClassLoaderId, name)`.
+                            let (ptr, len) = intern_typecheck_target(&name, Some(target_id));
                             let entry = (ptr as usize, len);
                             if checkcast_pcs.contains(&pc) {
                                 cc_im.insert(pc, entry);
@@ -15587,7 +15824,8 @@ fn try_compile_inner(
         // report can separate "the front end refused this bytecode" (build
         // returned None, `nodes_built` stays unmeasured) from "the graph was
         // built and then rejected for size".
-        let metrics_build = metrics.phase(metrics::Phase::Build);
+        note_jit_pipeline_stage(JIT_STAGE_BUILD);
+    let metrics_build = metrics.phase(metrics::Phase::Build);
         let built = builder.build(code, code_len);
         drop(metrics_build);
         if let Some(g) = built.as_ref() {
@@ -15700,7 +15938,8 @@ fn try_compile_inner(
                 // node count. Shrinking the graph therefore shrinks the frame
                 // only when it also shrinks peak simultaneous liveness — which
                 // is what the report's `peak_live_values` is for.
-                let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
+                note_jit_pipeline_stage(JIT_STAGE_OPTIMIZE);
+    let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
                 let metrics_nodes_before_optimize = graph.nodes.len();
                 ir_optimize::optimize(&mut graph);
                 drop(metrics_optimize);
@@ -15771,7 +16010,8 @@ fn try_compile_inner(
                     // double-charge each other; on the path where EA changes
                     // nothing it drops at the end of this block instead, which
                     // is still EA-only work.
-                    let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
+                    note_jit_pipeline_stage(JIT_STAGE_EA);
+    let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
                     let metrics_nodes_before_ea = graph.nodes.len();
                     let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     // Cold-path information (docs/jit/escape-analysis.md §6.3).
@@ -15901,7 +16141,8 @@ fn try_compile_inner(
                         graph.safepoints.len(),
                     );
                     // Phase 6 (schedule).
-                    let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
+                    note_jit_pipeline_stage(JIT_STAGE_SCHEDULE);
+    let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
                     let schedule = ir_schedule::schedule(&graph);
                     drop(metrics_schedule);
                     // Supply BOTH the profiled branch hints (Step 4) and the
@@ -15927,7 +16168,8 @@ fn try_compile_inner(
                     // the point is that it would stop being true if that
                     // changed.
                     compile_gate::note_backend_entry();
-                    let metrics_lower = metrics.phase(metrics::Phase::Lower);
+                    note_jit_pipeline_stage(JIT_STAGE_LOWER);
+    let metrics_lower = metrics.phase(metrics::Phase::Lower);
                     let lowered = ir_lower::lower_inner(
                         &graph,
                         &schedule,
@@ -16302,8 +16544,18 @@ fn try_compile_inner(
             };
             // Interned process-wide, NOT owned by this compilation — the
             // type-check helpers memoize on `(ptr, len)` from thread-locals
-            // that outlive us. See `intern_typecheck_class_name`.
-            let (ptr, len) = intern_typecheck_class_name(&class_name);
+            // that outlive us. See `intern_typecheck_target`.
+            //
+            // When the `new` resolver can name the exact `ClassId` this site's
+            // `CONSTANT_Class` entry resolves to through the compiling class's
+            // loader, the site is interned under that identity so the runtime
+            // helper compares ids rather than re-resolving a bare name against
+            // a `(ClassLoaderId, name)`-keyed dictionary.
+            let target_id = cp_new_resolver.and_then(|r| match r(cp_idx) {
+                Some(JitNewSite::Resolved { class_id, .. }) => Some(class_id),
+                _ => None,
+            });
+            let (ptr, len) = intern_typecheck_target(&class_name, target_id);
             typecheck_info.push((pc, ptr, len));
         }
     }
@@ -17763,6 +18015,7 @@ fn try_compile_inner(
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
     // selection, encoding and buffer install together. The guard also covers
     // the `?` below: a backend bail is a compilation that spent this time.
+    note_jit_pipeline_stage(JIT_STAGE_SINGLE_PASS);
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
         admission,
@@ -24623,6 +24876,40 @@ mod tests {
             let s = unsafe { std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) }.unwrap();
             assert_eq!(s, expect);
         }
+    }
+
+    /// Two loaders' same-named classes are two classes, and a type-check site
+    /// must be able to say which one it meant.
+    ///
+    /// The class dictionary is keyed by `(ClassLoaderId, name)`, but a
+    /// compiled type-check site used to carry only the name — so
+    /// `jit_typecheck_resolve` re-resolved it at run time, could land on the
+    /// wrong copy, and covered for that with a loader-blind name walk that
+    /// accepted *either* copy. Interning by `(name, resolved ClassId)` gives
+    /// each copy its own site identity and lets the helper answer by identity.
+    #[test]
+    fn a_typecheck_site_is_interned_under_the_class_id_its_loader_resolved() {
+        let (p_a, l_a) = intern_typecheck_target("com/example/Forked", Some(4_242));
+        let (p_b, l_b) = intern_typecheck_target("com/example/Forked", Some(4_243));
+        assert_eq!(l_a, l_b);
+        assert_ne!(
+            p_a, p_b,
+            "one name resolved to two loaders' classes must be two sites"
+        );
+        assert_eq!(typecheck_target_for_site(p_a), Some(4_242));
+        assert_eq!(typecheck_target_for_site(p_b), Some(4_243));
+
+        // Stable: recompiling the same site rejoins the same identity.
+        assert_eq!(
+            intern_typecheck_target("com/example/Forked", Some(4_242)),
+            (p_a, l_a)
+        );
+
+        // A site whose target was not loaded at compile time records nothing,
+        // and so keeps the pre-existing name-resolution behaviour.
+        let (p_none, _) = intern_typecheck_class_name("com/example/Forked");
+        assert_ne!(p_none, p_a);
+        assert_eq!(typecheck_target_for_site(p_none), None);
     }
 
     /// T10.3 — Verify the FxHashMap swap preserves insert/lookup semantics for

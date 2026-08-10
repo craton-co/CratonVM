@@ -257,6 +257,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "aioobe3", on_key: Some("CRATONVM_DBG_AIOOBE3"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "altrace", on_key: Some("CRATONVM_DBG_ALTRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ann-proxy-dispatch-trace", on_key: Some("CRATONVM_ANN_PROXY_DISPATCH_TRACE"), off_key: None, off_word: None },
+    // Per-phase timing for `annotation_proxy_dispatch_impl` (total / walk /
+    // flagread / namecmp), printed every 100k dispatches. Reading one annotation
+    // attribute costs ~10.5 us against ~10 ns on HotSpot; this splits it.
+    E { group: Group::DBG, token: "ann-proxy-prof", on_key: Some("CRATONVM_DBG_ANN_PROXY_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ann-trace", on_key: Some("CRATONVM_ANN_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "annproxy-wrap", on_key: Some("CRATONVM_DBG_ANNPROXY_WRAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "anonalloc", on_key: Some("CRATONVM_DBG_ANONALLOC"), off_key: None, off_word: None },
@@ -364,6 +368,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "g1-dbg-zero", on_key: Some("CRATONVM_G1_DBG_ZERO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "g1diag", on_key: Some("CRATONVM_DBG_G1DIAG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-array-guard-bt", on_key: Some("CRATONVM_GC_ARRAY_GUARD_BT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "gc-fallback-reasons", on_key: Some("CRATONVM_DBG_GC_FALLBACK_REASONS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-overhead", on_key: Some("CRATONVM_DBG_GC_OVERHEAD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-stats", on_key: Some("CRATONVM_GC_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "gc-stress", on_key: Some("CRATONVM_DBG_GC_STRESS"), off_key: None, off_word: None },
@@ -452,6 +457,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "lambda", on_key: Some("CRATONVM_DBG_LAMBDA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lambda-dispatch", on_key: Some("CRATONVM_DBG_LAMBDA_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lambda-generic", on_key: Some("CRATONVM_DBG_LAMBDA_GENERIC"), off_key: None, off_word: None },
+    // Per-phase timing for `try_lambda_dispatch` (lookup / prep / target /
+    // other), printed every 200k dispatches. Arms the timers; an unarmed run
+    // pays one relaxed load per dispatch. See `runtime::interpreter::lambda::lambda_prof`.
+    E { group: Group::DBG, token: "lambda-prof", on_key: Some("CRATONVM_DBG_LAMBDA_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "layout", on_key: Some("CRATONVM_DBG_LAYOUT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ldc-classref-trace", on_key: Some("CRATONVM_LDC_CLASSREF_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "letsgo", on_key: Some("CRATONVM_DBG_LETSGO"), off_key: None, off_word: None },
@@ -463,6 +472,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "loadclass", on_key: Some("CRATONVM_DBG_LOADCLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loader-chain", on_key: Some("CRATONVM_DBG_LOADER_CHAIN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "loader-trace", on_key: Some("CRATONVM_DBG_LOADER_TRACE"), off_key: None, off_word: None },
+    // Restores the pre-fix load-time transform behaviour: offer every class to
+    // the `ClassFileTransformer` chain on every constant-pool resolution rather
+    // than once per name. The red control for the load-time-transform rescan
+    // fix (see `runtime::instrument::LoadTimeOffered`) — with it set, a Spring
+    // Boot `@ClassPathExclusions` test under Mockito's inline mock maker hangs
+    // instead of passing.
+    E { group: Group::DBG, token: "load-transform-no-memo", on_key: Some("CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "logprov", on_key: Some("CRATONVM_DBG_LOGPROV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "longroot", on_key: Some("CRATONVM_DBG_LONGROOT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lookup", on_key: Some("CRATONVM_DBG_LOOKUP"), off_key: None, off_word: None },
@@ -766,6 +782,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "enable-inline-new", on_key: Some("CRATONVM_JIT_ENABLE_INLINE_NEW"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "exc-table-c2", on_key: None, off_key: Some("CRATONVM_JIT_NO_EXC_TABLE_C2"), off_word: None },
     E { group: Group::JIT, token: "force-c2", on_key: Some("CRATONVM_JIT_FORCE_C2"), off_key: None, off_word: None },
+    // The class-blind arm of the native-shadow seal. Default ON (correctness
+    // guard); `-native-shadow-interface-blind` measures its cost.
+    E { group: Group::JIT, token: "native-shadow-interface-blind", on_key: Some("CRATONVM_JIT_NATIVE_SHADOW_INTERFACE_BLIND"), off_key: None, off_word: Some("0") },
+    // The whole native-shadow caller seal. Default ON and load-bearing for
+    // CORRECTNESS; off is a measurement configuration only, for pricing the
+    // seal's ceiling. Never ship with it off.
+    E { group: Group::JIT, token: "native-shadow-caller-seal", on_key: Some("CRATONVM_JIT_NATIVE_SHADOW_CALLER_SEAL"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "full-self-call-spill", on_key: Some("CRATONVM_JIT_FULL_SELF_CALL_SPILL"), off_key: None, off_word: None },
     // Default-ON: `x64::licm::gc_inert_selfrec_enabled` reads `0`/`false`/`off`.
     E { group: Group::JIT, token: "gc-inert-selfrec", on_key: Some("CRATONVM_JIT_GC_INERT_SELFREC"), off_key: None, off_word: Some("0") },

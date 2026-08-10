@@ -216,7 +216,7 @@ pub(crate) fn receiver_is_tls_factory(
             return true;
         }
     }
-    matches!(ctx.class_name_of_id(receiver_cid).as_deref(), Some(n) if n == tls_name)
+    matches!(ctx.class_name_arc_of_id(receiver_cid).as_deref(), Some(n) if n == tls_name)
 }
 
 /// Guard the plaintext base-class implementation of `method`/`descriptor`.
@@ -444,7 +444,7 @@ mod tests {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("javax/net/ssl/SSLException")
                 );
             }

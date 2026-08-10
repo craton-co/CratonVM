@@ -3486,7 +3486,7 @@ mod tests {
             panic!("failed() was passed no Throwable: {:?}", delivered.args[1]);
         };
         assert_eq!(
-            ctx.class_name_of_id(ctx.class_id_of_object(thrown))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(thrown))
                 .as_deref(),
             Some("java/io/IOException"),
             "failed() must be handed a java.io.IOException"

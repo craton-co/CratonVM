@@ -2192,7 +2192,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let value = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
                 if let Some(Value::Object(Some(value))) = value {
                     if ctx
-                        .class_name_of_id(ctx.class_id_of_object(value))
+                        .class_name_arc_of_id(ctx.class_id_of_object(value))
                         .as_deref()
                         == Some("java/lang/String")
                     {
@@ -4443,7 +4443,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 match key {
                     Value::Object(Some(key_obj))
                         if ctx
-                            .class_name_of_id(ctx.class_id_of_object(key_obj))
+                            .class_name_arc_of_id(ctx.class_id_of_object(key_obj))
                             .as_deref()
                             == Some("java/lang/String") =>
                     {
@@ -15101,7 +15101,7 @@ pub(crate) fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> Result
     };
     if let Ok(class_id) = ctx.ensure_class_initialized(class_name) {
         let fields = ctx.class_num_total_fields(class_id);
-        if ctx.class_name_of_id(class_id).as_deref() == Some(class_name) && fields > 0 {
+        if ctx.class_name_arc_of_id(class_id).as_deref() == Some(class_name) && fields > 0 {
             return Ok(ctx.alloc_object(class_id, fields));
         }
     }
@@ -15111,7 +15111,7 @@ pub(crate) fn basic_file_attributes_alloc(ctx: &mut dyn NativeContext) -> Result
 }
 
 pub(crate) fn basic_file_attributes_is_windows(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(attrs))
         .as_deref()
         == Some("sun/nio/fs/WindowsFileAttributes")
 }
@@ -15135,7 +15135,7 @@ pub(crate) fn basic_file_attributes_is_synthetic(
     ctx: &dyn NativeContext,
     attrs: ObjectRef,
 ) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(attrs))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(attrs))
         .as_deref()
         == Some("java/nio/file/attribute/BasicFileAttributes")
 }
@@ -17885,7 +17885,7 @@ pub(crate) fn p98_index_javac_archive_packages(
     let container = match ctx.get_field(visitor, 1) {
         Value::Object(Some(container))
             if ctx
-                .class_name_of_id(ctx.class_id_of_object(container))
+                .class_name_arc_of_id(ctx.class_id_of_object(container))
                 .as_deref()
                 == Some("com/sun/tools/javac/file/JavacFileManager$ArchiveContainer") =>
         {

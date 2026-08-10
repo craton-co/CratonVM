@@ -36,7 +36,7 @@ Companion documents:
 
 - `docs/feature-designs/zgc-production-implementation-plan.md` — the plan the
   buildout followed, and where the ZGC-side follow-ups live.
-- `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md` —
+- `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md` —
   the 49 HANG / 22 FAIL classes from the first ZGC full-suite run. **Entry 7
   below changes how those FAIL logs should be triaged.**
 
@@ -492,7 +492,7 @@ ever thrown**. G1 closed the identical defect with
 **ACTIONABLE, and the reason this entry exists at all.** The abort is a
 `SIGABRT` with a single stderr line and no Java stack. Anyone triaging the
 **22 ZGC FAIL classes** in
-`docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`
+`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`
 should `grep 'FATAL: ZGC(real)'` over those logs **before** assuming a test
 bug or a VM defect elsewhere. A pre-fix run that hit this looks like an
 arbitrary crash, not like an OOM.

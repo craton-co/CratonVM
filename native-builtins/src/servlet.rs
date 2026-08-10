@@ -150,7 +150,7 @@ fn jython_py_none(ctx: &mut dyn NativeContext) -> Value {
 }
 
 fn jython_object_class_is(ctx: &mut dyn NativeContext, obj: ObjectRef, expected: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(expected)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(expected)
 }
 
 fn jython_map_field(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Option<ObjectRef> {
@@ -174,7 +174,7 @@ fn jython_pystringmap_put_all(
         return false;
     }
     if !matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(source))
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(source))
             .as_deref(),
         Some("org/python/core/PyStringMap" | "org/python/core/PyDictionary")
     ) {
@@ -3102,7 +3102,7 @@ fn s2_bb_synthetic_layout(ctx: &dyn NativeContext, buf: ObjectRef) -> bool {
     }
     let cid = ctx.class_id_of_object(buf);
     !matches!(
-        ctx.class_name_of_id(cid).as_deref(),
+        ctx.class_name_arc_of_id(cid).as_deref(),
         Some(
             "java/nio/IntBuffer"
                 | "java/nio/LongBuffer"

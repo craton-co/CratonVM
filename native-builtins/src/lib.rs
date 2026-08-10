@@ -3323,7 +3323,7 @@ fn native_spring_annotation_filter_matches_class(
     };
 
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("org/springframework/core/annotation/PackagesAnnotationFilter")
     {
@@ -3524,7 +3524,7 @@ fn native_spring_extension_resolve_parameter(
     };
 
     if scope
-        .class_name_of_id(scope.class_id_of_object(executable))
+        .class_name_arc_of_id(scope.class_id_of_object(executable))
         .as_deref()
         == Some("java/lang/reflect/Constructor")
     {
@@ -5898,7 +5898,7 @@ fn native_xsd_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Int(0))),
     };
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(other))
+        .class_name_arc_of_id(ctx.class_id_of_object(other))
         .as_deref()
         != Some(XERCES_XSD_KEY)
     {
@@ -8587,11 +8587,15 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;Ljava/lang/Module;)V",
         crate::phases_late::native_module_impl_add_exports_to_module,
     );
+    // NOT `native_module_impl_add_exports_all`: "to all unnamed modules" is a
+    // qualified edge on HotSpot (`Module.isExported(pkg)` stays false after
+    // it), and the `…_all` fn records the unqualified one. See
+    // `native_module_impl_add_exports_to_all_unnamed`.
     registry.register(
         "java/lang/Module",
         "implAddExportsToAllUnnamed",
         "(Ljava/lang/String;)V",
-        crate::phases_late::native_module_impl_add_exports_all,
+        crate::phases_late::native_module_impl_add_exports_to_all_unnamed,
     );
     registry.register(
         "java/lang/Module",
@@ -8617,11 +8621,13 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/String;Ljava/lang/Module;)V",
         crate::phases_late::native_module_impl_add_opens_to_module,
     );
+    // Qualified to the unnamed module, same as `implAddExportsToAllUnnamed`
+    // above — not `native_module_impl_add_opens_all`.
     registry.register(
         "java/lang/Module",
         "implAddOpensToAllUnnamed",
         "(Ljava/lang/String;)V",
-        crate::phases_late::native_module_impl_add_opens_all,
+        crate::phases_late::native_module_impl_add_opens_to_all_unnamed,
     );
 
     registry.register(
@@ -11175,7 +11181,7 @@ pub fn register_essential_natives_with_shims(
             if ctx.heap_kind_of(this) != cratonvm_types::ObjectKind::Array {
                 let cid = ctx.class_id_of_object(this);
                 let is_reflect_type = matches!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("java/lang/reflect/GenericArrayType")
                         | Some("java/lang/reflect/ParameterizedType")
                         | Some("java/lang/reflect/WildcardType")
@@ -11256,7 +11262,7 @@ pub fn register_essential_natives_with_shims(
             }
             let cid = ctx.class_id_of_object(this);
             let is_reflect = matches!(
-                ctx.class_name_of_id(cid).as_deref(),
+                ctx.class_name_arc_of_id(cid).as_deref(),
                 Some("java/lang/reflect/GenericArrayType")
                     | Some("java/lang/reflect/ParameterizedType")
                     | Some("java/lang/reflect/TypeVariable")
@@ -17192,7 +17198,7 @@ pub fn register_essential_natives_with_shims(
                 let is_synthetic = matches!(
                     ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                     Value::Object(Some(name))
-                        if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                             == Some("java/lang/String")
                 );
                 if is_synthetic {
@@ -17220,7 +17226,7 @@ pub fn register_essential_natives_with_shims(
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                         == Some("java/lang/String")
             );
             if is_synthetic {
@@ -17447,7 +17453,7 @@ pub fn register_essential_natives_with_shims(
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                         == Some("java/lang/String")
             );
             if is_synthetic {
@@ -17494,7 +17500,7 @@ pub fn register_essential_natives_with_shims(
             let is_synthetic = matches!(
                 ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
                 Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                         == Some("java/lang/String")
             );
             if is_synthetic {
@@ -18137,6 +18143,12 @@ pub fn register_essential_natives_with_shims(
     crate::phases_late::reflect_invoke::register_real_jdk_stackwalker_frame_method_type(registry);
     crate::phases_late::charset_buffers::register_real_jdk_charset_contains(registry);
     crate::phases_late::nio_file::register_real_jdk_files_owner(registry);
+    // Heap-ByteBuffer scalar getters. DEFAULT OFF — this call is a no-op
+    // unless CRATONVM_BYTEBUFFER_INTRINSIC=1. It makes the accessors ~1.4-2.1x
+    // faster and the JIT configuration 6-12% SLOWER, because registering a
+    // native takes the method away from the JIT, whose inlining is worth more
+    // than the shorter path. See the module doc for both measurements.
+    crate::phases_late::nio_buffer::register_heap_byte_buffer_accessors(registry);
     // CGLIB / Spring `ConfigurationClassEnhancer.enhance` minimal bytecode
     // emitter. Registered AFTER `net_phase_e::register_phase_e_networking`
     // so the real emitter at `cglib_enhancer.rs` overrides the older
@@ -22306,7 +22318,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         // Instead, copy the intern data: field 0 (value array) + field 1 (hash).
         let val = ctx.get_field(str_obj, 0);
         ctx.set_field(_this, 0, val);
-        let hash = ctx.get_field(str_obj, 1)?;
+        let hash = ctx.get_field(str_obj, 1);
         ctx.set_field(_this, 1, hash);
         Ok(None)
     });
@@ -22332,7 +22344,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         let str_obj = ctx.create_string(&s);
         let val = ctx.get_field(str_obj, 0);
         ctx.set_field(_this, 0, val);
-        let hash = ctx.get_field(str_obj, 1)?;
+        let hash = ctx.get_field(str_obj, 1);
         ctx.set_field(_this, 1, hash);
         Ok(None)
     });
@@ -24796,7 +24808,7 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     {
         let cid = ctx.class_id_of_object(this);
         if matches!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some("java/lang/reflect/GenericArrayType")
                 | Some("java/lang/reflect/ParameterizedType")
                 | Some("java/lang/reflect/WildcardType")
@@ -25309,7 +25321,7 @@ fn native_object_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let class_id = ctx.class_id_of_object(this);
-    if ctx.class_name_of_id(class_id).as_deref() == Some("org/apache/tomcat/util/buf/MessageBytes")
+    if ctx.class_name_arc_of_id(class_id).as_deref() == Some("org/apache/tomcat/util/buf/MessageBytes")
     {
         return native_message_bytes_to_string(ctx, args);
     }
@@ -26143,7 +26155,7 @@ fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) 
     // `PrintStream` path is unbuffered, so flushing it every line would be
     // pure overhead on a very hot path.
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         != Some("java/io/PrintWriter")
     {
@@ -28293,7 +28305,7 @@ fn native_method_handle_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         let has_downcall_layout = matches!(ctx.get_field(*receiver, 0), Value::Long(ptr) if ptr != 0)
             && match ctx.get_field(*receiver, 1) {
                 Value::Object(Some(descriptor)) => {
-                    ctx.class_name_of_id(ctx.class_id_of_object(descriptor))
+                    ctx.class_name_arc_of_id(ctx.class_id_of_object(descriptor))
                         .as_deref()
                         == Some("java/lang/foreign/FunctionDescriptor")
                 }
@@ -28472,7 +28484,7 @@ fn native_method_handle_link_to(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         return link_to_unsupported("call carries no trailing MemberName appendix");
     };
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(member))
+        .class_name_arc_of_id(ctx.class_id_of_object(member))
         .as_deref()
         != Some("java/lang/invoke/MemberName")
     {
@@ -28840,7 +28852,7 @@ fn native_objects_value_hash_code(
         return Ok(ctx.identity_hash_code(obj));
     }
 
-    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+    match ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() {
         Some("java/lang/String") => {
             match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
                 Some(Value::Int(v)) => Ok(v),
@@ -29657,7 +29669,7 @@ fn native_spring_is_using_forked_class_path_loader(
             .flatten();
         ctx.unpin_native_roots(thread_pin);
         matches!(loader, Some(Value::Object(Some(loader)))
-            if ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(loader)).as_deref()
                 == Some("org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader"))
     })();
     let this = ctx.read_native_pin(this_pin, this);
@@ -37446,7 +37458,7 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // when it actually holds a `java/lang/String`.
     if ctx.object_num_fields(this) >= 1 {
         if let v @ Value::Object(Some(o)) = ctx.get_field(this, 0) {
-            if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                 == Some("java/lang/String")
             {
                 return Ok(Some(v));
@@ -38460,7 +38472,11 @@ fn native_synthetic_instant_is_after(
 /// default-feature build — which is what the blocking `cargo test --workspace`
 /// CI job runs, while every check in this module's own CI job passes
 /// `--features synthetic-jdk` and so never saw it.
-pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> Result<(i32, i32, i32), MethodCallFailed> {
+///
+/// Infallible, and narrowed back to a plain tuple: the funnel migration widened
+/// it to `Result` although every path ends in `Ok`, which cost its `synthetic-jdk`
+/// caller a `?` it could not use (that build was red).
+pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> (i32, i32, i32) {
     let z = epoch_day + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = z - era * 146097;
@@ -38471,7 +38487,7 @@ pub(crate) fn epoch_day_to_ymd(epoch_day: i64) -> Result<(i32, i32, i32), Method
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    Ok((y as i32, m as i32, d as i32))
+    (y as i32, m as i32, d as i32)
 }
 
 /// `Instant.toString()` — ISO-8601, per `DateTimeFormatter.ISO_INSTANT`.
@@ -38487,7 +38503,7 @@ fn iso_instant_string(sec: i64, nano: i32) -> Result<String, MethodCallFailed> {
     // day rather than truncating toward zero.
     let days = sec.div_euclid(86_400);
     let secs_of_day = sec.rem_euclid(86_400);
-    let (y, m, d) = epoch_day_to_ymd(days)?;
+    let (y, m, d) = epoch_day_to_ymd(days);
     let (hh, mm, ss) = (secs_of_day / 3600, (secs_of_day % 3600) / 60, secs_of_day % 60);
     // Years outside 0..=9999 take an explicit sign, as ISO-8601 requires.
     let mut s = if (0..=9999).contains(&y) {
@@ -39581,6 +39597,41 @@ static PROXY_CLASS_CACHE: parking_lot::RwLock<
     >,
 > = parking_lot::RwLock::new(None);
 
+/// Drop every generated-proxy-class row this VM's class unloading just
+/// invalidated.
+///
+/// A row is `(vm, loader_namespace, ordered_iface_ids) -> generated_class_id`,
+/// and **class unloading can kill either side**. The value goes first: once
+/// `ClassManager::unload_user_classes` has removed the generated `$ProxyN`,
+/// a later `Proxy.newProxyInstance` with the same key was handed the dead id
+/// straight back out of this cache and allocated an instance against it. Its
+/// class then resolves to nothing — the same
+/// `ClassCastException: ? cannot be cast to …` this cache's `vm_identity`
+/// partition was added to stop, reached the other way round. That is what made
+/// `BatchJdbcAutoConfigurationTests`, `FreeMarkerAutoConfigurationReactive-
+/// IntegrationTests` and `OpenTelemetrySdkAutoConfigurationTests` fail under
+/// `-XX:+UseZGC`, whose every collection is a full mark and therefore runs
+/// loader reclamation on every cycle rather than only in the generational
+/// collector's narrow full-mark windows.
+///
+/// The KEY is purged on the same evidence: an entry keyed on an interface
+/// `ClassId` that no longer exists cannot be matched by a live request except
+/// by id reuse, and matching it by reuse is precisely the bug above.
+pub fn forget_unloaded_proxy_classes(vm_identity: usize, class_ids: &[u32]) {
+    if class_ids.is_empty() {
+        return;
+    }
+    let dead: rustc_hash::FxHashSet<u32> = class_ids.iter().copied().collect();
+    let mut guard = PROXY_CLASS_CACHE.write();
+    if let Some(map) = guard.as_mut() {
+        map.retain(|(vm, _, ifaces), cid| {
+            *vm != vm_identity
+                || (!dead.contains(&cid.as_u32())
+                    && !ifaces.iter().any(|i| dead.contains(&i.as_u32())))
+        });
+    }
+}
+
 /// Drop every generated-proxy-class row belonging to `vm_identity`. Called
 /// from `release_vm_native_state`; the rows hold `ClassId`s into a class
 /// manager that is going away.
@@ -39592,6 +39643,76 @@ pub fn forget_vm_proxy_classes(vm_identity: usize) {
     let mut modules = PROXY_LOADER_MODULES.write();
     if let Some(map) = modules.as_mut() {
         map.retain(|(vm, _), _| *vm != vm_identity);
+    }
+}
+
+#[cfg(test)]
+mod proxy_class_cache_unload_tests {
+    use cratonvm_types::ClassId;
+
+    /// The row whose VALUE was unloaded must go: handing that `ClassId` back
+    /// out of the cache is what allocated an instance against a class the
+    /// class manager had already removed.
+    #[test]
+    fn an_unloaded_generated_proxy_class_is_dropped_from_the_cache() {
+        const VM: usize = 0xC0FFEE;
+        {
+            let mut guard = super::PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert((VM, 7, vec![ClassId::new(100)]), ClassId::new(3003));
+            map.insert((VM, 7, vec![ClassId::new(101)]), ClassId::new(3005));
+        }
+        super::forget_unloaded_proxy_classes(VM, &[3003]);
+        let guard = super::PROXY_CLASS_CACHE.read();
+        let map = guard.as_ref().expect("cache populated above");
+        assert!(map.get(&(VM, 7, vec![ClassId::new(100)])).is_none());
+        assert_eq!(
+            map.get(&(VM, 7, vec![ClassId::new(101)])),
+            Some(&ClassId::new(3005)),
+            "a live row must survive the purge",
+        );
+    }
+
+    /// And the row whose KEY names an unloaded interface: it can only be
+    /// matched again through `ClassId` reuse, and matching by reuse is the
+    /// same defect one step removed.
+    #[test]
+    fn a_row_keyed_on_an_unloaded_interface_is_dropped_too() {
+        const VM: usize = 0xC0FFEF;
+        {
+            let mut guard = super::PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert(
+                (VM, 9, vec![ClassId::new(200), ClassId::new(201)]),
+                ClassId::new(4000),
+            );
+        }
+        super::forget_unloaded_proxy_classes(VM, &[201]);
+        let guard = super::PROXY_CLASS_CACHE.read();
+        let map = guard.as_ref().expect("cache populated above");
+        assert!(map
+            .get(&(VM, 9, vec![ClassId::new(200), ClassId::new(201)]))
+            .is_none());
+    }
+
+    /// Another VM's rows are none of this VM's business — the same partition
+    /// the `vm_identity` key component exists to keep.
+    #[test]
+    fn another_vms_rows_are_untouched() {
+        const MINE: usize = 0xD0D0;
+        const THEIRS: usize = 0xE0E0;
+        {
+            let mut guard = super::PROXY_CLASS_CACHE.write();
+            let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
+            map.insert((THEIRS, 1, vec![ClassId::new(300)]), ClassId::new(5000));
+        }
+        super::forget_unloaded_proxy_classes(MINE, &[5000, 300]);
+        let guard = super::PROXY_CLASS_CACHE.read();
+        let map = guard.as_ref().expect("cache populated above");
+        assert_eq!(
+            map.get(&(THEIRS, 1, vec![ClassId::new(300)])),
+            Some(&ClassId::new(5000)),
+        );
     }
 }
 
@@ -41871,7 +41992,7 @@ mod liquibase_checksum_tests {
         } else {
             2
         };
-        let obj = ctx.alloc_object(class_id, fields)?;
+        let obj = ctx.alloc_object(class_id, fields);
         ctx.set_field(obj, 0, Value::Long(millis));
         if let Some(nanos) = nanos {
             ctx.set_field(obj, fields - 1, Value::Int(nanos));
@@ -41887,7 +42008,7 @@ mod liquibase_checksum_tests {
         _args: &[Value],
     ) -> Option<MethodCallResult> {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(receiver))
+            .class_name_arc_of_id(ctx.class_id_of_object(receiver))
             .as_deref()
             != Some(ABSTRACT_CHANGE)
             || method_name != "getExcludedFieldFilters"
@@ -42042,7 +42163,7 @@ mod t2_random_tests {
         // Random's synthetic layout: field 0 = seed (Long), field 1 =
         // haveNextGaussian (Int). Same layout as SecureRandom so the
         // shared `sr_next_seed` helper works on both.
-        let r = try_alloc_concurrent_synthetic(ctx, "java/util/Random", 2)?;
+        let r = try_alloc_concurrent_synthetic(ctx, "java/util/Random", 2).unwrap();
         ctx.set_field(r, 0, Value::Long(0));
         ctx.set_field(r, 1, Value::Int(0));
         r
@@ -42155,7 +42276,7 @@ mod t2_6_crypto_acceptance_tests {
     /// `2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824`
     #[test]
     fn t2_6_19_sha256_hello_matches_rfc6234() {
-        let digest = compute_digest("SHA-256", b"hello");
+        let digest = compute_digest("SHA-256", b"hello").unwrap();
         let expected = [
             0x2c, 0xf2, 0x4d, 0xba, 0x5f, 0xb0, 0xa3, 0x0e, 0x26, 0xe8, 0x3b, 0x2a, 0xc5, 0xb9,
             0xe2, 0x9e, 0x1b, 0x16, 0x1e, 0x5c, 0x1f, 0xa7, 0x42, 0x5e, 0x73, 0x04, 0x33, 0x62,
@@ -42171,7 +42292,7 @@ mod t2_6_crypto_acceptance_tests {
     /// test vector `a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a`.
     #[test]
     fn t2_6_2_sha3_256_empty_matches_fips202() {
-        let digest = compute_digest("SHA3-256", b"");
+        let digest = compute_digest("SHA3-256", b"").unwrap();
         let expected = [
             0xa7, 0xff, 0xc6, 0xf8, 0xbf, 0x1e, 0xd7, 0x66, 0x51, 0xc1, 0x47, 0x56, 0xa0, 0x61,
             0xd6, 0x62, 0xf5, 0x80, 0xff, 0x4d, 0xe4, 0x3b, 0x49, 0xfa, 0x82, 0xd8, 0x0a, 0x4b,
@@ -42183,7 +42304,7 @@ mod t2_6_crypto_acceptance_tests {
     /// T2.6.2 companion — SHA3-512("abc") matches the FIPS 202 vector.
     #[test]
     fn t2_6_2_sha3_512_abc_matches_fips202() {
-        let digest = compute_digest("SHA3-512", b"abc");
+        let digest = compute_digest("SHA3-512", b"abc").unwrap();
         assert_eq!(digest.len(), 64);
         // First 8 bytes suffice to catch catastrophic backend swaps.
         let expected_prefix = [0xb7, 0x51, 0x85, 0x0b, 0x1a, 0x57, 0x16, 0x8a];
@@ -42406,6 +42527,47 @@ pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
 /// probe cost 130M `getenv` calls per CratonBench `hashmap` run before
 /// `c258662e4`. Keep these reads as the LEFT operand of any `&&` whose right
 /// operand is a string compare, exactly as that fix required.
+
+/// Volume and cost of the NATIVE proxy-dispatch entry
+/// (`Proxy$Dispatch.invokeProxy`), armed by `CRATONVM_DBG=ann-proxy-prof`.
+///
+/// The companion counter in `annotation_proxy_dispatch_impl` covers only the
+/// interpreter's hook. This is the other half of the funnel, and on a workload
+/// whose annotations are reached through generated `$ProxyN` bodies it is the
+/// half that carries the traffic. Printed on the same flag so one run reports
+/// both.
+static PROXY_DISPATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROXY_DISPATCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn proxy_dispatch_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANN_PROXY_PROF").is_ok())
+}
+
+pub(crate) fn note_proxy_dispatch_ns(ns: u64) {
+    use std::sync::atomic::Ordering;
+    PROXY_DISPATCH_NS.fetch_add(ns, Ordering::Relaxed);
+    let n = PROXY_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100_000 == 0 {
+        eprintln!(
+            "[PROXY-DISPATCH-PROF] native invokeProxy calls={n} total={}ns/call cumulative={}ms",
+            PROXY_DISPATCH_NS.load(Ordering::Relaxed) / n,
+            PROXY_DISPATCH_NS.load(Ordering::Relaxed) / 1_000_000,
+        );
+    }
+}
+
+/// Final tally, for the exit dump — the number that turns "this call is 1000x
+/// too slow" into "and it is worth N seconds of the run".
+pub fn proxy_dispatch_prof_summary() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    let calls = PROXY_DISPATCH_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return None;
+    }
+    Some((calls, PROXY_DISPATCH_NS.load(Ordering::Relaxed)))
+}
+
 #[inline(always)]
 pub(crate) fn nbflags() -> &'static cratonvm_types::flags::NativeFlags {
     &cratonvm_types::flags().natives

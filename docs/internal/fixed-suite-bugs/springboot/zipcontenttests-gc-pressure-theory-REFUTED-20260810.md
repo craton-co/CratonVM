@@ -1,7 +1,37 @@
 # `ZipContentTests` HANG — disk-capacity theory checked and RULED OUT for this run; actual driver looks like GC/allocation pressure from its multi-gigabyte zip64 fixture, on a class that is already borderline-slow
 
-**Status: OPEN — not root-caused; a throughput/GC-pressure problem on an
-inherently heavy test class, not the previously-suspected disk-space
+**Status: RETIRED 2026-08-10 — the GC/allocation-pressure reading below is
+REFUTED by measurement, and the class is root-caused elsewhere. Live page:
+`known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.**
+
+What this page got right: the disk-capacity theory does not fit, and it says so
+having actually checked rather than assumed. What it got wrong, and the numbers
+that settle it:
+
+* **GC/allocation pressure is not the driver.** `-Xmx 8g` runs the class in
+  308.9s against `-Xmx 2g`'s 315.5s — a 2% difference. Quadrupling the heap
+  changes nothing. (The same lever turned a 300s overrun into a 24.3s pass for
+  `HttpComponentsClientHttpConnectorBuilderTests`, so it is a real lever that
+  this class simply does not respond to.)
+* **It is not a hang.** Run without the 300s ceiling it PASSES 29/29 in 315.5s
+  (JIT) and 219.1s (`--nojit`), against HotSpot's 22.4s.
+* **The 0-byte `.out.log` inference does not hold.** `SbRunner` prints nothing
+  until `launcher.execute(req)` *returns* (`sb-runner/SbRunner.java:80,83`), so
+  an empty stdout means "did not finish" and cannot locate the stall. The
+  claim below that "it hangs during class initialization, before any test
+  method runs" rests entirely on that inference and is unfounded — all 29 tests
+  do run.
+* **The actual cost** is `java.nio.ByteBuffer` scalar accessors, which the zip
+  header reader calls once per field: `getShort`+`getInt` measure 2234 ns/op
+  against HotSpot's 1.36. File I/O is *faster* than HotSpot here and zlib is
+  within 2x.
+
+Kept for the run history and the cross-run table, which are still accurate.
+
+---
+
+**Original status: OPEN — not root-caused; a throughput/GC-pressure problem on
+an inherently heavy test class, not the previously-suspected disk-space
 environmental artifact.**
 
 ## Why this doc exists: checking, not assuming, the known disk-capacity gotcha

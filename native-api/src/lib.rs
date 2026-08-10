@@ -259,7 +259,7 @@ pub trait ClassDiscriminator {
 
     /// `true` iff `class_id` is **exactly** `which` — no superclass walk, no
     /// interface check. This is the direct replacement for
-    /// `ctx.class_name_of_id(id).as_deref() == Some("java/util/TreeMap")`.
+    /// `ctx.class_name_arc_of_id(id).as_deref() == Some("java/util/TreeMap")`.
     fn class_is(&self, class_id: ClassId, which: WellKnownClass) -> bool {
         self.well_known_class_id(which) == Some(class_id)
     }

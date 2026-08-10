@@ -21,6 +21,32 @@ ASN1", i.e. "an invalid ASN1 tag value was encountered") but the error code is
 identical. Confirms this is still the same accepted DSA/Windows-SChannel gap,
 not a new regression; no doc changes needed beyond this confirmation.
 
+## Reconfirmed 2026-08-10 — collector-agnostic (Generational, G1, and ZGC)
+
+Reconciling the 139-class union of non-passed classes from the three
+2026-08-08f full-suite reruns (`craton-nonpassed-{default,g1,zgc}-20260808f`)
+on `dev@6365de194`, `module/spring-boot-ldap` `EmbeddedLdapAutoConfigurationTests`
+is FAIL under **all three** GC backends, byte-identical signature in every
+run: 1 of 17 tests failed
+(`whenSslBundleIsConfiguredLdapsListenerIsConfigured`), same
+`directoryServer` `BeanCreationException` chain, same
+`IOException(ServerConfig with_single_cert failed: unexpected error: failed
+to parse private key as RSA, ECDSA, or EdDSA; ...)`, same `os error
+-2146881269` (`CRYPT_E_ASN1_BADTAG`):
+
+| GC | Shard | Seconds | Log |
+|---|---|---:|---|
+| default (Generational) | s2 | 34.225 | `craton-nonpassed-default-20260808f-s2/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedd-3c6a8c4df0c6.{out,err}.log` |
+| G1 | s2 | 38.808 | `craton-nonpassed-g1-20260808f-s2/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedded.Em-3c6a8c4df0c6.{out,err}.log` |
+| ZGC | s2 | 35.949 | `craton-nonpassed-zgc-20260808f-s2/all-jit/logs/module_spring-boot-ldap.org.springframework.boot.ldap.autoconfigure.embedded.E-3c6a8c4df0c6.{out,err}.log` |
+
+(all under `apps/spring-boot-suite-runner/.suite/results/`). This is the same
+1024-bit-DSA-key/Windows-SChannel platform gap across all three collectors,
+not a GC-specific defect — expected, since the root cause is a TLS
+key-type/backend limitation on Windows with nothing to do with the
+collector. Status and conclusion below unchanged: still OPEN, still an
+accepted platform limitation.
+
 ## Symptom
 
 `module/spring-boot-ldap`'s
