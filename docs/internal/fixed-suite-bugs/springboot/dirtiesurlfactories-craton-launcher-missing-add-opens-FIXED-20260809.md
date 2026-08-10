@@ -157,10 +157,45 @@ the only variable is which copy of `run-spring-boot-suite.ps1` launches them:
 Running the unmodified runner as the red arm — rather than reasoning about what
 it would have done — is what makes the green arm mean anything.
 
-**The eight classes are NOT certified green, and this host cannot certify
-them.** With the flag granted, seven of the eight still fail — but every single
-failure block in every log is "cannot start a web server on port 8080"
-(`ConnectorStartFailedException` / `ApplicationContextException: Unable to
+### CERTIFIED 2026-08-10 — 7 of 8 PASS, 43 tests, 0 failures
+
+Re-run once port 8080 was free, serially, on a fresh build of `dev`
+(`250a8a417`, i.e. well after the 2026-08-06 encapsulation fix — an older
+binary would pass these vacuously, since the gate it needs did not exist yet):
+
+| Module | Class | Result |
+|---|---|---|
+| `spring-boot-tomcat` | `SslConnectorCustomizerTests` | **PASS** 8/8, 9.4s |
+| `spring-boot-tomcat` | `autoconfigure.TomcatWebServerFactoryCustomizerTests` | HANG 900s, `tests=0` — see below |
+| `spring-boot-tomcat` | `servlet.TomcatServletWebServerServletContextListenerTests` | **PASS** 2/2, 31.9s |
+| `spring-boot-jetty` | `autoconfigure.servlet.JettyServletWebServerServletContextListenerTests` | **PASS** 2/2, 34.9s |
+| `spring-boot-servlet` | `autoconfigure.MultipartAutoConfigurationTests` | **PASS** 12/12, 83.3s |
+| `spring-boot-websocket` | `autoconfigure.servlet.WebSocketMessagingAutoConfigurationTests` | **PASS** 13/13, 95.0s |
+| `spring-boot-webflux` | `autoconfigure.actuate.web.WebFluxManagementChildContextConfigurationIntegrationTests` | **PASS** 5/5, 81.4s |
+| `spring-boot-security` | `autoconfigure.web.servlet.SecurityFilterAutoConfigurationEarlyInitializationTests` | **PASS** 1/1, 36.8s |
+
+`Unable to reset field` count across all eight logs: **0**. Port-bind failures:
+**0**. Every one of these classes failed 100% of its tests before the fix.
+
+The single non-pass is **not this defect**.
+`TomcatWebServerFactoryCustomizerTests` times out with `tests=0` because it is
+the class tracked by
+`docs/known-issues/springboot/tomcat-jetty-servletwebserverfactorytests-300s-budget-overrun-20260807.md`
+— HotSpot runs its 66 tests in 11.5s, CratonVM needs 800s+ of real work once
+its tests actually execute. That is the throughput gap, and it is somebody
+else's page.
+
+Note how the earlier, port-contended run *flattered* this class: it "finished"
+in 201s only because 82 of its tests were failing fast on a busy port. Removing
+the contention made it slower, not faster. A shorter wall time is not
+automatically a better one.
+
+### The superseded reading (kept, because it was wrong in an instructive way)
+
+Before the re-run above, the state was: **not certified, and this host cannot
+certify them.** With the flag granted, seven of the eight still failed — but
+every single failure block in every log was "cannot start a web server on port
+8080" (`ConnectorStartFailedException` / `ApplicationContextException: Unable to
 start web server`), with **zero** occurrences of this doc's defect:
 
 | class | `Unable to reset field` | port-bind failures | total failure blocks |
@@ -232,10 +267,9 @@ here as a workaround. Re-enabling would need a Gradle test recompile and an
 upstream diff to justify it. The runner now grants the flag unconditionally, so
 if those annotations ever go live they are already covered.
 
-**Re-run the eight classes on an idle host.** Nothing about the fix is
-outstanding, but the green column above is HotSpot's, not CratonVM's, for the
-reason set out under Verification. The re-run needs a host with no other
-CratonVM process holding port 8080.
+**~~Re-run the eight classes on an idle host.~~ DONE 2026-08-10** — 7/8 PASS,
+43 tests, 0 failures; see "CERTIFIED" under Verification. The eighth is the
+throughput class tracked by its own page.
 
 **A separate `ServerSocketChannel` divergence, found by the contention probe
 and unrelated to this doc.** On the *control* row — binding a port nothing
