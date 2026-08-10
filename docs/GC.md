@@ -7,22 +7,36 @@ java-launcher-compatible:
 
 | Flag | Backend | One-liner |
 |---|---|---|
-| *(default)* | `GenerationalHeap` (`gc/src/gen_heap.rs`) | Semi-space young gen + free-list old gen with a concurrent old-gen mark-sweep cycle. Young collections are **moving by default**; each cycle diverts to the non-moving sweep only when its own root-coverage proof fails (see "Backend details" below). |
+| `-XX:+UseGenerationalGC` / `-XX:-UseZGC` | `GenerationalHeap` (`gc/src/gen_heap.rs`) | Semi-space young gen + free-list old gen with a concurrent old-gen mark-sweep cycle. Young collections are **moving by default**; each cycle diverts to the non-moving sweep only when its own root-coverage proof fails (see "Backend details" below). |
 | `-XX:+UseG1GC` | `G1Collector` (`gc/src/g1.rs`) | Region-based (1 MB regions, 2 MB above 4 GB heaps): young/mixed evacuation with remembered sets, SATB concurrent marking, humongous spans, region pinning. |
-| `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep over one arena, with a hash-set allocation registry. No colored pointers, no load barriers, no concurrency, no compaction. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) is a metadata-only simulation with no production consumer. |
+| *(default)* / `-XX:+UseZGC` / `-XX:+UseZ` | `ZgcRealHeap` (`gc/src/zgc.rs`) | **Not a real ZGC**: a memory-backed, non-moving, whole-heap stop-the-world mark-sweep over one arena, with a hash-set allocation registry. No colored pointers, no load barriers, no concurrency, no compaction. The colored-pointer/`ZPage` code above it in `zgc.rs` (and `zgc_concurrent.rs`) is a metadata-only simulation with no production consumer. |
 
 Unrecognized `-XX:+Use*GC` selectors warn and fall back to Generational.
 Heap size comes from `-Xmx`/`-Xms` as usual.
 
-**Only two of the three are in a stock build.** ZGC is behind the
-default-off `zgc` Cargo feature (`gc/Cargo.toml:90`, `vm/Cargo.toml:106`),
-which gates the `GcAlgorithm::Zgc` variant and its `parse_gc_algorithm` arm
-(`vm/src/config.rs:51`) as well as the `VmHeap::Zgc` arms — so in a default
-build `-XX:+UseZGC` takes the fall-back path above. A ZGC-capable launcher
-is `cargo build -p cratonvm-cli --features zgc`. It is default-off because
-it is not at parity: on the 1975-class Spring Boot suite it measures 1860 PASS vs. Generational's 1902, 49 HANG vs. 18
-([record](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md)). The plan to make
-it a real, concurrent, generational, compacting ZGC is
+**ZGC became the DEFAULT on 2026-08-10**, and the `zgc` Cargo feature went
+default-ON with it (it gates the `GcAlgorithm::Zgc` variant, so the default
+cannot be `Zgc` without it). It is still **not a real ZGC** — everything the
+table says about it holds — and it was promoted on measured suite behaviour,
+not on maturity: on the 651-class Tomcat suite under all three backends on one
+commit, ZGC scored 604 PASS / 29 HANG / 0 CRASH in 247 min against
+Generational's 519 / 115 / 1 in 356 min, and 63 classes are non-PASS under
+Generational while passing under both other backends
+([record](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md)).
+
+Two consequences worth stating plainly:
+
+* **It costs heap.** No compaction means ~1.5x the generational footprint on
+  buffer-churning workloads — `ZipContentTests` OOMs at `-Xmx 2g` and passes
+  from 3g. Raise `-Xmx` before diagnosing a post-flip `OutOfMemoryError`.
+* **`-XX:+UseGenerationalGC` is the escape hatch**, in every build. A
+  `--no-default-features` build has no ZGC at all and defaults to Generational.
+
+The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
+[record](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md))
+predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
+it is the measurement this flip still owes. The plan to make this a real,
+concurrent, generational, compacting ZGC is
 [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 
 ## The VM ↔ GC protocol

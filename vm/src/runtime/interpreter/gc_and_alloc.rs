@@ -5386,7 +5386,23 @@ mod root_snapshot_screen_tests {
     /// and then asserts the scan keeps it from BOTH slot kinds.
     #[test]
     fn operand_stack_roots_use_the_same_screen_as_locals() {
-        let shared = SharedVm::new(VmConfig::default());
+        // The collector is PINNED, not defaulted. The disagreement this test
+        // manufactures is generational-specific: it corrupts the header's
+        // `ObjectKind` byte so the strict probe rejects the address while
+        // arena containment still accepts it. On ZGC `is_object_address` is a
+        // registry-base lookup, not a header-tag probe, so the corruption does
+        // not move it and the precondition assert below fails — which is what
+        // happened when the default collector became `Zgc` on 2026-08-10.
+        //
+        // Left as a generational test rather than generalised, deliberately:
+        // whether the operand-stack and locals screens also agree under ZGC's
+        // registry-based probe is a real and separate question, and this
+        // test's setup cannot ask it. It is not covered here.
+        let cfg = VmConfig {
+            gc_algorithm: crate::config::GcAlgorithm::Generational,
+            ..VmConfig::default()
+        };
+        let shared = SharedVm::new(cfg);
         let heap = &shared.mem.heap;
 
         let obj = heap.alloc_object(ClassId::new(0), 0);

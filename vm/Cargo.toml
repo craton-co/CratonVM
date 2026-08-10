@@ -62,7 +62,11 @@ exclude = [
 # `-p cratonvm-cli --features zgc` (the launcher binary, where the gated
 # `GcAlgorithm::Zgc` variant and `parse_gc_algorithm` arm actually get linked)
 # and runs `cargo test -p cratonvm-gc --lib --features zgc`.
-default = ["awt", "management"]
+# `zgc` joined the default set on 2026-08-10: `GcAlgorithm`'s default is now
+# `Zgc`, and that variant is `#[cfg(feature = "zgc")]`, so the feature has to
+# be on for the default build to select it. `--no-default-features` still
+# compiles and falls back to `Generational`.
+default = ["awt", "management", "zgc"]
 # AWT/Swing/Java2D desktop natives. On by default so the standard build
 # registers them exactly as before. `cratonvm-native-awt` sets
 # `publish = false`, so this feature is what makes the dependency optional:
