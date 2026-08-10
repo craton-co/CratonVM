@@ -5525,7 +5525,7 @@ pub(crate) fn verify_member_access(
     // `public_member_class_is_reachable`, and asks it correctly — answered with
     // the value. `StaticFieldELResolver.getValue` consults `canAccess`, so the
     // disagreement surfaced as `PropertyNotFoundException` with a null cause.
-    // See docs/internal/tomcat/teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
+    // See tomcat/teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
     let declaring_is_public =
         (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) != 0;
 

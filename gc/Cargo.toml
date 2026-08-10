@@ -116,7 +116,7 @@ gpu-offload = []
 # NOT because nothing uses it. The first full Spring Boot suite comparison
 # (2026-08-07, same binary, same 1975 classes) measured 1860 PASS / 49 HANG /
 # 22 FAIL under `-XX:+UseZGC` against 1902 / 18 / 11 on the default collector
-# — see `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
+# — see `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
 #
 # DEFAULT-OFF IS NOT UNCOMPILED. A configuration nothing builds rots: this one
 # stopped compiling entirely (E0063) when `ZgcRealHeap::with_capacity()` was

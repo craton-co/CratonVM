@@ -2302,7 +2302,7 @@ pub struct ZgcRealHeap {
     /// 1902 / 18 / 11 on the default collector — **35 classes PASS -> HANG**,
     /// concentrated on `*AutoConfigurationTests`, i.e. `ApplicationContext`
     /// boot/teardown, the most allocation-heavy workload in the suite
-    /// (`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
+    /// (`fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
     ///
     /// That record does not attribute the hangs to this lock and neither does
     /// this field: a global lock on every allocation is the wrong answer at

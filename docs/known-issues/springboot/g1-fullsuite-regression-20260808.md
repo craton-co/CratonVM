@@ -334,7 +334,7 @@ this exact failure — *"an unaligned TLAB ... gets its end rounded DOWN by
 `Tlab::new`'s release safety net — leaving an untracked zeroed sliver between
 the TLAB's filler and the next region that derails the non-moving walk"* — and
 citing
-[`../../internal/fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md`](../../internal/fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md).
+`fixed-suite-bugs/tlab-trigger-gc-young-walk-corruption-FIXED.md`.
 G1's copy of the same carve never received it. Nothing about G1's design is
 implicated; it simply missed a fix the other collector got.
 
@@ -784,7 +784,7 @@ a relocation the root set failed to cover.
   [`hikaridatasourceconfigurationtests-pool-start-hang-20260807.md`](hikaridatasourceconfigurationtests-pool-start-hang-20260807.md).
   It passes on both arms here (485 / 615 s), so this page adds nothing to it.
 * The superseded page,
-  [`g1-fullsuite-regression-RETIRED-20260807.md`](../../internal/fixed-suite-bugs/springboot/g1-fullsuite-regression-RETIRED-20260807.md),
+  `fixed-suite-bugs/springboot/g1-fullsuite-regression-RETIRED-20260807.md`,
   closed the previous edition by exactly this method and had already found
   `BindConverterTests` green under G1 and
   `ChildManagementContextInitializerAotTests` *worse* under the default collector.
@@ -831,7 +831,7 @@ defect.
 # G1 vs. Generational, full Spring Boot suite — rerun 2026-08-08 on a clean binary
 
 **Status: OPEN — characterized, not root-caused.** Supersedes
-[`g1-fullsuite-regression-RETIRED-20260807.md`](../../internal/fixed-suite-bugs/springboot/g1-fullsuite-regression-RETIRED-20260807.md)
+`fixed-suite-bugs/springboot/g1-fullsuite-regression-RETIRED-20260807.md`
 (that page's own findings are still valid and closed; this is a fresh
 comparison, not a reopening). The prior comparison ran against a binary that
 turned out to have a near-total heap-corruption bug (`gen_heap::read_slot:
@@ -894,7 +894,7 @@ pass either way).
 ## Cross-reference: 9 of these 14 are the *identical* change under ZGC too
 
 See the companion doc, retired 2026-08-10:
-[`zgc-real-fullsuite-regression-RETIRED-20260808.md`](../../internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md).
+`fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`.
 Two **collector-agnostic** defects were root-caused there, and one of them is
 live for G1 too, so this page's own residuals are worth re-measuring before
 being triaged as G1 behaviour: a generated-`$ProxyN` cache that kept handing

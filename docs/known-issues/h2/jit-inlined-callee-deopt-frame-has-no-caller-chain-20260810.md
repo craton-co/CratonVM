@@ -2,7 +2,7 @@
 
 **Status:** OPEN (2026-08-10). Found while closing
 `gc-variant-fullsuite-crashes-hangs-fails-20260810` (now retired to
-`docs/internal/fixed-suite-bugs/h2-suite-bugs/`). The *symptom* it caused there
+`fixed-suite-bugs/h2-suite-bugs/`). The *symptom* it caused there
 — `org.h2.test.scripts.TestScript` and `org.h2.test.synth.TestCrashAPI` dying
 with a fatal `InternalError` under all three collectors — is fixed. The
 mechanism underneath is not.
@@ -91,9 +91,9 @@ Answering that is a smaller, decidable question than the symptom:
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md`
+- `fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md`
   — the sweep this came out of, and the sink fix.
-- `docs/internal/fixed-suite-bugs/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`
+- `fixed-suite-bugs/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`
   — where the identity gate and `despeculate_stashed_frame_method` came from.
   Its "outer consumer that CAN attribute it" assumption is exactly the one an
   inlinee breaks.

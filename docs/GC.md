@@ -33,7 +33,7 @@ Two consequences worth stating plainly:
   `--no-default-features` build has no ZGC at all and defaults to Generational.
 
 The Spring Boot comparison (1860 PASS vs 1902, 49 HANG vs 18,
-[record](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md))
+record `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`)
 predates the two ZGC-only defects fixed on 2026-08-10 and has not been re-run;
 it is the measurement this flip still owes. The plan to make this a real,
 concurrent, generational, compacting ZGC is

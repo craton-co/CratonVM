@@ -7929,8 +7929,8 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // `ServiceLoader` then read a registration for a provider it could not load
     // and raised `ServiceConfigurationError: ... Provider ... not found` where
     // HotSpot finds no providers at all. See
-    // `docs/internal/fixed-suite-bugs/springboot/`
-    // `classpath-exclusions-flat-scan-leak-FIXED.md`.
+    // `fixed-suite-bugs/springboot/
+    // classpath-exclusions-flat-scan-and-module-provides-leak-FIXED-20260810.md`.
     //
     // The SINGULAR `findResource` has drawn this line since the ModifiedClassPath
     // work (see its `object_extends(.., "java/net/URLClassLoader")` early return);
