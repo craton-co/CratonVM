@@ -13134,6 +13134,34 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             // waits out that pause, leaving one permanently outstanding arrival.
             // The snapshot makes the worker identity-excluded for every such
             // request and lets the collector maintain its terminal roots.
+            //
+            // Retire this worker's TLAB FIRST, exactly as the main-thread
+            // teardown already does before its own `clear_tlab_addr`. A TLAB
+            // carve advances the owning region's `cursor` over the WHOLE chunk,
+            // so the un-allocated tail `[cursor, end)` sits inside the region's
+            // walked `[0, cursor)` range while holding no object grid. Two
+            // mechanisms normally cover that: `retire()` stamps a walkable
+            // filler over the tail, and — for a thread frozen before it could
+            // retire — `collect_reserved_tlab_tails` publishes the span so the
+            // walkers stride past it. `clear_tlab_addr` below withdraws this
+            // thread from the second mechanism, so without the first the tail
+            // becomes a hole owned by nobody: a later linear walk of that
+            // region reads the zeroed span as 16-byte all-zero objects and
+            // strides off the object grid. `retire()` is idempotent, so doing
+            // it here is safe even when a safepoint park already retired.
+            //
+            // SCOPE — this closes a real asymmetry (the main-thread teardown a
+            // few thousand lines up already retires before its own
+            // `clear_tlab_addr`; this path did not), but it is NOT the fix for
+            // the open G1 corruption in
+            // `docs/known-issues/springboot/g1-fullsuite-regression-20260808.md`.
+            // Measured: with this change,
+            // `Log4J2LoggingSystemTests -XX:+UseG1GC` still fails 18/61 with
+            // 239/252 `g1::get_field ... num_slots=0 class_id=ClassId(0)` hits
+            // and 8 walk breaks per run — unchanged from without it. So a dying
+            // worker's un-retired TLAB is not what produces the unwalkable
+            // span that page is chasing; that producer is still unidentified.
+            jvm_thread.tlab.retire();
             NativeContextImpl {
                 shared: &shared_arc,
                 thread: &mut jvm_thread,
