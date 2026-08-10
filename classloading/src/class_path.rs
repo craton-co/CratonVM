@@ -577,6 +577,68 @@ impl std::fmt::Debug for ClassPathEntry {
     }
 }
 
+/// Do two entries read from the same place?
+///
+/// This is the identity HotSpot's `URLClassPath` dedupes on: it refuses to
+/// push a URL already on its path, so `java -cp dir;dir` answers
+/// `getResources` with ONE URL, not two (measured, JDK 25).
+fn same_classpath_source(a: &ClassPathEntry, b: &ClassPathEntry) -> bool {
+    match (a, b) {
+        (ClassPathEntry::Directory(x), ClassPathEntry::Directory(y)) => x == y,
+        (ClassPathEntry::JarFile { path: x, .. }, ClassPathEntry::JarFile { path: y, .. })
+        | (ClassPathEntry::JmodFile { path: x, .. }, ClassPathEntry::JmodFile { path: y, .. })
+        | (ClassPathEntry::JImageFile { path: x, .. }, ClassPathEntry::JImageFile { path: y, .. }) => x == y,
+        (
+            ClassPathEntry::NestedDirectory {
+                parent_jar: xj,
+                prefix: xp,
+                ..
+            },
+            ClassPathEntry::NestedDirectory {
+                parent_jar: yj,
+                prefix: yp,
+                ..
+            },
+        ) => xj == yj && xp == yp,
+        (
+            ClassPathEntry::NestedJar {
+                parent_jar: xj,
+                nested_path: xn,
+                ..
+            },
+            ClassPathEntry::NestedJar {
+                parent_jar: yj,
+                nested_path: yn,
+                ..
+            },
+        ) => xj == yj && xn == yn,
+        _ => false,
+    }
+}
+
+/// Append `entry` unless this `ClassPath` already reads from that source.
+///
+/// One physical source can reach a single `ClassPath` twice. The case that
+/// mattered: `--jar <pathing-jar>` expands the launch jar's manifest
+/// `Class-Path` in `vm-cli`, hands the result to `ClassPath::new`, and
+/// `load_jar_data_at_depth` then expands that same manifest again when it
+/// opens the launch jar. Jars survived it — that function returns early for an
+/// archive already published — but directories were pushed unconditionally, so
+/// every directory on a pathing jar's manifest was enumerated TWICE. Spring
+/// Boot's `@WithPackageResources` copies each `getResources` hit into a fresh
+/// temp root, so the second copy of the same directory failed with
+/// `FileAlreadyExistsException` and took the whole SSL/PEM/JKS test cluster
+/// with it.
+fn push_classpath_entry(entries: &mut Vec<ClassPathEntry>, entry: ClassPathEntry) {
+    if entries
+        .iter()
+        .any(|existing| same_classpath_source(existing, &entry))
+    {
+        return;
+    }
+    entries.push(entry);
+}
+
 /// Parsed contents of `META-INF/MANIFEST.MF` relevant to JAR loading.
 #[derive(Debug, Default)]
 pub struct ManifestInfo {
@@ -1658,7 +1720,7 @@ impl ClassPath {
                             )
                             .or_else(|| Self::build_nested_directory_from_jar(&path, data, &prefix))
                             {
-                                entries.push(entry);
+                                push_classpath_entry(entries, entry);
                             }
                         }
                         Err(e) => {
@@ -1678,10 +1740,10 @@ impl ClassPath {
             }
             let path = PathBuf::from(&p);
             if path.is_dir() {
-                entries.push(ClassPathEntry::Directory(path));
+                push_classpath_entry(entries, ClassPathEntry::Directory(path));
             } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
                 match Self::load_jmod(&path) {
-                    Ok(entry) => entries.push(entry),
+                    Ok(entry) => push_classpath_entry(entries, entry),
                     Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
                 }
             } else if Self::is_likely_jimage(&path) {
@@ -1692,7 +1754,7 @@ impl ClassPath {
                 // name check lets users write `-cp /path/to/lib/modules`
                 // without having to pass a special flag.
                 match Self::load_jimage(&path) {
-                    Ok(entry) => entries.push(entry),
+                    Ok(entry) => push_classpath_entry(entries, entry),
                     Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
                 }
             } else if path.is_file() {
@@ -1874,7 +1936,7 @@ impl ClassPath {
                             )
                             .or_else(|| Self::build_nested_directory_from_jar(&path, data, &prefix))
                             {
-                                entries.push(entry);
+                                push_classpath_entry(entries, entry);
                             }
                         }
                         Err(e) => {
@@ -1895,15 +1957,15 @@ impl ClassPath {
 
             let path = PathBuf::from(&p);
             if path.is_dir() {
-                entries.push(ClassPathEntry::Directory(path));
+                push_classpath_entry(entries, ClassPathEntry::Directory(path));
             } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
                 match Self::load_jmod(&path) {
-                    Ok(entry) => entries.push(entry),
+                    Ok(entry) => push_classpath_entry(entries, entry),
                     Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
                 }
             } else if Self::is_likely_jimage(&path) {
                 match Self::load_jimage(&path) {
-                    Ok(entry) => entries.push(entry),
+                    Ok(entry) => push_classpath_entry(entries, entry),
                     Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
                 }
             } else if path.is_file() {
@@ -2180,7 +2242,7 @@ impl ClassPath {
                                         pb.display(),
                                         prefix
                                     );
-                                    self.entries.push(entry);
+                                    push_classpath_entry(&mut self.entries, entry);
                                 }
                                 None => debug!(
                                     "Dynamic classpath: nested-dir {}!/{} \
@@ -2203,10 +2265,10 @@ impl ClassPath {
             let pb = std::path::PathBuf::from(&expanded);
             if pb.is_dir() {
                 debug!("Dynamic classpath: adding directory {expanded}");
-                self.entries.push(ClassPathEntry::Directory(pb));
+                push_classpath_entry(&mut self.entries, ClassPathEntry::Directory(pb));
             } else if pb.extension().is_some_and(|e| e == "jmod") && pb.exists() {
                 match Self::load_jmod(&pb) {
-                    Ok(entry) => self.entries.push(entry),
+                    Ok(entry) => push_classpath_entry(&mut self.entries, entry),
                     Err(e) => debug!("Dynamic classpath: failed to read JMOD {expanded}: {e}"),
                 }
             } else if pb.is_file() {
@@ -4486,7 +4548,7 @@ impl ClassPath {
     pub fn add_jimage(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
         let path = path.as_ref().to_path_buf();
         let entry = Self::load_jimage(&path)?;
-        self.entries.push(entry);
+        push_classpath_entry(&mut self.entries, entry);
         Ok(())
     }
 
