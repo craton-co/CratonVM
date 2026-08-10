@@ -2303,7 +2303,7 @@ fn byte_buffer_view_set(
 const SEGMENT_VAR_HANDLE_CLASS: &str = "java/lang/invoke/SegmentVarHandle";
 
 fn is_segment_var_handle(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
 }
 
 /// A `SegmentVarHandle`'s own `enclosing` (the `ValueLayout` it was built
@@ -7810,7 +7810,7 @@ pub(crate) fn mh_dispatch(
     // foreign downcall. Those compact handles store the function address in
     // field 0 rather than the MethodHandle metadata slots, so dispatch them
     // directly before trying to decode the generic MethodHandle layout.
-    if ctx.class_name_of_id(ctx.class_id_of_object(mh)).as_deref()
+    if ctx.class_name_arc_of_id(ctx.class_id_of_object(mh)).as_deref()
         == Some("java/lang/foreign/DowncallHandle")
     {
         if crate::nbflags().dbg_mh_dispatch {
@@ -9318,7 +9318,7 @@ fn collect_trailing_varargs(
         let found = tail.iter().enumerate().find(|(i, v)| {
             !taken[*i]
                 && matches!(v, Value::Object(Some(o))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
         }).map(|(i, _)| i);
         let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
         if let Some(i) = idx {
@@ -9828,7 +9828,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // void invokeExact into a silent no-op.
             if let Some(Value::Object(Some(this))) = args.first() {
                 if ctx
-                    .class_name_of_id(ctx.class_id_of_object(*this))
+                    .class_name_arc_of_id(ctx.class_id_of_object(*this))
                     .as_deref()
                     == Some("java/lang/foreign/DowncallHandle")
                 {
@@ -12007,7 +12007,7 @@ mod tests {
         };
         let cid = ctx.class_id_of_object(obj);
         assert_eq!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some(wrapper),
             "boxed with the wrong wrapper class"
         );

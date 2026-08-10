@@ -714,7 +714,7 @@ fn xssimple_create_string(ctx: &mut dyn NativeContext, units: &[u16]) -> ObjectR
 
 fn xssimple_object_is_string_buffer(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(obj);
-    if ctx.class_name_of_id(class_id).as_deref() == Some("java/lang/StringBuffer") {
+    if ctx.class_name_arc_of_id(class_id).as_deref() == Some("java/lang/StringBuffer") {
         return true;
     }
     ctx.class_id_by_name("java/lang/StringBuffer")

@@ -199,7 +199,7 @@ fn antlr_names_for_class_name(name: &str) -> AntlrClassNames {
 
 #[inline]
 fn antlr_names_for_object(ctx: &mut dyn NativeContext, obj: ObjectRef) -> AntlrClassNames {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj))
         .as_deref()
         .map(antlr_names_for_class_name)
         .unwrap_or(ANTLR_NAMES)
@@ -686,7 +686,7 @@ fn native_antlr_array_prediction_context_init_singleton(
     let parent = antlr_singleton_parent(ctx, singleton);
     let return_state = antlr_singleton_return_state(ctx, singleton);
     let pc_name = match ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         .map(|name| name.starts_with("groovyjarjarantlr4/v4/runtime/"))
     {
@@ -1261,7 +1261,7 @@ fn antlr_arraylist_append(
 }
 
 fn antlr_is_java_arraylist(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/util/ArrayList")
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/util/ArrayList")
 }
 
 fn antlr_atn_state_transitions(
@@ -2146,7 +2146,7 @@ fn antlr_semantic_context_is_precedence_predicate(
     ctx: &mut dyn NativeContext,
     sem: ObjectRef,
 ) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(sem))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(sem))
         .as_deref()
         .map(|name| antlr_class_name_matches(name, "/atn/SemanticContext$PrecedencePredicate"))
         .unwrap_or(false)
@@ -2693,21 +2693,21 @@ fn antlr_dfa_start_rule(ctx: &mut dyn NativeContext, dfa: ObjectRef) -> Option<i
 }
 
 fn antlr_transition_is_action(ctx: &mut dyn NativeContext, transition: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(transition))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(transition))
         .as_deref()
         .map(|name| antlr_class_name_matches(name, "/atn/ActionTransition"))
         .unwrap_or(false)
 }
 
 fn antlr_transition_is_rule(ctx: &mut dyn NativeContext, transition: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(transition))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(transition))
         .as_deref()
         .map(|name| antlr_class_name_matches(name, "/atn/RuleTransition"))
         .unwrap_or(false)
 }
 
 fn antlr_transition_is_epsilon(ctx: &mut dyn NativeContext, transition: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(transition))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(transition))
         .as_deref()
         .map(antlr_transition_is_epsilon_class)
         .unwrap_or(false)

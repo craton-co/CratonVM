@@ -4079,7 +4079,7 @@ mod jdk25_concurrency_tests {
             Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("java/util/concurrent/TimeoutException"),
                     "joinUntil past-deadline must throw a real TimeoutException"
                 );

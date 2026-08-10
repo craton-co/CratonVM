@@ -9912,7 +9912,7 @@ fn re5_read_byte_array_range(
 fn re5_handler_tag(ctx: &dyn NativeContext, handler: Option<Value>) -> Option<String> {
     if let Some(Value::Object(Some(h))) = handler {
         let cid = ctx.class_id_of_object(h);
-        if ctx.class_name_of_id(cid).as_deref() == Some("java/net/http/HttpResponse$BodyHandler") {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some("java/net/http/HttpResponse$BodyHandler") {
             if let Value::Object(Some(s)) = ctx.get_field(h, 0) {
                 if let Some(tag) = ctx.read_string(s) {
                     return Some(tag);

@@ -1683,7 +1683,7 @@ fn bytebuddy_object_is_instance_of(
     class_name: &str,
 ) -> bool {
     let obj_class = ctx.class_id_of_object(obj);
-    if ctx.class_name_of_id(obj_class).as_deref() == Some(class_name) {
+    if ctx.class_name_arc_of_id(obj_class).as_deref() == Some(class_name) {
         return true;
     }
     ctx.class_id_by_name(class_name)
@@ -2167,7 +2167,7 @@ fn bytebuddy_object_is_exact_class(
     obj: ObjectRef,
     class_name: &str,
 ) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
 }
 
 fn native_bytebuddy_method_type_token_hash_code(
@@ -3736,7 +3736,7 @@ pub(crate) fn native_surefire_forkedbooter_exit_code(
 }
 
 fn is_surefire_forwarding_print_stream(ctx: &dyn NativeContext, stream: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(stream))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(stream))
         .as_deref()
         == Some(SUREFIRE_FORWARDING_PRINT_STREAM)
 }
@@ -4563,9 +4563,9 @@ fn assertj_array_list_long_layout(
     iterable: ObjectRef,
     needle: ObjectRef,
 ) -> Option<(ObjectRef, usize, usize, i64)> {
-    if ctx.class_name_of_id(ctx.class_id_of_object(iterable)).as_deref()
+    if ctx.class_name_arc_of_id(ctx.class_id_of_object(iterable)).as_deref()
         != Some("java/util/ArrayList")
-        || ctx.class_name_of_id(ctx.class_id_of_object(needle)).as_deref()
+        || ctx.class_name_arc_of_id(ctx.class_id_of_object(needle)).as_deref()
             != Some("java/lang/Long")
     {
         return None;

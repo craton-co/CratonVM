@@ -1033,7 +1033,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let (lang, country, variant) = match args.get(1) {
         Some(Value::Object(Some(loc))) => {
             let cid = ctx.class_id_of_object(*loc);
-            if ctx.class_name_of_id(cid).as_deref() == Some("java/util/Locale") {
+            if ctx.class_name_arc_of_id(cid).as_deref() == Some("java/util/Locale") {
                 requested_locale_obj = Some(*loc);
                 // Read via getLanguage()/getCountry()/getVariant() so it works
                 // for both our synthetic Locales and the JDK's predefined

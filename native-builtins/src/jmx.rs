@@ -2239,7 +2239,7 @@ fn try_delegate_to_real_provider(
             Ok(Some(v)) => return Some(Ok(Some(v))),
             Ok(None) => {}
             Err(MethodCallFailed::ExceptionThrown(exc)) => {
-                let is_malformed = ctx.class_name_of_id(ctx.class_id_of_object(exc)).as_deref()
+                let is_malformed = ctx.class_name_arc_of_id(ctx.class_id_of_object(exc)).as_deref()
                     == Some("java/net/MalformedURLException");
                 if !is_malformed && first_exception.is_none() {
                     first_exception = Some(exc);

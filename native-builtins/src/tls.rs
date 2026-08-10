@@ -3279,7 +3279,7 @@ mod tls_tests {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let cid = ctx.class_id_of_object(exc);
                 assert_eq!(
-                    ctx.class_name_of_id(cid).as_deref(),
+                    ctx.class_name_arc_of_id(cid).as_deref(),
                     Some("java/security/NoSuchAlgorithmException")
                 );
             }

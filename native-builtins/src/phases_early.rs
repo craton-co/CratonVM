@@ -51,7 +51,7 @@ fn object_array_element_hash_code(
         return Ok(ctx.identity_hash_code(obj));
     }
 
-    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+    match ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() {
         Some("java/lang/String") => {
             match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
                 Some(Value::Int(v)) => Ok(v),
@@ -5513,7 +5513,7 @@ fn es_get_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Object
 
 fn es_real_kind(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<&'static str> {
     match ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
     {
         Some("java/util/RegularEnumSet") => Some("regular"),
@@ -8897,7 +8897,7 @@ fn fjt_is_unchecked_throwable(ctx: &mut dyn NativeContext, ex: ObjectRef) -> boo
     let mut cur = Some(ctx.class_id_of_object(ex));
     for _ in 0..64 {
         let Some(cid) = cur else { return false };
-        match ctx.class_name_of_id(cid).as_deref() {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
             Some("java/lang/RuntimeException") | Some("java/lang/Error") => return true,
             Some("java/lang/Exception") | Some("java/lang/Throwable") | Some("java/lang/Object") => {
                 return false
@@ -12444,7 +12444,7 @@ fn p52_isa_addr_ip(ctx: &mut dyn NativeContext, addr: ObjectRef) -> String {
 fn p52_is_isa_holder(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(obj);
     matches!(
-        ctx.class_name_of_id(class_id).as_deref(),
+        ctx.class_name_arc_of_id(class_id).as_deref(),
         Some("java/net/InetSocketAddress$InetSocketAddressHolder")
     )
 }

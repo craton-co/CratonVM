@@ -128,7 +128,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             };
             let entry_name = match args.get(1) {
                 Some(Value::Object(Some(e)))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(*e)).as_deref()
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(*e)).as_deref()
                         == Some(
                             "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
                         ) =>
@@ -206,7 +206,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             // NestedJarFile's bytecode override. Delegate from the bridge
             // itself so the concrete receiver keeps its multi-release
             // `NestedJarEntry` representation.
-            if ctx.class_name_of_id(ctx.class_id_of_object(this)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(this)).as_deref()
                 == Some("org/springframework/boot/loader/jar/NestedJarFile")
             {
                 return ctx.invoke(
@@ -1429,7 +1429,7 @@ pub(crate) fn spring_class_utils_for_name_impl(
     // fixed-suite-bugs/springboot/classutils-forname-platform-loader-false-positive.md).
     if let Some(loader) = loader {
         let is_platform_or_boot = matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(loader))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(loader))
                 .as_deref(),
             Some("jdk/internal/loader/ClassLoaders$PlatformClassLoader")
                 | Some("jdk/internal/loader/ClassLoaders$BootClassLoader")

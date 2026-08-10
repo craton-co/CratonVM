@@ -878,7 +878,7 @@ fn resource_package_name(name: &str) -> &str {
 fn resource_caller_module(ctx: &mut dyn NativeContext) -> Option<String> {
     for cid in ctx.frame_class_ids() {
         if matches!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some("java/lang/Module")
         ) {
             continue;

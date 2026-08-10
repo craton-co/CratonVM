@@ -2240,7 +2240,7 @@ pub(crate) fn invoke_single_load_class_override(
 /// defined by application loader` — the two loaders are unrelated objects
 /// with disjoint URLs, not aliases of the single real Application loader.
 fn is_bare_url_class_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(this))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("java/net/URLClassLoader")
 }
@@ -2643,7 +2643,7 @@ fn find_loaded_class_for_loader_inner(
         .collect();
     for cid in defined_here {
         let cid = cratonvm_types::ClassId::new(cid);
-        if ctx.class_name_of_id(cid).as_deref() == Some(internal_name) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(internal_name) {
             return Some(ctx.get_class_mirror(cid));
         }
     }
@@ -5193,7 +5193,7 @@ fn loader_overrides_find_resources(ctx: &mut dyn NativeContext, this_ref: Object
     const FIND_RESOURCES_DESC: &str = "(Ljava/lang/String;)Ljava/util/Enumeration;";
     let mut cid = Some(ctx.class_id_of_object(this_ref));
     while let Some(c) = cid {
-        match ctx.class_name_of_id(c).as_deref() {
+        match ctx.class_name_arc_of_id(c).as_deref() {
             // Reached the base class (or an untyped class): no override found.
             Some("java/lang/ClassLoader") | Some("java/lang/Object") | None => return false,
             _ => {}
@@ -6765,7 +6765,7 @@ fn probe_resource_exists(ctx: &mut dyn NativeContext, url: ObjectRef) -> bool {
 pub(crate) fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &str) -> bool {
     let mut class_id = ctx.class_id_of_object(obj);
     for _ in 0..64 {
-        match ctx.class_name_of_id(class_id).as_deref() {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
             Some(name) if name == target => return true,
             None => return false,
             _ => {}

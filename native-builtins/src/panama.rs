@@ -1441,7 +1441,7 @@ impl PeClassMemo {
         if raw == self.miss.load(relaxed) {
             return false;
         }
-        let matched = ctx.class_name_of_id(class_id).as_deref() == Some(expected);
+        let matched = ctx.class_name_arc_of_id(class_id).as_deref() == Some(expected);
         if matched {
             self.hit.store(raw, relaxed);
         } else {
@@ -2065,7 +2065,7 @@ pub(crate) fn downcall_option_captures_call_state(
     option: ObjectRef,
 ) -> bool {
     matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(option))
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(option))
             .as_deref(),
         Some("jdk/internal/foreign/abi/LinkerOptions$CaptureCallState")
     )

@@ -862,7 +862,7 @@ pub(crate) fn jul_logger_name_object(
     // `ConfigurationData`.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, 0) {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .class_name_arc_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
@@ -878,7 +878,7 @@ pub(crate) fn jul_logger_name_object(
     // The `logmanager` synthetic layout.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, LOGGER_FIELD_NAME) {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .class_name_arc_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
@@ -940,7 +940,7 @@ fn tomcat_context_loader_key(ctx: &mut dyn NativeContext) -> i32 {
 fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager))
+        .class_name_arc_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         != Some("org/apache/juli/ClassLoaderLogManager")
     {
@@ -1003,7 +1003,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     logger = ctx.read_native_pin(logger_pin, logger);
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager))
+        .class_name_arc_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         == Some("org/apache/juli/ClassLoaderLogManager")
     {
@@ -4072,7 +4072,7 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> R
     // ClassLoaderLogManager creates a real per-webapp logger.
     let synthetic_layout = matches!(ctx.get_field(logger, LOGGER_FIELD_NAME),
         Value::Object(Some(name))
-            if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                 == Some("java/lang/String"));
     if synthetic_layout {
         // `allocate_logger` now populates this same slot with a real parent
@@ -4080,7 +4080,7 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> R
         // don't misread it as one.
         if let Value::Object(Some(list)) = ctx.get_field(logger, LOGGER_FIELD_PARENT) {
             if ctx
-                .class_name_of_id(ctx.class_id_of_object(list))
+                .class_name_arc_of_id(ctx.class_id_of_object(list))
                 .as_deref()
                 != Some(CLS_JUL_LOGGER)
             {
@@ -4472,7 +4472,7 @@ fn jul_is_throwable(ctx: &dyn NativeContext, o: ObjectRef) -> bool {
     let mut cid = ctx.class_id_of_object(o);
     // Depth guard: a corrupt or self-referential chain must not spin here.
     for _ in 0..64 {
-        match ctx.class_name_of_id(cid).as_deref() {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
             Some("java/lang/Throwable") => return true,
             // `Object` terminates the chain; `None` means the id is not a
             // real loaded class (synthetic lambda proxy, stale ref).
