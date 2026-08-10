@@ -1,6 +1,6 @@
 # G1 vs. Generational, full Spring Boot suite — the 14-class diff re-measured, 2026-08-10
 
-**Status: OPEN, but rewritten.** The 2026-08-08 page (kept verbatim at the
+**Status: OPEN, but rewritten — and the defect is now known to be JIT-dependent (§3b).** The 2026-08-08 page (kept verbatim at the
 bottom) framed this as "14 classes changed status, G1 essentially at parity".
 Re-running all 14 on a fresh `dev` binary, two ABBA-interleaved rounds per
 class, says something different and much narrower:
@@ -134,6 +134,59 @@ retired TLAB's filler correctly, then lands on a **zeroed 16-byte pseudo-object*
 (`HEADER_SIZE` = 16, `num_slots=0` ⇒ recorded size 16) which is embedded in real
 data — 16 bytes later the bytes decode as `slots=65536`, and the walk breaks.
 
+## 3b. The corruption is JIT-dependent — bisect so far
+
+The single most useful fact about this defect, established after the first
+write-up of this page. Same binary, same class, G1 throughout:
+
+| arm | result | `gc::guard` hits | walk desyncs |
+|---|---|---:|---:|
+| G1 + JIT | FAIL 18/61 | **563** | many |
+| G1 + **`--nojit`** | **PASS 61/61** | **0** | **0** |
+| G1 + JIT, `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` | FAIL 16/61 | 307 | 12 |
+| G1 + JIT, `CRATONVM_NO_JIT_TLAB_ZERO_ELISION=1` | **SIGSEGV** | 97 | 8 |
+| G1 + JIT, `CRATONVM_JIT_DISABLE_INLINE_NEW=1` | still corrupt † | 0 † | 8 |
+
+† this arm produced **zero** `g1::get_field` guard hits but is not clean: a
+*different* guard fires instead —
+`interpreter::invoke: Stale pointer detected in invokevirtual receiver
+(ptr=..., all-zero header)`, repeatedly, on the same address. Reading a
+single guard's count as "fixed" would have been a false green here.
+
+So: **turning the JIT off makes G1 completely clean on a class that fails 18/61
+with it on** — but none of the three JIT allocation gates accounts for it. The
+inline object allocator (`emit_inline_tlab_new`, `jit/src/x64/objects.rs:634`) is
+therefore *not* the source, despite its own comment documenting a previously
+confirmed heap corruption of exactly this shape (a compact `body_size` baked as
+an immediate at compile time going stale when the layout is replaced). Worth
+noting for whoever picks this up: that emitter's `layout_replace_guard` is emitted
+**only when `compact_snapshot` is `Some`**, and by its own comment "new class
+REGISTRATIONS don't bump it, only replacements do" — a site compiled while the
+class had no registered compact layout bakes the LEGACY size and emits no guard
+at all. That is a real hole; it is simply not the one causing this.
+
+### The shape the trails converge on
+
+Every desync ends the same way — the last step before the break is a `0x10`-sized
+`cid=0,k=0` read, i.e. the walker consuming **exactly one 16-byte all-zero
+header** (`HEADER_SIZE` = 16) and then landing inside that object's body, reading
+body bytes as a header:
+
+```
+region=119 ... 0x19188+0x28(cid=0,k=1)  0x191b0+0x20(cid=4044482304,k=1)  0x191d0+0x10(cid=0,k=0)
+           break at 0x191e0
+region=7   ... 0xa4340+0x20(cid=148,k=0) 0xa4360+0x10(cid=0,k=0)
+           break at 0xa4370
+```
+
+Note `0x19188+0x28(cid=0,k=1)` — an Array with `class_id=0` but a real size.
+So the object grid is acquiring entries whose **header is zero while their body
+holds real data**: space reserved and neighbours allocated after it, but
+`class_id`/`num_slots`/`kind` never written (or cleared). That is a
+partially-initialized object made visible to a heap walk, and it is what both the
+`g1::get_field` guard and the `invokevirtual` stale-receiver guard are seeing from
+their two different directions.
+
 ## 4. What is ruled out, and the open question
 
 Three hypotheses were tested and **refuted** — each is recorded because each one
@@ -157,18 +210,33 @@ looked right:
    payloads up to 8 and `HEADER_SIZE`/`ARRAY_DATA_OFFSET` are 16, so
    `object_total_size` is 8-aligned; the walker's stride and the allocator agree.
 
-**Open question:** what writes a 16-byte zeroed hole into the middle of a
-never-recycled Eden region, immediately after a retired TLAB's filler and
-immediately before live data? The region's `[0, cursor)` covers the whole TLAB
-carve including any un-initialized part, which is exactly what
-`Tlab::reserved_tail` + `collect_reserved_tlab_tails` +
+4. **"It is one of the JIT's allocation fast paths."** Three gates tested
+   individually, all still corrupt — see §3b. `emit_inline_tlab_new` is out.
+
+**Open question:** with the JIT on, what leaves an object in an Eden region whose
+**header is all zero while its body holds real data**, with neighbours allocated
+after it (so the region cursor moved past it)? `--nojit` never produces one. The
+region's `[0, cursor)` covers the whole TLAB carve including any un-initialized
+part, which is what `Tlab::reserved_tail` + `collect_reserved_tlab_tails` +
 `G1Collector::set_jit_tlab_skip_regions` exist to cover — but those spans are a
-per-pause transient, cleared after the collection, whereas the hole observed here
-is permanent (it desyncs the same region on later pauses). The next step is to
-report, at the desync, whether the landing offset lies inside any *currently
-published* skip span: if it does not, the span belongs to no live thread, which
-points at a TLAB abandoned without a retire (thread teardown) rather than at a
-walker gap.
+per-pause transient, cleared after the collection, whereas what is observed here
+desyncs the same region on later pauses.
+
+Two concrete next steps, in order:
+
+* Report, at the desync, whether the landing offset lies inside any *currently
+  published* skip span. If it does not, the span belongs to no live thread —
+  pointing at a TLAB abandoned without a retire (thread teardown) rather than at
+  a walker gap.
+* Walk the remaining JIT gates the same way §3b walked the allocation ones —
+  `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1` first, then the inline **array**
+  allocation path (`jit/src/x64/bytecode_walk.rs:10055`, "writes
+  array_length/GC_FLAG_COMPACT inline"), which has no dedicated off-gate yet and
+  is array-shaped like the `slots=65536` / `obj_size=0x100010` misreads.
+
+**Do not read a single guard's count as a verdict** — the
+`CRATONVM_JIT_DISABLE_INLINE_NEW=1` arm shows `g1::get_field` hits dropping to
+zero while the `invokevirtual` stale-receiver guard fires throughout.
 
 **Reproducer:** `Log4J2LoggingSystemTests` (`core/spring-boot`) under
 `-XX:+UseG1GC` — 445 guard hits, ~510 s, far cheaper and louder than
