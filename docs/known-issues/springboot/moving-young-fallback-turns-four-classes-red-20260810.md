@@ -179,6 +179,52 @@ these four**: peaks of #4096 and #16384 are far past the 512 that filter was
 built for. Whether the remaining fallbacks are further false positives or
 genuine unregistered frames is not established here.
 
+## `innermost-rbp-belongs-to-unguarded-callee` is the indirect-call case
+
+`Log4J2LoggingSystemTests` is **100%** this one reason — all 17 logged lines, up
+to #4096. It is now reproducible in 20 seconds, without Spring, JUnit or a
+suite: `probes/MovingYoungFallbackCallFormProbe.java` runs identical allocation
+and identical recursion depth through three call forms and the reason partitions
+perfectly by form.
+
+| Arm | Call form | iters / 20s | peak | reason observed |
+|---|---|---:|---:|---|
+| `iface` (4 receiver types) | indirect | 8.98M, 10.19M | 32, 32 | **100%** `innermost-rbp-belongs-to-unguarded-callee` |
+| `virtual` (one final receiver) | indirect | 5.68M | 16 | **100%** the same |
+| `static` (recursive `invokestatic`) | direct `E8 rel32` | 28.3M | 64 | **100%** `parent-frame-map-incomplete`, **zero** innermost-rbp |
+
+That is what a failing `E8 rel32` decode predicts exactly.
+`innermost_frame_method` (`vm/src/jit/conservative_roots.rs`) establishes which
+`CompiledMethod` owns the innermost frame by decoding the five-byte direct CALL
+immediately before the saved return address; a frame entered by an indirect call
+— every megamorphic site, every inline-cache miss, every trampoline — has no
+such encoding, so `direct_call_callee` returns `None` and the scan fails closed.
+
+Corroborating, at zero build cost: the existing opt-out
+`CRATONVM_GC_NO_CALLEE_RESOLVE=1`, which disables that resolution entirely, is
+**completely inert** on the indirect arms — identical peak and identical line
+count with it on and off. The resolution it gates never succeeds there, so
+turning it off changes nothing. An inert lever is not an elimination; here it is
+positive evidence that the decode is failing rather than being skipped.
+
+### …but fixing it may shift the reason rather than remove the fallback
+
+Normalised per unit of work the three arms are comparable — static 2.3
+fallbacks per million iterations, iface 3.6, virtual 2.8. The direct-call arm
+does not fall back *less*; it falls back under a **different** reason. So making
+indirect frames resolvable could simply move those collections into
+`parent-frame-map-incomplete` instead of letting them compact.
+
+Before paying for the fix — pairing a method identity with the recorded RBP
+touches the frame-record store in the IR backend, the single-pass backend and
+the shared allocation stub, on the path that runs at every compiled frame push —
+the ceiling should be measured with a **diagnostic-only** build: on a
+`FOREIGN_INNERMOST_RBP` fallback, record whether every *other* precondition was
+already satisfied. That says how many of these collections would actually become
+moving, with no behaviour change. The two worst classes (`Integration`,
+`Quartz`) peak under different reasons entirely, so this fix is not expected to
+help them.
+
 ## The count is the triage signal
 
 The fallback peak separates the two outcomes cleanly, and cheaply:
