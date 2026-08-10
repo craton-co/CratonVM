@@ -737,6 +737,7 @@ fn seed_channel_interruptor(ctx: &mut dyn NativeContext, ch: ObjectRef) -> Objec
 ///   field 8 = Unix-domain socket path (String or null; both ends' address)
 ///   field 9 = input shutdown (1=shut down, 0=open)
 ///   field 10 = output shutdown (1=shut down, 0=open)
+///   field 11 = SO_REUSEADDR as last requested (see `F_REUSEADDR`)
 const F_OPEN: usize = 0;
 const F_BLOCKING: usize = 1;
 const F_REG_ID: usize = 2;
@@ -748,7 +749,27 @@ const F_FAMILY: usize = 7;
 const F_UDS_PATH: usize = 8;
 const F_INPUT_SHUTDOWN: usize = 9;
 const F_OUTPUT_SHUTDOWN: usize = 10;
-const N_FIELDS: usize = 11;
+
+/// `SO_REUSEADDR` as Java last requested it, held from before the bind.
+///
+/// It is a `Syn` side-table slot like the rest, so it MUST be inside
+/// `N_FIELDS`: `cf_set`/`cf_get` both early-return on `idx >= N_FIELDS`, which
+/// means an out-of-range index is silently dropped on write and reads back as
+/// `Value::Int(0)` — indistinguishable from "Java never set it". (Cost me one
+/// build: `F_REUSEADDR = 11` with `N_FIELDS = 11` looked right and did
+/// nothing.)
+///
+/// It has to live somewhere channel-scoped because `SO_REUSEADDR` is a
+/// *pre-bind* option, and before a bind a channel has no registry id at all.
+/// `sc_set_option` recorded into `tcp_option_state()` keyed by that id, under
+/// `if let Some(id) = read_reg_id(...)`, so the one option whose whole purpose
+/// is to be set before binding was the one option that got dropped on the
+/// floor — and `sc_get_option`'s matching `else { 0 }` then reported it as
+/// `false`. `setOption(SO_REUSEADDR, true)` immediately followed by
+/// `getOption(SO_REUSEADDR)` answered `false` on CratonVM and `true` on
+/// HotSpot.
+const F_REUSEADDR: usize = 11;
+const N_FIELDS: usize = 12;
 
 /// `F_FAMILY` value for a `StandardProtocolFamily.UNIX` channel.
 const FAMILY_UNIX: i32 = 1;
@@ -3674,6 +3695,14 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // Accept either Int or Boolean payloads — both arrive as Value::Int here.
     let val = socket_option_value(ctx, args.get(2).copied().unwrap_or(Value::Int(0)));
 
+    // `SO_REUSEADDR` is a pre-bind option, so it is normally set while the
+    // channel still has no registry id and the `if let Some(id)` below cannot
+    // run. Record it against the channel itself first; `ssc_finish_bind` reads
+    // it back and applies it to the listener it just created.
+    if opt_name == "SO_REUSEADDR" {
+        cf_set(ctx, this, F_REUSEADDR, Value::Int(val));
+    }
+
     if let Some(id) = read_reg_id(ctx, this) {
         tcp_option_state()
             .write()
@@ -3722,9 +3751,25 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             match map.get(&id) {
                 Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
                 Some(TcpHandle::Bound(s)) => read_option(s, &opt_name).unwrap_or(0),
+                // A LISTENER is not a TcpStream, so `read_option` cannot see
+                // it. Ask the OS directly for the one option that is meaningful
+                // on a listener, and only fall back to what Java requested when
+                // the platform shim declines to answer — never to a fabricated
+                // `false`.
+                Some(TcpHandle::Listener(l)) if opt_name == "SO_REUSEADDR" => {
+                    match crate::net::listener_get_reuseaddr(l) {
+                        Some(on) => i32::from(on),
+                        None => cf_get(ctx, this, F_REUSEADDR).as_int().unwrap_or(0),
+                    }
+                }
                 _ => 0,
             }
         }
+    } else if opt_name == "SO_REUSEADDR" {
+        // Unbound channel: there is no socket to ask, so the honest answer is
+        // what Java last set. Returning 0 here is what made a `setOption(true)`
+        // read back `false`.
+        cf_get(ctx, this, F_REUSEADDR).as_int().unwrap_or(0)
     } else {
         0
     };
@@ -4027,6 +4072,25 @@ fn ssc_finish_bind(
         .local_addr()
         .map(|a| a.port() as i32)
         .unwrap_or(requested_port);
+    // Apply the pre-bind `SO_REUSEADDR` Java asked for, if any.
+    //
+    // On Unix `std` already sets it for `TcpListener::bind`, so this is a
+    // confirmation; on Windows `std` deliberately does not, and the option
+    // genuinely lands here. It lands AFTER the bind either way, because
+    // `TcpListener::bind` owns socket creation — so this makes the socket
+    // carry the option (and `getOption` report it truthfully) without
+    // retroactively changing the bind that already happened. Setting it
+    // before the bind would need raw socket creation; that is a separate
+    // change and is called out in the known-issues doc rather than implied
+    // here.
+    if cf_get(ctx, this, F_REUSEADDR).as_int().unwrap_or(0) != 0 {
+        if let Err(e) = crate::net::listener_set_reuseaddr(&listener, true) {
+            // Not fatal: the bind succeeded, and the option is advisory on an
+            // already-bound socket. Losing it silently is what this whole fix
+            // is about, so say so.
+            tracing::debug!("SO_REUSEADDR on a bound listener was refused: {e}");
+        }
+    }
     let blocking = read_blocking_flag(ctx, this);
     if !blocking {
         listener
@@ -5070,17 +5134,45 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(ss_value))))
 }
 
-/// The address Netty publishes from a listener must be usable as a client
-/// destination. Windows rejects a connect to an unspecified (`0.0.0.0`/`::`)
-/// listener address with WSAEADDRNOTAVAIL, even though binding that wildcard is
-/// valid. A local in-process client should therefore receive the corresponding
-/// loopback address while concrete listener addresses remain unchanged.
+/// The host `getLocalAddress()` reports for a listener: whatever it is actually
+/// bound to, including the wildcard.
+///
+/// # This used to rewrite the wildcard to loopback, and that was wrong
+///
+/// The rewrite (`0.0.0.0` → `127.0.0.1`, `::` → `::1`) was added because "the
+/// address Netty publishes from a listener must be usable as a client
+/// destination", on the premise that Windows rejects a connect to an
+/// unspecified address with `WSAEADDRNOTAVAIL`. The named casualty was
+/// `sun.net.httpserver.ServerImpl.getAddress()` feeding
+/// `RestClientBuilderIntegTests`, which reconnects to what it is given.
+///
+/// Both halves of that premise were measured on 2026-08-10 (Windows 11,
+/// `probes/WildcardBindReachabilityProbe.java`,
+/// `probes/HttpServerWildcardAddressProbe.java`) and neither holds:
+///
+/// * **HotSpot reports the wildcard and its callers cope.** Temurin 25 answers
+///   `HttpServer.getAddress() == /[0:0:0:0:0:0:0:0]:p` with
+///   `isAnyLocalAddress() == true`. If publishing the wildcard broke
+///   reconnecting callers, it would break them on HotSpot first.
+/// * **Connecting to the IPv4 wildcard works — on CratonVM too.** The probe's
+///   `connect 0.0.0.0` row is `OK` on both VMs (Windows resolves a connect to
+///   the unspecified address as loopback). The `WSAEADDRNOTAVAIL` this rewrite
+///   was built to dodge does not reproduce.
+///
+/// Meanwhile the rewrite cost real fidelity: a server bound to every interface
+/// reported one address, and `InetSocketAddress.getAddress().isAnyLocalAddress()`
+/// answered `false` where HotSpot answers `true`. The bind itself was always
+/// correct — `netstat` shows `0.0.0.0:p LISTENING` and a connect from this
+/// host's LAN address succeeds — so this only ever mis-*reported*.
+///
+/// One divergence this does NOT close: HotSpot binds `0.0.0.0` as a dual-stack
+/// IPv6 socket and so reports `[::]`, while `ssc_bind` creates a v4 listener
+/// and reports `0.0.0.0`. Both are "the wildcard" and both satisfy
+/// `isAnyLocalAddress()`, but they are not the same string, and a caller that
+/// then connects to `::` reaches a v4-only listener on CratonVM and a
+/// dual-stack one on HotSpot. Tracked in the known-issues doc, not fixed here.
 fn advertised_listener_host(addr: SocketAddr) -> String {
-    match addr {
-        SocketAddr::V4(addr) if addr.ip().is_unspecified() => "127.0.0.1".to_string(),
-        SocketAddr::V6(addr) if addr.ip().is_unspecified() => "::1".to_string(),
-        _ => addr.ip().to_string(),
-    }
+    addr.ip().to_string()
 }
 
 fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5560,15 +5652,19 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     #[test]
-    fn advertised_listener_host_converts_only_wildcard_listener_addresses() {
+    /// The wildcard is reported AS the wildcard, matching HotSpot.
+    ///
+    /// This asserted the opposite until 2026-08-10 — that `0.0.0.0` became
+    /// `127.0.0.1` — which is why the rewrite survived: the test pinned the
+    /// bug. Oracle for the new expectation is Temurin 25, which answers
+    /// `isAnyLocalAddress() == true` from both `ServerSocketChannel
+    /// .getLocalAddress()` and `HttpServer.getAddress()`.
+    fn advertised_listener_host_reports_the_address_actually_bound() {
         assert_eq!(
             advertised_listener_host("0.0.0.0:49152".parse().unwrap()),
-            "127.0.0.1"
+            "0.0.0.0"
         );
-        assert_eq!(
-            advertised_listener_host("[::]:49152".parse().unwrap()),
-            "::1"
-        );
+        assert_eq!(advertised_listener_host("[::]:49152".parse().unwrap()), "::");
         assert_eq!(
             advertised_listener_host("127.0.0.2:49152".parse().unwrap()),
             "127.0.0.2"
