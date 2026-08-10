@@ -278,6 +278,28 @@ pub fn dump_canonical_census() {
     }
 }
 
+/// Record a `--jdk-only` refusal of a `check_override` **name** disjunct.
+///
+/// The chain's name entries all say "prefer our native over the real JDK's
+/// concrete bytecode", which §1.4 forbids under strict policy. Refusing them is
+/// what the wave-2 record prescribes as the strict replacement for the whole
+/// chain; recording the refusal is what keeps the two modes' difference
+/// nameable rather than silent, and it is the same shape §8's
+/// interface-substitution refusal uses.
+///
+/// The free-text `native_kind` tag distinguishes these rows from the
+/// interpreter's `NativeKind`-tagged shadow observations and from the JIT's
+/// `"jit-thin-direct-helper"` rows: all three are different facts about the
+/// same method and all three belong in the report.
+///
+/// Like §8's, this deliberately does NOT bump `JDK_ONLY_NATIVE_SHADOW_ATTEMPTS`.
+/// That counter surfaces as `interpreter_bytecode_preferred` and means "a
+/// registered native yielded to bytecode at dispatch"; this is a resolution-time
+/// refusal to mark the method native at all, one step earlier.
+pub fn record_check_override_strict_refusal(class_name: &str, method_name: &str, descriptor: &str) {
+    offer_native_shadow_observation(class_name, method_name, descriptor, "check-override-name");
+}
+
 /// JDK-ONLY-WAVE2 §11 census: which `check_override` disjuncts actually admit
 /// a native, keyed by the triple that reached the branch.
 ///
@@ -20854,20 +20876,47 @@ fn invoke_on_class_shared_inner(
                     // (e.g. ByteArrayInputStream created by getResourceAsStream).
                     //
                     // JDK-ONLY-WAVE2: the `check_override` chain header. Of the
-                    // ~250 disjuncts below, exactly ONE survives contract §7:
+                    // disjuncts below, exactly ONE survives contract §7:
                     // `method.is_abstract()`, which is §7 step 3b (no `Code`,
                     // so a registered native is the only thing there is to run
                     // — the documented deviation in `resolve_dispatch`'s
                     // banner). Every other disjunct is a class-name exception
                     // saying "prefer our native over the real JDK's concrete
-                    // bytecode", which is precisely what §1.4 forbids. What
-                    // must replace the whole chain: nothing — under
-                    // `--jdk-only` `resolve_dispatch` step 3 returns
-                    // `Bytecode` for all of them. Removing them under
-                    // `Compatible` is a separate, per-family exercise; each
-                    // entry is load-bearing for a real boot today.
-                    let check_override = method.is_abstract()
-                        || class_name == "java/io/ByteArrayInputStream"
+                    // bytecode", which is precisely what §1.4 forbids.
+                    //
+                    // **Strict half CLOSED 2026-08-10.** The record's own answer
+                    // to "what must replace the chain" was *nothing*, and that
+                    // is now enforced: under `--jdk-only` the name half is not
+                    // consulted, every refusal is recorded by triple, and §7
+                    // step 3 answers `Bytecode` for all of them. Measured on the
+                    // 23-vector strict corpus: the chain admitted TWELVE triples
+                    // by name there and no vector changed verdict when they
+                    // stopped being admitted.
+                    //
+                    // Removing them under `Compatible` remains a separate,
+                    // per-family exercise; each entry is load-bearing for a real
+                    // boot today, and three static-analysis tranches
+                    // (unreachability, then redundancy) already took the chain
+                    // from 217 disjuncts to 179 without moving the admitted set.
+                    // Under `JdkOnly` the name half of this chain is not
+                    // consulted at all. Every disjunct below `is_abstract()`
+                    // says "prefer our native over the real JDK's CONCRETE
+                    // bytecode", which is exactly what §1.4 forbids, and the
+                    // wave-2 record's own answer to "what must replace the
+                    // chain" is *nothing*: §7 step 3 returns `Bytecode` for all
+                    // of them. `method.is_abstract()` stays in BOTH modes — it
+                    // is §7 step 3b, the documented deviation in
+                    // `resolve_dispatch`'s banner (no `Code`, so a registered
+                    // native is the only body there is), and removing it would
+                    // stop the VM booting in either mode.
+                    //
+                    // Shaped as one boolean rather than a `!jdk_only_strict &&`
+                    // threaded through 179 disjuncts so the census below can
+                    // still see what the chain WOULD have admitted, and record
+                    // the strict refusal by name. A refusal nobody can name is
+                    // the failure mode this whole lane exists to remove.
+                    let jdk_only_strict = crate::vm::dispatch_policy(shared).is_jdk_only();
+                    let name_override = class_name == "java/io/ByteArrayInputStream"
                         // Jandex constructs a real-JDK BufferedInputStream around
                         // a resource stream.  Its registered native methods use
                         // the inherited `in` field, so its constructor must use
@@ -23143,6 +23192,26 @@ fn invoke_on_class_shared_inner(
                                     | ("flush", "()V")
                                     | ("close", "()V")
                             ));
+                    let check_override =
+                        method.is_abstract() || (!jdk_only_strict && name_override);
+                    // A name disjunct wanted this native and strict policy said
+                    // no. Record it where every other §1.4 observation goes, so
+                    // `--jdk-only-report` names the triple instead of leaving a
+                    // silent behaviour difference between the two modes. Gated
+                    // on a registration existing because a disjunct that finds
+                    // nothing registered was inert in both modes and refusing it
+                    // is not an event.
+                    if jdk_only_strict
+                        && name_override
+                        && !method.is_abstract()
+                        && shared
+                            .natives
+                            .native_methods
+                            .find(class_name, method_name, descriptor)
+                            .is_some()
+                    {
+                        record_check_override_strict_refusal(class_name, method_name, descriptor);
+                    }
                     if check_override_census_on() {
                         CHECK_OVERRIDE_REACHED
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
