@@ -297,6 +297,12 @@ Two concrete next steps, in order:
   ever has that flag set, suspect g1.rs:461 first — it *assigns* rather than
   maxes the cursor.
 
+  **And every production caller of `VmHeap::refill_tlab`:** exactly two, both in
+  `gc_and_alloc.rs` — `:3223` and the wedge-break retry at `:3237` — and both
+  results flow into the same `if let Some((buf, size)) = refill { thread.tlab =
+  Tlab::new(buf, size) }`. No path carves a chunk and drops it, so "a TLAB
+  chunk was allocated and never owned" is closed too.
+
   **And every production site that installs a `Tlab`:**
   `gc_and_alloc.rs:3245` (retires the outgoing TLAB first, at :3221) and
   `vm_init.rs:9368` (the main thread's initial install, so nothing prior to
