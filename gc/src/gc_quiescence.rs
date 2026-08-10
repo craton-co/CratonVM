@@ -248,6 +248,21 @@ static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 static MOVING_YOUNG_INCOMPLETE_REASON: AtomicUsize = AtomicUsize::new(0);
 
+// EVERY reason this cycle recorded, as a bitmask over `incomplete_reason`
+// codes, alongside the first-wins scalar above.
+//
+// Diagnostic only — nothing reads it to decide anything. It exists because the
+// scalar is first-wins, which is right for "what forced this verdict" and wrong
+// for "would repairing reason X have helped": a cycle reported as
+// `active-safepoint-map-incomplete` may ALSO have hit
+// `innermost-rbp-belongs-to-unguarded-callee`, and a cycle reported as the
+// latter may have hit nothing else at all. Only that second kind turns into a
+// moving collection if the innermost-rbp resolution is repaired, so sizing that
+// repair needs the whole set, not its first element. Printed by
+// `CRATONVM_DBG_GC_FALLBACK_REASONS=1`.
+#[cfg(not(test))]
+static MOVING_YOUNG_INCOMPLETE_REASON_MASK: AtomicUsize = AtomicUsize::new(0);
+
 // A STRICTLY NARROWER per-cycle verdict than the one above: this cycle scanned
 // state belonging to a peer thread that will never apply the collection's
 // pointer map to itself (an OS-suspended in-JIT peer, or a blocked peer's JIT
@@ -262,6 +277,8 @@ thread_local! {
     static MOVING_YOUNG_COVERAGE_INCOMPLETE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
     static MOVING_YOUNG_INCOMPLETE_REASON: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static MOVING_YOUNG_INCOMPLETE_REASON_MASK: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static UNREWRITABLE_PEER_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -299,6 +316,21 @@ fn incomplete_reason_set_if_unset(reason: usize) {
 #[inline]
 fn incomplete_reason_clear() {
     MOVING_YOUNG_INCOMPLETE_REASON.store(incomplete_reason::NONE, Ordering::Release);
+    MOVING_YOUNG_INCOMPLETE_REASON_MASK.store(0, Ordering::Release);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn incomplete_reason_mask_add(reason: usize) {
+    if reason < incomplete_reason::COUNT {
+        MOVING_YOUNG_INCOMPLETE_REASON_MASK.fetch_or(1usize << reason, Ordering::AcqRel);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn incomplete_reason_mask_get() -> usize {
+    MOVING_YOUNG_INCOMPLETE_REASON_MASK.load(Ordering::Acquire)
 }
 
 #[cfg(not(test))]
@@ -345,6 +377,21 @@ fn incomplete_reason_set_if_unset(reason: usize) {
 #[inline]
 fn incomplete_reason_clear() {
     MOVING_YOUNG_INCOMPLETE_REASON.with(|c| c.set(incomplete_reason::NONE));
+    MOVING_YOUNG_INCOMPLETE_REASON_MASK.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+#[inline]
+fn incomplete_reason_mask_add(reason: usize) {
+    if reason < incomplete_reason::COUNT {
+        MOVING_YOUNG_INCOMPLETE_REASON_MASK.with(|c| c.set(c.get() | (1usize << reason)));
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn incomplete_reason_mask_get() -> usize {
+    MOVING_YOUNG_INCOMPLETE_REASON_MASK.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -675,6 +722,7 @@ pub fn mark_moving_young_coverage_incomplete() {
 /// that actually forced the decision; later ones are consequences).
 pub fn mark_moving_young_coverage_incomplete_because(reason: usize) {
     incomplete_reason_set_if_unset(reason);
+    incomplete_reason_mask_add(reason);
     coverage_incomplete_set(true);
     // Classify off the reason the CALLER passed, not the stored one: the stored
     // reason is first-wins (it names what forced the decision), so a later
@@ -723,6 +771,45 @@ pub fn record_moving_young_coverage_fallback() -> usize {
              sweep (no compaction, free-list allocation). Persistent fallbacks mean the \
              young generation is not actually a copying collector.",
             incomplete_reason::label(moving_young_incomplete_reason()),
+        );
+    }
+    // Sizing line for a prospective repair: the first-wins label above cannot
+    // say whether a cycle would have become movable had one obligation been
+    // provable, because other obligations may have failed in the same cycle.
+    //
+    // `attributable=innermost-rbp` is the metric that answers it, and it is
+    // deliberately NOT "the mask holds exactly one bit". One failure of
+    // `innermost_frame_method` is reported TWICE by design: the coverage refresh
+    // records `FOREIGN_INNERMOST_RBP`, and the band-verification walk, which
+    // calls the same helper and bails at the same `None`, records
+    // `UNBOUNDED_FRAME_BAND` (see `vm/src/jit/conservative_roots.rs`, the
+    // `innermost_frame_method` bail whose comment names the other reason). A
+    // single-bit test can therefore NEVER fire for this cause and would price
+    // the repair at zero — it did, before this was corrected.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_FALLBACK_REASONS").is_some() {
+        let mask = incomplete_reason_mask_get();
+        let first = moving_young_incomplete_reason();
+        let innermost_pair =
+            (1usize << incomplete_reason::FOREIGN_INNERMOST_RBP)
+                | (1usize << incomplete_reason::UNBOUNDED_FRAME_BAND);
+        let attributable_innermost = mask != 0
+            && mask & (1usize << incomplete_reason::FOREIGN_INNERMOST_RBP) != 0
+            && mask & !innermost_pair == 0;
+        let mut all = String::new();
+        for code in 0..incomplete_reason::COUNT {
+            if mask & (1usize << code) != 0 {
+                if !all.is_empty() {
+                    all.push(',');
+                }
+                all.push_str(incomplete_reason::label(code));
+            }
+        }
+        eprintln!(
+            "[moving-young-reasons] #{n} first={} sole={} attributable-innermost-rbp={} all={}",
+            incomplete_reason::label(first),
+            if mask == (1usize << first) { "yes" } else { "no" },
+            if attributable_innermost { "yes" } else { "no" },
+            all,
         );
     }
     n
