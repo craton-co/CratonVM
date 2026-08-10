@@ -115,12 +115,32 @@ EXTRA_VM_ARGS="${EXTRA_VM_ARGS:-}"   # extra cratonvm CLI args (verbatim)
 #     without the flag, 18/18 and 1/1 with it (and Gradle agrees).
 #   * -Xshare:off is HotSpot-only (CratonVM has no CDS archive) and is added
 #     to the hotspot mode alone.
+#
+# `junit.vintage.discovery.issue.reporting.enabled=false` is NOT from
+# TestConventions — it comes from `spring-test/spring-test.gradle`, which is the
+# only module that puts the JUnit Vintage engine on its test classpath. It is
+# required *because of* the line above it: `severity.critical=INFO` promotes
+# every discovery issue of severity INFO or worse to fatal, and the Vintage
+# engine emits an INFO-level "this engine is deprecated" notice on every single
+# discovery. Copying TestConventions' flags without spring-test.gradle's
+# counterpart therefore turns that deprecation notice into a
+# `DiscoveryIssueException` and fails the class outright. Spring's own build
+# comment says exactly this — "we disable reporting of the 'deprecated'
+# discovery issue, because that would otherwise fail the build".
+#
+# Measured 2026-08-10: 40 of the 81 remaining FAILs in the full-index default
+# sweep were this and nothing else, every one of them an
+# `org.springframework.test.context.junit4.*` / `*VintageTests` class. It is
+# applied unconditionally here rather than per-module because spring-test is the
+# only module carrying junit-vintage (verified against every module's
+# cratonvm-testcp.txt), so the flag is inert everywhere else.
 SPRING_JVM_ARGS=(
   --add-opens=java.base/java.lang=ALL-UNNAMED
   --add-opens=java.base/java.util=ALL-UNNAMED
   -Djava.awt.headless=true
   -Dio.netty.leakDetection.level=paranoid
   -Djunit.platform.discovery.issue.severity.critical=INFO
+  -Djunit.vintage.discovery.issue.reporting.enabled=false
 )
 
 # ------------------------------------------------------------------ helpers ---
