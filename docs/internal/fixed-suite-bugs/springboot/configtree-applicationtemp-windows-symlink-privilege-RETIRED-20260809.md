@@ -54,18 +54,34 @@ message at all, only `=> java.nio.file.FileSystemException`.
 Any detector keyed on that English sentence would therefore have silently never
 fired. Match the exception **type** and that structural signature instead.
 
-## 2. What the retired doc got wrong
+## 2. Where its evidence lives, and what it still got wrong
 
-- **Its run does not exist.** It cites
-  `craton-fullsuite-windows-20260806-s1` and log paths beneath it. There is no
-  such run directory; the 2026-08-06 Windows runs are
-  `craton-nonpassed-20260806-s{1..7}`, and neither class appears in them. The
-  `FAIL 23/3` row it describes is real but comes from the earlier runs that do
-  carry it — `broad-NEGCTL-20260727`, `jitfix-20260727`, `mockfix2-20260727`,
-  `craton-rerun-20260731`, `craton-rerun-20260801`,
-  `bothfix-coreregr-20260801`, `devtools-cluster-coreregr-20260801`,
-  `r2dbcfix-coreregr-20260801` — **ten runs of the identical row**, which is the
-  clearest possible sign the triage loop was not converging.
+**Its run is real and every figure in it checks out.** `FAIL 4.311s 23/3` and
+`FAIL 2.062s tests=5 failed=0 aborted=1 skipped=1` are exact. The run is just
+not in the main checkout: the Spring Boot suite is driven from the
+`CratonVM-spring-boot-residual-20260728` worktree, and each worktree keeps its
+own `apps/spring-boot-suite-runner/.suite/results/`. So
+
+```
+/c/craton/CratonVM-spring-boot-residual-20260728/apps/spring-boot-suite-runner/
+    .suite/results/craton-fullsuite-windows-20260806-s{1..4}/
+```
+
+is where `craton-fullsuite-windows-20260806-s1` actually is. **Search every
+worktree before concluding a cited run is missing** — grepping only
+`C:\craton\cratonvm` finds a different, unrelated set of runs
+(`craton-nonpassed-20260806-s*`) and makes a correctly-cited run look invented.
+This doc previously claimed exactly that, wrongly.
+
+The row is also not a one-off: the identical `FAIL 23/3` for
+`ConfigTreePropertySourceTests` appears in at least ten separate runs between
+2026-07-27 and 2026-08-01 in the main checkout alone (`broad-NEGCTL-20260727`,
+`jitfix-20260727`, `mockfix2-20260727`, `craton-rerun-20260731`,
+`craton-rerun-20260801`, `bothfix-coreregr-20260801`,
+`devtools-cluster-coreregr-20260801`, `r2dbcfix-coreregr-20260801`, …) — a
+triage loop that was not converging.
+
+What it did get wrong:
 
 - **It concluded without exercising the code.** It reasons entirely from test
   source and from the fact that the call cannot succeed here. It never ran
