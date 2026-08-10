@@ -262,6 +262,47 @@ The measurement is sensitive and the answer is still zero: the fallback rate is
 flat across all four arms, because `cross-thread-jit-peer` is in **100% of
 cycles in both**.
 
+### Priced: pinning is CHEAP — ~50 conservative roots per parked peer, linear
+
+The one structural option that can be priced without building it, because the
+conservative root set is already counted (`XT_HELPER_WINDOW_ROOTS`, exposed by
+`CRATONVM_DBG=xt-jit-root-scan`). The pin set is exactly that set: the objects a
+pinning collector would have to leave in place while compacting everything else.
+
+`MovingYoungFallbackPeerParkProbe`, 15s per arm, `--Xmx 512m`, roots per
+helper-window pass:
+
+| parked peers | roots / pass | per peer | passes |
+|---:|---:|---:|---:|
+| 1 | 41 | 41.0 | 22 |
+| 2 | 85 | 42.5 | 22 |
+| 4 | 190 | 47.5 | 19 |
+| 8 | 403 | 50.4 | 18 |
+
+Dead linear at **~50 roots per parked peer**, and stable run to run (the 4-peer
+figure reproduced at 194 in a separate 25s run, every one of its 28 passes
+identical).
+
+Extrapolating: a Spring app with 40 threads parked in JIT frames pins ~2,000
+objects per collection; 200 threads pins ~10,000. For a compactor those are
+small numbers — a region- or block-based young collector marks the blocks
+holding them non-evacuable and compacts the rest. **The comparison that matters
+is against the status quo, where a SINGLE parked peer forces the entire
+collection to be non-moving.** Trading "compact nothing" for "leave ~50 objects
+per peer in place" is the whole prize on this page.
+
+Three caveats on the number:
+
+- These are conservative **candidates** — stack/register words that resolve to a
+  live object, including duplicates and false positives. Distinct pinned objects
+  is `<=` the figure, so ~50/peer is an upper bound.
+- A false positive pins a dead object, retaining garbage until the next cycle.
+  That is safe, and bounded by the same ~50/peer.
+- The per-peer constant is workload-shaped: this probe parks each peer under a
+  depth-12 recursion of one compiled method. Deeper or wider frames scan more
+  words. **The linearity is the robust finding; the constant is not.** A real
+  workload should be measured before the number is used for sizing.
+
 ### The actual root: any peer thread with live JIT frames blocks compaction
 
 `CROSS_THREAD_JIT_PEER` is *"another thread holds live JIT frames whose coverage
