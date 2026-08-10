@@ -3213,7 +3213,15 @@ pub(super) fn execute_instruction(
                             .read()
                             .get_class(actual_class_id)
                             .map(|c| c.name.to_string())
-                            .unwrap_or_else(|| "?".to_string());
+                            // A bare `?` here cost a whole triage round: it is
+                            // the only thing the message says about a receiver
+                            // whose class id resolves to nothing, and "?" is
+                            // consistent with a reclaimed header, a foreign
+                            // layout domain, and the synthetic auto-box wrapper
+                            // alike. The id tells those apart on the first
+                            // sighting (`AUTOBOX_CLASS_ID` is `u32::MAX`), so
+                            // name it rather than counting the question marks.
+                            .unwrap_or_else(|| format!("?class_id={actual_class_id}"));
                         // Spring's ConfigurationClassParser reaches this cast
                         // only after requesting annotation attributes with
                         // `classValuesAsString=true`. Under its forked
