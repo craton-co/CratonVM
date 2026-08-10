@@ -1246,6 +1246,24 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
                 loader.as_ptr() as usize
             );
         }
+        // Arm the young marker's edge trace on THIS class's loader.
+        // `CRATONVM_DBG_MARK_WHY_CLASS=<internal/class/Name>` — the address is
+        // not knowable before the class is defined, which is why the watch is
+        // armed here instead of parsed from a hex env var at startup.
+        if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_MARK_WHY_CLASS") {
+            let name = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|c| c.name.to_string())
+                .unwrap_or_default();
+            if name == want {
+                let addr = loader.as_ptr() as usize;
+                eprintln!("[MARKWHY] arming young-mark watch on {name} loader={addr:#x}");
+                cratonvm_gc::heap::set_young_mark_watch(addr);
+            }
+        }
         cratonvm_types::mirror_pin::add_mirror_pin(
             shared.vm_identity,
             loader.as_ptr() as usize,

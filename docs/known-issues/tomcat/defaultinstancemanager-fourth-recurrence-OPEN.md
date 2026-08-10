@@ -74,11 +74,16 @@ Two traps in reading those rows, both of which cost a round of investigation:
   the header's `class_id` and instance→loader is the `loader_pin` side table;
   neither is a ref slot, so neither appears in a referrer walk. The mirror
   having no referrer is the EXPECTED state, not a finding.
-* **`young_survivor=true` is not a wrong verdict.**
+* **`young_survivor=true` looked like a faithful report and is not one.**
   `is_live_young_survivor` is `word0 != 0` — it reports whether the sweep
-  zeroed the span, and never consults a mark bit. So for a young object
-  `is_marked` is a faithful reporter of what the MARKER decided. The verdict
-  is right; the marking is what needs explaining.
+  zeroed the span, never a mark bit. I first read that as "so it faithfully
+  reports what the MARKER decided, and the marking is what needs explaining",
+  and wrote that down. It is wrong, and the section below measures why: the
+  marker never marked this object, and the sweep never *visited* it either, so
+  the byte pattern reports the liveness of neither. Inferring a verdict from a
+  side effect is sound only while every path that skips the side effect is
+  also a path that cannot leave a dead object behind — and the sweep has at
+  least three such paths.
 
 Also eliminated:
 
@@ -95,22 +100,56 @@ Also eliminated:
   `mark_and_push_rescues_a_walked_base_the_plausibility_screen_rejects` passes
   on dev.
 
+## The marker is innocent. The SWEEP never visits the span.
+
+`CRATONVM_DBG_MARK_WHY_CLASS=<internal/class/Name>` arms a watch on that class's
+loader (the address is not knowable before the class is defined) and labels
+every young-marker edge that reaches it, plus the sweep walk's decision at that
+base. Measured, dead loader vs live loader in the same run shape:
+
+| | `annotations_jsp` (evicted) | `bug36923_jsp` (live) |
+|---|---|---|
+| young-marker edges reaching the loader | **0** | 4 — `3x field`, `1x loader_pin` |
+| sweep walk stops at its base | **never** | yes, `side_marked=true` |
+
+The live loader is the control that proves the instrument can fire. So:
+
+1. The **marker is correct** — it never marks the evicted loader. Every root
+   source eliminated across four investigations was eliminated correctly.
+2. The **sweep walk never reaches that span at all.** It is inside a stretch the
+   walk skips — a free block, a TLAB reservation, or an abandoned stretch. No
+   desync/abandon markers appear in the run, so the skip list is the leading
+   candidate.
+3. A span the walk never visits is **never zeroed**.
+4. `is_live_young_survivor` is literally `word0 != 0`, resting on "the young
+   sweep writes an ALL-ZERO header over every span it reclaims". An unvisited
+   span never got that write, so it reports **live**.
+5. `reconcile_class_mirrors` consults exactly that verdict, so it retains the
+   mirror; `rebuild_mirror_pins` re-registers it; the `WeakReference<Class>`
+   never clears; the annotation cache stays at 9.
+
+That is a complete chain from a false premise to the assertion, and it explains
+why every rooting lever was inert: nothing about rooting is wrong.
+
+Note the premise is the one the bisected commit is documented as having
+weakened — "a fresh header is never all-zero" died when the hash went lazy, and
+these predicates were rewritten onto the mark word "WEAKER, not equivalent".
+The connection is consistent but **not yet proven**; the open question is now
+narrow and mechanical.
+
 ## The open question
 
-Something in the young non-moving marker marks the evicted JSP's `ClassLoader`,
-with no root, no heap referrer and no `loader_pin` instance — and it started
-doing so when the identity hash left the header. The commit's own message names
-the mechanism class:
+Why does the sweep walk skip that span? `existing_free` (free blocks from prior
+sweeps), `jit_skips` (reserved TLAB tails — unlikely, `--nojit` fails too), or a
+walk that abandoned early. The probe to write next reports which skip arm covers
+the watched address, at the top of the walk loop.
 
-> The stale-pointer detector and the zeroed-region screens keyed on "a fresh
-> header is never all-zero, because a hash is stamped at allocation". That
-> premise is dead: the hash is lazy now... The predicates were rewritten onto
-> the mark word and each says at the site that it is WEAKER, not equivalent.
-
-The next step is to instrument the young marker's mark REASON for the loader
-address (the old-gen BFS already threads reason strings — `loader_pin`,
-`mirror_pin`, `metadata_pin`, `external-overlay`; the young marker does not),
-rather than to keep eliminating root sources from the outside.
+The second question, independent of the first and arguably the more important
+one: **`is_live_young_survivor` infers liveness from a side effect.** "The span
+was not zeroed" is not the same proposition as "the object is live", and the
+sweep has at least three legitimate ways to leave a dead span unzeroed. A
+verdict that reads a byte pattern where a mark bit exists will keep producing
+this class of bug regardless of which skip arm is responsible here.
 
 ## Do not close this without a regression pin
 
