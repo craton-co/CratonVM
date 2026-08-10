@@ -4077,8 +4077,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let a = build_local_module_loader(&mut ctx);
-        let b = build_local_module_loader(&mut ctx);
+        let a = build_local_module_loader(&mut ctx).unwrap();
+        let b = build_local_module_loader(&mut ctx).unwrap();
         assert_eq!(a.as_ptr(), b.as_ptr());
     }
 
@@ -4088,9 +4088,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let a = build_default_boot_holder_instance(&mut ctx);
-        let b = build_default_boot_holder_instance(&mut ctx);
-        let c = build_local_module_loader(&mut ctx);
+        let a = build_default_boot_holder_instance(&mut ctx).unwrap();
+        let b = build_default_boot_holder_instance(&mut ctx).unwrap();
+        let c = build_local_module_loader(&mut ctx).unwrap();
         assert_eq!(a.as_ptr(), b.as_ptr());
         assert_eq!(a.as_ptr(), c.as_ptr());
     }
@@ -4113,7 +4113,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("org.jboss.as.standalone");
         let result = native_loader_load_module(
             &mut ctx,
@@ -4144,7 +4144,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name1 = ctx.create_string("a.b");
         let r1 = native_loader_load_module(
             &mut ctx,
@@ -4173,7 +4173,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("ghost.module.never.exists");
         let err = native_loader_load_module(
             &mut ctx,
@@ -4195,7 +4195,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let err = native_loader_load_module(
             &mut ctx,
             &[Value::Object(Some(loader)), Value::Object(None)],
@@ -4211,7 +4211,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("../escape");
         let err = native_loader_load_module(
             &mut ctx,
@@ -4233,7 +4233,7 @@ mod tests {
         clear_boot_loader_for_test();
         set_mp_root_for_test(None);
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("anything");
         let err = native_loader_load_module(
             &mut ctx,
@@ -4260,7 +4260,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("foo.bar");
         let module = match native_loader_load_module(
             &mut ctx,
@@ -4292,7 +4292,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("zz.yy");
         let module = match native_loader_load_module(
             &mut ctx,
@@ -4350,7 +4350,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         setup_test_env(tmp.path());
         let mut ctx = MockNativeContext::new();
-        let boot = build_local_module_loader(&mut ctx);
+        let boot = build_local_module_loader(&mut ctx).unwrap();
 
         for accessor in [
             "getBootModuleLoader",
@@ -4393,7 +4393,7 @@ mod tests {
         // the calls but use four distinct receiver/name pairs to
         // simulate concurrent traffic.
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let mut refs = Vec::new();
         for _ in 0..4 {
             let name = ctx.create_string("race.me");
@@ -4821,7 +4821,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("org.jboss.as.jmx");
         native_loader_load_module(
             &mut ctx,
@@ -4863,7 +4863,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let n1 = ctx.create_string("a");
         native_loader_load_module(
             &mut ctx,
@@ -4980,7 +4980,7 @@ mod tests {
         setup_test_env(root);
 
         let mut ctx = MockNativeContext::new();
-        let loader = build_local_module_loader(&mut ctx);
+        let loader = build_local_module_loader(&mut ctx).unwrap();
         let name = ctx.create_string("leaf");
         native_loader_load_module(
             &mut ctx,

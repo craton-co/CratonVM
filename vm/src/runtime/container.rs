@@ -290,65 +290,189 @@ pub fn effective_memory_limit(info: &ContainerInfo, config_max: usize) -> usize 
     }
 }
 
-/// Numerator of the fraction of the container memory limit used as the
-/// default maximum heap. `1/4` mirrors HotSpot's default
-/// `MaxRAMPercentage` (25%) under `-XX:+UseContainerSupport`.
-const DEFAULT_HEAP_FRACTION_NUM: u64 = 1;
-/// Denominator of [`DEFAULT_HEAP_FRACTION_NUM`].
-const DEFAULT_HEAP_FRACTION_DEN: u64 = 4;
+/// Floor for the ergonomic default heap, in bytes (the historical 256 MB
+/// baseline).
+pub const ERGONOMIC_HEAP_FLOOR: u64 = 256 * 1024 * 1024;
 
-/// Upper bound on the container-derived default heap, in bytes (8 GiB).
+/// Default cap for the ergonomic default heap, in bytes (4 GiB).
 ///
-/// Even on a very large container we do not want the *default* (un-tuned)
-/// heap to balloon arbitrarily; an explicit `-Xmx` always overrides this.
-const DEFAULT_HEAP_CAP: u64 = 8 * 1024 * 1024 * 1024;
+/// The cap exists because CratonVM's generational heap **eagerly commits** its
+/// arenas (`Arena::new` → `vec![0u8; cap]`): an uncapped 1/4-of-RAM heap (e.g.
+/// 16 GiB on a 64 GiB host) would charge ~16 GiB of commit per process. The cap
+/// keeps the default's commit bounded while still giving GC-heavy workloads
+/// enough room. (If the heap is ever made lazily-committed, the cap can grow or
+/// be removed to fully match HotSpot.)
+pub const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Lower bound on the container-derived default heap, in bytes (16 MiB).
+/// The ergonomic default maximum heap, clamped — the ONE implementation.
 ///
-/// Guards against pathologically small cgroup limits producing a heap so
-/// tiny the VM cannot start.
-const DEFAULT_HEAP_FLOOR: u64 = 16 * 1024 * 1024;
+/// Take 1/4 of `basis` (HotSpot's default `MaxRAMPercentage`), cap it at `cap`
+/// (itself floored so a tiny `CRATONVM_DEFAULT_HEAP_MAX_MB` cannot drop below
+/// the 256 MB floor), floor it at 256 MB, and finally bound it by `basis` itself
+/// so a tiny container is never handed more than its whole limit.
+///
+/// # Why this is not two functions
+///
+/// It was. The launcher sized off `min(physical RAM, cgroup limit)` with a 4 GiB
+/// cap and a 256 MB floor; `SharedVm::new` sized off the **cgroup limit alone**
+/// with an 8 GiB cap and a 16 MiB floor and no host-RAM basis at all. Two
+/// answers to one question, differing by 2x at the top end, and only one of them
+/// carried the eager-commit reasoning that motivates having a cap. Both callers
+/// now clamp here.
+pub fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
+    let quarter = basis / 4;
+    let capped = quarter.min(cap.max(ERGONOMIC_HEAP_FLOOR));
+    let floored = capped.max(ERGONOMIC_HEAP_FLOOR);
+    let bounded = floored.min(basis);
+    usize::try_from(bounded).unwrap_or(usize::MAX)
+}
+
+/// The cap in force, honouring `CRATONVM_DEFAULT_HEAP_MAX_MB`.
+pub fn ergonomic_heap_cap() -> u64 {
+    cratonvm_types::flags::runtime_var("CRATONVM_DEFAULT_HEAP_MAX_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(MAX_ERGONOMIC_HEAP)
+}
+
+/// Whether ergonomic default-heap sizing is enabled at all
+/// (`CRATONVM_DEFAULT_HEAP_ERGONOMICS=0` opts out, giving the fixed 256 MB
+/// library default).
+pub fn ergonomic_heap_sizing_enabled() -> bool {
+    cratonvm_types::flags::runtime_var("CRATONVM_DEFAULT_HEAP_ERGONOMICS").as_deref() != Ok("0")
+}
+
+/// The ergonomic default maximum heap in bytes, or `None` when ergonomics are
+/// off or physical RAM cannot be determined.
+///
+/// `container_mem_limit` is the detected cgroup limit (or `None` when uncontained
+/// or container support is off); the basis is then `min(physical RAM, cgroup
+/// limit)`, because HotSpot's `MaxRAMPercentage` applies to the container limit
+/// rather than the host total — on a 64 GB host with `--memory=512m` the default
+/// heap is sized off 512 MB.
+///
+/// An explicit `-Xmx` always wins over this; the caller is responsible for not
+/// calling it when one was given.
+pub fn ergonomic_default_max_heap(container_mem_limit: Option<u64>) -> Option<usize> {
+    if !ergonomic_heap_sizing_enabled() {
+        return None;
+    }
+    let phys = physical_ram_bytes()?;
+    let basis = match container_mem_limit {
+        Some(limit) => phys.min(limit),
+        None => phys,
+    };
+    Some(clamp_ergonomic_heap(basis, ergonomic_heap_cap()))
+}
 
 /// Suggest a container-aware default maximum heap size, in bytes.
 ///
-/// When a cgroup memory limit is present, returns a sane fraction
-/// (currently 1/4, matching HotSpot's default `MaxRAMPercentage` under
-/// `-XX:+UseContainerSupport`) of that limit, clamped to
-/// `[DEFAULT_HEAP_FLOOR, DEFAULT_HEAP_CAP]`. The clamp never raises the
-/// result above the cgroup limit itself.
+/// When a cgroup memory limit is present, sizes it with
+/// [`ergonomic_default_max_heap`] — the same arithmetic, the same cap and the
+/// same env knobs the launcher uses. When no cgroup memory limit is known
+/// (non-containerized, non-Linux, or "unlimited"), returns `fixed_default`
+/// unchanged.
 ///
-/// When no cgroup memory limit is known (non-containerized, non-Linux, or
-/// "unlimited"), returns `fixed_default` unchanged — so callers get exactly
-/// today's behavior outside containers.
+/// # Why an uncontained embedder still gets the fixed default
 ///
-/// This is a *pure* suggestion: it reads only `info` and the supplied
-/// fallback and has no side effects, so it is safe to call from the heap
-/// sizer. The result is intended to be used only when the user did **not**
-/// pass an explicit `-Xmx`; an explicit maximum must still take precedence
-/// in the caller.
+/// This is the one place the launcher and the library deliberately differ, and
+/// it is about *whose process it is*. The launcher owns the process it sizes, so
+/// taking a quarter of host RAM is its call to make. An embedded VM shares the
+/// address space of an application that allocated its own memory before
+/// `JNI_CreateJavaVM` was ever reached, and the heap commits eagerly — silently
+/// claiming a quarter of the machine inside someone else's process is not a
+/// library's decision. A cgroup limit IS an explicit statement about the
+/// process's memory budget, which is why that case is sized and the bare-metal
+/// case is not. An embedder that wants launcher ergonomics calls
+/// [`ergonomic_default_max_heap`] and passes the result to
+/// `VmConfig::with_max_heap_size`.
 ///
 /// `SharedVm::new` uses this to seed `max_heap_size` only while the config is
 /// still at the built-in default. Callers that set a non-default heap size keep
 /// their configured value.
+/// The basis is the cgroup limit itself rather than the launcher's
+/// `min(physical RAM, limit)`: a cgroup limit is by construction a bound the
+/// process cannot exceed, so the two differ only when the limit is configured
+/// *above* physical RAM — a case where the container runtime has already made a
+/// promise the machine cannot keep. Taking the limit here keeps the answer
+/// independent of the host the code runs on, which the launcher's path (which
+/// genuinely has no other basis) cannot be.
 pub fn suggested_default_max_heap(info: &ContainerInfo, fixed_default: usize) -> usize {
     match info.memory_limit {
-        Some(limit) => {
-            // Compute fraction in u64 to avoid usize overflow on 32-bit
-            // targets and to keep the arithmetic platform-independent.
-            let fraction = limit / DEFAULT_HEAP_FRACTION_DEN * DEFAULT_HEAP_FRACTION_NUM;
-
-            // Clamp to the cap, then to the floor — but never exceed the
-            // actual cgroup limit (a tiny container must not be handed the
-            // floor if the floor is larger than the whole limit).
-            let capped = std::cmp::min(fraction, DEFAULT_HEAP_CAP);
-            let floored = std::cmp::max(capped, DEFAULT_HEAP_FLOOR);
-            let bounded = std::cmp::min(floored, limit);
-
-            // Saturate when converting to usize (e.g. a >4 GiB suggestion on
-            // a 32-bit host) so we never wrap.
-            usize::try_from(bounded).unwrap_or(usize::MAX)
+        Some(limit) if ergonomic_heap_sizing_enabled() => {
+            clamp_ergonomic_heap(limit, ergonomic_heap_cap())
         }
-        None => fixed_default,
+        _ => fixed_default,
+    }
+}
+
+/// Total physical RAM in bytes, or `None` if it can't be determined.
+///
+/// Used for HotSpot-style ergonomic default-heap sizing when the user did not
+/// pass an explicit `-Xmx`. Mirrors the platform probes in
+/// `vm::runtime::crash_handler` but returns the raw byte count.
+pub fn physical_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok != 0 && status.ull_total_phys > 0 {
+            return Some(status.ull_total_phys);
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        None
     }
 }
 
@@ -501,34 +625,36 @@ mod tests {
 
     #[test]
     fn suggested_heap_capped_for_large_container() {
-        // 64 GiB container → 1/4 = 16 GiB, capped to 8 GiB.
+        // 64 GiB container → 1/4 = 16 GiB, capped to the ergonomic 4 GiB.
+        // This is the cap that used to be 8 GiB here and 4 GiB in the
+        // launcher — one question, two answers.
         let info = ContainerInfo {
             memory_limit: Some(64 * 1024 * 1024 * 1024),
             ..ContainerInfo::non_containerized()
         };
         assert_eq!(
             suggested_default_max_heap(&info, 256 * 1024 * 1024),
-            DEFAULT_HEAP_CAP as usize
+            MAX_ERGONOMIC_HEAP as usize
         );
     }
 
     #[test]
     fn suggested_heap_floored_but_within_limit() {
-        // 32 MiB container → 1/4 = 8 MiB, below the 16 MiB floor, but the
-        // floor must not exceed the whole 32 MiB limit, so we get 16 MiB.
+        // 512 MiB container → 1/4 = 128 MiB, raised to the 256 MiB floor
+        // (which is the launcher's floor; this path used to floor at 16 MiB).
         let info = ContainerInfo {
-            memory_limit: Some(32 * 1024 * 1024),
+            memory_limit: Some(512 * 1024 * 1024),
             ..ContainerInfo::non_containerized()
         };
         assert_eq!(
             suggested_default_max_heap(&info, 256 * 1024 * 1024),
-            DEFAULT_HEAP_FLOOR as usize
+            ERGONOMIC_HEAP_FLOOR as usize
         );
     }
 
     #[test]
     fn suggested_heap_tiny_container_never_exceeds_limit() {
-        // 8 MiB container: 1/4 = 2 MiB → floor would be 16 MiB, but the
+        // 8 MiB container: 1/4 = 2 MiB → the floor would be 256 MiB, but the
         // limit is only 8 MiB, so the suggestion must be clamped to 8 MiB.
         let info = ContainerInfo {
             memory_limit: Some(8 * 1024 * 1024),
@@ -538,6 +664,24 @@ mod tests {
             suggested_default_max_heap(&info, 256 * 1024 * 1024),
             8 * 1024 * 1024
         );
+    }
+
+    /// The property the split implementations did not have: for one basis, the
+    /// launcher's sizer and the embedder's sizer produce the same number.
+    #[test]
+    fn the_launcher_and_the_embedder_size_a_container_identically() {
+        for limit_gib in [1u64, 2, 4, 8, 16, 64] {
+            let limit = limit_gib * 1024 * 1024 * 1024;
+            let info = ContainerInfo {
+                memory_limit: Some(limit),
+                ..ContainerInfo::non_containerized()
+            };
+            assert_eq!(
+                suggested_default_max_heap(&info, 256 * 1024 * 1024),
+                clamp_ergonomic_heap(limit, MAX_ERGONOMIC_HEAP),
+                "the two sizers disagreed at a {limit_gib} GiB limit"
+            );
+        }
     }
 
     #[test]

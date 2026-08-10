@@ -2303,7 +2303,7 @@ fn byte_buffer_view_set(
 const SEGMENT_VAR_HANDLE_CLASS: &str = "java/lang/invoke/SegmentVarHandle";
 
 fn is_segment_var_handle(ctx: &mut dyn NativeContext, vh: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(vh)).as_deref() == Some(SEGMENT_VAR_HANDLE_CLASS)
 }
 
 /// A `SegmentVarHandle`'s own `enclosing` (the `ValueLayout` it was built
@@ -7810,7 +7810,7 @@ pub(crate) fn mh_dispatch(
     // foreign downcall. Those compact handles store the function address in
     // field 0 rather than the MethodHandle metadata slots, so dispatch them
     // directly before trying to decode the generic MethodHandle layout.
-    if ctx.class_name_of_id(ctx.class_id_of_object(mh)).as_deref()
+    if ctx.class_name_arc_of_id(ctx.class_id_of_object(mh)).as_deref()
         == Some("java/lang/foreign/DowncallHandle")
     {
         if crate::nbflags().dbg_mh_dispatch {
@@ -9318,7 +9318,7 @@ fn collect_trailing_varargs(
         let found = tail.iter().enumerate().find(|(i, v)| {
             !taken[*i]
                 && matches!(v, Value::Object(Some(o))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
+                    if ctx.class_name_arc_of_id(ctx.class_id_of_object(*o)).as_deref() == Some(want_class))
         }).map(|(i, _)| i);
         let idx = found.or_else(|| (0..tail.len()).rev().find(|i| !taken[*i]));
         if let Some(i) = idx {
@@ -9828,7 +9828,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
             // void invokeExact into a silent no-op.
             if let Some(Value::Object(Some(this))) = args.first() {
                 if ctx
-                    .class_name_of_id(ctx.class_id_of_object(*this))
+                    .class_name_arc_of_id(ctx.class_id_of_object(*this))
                     .as_deref()
                     == Some("java/lang/foreign/DowncallHandle")
                 {
@@ -11636,7 +11636,7 @@ mod tests {
             "identity",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             MH_KIND_IDENTITY,
-        );
+        ).unwrap();
         // Simulates `dropArguments(leaf, 1, [Object.class, Object.class])`:
         // a 3-param adapter where params[1..3] are dropped and param[0] is
         // the one forwarded to `leaf`. Built directly (bypassing
@@ -11648,15 +11648,15 @@ mod tests {
             "drop",
             "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             MH_KIND_DROP,
-        );
+        ).unwrap();
         ctx.set_field(adapter, MH_BOUND, Value::Object(Some(leaf)));
 
         // Three distinct sentinel objects so a wrong-position bug (e.g. a
         // dropped arg silently reaching `leaf` instead of the kept one)
         // is unmistakable rather than accidentally passing.
-        let kept = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
-        let dropped1 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
-        let dropped2 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
+        let kept = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
+        let dropped1 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
+        let dropped2 = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
         let args = [
             Value::Object(Some(kept)),
             Value::Object(Some(dropped1)),
@@ -11683,7 +11683,7 @@ mod tests {
             "parseInt",
             "(Ljava/lang/String;)I",
             MH_KIND_STATIC,
-        );
+        ).unwrap();
         // In the mock, `set_field_by_name("type", ...)` maps to slot 2
         // (see test_utils::mock_jdk_field_slot) — that's the same slot
         // the MH write-path targets, so reading it back yields the
@@ -11724,7 +11724,7 @@ mod tests {
     #[test]
     fn build_method_type_from_descriptor_non_null() {
         let mut ctx = MockNativeContext::new();
-        let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I");
+        let mt = build_method_type_from_descriptor(&mut ctx, "(Ljava/lang/String;)I").unwrap();
         assert!(
             mt.is_some(),
             "MethodType should be non-null for a valid descriptor"
@@ -11735,8 +11735,12 @@ mod tests {
     #[test]
     fn build_method_type_from_descriptor_rejects_garbage() {
         let mut ctx = MockNativeContext::new();
-        assert!(build_method_type_from_descriptor(&mut ctx, "").is_none());
-        assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor").is_none());
+        assert!(build_method_type_from_descriptor(&mut ctx, "")
+            .unwrap()
+            .is_none());
+        assert!(build_method_type_from_descriptor(&mut ctx, "not-a-descriptor")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -11748,7 +11752,7 @@ mod tests {
             "containsKey",
             "(Ljava/lang/Object;)Z",
             MH_KIND_VIRTUAL,
-        );
+        ).unwrap();
         let effective_desc =
             ctx.create_string("(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
         ctx.set_field(mh, MH_DESC, Value::Object(Some(effective_desc)));
@@ -11780,7 +11784,7 @@ mod tests {
             "containsKey",
             "(Ljava/lang/Object;)Z",
             MH_KIND_VIRTUAL,
-        );
+        ).unwrap();
         let result = box_direct_primitive_return(
             &mut ctx,
             mh,
@@ -11850,7 +11854,7 @@ mod tests {
             "java/lang/invoke/LambdaForm",
             "interpret_V",
             "()V",
-        );
+        ).unwrap();
         match mn_get(&mut ctx, mn, "clazz", MN_CLAZZ) {
             Value::Object(Some(_)) => {}
             other => panic!("expected clazz to be non-null, got {:?}", other),
@@ -11893,7 +11897,7 @@ mod tests {
     #[test]
     fn mn_synthetic_layout_predicate_is_true_without_a_method_field() {
         let mut ctx = MockNativeContext::new();
-        let mn = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT)?;
+        let mn = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MemberName", MN_FIELD_COUNT).unwrap();
         assert!(
             mn_has_synthetic_layout(&mut ctx, mn),
             "a class declaring no instance field named `method` is not a real MemberName"
@@ -11905,7 +11909,9 @@ mod tests {
     #[test]
     fn c33_ibg_interpreter_entry_point_returns_non_null() {
         let mut ctx = MockNativeContext::new();
-        let mt = build_method_type_from_descriptor(&mut ctx, "(I)J").expect("MethodType");
+        let mt = build_method_type_from_descriptor(&mut ctx, "(I)J")
+            .unwrap()
+            .expect("MethodType");
         let result =
             native_ibg_generate_interpreter_entry_point(&mut ctx, &[Value::Object(Some(mt))]);
         match result {
@@ -11919,8 +11925,10 @@ mod tests {
         let mut ctx = MockNativeContext::new();
         // A LambdaForm and MethodType. Synthetic alloc for the form is fine
         // since the native doesn't read its fields.
-        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/LambdaForm", 8)?;
-        let mt = build_method_type_from_descriptor(&mut ctx, "()V").expect("MethodType");
+        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/LambdaForm", 8).unwrap();
+        let mt = build_method_type_from_descriptor(&mut ctx, "()V")
+            .unwrap()
+            .expect("MethodType");
         let result = native_ibg_generate_customized_code(
             &mut ctx,
             &[Value::Object(Some(form)), Value::Object(Some(mt))],
@@ -11934,7 +11942,7 @@ mod tests {
     #[test]
     fn c33_ibg_named_function_invoker_returns_non_null() {
         let mut ctx = MockNativeContext::new();
-        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6)?;
+        let form = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodTypeForm", 6).unwrap();
         let result =
             native_ibg_generate_named_function_invoker(&mut ctx, &[Value::Object(Some(form))]);
         match result {
@@ -11999,7 +12007,7 @@ mod tests {
         };
         let cid = ctx.class_id_of_object(obj);
         assert_eq!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some(wrapper),
             "boxed with the wrong wrapper class"
         );
@@ -12176,11 +12184,11 @@ mod tests {
     #[test]
     fn p67_memory_segment_varhandle_access_mode_type_uses_segment_and_offset_coordinates() {
         let mut ctx = MockNativeContext::new();
-        let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3)?;
+        let vh = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle", 3).unwrap();
         register_p67_memory_segment_var_handle(&mut ctx, vh, 4);
 
         let access_type =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/VarHandle$AccessType", 2).unwrap();
         ctx.set_field(access_type, 1, Value::Int(0));
         let get_mt = match varhandle_access_mode_type_uncached(
             &mut ctx,

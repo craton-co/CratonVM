@@ -39,13 +39,20 @@ use std::sync::OnceLock;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
-/// `loader heap address -> [mirror heap addresses defined by that loader]`.
-/// Only user-defined loaders ever appear (built-in/bootstrap classes' mirrors
-/// are unconditionally rooted directly — see `vm::memory::roots` step 6 — so
-/// they never need this propagation), so the map stays small in the common
-/// case (no custom `ClassLoader` ever touched).
-fn store() -> &'static RwLock<FxHashMap<usize, Vec<usize>>> {
-    static INSTANCE: OnceLock<RwLock<FxHashMap<usize, Vec<usize>>>> = OnceLock::new();
+/// `loader heap address -> (owning VM, [mirror heap addresses defined by that
+/// loader])`. Only user-defined loaders ever appear (built-in/bootstrap
+/// classes' mirrors are unconditionally rooted directly — see
+/// `vm::memory::roots` step 6 — so they never need this propagation), so the
+/// map stays small in the common case (no custom `ClassLoader` ever touched).
+///
+/// The key is a heap address, which is unique across every live VM in the
+/// process, so the read path needs no VM and a second VM's rows can never be
+/// mistaken for this one's. The owning VM is recorded only so
+/// [`forget_vm_mirror_pins`] can drop exactly one VM's rows at teardown — which
+/// is what the blanket wipe at VM *creation* got wrong: at that point every row
+/// in the table belongs to somebody else.
+fn store() -> &'static RwLock<FxHashMap<usize, (usize, Vec<usize>)>> {
+    static INSTANCE: OnceLock<RwLock<FxHashMap<usize, (usize, Vec<usize>)>>> = OnceLock::new();
     INSTANCE.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
@@ -55,13 +62,13 @@ fn store() -> &'static RwLock<FxHashMap<usize, Vec<usize>>> {
 static NON_EMPTY: AtomicBool = AtomicBool::new(false);
 
 /// Record that `loader_addr` (a user-defined `ClassLoader`'s current heap
-/// address) defined the class whose mirror lives at `mirror_addr`.
-pub fn add_mirror_pin(loader_addr: usize, mirror_addr: usize) {
-    store()
-        .write()
-        .entry(loader_addr)
-        .or_default()
-        .push(mirror_addr);
+/// address, in `vm`'s heap) defined the class whose mirror lives at
+/// `mirror_addr`.
+pub fn add_mirror_pin(vm: usize, loader_addr: usize, mirror_addr: usize) {
+    let mut g = store().write();
+    let row = g.entry(loader_addr).or_insert_with(|| (vm, Vec::new()));
+    row.0 = vm;
+    row.1.push(mirror_addr);
     NON_EMPTY.store(true, Ordering::Relaxed);
 }
 
@@ -74,7 +81,7 @@ pub fn mirrors_for_loader(loader_addr: usize) -> Option<Vec<usize>> {
         return None;
     }
     let g = store().read();
-    let v = g.get(&loader_addr)?;
+    let (_vm, v) = g.get(&loader_addr)?;
     if v.is_empty() {
         None
     } else {
@@ -88,17 +95,57 @@ pub fn mirrors_for_loader(loader_addr: usize) -> Option<Vec<usize>> {
 /// and the defining-loader side-table have both finished reconciling/
 /// remapping, so the marker always sees current addresses on the next
 /// collection.
-pub fn replace_mirror_pins(entries: &[(usize, usize)]) {
+/// Rows owned by another VM survive: this is one VM's collection, and its
+/// pointer map says nothing about another heap's addresses.
+pub fn replace_mirror_pins(vm: usize, entries: &[(usize, usize)]) {
     let mut g = store().write();
-    g.clear();
+    g.retain(|_, (owner, _)| *owner != vm);
     for &(loader_addr, mirror_addr) in entries {
-        g.entry(loader_addr).or_default().push(mirror_addr);
+        let row = g.entry(loader_addr).or_insert_with(|| (vm, Vec::new()));
+        row.0 = vm;
+        row.1.push(mirror_addr);
     }
     NON_EMPTY.store(!g.is_empty(), Ordering::Relaxed);
 }
 
-/// Drop all entries (new-VM reset).
-pub fn clear_mirror_pins() {
-    store().write().clear();
-    NON_EMPTY.store(false, Ordering::Relaxed);
+/// Drop every row `vm` owns, at that VM's teardown.
+///
+/// This replaces a blanket `clear()` that ran at VM *creation*, where the only
+/// rows present belong to a concurrently-live VM — see [`store`].
+pub fn forget_vm_mirror_pins(vm: usize) {
+    let mut g = store().write();
+    g.retain(|_, (owner, _)| *owner != vm);
+    NON_EMPTY.store(!g.is_empty(), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teardown_drops_only_the_torn_down_vms_rows() {
+        const VM_A: usize = 0xA00;
+        const VM_B: usize = 0xB00;
+        forget_vm_mirror_pins(VM_A);
+        forget_vm_mirror_pins(VM_B);
+
+        add_mirror_pin(VM_A, 0x1000, 0x1008);
+        add_mirror_pin(VM_B, 0x2000, 0x2008);
+
+        forget_vm_mirror_pins(VM_A);
+        assert_eq!(mirrors_for_loader(0x1000), None);
+        assert_eq!(
+            mirrors_for_loader(0x2000),
+            Some(vec![0x2008]),
+            "a concurrently-live VM keeps its mirrors"
+        );
+
+        // One VM's post-GC re-sync must leave the other's rows in place.
+        replace_mirror_pins(VM_A, &[(0x1100, 0x1108)]);
+        assert_eq!(mirrors_for_loader(0x1100), Some(vec![0x1108]));
+        assert_eq!(mirrors_for_loader(0x2000), Some(vec![0x2008]));
+
+        forget_vm_mirror_pins(VM_A);
+        forget_vm_mirror_pins(VM_B);
+    }
 }

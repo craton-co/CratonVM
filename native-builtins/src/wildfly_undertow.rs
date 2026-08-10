@@ -1807,7 +1807,7 @@ mod tests {
     #[test]
     fn t19_2_d_http_string_synthetic_init_round_trips_text() {
         let mut ctx = mock_ctx();
-        let hs = try_alloc_concurrent_synthetic(&mut ctx, CLS_HTTP_STRING, HS_NUM_SLOTS)?;
+        let hs = try_alloc_concurrent_synthetic(&mut ctx, CLS_HTTP_STRING, HS_NUM_SLOTS).unwrap();
         let text = ctx.create_string("HTTP/1.1");
         native_http_string_init(
             &mut ctx,
@@ -1823,7 +1823,7 @@ mod tests {
     #[test]
     fn t19_2_d_header_map_put_get_round_trip() {
         let mut ctx = mock_ctx();
-        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
+        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS).unwrap();
         native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
         let k = ctx.create_string("Content-Type");
         let v = ctx.create_string("application/json");
@@ -1850,7 +1850,7 @@ mod tests {
     #[test]
     fn t19_2_d_header_map_get_first_string_round_trip_remoting_key() {
         let mut ctx = mock_ctx();
-        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
+        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS).unwrap();
         native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
         let k = ctx.create_string("Sec-JbossRemoting-Key");
         let v = ctx.create_string("2DDsEnGla2nNyCzrLngBkw==");
@@ -1905,7 +1905,7 @@ mod tests {
     #[test]
     fn t19_2_d_header_map_rejects_crlf_injection_value() {
         let mut ctx = mock_ctx();
-        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS)?;
+        let hm = try_alloc_concurrent_synthetic(&mut ctx, CLS_HEADER_MAP, HM_NUM_SLOTS).unwrap();
         native_header_map_init(&mut ctx, &[Value::Object(Some(hm))]).unwrap();
         let k = ctx.create_string("X-Foo");
         let v = ctx.create_string("ok\r\nInjected: yes");
@@ -1925,7 +1925,7 @@ mod tests {
         let mut ctx = mock_ctx();
         // Fabricate a populated exchange and confirm the natives read back
         // the method / uri / headers we populated.
-        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS)?;
+        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS).unwrap();
         let method = ctx.create_string("GET");
         let uri = ctx.create_string("/auth/realms/master");
         ctx.set_field(ex, EX_FIELD_METHOD, Value::Object(Some(method)));
@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     fn t19_2_d_response_sender_send_writes_body() {
         let mut ctx = mock_ctx();
-        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS)?;
+        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS).unwrap();
         let sender_v = native_exchange_get_response_sender(&mut ctx, &[Value::Object(Some(ex))])
             .unwrap()
             .unwrap();
@@ -2037,7 +2037,7 @@ mod tests {
     #[test]
     fn t19_2_d_listener_service_get_bound_address_after_start() {
         let mut ctx = mock_ctx();
-        let ls = try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SVC, LS_NUM_SLOTS)?;
+        let ls = try_alloc_concurrent_synthetic(&mut ctx, CLS_LISTENER_SVC, LS_NUM_SLOTS).unwrap();
         // Simulate the `start` step having populated the bound-address
         // InetSocketAddress mirror (in real flow T19.5's net_local_inet_address
         // fills this in).
@@ -2059,7 +2059,7 @@ mod tests {
     #[test]
     fn t19_2_d_handler_panic_yields_500() {
         let mut ctx = mock_ctx();
-        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS)?;
+        let ex = try_alloc_concurrent_synthetic(&mut ctx, CLS_EXCHANGE, EX_NUM_SLOTS).unwrap();
         // We don't have a real Java handler in the mock, but the dispatcher
         // resolves the invoke through `invoke_virtual`; the mock returns
         // Ok(None) when no script is primed. To exercise the panic branch

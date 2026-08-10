@@ -912,7 +912,7 @@ pub(crate) fn native_throwable_get_message(
         // exception class. Gate the fallback on the slot actually being a String.
         _ => match ctx.get_field(this, 0) {
             v @ Value::Object(Some(o))
-                if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                     == Some("java/lang/String") =>
             {
                 v
@@ -1077,7 +1077,7 @@ fn throwable_detail_message_text(ctx: &mut dyn NativeContext, t: ObjectRef) -> O
         _ if has_named_detail_message => Value::Object(None),
         _ => match ctx.get_field(t, 0) {
             v @ Value::Object(Some(o))
-                if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                     == Some("java/lang/String") =>
             {
                 v

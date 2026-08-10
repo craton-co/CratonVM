@@ -1791,7 +1791,7 @@ mod cb_layout_tests {
             .ensure_class_initialized("java/nio/CharBuffer")
             .expect("class init");
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, 12);
-        let buf = ctx.alloc_object(class_id, 10)?;
+        let buf = ctx.alloc_object(class_id, 10);
 
         cb_write_hb(&mut ctx, buf, arr, 12);
 
@@ -1823,7 +1823,7 @@ mod cb_layout_tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         let class_id = ClassId::new(9999); // never registered by name
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, 8);
-        let buf = ctx.alloc_object(class_id, 5)?;
+        let buf = ctx.alloc_object(class_id, 5);
 
         cb_write_hb(&mut ctx, buf, arr, 8);
 

@@ -1043,7 +1043,12 @@ fn initialize_class_shared(
                 // from jimage (they're pre-verified by javac/jlink).
                 // This matches HotSpot's behavior: -Xverify:none for
                 // java.base, -Xverify:remote for application classes.
-                if !per_class_skip && !verifier_skip_eligible(class) {
+                // `-Xverify:all` withdraws the bootstrap shortcut: the skip
+                // below exists because jimage classes were pre-verified by
+                // javac/jlink, and a deployment asking for `all` is asking us
+                // to stop taking that on trust.
+                let skip_boot = !cm.strict_verification() && verifier_skip_eligible(class);
+                if !per_class_skip && !skip_boot {
                     // Pass 2 вЂ” structural verification.
                     let structural =
                         crate::classloading::verifier::verify_class_structure(class, store);

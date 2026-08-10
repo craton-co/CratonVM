@@ -253,7 +253,7 @@ fn remap_security_manager(shared: &crate::vm::SharedVm, map: &cratonvm_types::Po
 // heap's addresses to another heap's collector and rewriting one VM's entries
 // through another VM's relocation map. See `runtime::serialization::oscache`.
 fn scan_osc_cache(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
-    shared.classes.osc_cache.scan_roots(roots);
+    shared.classes.osc_cache.scan_roots(shared.vm_identity, roots);
 }
 fn remap_osc_cache(shared: &crate::vm::SharedVm, map: &cratonvm_types::PointerMap) {
     shared.classes.osc_cache.remap_roots(map);

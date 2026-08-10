@@ -1800,6 +1800,92 @@ impl MonitorTable {
         }
     }
 
+    /// The identity hash of an object whose mark word has no room for one,
+    /// installing `mint()`'s value the first time and answering with it
+    /// forever after.
+    ///
+    /// A `NEUTRAL` word carries the hash in its upper bits, and that is where
+    /// [`ObjectHeader::mark_word_identity_hash`] puts it. Every other state has
+    /// the space spoken for: a `THIN_LOCKED` payload is an owner plus a
+    /// recursion count, an `INFLATED` payload is a monitor pointer. Before this
+    /// method existed the heap answered such an object with `0`, which the VM's
+    /// "never hand back 0" guard turned into `i32::MAX` — the SAME value for
+    /// every locked-then-hashed object, and a value that changed the moment the
+    /// thin lock was released and a real hash was minted into the freed word.
+    ///
+    /// A changing identity hash is not a cosmetic defect. `HashMap` files an
+    /// entry under the hash it read at `put` and looks it up under the hash it
+    /// reads at `get`; when those differ the map cannot find its own key, and
+    /// re-putting that key grows a SECOND entry for the same object. Spring
+    /// Boot's `TomcatWebServer` hits it exactly: it parks a service's
+    /// connectors in a `Map<Service, Connector[]>` from inside
+    /// `LifecycleBase.start()`, which is `synchronized` on that very
+    /// `StandardService`. The lookup after the lock was released missed, the
+    /// service came back with no connectors, `Tomcat.getConnector()` fabricated
+    /// a fresh port-8080 connector on the already-running service, and every
+    /// embedded-Tomcat test failed with `Connector configured to listen on port
+    /// 8080 failed to start`.
+    ///
+    /// Inflating is what HotSpot does here — `ObjectSynchronizer::FastHashCode`
+    /// inflates a stack-locked object and stores the hash in the monitor's
+    /// displaced header — and it is stable for the object's life: nothing in
+    /// this VM deflates a LIVE object's monitor (the mark word's reference is
+    /// released only for an object the collector has proved dead), so once
+    /// displaced the hash stays reachable through the same pointer.
+    ///
+    /// `mint` runs at most once per call, and its value is adopted only if this
+    /// caller wins the install race; [`Monitor::displace_hash`] makes the losers
+    /// converge on the winner's value.
+    /// The Java-visible identity hash of `obj_ref`, given `heap_answer` — what
+    /// the collector's own `identity_hash_code` accessor said.
+    ///
+    /// The two-branch shape lives here, in one place, so the VM's
+    /// `NativeContext::identity_hash_code` and the regression test below
+    /// exercise the same composition rather than each restating it.
+    ///
+    /// `heap_answer == 0` is not "no hash yet": the heap mints one for a
+    /// NEUTRAL word. It means the word cannot hold a hash at all and nothing is
+    /// displaced — see [`Self::identity_hash_via_monitor`].
+    pub fn java_identity_hash(
+        &self,
+        obj_ref: ObjectRef,
+        heap_answer: i32,
+        mint: impl FnOnce() -> i32,
+    ) -> i32 {
+        let hash = if heap_answer != 0 {
+            heap_answer
+        } else {
+            self.identity_hash_via_monitor(obj_ref, mint)
+        };
+        // `identityHashCode` must never be 0: the JDK's
+        // `InvokerBytecodeGenerator` uses it as a HashMap key and asserts
+        // non-zero. Only a corrupt INFLATED word reaches this arm now.
+        match hash {
+            0 => i32::MAX,
+            h => h,
+        }
+    }
+
+    pub fn identity_hash_via_monitor(&self, obj_ref: ObjectRef, mint: impl FnOnce() -> i32) -> i32 {
+        let Ok(monitor) = self.ensure_inflated(obj_ref, ThreadId(0)) else {
+            // Only a corrupt INFLATED word carrying a null monitor pointer
+            // reaches here. Report "no answer" and let the caller's guard speak.
+            return 0;
+        };
+        let existing = monitor.displaced_hash();
+        if existing != 0 {
+            return existing;
+        }
+        // `displace_hash` reads 0 as "none recorded", so a mint that produced 0
+        // would install nothing and be re-minted on the next call — the one
+        // thing an identity hash must never do.
+        let candidate = match mint() {
+            0 => i32::MAX,
+            h => h,
+        };
+        monitor.displace_hash(candidate)
+    }
+
     /// Ensure the object's lock is inflated and return the heavyweight
     /// `Monitor`. If the calling thread holds the thin lock, ownership is
     /// transferred atomically.
@@ -3244,6 +3330,98 @@ mod tests {
         // than mints.
         assert_eq!(heap.identity_hash_code(obj), before);
         assert_eq!(heap.identity_hash_code(obj), before);
+    }
+
+    /// An object first hashed while it is THIN_LOCKED must answer the same
+    /// value once the lock is released.
+    ///
+    /// A thin-locked mark word's payload is an owner plus a recursion count, so
+    /// the heap cannot answer at all and returns `0`. Before
+    /// [`MonitorTable::java_identity_hash`] the VM turned that `0` into
+    /// `i32::MAX` and returned it, so the object answered `i32::MAX` while
+    /// locked and a freshly minted value after the unlock — a *changing*
+    /// identity hash. `probes/IdentityHashWhileLockedProbe.java` measured
+    /// exactly that against this VM (`inside=2147483647 afterUnlock=16`) and a
+    /// HotSpot control that reports one value throughout; this test is the
+    /// in-tree fence for it.
+    #[test]
+    fn the_identity_hash_of_a_thin_locked_object_survives_the_unlock() {
+        let heap = leaked_heap();
+        let table = MonitorTable::new();
+        let obj = heap.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let tid = ThreadId(29);
+
+        // Lock FIRST, so the object reaches the hash path with a mark word that
+        // has no room for one. (Hashing first would keep it in the mark word
+        // and take the already-covered path.)
+        table.enter(obj, tid);
+        assert_eq!(
+            ObjectHeader::mark_state(header_of(obj).mark_word.load(Ordering::Relaxed)),
+            types::MARK_THIN_LOCKED,
+            "precondition: an unhashed object thin-locks"
+        );
+
+        // A mint that answers a DIFFERENT value on every call. A constant one
+        // would let a re-minting implementation pass this test.
+        let next = std::cell::Cell::new(0x5EED_0001_i32);
+        let mint = || {
+            let v = next.get();
+            next.set(v + 1);
+            v
+        };
+
+        let while_locked = table.java_identity_hash(obj, heap.identity_hash_code(obj), mint);
+        assert_ne!(while_locked, 0, "identityHashCode must never be 0");
+        assert_ne!(
+            while_locked,
+            i32::MAX,
+            "i32::MAX is the 'no answer' sentinel: returning it hands every \
+             locked-then-hashed object in the process the SAME hash"
+        );
+
+        table.exit(obj, tid).unwrap();
+
+        let after_unlock = table.java_identity_hash(obj, heap.identity_hash_code(obj), mint);
+        assert_eq!(
+            while_locked, after_unlock,
+            "identity hash changed across the unlock: {while_locked} -> {after_unlock}"
+        );
+        // Stable on repeat, i.e. the displaced path reads rather than mints.
+        assert_eq!(
+            table.java_identity_hash(obj, heap.identity_hash_code(obj), mint),
+            while_locked
+        );
+    }
+
+    /// Two different objects hashed while locked must not collide.
+    ///
+    /// The pre-fix answer was the constant `i32::MAX` for every one of them,
+    /// which is a legal-looking hash and a catastrophic one: every such object
+    /// lands in the same `HashMap` bucket and compares unequal, so the map
+    /// degrades to a linear scan that also cannot find its own keys.
+    #[test]
+    fn locked_objects_do_not_all_share_one_identity_hash() {
+        let heap = leaked_heap();
+        let table = MonitorTable::new();
+        let first = heap.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let second = heap.alloc_object(cratonvm_types::ClassId::new(0), 1);
+        let tid = ThreadId(31);
+
+        let next = std::cell::Cell::new(0x5EED_1001_i32);
+        let mint = || {
+            let v = next.get();
+            next.set(v + 1);
+            v
+        };
+
+        table.enter(first, tid);
+        table.enter(second, tid);
+        let a = table.java_identity_hash(first, heap.identity_hash_code(first), mint);
+        let b = table.java_identity_hash(second, heap.identity_hash_code(second), mint);
+        table.exit(second, tid).unwrap();
+        table.exit(first, tid).unwrap();
+
+        assert_ne!(a, b, "two distinct locked objects were given the same hash");
     }
 
     /// An object that inflates *without* ever having been hashed displaces

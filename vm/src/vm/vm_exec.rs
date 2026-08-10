@@ -6958,6 +6958,18 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|c| c.name.to_string())
     }
 
+    /// The whole point of the override: `Class::name` is already an
+    /// `Arc<str>`, so the answer is a refcount bump rather than the fresh
+    /// `String` the default (and `class_name_of_id`) allocates.
+    fn class_name_arc_of_id(&self, class_id: ClassId) -> Option<std::sync::Arc<str>> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| std::sync::Arc::clone(&c.name))
+    }
+
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
         self.shared.mem.heap.class_id_of(obj)
     }
@@ -10492,13 +10504,35 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         // `fixed-suite-bugs/tomcat-embedded-server-keystore-empty-cert-chain-intermittent-FIXED.md`
         // for the bug this produced in `keystore.rs`'s `store_id_by_identity`.
         //
-        // What remains here is now just a last-resort guard against a 0
-        // making it back out of the heap at all (it shouldn't, but this
-        // keeps the "never 0" contract airtight regardless).
-        match self.shared.mem.heap.identity_hash_code(obj) {
-            0 => i32::MAX,
-            h => h,
-        }
+        // A `0` from the heap is not "no hash yet" — it is "this object's mark
+        // word cannot hold one and nothing is displaced": the word is
+        // THIN_LOCKED (payload = owner + recursion) or INFLATED (payload = a
+        // monitor pointer) and the object had never been hashed before it got
+        // there. Mapping that to `i32::MAX` and returning was wrong twice over:
+        // every locked-then-hashed object answered the SAME value, and the
+        // answer CHANGED to a freshly minted one as soon as the lock was
+        // released and the word went back to NEUTRAL.
+        //
+        // A `HashMap` keyed by such an object then cannot find its own entry —
+        // `put` filed it under `i32::MAX`, `get` looks under the new hash — and
+        // re-putting the same key grows a second entry. That is how Spring
+        // Boot's `TomcatWebServer` lost the connectors it parks in a
+        // `Map<Service, Connector[]>` from inside `LifecycleBase.start()`
+        // (`synchronized` on that same `StandardService`), leaving
+        // `Tomcat.getConnector()` to fabricate a port-8080 connector on a
+        // running service. `probes/IdentityHashWhileLockedProbe.java` is the
+        // three-line repro.
+        //
+        // Inflate and displace the hash into the monitor instead — HotSpot's
+        // answer, and a stable one, since a live object's monitor is never
+        // deflated here. `java_identity_hash` also keeps the last-resort
+        // "never hand back 0" guard.
+        let heap = &self.shared.mem.heap;
+        let heap_answer = heap.identity_hash_code(obj);
+        self.shared
+            .threads
+            .monitors
+            .java_identity_hash(obj, heap_answer, || heap.next_identity_hash())
     }
 
     fn register_var_handle_root(&mut self, vh: ObjectRef) {
@@ -13330,7 +13364,7 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // its physical class name.
         let lock_class_name = if contended.is_none() {
             waiting.and_then(|object| {
-                (self.class_name_of_id(self.class_id_of_object(object)).as_deref()
+                (self.class_name_arc_of_id(self.class_id_of_object(object)).as_deref()
                     == Some("java/util/concurrent/CountDownLatch"))
                     .then(|| "java/util/concurrent/CountDownLatch$Sync".to_string())
             })

@@ -1454,7 +1454,7 @@ fn is_real_cache(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     match ctx.get_field(this, CACHE_FIELD_MANAGER) {
         Value::Object(Some(mgr)) => {
             let cid = ctx.class_id_of_object(mgr);
-            ctx.class_name_of_id(cid).as_deref() != Some(CLS_MANAGER)
+            ctx.class_name_arc_of_id(cid).as_deref() != Some(CLS_MANAGER)
         }
         _ => true,
     }
@@ -2629,7 +2629,7 @@ mod tests {
             other => panic!("expected builder passed to putConfiguration, got {other:?}"),
         };
         assert_eq!(
-            ctx.class_name_of_id(ctx.class_id_of_object(builder))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(builder))
                 .as_deref(),
             Some(CLS_CONFIG_BUILDER)
         );

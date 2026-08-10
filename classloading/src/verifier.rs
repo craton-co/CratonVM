@@ -165,8 +165,25 @@ pub fn verify_class(
     store: &ClassStore,
     hierarchy: &dyn ClassHierarchy,
 ) -> Result<(), LinkageError> {
+    verify_class_with_strictness(class, store, hierarchy, false)
+}
+
+/// [`verify_class`] with the `-Xverify:all` decision threaded in.
+///
+/// `strict = true` forces spec-literal branch-target checking on EVERY class,
+/// including the trusted bootstrap image that [`verify_class`] verifies
+/// leniently. This is the production entry point
+/// `bytecode_verifier::verify_bytecode_strict` was documented as having and
+/// did not: `ClassManager::strict_verification` (set from
+/// `VmConfig::xverify_mode`) is what supplies the flag.
+pub fn verify_class_with_strictness(
+    class: &Class,
+    store: &ClassStore,
+    hierarchy: &dyn ClassHierarchy,
+    strict: bool,
+) -> Result<(), LinkageError> {
     verify_class_structure(class, store)?;
-    verify_class_bytecode(class, hierarchy)?;
+    verify_class_bytecode_with_strictness(class, hierarchy, strict)?;
     Ok(())
 }
 
@@ -238,13 +255,23 @@ pub fn verify_class_bytecode(
     // methods are rejected after their structural scan. Threaded through the
     // inner function so tests can exercise both policies deterministically
     // without depending on the process-wide `OnceLock`.
-    verify_class_bytecode_inner(class, hierarchy, allow_jsr_ret())
+    verify_class_bytecode_with_strictness(class, hierarchy, false)
+}
+
+/// [`verify_class_bytecode`] with the `-Xverify:all` decision threaded in.
+pub fn verify_class_bytecode_with_strictness(
+    class: &Class,
+    hierarchy: &dyn ClassHierarchy,
+    strict: bool,
+) -> Result<(), LinkageError> {
+    verify_class_bytecode_inner(class, hierarchy, allow_jsr_ret(), strict)
 }
 
 fn verify_class_bytecode_inner(
     class: &Class,
     hierarchy: &dyn ClassHierarchy,
     allow_jsr: bool,
+    force_strict: bool,
 ) -> Result<(), LinkageError> {
     // Identify methods that use subroutines (jsr / jsr_w / ret). The scan
     // is opcode-only; we do not need to fully decode the bytecode to
@@ -266,8 +293,13 @@ fn verify_class_bytecode_inner(
     if !any_jsr {
         // Common path — no subroutines anywhere. Delegate to the
         // standard verifier unchanged. `verify_bytecode` now self-selects
-        // strict-by-default for untrusted classes (SECURITY FIX V4).
-        return super::bytecode_verifier::verify_bytecode(class, hierarchy);
+        // strict-by-default for untrusted classes (SECURITY FIX V4), and
+        // `-Xverify:all` extends that to the trusted ones.
+        return if force_strict {
+            super::bytecode_verifier::verify_bytecode_strict(class, hierarchy)
+        } else {
+            super::bytecode_verifier::verify_bytecode(class, hierarchy)
+        };
     }
 
     // SECURITY FIX (V4): strict branch-target frame checking is the default
@@ -275,7 +307,7 @@ fn verify_class_bytecode_inner(
     // `bytecode_verifier::verify_bytecode`. The per-method JSR path below
     // honours the same decision so a JSR-containing untrusted class does not
     // silently downgrade its non-JSR sibling methods to lenient mode.
-    let strict = !super::bytecode_verifier::class_is_bootstrap_trusted(class);
+    let strict = force_strict || !super::bytecode_verifier::class_is_bootstrap_trusted(class);
 
     // POLICY: whether subroutine-using methods may be accepted under the
     // structural-only fallback. Two independent paths permit acceptance:
@@ -3001,14 +3033,14 @@ mod tests {
         // Default policy (escape hatch off): legal pre-Java-7 version, so the
         // structurally well-formed subroutine method is accepted — this is the
         // regression fix (ByteBuddy `JavaDispatcher$DynamicClassLoader.proxy`).
-        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             accepted_default.is_ok(),
             "legal pre-Java-7 (major 49) subroutine method must be accepted by \
              default (HotSpot loads it), got {accepted_default:?}"
         );
         // Escape hatch on: also accepted (structural-only).
-        let accepted_hatch = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let accepted_hatch = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             accepted_hatch.is_ok(),
             "with CRATONVM_ALLOW_JSR_RET the structurally-valid subroutine method \
@@ -3092,7 +3124,7 @@ mod tests {
                 double_jsr_method("legacyFinally"),
             ],
         );
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             res.is_ok(),
             "legal pre-Java-7 class must verify, got {res:?}"
@@ -3152,7 +3184,7 @@ mod tests {
                 plain_method("plain", vec![0xb1], 1, 1),
             ],
         );
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             res.is_ok(),
             "legal pre-Java-7 class must verify, got {res:?}"
@@ -3198,7 +3230,7 @@ mod tests {
                 plain_method("plain", vec![0x2a, 0x4b, 0xb1], 1, 1),
             ],
         );
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(res.is_ok(), "class must verify, got {res:?}");
 
         let maps = crate::type_maps::class_type_maps(class.id).expect("maps must be published");
@@ -3229,7 +3261,7 @@ mod tests {
             make_pre_java7_class_with_id(90_004, vec![double_jsr_method("legacyFinally")]);
         // Major ≥ 51 makes the subroutine opcodes illegal (JVMS §4.9.1).
         class.version = ClassFileVersion::JAVA_7;
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(res.is_err(), "subroutine at major 51 must be rejected");
         assert_eq!(
             crate::type_maps::verification_status(class.id),
@@ -3263,14 +3295,14 @@ mod tests {
         // Forbidden at major ≥ 51 — mark the class as Java 7.
         class.version = ClassFileVersion::JAVA_7;
         // Default policy: malformed (subroutine opcode at version ≥ 51) → reject.
-        let rejected = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let rejected = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             rejected.is_err(),
             "subroutine opcode at class-file version 51+ is forbidden (JVMS §4.9.1) \
              and must be rejected by default, got {rejected:?}"
         );
         // Escape hatch on: structural-only acceptance regardless of version.
-        let accepted = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let accepted = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             accepted.is_ok(),
             "with CRATONVM_ALLOW_JSR_RET the structurally-valid subroutine method \
@@ -3355,7 +3387,7 @@ mod tests {
         // Legal pre-Java-7 (major 49) version: HotSpot loads this try-finally
         // double-jsr shape, so CratonVM accepts it after the structural scan —
         // by default, no escape hatch required.
-        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        let accepted_default = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false);
         assert!(
             accepted_default.is_ok(),
             "ByteBuddy clear()-shape (try-finally with double-jsr to one \
@@ -3363,7 +3395,7 @@ mod tests {
              default, got {accepted_default:?}"
         );
         // Escape hatch: also accepted (structural-only).
-        let accepted_hatch = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let accepted_hatch = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             accepted_hatch.is_ok(),
             "with CRATONVM_ALLOW_JSR_RET the structurally-valid clear()-shape \
@@ -3391,7 +3423,7 @@ mod tests {
             ],
             vec![],
         );
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             res.is_err(),
             "out-of-range jsr target must still be rejected by structural pass \
@@ -3460,7 +3492,7 @@ mod tests {
                 attributes: vec![],
             }))],
         });
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             res.is_err(),
             "non-JSR type-state bug must be detected even when a tolerated \
@@ -3504,7 +3536,7 @@ mod tests {
                 attributes: vec![],
             }))],
         });
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             res.is_err(),
             "type-state bug in non-JSR method must be caught even when a \
@@ -3550,7 +3582,7 @@ mod tests {
                 attributes: vec![],
             }))],
         });
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             res.is_err(),
             "malformed non-JSR method in a mixed class must still be rejected, \
@@ -3582,7 +3614,7 @@ mod tests {
         // Java 7+ (major 51): subroutine opcodes are forbidden → rejected by
         // default with a diagnostic message.
         class.version = ClassFileVersion::JAVA_7;
-        match verify_class_bytecode_inner(&class, &PermissiveHierarchy, false) {
+        match verify_class_bytecode_inner(&class, &PermissiveHierarchy, false, false) {
             Err(LinkageError::VerifyError {
                 method_name,
                 message,
@@ -3601,7 +3633,7 @@ mod tests {
 
     fn assert_legacy_jsr_structural_rejects(code: Vec<u8>, max_locals: u16, needle: &str) {
         let class = make_pre_java7_jsr_class("legacy", "()V", 2, max_locals, code, vec![]);
-        match verify_class_bytecode_inner(&class, &PermissiveHierarchy, true) {
+        match verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false) {
             Err(LinkageError::VerifyError { message, .. }) => {
                 assert!(
                     message.contains(needle),
@@ -3925,7 +3957,7 @@ mod tests {
             }))],
         });
 
-        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true);
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false);
         assert!(
             res.is_err(),
             "new C; invokespecial D.<init> must be rejected by the owner-match, got {res:?}"
@@ -3962,7 +3994,7 @@ mod tests {
         // Control: the *verifying* entry point rejects this class outright, so
         // before the fix a deferred-Pass-3 class published nothing at all.
         assert!(
-            verify_class_bytecode_inner(&class, &PermissiveHierarchy, true).is_err(),
+            verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false).is_err(),
             "fixture must be one the verifying path rejects"
         );
 
@@ -4282,7 +4314,7 @@ mod tests {
             ConstantPoolEntry::Utf8("not a class".into()), // 1
         ]);
         let class = catch_type_class(92_101, cp, 1);
-        let err = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+        let err = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false)
             .expect_err("a catch_type that is not a CONSTANT_Class must be rejected");
         assert!(err.to_string().contains("CONSTANT_Class"), "{err}");
     }
@@ -4292,7 +4324,7 @@ mod tests {
         // Nothing at index 7 at all — the pre-fix fallback silently typed the
         // handler entry as `java/lang/Throwable` and verified clean.
         let class = catch_type_class(92_102, empty_cp(), 7);
-        let err = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+        let err = verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false)
             .expect_err("an out-of-range catch_type must be rejected");
         assert!(err.to_string().contains("CONSTANT_Class"), "{err}");
     }
@@ -4307,7 +4339,7 @@ mod tests {
             ConstantPoolEntry::ClassReference { name_index: 1 },   // 2
         ]);
         let class = catch_type_class(92_103, cp, 2);
-        verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+        verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false)
             .expect("a CONSTANT_Class catch_type must verify");
     }
 
@@ -4315,7 +4347,7 @@ mod tests {
     fn accepts_a_catch_all_handler() {
         // `catch_type == 0` is the `finally` form and names no pool entry.
         let class = catch_type_class(92_104, empty_cp(), 0);
-        verify_class_bytecode_inner(&class, &PermissiveHierarchy, true)
+        verify_class_bytecode_inner(&class, &PermissiveHierarchy, true, false)
             .expect("a catch-all handler must verify");
     }
 

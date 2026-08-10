@@ -8465,7 +8465,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock: hold count should become 1
@@ -8484,7 +8484,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         let result = native_rl_try_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8497,7 +8497,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         // Lock twice -- should increment hold count to 2
@@ -8523,7 +8523,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -8541,7 +8541,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8567,7 +8567,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -8596,7 +8596,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_to_zero_triggers_notify() {
         let mut ctx = make_ctx();
-        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)?;
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(2)]).unwrap();
 
         assert_eq!(cdl_count(&mut ctx, cdl), 2);
@@ -8612,7 +8612,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_await_returns_when_count_is_zero() {
         let mut ctx = make_ctx();
-        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)?;
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
         // Init with count=0 means await should return immediately
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(0)]).unwrap();
 
@@ -8624,7 +8624,7 @@ mod concurrency_tests {
     #[test]
     fn cdl_countdown_below_zero_stays_at_zero() {
         let mut ctx = make_ctx();
-        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1)?;
+        let cdl = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1).unwrap();
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(1)]).unwrap();
 
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
@@ -8642,7 +8642,7 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_decrements_permits() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         assert_eq!(sem_permits(&mut ctx, sem), 3);
@@ -8654,7 +8654,7 @@ mod concurrency_tests {
     #[test]
     fn sem_acquire_uninterruptibly_n_decrements_requested_permits() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
         native_sem_acquire_n(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
@@ -8664,7 +8664,7 @@ mod concurrency_tests {
     #[test]
     fn sem_release_increments_and_notifies() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(1)]).unwrap();
 
         // Release adds a permit (calls monitor_notify internally)
@@ -8675,7 +8675,7 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_no_permits_returns_zero() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(0)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8686,7 +8686,7 @@ mod concurrency_tests {
     #[test]
     fn sem_try_acquire_with_permits_succeeds() {
         let mut ctx = make_ctx();
-        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2)?;
+        let sem = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2).unwrap();
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(5)]).unwrap();
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
@@ -8815,9 +8815,9 @@ mod concurrency_tests {
         let a = ctx.alloc_object(ClassId::new(0), 1);
         let b = ctx.alloc_object(ClassId::new(0), 1);
 
-        let ka1 = gc_stable_lock_key(&mut ctx, a);
-        let ka2 = gc_stable_lock_key(&mut ctx, a);
-        let kb = gc_stable_lock_key(&mut ctx, b);
+        let ka1 = gc_stable_lock_key(&mut ctx, a).unwrap();
+        let ka2 = gc_stable_lock_key(&mut ctx, a).unwrap();
+        let kb = gc_stable_lock_key(&mut ctx, b).unwrap();
 
         // (a) stable for the same object across calls
         assert_eq!(ka1, ka2, "key must be stable for the same lock object");
@@ -9370,7 +9370,7 @@ mod concurrency_tests {
         // Verify that ReentrantLock lock/unlock cycle works with monitor-based contention
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9389,7 +9389,7 @@ mod concurrency_tests {
         // In single-threaded mock, monitor_wait returns immediately → not timed out
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9416,7 +9416,7 @@ mod concurrency_tests {
     fn m18_cond_await_nanos_returns_remaining() {
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9450,7 +9450,7 @@ mod concurrency_tests {
         // CopyOnWriteArrayList iterator should see a snapshot, not live data
         let mut ctx = make_ctx();
         let cowal =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CopyOnWriteArrayList", 2).unwrap();
         cratonvm_native_collections::native_al_init(&mut ctx, &[Value::Object(Some(cowal))])
             .unwrap();
 
@@ -9563,7 +9563,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ai = "java/util/concurrent/atomic/AtomicInteger";
         let mut ctx = make_ctx();
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, ai, 1)?;
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ai, 1).unwrap();
 
         let init = reg.find(ai, "<init>", "(I)V").unwrap();
         init(&mut ctx, &[Value::Object(Some(obj)), Value::Int(10)]).unwrap();
@@ -9625,7 +9625,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let al = "java/util/concurrent/atomic/AtomicLong";
         let mut ctx = make_ctx();
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, al, 1)?;
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, al, 1).unwrap();
 
         let init = reg.find(al, "<init>", "(J)V").unwrap();
         init(&mut ctx, &[Value::Object(Some(obj)), Value::Long(i64::MAX)]).unwrap();
@@ -9715,7 +9715,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ar = "java/util/concurrent/atomic/AtomicReference";
         let mut ctx = make_ctx();
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1)?;
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1).unwrap();
         let value = ctx.create_string("CLOSED");
 
         let init = reg.find(ar, "<init>", "(Ljava/lang/Object;)V").unwrap();
@@ -9739,7 +9739,7 @@ mod concurrency_tests {
         let reg = register_atomics();
         let ar = "java/util/concurrent/atomic/AtomicReference";
         let mut ctx = make_ctx();
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1)?;
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, ar, 1).unwrap();
 
         let s_a1 = ctx.create_string("hello");
         let s_a2 = ctx.create_string("hello");
@@ -9795,7 +9795,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
@@ -9831,7 +9831,7 @@ mod concurrency_tests {
         let _guard = stamped_test_lock();
         let mut ctx = make_ctx();
         let lock =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/locks/ReentrantLock", 3).unwrap();
         native_rl_init(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
         native_rl_lock(&mut ctx, &[Value::Object(Some(lock))]).unwrap();
 
@@ -9869,7 +9869,7 @@ mod concurrency_tests {
     #[test]
     fn rd8_completable_future_exceptional_passthrough() {
         let mut ctx = make_ctx();
-        let cf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4)?;
+        let cf = try_alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CompletableFuture", 4).unwrap();
         let err_msg = ctx.create_string("boom");
         ctx.set_field(cf, FUT_FIELD_RESULT, Value::Object(Some(err_msg)));
         ctx.set_field(cf, FUT_FIELD_DONE, Value::Int(2));

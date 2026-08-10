@@ -607,7 +607,7 @@ fn p67_session_is_real(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(session);
     ctx.resolve_field_index_by_class_id(class_id, "state")
         .is_some()
-        && ctx.class_name_of_id(class_id).as_deref()
+        && ctx.class_name_arc_of_id(class_id).as_deref()
             != Some("jdk/internal/foreign/MemorySessionImpl")
 }
 

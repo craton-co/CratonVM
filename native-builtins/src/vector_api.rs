@@ -2709,7 +2709,7 @@ mod vector_api_tests {
     #[test]
     fn test_float_vector_mul_reduce_uses_real_lanes() {
         let mut ctx = MockNativeContext::new();
-        let species = alloc_species(&mut ctx, 10);
+        let species = alloc_species(&mut ctx, 10).unwrap();
         let lhs = ctx.new_array(ArrayElementType::Float, 8);
         let rhs = ctx.new_array(ArrayElementType::Float, 8);
         for i in 0..8 {

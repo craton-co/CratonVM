@@ -21,7 +21,7 @@ which gates the `GcAlgorithm::Zgc` variant and its `parse_gc_algorithm` arm
 build `-XX:+UseZGC` takes the fall-back path above. A ZGC-capable launcher
 is `cargo build -p cratonvm-cli --features zgc`. It is default-off because
 it is not at parity: on the 1975-class Spring Boot suite it measures 1860 PASS vs. Generational's 1902, 49 HANG vs. 18
-([record](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md)). The plan to make
+([record](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md)). The plan to make
 it a real, concurrent, generational, compacting ZGC is
 [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
 

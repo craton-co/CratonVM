@@ -590,7 +590,7 @@ const WS_INPUT_CLOSED: usize = 3;
 /// (`protected HttpClient() {}`), so declining to write anything is exactly
 /// the faithful behaviour.
 fn is_synthetic_shape(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
 }
 
 fn alloc_http_client(ctx: &mut dyn NativeContext) -> Result<ObjectRef, MethodCallFailed> {

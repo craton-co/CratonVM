@@ -22,7 +22,7 @@ Collection](../user-guide/memory-and-gc.md).
 > of a consumer: on the 1975-class Spring Boot suite, same binary with only the
 > collector toggled, ZGC measures 1860 PASS / 49 HANG / 22 FAIL against the
 > default collector's 1902 / 18 / 11
-> ([record](../../../internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md)). The path to
+> ([record](../../../internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md)). The path to
 > a genuinely concurrent, generational, compacting ZGC is
 > [`docs/feature-designs/zgc-production-implementation-plan.md`](../../../feature-designs/zgc-production-implementation-plan.md).
 

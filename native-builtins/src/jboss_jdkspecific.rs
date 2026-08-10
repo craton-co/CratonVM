@@ -29,6 +29,7 @@
 //! This module is loaded from `lib.rs::register_essential_natives` alongside
 //! the existing `jboss_module_xml` handlers.
 
+use cratonvm_classloading::module::ALL_UNNAMED_TARGET;
 use cratonvm_native_api::{NativeContext, NativeKind, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
@@ -878,7 +879,7 @@ fn resource_package_name(name: &str) -> &str {
 fn resource_caller_module(ctx: &mut dyn NativeContext) -> Option<String> {
     for cid in ctx.frame_class_ids() {
         if matches!(
-            ctx.class_name_of_id(cid).as_deref(),
+            ctx.class_name_arc_of_id(cid).as_deref(),
             Some("java/lang/Module")
         ) {
             continue;
@@ -1701,11 +1702,32 @@ fn native_module_add_exports0(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
-/// `java.lang.Module.addExportsToAll0(Module from, String pkg)` and
-/// `addExportsToAllUnnamed0` — record an unqualified dynamic export.
+/// `java.lang.Module.addExportsToAll0(Module from, String pkg)` — record an
+/// unqualified dynamic export (`exports pkg;`, reaching every module).
 fn native_module_add_exports_to_all0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+) -> MethodCallResult {
+    native_module_add_exports_to0(ctx, args, "")
+}
+
+/// `java.lang.Module.addExportsToAllUnnamed0(Module from, String pkg)` —
+/// record an export qualified to the unnamed module.
+///
+/// Not the same edge as `addExportsToAll0`, which is what this used to share.
+/// `ALL-UNNAMED` reaches unnamed modules only, and HotSpot reports it as a
+/// qualified export: `Module.isExported(pkg)` stays **false** afterwards.
+fn native_module_add_exports_to_all_unnamed0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_module_add_exports_to0(ctx, args, ALL_UNNAMED_TARGET)
+}
+
+fn native_module_add_exports_to0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    target: &str,
 ) -> MethodCallResult {
     let from = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -1716,7 +1738,7 @@ fn native_module_add_exports_to_all0(
         _ => return Ok(None),
     };
     let from_name = module_registry_name(ctx, from);
-    ctx.module_add_exports(&from_name, &pkg.replace('.', "/"), "");
+    ctx.module_add_exports(&from_name, &pkg.replace('.', "/"), target);
     Ok(None)
 }
 
@@ -1863,18 +1885,28 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         native_module_add_exports_to_all0,
         NativeKind::Bridge,
     );
-    // Export to the unnamed module (`--add-exports …=ALL-UNNAMED`). The
-    // unnamed module's registry name is the empty string
-    // (`classloading::module::UNNAMED_MODULE`), which `add_exports` already
-    // reads as the unqualified form — so this deliberately shares the
-    // `addExportsToAll0` implementation. That is a widening (we grant to all
-    // modules rather than only unnamed ones); the alternative, dropping the
-    // edge entirely, produced spurious IllegalAccessErrors.
+    // Export to the unnamed module (`--add-exports …=ALL-UNNAMED`).
+    //
+    // This shared `addExportsToAll0`'s implementation until 2026-08-10, i.e. it
+    // recorded an UNQUALIFIED export: the unnamed module's registry name is the
+    // empty string (`classloading::module::UNNAMED_MODULE`) and `add_exports`
+    // read an empty target as "to all modules". That was a deliberate widening
+    // at the time, because the only alternative considered was dropping the
+    // edge entirely, which produced spurious IllegalAccessErrors.
+    //
+    // The choice stopped being binary when `ALL_UNNAMED_TARGET` landed (it was
+    // added for the `--add-exports`/`--add-opens` CLI path, which had the
+    // identical conflation and was caught diffing `Module.isOpen` against
+    // Temurin 25 — probes/AddOpensFlagProbe.java). It resolves to a QUALIFIED
+    // edge naming the unnamed module: classpath code still gets its grant, so
+    // the IllegalAccessError vector stays closed, while named modules stop
+    // receiving one and `Module.isExported(pkg)` keeps answering false the way
+    // HotSpot does.
     registry.register_with_kind(
         m,
         "addExportsToAllUnnamed0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
-        native_module_add_exports_to_all0,
+        native_module_add_exports_to_all_unnamed0,
         NativeKind::Bridge,
     );
     registry.register(

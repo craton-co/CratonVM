@@ -5187,7 +5187,7 @@ mod checkexec_security_tests {
     fn denying_security_manager_blocks_check_exec() {
         let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
-        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
 
         // Pre-arm the mock so the next invoke_virtual returns a SecurityException.
@@ -5217,7 +5217,7 @@ mod checkexec_security_tests {
         // if the SM check is skipped the spawn would attempt the path and
         // surface IOException, not SecurityException.
         let mut ctx = mock_ctx();
-        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
@@ -5228,7 +5228,7 @@ mod checkexec_security_tests {
         }
 
         // args[0] = Runtime instance (irrelevant here), args[1] = command.
-        let runtime_instance = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0)?;
+        let runtime_instance = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Runtime", 0).unwrap();
         let cmd = ctx.create_string("/path/to/definitely-nonexistent-binary-xyz");
         let result = native_runtime_exec_string(
             &mut ctx,
@@ -5258,7 +5258,7 @@ mod checkexec_security_tests {
         // and this test fails.
         install_spawn_policy_hook();
         let mut ctx = mock_ctx();
-        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
         unsafe {
             *ctx.invoke_virtual_result.get() = Some(Err(MethodCallFailed::InternalError(
@@ -5273,7 +5273,7 @@ mod checkexec_security_tests {
         // command[0] = "/bin/anything", a path that does not exist -- so if the
         // gate ever fails to refuse, the spawn fails with an IOException rather
         // than running something, and the assertion below still catches it.
-        let pb = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4)?;
+        let pb = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ProcessBuilder", 4).unwrap();
         let cmd_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         let prog = ctx.create_string("/bin/anything");
         ctx.set_array_element(cmd_arr, 0, Value::Object(Some(prog)));
@@ -5304,7 +5304,7 @@ mod checkexec_security_tests {
     fn allow_listed_sm_lets_specific_paths_through() {
         let _guard = security_state_test_lock();
         let mut ctx = mock_ctx();
-        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prev = set_security_manager_for_test(&ctx, Some(sm));
 
         // First call: simulate a denial for the disallowed binary.

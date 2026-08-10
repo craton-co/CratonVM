@@ -1,10 +1,11 @@
 # ZGC-real vs. Generational, full Spring Boot suite — RETIRED 2026-08-10
 
-**Status: CLOSED.** Every ZGC-only regression the page recorded is either
-root-caused and fixed here, or is a class with its own open page that fails the
-same way under the default collector. Neither of the two defects behind them is
-a ZGC defect: both are collector-agnostic bugs that ZGC is simply the first
-backend to hit on every collection.
+**Status: CLOSED.** Every ZGC-only regression the page recorded is now
+root-caused: two defects fixed here, one measured ZGC heap-size floor (§3), and
+the rest classes with their own open pages that fail the same way under the
+default collector. Neither of the two *defects* is a ZGC defect — both are
+collector-agnostic bugs that ZGC is simply the first backend to hit on every
+collection.
 
 Original pages: `zgc-real-fullsuite-regression-20260808` (the clean comparison
 after the two mark-word fixes) and its predecessor
@@ -145,18 +146,45 @@ tooling rather than in a comment:
   named the subsystem without naming the defect. An inert lever is not an
   elimination; the class id is what closed it.
 
-## 3. `ZipContentTests` — NOT a ZGC regression
+## 3. `ZipContentTests` — REAL and ZGC-specific, and it is a heap-size floor
 
 The page recorded a `CRASH` (a catchable `OutOfMemoryError: Java heap space
-(native primitive array of length 8192)` at 234.6s) and offered ZGC
-fragmentation as the mechanism. That reading does not survive the class's own
-history: it is `HANG`/`CRASH`/`PASS` in turn under the **default** collector
-across the 2026-07/08 runs, including one `OutOfMemoryError` at
-`alloc_array length 8192` under Generational on 2026-08-04. It is a
-borderline-capacity class at `-Xmx 2g` on every backend, tracked by its own open
-page,
-[`zipcontenttests-gc-pressure-timeout-not-disk-capacity-20260807.md`](../../../known-issues/springboot/zipcontenttests-gc-pressure-timeout-not-disk-capacity-20260807.md),
-and it stays there. It HANGs on both arms of this round's rerun.
+(native primitive array of length 8192)` at 234.6s), offered ZGC fragmentation
+as the mechanism, and said plainly that it had not measured it. On 2026-08-10
+the class's *default*-collector page was rewritten — its GC-pressure reading
+refuted, the cost re-attributed to `java.nio.ByteBuffer` scalar accessors
+([`zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`](../../../known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md),
+[`zipcontenttests-gc-pressure-theory-REFUTED-20260810.md`](zipcontenttests-gc-pressure-theory-REFUTED-20260810.md))
+— and that page correctly noted the heap-size A/B behind the refutation had
+**never been run under ZGC**. It has now, one class per process, no 300s
+ceiling, same host:
+
+| arm | result |
+|---|---|
+| default `-Xmx 2g` | **PASS 29/29 in 301s** |
+| ZGC `-Xmx 2g` | **OOM at 262s** — `OutOfMemoryError … (native primitive array of length 8192)` |
+| ZGC `-Xmx 3g` | **PASS 29/29 in 314s** |
+| ZGC `-Xmx 4g` | **PASS 29/29 in 312s** |
+| ZGC `-Xmx 8g` | **PASS 29/29 in 263s** |
+
+So the page's instinct was right and its size estimate was not. This is a
+genuine ZGC-only ceiling, but a **modest** one: somewhere between 2g and 3g,
+i.e. roughly 1.5x the default collector's footprint for this workload, and it
+is flat from 3g up. That is what a non-compacting whole-arena sweep costs on an
+allocation pattern the copying collector packs; it is not a fragmentation
+cliff, and 4x heap buys nothing over 1.5x.
+
+Note also that the heap lever behaves *oppositely* on the two backends for this
+one class: the default collector does not respond to it at all (315.5s at 2g vs
+308.9s at 8g, per the refutation page), while under ZGC it is the difference
+between an OOM and a pass. A lever that is inert on one collector is not
+thereby inert on another — which is exactly why that page flagged the missing
+arm rather than generalising.
+
+No fix here. ZGC-real is documented as a research vehicle with no compaction
+(`docs/GC.md`), so "needs ~1.5x heap on a buffer-churning workload" is the
+backend's stated shape rather than a defect, and it is now priced instead of
+guessed at. The suite's `-Xmx 2g` is what turns it into a red.
 
 ## 4. Everything else in the 24-row table — not ZGC regressions
 
@@ -216,7 +244,7 @@ directions, which is what says "budget", not "collector":
 | `ConfigurationPropertySourcesTests` | PASS 2158s | PASS 5156s |
 | `Log4J2LoggingSystemTests` | HANG | HANG |
 | `SpringApplicationTests` | HANG | HANG |
-| `ZipContentTests` | HANG | HANG |
+| `ZipContentTests` (budget-bound; see §3) | HANG | HANG |
 | `HikariDataSourceConfigurationTests` | HANG | HANG |
 | `KafkaAutoConfigurationTests` | HANG | HANG |
 | `QuartzEndpointWebIntegrationTests` | HANG | HANG |

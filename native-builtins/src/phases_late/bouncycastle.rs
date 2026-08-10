@@ -792,7 +792,7 @@ pub(crate) fn bc_f2m_arg_value(
     idx: usize,
 ) -> Result<Vec<u64>, MethodCallFailed> {
     let obj = obj_arg(args, idx)?;
-    if ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref()
+    if ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref()
         != Some("org/bouncycastle/math/ec/ECFieldElement$F2m")
     {
         return Err(RuntimeError::IllegalArgumentException {
@@ -3283,7 +3283,7 @@ pub(crate) fn bc_fp_arg_value(
     idx: usize,
 ) -> Result<crate::bigint::BigInt, MethodCallFailed> {
     let obj = obj_arg(args, idx)?;
-    if ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref()
+    if ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref()
         == Some("org/bouncycastle/math/ec/ECFieldElement$Fp")
     {
         let x_obj = bc_fp_obj_field(ctx, obj, "x")?;
@@ -6136,7 +6136,7 @@ pub(crate) fn bc_aes_native_init(ctx: &mut dyn NativeContext, args: &[Value]) ->
     ctx.set_field_by_name(this, "forEncryption", Value::Int(i32::from(for_enc)));
 
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("org/bouncycastle/crypto/engines/AESEngine")
     {
@@ -7565,7 +7565,7 @@ pub(crate) fn register_bc_cbc_block_cipher(r: &mut NativeMethodRegistry) {
             }
 
             let is_aes = ctx
-                .class_name_of_id(ctx.class_id_of_object(cipher))
+                .class_name_arc_of_id(ctx.class_id_of_object(cipher))
                 .as_deref()
                 == Some("org/bouncycastle/crypto/engines/AESEngine");
             let kw = if is_aes {
@@ -8854,7 +8854,7 @@ pub(crate) fn bc_sic_encrypt_counter(
     counter: &[u8],
 ) -> MethodCallResult {
     let is_aes = ctx
-        .class_name_of_id(ctx.class_id_of_object(cipher))
+        .class_name_arc_of_id(ctx.class_id_of_object(cipher))
         .as_deref()
         == Some("org/bouncycastle/crypto/engines/AESEngine");
     if is_aes {
@@ -9054,7 +9054,7 @@ pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
 
             // AES fast path: produce the keystream block natively from WorkingKey.
             let is_aes = ctx
-                .class_name_of_id(ctx.class_id_of_object(cipher))
+                .class_name_arc_of_id(ctx.class_id_of_object(cipher))
                 .as_deref()
                 == Some("org/bouncycastle/crypto/engines/AESEngine");
             let kw: Vec<[u32; 4]> = if is_aes {
@@ -10328,7 +10328,7 @@ pub(crate) fn bc_pkcs12_require_sha1(
         }
     };
     match ctx
-        .class_name_of_id(ctx.class_id_of_object(digest))
+        .class_name_arc_of_id(ctx.class_id_of_object(digest))
         .as_deref()
     {
         Some("org/bouncycastle/crypto/digests/SHA1Digest") => Ok(()),
