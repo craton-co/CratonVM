@@ -160,6 +160,26 @@ pub mod mic_prof {
     pub static PUB_BARRED: AtomicU64 = AtomicU64::new(0);
     pub static PUB_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 
+    /// `pub_probe_none` collapses FOUR distinct events into one number. On
+    /// `ZipContentTests` it read *exactly* equal to `hit_noentry` with
+    /// `pub_published=0` — a signature that says "the cache never learns a
+    /// target" but cannot say why, because three of the four ways to reach it
+    /// never run a probe at all:
+    ///
+    ///   * `not_probed_disabled`    — `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`
+    ///   * `not_probed_redefine`    — a redefinition has quiesced JIT dispatch
+    ///   * `not_probed_uncacheable` — the receiver is not cacheable at this site
+    ///   * `probe_returned_none`    — a probe DID run and `try_jit_compile_callee`
+    ///                                declined it
+    ///
+    /// Only the last is a compile refusal; the other three are gates, and the
+    /// fix for each is a different piece of code. `pub_probe_none` stays as
+    /// their sum so numbers from earlier runs still compare.
+    pub static NOT_PROBED_DISABLED: AtomicU64 = AtomicU64::new(0);
+    pub static NOT_PROBED_REDEFINE: AtomicU64 = AtomicU64::new(0);
+    pub static NOT_PROBED_UNCACHEABLE: AtomicU64 = AtomicU64::new(0);
+    pub static PROBE_RETURNED_NONE: AtomicU64 = AtomicU64::new(0);
+
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
@@ -240,7 +260,9 @@ pub mod mic_prof {
             "[MIC_PROF] quiesce_depth={} mic_calls={} hit_entry={} hit_noentry={} miss={} lambda={} \
              cyc_mic_total={} cyc_hit_entry_call={} cyc_invoke={} cyc_compile_probe={} \
              disp_calls={} cyc_disp_total={} \
-             pub_probe_none={} pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
+             pub_probe_none={} (not_probed_disabled={} not_probed_redefine={} \
+             not_probed_uncacheable={} probe_returned_none={}) \
+             pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
             cratonvm_gc::gc_quiescence::depth(),
             g(&MIC_CALLS),
             g(&MIC_HIT_ENTRY),
@@ -254,6 +276,10 @@ pub mod mic_prof {
             g(&DISP_CALLS),
             g(&CYC_DISP_TOTAL),
             g(&PUB_PROBE_NONE),
+            g(&NOT_PROBED_DISABLED),
+            g(&NOT_PROBED_REDEFINE),
+            g(&NOT_PROBED_UNCACHEABLE),
+            g(&PROBE_RETURNED_NONE),
             g(&PUB_BARRED),
             g(&PUB_PUBLISHED),
             cratonvm_jit::unowned_ic_entry_refusals(),
@@ -12601,17 +12627,35 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             || redefine_jit_quiesced
             || !cacheable_receiver
         {
+            // Attribute the skip. All three of these land in `pub_probe_none`
+            // below without a probe ever running, which is why that counter
+            // reading equal to `hit_noentry` could not distinguish "the compiler
+            // refused every callee" from "we never asked".
+            if !direct_virtual_compiled_callee_entry_enabled() {
+                mic_prof::bump(&mic_prof::NOT_PROBED_DISABLED);
+            } else if redefine_jit_quiesced {
+                mic_prof::bump(&mic_prof::NOT_PROBED_REDEFINE);
+            } else {
+                mic_prof::bump(&mic_prof::NOT_PROBED_UNCACHEABLE);
+            }
             None
         } else {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
-            crate::runtime::interpreter::try_jit_compile_callee(
+            let probed = crate::runtime::interpreter::try_jit_compile_callee(
                 vm,
                 &class_name,
                 info.method_name,
                 info.descriptor,
                 // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
                 true,
-            )
+            );
+            if probed.is_none() {
+                // A probe ACTUALLY ran and the compiler declined. This is the
+                // only one of the four `pub_probe_none` causes that names a
+                // compile refusal, and `CRATONVM_DBG=callee-probe` says which.
+                mic_prof::bump(&mic_prof::PROBE_RETURNED_NONE);
+            }
+            probed
         };
         // Keep handler-bearing methods on the helper path. A raw compiled
         // entry can leave a pending exceptional frame that the caller cannot
