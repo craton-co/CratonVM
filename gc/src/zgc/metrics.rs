@@ -6,7 +6,7 @@
 //!
 //! # Why this module exists
 //!
-//! `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md` records the first
+//! `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md` records the first
 //! full-suite comparison of `-XX:+UseZGC` against the default Generational
 //! backend: same binary, same 1975 Spring Boot classes, **50 status changes,
 //! 46 of them regressions** — 35 `PASS -> HANG` concentrated on
@@ -71,7 +71,7 @@
 //! * the *phase* is already in the enum a real collector is driven by; and
 //! * the counter was the only piece missing. Adding it after the walk lands
 //!   means the first real remap implementation ships unmeasured, which is
-//!   exactly the position `zgc-real-fullsuite-regression-20260807` is stuck in
+//!   exactly the position `zgc-real-fullsuite-regression-RETIRED-20260807` is stuck in
 //!   for the young-generation hypothesis. The instrument goes in first.
 //!
 //! **Decision: add the phase, do not fold it into mark.** The tempting
@@ -103,7 +103,7 @@
 //! append-only rule, and inserting `concurrent_remap` in cycle order shifts the
 //! four `sweep_*` columns right by four. That is deliberate and was checked:
 //! nothing in `gc/src/` calls [`ZgcMetrics::to_tsv_row`] yet (the harness
-//! wiring is the step the `zgc-real-fullsuite-regression-20260807` round never
+//! wiring is the step the `zgc-real-fullsuite-regression-RETIRED-20260807` round never
 //! reached), so no collected aggregation can be misaligned by it. Cycle order
 //! is load-bearing for [`ZgcMetrics::format_summary`]'s table, which is read by
 //! humans against a HotSpot log. Once a suite run has emitted rows, the
@@ -678,7 +678,7 @@ impl ZgcMetrics {
     /// print a small STW total and a large concurrent total, i.e. exactly the
     /// picture of a healthy low-latency collector, for a collector that stops
     /// the world for the whole cycle. That is the reading the
-    /// `zgc-real-fullsuite-regression-20260807` investigation must not be
+    /// `zgc-real-fullsuite-regression-RETIRED-20260807` investigation must not be
     /// handed.
     ///
     /// So the default is `false` and every phase is charged as STW, both in
@@ -1154,7 +1154,7 @@ impl ZgcMetrics {
     ///
     /// **Intent: direct comparability across collector arms.** The Spring Boot
     /// and H2 suite harnesses already aggregate per-class `results.tsv` files
-    /// (see the paths in `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`).
+    /// (see the paths in `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`).
     /// Emitting one row per VM here means a full-suite `-XX:+UseZGC` run can be
     /// joined against a Generational run with `sort`/`join` instead of by
     /// hand-parsing `[GC-SUMMARY]` lines out of 1975 logs — which is exactly the

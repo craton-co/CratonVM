@@ -549,7 +549,7 @@ impl VmHeap {
             // mutex acquire PER STACK WORD, per root-gathering pass, per
             // thread. `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5) names this
             // as a competing explanation for the 35 PASS→HANG classes in
-            // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`,
+            // `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`,
             // whose ApplicationContext boot/teardown shape is exactly deep
             // stacks × many threads. `zgc.rs:1467-1474` records that the same
             // shape already "read as a hang at scale" once — that fix covered
@@ -672,7 +672,7 @@ impl VmHeap {
             // which currently buys a full walk of the heap.
             // `audits/zgc-vmheap-arm-audit.md` §3.4 (AW-5), one of the two
             // instrument-separable hypotheses for the 35 PASS→HANG classes in
-            // `docs/known-issues/springboot/zgc-real-fullsuite-regression-20260807.md`.
+            // `docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260807.md`.
             //
             // Why it cannot lose a root. The guard only ever returns `None`
             // sooner; it can never turn a `None` into a `Some`, so no interior
