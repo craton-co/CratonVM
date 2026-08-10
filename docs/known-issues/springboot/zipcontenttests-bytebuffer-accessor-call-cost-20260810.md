@@ -221,6 +221,48 @@ Two smaller findings worth keeping:
   never. Reach before speed: a shape the hot code never executes cannot show a
   win however fast it is.
 
+## 2026-08-10 reconciliation — the 139-class rerun shows TIMEOUT on all three collectors, no OOM this time
+
+Reconciling the 139-class non-passed union from the same-day `default`/`g1`/`zgc`
+suite rerun (binaries `cratonvm-{default,g1,zgc}-20260808f.exe`, `dev@6365de194`,
+`-Xmx 2g` — the suite's default `MaxHeap`). `ZipContentTests` is TIMEOUT/HANG at
+~300s under **all three** collectors: default 300.195s, G1 300.144s, ZGC 300.102s.
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-{default,g1,zgc}-20260808f-s1/all-jit/logs/loader_spring-boot-loader.org.springframework.boot.loader.zip.ZipContentTests.{out,err}.log`.
+
+Every one of the three matches this page's own finding, not the retired
+GC-pressure framing:
+
+- **All three `.out.log`s are 0 bytes.** Exactly the "did not finish" signature
+  this page already established (`SbRunner` prints nothing until
+  `launcher.execute(req)` returns) — not evidence either way about *where* the
+  time went, but consistent with the class simply not reaching its own summary
+  print in the 300s window.
+- **No `OutOfMemoryError` anywhere in any of the three `.err.log`s.** At `-Xmx 2g`
+  this page's own ZGC heap-lever table recorded an OOM at 262s in one run and a
+  clean 301s pass in another (both under 2g) — i.e. run-to-run variance was
+  already on file for this exact heap size. This rerun's ZGC arm landed on the
+  "just runs out of the 300s budget first" side of that variance rather than the
+  "OOMs at 262s" side; both are downstream of the same finding (this class is
+  ~14x HotSpot and clears an *uncapped* run in 301-315s — a hair over the 300s
+  ceiling either way it resolves).
+- **default's `.err.log`** is active, not silent: `[moving-young] fallback` climbs
+  to #16 (`reason=unregistered-jit-frame-on-stack` after starting with
+  `innermost-rbp-belongs-to-unguarded-callee`), one `gc::guard` LIVE-object
+  retention, and repeated `old-gen mark: conservative root ... is an INTERIOR
+  word of the live object` warnings continuing every 20-40s up to the kill —
+  more fallback churn than this page's own 9-line/315s reference run logged, but
+  the same qualitative shape ("present, but not a churn story" per the section
+  above) and consistent with sitting closer to the ceiling this time round.
+- **G1's and ZGC's `.err.log`s are silent** (5 lines each, routine
+  post-clinit-fixup boilerplate only) — no GC/JIT diagnostic activity logged at
+  all in either, for the whole 300s run.
+
+**Collector-agnostic (reproduces under Generational, G1, and ZGC)** — all three
+land within 5% of the same ~300-315s wall time this page already priced to the
+`ByteBuffer` accessor cost, not to a hang or a new GC-pressure mechanism. No
+symptom drift from what this page describes.
+
 ## Reproducers
 
 - `probes/ZipContentTermsProbe.java` — prices every term the sampler named.

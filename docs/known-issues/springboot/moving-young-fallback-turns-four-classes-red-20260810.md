@@ -313,6 +313,56 @@ discover. Validated against all five logs from this session.
   bound; the JIT-vs-`--nojit` contrasts (2.3x, OOM-vs-pass, no-finish-vs-pass)
   are far too large to be explained by it.
 
+## 2026-08-10 reconciliation — confirmed on `Integration`/`Quartz`, but only the DEFAULT collector shows the named mechanism
+
+Reconciling the 139-class non-passed union from a same-day `default`/`g1`/`zgc`
+rerun (binaries `cratonvm-{default,g1,zgc}-20260808f.exe`, `dev@6365de194`, a later
+tip than the `f695ca875` binary this page's own measurement used).
+`IntegrationAutoConfigurationTests` and `QuartzEndpointWebIntegrationTests` are both
+TIMEOUT/HANG at ~300s under **all three** collectors this round:
+
+| Class | default | G1 | ZGC |
+|---|---:|---:|---:|
+| `IntegrationAutoConfigurationTests` | 300.104s | 300.200s | 300.170s |
+| `QuartzEndpointWebIntegrationTests` | 300.123s | 300.012s | 300.109s |
+
+The symptom (HANG at the 300s ceiling) is **collector-agnostic**. The *mechanism*
+recorded above is only directly confirmed on the default collector this round,
+though:
+
+- **default**: both `.err.log`s are loud — `[moving-young] fallback #N` lines
+  (Integration reached #256, Quartz #128, both climbing) interleaved with
+  `gc::guard: young non-moving sweep was about to ZERO a span containing a LIVE
+  (marked) object` retentions and `gen_heap: selective promotion: unwound N
+  candidate(s)` warnings, active right up to the kill — the exact signature this
+  page already names.
+- **G1 and ZGC**: both `.err.log`s are near-silent — only the routine
+  post-clinit-fixup/Mockito-self-attach boilerplate (7 lines each), zero GC/JIT
+  diagnostic output for the whole run. `[moving-young]` is default-collector
+  terminology (the non-moving *young* sweep fallback is specific to the
+  Generational collector's compaction path), so its absence under G1/ZGC is
+  expected and does not by itself mean those two collectors are clean — it means
+  this page's specific instrumentation doesn't fire there.
+- Both classes' `.out.log`s show steady progress on all three collectors (repeated
+  Spring/Integration context start-stop or Quartz scheduler cycles, new timestamped
+  output up to the moment of the kill on every collector) — no collector shows a
+  dead/silent process, so none of these are the previously-fixed STW/AB-BA deadlock
+  families.
+
+**Not established by this rerun:** whether G1 and ZGC are hitting an equivalent
+JIT-driven degradation via a different (un-instrumented) code path, or are simply
+too slow under the JIT for an unrelated reason and would finish given more budget.
+The standalone measurement above found the JIT itself is what breaks these
+classes on this page (`--nojit` clears them) — that root explanation does not
+depend on which GC is compacting the young generation, so the G1/ZGC HANGs are
+consistent with the same underlying JIT-triggered cause without independently
+proving it. A `--nojit` A/B under G1 and ZGC (the same protocol "The measurement"
+above used) would settle it.
+
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-{default,g1,zgc}-20260808f-s2/all-jit/logs/module_spring-boot-integration.org.springframework.boot.integration.autoco*-9d4bdd63bbf0.{out,err}.log`,
+`.../module_spring-boot-quartz.org.springframework.boot.quartz.actuate.endpoint*-e3de43e38499.{out,err}.log`.
+
 ## Reproduce
 
 ```bash
