@@ -17358,7 +17358,7 @@ fn try_compile_inner(
                                     // `StringUtils.cache`, which guard-bailed
                                     // at its own bci 54, and the orphan
                                     // surfaced two frames up
-                                    // (jit-inlined-callee-deopt-frame-has-no-caller-chain).
+                                    // (jit-direct-call-mints-an-orphaned-deopt-frame).
                                     // 582 sites in one run had no service
                                     // check; every one of them is a place an
                                     // orphan can be minted.
@@ -25267,7 +25267,7 @@ mod tests {
     /// 582 unserviced direct call sites, one of which
     /// (`ValueVarchar.get(String,CastDataProvider)` → `StringUtils.cache`)
     /// produced the orphan in
-    /// `jit-inlined-callee-deopt-frame-has-no-caller-chain`.
+    /// `jit-direct-call-mints-an-orphaned-deopt-frame`.
     ///
     /// The bind used to `continue` straight past the registration at the end
     /// of the scan loop, so this asserted 0 before the fix.

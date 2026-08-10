@@ -294,8 +294,11 @@ throughput, not correctness.
    not fixed; 69 detections. The enriched report is landed for whoever picks it
    up. Related in family to the G1 page's "a full, never-recycled Eden region is
    not walkable".
-2. **The inlined-callee deopt frame with no caller chain** —
-   `docs/known-issues/h2/jit-inlined-callee-deopt-frame-has-no-caller-chain-20260810.md`.
+2. **The orphaned deopt frame** — CLOSED 2026-08-10, and it was not inlining:
+   a statically-bound JIT-to-JIT direct call carried no `JitInvokeInfo`, so no
+   callee-deopt service check was emitted and the callee's stash propagated
+   past the only site that could attribute it. See
+   `../jit-direct-call-mints-an-orphaned-deopt-frame-20260810-FIXED.md`.
 3. **The G1 region-aligned evacuation SIGSEGV** — 4 classes, G1 only. Findings
    added to `docs/known-issues/hibernate/g1-collector-fullsuite-crashes-hangs-fails-20260806.md`,
    including a cheaper H2 repro than the Hibernate one it had.
@@ -328,8 +331,9 @@ JDK25=/data/toolchain/jdk-25 OUTROOT=/tmp/out \
   folder) — the HotSpot control, now confirmed, for the FAIL cluster.
 - `../../../known-issues/hibernate/g1-collector-fullsuite-crashes-hangs-fails-20260806.md`
   — the G1 region-aligned SIGSEGV, still OPEN, updated with this sweep's data.
-- `../../../known-issues/h2/jit-inlined-callee-deopt-frame-has-no-caller-chain-20260810.md`
-  — the orphaned-deopt-frame residual.
+- `../jit-direct-call-mints-an-orphaned-deopt-frame-20260810-FIXED.md`
+  — the orphaned-deopt-frame residual, now closed (and re-titled: the page this
+  sweep spawned blamed inlining, which was not the mechanism).
 - `../s2-bytebuffer-natives-real-jdk-direct-buffer-gaps-FIXED.md` and
   `../nio-buffer-address-indexed-slot-aliasing-FIXED.md` — the two previous
   passes over this same `s2_bb_*` storage-resolution surface. This one closes

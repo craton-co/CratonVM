@@ -3083,7 +3083,7 @@ unsafe fn try_resume_trapped_callee(
     // the frame stashed for an outer consumer that cannot attribute it, i.e.
     // each one MINTS an orphan. A refusal that cannot be named cannot be
     // counted, which is why the orphan in
-    // `jit-inlined-callee-deopt-frame-has-no-caller-chain` was attributed to
+    // `jit-direct-call-mints-an-orphaned-deopt-frame` was attributed to
     // inlining on no evidence.
     let cached = {
         let cm = vm.classes.class_manager.read();
