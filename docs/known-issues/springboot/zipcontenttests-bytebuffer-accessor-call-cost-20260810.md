@@ -153,18 +153,51 @@ The accessors themselves get faster exactly as predicted —
 2.14x — and the class still gets slower under the JIT, in three independent
 interleaved pairs.
 
-**Registering a native takes the method away from the JIT.** With
-`CRATONVM_DBG_JIT_COMPILED=1` and no native registered, the JIT compiles the
-entire chain — `HeapByteBuffer.getShort(I)S`, `getInt(I)I`, `checkIndex(I)I`,
-`checkIndex(II)I`, `ix(I)I`, `byteOffset(J)J` — and can inline it into callers.
-A registered native replaces all of that with a funnel crossing the JIT cannot
-inline. For code that calls these accessors from many small sites — the zip
-header reader calls `getShort()` eleven times and `getInt()` six times per
-central-directory record — the lost inlining costs more than the shorter path
-saves. In the interpreter there is no inlining to lose, and the same code wins
-by the margin the microbenchmark predicts.
+### The mechanism is NOT established — an earlier claim here was wrong
 
-So the conclusion is not "the accessors are fine". It is:
+This page first said the loss was the JIT no longer being able to INLINE these
+accessors once a native was registered. **That explanation does not hold.** The
+single-pass emitter "bails on any callee invoke that is not a resolver-proven
+elidable super-`<init>`" (`jit/src/lib.rs:5239`), and
+`HeapByteBuffer.getShort()`'s body is four invokes — `scope()`, `checkIndex`,
+`byteOffset`, and the `ScopedMemoryAccess` call. It was never inlined into its
+callers, so there was no inlining to lose. The JIT does COMPILE all of those
+methods (`CRATONVM_DBG_JIT_COMPILED=1` lists them), which is a different thing.
+
+The class-level numbers also deserve less weight than they were given. Across
+one session the SAME configuration — intrinsic OFF, JIT — measured 315.5s,
+353.8s, 413.7s and 450.7s on this host. That is a ±20% spread, and the three
+ON-vs-OFF deltas (5.9%, 6.2%, 12.2%) sit inside it. The pairs were run back to
+back, which controls for slow drift, but each pair is a single run: the
+direction is consistent, the magnitude is not established.
+
+What IS solid is the microbenchmark — small, repeated, interleaved, min-of-3,
+with the deliberately-excluded arms measuring 1.00x and 0.97x, which shows the
+lever is scoped to exactly the accessors it claims.
+
+So the open question is why a strictly shorter path did not show a class-level
+win, and the honest answer is that nobody has measured it yet. Candidates worth
+separating: run-to-run variance swamping a real small gain; inline-cache /
+dispatch differences at a native call site versus a compiled Java one; or the
+accessors simply not being a large enough share of this class's time for a 2x
+on them to move the total (they were ~18% of leaf samples, so the ceiling is
+about 9%). The last one is arithmetic and can be checked without a build.
+
+The arithmetic is worth doing before any more runs, because it bounds the whole
+question. The accessors were ~18% of leaf samples. Making them 2.4x faster
+removes `18% x (1 - 1/2.4)` = **~10%** of total time, and that is the CEILING.
+The measured deltas are 6-12% against a configuration whose own spread is ±20%
+— so this experiment could never have separated a 10% win from a 10% loss. It
+was underpowered by construction, and reading a mechanism out of it was the
+mistake.
+
+The `--nojit` arm is the one that lands where the arithmetic predicts: **9.4%
+faster** against a ~10% ceiling. That agreement is the strongest evidence on
+this page that the intrinsic does what it claims, and it is why the JIT arm's
+sign should not be trusted without a properly powered measurement (repeated
+pairs, or per-process CPU time rather than wall clock).
+
+Whatever the reason, the conclusion for this page is unchanged:
 
 1. **The intrinsic belongs in the JIT**, as a compiled inlinable intrinsic
    rather than a registered native. The contract is already pinned by
@@ -187,6 +220,48 @@ Two smaller findings worth keeping:
   all — its header reader calls `getShort()`/`getInt()` and the absolute forms
   never. Reach before speed: a shape the hot code never executes cannot show a
   win however fast it is.
+
+## 2026-08-10 reconciliation — the 139-class rerun shows TIMEOUT on all three collectors, no OOM this time
+
+Reconciling the 139-class non-passed union from the same-day `default`/`g1`/`zgc`
+suite rerun (binaries `cratonvm-{default,g1,zgc}-20260808f.exe`, `dev@6365de194`,
+`-Xmx 2g` — the suite's default `MaxHeap`). `ZipContentTests` is TIMEOUT/HANG at
+~300s under **all three** collectors: default 300.195s, G1 300.144s, ZGC 300.102s.
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-{default,g1,zgc}-20260808f-s1/all-jit/logs/loader_spring-boot-loader.org.springframework.boot.loader.zip.ZipContentTests.{out,err}.log`.
+
+Every one of the three matches this page's own finding, not the retired
+GC-pressure framing:
+
+- **All three `.out.log`s are 0 bytes.** Exactly the "did not finish" signature
+  this page already established (`SbRunner` prints nothing until
+  `launcher.execute(req)` returns) — not evidence either way about *where* the
+  time went, but consistent with the class simply not reaching its own summary
+  print in the 300s window.
+- **No `OutOfMemoryError` anywhere in any of the three `.err.log`s.** At `-Xmx 2g`
+  this page's own ZGC heap-lever table recorded an OOM at 262s in one run and a
+  clean 301s pass in another (both under 2g) — i.e. run-to-run variance was
+  already on file for this exact heap size. This rerun's ZGC arm landed on the
+  "just runs out of the 300s budget first" side of that variance rather than the
+  "OOMs at 262s" side; both are downstream of the same finding (this class is
+  ~14x HotSpot and clears an *uncapped* run in 301-315s — a hair over the 300s
+  ceiling either way it resolves).
+- **default's `.err.log`** is active, not silent: `[moving-young] fallback` climbs
+  to #16 (`reason=unregistered-jit-frame-on-stack` after starting with
+  `innermost-rbp-belongs-to-unguarded-callee`), one `gc::guard` LIVE-object
+  retention, and repeated `old-gen mark: conservative root ... is an INTERIOR
+  word of the live object` warnings continuing every 20-40s up to the kill —
+  more fallback churn than this page's own 9-line/315s reference run logged, but
+  the same qualitative shape ("present, but not a churn story" per the section
+  above) and consistent with sitting closer to the ceiling this time round.
+- **G1's and ZGC's `.err.log`s are silent** (5 lines each, routine
+  post-clinit-fixup boilerplate only) — no GC/JIT diagnostic activity logged at
+  all in either, for the whole 300s run.
+
+**Collector-agnostic (reproduces under Generational, G1, and ZGC)** — all three
+land within 5% of the same ~300-315s wall time this page already priced to the
+`ByteBuffer` accessor cost, not to a hang or a new GC-pressure mechanism. No
+symptom drift from what this page describes.
 
 ## Reproducers
 

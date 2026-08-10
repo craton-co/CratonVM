@@ -7455,6 +7455,32 @@ pub enum JitIntrinsic {
     ArraycopyPrimitive,
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
 
+    // ===== INTRINSIC REGION BEGIN: SCOPED_MEMORY_UNALIGNED =====
+    // `jdk.internal.misc.ScopedMemoryAccess.get{Short,Char,Int,Long}Unaligned`
+    // over a `byte[]` base — the leaf every `HeapByteBuffer` scalar getter
+    // bottoms out in.
+    //
+    // Why here and not as a registered native: registering a native takes the
+    // method away from the JIT, and the whole `HeapByteBuffer.getShort()` chain
+    // above this leaf (`checkIndex`, `nextGetIndex`, `ix`, `byteOffset`) is
+    // already inlinable compiled code. Replacing that chain with a native
+    // funnel measured 6-12% SLOWER on `ZipContentTests` even though the
+    // accessor itself got 1.4-2.1x faster — see
+    // `known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+    // Intrinsifying only this leaf leaves every caller inlinable.
+    //
+    // The base is the buffer's backing array and the incoming offset already
+    // includes `ARRAY_DATA_OFFSET`, so the load is `[base + offset]`, byte-
+    // swapped when the caller asks for big-endian. Every guard failure — null
+    // base, non-array, non-`byte[]` element type, out-of-range offset — falls
+    // back to ordinary dispatch, which runs the registered native and reports
+    // exactly what the interpreter would.
+    ScopedMemoryGetShortUnaligned,
+    ScopedMemoryGetCharUnaligned,
+    ScopedMemoryGetIntUnaligned,
+    ScopedMemoryGetLongUnaligned,
+    // ===== INTRINSIC REGION END: SCOPED_MEMORY_UNALIGNED =====
+
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
     // java.lang.String access intrinsics (Phase 3a). The foundation waves
     // (commits 06bfac0 / 544cbea) added inline getfield + array-access
@@ -8287,6 +8313,20 @@ pub fn try_resolve_intrinsic(
         return Some((JitIntrinsic::ArraycopyPrimitive.as_entry(), 5, b'V'));
     }
     // ===== INTRINSIC REGION END: ARRAYCOPY =====
+
+    // ===== INTRINSIC REGION BEGIN: SCOPED_MEMORY_UNALIGNED =====
+    // NOT MATCHED YET — deliberately. The `ScopedMemoryGet*Unaligned` variants
+    // are declared (see the enum) but nothing registers them, because the
+    // codegen arm that would emit their inline body does not exist yet.
+    // Registering a sentinel the codegen cannot emit is the one failure mode
+    // this matcher must never have: `try_compile` would push a `direct_calls`
+    // entry whose `entry` no arm recognises.
+    //
+    // The design and the measurement that motivates it are on the enum
+    // variants. What has to be true before this is switched on is written
+    // there too, and one claim in it is NOT yet verified — see
+    // `known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+    // ===== INTRINSIC REGION END: SCOPED_MEMORY_UNALIGNED =====
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
     // java.lang.String access intrinsics (length/charAt/isEmpty/hashCode).
@@ -12362,6 +12402,123 @@ pub fn take_jit_bail_site() -> Option<(&'static str, u32, u32)> {
     JIT_BAIL_SITE.with(|c| c.take())
 }
 
+thread_local! {
+    /// The furthest stage of the compile pipeline this thread has entered for
+    /// the compile currently running.
+    ///
+    /// # Why this exists
+    ///
+    /// `jit-method-stats` reported `reason=unrecorded` for **26 of the top 30**
+    /// hot-but-permanently-interpreted methods on a Spring Boot context-startup
+    /// workload — the compiler was asked, refused, bail-listed the method for
+    /// the life of the process, and recorded nothing about why. Every bail that
+    /// goes through `jitc_bail!` / `jitc_permanent_bail!` / the backend's own
+    /// `note_jit_bail_site*` calls is named; the unnamed ones come from
+    /// somewhere those macros do not cover, and reading the ~40 `None` exits of
+    /// `try_compile_inner` did not find it.
+    ///
+    /// So instead of auditing exits, bound the answer: each pipeline stage
+    /// stamps its own name on entry, and a `None` with no explicit site reports
+    /// the last stage reached. That cannot miss a path, present or future — a
+    /// new exit added tomorrow is still attributed to whichever stage was
+    /// running. The site name is deliberately shaped `no-site-after-<stage>` so
+    /// it is obvious in a report that this is the FALLBACK, not a diagnosis:
+    /// it localises the refusal to one stage, and the stage's owner then names
+    /// the specific exit.
+    static JIT_PIPELINE_STAGE: std::cell::Cell<&'static str> =
+        const { std::cell::Cell::new(JIT_STAGE_ENTRY) };
+}
+
+/// Stage names. `&'static str` because a bail site is one, so a stage can be
+/// reported as a site without formatting.
+pub const JIT_STAGE_ENTRY: &str = "no-site-after-entry";
+pub const JIT_STAGE_SCAN: &str = "no-site-after-scan";
+pub const JIT_STAGE_BUILD: &str = "no-site-after-ir-build";
+pub const JIT_STAGE_OPTIMIZE: &str = "no-site-after-ir-optimize";
+pub const JIT_STAGE_EA: &str = "no-site-after-escape-analysis";
+pub const JIT_STAGE_SCHEDULE: &str = "no-site-after-schedule";
+pub const JIT_STAGE_LOWER: &str = "no-site-after-lower";
+pub const JIT_STAGE_SINGLE_PASS: &str = "no-site-after-single-pass-backend";
+
+/// Stamp the stage the compile pipeline is entering. One `Cell` store.
+#[inline]
+pub fn note_jit_pipeline_stage(stage: &'static str) {
+    JIT_PIPELINE_STAGE.with(|c| c.set(stage));
+}
+
+/// The last stage stamped, resetting to `entry` for the next compile.
+pub fn take_jit_pipeline_stage() -> &'static str {
+    JIT_PIPELINE_STAGE.with(|c| c.replace(JIT_STAGE_ENTRY))
+}
+
+/// Census of methods sealed out of JIT compilation before any compile was
+/// attempted, by reason.
+///
+/// Separate from the compile-failure table because the two populations are
+/// different sizes and want different fixes: a Spring Boot context startup
+/// seals **856** methods here against **69** whose compile was attempted and
+/// refused. Until 2026-08-10 every one of the 856 was labelled
+/// `static-policy-or-native-shadow`, which cannot distinguish a policy-table
+/// entry (a list somebody can shorten) from a native-shadow scan hit (a scan
+/// that may be over-matching) from a `ForkJoinTask` subclass from a `<clinit>`.
+static JIT_SKIP_SEAL_REASONS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>>,
+> = std::sync::OnceLock::new();
+
+fn jit_skip_seal_reasons(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>> {
+    JIT_SKIP_SEAL_REASONS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Count one method sealed out of compilation for `reason`.
+///
+/// Called once per method (the seal is permanent and the caller checks the
+/// skip-set first), so the write lock is taken once per sealed method for the
+/// life of the process, not once per invocation.
+pub fn note_jit_skip_seal_reason(reason: &'static str) {
+    *jit_skip_seal_reasons().write().entry(reason).or_insert(0) += 1;
+}
+
+/// Census of native-shadow seal decisions by which arm fired.
+static JIT_NATIVE_SHADOW_CAUSES: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>>,
+> = std::sync::OnceLock::new();
+
+fn jit_native_shadow_causes(
+) -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<&'static str, u64>> {
+    JIT_NATIVE_SHADOW_CAUSES
+        .get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Count one native-shadow verdict, by arm (`direct` / `inherited` /
+/// `interface-blind`). Called from the caller-scan, which runs once per method
+/// before it is sealed — not per invocation.
+pub fn note_jit_native_shadow_cause(cause: &'static str) {
+    *jit_native_shadow_causes().write().entry(cause).or_insert(0) += 1;
+}
+
+/// The native-shadow arm census, highest count first.
+pub fn jit_native_shadow_cause_census() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = jit_native_shadow_causes()
+        .read()
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
+/// The seal census, highest count first, for the stats dump.
+pub fn jit_skip_seal_census() -> Vec<(&'static str, u64)> {
+    let mut v: Vec<(&'static str, u64)> = jit_skip_seal_reasons()
+        .read()
+        .iter()
+        .map(|(k, v)| (*k, *v))
+        .collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    v
+}
+
 /// The one bail site that is a MEASUREMENT rather than a verdict: the
 /// single-pass backend emitted past its code-buffer estimate.
 ///
@@ -13541,8 +13698,16 @@ pub fn try_compile_with_invokespecial_resolver(
     // the compile). This used to be taken AFTER the bail-list decision, which
     // is why that decision could not consult it.
     let site = if result.is_none() {
-        take_jit_bail_site()
+        // A refusal with no explicit site is still a refusal, and it is about to
+        // bail-list the method permanently. Attribute it to the last pipeline
+        // stage entered rather than reporting `unrecorded` — see
+        // [`JIT_PIPELINE_STAGE`] for why the fallback is a stage and not an
+        // audit of every exit.
+        Some(take_jit_bail_site().unwrap_or((take_jit_pipeline_stage(), 0, 0)))
     } else {
+        // Reset the stamp even on success, so a compile that succeeds cannot
+        // leave its last stage behind for the next one to report.
+        let _ = take_jit_pipeline_stage();
         None
     };
     // A code-buffer overflow is a MEASUREMENT, not a verdict: the backend now
@@ -14362,6 +14527,7 @@ fn try_compile_inner(
     // Phase 1 (scan/parse). The guard also covers the `return None` arm below:
     // a scan reject is a real compilation that spent real time, and its report
     // should say so.
+    note_jit_pipeline_stage(JIT_STAGE_SCAN);
     let metrics_scan = metrics.phase(metrics::Phase::Scan);
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
@@ -15658,7 +15824,8 @@ fn try_compile_inner(
         // report can separate "the front end refused this bytecode" (build
         // returned None, `nodes_built` stays unmeasured) from "the graph was
         // built and then rejected for size".
-        let metrics_build = metrics.phase(metrics::Phase::Build);
+        note_jit_pipeline_stage(JIT_STAGE_BUILD);
+    let metrics_build = metrics.phase(metrics::Phase::Build);
         let built = builder.build(code, code_len);
         drop(metrics_build);
         if let Some(g) = built.as_ref() {
@@ -15771,7 +15938,8 @@ fn try_compile_inner(
                 // node count. Shrinking the graph therefore shrinks the frame
                 // only when it also shrinks peak simultaneous liveness — which
                 // is what the report's `peak_live_values` is for.
-                let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
+                note_jit_pipeline_stage(JIT_STAGE_OPTIMIZE);
+    let metrics_optimize = metrics.phase(metrics::Phase::Optimize);
                 let metrics_nodes_before_optimize = graph.nodes.len();
                 ir_optimize::optimize(&mut graph);
                 drop(metrics_optimize);
@@ -15842,7 +16010,8 @@ fn try_compile_inner(
                     // double-charge each other; on the path where EA changes
                     // nothing it drops at the end of this block instead, which
                     // is still EA-only work.
-                    let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
+                    note_jit_pipeline_stage(JIT_STAGE_EA);
+    let metrics_ea = metrics.phase(metrics::Phase::EscapeAnalysis);
                     let metrics_nodes_before_ea = graph.nodes.len();
                     let (mut ea_graph, id_map) = escape_analysis_from_ir(&graph);
                     // Cold-path information (docs/jit/escape-analysis.md §6.3).
@@ -15972,7 +16141,8 @@ fn try_compile_inner(
                         graph.safepoints.len(),
                     );
                     // Phase 6 (schedule).
-                    let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
+                    note_jit_pipeline_stage(JIT_STAGE_SCHEDULE);
+    let metrics_schedule = metrics.phase(metrics::Phase::Schedule);
                     let schedule = ir_schedule::schedule(&graph);
                     drop(metrics_schedule);
                     // Supply BOTH the profiled branch hints (Step 4) and the
@@ -15998,7 +16168,8 @@ fn try_compile_inner(
                     // the point is that it would stop being true if that
                     // changed.
                     compile_gate::note_backend_entry();
-                    let metrics_lower = metrics.phase(metrics::Phase::Lower);
+                    note_jit_pipeline_stage(JIT_STAGE_LOWER);
+    let metrics_lower = metrics.phase(metrics::Phase::Lower);
                     let lowered = ir_lower::lower_inner(
                         &graph,
                         &schedule,
@@ -17844,6 +18015,7 @@ fn try_compile_inner(
     // Phase 10 (single-pass backend). Like `lower_inner`, this one call does
     // selection, encoding and buffer install together. The guard also covers
     // the `?` below: a backend bail is a compilation that spent this time.
+    note_jit_pipeline_stage(JIT_STAGE_SINGLE_PASS);
     let metrics_single_pass = metrics.phase(metrics::Phase::SinglePass);
     let mut compiled = x64::compile_with_param_slots(
         admission,

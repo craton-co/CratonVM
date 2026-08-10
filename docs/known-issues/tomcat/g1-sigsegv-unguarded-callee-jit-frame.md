@@ -73,6 +73,148 @@ Not yet checked whether this reproduces standalone (single class, no shard
 contention) or only appears under the full-suite run's allocation pressure —
 all 4 occurrences here came from a 651-class, 2-shard run.
 
+### 2026-08-10: it does NOT reproduce standalone — and that blocks the discriminator
+
+Run exactly as prescribed above (`-Xmx2g -XX:+UseG1GC`, one class per process,
+`JUnitCore`, quiet box), each class in two arms — plain G1, and G1 under
+`CRATONVM_G1_COVERAGE_PIN=1`. Binary `cratonvm-g1fix-20260810.exe`
+(`dev` + the diagnostics from the Spring Boot G1 page), 600 s cap:
+
+| Class | G1 baseline | G1 + `COVERAGE_PIN` |
+|---|---|---|
+| `…AutomaticDeploymentModification` | TIMEOUT 600 s | TIMEOUT 600 s |
+| `…AutomaticDeploymentWar` | **EXIT=0 (passed), 287 s** | TIMEOUT 600 s |
+| `…AutomaticDeploymentWarXml` | EXIT=1 (test failure), 152 s | EXIT=1, 532 s |
+| `TestHttpServletDoHeadInvalidWrite1ValidWrite511` | **EXIT=0 (passed), 85 s** | EXIT=1, 575 s |
+
+**Zero `EXCEPTION_ACCESS_VIOLATION` in any of the eight runs.**
+`…DeploymentWar` — one of the three that crashed at the *identical* faulting
+instruction in the suite run — passes cleanly standalone in 287 s, and
+`TestHttpServletDoHead…` passes in 85 s. So the crash needs the full-suite
+conditions (allocation pressure, 2-shard concurrency, or cross-class state);
+it is not a property of these classes in isolation.
+
+**Consequence: `CRATONVM_G1_COVERAGE_PIN` cannot be used this way.** The lever
+only tells you something when a crash is there to survive it, and standalone
+there is no crash. Running it under the full suite is possible in principle but
+expensive and probably impractical: the lever makes G1 refuse to evacuate, and
+its cost is visible even here — `…DeploymentWar` goes from a 287 s pass to a
+600 s timeout, and `TestHttpServletDoHead…` from an 85 s pass to a 575 s
+failure. Those pin-arm timeouts are the lever's documented no-op-pause cost,
+**not** evidence about the defect, and must not be read as either a pass or a
+fix. (`…DeploymentModification` times out on *both* arms, so it carries no
+signal at all here; and `…DeploymentWarXml`'s EXIT=1 is an ordinary test
+failure on both arms, not a crash.)
+
+### 4-way concurrency is not enough either
+
+Follow-up on the same binary: all 4 classes launched **simultaneously** under
+G1, each with its own `-Xmx2g`, 900 s cap, two rounds — the cheapest
+approximation of the shard pressure.
+
+| | r1 | r2 |
+|---|---|---|
+| `…AutomaticDeploymentModification` | TIMEOUT | TIMEOUT |
+| `…AutomaticDeploymentWar` | EXIT=0 | EXIT=0 |
+| `…AutomaticDeploymentWarXml` | EXIT=0 | EXIT=0 |
+| `TestHttpServletDoHead…` | EXIT=0 | EXIT=0 |
+| **crash reports** | **0** | **0** |
+
+Zero `EXCEPTION_ACCESS_VIOLATION` in 8 more process-runs (16 total across both
+experiments). Note `…DeploymentWarXml` passes here where it returned EXIT=1
+standalone, so these classes' *ordinary* outcomes are load-dependent too — but
+the crash never appeared.
+
+So the trigger needs more than these 4 classes and more than 4-way
+concurrency: something about the 651-class run itself — cumulative allocation
+across many classes, the specific shard composition and ordering, or a
+neighbour class that primes the condition. Reproducing it will most likely
+require re-running the actual shard rather than a subset, which also means
+`CRATONVM_G1_COVERAGE_PIN` can only be applied at that scale (and its cost —
+measured above at roughly 2-7x — makes a full pinned shard expensive but not
+obviously impossible).
+
+**What is worth carrying forward regardless:** all 4 classes are named in
+`gc young-gen last incomplete-coverage reason: innermost-rbp-belongs-to-unguarded-callee`,
+and the Spring Boot G1 page's corruption is `--nojit`-clean. If the two are one
+defect, the cheaper Spring Boot reproducer (`Log4J2LoggingSystemTests`, ~9 min,
+200-560 zeroed-header reads per run) is a far better vehicle for the fix than
+a 651-class Tomcat shard, and a fix validated there should be re-checked here.
+
+## 2026-08-10: the Spring Boot G1 corruption is ROOT-CAUSED — re-test before investigating further
+
+[`../springboot/g1-fullsuite-regression-20260808.md`](../springboot/g1-fullsuite-regression-20260808.md)
+§3c: `G1Collector::refill_tlab` carved TLABs whose size was not a multiple of 8.
+`bump_alloc` commits the full size to `region.cursor` while `Tlab::new` rounds
+its `end` DOWN to 8, so the bytes between the two ends were covered by no
+filler, no skip span and no object. A linear walk read them as an all-zero
+16-byte object, desynced 8 bytes off the real grid, and abandoned the walk —
+leaving every heap reference past that offset un-rewritten by the pause.
+`GenerationalHeap::refill_tlab` has masked with `& !7` since 2026-07-18; G1's
+copy never got it, which is exactly why it was G1-only. Fixed; the reproducer
+goes FAIL 18/61 → **PASS 61/61** with zero walk breaks.
+
+**This is very likely these crashes too, and the fix is cheap to test.** The
+symptom here — a read through a stale pointer under G1 where the default
+collector is merely slow — is what "references past the desync point are never
+rewritten" produces: the pause moves an object, the reference in the un-walked
+tail still names the old address, and the region is later reset and reused.
+
+**Before spending anything else on this page, re-run the shard on a binary with
+the fix** (`gc/src/g1.rs`, `tlab_carve_size`). Everything below was written
+before the root cause was known.
+
+**The mechanism this page proposes is now positively refuted, not merely
+doubted.** Root scanning was never the problem: the frame's roots are
+enumerated correctly, and the fix touches neither root scanning nor frame
+registration. `innermost-rbp-belongs-to-unguarded-callee` is a real condition
+and it is what pushes the collector onto the *linear-walk* path — which is where
+the unaligned carve bites. So the reason string is a genuine **precondition**
+for reaching the bug, which is why it correlates so well, but "an unguarded JIT
+frame's root points at freed memory" is the wrong story and the suggested fix
+(conservative treatment in G1's root scanner) would not have fixed it.
+
+## Very likely the same defect as the Spring Boot G1 corruption — and the mechanism above may be the wrong one
+
+See [`../springboot/g1-fullsuite-regression-20260808.md`](../springboot/g1-fullsuite-regression-20260808.md)
+§3/§3b. That page characterizes a G1-only corruption on a different suite whose
+evidence lines up with the crashes here:
+
+* **G1-only, where the default collector is merely slow.** Same asymmetry,
+  measured repeatedly (`CloudFoundryActuatorAutoConfigurationTests`: default
+  TIMEOUT 4/4 at 900 s vs G1 PASS 3/3).
+* **A matching `EXCEPTION_ACCESS_VIOLATION`** under G1
+  (`CacheAutoConfigurationTests`, 272 s), whose dump has ASCII class-name bytes
+  in shadow-stack slots — reads landing in memory that was reset and reused.
+* **JIT-dependence, established by control.** `--nojit` under G1 is completely
+  clean on the loudest reproducer (`Log4J2LoggingSystemTests`: PASS 61/61, zero
+  corruption reports) where JIT-on fails 18/61 with 563 zeroed-header reads.
+  That matches this page's "unregistered JIT frame" correlation.
+
+**But the mechanism this page names is not what that investigation found, and
+it is worth not fixing the wrong thing.** This page assumes an unguarded JIT
+frame's *root* points at freed or relocated memory. The measured chain there is
+different: G1 walks a **JIT-pinned Eden region** linearly as a remembered-set
+source (pinned regions are held OUT of the collection set, so they get walked
+rather than evacuated), the walk hits an unwalkable hole and is **abandoned**,
+and every **heap reference past that offset is therefore never rewritten** by
+the pause. The frame's roots are enumerated fine; it is the heap slots that go
+stale. Both stories end in "dereference a stale pointer", so the crash dumps
+cannot separate them — but they have different fixes.
+
+Two things from that page apply directly here:
+
+* `CRATONVM_G1_COVERAGE_PIN=1` is the discriminator. Under it G1 refuses to
+  evacuate on any pause whose root coverage is incomplete, so it moves nothing.
+  **A crash that survives that lever is not caused by a relocation the root set
+  failed to cover** — which would refute this page's premise outright. It is
+  cheap and has never been run against these four classes.
+* Seven hypotheses are already refuted there with controls — including the
+  `metadata_pin_deferrable` G1 asymmetry, three JIT allocation gates, and an
+  abandoned-TLAB-at-thread-death theory that had a hexdump behind it and still
+  changed nothing — plus the whole TLAB-bookkeeping branch closed by
+  enumeration. Worth reading before spending a cycle here.
+
 ## Suggested next step
 
 Since G1 crashes exactly where the generational GC's own diagnostic already

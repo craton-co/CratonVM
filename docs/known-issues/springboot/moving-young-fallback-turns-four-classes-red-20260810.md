@@ -179,6 +179,179 @@ these four**: peaks of #4096 and #16384 are far past the 512 that filter was
 built for. Whether the remaining fallbacks are further false positives or
 genuine unregistered frames is not established here.
 
+## `innermost-rbp-belongs-to-unguarded-callee` is the indirect-call case
+
+`Log4J2LoggingSystemTests` is **100%** this one reason — all 17 logged lines, up
+to #4096. It is now reproducible in 20 seconds, without Spring, JUnit or a
+suite: `probes/MovingYoungFallbackCallFormProbe.java` runs identical allocation
+and identical recursion depth through three call forms and the reason partitions
+perfectly by form.
+
+| Arm | Call form | iters / 20s | peak | reason observed |
+|---|---|---:|---:|---|
+| `iface` (4 receiver types) | indirect | 8.98M, 10.19M | 32, 32 | **100%** `innermost-rbp-belongs-to-unguarded-callee` |
+| `virtual` (one final receiver) | indirect | 5.68M | 16 | **100%** the same |
+| `static` (recursive `invokestatic`) | direct `E8 rel32` | 28.3M | 64 | **100%** `parent-frame-map-incomplete`, **zero** innermost-rbp |
+
+That is what a failing `E8 rel32` decode predicts exactly.
+`innermost_frame_method` (`vm/src/jit/conservative_roots.rs`) establishes which
+`CompiledMethod` owns the innermost frame by decoding the five-byte direct CALL
+immediately before the saved return address; a frame entered by an indirect call
+— every megamorphic site, every inline-cache miss, every trampoline — has no
+such encoding, so `direct_call_callee` returns `None` and the scan fails closed.
+
+Corroborating, at zero build cost: the existing opt-out
+`CRATONVM_GC_NO_CALLEE_RESOLVE=1`, which disables that resolution entirely, is
+**completely inert** on the indirect arms — identical peak and identical line
+count with it on and off. The resolution it gates never succeeds there, so
+turning it off changes nothing. An inert lever is not an elimination; here it is
+positive evidence that the decode is failing rather than being skipped.
+
+### 2026-08-10, later: `Log4J2LoggingSystemTests` now COMPLETES on dev
+
+Re-run on `cratonvm-mygc-20260810.exe` (dev `3cb0129f6`), twice, `--Xmx 2g`:
+
+```
+SBRUNNER_RESULT tests=61 failed=14 aborted=0 skipped=0 containersFailed=0
+```
+
+— in **under 600s**, the same 61/14 HotSpot reports, where the `6365de194`
+binary did not finish in **3600s**. The row in the table above is therefore
+stale for this class. Something between `6365de194` and `3cb0129f6` fixed it;
+`cb947ffb8` ("retire a worker's TLAB before withdrawing it from tail
+publication") is the plausible candidate but **this has not been attributed by
+bisect** — do not cite it as the cause.
+
+Its fallback count is also **intermittent between runs of the same binary**:
+one run recorded 478 fallback cycles and completed, the next recorded **zero**
+and completed. That is consistent with the binding obligation
+(`xt-helper-window-conservative-scan`) depending on whether peer threads happen
+to be parked inside JIT frames when a collection lands, rather than on anything
+the class does deterministically.
+
+**Consequence for pricing `XT_HELPER_WINDOW`:** the A/B of its kill switch
+(`CRATONVM_JIT=xt-helper-window-scan=0` vs default) on this class was
+**inconclusive** — both arms recorded zero fallbacks, and a reduction cannot be
+measured from a zero baseline. Pricing it needs a workload with a *stable*
+fallback rate AND peer threads. `probes/MovingYoungFallbackCallFormProbe.java`
+has the stable rate (23–45 cycles per 20s run) but is single-threaded, so it
+never produces this reason at all. The missing artifact is that probe plus
+worker threads that park inside JIT frames.
+
+### Priced: `XT_HELPER_WINDOW` is also worth ZERO — the binding obligation is `cross-thread-jit-peer`
+
+`probes/MovingYoungFallbackPeerParkProbe.java` supplies what was missing: peers
+parked *under compiled frames* (each worker warms a recursive method until it is
+compiled, then re-enters it and blocks at the bottom of that chain) plus a main
+thread allocating hard enough to force collections while they sit there. It
+produces `xt-helper-window-conservative-scan` in every cycle, which no
+single-threaded probe can do, at a stable rate.
+
+Interleaved A/B of the existing kill switch, `CRATONVM_JIT=xt-helper-window-scan=0`:
+
+| arm | iters | cycles | with `xt-helper-window` | with `cross-thread-jit-peer` | rate /Miter |
+|---|---:|---:|---:|---:|---:|
+| on | 7.25M | 27 | 27 | 27 | 3.73 |
+| **off** | 7.61M | 28 | **0** | 28 | 3.68 |
+| on | 7.70M | 28 | 28 | 28 | 3.63 |
+| **off** | 9.07M | 33 | **0** | 33 | 3.64 |
+
+The lever **works** — the reason disappears entirely, 27/28 → 0 — so this is not
+the inert-lever ambiguity that made `CRATONVM_GC_NO_CALLEE_RESOLVE` unreadable.
+The measurement is sensitive and the answer is still zero: the fallback rate is
+flat across all four arms, because `cross-thread-jit-peer` is in **100% of
+cycles in both**.
+
+### The actual root: any peer thread with live JIT frames blocks compaction
+
+`CROSS_THREAD_JIT_PEER` is *"another thread holds live JIT frames whose coverage
+this thread's scan cannot verify and whose registers/stack are not rewritable."*
+That is not a decoding bug, and no per-reason repair reaches it. It explains
+every result on this page:
+
+- **single-threaded probes** have no peers, so they fall back only for
+  `innermost-rbp` — which is why repairing that looked like a 100% win there;
+- **every real workload here** is multithreaded Spring, so a peer holds JIT
+  frames essentially always, and moving-young is unreachable *regardless* of any
+  other obligation being repaired.
+
+So the honest framing is not "there is a bug making these four classes fall
+back". It is that **moving-young does not currently survive contact with a
+multithreaded workload**, and the four classes are just where that showed up as
+a timeout. Three separate repairs were priced against real cycles and all three
+came back at zero (`innermost-rbp` 0%, `xt-helper-window` 0%, and the
+`CRATONVM_GC_NO_CALLEE_RESOLVE` path inert).
+
+The only directions that can move this are structural, and should be priced
+before being built:
+
+1. **Bring blocked peers to a precise safepoint** so their roots become
+   rewritable — principled, and the largest.
+2. **Pin conservatively-found objects and compact around them** rather than
+   declining the whole collection. This is what production collectors do with
+   conservative roots, and it is the only option that converts a whole-heap
+   refusal into a bounded cost.
+3. **Keep threads out of JIT frames while blocked** — narrows the window without
+   closing it.
+
+### Measured: repairing the indirect-call path would convert NOTHING in a real workload
+
+`CRATONVM_DBG_GC_FALLBACK_REASONS=1` records the full per-cycle reason **set**
+(the stored reason is first-wins, so it cannot answer "would repairing X have
+helped"). `attributable-innermost-rbp=yes` marks a cycle whose entire
+incompleteness traces to the indirect-call resolution — counting the
+`compiled-frame-band-unbounded` bit that the same `innermost_frame_method`
+failure co-emits from the band walk.
+
+| Workload | threads | cycles | attributable |
+|---|---|---:|---:|
+| probe `iface` (megamorphic) | 1 | 23 | **23 — 100%** |
+| probe `virtual` (final receiver) | 1 | 45 | **45 — 100%** |
+| probe `static` (direct `E8`) | 1 | 111 | 0 — different pair |
+| **`Log4J2LoggingSystemTests`** | many | **478** | **0 — 0%** |
+
+Every one of Log4J2's 478 cycles carries a **third, independent** reason:
+
+```
+all=xt-helper-window-conservative-scan,compiled-frame-band-unbounded,innermost-rbp-belongs-to-unguarded-callee
+```
+
+`xt-helper-window-conservative-scan` is a **cross-thread** obligation — "a
+blocked peer's JIT helper window was scanned conservatively" — and nothing about
+`innermost_frame_method` touches it. Repair the indirect-call resolution
+perfectly and all 478 cycles still fall back on that reason alone.
+
+**So the indirect-call repair is not the fix for these classes, and was not
+attempted.** It would cost a store on every compiled frame push across three
+compile doors and convert zero real cycles. The single-threaded probe said 100%
+precisely *because* it is single-threaded; the discriminator is peer threads,
+which every one of the four affected classes has and the probe does not. A
+20-second synthetic reproducer generalised exactly backwards here.
+
+The target is `XT_HELPER_WINDOW` (`vm/src/jit/xt_root_scan.rs`), not
+`innermost_frame_method`. It has its own opt-out,
+`CRATONVM_XT_HELPER_WINDOW_SCAN=0`, which is where a next pass should start —
+price the ceiling with the existing lever before writing anything, the same way
+`CRATONVM_GC_NO_CALLEE_RESOLVE` priced this one at zero.
+
+### The earlier worry, resolved
+
+Normalised per unit of work the three arms are comparable — static 2.3
+fallbacks per million iterations, iface 3.6, virtual 2.8. The direct-call arm
+does not fall back *less*; it falls back under a **different** reason. So making
+indirect frames resolvable could simply move those collections into
+`parent-frame-map-incomplete` instead of letting them compact.
+
+Before paying for the fix — pairing a method identity with the recorded RBP
+touches the frame-record store in the IR backend, the single-pass backend and
+the shared allocation stub, on the path that runs at every compiled frame push —
+the ceiling should be measured with a **diagnostic-only** build: on a
+`FOREIGN_INNERMOST_RBP` fallback, record whether every *other* precondition was
+already satisfied. That says how many of these collections would actually become
+moving, with no behaviour change. The two worst classes (`Integration`,
+`Quartz`) peak under different reasons entirely, so this fix is not expected to
+help them.
+
 ## The count is the triage signal
 
 The fallback peak separates the two outcomes cleanly, and cheaply:
@@ -226,6 +399,56 @@ discover. Validated against all five logs from this session.
   running during these measurements. Absolute wall-clock is therefore an upper
   bound; the JIT-vs-`--nojit` contrasts (2.3x, OOM-vs-pass, no-finish-vs-pass)
   are far too large to be explained by it.
+
+## 2026-08-10 reconciliation — confirmed on `Integration`/`Quartz`, but only the DEFAULT collector shows the named mechanism
+
+Reconciling the 139-class non-passed union from a same-day `default`/`g1`/`zgc`
+rerun (binaries `cratonvm-{default,g1,zgc}-20260808f.exe`, `dev@6365de194`, a later
+tip than the `f695ca875` binary this page's own measurement used).
+`IntegrationAutoConfigurationTests` and `QuartzEndpointWebIntegrationTests` are both
+TIMEOUT/HANG at ~300s under **all three** collectors this round:
+
+| Class | default | G1 | ZGC |
+|---|---:|---:|---:|
+| `IntegrationAutoConfigurationTests` | 300.104s | 300.200s | 300.170s |
+| `QuartzEndpointWebIntegrationTests` | 300.123s | 300.012s | 300.109s |
+
+The symptom (HANG at the 300s ceiling) is **collector-agnostic**. The *mechanism*
+recorded above is only directly confirmed on the default collector this round,
+though:
+
+- **default**: both `.err.log`s are loud — `[moving-young] fallback #N` lines
+  (Integration reached #256, Quartz #128, both climbing) interleaved with
+  `gc::guard: young non-moving sweep was about to ZERO a span containing a LIVE
+  (marked) object` retentions and `gen_heap: selective promotion: unwound N
+  candidate(s)` warnings, active right up to the kill — the exact signature this
+  page already names.
+- **G1 and ZGC**: both `.err.log`s are near-silent — only the routine
+  post-clinit-fixup/Mockito-self-attach boilerplate (7 lines each), zero GC/JIT
+  diagnostic output for the whole run. `[moving-young]` is default-collector
+  terminology (the non-moving *young* sweep fallback is specific to the
+  Generational collector's compaction path), so its absence under G1/ZGC is
+  expected and does not by itself mean those two collectors are clean — it means
+  this page's specific instrumentation doesn't fire there.
+- Both classes' `.out.log`s show steady progress on all three collectors (repeated
+  Spring/Integration context start-stop or Quartz scheduler cycles, new timestamped
+  output up to the moment of the kill on every collector) — no collector shows a
+  dead/silent process, so none of these are the previously-fixed STW/AB-BA deadlock
+  families.
+
+**Not established by this rerun:** whether G1 and ZGC are hitting an equivalent
+JIT-driven degradation via a different (un-instrumented) code path, or are simply
+too slow under the JIT for an unrelated reason and would finish given more budget.
+The standalone measurement above found the JIT itself is what breaks these
+classes on this page (`--nojit` clears them) — that root explanation does not
+depend on which GC is compacting the young generation, so the G1/ZGC HANGs are
+consistent with the same underlying JIT-triggered cause without independently
+proving it. A `--nojit` A/B under G1 and ZGC (the same protocol "The measurement"
+above used) would settle it.
+
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-{default,g1,zgc}-20260808f-s2/all-jit/logs/module_spring-boot-integration.org.springframework.boot.integration.autoco*-9d4bdd63bbf0.{out,err}.log`,
+`.../module_spring-boot-quartz.org.springframework.boot.quartz.actuate.endpoint*-e3de43e38499.{out,err}.log`.
 
 ## Reproduce
 

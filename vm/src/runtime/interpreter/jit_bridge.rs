@@ -2397,13 +2397,35 @@ pub(super) fn jit_invoke_targets_native_shadow(
     // same-descriptor native for a genuinely unrelated interface is rare and
     // merely costs a missed tier-up opportunity for that one caller, never a
     // correctness bug).
+    // `CRATONVM_JIT=-native-shadow-interface-blind` suppresses this arm, so its
+    // cost can be A/B'd on a real workload before anyone decides whether to make
+    // it precise. Default-on: it is a CORRECTNESS guard (a compiled direct call
+    // bypasses the interpreter's native-vs-bytecode choice), and the shape it
+    // covers is real — `GroovyClassValueJava7 implements GroovyClassValue,
+    // extends java.lang.ClassValue` inheriting a natively-registered `get()`.
+    // The lever exists to measure the arm, not to be shipped off.
     let interface_blind_possible_shadow = is_interface_ref
         && !direct
         && !inherited
+        && crate::runtime::env_cache::jit_native_shadow_interface_blind()
         && shared
             .natives
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
+    // Which arm fired, counted. The three have very different standing:
+    // `direct`/`inherited` are precise facts about THIS call, while
+    // `interface_blind` is a class-blind "does ANY registered native have this
+    // (name, descriptor)" probe whose own comment concedes it "can only ever ADD
+    // conservatism". On a Spring Boot context startup this whole predicate seals
+    // 1,279 methods out of the JIT — more than the 1,155 that reach C2 — and
+    // until now nothing said which arm was responsible for them.
+    if direct {
+        cratonvm_jit::note_jit_native_shadow_cause("direct");
+    } else if inherited {
+        cratonvm_jit::note_jit_native_shadow_cause("inherited");
+    } else if interface_blind_possible_shadow {
+        cratonvm_jit::note_jit_native_shadow_cause("interface-blind");
+    }
     if (direct || inherited || interface_blind_possible_shadow)
         && crate::runtime::env_cache::dbg_jitc()
     {
@@ -5517,12 +5539,49 @@ pub(super) fn background_compile_task(
             )
         })
         .unwrap_or(false);
+    // A `None` above is not one thing. The comment on `published` already lists
+    // the causes — "skip-listed, resolver miss, code-cache cap, concurrent
+    // redefine" — and two of them are PERMANENT POLICY, not a codegen attempt
+    // that failed. Reporting every `None` as a codegen failure made
+    // `complete_task` spend `tier_fail_count` on methods no compile was ever
+    // run for: three futile background tasks each, then the method is retired
+    // and reported by `jit-method-stats` as `compile-failed reason=unrecorded`
+    // — unrecorded precisely because nothing ran to record a bail site.
+    //
+    // That is how a Spring Boot context startup reported
+    // `hot_but_stuck_in_interpreter=79 (ineligible-by-policy=0,
+    // compile-failures=69)` while 2499 methods sat in the skip-seal census:
+    // every one of those 69 was a policy verdict wearing a codegen failure's
+    // label, which sent the reader looking for a compiler bug that is not there.
+    //
+    // `MethodState::ineligible` is the field that exists for exactly this, and
+    // `complete_task` already honours it — it just was never told.
+    let declined_permanently = !published
+        && (shared
+            .jit
+            .jit_skip_set
+            .read()
+            // The skip-set is keyed by `Arc<str>` and `MethodKey` holds
+            // `String`, so the probe has to materialise a key. Three small
+            // allocations on a path that runs once per FAILED compile task —
+            // not per invocation — which is the whole reason this check can
+            // afford to be here at all.
+            .contains(&(
+                std::sync::Arc::from(task.method_key.class_name.as_str()),
+                std::sync::Arc::from(task.method_key.method_name.as_str()),
+                std::sync::Arc::from(task.method_key.descriptor.as_str()),
+            ))
+            || cratonvm_jit::is_jit_bail_listed(
+                &task.method_key.class_name,
+                &task.method_key.method_name,
+                &task.method_key.descriptor,
+            ));
     CompileOutcome {
         // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         compile_time_ms: start.elapsed().as_millis() as u64,
         published,
         c2_upgrade_candidate,
-        declined_permanently: false,
+        declined_permanently,
     }
 }
 

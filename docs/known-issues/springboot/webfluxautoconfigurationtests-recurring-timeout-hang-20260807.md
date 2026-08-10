@@ -181,12 +181,111 @@ list is the annotation machinery the sampling profile already pointed at:
 | 21,684 | `TypeMappedAnnotation.createIfPossible` |
 | 7,860 | `AnnotatedElementUtils.findMergedAnnotation` |
 
-**26 of the top 30 report `reason=unrecorded`** — the compiler refused and did
-not say why. Four name `rbc6-handler-reads-unsafe-local`. That diagnostic gap is
-the first thing to close: `try_compile` records a reason only when some bail
-site called `note_jit_bail_site`, and the `None`-returning paths after
-`backend_attempted = true` (jit/src/lib.rs:17753) evidently include some that do
-not. Until those are named, the refusals cannot be fixed.
+**26 of the top 30 reported `reason=unrecorded`.** That is now resolved, and the
+answer was not the one this page assumed — see the next section.
+
+**Update 2026-08-10 — 63 of the 69 "compile failures" were never compiled at
+all.** They were **policy verdicts wearing a codegen failure's label**.
+
+`try_jit_compile_wrapped_entry` returns `None` for several unrelated reasons,
+and its own comment lists them: *"skip-listed, resolver miss, code-cache cap,
+concurrent redefine, ..."*. Two of those are permanent policy, not a codegen
+attempt that failed — but the `CompileOutcome` hardcoded
+`declined_permanently: false`, so `CompilerCore::complete_task` spent
+`tier_fail_count` on every one of them. Three futile background compile tasks
+per method, then the method is retired and reported as `compile-failed
+reason=unrecorded` — unrecorded *precisely because nothing ever ran to record a
+bail site*. `MethodState::ineligible` is the field that exists for this case,
+and `complete_task` already honours it; it was simply never told.
+
+Fixed by reporting a `None` as `declined_permanently` when the method is in the
+skip-set or on the permanent bail-list. Same class, same workload:
+
+| | before | after |
+|---|---:|---:|
+| `hot_but_stuck_in_interpreter` | 79 | 81 |
+| ...of which **ineligible-by-policy** | **0** | **63** |
+| ...of which **compile-failures** | **69** | **7** |
+| C1 compiles | 1552 | 1571 |
+
+So there were never 69 compiler bugs here — there are **7**, and those do carry
+real bail sites (`rbc6-handler-reads-unsafe-local` and friends). The other 63
+are the skip-seal policy, which is the finding below. Wall-clock is unchanged
+(240.97s → 240.79s), as it should be: this corrects a label and stops wasted
+compile tasks, it does not make anything faster.
+
+A stage-fallback was added at the same time (`no-site-after-<stage>`, stamped by
+each pipeline phase) so that a *genuine* silent refusal can never report
+`unrecorded` again. It did not fire on this workload — which is itself what
+proved no compile was running for those 63.
+
+### 1b. 2,498 methods are sealed out of compilation before any attempt
+
+The seal census, now split by reason (it was one label,
+`static-policy-or-native-shadow`, covering four different verdicts):
+
+```
+JIT skip-seal census: 2498 method(s) sealed before any compile
+  | calls-native-shadowed-method=1279  clinit=1219
+```
+
+**1,279 methods are excluded from the JIT because they call a method that has a
+native shadow** — more than the 1,155 that reach C2 in the same run. Nothing
+from the static policy table, nothing from the `ForkJoinTask` rule. This is the
+largest single population touching the gap and it was invisible before today.
+
+### 1c. …and it is worth nothing. Measured, 2026-08-10.
+
+That headline — "more sealed than compiled" — is exactly the kind that gets a
+large compiler change funded. It was tested first, in two steps, and it does not
+survive either.
+
+**Step 1: which arm fires?** The predicate has three, and they do not have equal
+standing: `direct` and `inherited` are precise facts about the call, while
+`interface_blind_possible_shadow` is a class-blind *"does ANY registered native
+have this (name, descriptor)"* probe whose own comment concedes it "can only ever
+ADD conservatism". The obvious suspicion was that the class-blind arm was
+over-matching common signatures (`get()`, `size()`, `equals`) in Spring code.
+
+```
+JIT native-shadow verdicts by arm: direct=1015  interface-blind=169  inherited=81
+```
+
+It is not. The class-blind arm is 13%. Suppressing it
+(`CRATONVM_JIT=-native-shadow-interface-blind`) frees 126 methods and moves 9
+more to C2 — and moves wall clock not at all: 228.6s / 269.6s with it against
+256.6s / 266.8s without, interleaved and HotSpot-bracketed. The seal is dominated
+by **precise, correct** hits: Spring really does call natively-shadowed JDK
+methods nearly everywhere.
+
+**Step 2: price the ceiling.** If narrowing the detection is not the lever, the
+only remaining one is the *granularity* — the seal disqualifies the whole caller
+rather than just refusing the direct-call optimisation at that one site — and
+rebuilding it per-site is a large, correctness-critical compiler change. So
+rather than build it, price its best case by removing the seal entirely
+(`CRATONVM_JIT=-native-shadow-caller-seal`, a measurement-only lever; it
+disables a correctness guard and must never ship):
+
+| | seal on | seal off |
+|---|---:|---:|
+| sealed for `calls-native-shadowed-method` | 1281 | **17** |
+| methods reaching C2 | 1156 | **1212** |
+| wall clock | 245.97s | **253.92s / 249.73s** |
+| tests | 70/70 | 70/70 |
+
+**Freeing 1,264 methods to compile buys nothing** — if anything it is marginally
+slower, since the extra compiles are not free. The ceiling on this lead is zero,
+so the per-site rebuild should not be attempted for this workload's sake.
+
+Why zero is consistent with everything else on this page: the profile is diffuse,
+the JIT already reaches 1,156 methods in 166 ms, and compiling 56 more changes
+nothing because the time is not in the methods the seal was holding back. The
+largest measured single term remains the annotation-proxy entry path (~94% of a
+~14 us attribute read), which no amount of tier-up touches.
+
+`SealProbe` remains as the shape probe: a JDK-leaf call costs ~50 ns/iter against
+8 for pure integer work, and `String.charAt` ~460. That per-call cost is real —
+it is simply not paid for by compiling the *caller*.
 
 ### 2. Annotation *attribute reads* cost ~10.5 us — and 94% of that is not where it looks
 
@@ -236,6 +335,67 @@ wrong and has been recomputed above. This is a real finding in its own right and
 does not belong to this class; it is filed here only because it is where it was
 found.
 
+## 4. The annotation-proxy entry path — also worth ~1%. Measured 2026-08-10.
+
+The remaining lead was the ~94% of a ~14 us attribute read that sits *before*
+`annotation_proxy_dispatch_impl`. Two measurements settle it.
+
+**Where the entry cost splits.** `ProxyProbe` compares a plain
+`java.lang.reflect.Proxy` with a trivial hand-written `InvocationHandler`
+against an annotation proxy, arm-A shape, net of each VM's own control:
+
+| | HotSpot | CratonVM |
+|---|---:|---:|
+| direct interface call (control) | 8 ns | 760 ns |
+| **plain** JDK proxy `.value()` | 10 ns | 6,126 ns |
+| **annotation** proxy `.value()` | 14 ns | 16,175 ns |
+
+So ~35% of the annotation cost is **generic dynamic-proxy dispatch** — shared
+with every JDK proxy, including Spring AOP's — and ~65% is annotation-specific.
+Both are ~500-1000x HotSpot. The generated `$ProxyN` body allocates an
+`Object[]` per call (`ICONST_0; ANEWARRAY`) and the native
+`Proxy$Dispatch.invokeProxy` does a `class_name_of_id` String allocation, a
+by-name field lookup on the `Method`, and a String materialisation of the member
+name — all per call.
+
+**And it does not matter here**, because the call volume is small:
+
+```
+[PROXY-DISPATCH-PROF] native invokeProxy calls=300000 total=9532ns/call cumulative=2859ms
+```
+
+~300-400k dispatches at ~9.5 us = **~2.9-3.8 s of a 357 s run, ~1%**. The
+interpreter-side hook adds ~0.3-0.5 s. Making the entire annotation and proxy
+machinery *infinitely fast* would save about three seconds.
+
+**A measurement caveat worth keeping.** The first version of this count
+instrumented only `annotation_proxy_dispatch_impl` and reported ~100k
+dispatches — implying <0.5 s and a tidy conclusion. That was wrong by ~10x:
+proxy dispatch is a **two-branch funnel** (the interpreter hook *and* the native
+`invokeProxy` entry, which deliberately does not route through the other), and
+counting one branch under-reports by exactly the factor that decides the answer.
+Both branches are now counted under the same flag.
+
+## Conclusion: there is no single term, and three leads have proved it
+
+| lead | headline | measured worth |
+|---|---|---|
+| compile refusals | "69 hot methods refused" | 63 were mislabelled policy; 7 real |
+| native-shadow seal | "1,279 sealed > 1,155 at C2" | removing it entirely: **0** |
+| annotation/proxy path | "~1000x HotSpot per call" | **~1%** of the run |
+
+Every per-call gap above is real and large. None of them is where the 20x lives,
+because none of them happens often enough. What is left is ordinary Java
+throughput across Spring's own code — the sampling profile says exactly that
+(largest single leaf 3.9%; 50.7% under `springframework/core/annotation`, which
+is Spring's *own Java classes*, not VM annotation calls) and three independent
+ceiling measurements have now failed to contradict it.
+
+**Anyone picking this up should stop looking for a mechanism and start on
+breadth**: the interpreter and the compiled-code quality across ordinary
+application bytecode. And they should keep pricing ceilings first — it has cost
+one build each time and saved three large changes.
+
 ## What is left
 
 A ~10-30x gap on Spring context startup with **no single dominant term**. What
@@ -250,16 +410,23 @@ is now known, and what the next attempt should not repeat:
   are different measurements, and here they disagreed by 4x versus 0%.
 - Both previously-unmeasured angles are now measured (see the section above).
   The three leads they produced, in the order worth taking them:
-  1. **Name the 26 `reason=unrecorded` compile refusals.** Cheapest, unblocks
-     the rest, and it is a diagnostic-completeness fix rather than a codegen
-     one: every `None` return after `backend_attempted = true` needs to call
-     `note_jit_bail_site`. 69 hot methods are permanently interpreted behind it.
-  2. **The annotation-proxy entry path**, which is ~94% of a ~14 us attribute
-     read. `ann-proxy-prof` already brackets the dispatcher, so the next probe
-     only has to bracket what comes before it: the generated `$ProxyN` body and
-     the native proxy dispatch.
-  3. **OSR-only loops at 7-16x**, which is not this class's problem but is
-     probably somebody's.
+  1. ~~Name the 26 `reason=unrecorded` compile refusals.~~ **DONE 2026-08-10** —
+     63 of the 69 were policy verdicts mislabelled as codegen failures; 7 real
+     ones remain, each with a named bail site.
+  2. ~~The skip seal: 1,279 methods excluded for `calls-native-shadowed-method`.~~
+     **CLOSED 2026-08-10, ceiling measured at zero** (§1c). Removing the seal
+     entirely frees 1,264 methods, moves 56 more to C2, and does not improve wall
+     clock. Do not rebuild it per-site for this workload's sake.
+  3. ~~The annotation-proxy entry path.~~ **CLOSED 2026-08-10 at ~1%** (§4).
+     ~300-400k dispatches at ~9.5 us = ~3 s of a 357 s run.
+  4. **OSR-only loops at 7-16x**, which is not this class's problem but is
+     probably somebody's — the one item on this page still worth someone's time,
+     and it belongs to whoever owns tier-up, not to this class.
+
+  The pattern across all three closed leads: every headline number ("69 refused
+  compiles", "more sealed than compiled", "1000x per call") looked like a cause
+  and none was. Price the ceiling with a lever or a counter before building the
+  fix — three times now that has cost one build and saved a large one.
 - Do **not** change `try_lambda_dispatch` on the strength of reading it. That
   function carries a long list of named correctness regressions in its own
   comments (`ProcessInfoTests.memoryInfoIsAvailable`,

@@ -156,7 +156,50 @@ checking, in order of plausibility given this suite's other findings:
    `apps/spring-boot/sb-runner`, one class at a time, no 300s ceiling) would settle this in one
    run without needing the full suite harness.
 
+## 2026-08-10 reconciliation — `TomcatServletWebServerFactoryTests` confirmed collector-agnostic, still HANG on G1 (not FAIL)
+
+Reconciling the 139-class non-passed union from the same-day `default`/`g1`/`zgc`
+suite rerun (binaries `cratonvm-{default,g1,zgc}-20260808f.exe`, `dev@6365de194`).
+`TomcatServletWebServerFactoryTests` is TIMEOUT/HANG at ~300s under **all three**
+collectors this round — default 300.135s, G1 300.106s, ZGC 300.200s, per
+`results.tsv`'s `status`/`note` columns in each of
+`craton-nonpassed-{default,g1,zgc}-20260808f-s2/all-jit/results.tsv`. (An
+upstream note for this reconciliation batch described the G1 row as FAIL rather
+than HANG; that does not match what this rerun's own `results.tsv` rows record —
+worth double-checking against whatever produced that note, but the raw data
+checked here is unambiguously HANG on all three.)
+
+All three logs show exactly this page's already-established signature — steady,
+uninterrupted forward progress, not a stall:
+
+| Collector | `.out.log` lines | `Starting Servlet engine` cycles reached | port-8080 fabrication lines |
+|---|---:|---:|---:|
+| default | 619 | 65 | 0 |
+| G1 | 496 | 52 | 0 |
+| ZGC | 571 | 60 | 0 |
+
+Each collector reaches roughly half the class's ~126 total cycles by the 300s
+cutoff (consistent with this page's own ~2x-budget extrapolation), with new
+timestamped Tomcat lifecycle output right up to the kill in every case — none of
+the three shows a stuck/repeating timestamp or the STW-stall/AB-BA-deadlock
+signatures this page already ruled out. **Zero `8080` occurrences in any of the
+three `.out.log`s** confirms the `Tomcat.getConnector()`-fabricates-8080 bug (now
+fixed, see the retirement note at the top of this page and
+`fixed-suite-bugs/springboot/hashmap-get-misses-a-key-its-own-entryset-yields-FIXED-20260810.md`)
+has not regressed on any collector — what remains is purely the throughput gap
+this page already characterizes as open.
+
+**Collector-agnostic (reproduces under Generational, G1, and ZGC)** — same
+symptom, same rough cycle-count/budget ratio, on all three. No root cause beyond
+what this page already documents (§"Root cause — not identified in this pass");
+this reconciliation adds G1/ZGC coverage to what was previously a default-collector-only
+measurement (the original 2026-08-06/2026-08-10 runs referenced above did not
+include a G1 or ZGC arm for this class), it does not change the open question.
+
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-{default,g1,zgc}-20260808f-s2/all-jit/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.servlet.TomcatSe*-3257b00b67ee.{out,err}.log`.
+
 ## Affected classes
 
-- `module/spring-boot-tomcat` — `org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests` (HANG, 300.170s, ~62/126 cycles reached)
+- `module/spring-boot-tomcat` — `org.springframework.boot.tomcat.servlet.TomcatServletWebServerFactoryTests` (HANG, 300.170s, ~62/126 cycles reached; reconfirmed 2026-08-10 as HANG at ~52-65/126 cycles on default, G1, and ZGC alike)
 - `module/spring-boot-jetty` — `org.springframework.boot.jetty.servlet.JettyServletWebServerFactoryTests` (HANG, 300.070s, ~57/111 cycles reached)
