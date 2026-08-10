@@ -4436,6 +4436,19 @@ pub(crate) fn try_osr_with_backoff(
             // Strictly a waste-elimination change: it removes compiles, never
             // adds compiled execution. The loop runs interpreted either way.
             if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
+                // Counted, because this path is why `osr_entered=0` can appear
+                // next to `osr_refused_entry=0` and a non-zero `osr=` compile
+                // count — a combination that reads like "OSR was never even
+                // tried" when in fact an artifact was built and found
+                // un-enterable at this pc. `osr_refused_entry` is only recorded
+                // inside `try_osr`, which this arm returns before reaching, so
+                // without these two the whole OSR lifecycle line is silent about
+                // the most common way OSR fails to happen.
+                cratonvm_jit::metrics::record_osr_event(if published_but_unenterable {
+                    "osr_published_but_unenterable"
+                } else {
+                    "osr_method_denied"
+                });
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }

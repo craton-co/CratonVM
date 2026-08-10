@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-426 tokens.
+429 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -190,6 +190,7 @@ export inherited from a parent shell.
 | `g1-dbg-zero` | `CRATONVM_G1_DBG_ZERO` |
 | `g1diag` | `CRATONVM_DBG_G1DIAG` |
 | `gc-array-guard-bt` | `CRATONVM_GC_ARRAY_GUARD_BT` |
+| `gc-fallback-reasons` | `CRATONVM_DBG_GC_FALLBACK_REASONS` |
 | `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
 | `gc-stats` | `CRATONVM_GC_STATS` |
 | `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
@@ -260,6 +261,7 @@ export inherited from a parent shell.
 | `field-site` | `CRATONVM_DBG_FIELD_SITE` |
 | `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
 | `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
+| `jit-scan-prof` | `CRATONVM_DBG_JIT_SCAN_PROF` |
 | `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
 | `jit-pin` | `CRATONVM_DBG_JIT_PIN` |
 | `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
@@ -298,6 +300,7 @@ export inherited from a parent shell.
 | `mh-dispatch` | `CRATONVM_DBG_MH_DISPATCH` |
 | `mh-stack` | `CRATONVM_DBG_MH_STACK` |
 | `mic-prof` | `CRATONVM_DBG_MIC_PROF` |
+| `mic-trace` | `CRATONVM_DBG_MIC_TRACE` |
 | `minvoke` | `CRATONVM_DBG_MINVOKE` |
 | `mirrorpin` | `CRATONVM_DBG_MIRRORPIN` |
 | `modprov` | `CRATONVM_DBG_MODPROV` |

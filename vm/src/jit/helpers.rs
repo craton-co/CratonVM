@@ -165,6 +165,16 @@ pub mod mic_prof {
         *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
     }
 
+    /// `CRATONVM_DBG_MIC_TRACE` — the per-call `[DISP_TRACE]` line, separate
+    /// from [`enabled`] because one `eprintln` per dispatched call is only
+    /// affordable when dispatch is cold. It is not cold on a call-dense
+    /// workload, where it buries the counters it shares a switch with under
+    /// hundreds of megabytes of stderr.
+    pub fn trace_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_TRACE").is_some())
+    }
+
     #[inline]
     pub fn now() -> u64 {
         // SAFETY: rdtsc is unprivileged on x86-64.
@@ -9153,10 +9163,18 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     jit_safepoint_flush_satb(vm_ptr);
     mic_prof::dump_maybe_disp();
     let _cyc_disp = mic_prof::CycGuard::new(&mic_prof::CYC_DISP_TOTAL);
-    // WS1 diagnostic: per-call dispatch trace (the dispatch helper is cold
-    // enough on the kafka repro — ~15 calls — that an eprintln per call is
-    // affordable and names the callee that encloses the lost wall time).
-    let _disp_trace = if mic_prof::enabled() {
+    // WS1 diagnostic: per-call dispatch trace, naming the callee that encloses
+    // the lost wall time.
+    //
+    // This used to ride on `mic_prof::enabled()`, justified by "the dispatch
+    // helper is cold enough on the kafka repro — ~15 calls — that an eprintln
+    // per call is affordable". On a call-dense workload it is not cold: on
+    // `ZipContentTests` the same switch wrote **268 MB of stderr in 73 seconds**
+    // and had to be killed, so the COUNTERS — which are the reason to reach for
+    // MIC_PROF at all, and are cheap — could not be read on the one workload
+    // that needed them. A per-call `eprintln` and a set of atomic counters do
+    // not belong on one switch. The trace now has its own.
+    let _disp_trace = if mic_prof::trace_enabled() {
         let info = &*(info_ptr as *const JitInvokeInfo);
         struct DispTrace {
             label: String,
