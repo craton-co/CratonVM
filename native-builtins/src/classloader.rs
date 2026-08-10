@@ -5247,6 +5247,44 @@ fn cl_get_resources_impl(
     };
     let resource_name = name.trim_start_matches('/');
 
+    // The platform loader exposes the JDK's own module resources (`jrt:`) and
+    // NOTHING from the application classpath. Answering it from the flat scan —
+    // which is what the fall-through at the end of this function does, since
+    // `jdk/internal/loader/*` is a builtin loader class — hands the whole
+    // application classpath to every child whose parent is platform.
+    //
+    // That topology is exactly what Spring Boot's `ModifiedClassPathClassLoader`
+    // is built on: it parents itself to the platform loader precisely so its own
+    // (exclusion-filtered) URL array is the complete application view. Its
+    // `getResources` is parent-first, so an unrestricted platform parent put the
+    // excluded jar's `META-INF/services` entry straight back — the same leak the
+    // receiver-local half of this fix addresses one level down.
+    //
+    // `cl_get_resource` has drawn this line for the singular lookup since the
+    // ModifiedClassPath work; this is the plural half of the same rule, and it
+    // keeps the two spec-consistent (`getResource` must return the first URL
+    // `getResources` would).
+    if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
+        if is_platform_class_loader(ctx, this_ref) {
+            let urls: Vec<String> = ctx
+                .find_all_resource_urls(resource_name)
+                .into_iter()
+                .filter(|url| url.starts_with("jrt:"))
+                .collect();
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, urls.len());
+            let p_arr = ctx.pin_native_root(arr);
+            for (i, url) in urls.iter().enumerate() {
+                let url_obj = crate::jboss_module_loader::build_synthetic_url(ctx, url)?;
+                let arr = ctx.read_native_pin(p_arr, arr);
+                ctx.set_array_element(arr, i, Value::Object(Some(url_obj)));
+            }
+            let arr = ctx.read_native_pin(p_arr, arr);
+            let enm = make_snapshot_enumeration(ctx, arr)?;
+            ctx.unpin_native_roots(p_arr);
+            return Ok(Some(Value::Object(Some(enm))));
+        }
+    }
+
     // See `cl_get_resource`: the URLClassLoader path must stay local rather
     // than falling into the process-wide resource enumeration.
     if allow_delegate {
@@ -6488,7 +6526,7 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
 /// Legacy compatibility slot for URLClassPath instances created by older
 /// synthetic paths. Real-JDK URLClassLoader constructor URLs are retained in
 /// the named `path` ArrayList instead, because raw slot zero aliases that field.
-const UCP_STASHED_URLS: usize = 0;
+pub(crate) const UCP_STASHED_URLS: usize = 0;
 
 /// True when `ucp` carries CratonVM's SYNTHETIC `URLClassPath` layout — i.e.
 /// [`UCP_STASHED_URLS`] (slot 0) really is our stash array.
@@ -7236,6 +7274,28 @@ fn loader_has_recorded_url_set(ctx: &mut dyn NativeContext, loader: ObjectRef) -
         || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
 }
 
+/// Does `loader` answer resource lookups entirely out of a URL list CratonVM
+/// can enumerate in full?
+///
+/// When this is true, `loader.getResources(name)` is exhaustive for that
+/// loader — including when it comes back EMPTY — so a caller must not widen an
+/// empty answer with a process-wide classpath scan. `ucl_find_resources` is
+/// what makes that guarantee hold; this predicate is how a caller outside
+/// `classloader.rs` (`service_loader::discover_providers`) asks whether it may
+/// rely on it.
+///
+/// Deliberately narrower than [`loader_has_recorded_url_set`]: that one accepts
+/// a `URLClassLoader` carrying a `ucp` whose URL list may not have been recorded
+/// yet, which is precisely the "the local scan could not run" case a caller must
+/// still fall back for.
+pub(crate) fn loader_owns_complete_resource_view(
+    ctx: &dyn NativeContext,
+    loader: ObjectRef,
+) -> bool {
+    object_extends(ctx, loader, "java/net/URLClassLoader")
+        && !loader_constructor_url_paths(ctx, loader).is_empty()
+}
+
 /// Is a package with class files under `class_glob` (e.g.
 /// `com/example/pkg/*.class`) visible **to this specific loader**?
 ///
@@ -7850,10 +7910,44 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let resource_name = name.trim_start_matches('/').to_string();
 
-    // Run the standard flat-classpath scan first while the arguments are
-    // still fresh; custom-handler/local probing below can allocate.
     let p_this = ctx.pin_native_root(this);
-    let std_enum = cl_get_resources_impl(ctx, args, false)?;
+
+    // Does this receiver's OWN URL list answer the question? That decides what
+    // an EMPTY local scan MEANS, and the two meanings need opposite handling:
+    //
+    //   * URL list knowable, scan empty  -> the resource genuinely is not on
+    //     this loader's classpath. Returning it anyway is a leak.
+    //   * URL list not knowable at all   -> the local scan could not run; the
+    //     historical process-wide scan is all there is.
+    //
+    // Only the first case is new. It is what Spring Boot's
+    // `ModifiedClassPathClassLoader` builds on purpose: it filters
+    // `hibernate-validator-*.jar` / `logback-*.jar` out of its own `URL[]` so a
+    // `@ClassPathExclusions` test sees a classpath without them. Falling back to
+    // the flat scan handed that jar's `META-INF/services` entry straight back,
+    // while `loadClass` still (correctly) refused the class it names --
+    // `ServiceLoader` then read a registration for a provider it could not load
+    // and raised `ServiceConfigurationError: ... Provider ... not found` where
+    // HotSpot finds no providers at all. See
+    // `docs/internal/fixed-suite-bugs/springboot/`
+    // `classpath-exclusions-flat-scan-leak-FIXED.md`.
+    //
+    // The SINGULAR `findResource` has drawn this line since the ModifiedClassPath
+    // work (see its `object_extends(.., "java/net/URLClassLoader")` early return);
+    // this is the plural half of the same rule, kept narrower so a loader whose
+    // URLs CratonVM cannot see behaves exactly as before.
+    let this_probe = ctx.read_native_pin(p_this, this);
+    let has_own_urls = !loader_constructor_url_paths(ctx, this_probe).is_empty();
+
+    // Run the standard flat-classpath scan first while the arguments are
+    // still fresh; custom-handler/local probing below can allocate. Skipped
+    // outright when the receiver answers for itself -- besides being the leak
+    // above, it is a full process-wide walk per `findResources` call.
+    let std_enum = if has_own_urls {
+        None
+    } else {
+        cl_get_resources_impl(ctx, args, false)?
+    };
     let std_ref = match std_enum {
         Some(Value::Object(Some(e))) => Some(e),
         _ => None,
@@ -7898,7 +7992,13 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
         )?))),
         None => match local_ref.or(std_ref) {
             Some(e) => Some(Value::Object(Some(e))),
-            None => std_enum,
+            // `std_enum` is `None` in exactly the `has_own_urls` case, so the
+            // empty enumeration below is this loader's own authoritative "no
+            // matches" -- not a dropped result.
+            None => match std_enum {
+                Some(e) => Some(e),
+                None => Some(Value::Object(Some(empty_enumeration_impl(ctx)?))),
+            },
         },
     };
     ctx.unpin_native_roots(p_this);
@@ -10662,6 +10762,165 @@ mod classloader_tests {
             file_field.contains("tomcat0807_webapp.txt"),
             "returned URL should point at the receiver-local resource, got {file_field}"
         );
+    }
+
+    /// A loader whose OWN URL list is knowable answers `findResources` out of
+    /// that list alone. An empty answer is the answer — widening it with the
+    /// process-wide scan is what handed a `@ClassPathExclusions` test back the
+    /// `META-INF/services` entry of the very jar it excluded.
+    #[test]
+    fn test_urlclassloader_find_resources_does_not_fall_back_to_flat_scan() {
+        const SPI: &str = "META-INF/services/org.slf4j.spi.SLF4JServiceProvider";
+
+        // The loader's own URL: a directory that does NOT hold the descriptor,
+        // standing in for a classpath the excluded jar was filtered out of.
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut ctx = MockNativeContext::new();
+        let loader = new_object_ref(&mut ctx, "java/net/URLClassLoader");
+        let ucp = new_object_ref(&mut ctx, "jdk/internal/loader/URLClassPath");
+        let url = new_object_ref(&mut ctx, "java/net/URL");
+        let path = ctx.create_string(&dir.path().to_string_lossy());
+        ctx.set_field(url, 3, Value::Object(Some(path)));
+        ctx.set_field_by_name(loader, "ucp", Value::Object(Some(ucp)));
+        let urls = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        ctx.set_array_element(urls, 0, Value::Object(Some(url)));
+        ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(urls)));
+
+        // ... while the PROCESS-WIDE classpath does hold it. This is the leak
+        // source: without it the assertion below would pass vacuously.
+        ctx.set_resource(
+            SPI,
+            b"ch.qos.logback.classic.spi.LogbackServiceProvider\n".to_vec(),
+        );
+        let flat_name = ctx.create_string(SPI);
+        let flat = cl_get_resources_impl(
+            &mut ctx,
+            &[
+                Value::Object(Some(loader)),
+                Value::Object(Some(flat_name)),
+            ],
+            false,
+        )
+        .expect("flat scan")
+        .expect("flat scan return value");
+        assert_eq!(
+            enumeration_len(&mut ctx, flat),
+            1,
+            "the process-wide scan must see this descriptor, else the assertion \
+             below would pass without the leak ever being possible"
+        );
+
+        assert!(
+            loader_local_resource_urls(&mut ctx, loader, SPI).is_empty(),
+            "receiver-local scan must not find the excluded descriptor"
+        );
+
+        let name = ctx.create_string(SPI);
+        let found = ucl_find_resources(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .expect("findResources native")
+        .expect("return value");
+        assert_eq!(
+            enumeration_len(&mut ctx, found),
+            0,
+            "an empty receiver-local result must be returned as-is, not replaced \
+             by the process-wide classpath scan"
+        );
+    }
+
+    /// A loader CratonVM has NO URL view of keeps the historical flat-scan
+    /// fallback — "the local scan found nothing" and "the local scan could not
+    /// run" are different answers and only the first one is authoritative.
+    #[test]
+    fn test_urlclassloader_find_resources_keeps_flat_scan_without_recorded_urls() {
+        const SPI: &str = "META-INF/services/com.acme.Service";
+
+        let mut ctx = MockNativeContext::new();
+        let loader = new_object_ref(&mut ctx, "java/net/URLClassLoader");
+        ctx.set_resource(SPI, b"com.acme.Provider\n".to_vec());
+
+        assert!(
+            loader_constructor_url_paths(&ctx, loader).is_empty(),
+            "fixture must leave this loader's URL list unknowable"
+        );
+
+        let name = ctx.create_string(SPI);
+        let found = ucl_find_resources(
+            &mut ctx,
+            &[Value::Object(Some(loader)), Value::Object(Some(name))],
+        )
+        .expect("findResources native")
+        .expect("return value");
+        assert_eq!(
+            enumeration_len(&mut ctx, found),
+            1,
+            "with no recorded URLs the process-wide scan is all there is"
+        );
+    }
+
+    /// The platform loader owns the JDK module surface and nothing else. Serving
+    /// it the flat application classpath makes every child parented to it — the
+    /// shape `ModifiedClassPathClassLoader` is built on — see the very jars its
+    /// exclusions removed, through parent-first delegation.
+    #[test]
+    fn test_platform_loader_get_resources_excludes_application_classpath() {
+        const SPI: &str = "META-INF/services/org.slf4j.spi.SLF4JServiceProvider";
+
+        let mut ctx = MockNativeContext::new();
+        ctx.set_resource(
+            SPI,
+            b"ch.qos.logback.classic.spi.LogbackServiceProvider\n".to_vec(),
+        );
+
+        // Control: an ordinary receiver still gets the application classpath, so
+        // an empty answer below is the platform rule and not an empty fixture.
+        let app = new_object_ref(&mut ctx, "jdk/internal/loader/ClassLoaders$AppClassLoader");
+        let app_name = ctx.create_string(SPI);
+        let app_enum = cl_get_resources_impl(
+            &mut ctx,
+            &[Value::Object(Some(app)), Value::Object(Some(app_name))],
+            true,
+        )
+        .expect("app getResources")
+        .expect("app return value");
+        assert_eq!(
+            enumeration_len(&mut ctx, app_enum),
+            1,
+            "the application loader must still see the process classpath"
+        );
+
+        let platform = new_object_ref(
+            &mut ctx,
+            "jdk/internal/loader/ClassLoaders$PlatformClassLoader",
+        );
+        let name = ctx.create_string(SPI);
+        let found = cl_get_resources_impl(
+            &mut ctx,
+            &[Value::Object(Some(platform)), Value::Object(Some(name))],
+            true,
+        )
+        .expect("platform getResources")
+        .expect("return value");
+        assert_eq!(
+            enumeration_len(&mut ctx, found),
+            0,
+            "the platform loader must not enumerate application-classpath resources"
+        );
+    }
+
+    /// Length of a snapshot `Enumeration$Impl` (field 0 is its backing array).
+    fn enumeration_len(ctx: &mut MockNativeContext, value: Value) -> usize {
+        let enm = match value {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected an Enumeration object, got {other:?}"),
+        };
+        match ctx.get_field(enm, 0) {
+            Value::Object(Some(arr)) => ctx.array_length(arr),
+            _ => 0,
+        }
     }
 
     #[test]

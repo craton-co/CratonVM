@@ -911,6 +911,30 @@ fn discover_providers(
         })
         .unwrap_or(false);
 
+    // Is the loader-scoped lookup below EXHAUSTIVE for this loader — i.e. may an
+    // empty result be taken at face value?
+    //
+    // The flat classpath scan further down unions the `META-INF/services/<svc>`
+    // descriptors of EVERY jar in the process, with no notion of any one
+    // loader's classpath. For a loader built specifically to hide a jar
+    // (Spring Boot's `ModifiedClassPathClassLoader` under
+    // `@ClassPathExclusions`), that scan re-adds the very provider registration
+    // the exclusion removed, while `loadClass` still refuses the class it names
+    // — so `ServiceLoader` reads a registration it cannot honour and raises
+    // `ServiceConfigurationError: <svc>: Provider <cn> not found` (the
+    // `loaded == 0 && !missing.is_empty()` arm below) where HotSpot simply
+    // discovers no providers.
+    //
+    // `loader_owns_complete_resource_view` is true only when the receiver is a
+    // `URLClassLoader`-family loader whose own URL list CratonVM can enumerate in
+    // full — exactly the condition under which `ucl_find_resources` returns an
+    // authoritative (possibly empty) answer. Every other loader keeps the flat
+    // scan, including one whose URLs were never recorded: there the loader-scoped
+    // lookup could not run at all, and an empty result means nothing.
+    let loader_view_is_exhaustive = loader_ref_opt.is_some_and(|r| {
+        crate::classloader::loader_owns_complete_resource_view(ctx, r) && !loader_is_jboss_module
+    });
+
     let diag_sl = crate::nbflags().diag_serviceloader;
 
     if loader_is_jboss_module {
@@ -1054,7 +1078,15 @@ fn discover_providers(
                             got = true;
                         }
                     }
-                    if !got {
+                    // Reading the named URL failed, so fall back to resolving its
+                    // entry path against the classpath. For an embedded/synthetic
+                    // loader that is the only way in. For a URLClassLoader whose
+                    // own URLs are known this is a process-wide union under a
+                    // loader-scoped name — the same exclusion leak as the flat
+                    // scan below — and its URLs are ordinary `jar:`/`file:` ones
+                    // the two readers above already handle, so there is nothing
+                    // here for it to recover.
+                    if !got && !loader_view_is_exhaustive {
                         let bytes_list = ctx.find_all_resource_bytes(&entry_path);
                         for bytes in &bytes_list {
                             parse_provider_lines(bytes, &mut providers);
@@ -1196,7 +1228,14 @@ fn discover_providers(
     // Flat classpath scan: providers listed directly at
     // META-INF/services/<svc> on the classpath (normal case for
     // non-embedded loaders and JDK built-in providers).
-    let descriptors = if loader_is_jboss_module {
+    //
+    // Skipped when the loader already answered exhaustively for itself — see
+    // `loader_view_is_exhaustive`. Note this is NOT gated on the loader-scoped
+    // pass having FOUND anything: an empty authoritative answer is the whole
+    // point, and supplementing it here is what leaked an excluded jar's
+    // registration back in.
+    let skip_flat_scan = loader_is_jboss_module || loader_view_is_exhaustive;
+    let descriptors = if skip_flat_scan {
         Vec::new()
     } else {
         ctx.find_all_resource_bytes(&resource)
@@ -1205,7 +1244,7 @@ fn discover_providers(
         parse_provider_lines(bytes, &mut providers);
     }
     // Test mocks may stub `find_resource` without populating the bytes list.
-    if descriptors.is_empty() && !loader_is_jboss_module {
+    if descriptors.is_empty() && !skip_flat_scan {
         if let Some(bytes) = ctx.find_resource(&resource) {
             parse_provider_lines(&bytes, &mut providers);
         }
@@ -1223,9 +1262,25 @@ fn discover_providers(
     // META-INF/services FQNs. Providers that fail to load/instantiate are
     // skipped by the iterator, so a module-declared provider CratonVM cannot
     // construct is harmless.
-    let service_slash = service_name.replace('.', "/");
-    for mp in ctx.service_providers_from_modules(&service_slash) {
-        providers.push(mp.replace('/', "."));
+    //
+    // `service_providers_from_modules` reads ONE VM-global module registry, with
+    // no notion of which loader is asking — the third flavour of the same
+    // exclusion leak. It is also not what a real JVM does here: a modular jar
+    // reached through the CLASS path is an unnamed-module citizen whose
+    // `module-info` the JDK ignores outright, so `ServiceLoader` sees only its
+    // `META-INF/services`. `logback-classic.jar` is exactly that — it declares
+    // `provides SLF4JServiceProvider with LogbackServiceProvider`, and CratonVM
+    // was handing that declaration to a loader built to exclude the jar.
+    //
+    // A loader with its own recorded URL list IS a class-path loader, so skip
+    // the module source for it. Every other caller — notably the null/builtin
+    // loader behind `ToolProvider.getSystemJavaCompiler()`, the case this source
+    // exists for — is untouched.
+    if !loader_view_is_exhaustive {
+        let service_slash = service_name.replace('.', "/");
+        for mp in ctx.service_providers_from_modules(&service_slash) {
+            providers.push(mp.replace('/', "."));
+        }
     }
 
     providers.sort();
@@ -3378,6 +3433,150 @@ mod tests {
         let bytes = read_jar_url_entry(&synthetic_linux_url).unwrap();
         assert_eq!(bytes, b"com.acme.Provider\n");
     }
+    /// Build a `ModifiedClassPathClassLoader`-shaped receiver: a
+    /// `URLClassLoader` SUBCLASS (so it is not a builtin loader) whose own URL
+    /// list is a single directory — recorded, and deliberately not holding the
+    /// service descriptor.
+    fn modified_classpath_loader(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        own_dir: &std::path::Path,
+    ) -> cratonvm_types::ObjectRef {
+        let url_cid = ctx
+            .ensure_class_initialized("java/net/URLClassLoader")
+            .expect("URLClassLoader class");
+        let mcpcl_cid = ctx
+            .ensure_class_initialized(
+                "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader",
+            )
+            .expect("ModifiedClassPathClassLoader class");
+        ctx.set_superclass(mcpcl_cid, url_cid);
+        // The mock resolves field names off an exact-class-name table, so a
+        // SUBCLASS of URLClassLoader needs its inherited `ucp` declared or
+        // `set_field_by_name` silently no-ops and the fixture would present a
+        // loader with no URLs at all.
+        ctx.set_declared_fields(
+            mcpcl_cid,
+            vec![cratonvm_native_api::FieldMetadata {
+                name: "ucp".to_string(),
+                descriptor: "Ljdk/internal/loader/URLClassPath;".to_string(),
+                access_flags: 0,
+                slot_index: 0,
+                declaring_class_id: mcpcl_cid,
+                is_static: false,
+            }],
+        );
+        let mut new_ref = |ctx: &mut crate::test_utils::MockNativeContext, name: &str| match ctx
+            .new_object(name)
+            .unwrap()
+        {
+            Some(Value::Object(Some(obj))) => obj,
+            other => panic!("expected {name} object, got {other:?}"),
+        };
+        let loader = new_ref(
+            ctx,
+            "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader",
+        );
+        let ucp = new_ref(ctx, "jdk/internal/loader/URLClassPath");
+        let url = new_ref(ctx, "java/net/URL");
+        let path = ctx.create_string(&own_dir.to_string_lossy());
+        ctx.set_field(url, 3, Value::Object(Some(path)));
+        ctx.set_field_by_name(loader, "ucp", Value::Object(Some(ucp)));
+        let urls = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+        ctx.set_array_element(urls, 0, Value::Object(Some(url)));
+        ctx.set_field(ucp, crate::classloader::UCP_STASHED_URLS, Value::Object(Some(urls)));
+        loader
+    }
+
+    fn service_loader_for(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        service: &str,
+        loader: Value,
+    ) -> cratonvm_types::ObjectRef {
+        let service_id = ctx
+            .ensure_class_initialized(service)
+            .expect("create service class");
+        let service_mirror = ctx.get_class_mirror(service_id);
+        match build_service_loader(ctx, Value::Object(Some(service_mirror)), loader)
+            .expect("build ServiceLoader")
+        {
+            Some(Value::Object(Some(sl))) => sl,
+            other => panic!("expected ServiceLoader object, got {other:?}"),
+        }
+    }
+
+    /// The flat classpath scan must not re-add a provider registration that the
+    /// receiver's own (exclusion-filtered) URL list does not carry.
+    ///
+    /// This is the `@ClassPathExclusions` leak: the descriptor came back from a
+    /// process-wide scan, `loadClass` then correctly refused the class it named,
+    /// and `ServiceLoader` raised `ServiceConfigurationError: ... Provider ...
+    /// not found` where HotSpot discovers no providers at all.
+    #[test]
+    fn discover_providers_skips_flat_scan_for_a_loader_with_its_own_urls() {
+        const SVC: &str = "org.slf4j.spi.SLF4JServiceProvider";
+        let resource = format!("META-INF/services/{SVC}");
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut ctx = mock_ctx();
+        // The process-wide classpath DOES carry the descriptor — without this
+        // the assertion below could not fail even if the scan still ran.
+        ctx.set_resource(
+            &resource,
+            b"ch.qos.logback.classic.spi.LogbackServiceProvider\n".to_vec(),
+        );
+        // `logback-classic.jar` also DECLARES this provider in its `module-info`.
+        // On a real JVM that declaration is invisible to a class-path loader; the
+        // VM-global module registry offered it to every caller, so the same
+        // provider leaked back through a second door after the flat scan closed.
+        ctx.set_module_providers(
+            "org/slf4j/spi/SLF4JServiceProvider",
+            vec!["ch/qos/logback/classic/spi/LogbackServiceProvider"],
+        );
+
+        let loader = modified_classpath_loader(&mut ctx, dir.path());
+        assert!(
+            crate::classloader::object_extends(&ctx, loader, "java/net/URLClassLoader"),
+            "fixture loader must extend URLClassLoader"
+        );
+        assert!(
+            crate::classloader::loader_owns_complete_resource_view(&ctx, loader),
+            "fixture must present a URLClassLoader-family loader with recorded URLs"
+        );
+        let sl = service_loader_for(&mut ctx, "org/slf4j/spi/SLF4JServiceProvider", Value::Object(Some(loader)));
+        // `discover_providers` reads the named `loader` field, then legacy slot 1.
+        assert!(
+            matches!(ctx.get_field_by_name(sl, "loader"), Value::Object(Some(_)))
+                || matches!(ctx.get_field(sl, 1), Value::Object(Some(_))),
+            "fixture must put the loader where discover_providers reads it"
+        );
+
+        let providers = discover_providers(&mut ctx, sl).expect("discover providers");
+        assert!(
+            providers.is_empty(),
+            "a loader whose own URL list excludes the jar must discover no \
+             providers from it; got {providers:?}"
+        );
+    }
+
+    /// Control for the test above: with no loader to answer for itself, the flat
+    /// classpath scan is still the discovery mechanism.
+    #[test]
+    fn discover_providers_keeps_flat_scan_without_a_scoped_loader() {
+        const SVC: &str = "com.acme.Service";
+        let resource = format!("META-INF/services/{SVC}");
+
+        let mut ctx = mock_ctx();
+        ctx.set_resource(&resource, b"com.acme.Provider\n".to_vec());
+        let sl = service_loader_for(&mut ctx, "com/acme/Service", Value::Object(None));
+
+        let providers = discover_providers(&mut ctx, sl).expect("discover providers");
+        assert_eq!(
+            providers,
+            vec!["com.acme.Provider"],
+            "the flat classpath scan must still serve loaders CratonVM has no URL view of"
+        );
+    }
+
     #[test]
     fn discover_providers_includes_jpms_module_provides_entries() {
         let mut ctx = mock_ctx();
