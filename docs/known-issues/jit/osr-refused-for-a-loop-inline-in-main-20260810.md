@@ -121,7 +121,7 @@ Not, on the evidence so far, application throughput: Spring's hot code is in
 called methods, and the WebFlux investigation measured the whole OSR question as
 worth ~nothing there (`osr_entered=0` on that workload, with the run's cost
 diffuse — see
-`springboot/webfluxautoconfigurationtests-recurring-timeout-hang-20260807.md`).
+`fixed-suite-bugs/springboot/webfluxautoconfigurationtests-recurring-timeout-RETIRED-20260810.md`).
 
 It hurts **measurement**. A benchmark whose loop sits in `main` — the default
 way anyone writes a quick probe — measures the interpreter at ~180x. In this
