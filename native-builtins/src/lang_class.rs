@@ -5525,7 +5525,27 @@ pub(crate) fn verify_member_access(
     // `public_member_class_is_reachable`, and asks it correctly — answered with
     // the value. `StaticFieldELResolver.getValue` consults `canAccess`, so the
     // disagreement surfaced as `PropertyNotFoundException` with a null cause.
-    // See docs/internal/tomcat/teststaticfieldelresolver-get-type-field-not-found.md.
+    // See docs/internal/tomcat/teststaticfieldelresolver-get-type-field-not-found-CLOSED.md.
+    let declaring_is_public =
+        (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) != 0;
+
+    // A public member of a public class needs no package at all, and it is the
+    // overwhelmingly common answer. `package_of_class_id` allocates two Strings
+    // per call, and `jakarta.el.Util.canAccess` sits on EL's method-resolution
+    // path — computing the package before this test made every EL invocation
+    // pay for a question it never asks.
+    if declaring_is_public && (modifiers & SA_ACC_PUBLIC) != 0 {
+        return true;
+    }
+
+    // Package NAME only, deliberately, and not `Reflection.isSameClassPackage`'s
+    // name-plus-defining-loader pair. This is the same comparison the sibling
+    // gate `public_member_class_is_reachable` (the one `Field.get` asks) already
+    // makes, and the two must not disagree — that disagreement is the whole
+    // defect this reordering fixes. Two classes sharing a package NAME under
+    // different loaders are distinct run-time packages to HotSpot and would be
+    // refused there; tightening both gates together needs its own witness, so
+    // it is not done here.
     let same_package = match (
         package_of_class_id(ctx, caller_id),
         package_of_class_id(ctx, declaring_id),
@@ -5533,7 +5553,7 @@ pub(crate) fn verify_member_access(
         (Some(a), Some(b)) => a == b,
         _ => false,
     };
-    if (i32::from(ctx.class_access_flags(declaring_id)) & SA_ACC_PUBLIC) == 0 && !same_package {
+    if !declaring_is_public && !same_package {
         return false;
     }
 
