@@ -201,24 +201,86 @@ pub mod mic_prof {
         unsafe { core::arch::x86_64::_rdtsc() }
     }
 
+    /// Counter families for the re-entrancy gate. Depth is tracked PER FAMILY,
+    /// not globally: `cyc_invoke` is nested inside `cyc_mic_total` by
+    /// construction, so one shared depth would silently stop `cyc_invoke` ever
+    /// accumulating — which is precisely the number the funnel question needs.
+    const CYC_FAMILIES: usize = 5;
+
+    fn cyc_family(ctr: &'static AtomicU64) -> usize {
+        if std::ptr::eq(ctr, &CYC_MIC_TOTAL) {
+            0
+        } else if std::ptr::eq(ctr, &CYC_HIT_ENTRY_CALL) {
+            1
+        } else if std::ptr::eq(ctr, &CYC_INVOKE) {
+            2
+        } else if std::ptr::eq(ctr, &CYC_COMPILE_PROBE) {
+            3
+        } else {
+            4 // CYC_DISP_TOTAL
+        }
+    }
+
+    thread_local! {
+        /// Re-entrancy depth per counter family, so a nested dispatch does not
+        /// add its cycles to an enclosing span of the SAME family.
+        static CYC_DEPTH: std::cell::Cell<[u32; CYC_FAMILIES]> =
+            const { std::cell::Cell::new([0; CYC_FAMILIES]) };
+    }
+
     /// Cycle accumulator that survives early returns.
+    ///
+    /// **Only the OUTERMOST guard accumulates.** These spans cover the whole
+    /// helper *including execution of the callee*, and a compiled callee
+    /// routinely dispatches again — so a naive guard counts the inner call's
+    /// cycles at every enclosing level. That is not a small distortion: on
+    /// `ZipContentTests` the naive `cyc_mic_total` + `cyc_disp_total` summed to
+    /// 2.9e12 cycles against a ~260 s CPU run, i.e. roughly 4x more time than
+    /// the process actually had, which makes the totals unusable as a share of
+    /// anything and quietly invites reading them as one.
+    ///
+    /// Gating on depth makes them true wall-of-the-outermost-call totals, so
+    /// `cyc_mic_total - cyc_invoke` is the funnel's own cost rather than a
+    /// number contaminated by every callee beneath it.
     pub struct CycGuard {
         t0: u64,
         ctr: &'static AtomicU64,
+        family: usize,
     }
     impl CycGuard {
         pub fn new(ctr: &'static AtomicU64) -> Option<Self> {
-            if enabled() {
-                Some(Self { t0: now(), ctr })
-            } else {
-                None
+            if !enabled() {
+                return None;
             }
+            let family = cyc_family(ctr);
+            let outermost = CYC_DEPTH.with(|d| {
+                let mut cur = d.get();
+                let was = cur[family];
+                cur[family] = was + 1;
+                d.set(cur);
+                was == 0
+            });
+            // `u64::MAX` marks "nested — hold the depth, accumulate nothing".
+            Some(Self {
+                t0: if outermost { now() } else { u64::MAX },
+                ctr,
+                family,
+            })
         }
     }
     impl Drop for CycGuard {
         fn drop(&mut self) {
-            self.ctr
-                .fetch_add(now().wrapping_sub(self.t0), Ordering::Relaxed);
+            let family = self.family;
+            CYC_DEPTH.with(|d| {
+                let mut cur = d.get();
+                cur[family] = cur[family].saturating_sub(1);
+                d.set(cur);
+            });
+            // `u64::MAX` is the "nested, do not accumulate" marker set in `new`.
+            if self.t0 != u64::MAX {
+                self.ctr
+                    .fetch_add(now().wrapping_sub(self.t0), Ordering::Relaxed);
+            }
         }
     }
 
