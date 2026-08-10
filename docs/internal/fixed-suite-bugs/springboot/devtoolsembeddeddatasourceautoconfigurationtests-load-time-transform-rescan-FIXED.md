@@ -106,6 +106,25 @@ the verdict does not rest on comparing two builds:
 | default | **PASS 4/4** |
 | `CRATONVM_DBG=load-transform-no-memo` | **TIMEOUT at 300s**, 0-byte stdout, `.err.log` ending at the Mockito self-attach line — the filed signature, byte for byte |
 
+### Where the fixed binary lands
+
+This box is shared and its load moves a lot (the same Aug-05 binary measured
+21.4s on a quiet box and 43.0s on a busy one), so the numbers below were taken
+**interleaved, HotSpot first and last**, so the control brackets the arms:
+
+| Arm | Seconds |
+|---|---:|
+| HotSpot (run 1) | 6.08 |
+| CratonVM, fix applied | **49.6** |
+| CratonVM, `cratonvm-fullsuite1shard-20260805.exe` (pre-hook) | 43.0 |
+| HotSpot (run 2) | 6.07 |
+
+The fix lands within ~15% of the binary that predates the hook entirely, which
+is the right shape: one offer per class is not free, but it is a bounded
+one-shot cost rather than a per-resolution one. The remaining 8.2x against
+HotSpot is this suite's ordinary Spring-context-startup gap and is not this
+bug.
+
 ## Fix
 
 `vm/src/runtime/instrument.rs`: claim one load-time offer per class name per
