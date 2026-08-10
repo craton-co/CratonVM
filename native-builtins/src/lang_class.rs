@@ -14204,10 +14204,18 @@ pub(crate) fn annotation_element_to_java_typed(
                 }
                 let scoped = container_class_id
                     .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-                if let Some(cid) = scoped.or_else(|| ctx.class_id_by_name(class_name)) {
+                let global = ctx.class_id_by_name(class_name);
+                if let Some(cid) = scoped.or(global) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
-                        eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
+                        eprintln!(
+                            "ANN-CLASS desc={desc} class={class_name} already-loaded ok \
+                             holder={:?}/L{:?} via={} answer=L{}",
+                            container_class_id.map(|h| h.as_u32()),
+                            container_class_id.map(|h| ctx.loader_id_of_class(h)),
+                            if scoped.is_some() { "scoped" } else { "GLOBAL" },
+                            ctx.loader_id_of_class(cid),
+                        );
                     }
                     return Ok(Value::Object(Some(mirror)));
                 }
