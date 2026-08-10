@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Reference data point, supports [gc-moving-young-persistent-nonmoving-fallback-regression.md](gc-moving-young-persistent-nonmoving-fallback-regression.md) and [g1-sigsegv-unguarded-callee-jit-frame.md](g1-sigsegv-unguarded-callee-jit-frame.md) |
+| **Status** | Reference data point, supports `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md` and [g1-sigsegv-unguarded-callee-jit-frame.md](g1-sigsegv-unguarded-callee-jit-frame.md) |
 | **Discovered** | 2026-08-10, `dev` merge, 3 parallel 2-shard full-suite runs (one per GC backend), each on its own uniquely-named binary |
 
 ## Method
@@ -31,7 +31,7 @@ though not an isolated-host measurement).
   print a summary — worth its own look, not yet identified which class), and
   the longest wall time despite having the fewest genuine FAILs. This is
   consistent with — and a much larger-scale confirmation of —
-  [gc-moving-young-persistent-nonmoving-fallback-regression.md](gc-moving-young-persistent-nonmoving-fallback-regression.md)'s
+  `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`'s
   hypothesis that the generational collector's persistent fallback to a
   non-moving sweep is a broad throughput problem, not a niche one.
 - **G1 finishes faster and hangs less, but crashes** — see
@@ -155,7 +155,7 @@ The counter reaches **#1024** within a single class, across seven reasons:
 these classes making *progress* the whole time — Tomcat starting, servicing,
 stopping — just far too slowly to finish inside 300s. Throughput, not deadlock.
 
-This is [gc-moving-young-persistent-nonmoving-fallback-regression.md](gc-moving-young-persistent-nonmoving-fallback-regression.md)
+This is `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`
 at class-list scale, and the 0-vs-0 rows are why the other two backends are
 clean here: the mechanism is generational-only by construction, so a collector
 that does not have that young-generation copying path cannot exhibit it.
@@ -242,7 +242,7 @@ that is where to look, but nothing here establishes it.
 
 ## Not yet done
 
-- The default-GC run's `NOSUMMARY` was `org.apache.catalina.tribes.test.channel.TestDataIntegrity` — already part of the known-environmental multicast family (see [tribes-multicast-family-still-environmental.md](tribes-multicast-family-still-environmental.md)), but a VM abort with no JUnit summary at all is a stronger symptom than that family's usual assertion failures. Not yet checked whether this is a distinct VM-abort defect or the same environmental flakiness manifesting differently under load.
+- The default-GC run's `NOSUMMARY` was `org.apache.catalina.tribes.test.channel.TestDataIntegrity` — already part of the known-environmental multicast family (see [!tribes-multicast-family-still-environmental.md](!tribes-multicast-family-still-environmental.md)), but a VM abort with no JUnit summary at all is a stronger symptom than that family's usual assertion failures. Not yet checked whether this is a distinct VM-abort defect or the same environmental flakiness manifesting differently under load.
 - ~~Diff the FAIL/HANG class lists across the three backends.~~ **DONE
   2026-08-10**, all three columns — see the three sections above. Summary:
   default-only 63, G1-only 6, ZGC-only 2. The asymmetry is the finding: the
