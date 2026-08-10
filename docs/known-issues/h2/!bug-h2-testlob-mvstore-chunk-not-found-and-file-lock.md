@@ -1,6 +1,21 @@
 # `TestLob` fails past the LOB pipe-stream fix: `MVStoreException: Chunk N not found` and `OverlappingFileLockException`
 
 ## Status
+
+**HotSpot control, 2026-08-10 — the H2 race fires on stock HotSpot too.**
+This page attributes symptom 1 to a real H2-level chunk-reclaim race "made
+practically reachable by CratonVM's documented raw interpreter-throughput gap".
+A stock HotSpot 25 control over the H2 non-passing set on the same host, same
+build, same classpath, same 300 s cap now shows **HotSpot failing `TestLob`
+with the same `MVStoreException: Chunk 6 not found`**. So the race does not
+need CratonVM's throughput gap to be reachable — it is reachable on this host
+under load on the reference VM. That strengthens the page's conclusion (not a
+CratonVM defect) and weakens only its explanation of *why* it shows up. Caveat
+worth carrying: that control shared the host with three concurrent CratonVM
+suite runs, so it establishes "reachable under load on HotSpot", not
+"reachable on an idle HotSpot".
+See `internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` §4.
+
 **CLOSED (2026-07-23 follow-up session) — both symptoms are now understood
 to be the SAME underlying H2-level mechanism, and are not open CratonVM
 defects.** One genuine, independent CratonVM bug was found and FIXED along
