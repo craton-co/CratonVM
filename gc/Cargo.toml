@@ -41,7 +41,12 @@ proptest = "1"
 loom = "0.7"
 
 [features]
-default = []
+# `zgc` is DEFAULT-ON as of 2026-08-10, because `GcAlgorithm`'s default is now
+# `Zgc` (`vm/src/config.rs`) and that variant is `#[cfg(feature = "zgc")]`. A
+# `--no-default-features` build still compiles: the default falls back to
+# `Generational` under the matching `cfg(not(...))`, and `-XX:+UseGenerationalGC`
+# remains the always-available escape hatch in either build.
+default = ["zgc"]
 # GPU-offload coordination primitives (Part F of the GPU offload plan).
 # Enables `safepoint::SafepointToken`, `Heap::enter_gpu_critical`, and
 # GC-delay logic that pauses collection while a token is held. With this
