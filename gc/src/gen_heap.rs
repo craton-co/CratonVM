@@ -391,6 +391,12 @@ pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
 /// live memory).
 pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
+/// striding OVER the watched base, inside some earlier object's computed
+/// extent. Bounds the log: a desynced grid can straddle one watched address on
+/// many consecutive objects.
+static MARKWHY_STRADDLE_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DoHead walk-desync hardening — count of forwarded young objects whose
 /// forwarding target failed validation (not inside old gen). Such a header is
 /// a phantom write from a desynced walk or corruption; the span is retained
@@ -9441,6 +9447,16 @@ impl GenerationalHeap {
         // (walk start, or the end of a known free block). Entries above the
         // watermark were collected while striding an unverified stretch.
         let mut dead_watermark: usize = 0;
+        // How much reclamation the ANOMALY UNWINDS threw away, and how often.
+        //
+        // `dead_regions.truncate(dead_watermark)` appears at five sites and is
+        // silent at every one of them. That makes two very different sweeps
+        // print the same thing: one that walked a clean grid and genuinely found
+        // nothing dead, and one that found plenty and unwound all of it on a
+        // grid anomaly. Distinguishing them is the whole question when a sweep
+        // reclaims less than expected, so count both.
+        let mut dead_unwinds: usize = 0;
+        let mut dead_unwound_entries: usize = 0;
         // H2-GCVAR: where the walk was last standing on ground truth (walk
         // start, the parallel prefix's verified end, or a free block's end),
         // and the object it strode immediately before the current cursor.
@@ -9613,6 +9629,8 @@ impl GenerationalHeap {
                     // it may cover a live object's interior. Unwind them
                     // (they have not been zeroed or published yet;
                     // over-retention is always safe under this sweep).
+                    dead_unwinds += 1;
+                    dead_unwound_entries += dead_regions.len() - dead_watermark;
                     dead_regions.truncate(dead_watermark);
                 }
                 if resynced {
@@ -9716,6 +9734,8 @@ impl GenerationalHeap {
                     // Reclaim decisions taken since the last anchor were taken
                     // on a grid this span calls into question -- drop them. That
                     // half was always right.
+                    dead_unwinds += 1;
+                    dead_unwound_entries += dead_regions.len() - dead_watermark;
                     dead_regions.truncate(dead_watermark);
                     // What was wrong is the RESUME. Re-anchoring at the next
                     // FREE BLOCK abandons everything in between, and when the
@@ -9961,7 +9981,9 @@ impl GenerationalHeap {
                 // decisions made since the last anchor — they may cover a
                 // live object's interior. They have not been zeroed or
                 // published yet (deferred to the publication loop).
-                dead_regions.truncate(dead_watermark);
+                dead_unwinds += 1;
+                    dead_unwound_entries += dead_regions.len() - dead_watermark;
+                    dead_regions.truncate(dead_watermark);
                 if resync_to_next_free_block(&mut cursor, &mut free_iter) {
                     tracing::warn!(
                         "non-moving sweep: re-anchored at next free block (offset {}); \
@@ -10005,6 +10027,8 @@ impl GenerationalHeap {
                     // decisions since the last anchor are suspect — unwind
                     // them (over-retention safe) before re-anchoring at the
                     // hole, where the skip loop takes over.
+                    dead_unwinds += 1;
+                    dead_unwound_entries += dead_regions.len() - dead_watermark;
                     dead_regions.truncate(dead_watermark);
                     cursor = foff;
                     continue;
@@ -10086,6 +10110,8 @@ impl GenerationalHeap {
                     // grid this header calls into question — unwind it
                     // (over-retention is always safe under this sweep), then
                     // re-anchor exactly as the unlisted-zero-span path does.
+                    dead_unwinds += 1;
+                    dead_unwound_entries += dead_regions.len() - dead_watermark;
                     dead_regions.truncate(dead_watermark);
                     if let Some(a) = next_grid_anchor(&grid_anchors, cursor) {
                         if a > cursor && a < used {
@@ -10184,6 +10210,52 @@ impl GenerationalHeap {
                     header.is_forwarded(),
                     header.gc_flags() & GC_FLAG_MARKED != 0,
                 );
+            }
+
+            // MARKWHY, the STRADDLE case — and the one that matters when the
+            // line above never prints.
+            //
+            // "The walk covers the address and never stops at it" is a
+            // statement about SOME OTHER object: the base is inside an extent
+            // the walk computed for an object that starts earlier. The arm
+            // above can never report that, because it tests for equality with
+            // the base. This one names the culprit, and prints the raw header
+            // words the stride was computed from rather than a re-read — a
+            // re-read after the fact is exactly what a desync corrupts.
+            //
+            // Bounded to a handful of lines: a straddle is at most one object
+            // per watch per sweep, and the counter stops a pathological grid
+            // from filling a log.
+            if sweep_mark_why != 0 {
+                let base = from_base + cursor;
+                if base < sweep_mark_why && sweep_mark_why < base + total_size {
+                    let n = MARKWHY_STRADDLE_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        // SAFETY: `cursor + HEADER_SIZE <= used` for any object
+                        // the walk sized, so both header words are in-bounds.
+                        let (raw0, raw1) = unsafe {
+                            (
+                                *(obj_ptr as *const u64),
+                                *((obj_ptr as *const u64).add(1)),
+                            )
+                        };
+                        eprintln!(
+                            "[MARKWHY] STRADDLE: object @{base:#x} off={cursor:#x} size={total_size}                              swallows watch={sweep_mark_why:#x} (+{} into it)                              class_id={} kind={:?} elem={:?} shape={} compact={}                              body_size={} array_len={} raw0={raw0:#018x} raw1={raw1:#018x}                              since_anchor={objects_since_anchor} anchor={last_anchor_off:#x}                              prev=({:#x},{},{},{})",
+                            sweep_mark_why - base,
+                            header.class_id.as_u32(),
+                            header.kind(),
+                            header.element_type(),
+                            header.shape,
+                            is_compact_object(header),
+                            object_body_size(header),
+                            header.array_length(),
+                            prev_obj.0,
+                            prev_obj.1,
+                            prev_obj.2,
+                            prev_obj.3,
+                        );
+                    }
+                }
             }
 
             if header.is_forwarded() {
@@ -10630,9 +10702,21 @@ impl GenerationalHeap {
         {
             let w = crate::heap::young_mark_watch();
             if w != 0 && w >= from_base {
+                // `objects_swept` is NOT reportable here: its only increment
+                // is in the publication loop several hundred lines below, so
+                // reading it at this point prints a structural zero on every
+                // run, on every workload, whether the sweep reclaimed a million
+                // objects or none. It did exactly that once, and the zero was
+                // read as "this sweep reclaimed NOTHING" — a whole-VM
+                // reclamation-failure conclusion drawn from a counter that had
+                // not been written yet.
+                //
+                // The walk-time facts are `dead_regions` and what the anomaly
+                // unwinds took out of it, so report those.
                 eprintln!(
-                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} objects_swept={objects_swept}",
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} dead_regions={} dead_watermark={dead_watermark}                      unwinds={dead_unwinds} unwound_entries={dead_unwound_entries}",
                     w - from_base,
+                    dead_regions.len(),
                 );
             }
         }
@@ -11016,6 +11100,25 @@ impl GenerationalHeap {
             );
         }
         report_phase("zero-and-publish");
+
+        // MARKWHY: what this sweep ACTUALLY reclaimed, read after the only
+        // place that writes it.
+        //
+        // The companion of the note on the `walk ended` line above. That line
+        // is the right place to report the walk's decisions and the wrong place
+        // to report their execution, because publication happens here. Anyone
+        // asking "did this sweep free anything" needs this line, and asking the
+        // earlier one gets a zero that means nothing.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    "[MARKWHY] sweep done: objects_swept={objects_swept} bytes_swept={bytes_swept}                      dead_regions={} reclaimed_regions={} deferred={defer_reclamation}",
+                    dead_regions.len(),
+                    reclaimed_regions.len(),
+                );
+            }
+        }
 
         // DBG (CRATONVM_DBG_SWEEP_CENSUS): per-cycle census of what this sweep
         // reclaimed, by class. A continuously-live workload class (e.g. the
