@@ -23,6 +23,68 @@
 
 use super::*;
 
+/// Per-phase timing for [`try_lambda_dispatch`], armed by
+/// `CRATONVM_DBG=lambda-prof`.
+///
+/// Exists because a lambda's SAM call measures ~4.2 us on this VM against ~18 ns
+/// for the *identical* interface call on a named class (monomorphic call sites,
+/// both measurement orders — see the `LambdaProbe2` numbers in the WebFlux
+/// throughput record) — a ~220x penalty HotSpot does not have, and large enough
+/// to dominate lambda-dense workloads such as Spring context startup. Naming the
+/// term needs the total and the parts measured in the same run: reading the
+/// source offers four plausible candidates (the call-site clone, argument
+/// coercion, the by-name class resolution, the target invoke) and cannot rank
+/// them.
+///
+/// Off by default and behind a `OnceLock`, so an unprofiled run pays one relaxed
+/// load per dispatch.
+pub(crate) mod lambda_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub(crate) static CALLS: AtomicU64 = AtomicU64::new(0);
+    /// Whole `try_lambda_dispatch`, entry to return.
+    pub(crate) static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    /// The `lambda_proxies` read + `LambdaCallSite` clone.
+    pub(crate) static LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
+    /// Everything between the lookup and the target invoke: descriptor splits,
+    /// capture prepending, `coerce_lambda_args`.
+    pub(crate) static PREP_NS: AtomicU64 = AtomicU64::new(0);
+    /// The target invoke itself — the impl body plus whatever class resolution
+    /// the chosen invoke entry point does on the way in.
+    pub(crate) static TARGET_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_LAMBDA_PROF").is_ok())
+    }
+
+    pub(crate) fn add(counter: &AtomicU64, ns: u64) {
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// How often to print. Every N dispatches, so a profile lands even on a run
+    /// that is killed at a timeout rather than exiting cleanly.
+    pub(crate) const REPORT_EVERY: u64 = 200_000;
+
+    pub(crate) fn report() {
+        let calls = CALLS.load(Ordering::Relaxed).max(1);
+        let total = TOTAL_NS.load(Ordering::Relaxed);
+        let lookup = LOOKUP_NS.load(Ordering::Relaxed);
+        let prep = PREP_NS.load(Ordering::Relaxed);
+        let target = TARGET_NS.load(Ordering::Relaxed);
+        let other = total.saturating_sub(lookup + prep + target);
+        eprintln!(
+            "[LAMBDA-PROF] calls={calls} total={}ns/call  lookup={}  prep={}  target={}  other={}",
+            total / calls,
+            lookup / calls,
+            prep / calls,
+            target / calls,
+            other / calls,
+        );
+    }
+}
+
 /// LambdaMetafactory argument adaptation (`samMethodType` → `instantiatedMethodType`).
 ///
 /// When a functional-interface SAM has erased parameters (commonly `Object`,
@@ -1215,7 +1277,27 @@ pub(crate) fn try_lambda_dispatch(
     LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
     let _lambda_dispatch_guard = LambdaDispatchGuard;
 
+    // `CRATONVM_DBG=lambda-prof` — see [`lambda_prof`]. The guard measures the
+    // whole call on every exit path (including the `return Ok(None)` fallthroughs
+    // that hand the call back to ordinary interface dispatch), because a term
+    // that only shows up on one arm would otherwise be invisible.
+    let prof = lambda_prof::on();
+    let prof_entry = prof.then(std::time::Instant::now);
+    struct ProfTotalGuard(Option<std::time::Instant>);
+    impl Drop for ProfTotalGuard {
+        fn drop(&mut self) {
+            let Some(t0) = self.0 else { return };
+            lambda_prof::add(&lambda_prof::TOTAL_NS, t0.elapsed().as_nanos() as u64);
+            let n = lambda_prof::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n % lambda_prof::REPORT_EVERY == 0 {
+                lambda_prof::report();
+            }
+        }
+    }
+    let _prof_total_guard = ProfTotalGuard(prof_entry);
+
     // Look up the lambda proxy metadata for this ClassId.
+    let lookup_start = prof.then(std::time::Instant::now);
     let call_site = {
         let proxies = shared.classes.lambda_proxies.read();
         match proxies.get(&obj_class_id) {
@@ -1223,6 +1305,14 @@ pub(crate) fn try_lambda_dispatch(
             None => return Ok(None), // Not a lambda proxy
         }
     };
+    if let Some(t) = lookup_start {
+        lambda_prof::add(&lambda_prof::LOOKUP_NS, t.elapsed().as_nanos() as u64);
+    }
+    // Marks the end of "prep" and the start of "target" for whichever
+    // MethodHandleKind arm runs below; each arm stamps it immediately before its
+    // own invoke. Left `None` on the arms that are not instrumented, which then
+    // report their whole cost under `other`.
+    let prep_start = prof.then(std::time::Instant::now);
     if crate::runtime::env_cache::lambda_dbg() {
         eprintln!(
             "[cratonvm-dbg] lambda dispatch entry: cid={} sam={}.{} impl={}.{}{} kind={:?}",
@@ -1572,6 +1662,10 @@ pub(crate) fn try_lambda_dispatch(
                     full_args.len(),
                 );
             }
+            let target_start = prep_start.map(|t| {
+                lambda_prof::add(&lambda_prof::PREP_NS, t.elapsed().as_nanos() as u64);
+                std::time::Instant::now()
+            });
             let result = if let Some(impl_cid) =
                 lambda_impl_dispatch_override_driven(shared, thread, &call_site)
             {
@@ -1597,6 +1691,9 @@ pub(crate) fn try_lambda_dispatch(
                     &full_args,
                 )?
             };
+            if let Some(t) = target_start {
+                lambda_prof::add(&lambda_prof::TARGET_NS, t.elapsed().as_nanos() as u64);
+            }
             if crate::runtime::env_cache::lambda_dbg() {
                 eprintln!(
                     "[cratonvm-dbg] lambda static-post-invoke: {}.{}{} result={:?}",
