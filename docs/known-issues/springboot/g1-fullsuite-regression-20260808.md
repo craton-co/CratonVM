@@ -773,11 +773,11 @@ a relocation the root set failed to cover.
 ## 6. Cross-references
 
 * `QuartzEndpointWebIntegrationTests` — its own open page,
-  [`quartzendpointwebintegrationtests-recurring-timeout-hang-20260807.md`](quartzendpointwebintegrationtests-recurring-timeout-hang-20260807.md),
+  `fixed-suite-bugs/springboot/quartzendpointwebintegrationtests-recurring-timeout-RETIRED-20260810.md`,
   whose history table already records HANG under default, G1 *and* ZGC on
   2026-08-07. Not a collector row.
 * `Log4J2LoggingSystemTests` also has
-  [`log4j2-logback-loggingsystemtests-modifiedclasspath-throughput-hang-20260807.md`](log4j2-logback-loggingsystemtests-modifiedclasspath-throughput-hang-20260807.md)
+  `fixed-suite-bugs/springboot/log4j2-logback-loggingsystemtests-RETIRED-20260810.md`
   for its *throughput* behaviour. The G1 failure in §3 is a different, harder
   symptom (memory corruption, not slowness) and belongs here.
 * `HikariDataSourceConfigurationTests` —
@@ -788,7 +788,7 @@ a relocation the root set failed to cover.
   closed the previous edition by exactly this method and had already found
   `BindConverterTests` green under G1 and
   `ChildManagementContextInitializerAotTests` *worse* under the default collector.
-* The ZGC companion, [`zgc-real-fullsuite-regression-20260808.md`](zgc-real-fullsuite-regression-20260808.md),
+* The ZGC companion, `fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`,
   shares 9 of these rows. Its "collector-agnostic timeout-boundary noise" reading
   is consistent with §2 for the non-reproducing rows; its own rows have not been
   re-measured here.
