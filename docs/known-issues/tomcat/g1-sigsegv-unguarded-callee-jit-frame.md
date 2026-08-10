@@ -106,9 +106,40 @@ fix. (`…DeploymentModification` times out on *both* arms, so it carries no
 signal at all here; and `…DeploymentWarXml`'s EXIT=1 is an ordinary test
 failure on both arms, not a crash.)
 
-Next attempt should therefore reproduce under suite-like conditions — several
-of these classes concurrently, or the shard that contained them — before
-reaching for any lever.
+### 4-way concurrency is not enough either
+
+Follow-up on the same binary: all 4 classes launched **simultaneously** under
+G1, each with its own `-Xmx2g`, 900 s cap, two rounds — the cheapest
+approximation of the shard pressure.
+
+| | r1 | r2 |
+|---|---|---|
+| `…AutomaticDeploymentModification` | TIMEOUT | TIMEOUT |
+| `…AutomaticDeploymentWar` | EXIT=0 | EXIT=0 |
+| `…AutomaticDeploymentWarXml` | EXIT=0 | EXIT=0 |
+| `TestHttpServletDoHead…` | EXIT=0 | EXIT=0 |
+| **crash reports** | **0** | **0** |
+
+Zero `EXCEPTION_ACCESS_VIOLATION` in 8 more process-runs (16 total across both
+experiments). Note `…DeploymentWarXml` passes here where it returned EXIT=1
+standalone, so these classes' *ordinary* outcomes are load-dependent too — but
+the crash never appeared.
+
+So the trigger needs more than these 4 classes and more than 4-way
+concurrency: something about the 651-class run itself — cumulative allocation
+across many classes, the specific shard composition and ordering, or a
+neighbour class that primes the condition. Reproducing it will most likely
+require re-running the actual shard rather than a subset, which also means
+`CRATONVM_G1_COVERAGE_PIN` can only be applied at that scale (and its cost —
+measured above at roughly 2-7x — makes a full pinned shard expensive but not
+obviously impossible).
+
+**What is worth carrying forward regardless:** all 4 classes are named in
+`gc young-gen last incomplete-coverage reason: innermost-rbp-belongs-to-unguarded-callee`,
+and the Spring Boot G1 page's corruption is `--nojit`-clean. If the two are one
+defect, the cheaper Spring Boot reproducer (`Log4J2LoggingSystemTests`, ~9 min,
+200-560 zeroed-header reads per run) is a far better vehicle for the fix than
+a 651-class Tomcat shard, and a fix validated there should be re-checked here.
 
 ## Very likely the same defect as the Spring Boot G1 corruption — and the mechanism above may be the wrong one
 
