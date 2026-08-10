@@ -6,7 +6,7 @@
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
-| **Fourth in a chain** | [07-14](../../internal/fixed-suite-bugs/tomcat/defaultinstancemanager-classunloading-count-mismatch-FIXED.md) · [07-27](../../internal/fixed-suite-bugs/tomcat/defaultinstancemanager-classunload-offbyone-recurrence-FIXED.md) · [08-01](../../internal/fixed-suite-bugs/tomcat/defaultinstancemanager-third-recurrence-FIXED.md) |
+| **Fourth in a chain** | 07-14 `fixed-suite-bugs/tomcat/defaultinstancemanager-classunloading-count-mismatch-FIXED.md` · 07-27 `fixed-suite-bugs/tomcat/defaultinstancemanager-classunload-offbyone-recurrence-FIXED.md` · 08-01 `fixed-suite-bugs/tomcat/defaultinstancemanager-third-recurrence-FIXED.md` |
 
 ## Reproduction
 
