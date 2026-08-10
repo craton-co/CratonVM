@@ -39068,8 +39068,14 @@ fn reflect_array_element_assignable(
     // had been created FROM. `adapt` is generic over the component type, so it
     // must go through `Array.set` where ordinary code emits `aastore` and sails
     // past. That asymmetry, not the loader split on its own, is why this
-    // surfaced here and nowhere else. See
-    // `docs/known-issues/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md`.
+    // surfaced here and nowhere else.
+    //
+    // The split itself was found and fixed on 2026-08-10 — a compiled
+    // `invokestatic` bound its owner class by name, so `createProxy` ran in the
+    // wrong loader's copy. See
+    // `fixed-suite-bugs/spring/aotintegration-hangs-after-the-unmodifiable-get-fix.md`.
+    // This check stays: it is the lenient rule `aastore` has always applied,
+    // and `Array.set` is supposed to apply the same one.
     //
     // `None` means the context models no hierarchy (mocks): keep the exact-only
     // answer above rather than widening it.

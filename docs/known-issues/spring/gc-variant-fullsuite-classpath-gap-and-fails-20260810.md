@@ -174,6 +174,10 @@ clears.
   results from the identical run, where (unlike here) the non-passing set
   IS dominated by real CratonVM-level defects (a shared SIGSEGV site, a
   GC-guard near-miss) rather than a harness gap.
-- `aotintegration-hangs-after-the-unmodifiable-get-fix.md` (this folder) —
-  an earlier Spring AOT-related finding; check for overlap with the
-  `org/springframework/aot/` classpath-gap cluster above once that's fixed.
+- `aotintegration-hangs-after-the-unmodifiable-get-fix.md` — an earlier Spring
+  AOT finding, **closed 2026-08-10** and retired to the internal archive. Its
+  root cause was a compiled `invokestatic` binding its owner class by binary
+  NAME, so under `@CompileWithForkedClassLoader` it called into the other
+  loader's copy. Anything in the `org/springframework/aot/` cluster above that
+  involves two loaders defining one name should be re-run against a binary
+  carrying that fix before being investigated on its own.
