@@ -95,10 +95,35 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 //
 // They are deliberately decoupled from one another: each depends on a trait it
 // declares itself rather than on a sibling's concrete types, so they can land
-// and be reviewed independently. NONE of them is wired into `ZgcRealHeap` yet —
-// `ZgcRealHeap` is still the stop-the-world non-moving mark-sweep it has always
-// been. Declaring them here compiles and unit-tests them under `--features
-// zgc`; adopting them is a separate, later step.
+// and be reviewed independently.
+//
+// ADOPTION STATUS — recount before quoting. This said "NONE of them is wired
+// into `ZgcRealHeap` yet" from 2026-08-07 until 2026-08-10, and by the end of
+// that window HALF of them were. `gc/Cargo.toml` quoted it, and
+// `docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`
+// quoted that in turn to argue ZGC's suite result might be an artefact of an
+// unwired allocator — which is exactly the inference a stale count corrupts.
+// As of 2026-08-10, uses in THIS file outside `mod tests`:
+//
+//     census 24 · mark 15 · tlab 12 · vaddr 7 · page 2 · metrics 1   ADOPTED
+//     barrier · forwarding · remembered · generation · relocate · adapters  NOT
+//
+// The TLAB in particular is default-ON and serves `alloc_object`/`alloc_array`
+// through `alloc_raw_tlab`, so "not wired into the real allocator" is the one
+// phrasing to avoid. `vaddr` additionally reaches `gc/src/heap.rs` and
+// `vm/src/jit/helpers.rs`, as the tripwire that catches a colored word arriving
+// where a plain pointer belongs.
+//
+// What HAS not changed is the collector: `ZgcRealHeap` is still the
+// stop-the-world non-moving mark-sweep it has always been, and the six
+// unadopted modules are precisely the moving/generational/concurrent
+// machinery — `vm_init.rs` still hard-codes `RELOCATION_REQUESTED = false`.
+// Say that, rather than that nothing is wired in.
+//
+// Recount with, from the repo root:
+//
+//     awk '/^mod tests \{/{exit} {print}' gc/src/zgc.rs \
+//       | grep -c '\bcensus::'      # etc, per module
 
 /// Real colored-pointer encoding and virtual address space.
 pub mod vaddr;
