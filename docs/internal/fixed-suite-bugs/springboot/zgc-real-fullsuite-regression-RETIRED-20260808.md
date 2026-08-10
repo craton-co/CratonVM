@@ -270,9 +270,23 @@ family, and the G1 page stays open for them.
 `cargo test -p cratonvm-gc --features zgc`: 1456 lib tests + every integration
 target green.
 
-Known gap: `cargo test -p cratonvm-native-builtins --lib` does not compile on
-dev at all (619 errors, e.g. `alloc_concurrent_synthetic` not in scope at
-`lib.rs:42292`), confirmed pre-existing by stashing this branch's change and
-rebuilding the target. The three unit tests added beside `PROXY_CLASS_CACHE`
-are therefore written but unrun; the end-to-end oracle for §2 is the three
-Spring Boot classes above.
+`cargo test -p cratonvm-native-builtins --lib`: **3387 passed, 0 failed**,
+including the three tests added beside `PROXY_CLASS_CACHE`.
+
+That line was originally written the other way round — the target did not
+compile at all (619 errors, `alloc_concurrent_synthetic` not in scope), which
+was confirmed pre-existing at this branch's base by stashing the change and
+rebuilding. `254121675` ("finish the funnel migration inside the test modules")
+landed on dev the same evening and repaired it, so the tests run after the
+merge. Two things then came out of actually running them:
+
+* the crate's suite had one **flaky** test —
+  `security_manager::tests::test_check_access_thread_and_group` failed about
+  once in twenty whole-suite runs. It was the only policy-sensitive test in
+  that module not holding `policy_test_lock()`, so a policy-installing sibling
+  scheduled beside it turned the no-policy ALLOW it asserts into a DENY. Run as
+  a pair on two threads: 27/30 failures before, 0/30 after. Whole suite: 0/30
+  after.
+* a compiling test target is not a running one, and neither is a passing single
+  run. "Unrun" was the honest status when this was written; it should not have
+  been left as the final one.
