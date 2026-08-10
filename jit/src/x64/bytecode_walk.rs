@@ -6470,8 +6470,30 @@ impl Compiler {
                             } else {
                                 ARG_REGS.len()
                             };
+                            // 5. The callee cannot stash a deopt frame.
+                            //
+                            // A sibling tail call REPLACES this frame, so the
+                            // callee returns straight to OUR caller — and if it
+                            // traps, the `i64::MIN` sentinel and the frame it
+                            // stashed under the CALLEE's key arrive at a call
+                            // site that invoked US. That site's identity gate
+                            // (`try_resume_trapped_callee`) correctly refuses a
+                            // stash naming a method it did not call, and the
+                            // frame becomes an orphan nobody can attribute.
+                            // A real CALL keeps this frame alive long enough
+                            // for `emit_inline_callee_deopt_check` below to
+                            // service the trap at the site that made it.
+                            //
+                            // `info_ptr.is_some()` IS the "can stash" test:
+                            // a `JitInvokeInfo` is registered for exactly the
+                            // sites whose callee is a compiled Java artifact
+                            // (plus `ArraycopyPrimitive`, the one intrinsic
+                            // that deopts). Inline-machine-code intrinsics and
+                            // the thin native helpers have no info and no way
+                            // to stash, so they keep the tail form.
                             let sibling_tail_ok = is_sibling_tail
                                 && arg_slots.len() <= sibling_reg_limit
+                                && info_ptr.is_none()
                                 && sp_tailcall_enabled();
                             if sibling_tail_ok {
                                 // Load args into ABI registers, tear
@@ -6491,7 +6513,6 @@ impl Compiler {
                                     }
                                 }
                                 self.emit_epilogue_without_ret();
-                                self.dbg_unserviced_direct_call("invokestatic-tailcall", pc, false, false);
                                 self.emit_jmp_absolute(callee_entry);
                                 // Consume the invokestatic (3) and the
                                 // xreturn (1) — no fall-through.
