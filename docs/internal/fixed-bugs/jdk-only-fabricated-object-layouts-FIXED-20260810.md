@@ -921,7 +921,8 @@ Six things, each paid for at least twice:
 * **The census must stay at zero.** Both standing probes, both modes:
 
   ```sh
-  CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home "$JAVA_HOME" \n    -cp . W2ResidualCensusProbe 2>&1 | grep -E '\[OVERLAY-LAYOUT\].*(NAME|VM) '
+  CRATONVM_DBG=overlay,overlay-all cratonvm --real-jdk --java-home "$JAVA_HOME" \
+    -cp . W2ResidualCensusProbe 2>&1 | grep -E '\[OVERLAY-LAYOUT\].*(NAME|VM) '
   ```
 
   and the same for `JdkOnlyCensusLoadProbe`. Before 2026-08-10 this printed the
