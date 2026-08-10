@@ -1138,6 +1138,16 @@ pub struct G1Region {
     /// it: the trail of walked objects names the victim, this names the call
     /// that committed the bytes.
     bump_trail: BumpTrail,
+    /// The same, restricted to `tlab:*` carves.
+    ///
+    /// A shared ring cannot answer the question it exists for. TLAB carves are
+    /// rare and huge (one `0x1fa78`-byte carve observed) while per-object
+    /// advances are constant and small, so by the time a walk breaks inside a
+    /// carve, hundreds of `obj:*` entries have evicted it — which is exactly
+    /// what happened on all four breaks of the first run. Keeping carves in
+    /// their own ring makes the owner of a large committed hole recoverable no
+    /// matter how much per-object traffic followed it.
+    tlab_trail: BumpTrail,
 }
 
 impl G1Region {
@@ -1162,6 +1172,7 @@ impl G1Region {
             recycled_in_generation: 0,
             mark_bitmap,
             bump_trail: BumpTrail::default(),
+            tlab_trail: BumpTrail::default(),
         }
     }
 
@@ -1253,6 +1264,10 @@ impl G1Region {
         if gc_flags().g1_dbg_reach {
             self.bump_trail
                 .record(self.reuse_epoch, offset_in_region, size, site);
+            if site.starts_with("tlab:") {
+                self.tlab_trail
+                    .record(self.reuse_epoch, offset_in_region, size, site);
+            }
         }
         let ptr = aligned as *mut u8;
         // Zero-init the allocated area. This is the SINGLE establishment of
@@ -4581,7 +4596,8 @@ impl G1Collector {
                     eprintln!(
                         "[g1][DESYNC-COVER] {} {} bumps=[{}]",
                         describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
-                        r.bump_trail.describe_owner(r.reuse_epoch, offset),
+                        r.tlab_trail
+                            .describe_owner_or(&r.bump_trail, r.reuse_epoch, offset),
                         r.bump_trail.render(),
                     );
                 }
@@ -4610,12 +4626,14 @@ impl G1Collector {
                     eprintln!(
                         "[g1][WALKBRK-COVER] {} {} {}",
                         describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
-                        r.bump_trail.describe_owner(r.reuse_epoch, offset),
+                        r.tlab_trail
+                            .describe_owner_or(&r.bump_trail, r.reuse_epoch, offset),
                         hexdump_around(base, cursor, offset),
                     );
                     eprintln!(
-                        "[g1][WALKBRK-BUMPS] region={source_idx} epoch={} bumps=[{}]",
+                        "[g1][WALKBRK-BUMPS] region={source_idx} epoch={} carves=[{}] bumps=[{}]",
                         r.reuse_epoch,
+                        r.tlab_trail.render(),
                         r.bump_trail.render(),
                     );
                 }
@@ -4807,10 +4825,13 @@ impl G1Collector {
                             trail.render(),
                         );
                         eprintln!(
-                            "[g1][WALKBRK-BUMPS] phase4 region={i} {} bumps=[{}]",
-                            regions[i]
-                                .bump_trail
-                                .describe_owner(regions[i].reuse_epoch, offset),
+                            "[g1][WALKBRK-BUMPS] phase4 region={i} {} carves=[{}] bumps=[{}]",
+                            regions[i].tlab_trail.describe_owner_or(
+                                &regions[i].bump_trail,
+                                regions[i].reuse_epoch,
+                                offset,
+                            ),
+                            regions[i].tlab_trail.render(),
                             regions[i].bump_trail.render(),
                         );
                     }
@@ -9595,7 +9616,13 @@ impl WalkTrail {
 }
 
 /// How many cursor advances [`BumpTrail`] keeps per region.
-const BUMP_TRAIL_LEN: usize = 12;
+///
+/// Sized from the first run that used it: a 12-entry ring resolved `OWNER` on
+/// none of four breaks, because a region takes hundreds of `obj:*` advances
+/// after the `tlab:*` carve that actually committed the span, and they evict it.
+/// Widening alone does not fix that (the ratio, not the depth, is the problem) —
+/// see [`G1Region::tlab_trail`] for the half that does.
+const BUMP_TRAIL_LEN: usize = 32;
 
 static NEXT_BUMP_TID: AtomicU64 = AtomicU64::new(1);
 
@@ -9699,6 +9726,17 @@ impl BumpTrail {
     fn owner_of(&self, epoch: u64, offset: usize) -> Option<&BumpEntry> {
         self.iter_oldest_first()
             .find(|e| e.epoch == epoch && offset >= e.offset && offset < e.offset + e.size)
+    }
+
+    /// `describe_owner` against `self` first, falling back to `other`.
+    ///
+    /// Used to ask the `tlab:*`-only ring before the shared one: a large hole's
+    /// owner is a carve, and the shared ring is the one that loses it.
+    fn describe_owner_or(&self, other: &BumpTrail, epoch: u64, offset: usize) -> String {
+        if self.owner_of(epoch, offset).is_some() {
+            return self.describe_owner(epoch, offset);
+        }
+        other.describe_owner(epoch, offset)
     }
 
     fn describe_owner(&self, epoch: u64, offset: usize) -> String {

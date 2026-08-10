@@ -598,9 +598,19 @@ impl ThreadRegistry {
             }
         }
         if cratonvm_types::flags().gc.g1_dbg_reach {
+            // Sequence number, not a pause id: the walk-break reports carry no
+            // pause identity either, so the only thing that can be compared is
+            // "how many times did the publish path run" against "how many
+            // breaks reported ZERO published skip spans". The first run
+            // produced exactly ONE census line across 453 s and four
+            // zero-span breaks, which is the fact this counter is here to
+            // confirm or kill.
+            static CENSUS_SEQ: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let seq = CENSUS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
             eprintln!(
-                "[g1][TLAB-CENSUS] entries={total} dead={dead} alive_no_tlab_addr={unregistered} \
-                 alive_retired={retired} published={}",
+                "[g1][TLAB-CENSUS] #{seq} entries={total} dead={dead} \
+                 alive_no_tlab_addr={unregistered} alive_retired={retired} published={}",
                 out.len()
             );
         }

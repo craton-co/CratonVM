@@ -214,15 +214,31 @@ Fixed by unpublishing without freeing (`invalidate` retires the entry to a list
 `Drop` reclaims), which is all invalidation is for and restores the documented
 invariant verbatim.
 
-**Not yet claimed: that this is THE defect.** A use-after-free is a defect on
-its own terms and this one is now closed, but the causal step — cache ON, fix
-applied, corruption gone — is a separate measurement, recorded below when it
-lands. Two things would have to be true and neither is established yet: that the
-freed recipe is what zeroes an object *header* (the UAF's own writes are field
-writes, and the bounds check drops the out-of-range ones), and that 552 of the
-563 guard hits, which are `get_field` reads rather than writes, follow from it.
-Until then the honest reading of the green above is "the fault needs this
-module", not "the fault is this module".
+**The UAF is NOT this defect — measured, not assumed.** Cache in its default ON
+state against the fixed binary:
+
+| arm | result | `gc::guard` |
+|---|---|---:|
+| G1 + JIT, cache ON (baseline) | FAIL 18/61 | 563 |
+| G1 + JIT, cache ON, **UAF fixed** | **FAIL 18/61** | 252 |
+| G1 + JIT, cache OFF | PASS 61/61 | 0 |
+
+So the caution above was warranted and the answer is negative: the use-after-free
+was real and is fixed, but it is not the mechanism. The guard-hit count moves
+around between runs (563 / 252 / 239 have all been seen on unchanged code) and
+carries no signal at this resolution — the *test* outcome is the one that does,
+and it did not move at all.
+
+What remains true is the gate itself: `NO_JIT_ALLOC_CLASS_CACHE=1` still turns
+18 failures into zero. Since the recipe contents are now exonerated, the
+remaining difference between the two arms is that the cached path **skips
+`vm.classes.class_manager.read()` on every slow-path allocation**. That is a
+per-allocation acquisition of a VM-wide lock, i.e. a serialization point that
+the cache removes — so the likeliest reading is now that the gate perturbs
+*timing* rather than fixing a fault, and that whatever races is reachable only
+when slow-path allocation does not serialize on that lock. Whoever picks this up
+should treat "cache off" as a **timing probe, not a fix**, and should not ship it
+as one.
 
 ### The shape the trails converge on
 
@@ -466,6 +482,44 @@ question is which caller — which only a run can say.
    nobody registered, everybody registered but retired, or this function never
    reached — and the counts separate the first two while the line's *absence*
    settles the third.
+
+### What the first instrumented run said
+
+Full failing run (`FAIL 18/61`, 453 s, cache ON, UAF fixed):
+
+* **`[g1][FREE-CURSOR]`: zero.** The `Free ⇒ cursor == 0` invariant holds
+  everywhere it is relied on, across a whole failing run. Instrument 2 is
+  **refuted, not merely unobserved** — do not re-open it.
+* **Every break saw an empty skip list.** Four walk breaks, four
+  `ZERO published skip spans this pause`; **no** break landed inside a published
+  span, and **no** break reported a non-empty span list. Not one pause in the
+  entire run had anything published.
+* **One `[g1][TLAB-CENSUS]` line for the whole run**, reading
+  `entries=10 dead=8 alive_no_tlab_addr=0 alive_retired=2 published=0`. For that
+  pause the empty publication is legitimate — every *alive* thread had genuinely
+  retired, and registration is not the gap.
+* **All 252 guard hits are `g1::get_field` on `num_slots=0`** — reads through
+  all-zero headers, no writes.
+
+The unexplained pair is the second and third bullets together: the walk always
+sees an empty skip list, and the producer that fills it appears to run roughly
+once. `collect_reserved_tlab_tails` has exactly one caller
+(`stw_take_over_and_wait`, `vm/src/runtime/interpreter/gc_and_alloc.rs:485`), so
+either that path runs on a small minority of G1 pauses — in which case every
+other pause walks Eden with **no** TLAB protection at all — or it runs often and
+computes empty every time. The census is sequence-numbered now precisely to
+decide which, since one sample cannot.
+
+Note the shape one break landed on, which fits a live-TLAB hole exactly: an
+8-byte `GAP_FILLER` sentinel at `0x207f0` (so a TLAB *was* correctly retired,
+ending at `0x207f8`), immediately followed by zeroes — i.e. the next carve, whose
+owner had allocated nothing, with nothing published to cover it.
+
+The first ring was too coarse to name that owner: `OWNER=unknown` on all four
+breaks, because a region takes hundreds of small `obj:*` advances after the one
+large `tlab:*` carve that committed the span, and they evict it. Carves now get
+their own ring (`carves=[...]` in the report), which is what makes the owner
+recoverable.
 
 ## 5. `CloudFoundryActuatorAutoConfigurationTests` — the page has this backwards
 
