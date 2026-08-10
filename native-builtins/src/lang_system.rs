@@ -1718,7 +1718,11 @@ pub(crate) fn native_runtime_get_runtime(
 ) -> MethodCallResult {
     let class_id = match ctx.ensure_class_initialized("java/lang/Runtime") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/Runtime", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): `java.lang.Runtime`
+        // is in every image, so the `Ok` arm is what runs; handing back a
+        // fabricated `Runtime` on a broken one substitutes for `java.base`
+        // rather than reporting that it is missing.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/Runtime", 8)?,
     };
     let obj = ctx.alloc_object(class_id, 0);
     Ok(Some(Value::Object(Some(obj))))
@@ -2823,7 +2827,16 @@ pub(crate) fn native_system_getenv_all(
         ctx.set_field(map, f_loadfactor, Value::Float(0.75));
         ctx.set_field(map, f_entryset, Value::Object(None));
 
-        let node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", node_n_fields);
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). This arm is the
+        // REAL-layout path — every field index above came from the real
+        // `java.util.HashMap`/`HashMap$Node` — so `HashMap$Node` is already
+        // loaded here and the ask resolves to the real class rather than
+        // fabricating. The refusal only fires on an image where it is not.
+        let node_class_id = crate::util_concurrent_ext::refused_class(
+            ctx,
+            "java/util/HashMap$Node",
+            node_n_fields,
+        )?;
 
         for (key, value) in std::env::vars() {
             let key_obj = ctx.create_string(&key);
@@ -2859,8 +2872,16 @@ pub(crate) fn native_system_getenv_all(
     // A failed real-class initialization yields ClassId(0), whose Object layout
     // has zero slots. This fallback writes map and node fields, so both need
     // named synthetic layouts even when the real classes cannot initialize.
-    let fallback_map_class_id = ctx.ensure_synthetic_class("java/util/HashMap", 3);
-    let fallback_node_class_id = ctx.ensure_synthetic_class("java/util/HashMap$Node", 4);
+    //
+    // Fallible since 2026-08-10 (JDK-only wave 2, step 3): a 3-field synthetic
+    // `java/util/HashMap` IS the compatibility substitution — the comment above
+    // says as much — so under `--jdk-only` it is refused and `System.getenv()`
+    // raises `NoClassDefFoundError` naming the class instead of handing back a
+    // map whose layout `java.base`'s own `HashMap` bytecode cannot read.
+    let fallback_map_class_id =
+        crate::util_concurrent_ext::refused_class(ctx, "java/util/HashMap", 3)?;
+    let fallback_node_class_id =
+        crate::util_concurrent_ext::refused_class(ctx, "java/util/HashMap$Node", 4)?;
     let map = ctx.alloc_object(fallback_map_class_id, 3); // MAP_NUM_FIELDS = 3
     ctx.set_field(map, 0, Value::Object(Some(buckets))); // MAP_FIELD_BUCKETS
     ctx.set_field(map, 1, Value::Int(0)); // MAP_FIELD_SIZE

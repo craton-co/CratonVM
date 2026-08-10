@@ -387,29 +387,11 @@ fn register_activation_natives(r: &mut NativeMethodRegistry) {
     // Activatable.<init>()V — genuinely empty; see the note on
     // `ActivationGroup.<init>` below for why every `<init>` in this module is a
     // real no-op rather than a suppressed body.
-    r.register(
-        "java/rmi/activation/Activatable",
-        "<init>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
 
     // Activatable.register(ActivationDesc) -> ActivationID
     // Throws ActivationException since activation was removed in JDK 17
-    r.register(
-        "java/rmi/activation/Activatable",
-        "register",
-        "(Ljava/rmi/activation/ActivationDesc;)Ljava/rmi/activation/ActivationID;",
-        activation_throws,
-    );
 
     // Activatable.exportObject(Remote, ActivationID, int) -> Remote
-    r.register(
-        "java/rmi/activation/Activatable",
-        "exportObject",
-        "(Ljava/rmi/Remote;Ljava/rmi/activation/ActivationID;I)Ljava/rmi/Remote;",
-        activation_throws,
-    );
 
     // ActivationGroup.getSystem() -> ActivationSystem
     //
@@ -419,12 +401,6 @@ fn register_activation_natives(r: &mut NativeMethodRegistry) {
     // back a null that the caller could only discover by NPE-ing on it several
     // frames later.  Real `getSystem()` throws when no system is set, so
     // throwing here is BOTH spec-shaped and the honest answer.
-    r.register(
-        "java/rmi/activation/ActivationGroup",
-        "getSystem",
-        "()Ljava/rmi/activation/ActivationSystem;",
-        activation_throws,
-    );
 
     // The two `<init>()V` no-ops below are genuinely empty: `java.rmi
     // .activation` was removed in JDK 17, so in real-JDK mode these classes do
@@ -432,12 +408,6 @@ fn register_activation_natives(r: &mut NativeMethodRegistry) {
     // mode the stub class has no state to initialise. They exist only so a
     // `new` reaches the caller's next call — which is one of the throwing
     // methods above, i.e. the point at which the caller learns the truth.
-    r.register(
-        "java/rmi/activation/ActivationGroup",
-        "<init>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
 
     // `java/rmi/activation/ActivationSystem.<init>()V` REMOVED: `ActivationSystem`
     // is an INTERFACE, so no bytecode can ever contain `new ActivationSystem()`
@@ -470,12 +440,6 @@ fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
     // (The existing registration in lib.rs is a no-op stub; register a real one here
     //  under sun/misc/Unsafe which is the deprecated path. The lib.rs version for
     //  jdk/internal/misc/Unsafe already has defineAnonymousClass which validates.)
-    r.register(
-        u,
-        "defineClass",
-        "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;",
-        native_unsafe_define_class,
-    );
     // Also register for jdk/internal variant
     r.register(
         u2,
@@ -874,153 +838,11 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     let refl = "sun/reflect/Reflection";
 
     // getCallerClass(int depth) -> Class — deprecated depth-based form
-    r.register(
-        refl,
-        "getCallerClass",
-        "(I)Ljava/lang/Class;",
-        |ctx, args| {
-            let depth = match args.get(0) {
-                Some(Value::Int(d)) => *d,
-                _ => 0,
-            };
-
-            if depth == 0 {
-                // Return Reflection.class itself
-                let cid = ctx
-                    .ensure_class_initialized("sun/reflect/Reflection")
-                    .unwrap_or(cratonvm_types::ClassId::new(0));
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
-            }
-
-            // Walk the stack to the given depth
-            // Use capture_stack_trace with a dummy hash to get frames
-            let frames = ctx.capture_stack_trace(0);
-            if depth as usize <= frames.len() {
-                let frame = &frames[(depth - 1) as usize];
-                // Prefer the frame's own `class_id` (captured live from the
-                // interpreter frame) over a name-based re-lookup. A name-keyed
-                // lookup collapses to whichever class of that name loaded
-                // FIRST/globally-registered, which is wrong whenever the actual
-                // caller was loaded by a distinct ClassLoader from a same-named
-                // class elsewhere on the classpath (e.g. a custom parentless
-                // ClassLoader that `defineClass`-loads its own copy of a class
-                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
-                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
-                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
-                // comment for the matching guidance.
-                let cid = match frame.class_id {
-                    Some(cid) => cid,
-                    None => {
-                        let class_name = frame.class_name.replace('.', "/");
-                        ctx.ensure_class_initialized(&class_name)
-                            .unwrap_or(cratonvm_types::ClassId::new(0))
-                    }
-                };
-                let mirror = ctx.get_class_mirror(cid);
-                Ok(Some(Value::Object(Some(mirror))))
-            } else {
-                // depth beyond stack — return null
-                Ok(Some(Value::Object(None)))
-            }
-        },
-    );
 
     // getCallerClass() -> Class — JDK 8+ form (no-arg, skips framework frames)
-    r.register(
-        refl,
-        "getCallerClass",
-        "()Ljava/lang/Class;",
-        |ctx, _args| {
-            let frames = ctx.capture_stack_trace(0);
-            // Skip frame 0 (Reflection itself) and frame 1 (immediate caller)
-            // Return frame 2 (the actual caller)
-            if frames.len() > 2 {
-                let frame = &frames[2];
-                // Prefer the frame's own `class_id` (captured live from the
-                // interpreter frame) over a name-based re-lookup. A name-keyed
-                // lookup collapses to whichever class of that name loaded
-                // FIRST/globally-registered, which is wrong whenever the actual
-                // caller was loaded by a distinct ClassLoader from a same-named
-                // class elsewhere on the classpath (e.g. a custom parentless
-                // ClassLoader that `defineClass`-loads its own copy of a class
-                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
-                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
-                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
-                // comment for the matching guidance.
-                let cid = match frame.class_id {
-                    Some(cid) => cid,
-                    None => {
-                        let class_name = frame.class_name.replace('.', "/");
-                        ctx.ensure_class_initialized(&class_name)
-                            .unwrap_or(cratonvm_types::ClassId::new(0))
-                    }
-                };
-                let mirror = ctx.get_class_mirror(cid);
-                Ok(Some(Value::Object(Some(mirror))))
-            } else {
-                // Not enough frames — return null
-                Ok(Some(Value::Object(None)))
-            }
-        },
-    );
 
     // Also register under jdk.internal.reflect for modern JDKs
     let refl2 = "jdk/internal/reflect/Reflection";
-    r.register(
-        refl2,
-        "getCallerClass",
-        "(I)Ljava/lang/Class;",
-        |ctx, args| {
-            // Depth-variant: depth=0 => Reflection itself; depth=1 =>
-            // the immediate caller (the @CallerSensitive method);
-            // depth=2 => its caller; and so on.  Frames are stored with
-            // main at index 0 and innermost last; the native frame isn't
-            // in the Vec.  So depth=N corresponds to frames[len-N].
-            let depth = match args.get(0) {
-                Some(Value::Int(d)) => *d,
-                _ => 0,
-            };
-            if depth == 0 {
-                let cid = ctx
-                    .ensure_class_initialized("jdk/internal/reflect/Reflection")
-                    .unwrap_or(cratonvm_types::ClassId::new(0));
-                let mirror = ctx.get_class_mirror(cid);
-                return Ok(Some(Value::Object(Some(mirror))));
-            }
-            let frames = ctx.capture_stack_trace(0);
-            let target = if (depth as usize) <= frames.len() {
-                frames.get(frames.len() - depth as usize)
-            } else {
-                None
-            };
-            if let Some(frame) = target {
-                // Prefer the frame's own `class_id` (captured live from the
-                // interpreter frame) over a name-based re-lookup. A name-keyed
-                // lookup collapses to whichever class of that name loaded
-                // FIRST/globally-registered, which is wrong whenever the actual
-                // caller was loaded by a distinct ClassLoader from a same-named
-                // class elsewhere on the classpath (e.g. a custom parentless
-                // ClassLoader that `defineClass`-loads its own copy of a class
-                // also present on the system classpath — see H2 `Upgrade.loadH2`'s
-                // dynamic-driver-loading pattern, `DriverManager.deregisterDriver`'s
-                // caller-classloader check). See `StackTraceEntry::class_id`'s doc
-                // comment for the matching guidance.
-                let cid = match frame.class_id {
-                    Some(cid) => cid,
-                    None => {
-                        let class_name = frame.class_name.replace('.', "/");
-                        ctx.ensure_class_initialized(&class_name)
-                            .unwrap_or(cratonvm_types::ClassId::new(0))
-                    }
-                };
-                let mirror = ctx.get_class_mirror(cid);
-                Ok(Some(Value::Object(Some(mirror))))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
-        },
-    );
 
     r.register_with_kind(
         refl2,

@@ -7725,6 +7725,8 @@ impl GenerationalHeap {
             loader_pin_on: cratonvm_types::loader_pin::loader_pinning_enabled(),
             overlay_owners: crate::external_roots::external_owner_addrs(),
             metadata_pins: cratonvm_types::metadata_pin::snapshot(),
+            // Snapshotted once per collection; see `YoungMarkCtx::mark_why`.
+            mark_why: crate::heap::young_mark_watch(),
         };
         // ----- Oracle resolution accounting (H2-CID0, 2026-08-01) -----------
         //
@@ -7761,6 +7763,13 @@ impl GenerationalHeap {
                           worklist: &mut Vec<usize>,
                           bits: &crate::young_mark::YoungMarkBits| {
             let addr = ptr as usize;
+            // The conservative arm: a root-vector entry or a finalizable
+            // address. Reported BEFORE base resolution, because "a root
+            // pointed INTO this object" and "a root pointed AT it" are
+            // different answers and only the raw address distinguishes them.
+            if mark_ctx.mark_why != 0 && addr == mark_ctx.mark_why {
+                report_young_mark_why(addr, "conservative-root");
+            }
             if !in_young(addr) {
                 return;
             }
@@ -8019,7 +8028,13 @@ impl GenerationalHeap {
                 // SAFETY: `optr`/`oh` form a valid live object.
                 unsafe {
                     for_each_ref_slot(optr, oh, |raw, _slot| {
-                        mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
+                        mark_edge_precise(
+                            raw as usize,
+                            &mark_ctx,
+                            &side_bits,
+                            &mut worklist,
+                            "full-old-scan",
+                        );
                     });
                 }
             }
@@ -8055,7 +8070,13 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
-                    mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
+                    mark_edge_precise(
+                        raw as usize,
+                        &mark_ctx,
+                        &side_bits,
+                        &mut worklist,
+                        "dirty-card",
+                    );
                 }
             } else if is_compact_object(header) {
                 // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
@@ -8064,7 +8085,13 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
-                    mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
+                    mark_edge_precise(
+                        raw as usize,
+                        &mark_ctx,
+                        &side_bits,
+                        &mut worklist,
+                        "dirty-card",
+                    );
                 }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
@@ -8077,6 +8104,7 @@ impl GenerationalHeap {
                         &mark_ctx,
                         &side_bits,
                         &mut worklist,
+                        "dirty-card",
                     );
                 }
             }
@@ -8102,6 +8130,7 @@ impl GenerationalHeap {
                 &mark_ctx,
                 &side_bits,
                 &mut worklist,
+                "overlay-old-owner",
             );
         }
 
@@ -8118,7 +8147,13 @@ impl GenerationalHeap {
                 // SAFETY: `op`/`oh` are a valid live old-gen object.
                 unsafe {
                     for_each_ref_slot(op, oh, |r, _| {
-                        mark_edge_precise(r as usize, &mark_ctx, &side_bits, &mut worklist)
+                        mark_edge_precise(
+                            r as usize,
+                            &mark_ctx,
+                            &side_bits,
+                            &mut worklist,
+                            "full-old-scan",
+                        )
                     });
                 }
             }
@@ -8196,7 +8231,7 @@ impl GenerationalHeap {
                     resolve_candidate_bases(from_base, used_bytes, &exact_skips, &unresolved);
                 late_resolved_bases = bases.len();
                 for base in bases {
-                    mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist);
+                    mark_edge_precise(base, &mark_ctx, &side_bits, &mut worklist, "late-base");
                 }
                 if !worklist.is_empty() {
                     crate::young_mark::drain_parallel(
@@ -9331,6 +9366,34 @@ impl GenerationalHeap {
         // Every marked object is a survivor: clear the mark and leave it
         // exactly where it is.
         let existing_free = merge_skips(young_from.free_blocks_sorted());
+        // MARKWHY: which SKIP ARM covers the watched address? The walk never
+        // stopped at the evicted JSP loader's base, so its span is inside a
+        // stretch the walk strides over. There are three candidates and they
+        // want three different fixes, so name the one that actually applies
+        // instead of inferring it from the absence of desync markers.
+        //
+        // `existing_free` is already the MERGE of the arena free list and the
+        // JIT TLAB reservations, so the two are tested separately here — a
+        // reserved TLAB tail and a genuine free block are not the same finding.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base && w < from_base + young_from.used() {
+                let off = w - from_base;
+                let in_free = young_from
+                    .free_blocks_sorted()
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                let in_jit = jit_skips
+                    .iter()
+                    .find(|&&(o, sz)| off >= o && off < o + sz)
+                    .copied();
+                eprintln!(
+                    "[MARKWHY] skip-arm probe: watch={w:#x} off={off:#x} used={:#x}                      in_free_block={in_free:?} in_jit_tlab_skip={in_jit:?}",
+                    young_from.used(),
+                );
+            }
+        }
         // A2 diag (CRATONVM_DBG_A2): does the free list ALREADY self-overlap at
         // sweep start? `existing_free` is built only from prior sweeps' coalesced
         // output + the alloc/split bookkeeping between sweeps. A self-overlap here
@@ -9388,6 +9451,8 @@ impl GenerationalHeap {
         let mut prev_obj: (usize, usize, u32, u8) = (0, 0, 0, 0);
         let mut objects_live: usize = 0;
 
+        // See `YoungMarkCtx::mark_why`; read once, not per object.
+        let sweep_mark_why = crate::heap::young_mark_watch();
         let mut cursor: usize = 0;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
@@ -10105,6 +10170,22 @@ impl GenerationalHeap {
                 hit
             };
 
+            // MARKWHY: the young marker's edge trace answers "was it marked".
+            // This answers the different question the sweep decides — "will
+            // its span be reclaimed and zeroed" — which is what
+            // `is_live_young_survivor` (word0 != 0) later reports as liveness.
+            // The two can disagree: `late_pinned` retains a span from an
+            // INTERIOR conservative candidate, an address that never equals
+            // the object base and so never trips the edge trace.
+            if sweep_mark_why != 0 && from_base + cursor == sweep_mark_why {
+                eprintln!(
+                    "[MARKWHY] sweep @{:#x} size={total_size} side_marked={side_marked_survivor}                      late_pinned={late_pinned} forwarded={} header_marked={}",
+                    from_base + cursor,
+                    header.is_forwarded(),
+                    header.gc_flags() & GC_FLAG_MARKED != 0,
+                );
+            }
+
             if header.is_forwarded() {
                 // Evacuated to old gen by selective promotion: the live copy is
                 // in old gen and references were redirected in the fixup pass;
@@ -10539,6 +10620,20 @@ impl GenerationalHeap {
                         "[SWEEP-LIVENESS young]   victim=0x{victim:x} <- referrer=0x{referrer:x} class_id={cid} slot={slot}",
                     );
                 }
+            }
+        }
+
+        // MARKWHY: where did the walk actually END? If the watched offset is
+        // above this, the walk abandoned before reaching it and the span was
+        // retained by the "skipped stretch retained until a moving cycle
+        // resets from-space" arm rather than by any skip list.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} objects_swept={objects_swept}",
+                    w - from_base,
+                );
             }
         }
 
@@ -15006,6 +15101,10 @@ struct YoungMarkCtx {
     overlay_owners: Option<std::collections::HashSet<usize>>,
     /// Loader-owned metadata roots; `None` when the registry is empty.
     metadata_pins: Option<FxHashMap<usize, Vec<usize>>>,
+    /// [`crate::heap::young_mark_watch`], snapshotted once per collection so
+    /// the per-edge test is a field compare and not an atomic load. `0`
+    /// disables it, which is the default and the only value in a normal run.
+    mark_why: usize,
 }
 
 /// Precise-edge marker: mark + enqueue a value read out of an actual
@@ -15017,13 +15116,35 @@ struct YoungMarkCtx {
 /// is a semantic no-op for them and is skipped. Keeps the same header
 /// plausibility + extent rejection and the same never-write-through side-mark
 /// channel: nothing here writes to the heap.
+/// Report one young-mark edge that reached the watched address.
+///
+/// `#[cold]` and out of line so the armed test in `mark_edge_precise` costs a
+/// predictable not-taken branch on the hot path. Prints every arrival, not just
+/// the first: the question is which edges reach the object, and the second one
+/// is as interesting as the first when the first turns out to be legitimate.
+#[cold]
+#[inline(never)]
+fn report_young_mark_why(addr: usize, reason: &'static str) {
+    eprintln!("[MARKWHY] young marker reached {addr:#x} via {reason}");
+}
+
+/// `reason` names the EDGE that led here — `"field"` for an ordinary reference
+/// slot, and one of the side-table labels otherwise. It is a `&'static str`, so
+/// it costs nothing to pass; it is read only when `ctx.mark_why` is armed. The
+/// old-gen BFS has labelled its edges since it was written and the young marker
+/// had no equivalent, which is the whole reason a mirror kept being reported as
+/// "marked, by nothing visible".
 #[inline]
 fn mark_edge_precise(
     addr: usize,
     ctx: &YoungMarkCtx,
     bits: &crate::young_mark::YoungMarkBits,
     worklist: &mut Vec<usize>,
+    reason: &'static str,
 ) {
+    if ctx.mark_why != 0 && addr == ctx.mark_why {
+        report_young_mark_why(addr, reason);
+    }
     if addr < ctx.from_base || addr >= ctx.from_end || addr & 0x7 != 0 {
         return;
     }
@@ -15079,7 +15200,7 @@ fn scan_young_object(
     // SAFETY: `obj_ptr`/`header` are a validated young object.
     unsafe {
         for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-            mark_edge_precise(ref_ptr as usize, ctx, bits, worklist);
+            mark_edge_precise(ref_ptr as usize, ctx, bits, worklist, "field");
         });
     }
     // Collection-overlay liveness pin: an overlay is an out-of-heap edge owned
@@ -15101,7 +15222,7 @@ fn scan_young_object(
             obj_addr,
             Some(header.class_id.as_u32()),
         ) {
-            mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
+            mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist, "overlay-owner");
         }
     }
     // HIB-CV-24: also mark this object's defining ClassLoader so a live
@@ -15110,7 +15231,7 @@ fn scan_young_object(
         if let Some(loader_addr) =
             cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
         {
-            mark_edge_precise(loader_addr, ctx, bits, worklist);
+            mark_edge_precise(loader_addr, ctx, bits, worklist, "loader_pin");
         }
     }
     // Class-mirror liveness pin (companion to loader_pin): if this object IS
@@ -15119,7 +15240,7 @@ fn scan_young_object(
     // `ClassLoader.classes` field gives for free.
     if let Some(mirror_addrs) = cratonvm_types::mirror_pin::mirrors_for_loader(obj_addr) {
         for mirror_addr in mirror_addrs {
-            mark_edge_precise(mirror_addr, ctx, bits, worklist);
+            mark_edge_precise(mirror_addr, ctx, bits, worklist, "mirror_pin");
         }
     }
     // Loader-owned metadata roots (static reference fields, class monitor,
@@ -15131,7 +15252,7 @@ fn scan_young_object(
         .and_then(|pins| pins.get(&obj_addr))
     {
         for &metadata_addr in metadata_addrs {
-            mark_edge_precise(metadata_addr, ctx, bits, worklist);
+            mark_edge_precise(metadata_addr, ctx, bits, worklist, "metadata_pin");
         }
     }
 }

@@ -317,11 +317,14 @@ mod tests {
         );
     }
 
-    /// The two new trait methods must be invisible to a context that does not
-    /// override them: `ensure_synthetic_class` keeps returning
-    /// `ClassId::new(0)` (it now routes through the fallible default rather
-    /// than answering directly), and the classifier reports what
+    /// The trait methods must be invisible to a context that does not override
+    /// them: the fabrication default keeps answering `ClassId::new(0)`, the
+    /// VM-internal door answers the same, and the classifier reports what
     /// `class_id_by_name` reports.
+    ///
+    /// The infallible `ensure_synthetic_class` this also covered was deleted by
+    /// JDK-only wave 2 step 3 (2026-08-10); the remaining two are what a mock
+    /// or non-VM context now sees.
     #[test]
     fn the_trait_defaults_preserve_the_previous_answers() {
         use crate::registry::{NativeClassAccess, NativeSystemAccess};
@@ -329,10 +332,13 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
 
-        assert_eq!(ctx.ensure_synthetic_class("p/Whatever", 4), ClassId::new(0));
         assert_eq!(
             ctx.try_ensure_synthetic_class("p/Whatever", 4),
             Ok(ClassId::new(0)),
+        );
+        assert_eq!(
+            ctx.ensure_vm_internal_class("p/Whatever", 4),
+            ClassId::new(0),
         );
 
         // The mock has no name index, so every name reads absent — the same

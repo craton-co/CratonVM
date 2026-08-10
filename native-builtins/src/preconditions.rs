@@ -426,8 +426,6 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // formatter keeps them on the JDK's own `IndexOutOfBoundsException`
     // fallback instead of the `ArrayIndexOutOfBoundsException` they used to
     // throw.
-    registry.register(class, "checkIndex", "(II)I", check_index);
-    registry.register(class, "checkFromToIndex", "(III)I", check_from_to_index);
     registry.register(class, "checkFromIndexSize", "(III)I", check_from_index_size);
 }
 

@@ -226,20 +226,27 @@ fn ref_descriptor_to_internal_name(desc: &str) -> Option<String> {
 // Synthetic-impl allocation
 // ---------------------------------------------------------------------------
 
-fn alloc_impl(ctx: &mut dyn NativeContext, impl_class: &str) -> ObjectRef {
+fn alloc_impl(ctx: &mut dyn NativeContext, impl_class: &str) -> Result<ObjectRef, MethodCallFailed> {
     match ctx.ensure_class_initialized(impl_class) {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
             let n = FU_NUM_SLOTS.max(real);
-            ctx.alloc_object(cid, n)
+            Ok(ctx.alloc_object(cid, n))
         }
         // Fall back to a synthetic class declaring `FU_NUM_SLOTS` fields
         // rather than `ClassId::new(0)` (`java/lang/Object`, zero declared
         // fields): an object with Object's id but a non-zero slot count is
         // an undersized layout the GC's `get_field` bounds guard rejects.
+        //
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): the
+        // `…FieldUpdater$RustJvmImpl` classes this mints are declared by no
+        // JDK image — the dead sweep names them as VM-minted classes wearing a
+        // JDK name — so a strict run that gets one is running a synthetic field
+        // updater in place of `java.util.concurrent.atomic`'s own bytecode. It
+        // now refuses, naming the class.
         Err(_) => {
-            let cid = ctx.ensure_synthetic_class(impl_class, FU_NUM_SLOTS);
-            ctx.alloc_object(cid, FU_NUM_SLOTS)
+            let cid = crate::util_concurrent_ext::refused_class(ctx, impl_class, FU_NUM_SLOTS)?;
+            Ok(ctx.alloc_object(cid, FU_NUM_SLOTS))
         }
     }
 }
@@ -356,7 +363,7 @@ fn build_updater(
     };
 
     // Allocate the synthetic impl, populate slots.
-    let impl_obj = alloc_impl(ctx, impl_class);
+    let impl_obj = alloc_impl(ctx, impl_class)?;
     ctx.set_field(
         impl_obj,
         FU_SLOT_TCLASS_ID,

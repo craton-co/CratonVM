@@ -1493,7 +1493,11 @@ fn native_context_list_bindings(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     // NamingEnumeration backing.
     let binding_cid = match ctx.ensure_class_initialized("javax/naming/Binding") {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class("javax/naming/Binding", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): `javax.naming`
+        // is an enterprise namespace, so a fabricated `Binding` stand-in is the
+        // substitution contract §5 refuses. On a run that has JNDI on the
+        // classpath the `Ok` arm is what runs.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "javax/naming/Binding", 8)?,
     };
     let arr = ctx.new_ref_array(binding_cid, children.len());
     for (i, (k, v)) in children.iter().enumerate() {

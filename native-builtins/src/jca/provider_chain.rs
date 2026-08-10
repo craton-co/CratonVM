@@ -3120,18 +3120,6 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // `knownEngines` static-init chain in.  The constructor shim above
     // makes those chains unnecessary, so no-op them to skip the
     // class-load-time work entirely.
-    r.register(
-        "java/security/Provider$ServiceKey",
-        "<clinit>",
-        "()V",
-        clinit_noop,
-    );
-    r.register(
-        "java/security/Provider$EngineDescription",
-        "<clinit>",
-        "()V",
-        clinit_noop,
-    );
 
     // Round 87 (WildFly): skip BouncyCastle's EC asymmetric-provider
     // configuration.  `EC.<clinit>` calls `ECNamedCurveTable.getNames()`,

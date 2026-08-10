@@ -218,7 +218,7 @@ The in-code comment still points at the pre-move path
 `docs/known-issues/stringjoiner-synthetic-native-real-jdk-field-mismatch.md`,
 which no longer exists — a stale reference worth fixing in the same change. It
 survived the re-land; the same stale-path family is catalogued in
-[additional wave-2 markers §13](additional-wave2-markers-not-in-the-original-inventory.md).
+[additional wave-2 markers §13](../feature-designs/jdk-only-wave2/additional-wave2-markers-not-in-the-original-inventory.md).
 
 ## Not two copies — one list, one derived list, and four inline predicates
 

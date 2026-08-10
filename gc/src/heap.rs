@@ -1990,6 +1990,41 @@ pub fn set_dynamic_watch(addr: usize) {
     DYNAMIC_WATCH.store(addr, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// `CRATONVM_DBG_MARK_WHY_CLASS=<internal/class/Name>` — the address whose
+/// young-mark REASON should be reported. Armed at runtime.
+///
+/// "Why is this object still alive after a collection that should have
+/// reclaimed it" is not answerable from outside the marker. Every root source
+/// can be eliminated one at a time — the `TestDefaultInstanceManager` chain has
+/// now done that four times — and still leave the question open, because the
+/// retaining edge may be a SIDE TABLE (`loader_pin`, `mirror_pin`,
+/// `metadata_pin`, an overlay owner edge). Those are invisible to a referrer
+/// walk, absent from the root vector, and followed only inside the marker.
+///
+/// The old-gen BFS already labels each such edge (`mark_and_push_old_gen`'s
+/// `reason`). The young precise marker did not — so on the `System.gc()` path,
+/// which is exactly the non-moving young sweep, nothing recorded WHICH edge did
+/// the marking. That asymmetry is why the question kept being answered by
+/// elimination instead of by evidence.
+///
+/// Armed from `vm_object`'s `add_mirror_pin` hook: the interesting address (a
+/// JSP `ClassLoader`) is not known until its class is defined. Snapshotted into
+/// `YoungMarkCtx` once per collection, so the per-edge cost is a compare
+/// against a struct field, not an atomic load. `0` = disabled.
+static YOUNG_MARK_WATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`YOUNG_MARK_WATCH`].
+#[inline]
+pub fn set_young_mark_watch(addr: usize) {
+    YOUNG_MARK_WATCH.store(addr, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// See [`YOUNG_MARK_WATCH`].
+#[inline]
+pub fn young_mark_watch() -> usize {
+    YOUNG_MARK_WATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// See [`DYNAMIC_WATCH`].
 #[inline]
 pub fn dynamic_watch_addr() -> usize {
