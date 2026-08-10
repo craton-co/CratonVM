@@ -271,3 +271,40 @@ worse than saying this.
 * `cargo test -p cratonvm-cli --bins` — 127 passed, 0 failed.
 * `cargo test -p cratonvm-native-builtins --test lock_discipline_ratchet` —
   432 raw, green.
+* `cargo test -p cratonvm-vm --lib --features synthetic-jdk` — 3,979 passed,
+  1 failed (see below). That suite had not been runnable at all: the feature's
+  own build was red on `dev`.
+* `cargo test --workspace --no-fail-fast` over the tree with `origin/dev`
+  merged in — 13 failures, **all of which reproduce identically on pristine
+  `origin/dev`** and none of which this branch touches.
+
+### The reds that were already there
+
+Attribution matters more than the count, so each was reproduced on a detached
+worktree at `origin/dev` before being dismissed.
+
+**13 JIT intrinsic integration failures** — `intrinsic_arraycopy` (1),
+`intrinsic_string_access` (6), `intrinsic_string_narrow_oops` (1),
+`intrinsic_string_search` (5). Same names, same counts, on `origin/dev` with no
+part of this branch present. These tests hand-build heap objects from restated
+layout constants (`HEADER_SIZE`, `SLOT_SIZE`, a `kind` byte at offset 4), and
+`d7965af6a feat: HEADER_SIZE 24 -> 16` moved that layout underneath them —
+offset 4..8 is `shape` now, not a kind byte. A fixture that restates a layout
+constant is the failure mode this repository has recorded before; these are
+instances of it, and fixing them is its own change.
+
+**`vm::tests::server_socket_lifecycle`** binds `0.0.0.0:8080`, and on this host
+port 8080 is held by a release binary from an unrelated worktree
+(`CratonVM-symlink-20260809`). Not asserted — measured: `dev`'s own new
+`probes/ServerSocketPortContentionProbe.java`, run on Temurin 25.0.3 with the
+same occupant present, answers
+
+```text
+wildcard reuse=false : java.net.BindException: Address already in use: bind
+wildcard reuse=true  : java.net.BindException: Address already in use: bind
+loopback reuse=false : OK localAddr=/127.0.0.1:8080
+control port=18087   : OK localAddr=/0.0.0.0:18087
+```
+
+so HotSpot refuses the same wildcard bind this test performs. The control row
+confirms the run measures contention and not something else.
