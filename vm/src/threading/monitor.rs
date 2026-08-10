@@ -1800,6 +1800,62 @@ impl MonitorTable {
         }
     }
 
+    /// The identity hash of an object whose mark word has no room for one,
+    /// installing `mint()`'s value the first time and answering with it
+    /// forever after.
+    ///
+    /// A `NEUTRAL` word carries the hash in its upper bits, and that is where
+    /// [`ObjectHeader::mark_word_identity_hash`] puts it. Every other state has
+    /// the space spoken for: a `THIN_LOCKED` payload is an owner plus a
+    /// recursion count, an `INFLATED` payload is a monitor pointer. Before this
+    /// method existed the heap answered such an object with `0`, which the VM's
+    /// "never hand back 0" guard turned into `i32::MAX` — the SAME value for
+    /// every locked-then-hashed object, and a value that changed the moment the
+    /// thin lock was released and a real hash was minted into the freed word.
+    ///
+    /// A changing identity hash is not a cosmetic defect. `HashMap` files an
+    /// entry under the hash it read at `put` and looks it up under the hash it
+    /// reads at `get`; when those differ the map cannot find its own key, and
+    /// re-putting that key grows a SECOND entry for the same object. Spring
+    /// Boot's `TomcatWebServer` hits it exactly: it parks a service's
+    /// connectors in a `Map<Service, Connector[]>` from inside
+    /// `LifecycleBase.start()`, which is `synchronized` on that very
+    /// `StandardService`. The lookup after the lock was released missed, the
+    /// service came back with no connectors, `Tomcat.getConnector()` fabricated
+    /// a fresh port-8080 connector on the already-running service, and every
+    /// embedded-Tomcat test failed with `Connector configured to listen on port
+    /// 8080 failed to start`.
+    ///
+    /// Inflating is what HotSpot does here — `ObjectSynchronizer::FastHashCode`
+    /// inflates a stack-locked object and stores the hash in the monitor's
+    /// displaced header — and it is stable for the object's life: nothing in
+    /// this VM deflates a LIVE object's monitor (the mark word's reference is
+    /// released only for an object the collector has proved dead), so once
+    /// displaced the hash stays reachable through the same pointer.
+    ///
+    /// `mint` runs at most once per call, and its value is adopted only if this
+    /// caller wins the install race; [`Monitor::displace_hash`] makes the losers
+    /// converge on the winner's value.
+    pub fn identity_hash_via_monitor(&self, obj_ref: ObjectRef, mint: impl FnOnce() -> i32) -> i32 {
+        let Ok(monitor) = self.ensure_inflated(obj_ref, ThreadId(0)) else {
+            // Only a corrupt INFLATED word carrying a null monitor pointer
+            // reaches here. Report "no answer" and let the caller's guard speak.
+            return 0;
+        };
+        let existing = monitor.displaced_hash();
+        if existing != 0 {
+            return existing;
+        }
+        // `displace_hash` reads 0 as "none recorded", so a mint that produced 0
+        // would install nothing and be re-minted on the next call — the one
+        // thing an identity hash must never do.
+        let candidate = match mint() {
+            0 => i32::MAX,
+            h => h,
+        };
+        monitor.displace_hash(candidate)
+    }
+
     /// Ensure the object's lock is inflated and return the heavyweight
     /// `Monitor`. If the calling thread holds the thin lock, ownership is
     /// transferred atomically.
