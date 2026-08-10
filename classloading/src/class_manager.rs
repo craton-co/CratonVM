@@ -6653,10 +6653,8 @@ impl ClassManager {
         }
         debug_assert!(
             broken.is_empty(),
-            "a JDK-ONLY-LAYOUT `safe` claim does not hold for the loaded image:
-{}",
-            broken.join("
-")
+            "a JDK-ONLY-LAYOUT `safe` claim does not hold for the loaded image:\n{}",
+            broken.join("\n")
         );
     }
 

@@ -269,7 +269,8 @@ pub fn ensure_system_stdin_object(
         // warning names it at the one place that can see it.
         if shared.compatibility_mode().is_jdk_only() {
             tracing::warn!(
-                "jdk-only: System.in built on a fabricated java/io/FileInputStream                  (no `fd` field to resolve); writing the legacy slot-1 fd marker"
+                "jdk-only: System.in built on a fabricated java/io/FileInputStream \
+                 (no `fd` field to resolve); writing the legacy slot-1 fd marker"
             );
         }
         shared.mem.heap.set_field(in_obj, 1, Value::Int(1));
