@@ -77,7 +77,7 @@ done
 {
   echo "# Spring Framework full-index GC-variant sweep — $stamp"
   echo
-  printf '| variant | %s | total |\n' "$(printf '%s | ' OK FAIL LOADERR TIMEOUT EMPTY CRASH ABEND)"
+  printf '| variant | OK | FAIL | LOADERR | TIMEOUT | EMPTY | CRASH | ABEND | total |\n'
   printf '|---|--:|--:|--:|--:|--:|--:|--:|--:|\n'
   for v in $VARIANTS; do
     awk -F'\t' -v v="$v" '
