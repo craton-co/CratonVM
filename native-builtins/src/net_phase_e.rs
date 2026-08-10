@@ -3150,50 +3150,58 @@ pub(crate) fn uri_publish_named(
         }
         s
     };
-    let raw_s = ctx.create_string(raw);
-    // `string` — the volatile full-text cache `uri_raw_string` reads first.
-    ctx.set_field_by_name(uri_obj, "string", Value::Object(Some(raw_s)));
-    let set = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
+    // Pin across the whole publish. Every `put` below allocates a String, and a
+    // moving young GC there relocates `uri_obj` and leaves this raw ref stale —
+    // it then resolves to a reused, usually `java/lang/Object`, slot, and the
+    // component lands on a stranger. `make_uri` carried that exposure for one
+    // caller; this function now has eleven, so the pin belongs here rather than
+    // at each of them. `read_native_pin` is handle-authoritative: the stale
+    // local is only its out-of-range fallback.
+    let pin = ctx.pin_native_root(uri_obj);
+    let put = |ctx: &mut dyn NativeContext, name: &str, v: &str| {
+        let s = ctx.create_string(v);
+        let obj = ctx.read_native_pin(pin, uri_obj);
+        ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
+    };
+    let put_opt = |ctx: &mut dyn NativeContext, name: &str, val: &Option<String>| {
         if let Some(v) = val {
             let s = ctx.create_string(v);
-            ctx.set_field_by_name(uri_obj, name, Value::Object(Some(s)));
+            let obj = ctx.read_native_pin(pin, uri_obj);
+            ctx.set_field_by_name(obj, name, Value::Object(Some(s)));
         }
     };
-    set(ctx, "scheme", &scheme);
-    set(ctx, "authority", &authority);
-    set(ctx, "query", &query);
-    set(ctx, "fragment", &fragment);
+
+    // `string` — the volatile full-text cache `uri_raw_string` reads first.
+    put(ctx, "string", raw);
+    put_opt(ctx, "scheme", &scheme);
+    put_opt(ctx, "authority", &authority);
+    put_opt(ctx, "query", &query);
+    put_opt(ctx, "fragment", &fragment);
     if !path.is_empty() {
-        let p = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "path", Value::Object(Some(p)));
-        let dp = ctx.create_string(&path);
-        ctx.set_field_by_name(uri_obj, "decodedPath", Value::Object(Some(dp)));
+        put(ctx, "path", &path);
+        put(ctx, "decodedPath", &path);
     }
-    let ssp_s = ctx.create_string(&ssp);
-    ctx.set_field_by_name(uri_obj, "schemeSpecificPart", Value::Object(Some(ssp_s)));
-    let dssp = ctx.create_string(&ssp);
-    ctx.set_field_by_name(
-        uri_obj,
-        "decodedSchemeSpecificPart",
-        Value::Object(Some(dssp)),
-    );
+    put(ctx, "schemeSpecificPart", &ssp);
+    put(ctx, "decodedSchemeSpecificPart", &ssp);
     // `host`, `userInfo` and `port` come out of the authority, and a real
     // `java.net.URI` declares all three. Writing them keeps a receiver that
     // real bytecode reads directly consistent with what the accessors answer.
-    if let Some(a) = authority.as_deref().filter(|a| !a.is_empty()) {
-        let (user_info, host, port) = uri_parse_authority(a);
-        if let Some(h) = host {
-            let s = ctx.create_string(&h);
-            ctx.set_field_by_name(uri_obj, "host", Value::Object(Some(s)));
+    let port = match authority.as_deref().filter(|a| !a.is_empty()) {
+        Some(a) => {
+            let (user_info, host, port) = uri_parse_authority(a);
+            if let Some(h) = host {
+                put(ctx, "host", &h);
+            }
+            if let Some(u) = user_info {
+                put(ctx, "userInfo", &u);
+            }
+            port
         }
-        if let Some(u) = user_info {
-            let s = ctx.create_string(&u);
-            ctx.set_field_by_name(uri_obj, "userInfo", Value::Object(Some(s)));
-        }
-        ctx.set_field_by_name(uri_obj, "port", Value::Int(port));
-    } else {
-        ctx.set_field_by_name(uri_obj, "port", Value::Int(-1));
-    }
+        None => -1,
+    };
+    let obj = ctx.read_native_pin(pin, uri_obj);
+    ctx.set_field_by_name(obj, "port", Value::Int(port));
+    ctx.unpin_native_roots(pin);
 }
 
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
