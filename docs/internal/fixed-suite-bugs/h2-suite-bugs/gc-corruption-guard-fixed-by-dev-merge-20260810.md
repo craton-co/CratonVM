@@ -100,9 +100,14 @@ real problem was never this guard in the first place. See:
 - `gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md` (this folder) — what's
   still broken on h2 post-merge (a separate, still-open shared-SIGSEGV
   defect, plus a GC-specific object-grid-desync guard).
-- `../../../known-issues/spring/gc-variant-fullsuite-classpath-gap-and-fails-20260810.md` —
-  what's still broken on spring-framework post-merge (overwhelmingly a
-  harness classpath-completeness bug, not a VM defect at all).
+- `fixed-suite-bugs/spring/gc-variant-fullsuite-classpath-gap-and-fails-20260810-FIXED.md`
+  — what was broken on spring-framework post-merge. RETIRED 2026-08-10: it was
+  three defects, not the one harness classpath bug the original page described.
+  Two were harness bugs (a `dumpTestCp` task that dumped jar paths it never
+  built, and a JUnit Vintage deprecation notice promoted to fatal); the third
+  was a real CratonVM defect (`sun.reflect.misc.MethodUtil` unloadable, taking
+  the whole `javax.management` cluster with it). Re-measured after all three:
+  87.5% → 99.0/99.2/99.1% OK.
 
 One more defect that was live pre-merge and is confirmed **also gone**
 post-merge, found while reading the postmerge h2 logs for this doc (not
@@ -122,6 +127,12 @@ post-merge until now):
   previously-clean set would be invisible to everything measured here. If
   that assurance matters, it needs at least a sampled re-sweep of the
   previously-passing set.
+
+  **Closed for spring-framework 2026-08-10**: the sweep recorded in
+  `fixed-suite-bugs/spring/gc-variant-fullsuite-classpath-gap-and-fails-20260810-FIXED.md`
+  re-ran all 2848 classes × 3 GC variants, not just the non-passing set, and
+  found no regression among the previously-clean set (OK rose 2491 → 2819,
+  2499 → 2824, 2494 → 2823). Still open for h2.
 - **No bisection.** `dev` is 79k+ lines ahead of the pre-merge `main` tip;
   this doc did not narrow down which specific commit(s) fixed the guard.
   Given how tractable "confirm dev is clean, confirm main isn't, bisect

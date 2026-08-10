@@ -892,6 +892,38 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
     "java/lang/AccessibleObject",
 ];
 
+/// Frames that match `REFLECTION_INTERNAL_CLASSES` but are NOT reflection
+/// plumbing, and so must stay visible as the caller.
+///
+/// `sun/reflect/` is in the skip list for the pre-JDK-9 accessor classes
+/// (`sun.reflect.NativeMethodAccessorImpl` and friends). Those moved to
+/// `jdk.internal.reflect` in JDK 9, and in a real JDK 25 image the only things
+/// left under `sun/reflect/` are `annotation/`, `generics/`, `ReflectionFactory`
+/// and `misc/` — none of which sit between a caller and a reflection native.
+///
+/// `sun.reflect.misc.MethodUtil` is a genuine caller, and skipping it broke
+/// JMX outright. Its `<clinit>` calls `setAccessible(true)` on
+/// `Trampoline.invoke` from `MethodUtil$1`; both are in `java.base`, so
+/// same-module access is unconditionally allowed. Skipping the `MethodUtil$1`
+/// frame walked the stack out to the application class instead, decided the
+/// caller was the unnamed module, and threw
+/// `InaccessibleObjectException: module java.base does not "opens
+/// sun.reflect.misc" to unnamed module`. `MethodUtil.<clinit>` wraps that as
+/// `InternalError: bouncer cannot be found`, so every later use surfaced as
+/// `NoClassDefFoundError: sun/reflect/misc/MethodUtil`.
+///
+/// The JDK's `javax.management.modelmbean.RequiredModelMBean` routes every
+/// managed operation through `MethodUtil`, so this one skipped frame accounted
+/// for all 58 `javax.management.*` failures across 22 `org.springframework.jmx.*`
+/// classes in the 2026-08-10 full-index sweep. HotSpot 25 loads the class fine
+/// (`probes/MU.java` is the two-line control).
+///
+/// Narrow on purpose: the other `sun/reflect/` subpackages keep their existing
+/// treatment. Widening this to all of `sun/reflect/` would be a fail-OPEN
+/// change if any accessor-like class ever lands there again, and the skip list
+/// is what keeps `Method.invoke` attributed to real user code.
+const REFLECTION_INTERNAL_EXCEPTIONS: &[&str] = &["sun/reflect/misc/"];
+
 /// Walk the current Java call stack and return the ClassId of the first
 /// non-reflection frame вЂ” i.e. the user code that invoked the reflection
 /// native. Returns `None` if the stack contains no such frame (which
@@ -919,19 +951,31 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
     for cid in ctx.frame_class_ids() {
         let name = ctx.class_name_of_id(cid)?;
-        let is_internal = REFLECTION_INTERNAL_CLASSES.iter().any(|prefix| {
-            if prefix.ends_with('/') {
-                name.starts_with(prefix)
-            } else {
-                name == *prefix
-            }
-        });
-        if is_internal {
+        if is_reflection_internal_frame(&name) {
             continue;
         }
         return Some(cid);
     }
     None
+}
+
+/// Is this frame reflection plumbing that must be skipped when resolving the
+/// caller? Pure function so the exception carve-out can be unit-tested without
+/// standing up a VM.
+pub(crate) fn is_reflection_internal_frame(name: &str) -> bool {
+    if REFLECTION_INTERNAL_EXCEPTIONS
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return false;
+    }
+    REFLECTION_INTERNAL_CLASSES.iter().any(|prefix| {
+        if prefix.ends_with('/') {
+            name.starts_with(prefix)
+        } else {
+            name == *prefix
+        }
+    })
 }
 
 /// Loader-id sentinels (mirror of `NativeContext::loader_id_of_class`):
