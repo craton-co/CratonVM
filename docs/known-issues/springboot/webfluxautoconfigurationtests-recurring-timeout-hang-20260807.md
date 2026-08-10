@@ -181,12 +181,66 @@ list is the annotation machinery the sampling profile already pointed at:
 | 21,684 | `TypeMappedAnnotation.createIfPossible` |
 | 7,860 | `AnnotatedElementUtils.findMergedAnnotation` |
 
-**26 of the top 30 report `reason=unrecorded`** — the compiler refused and did
-not say why. Four name `rbc6-handler-reads-unsafe-local`. That diagnostic gap is
-the first thing to close: `try_compile` records a reason only when some bail
-site called `note_jit_bail_site`, and the `None`-returning paths after
-`backend_attempted = true` (jit/src/lib.rs:17753) evidently include some that do
-not. Until those are named, the refusals cannot be fixed.
+**26 of the top 30 reported `reason=unrecorded`.** That is now resolved, and the
+answer was not the one this page assumed — see the next section.
+
+**Update 2026-08-10 — 63 of the 69 "compile failures" were never compiled at
+all.** They were **policy verdicts wearing a codegen failure's label**.
+
+`try_jit_compile_wrapped_entry` returns `None` for several unrelated reasons,
+and its own comment lists them: *"skip-listed, resolver miss, code-cache cap,
+concurrent redefine, ..."*. Two of those are permanent policy, not a codegen
+attempt that failed — but the `CompileOutcome` hardcoded
+`declined_permanently: false`, so `CompilerCore::complete_task` spent
+`tier_fail_count` on every one of them. Three futile background compile tasks
+per method, then the method is retired and reported as `compile-failed
+reason=unrecorded` — unrecorded *precisely because nothing ever ran to record a
+bail site*. `MethodState::ineligible` is the field that exists for this case,
+and `complete_task` already honours it; it was simply never told.
+
+Fixed by reporting a `None` as `declined_permanently` when the method is in the
+skip-set or on the permanent bail-list. Same class, same workload:
+
+| | before | after |
+|---|---:|---:|
+| `hot_but_stuck_in_interpreter` | 79 | 81 |
+| ...of which **ineligible-by-policy** | **0** | **63** |
+| ...of which **compile-failures** | **69** | **7** |
+| C1 compiles | 1552 | 1571 |
+
+So there were never 69 compiler bugs here — there are **7**, and those do carry
+real bail sites (`rbc6-handler-reads-unsafe-local` and friends). The other 63
+are the skip-seal policy, which is the finding below. Wall-clock is unchanged
+(240.97s → 240.79s), as it should be: this corrects a label and stops wasted
+compile tasks, it does not make anything faster.
+
+A stage-fallback was added at the same time (`no-site-after-<stage>`, stamped by
+each pipeline phase) so that a *genuine* silent refusal can never report
+`unrecorded` again. It did not fire on this workload — which is itself what
+proved no compile was running for those 63.
+
+### 1b. 2,498 methods are sealed out of compilation before any attempt
+
+The seal census, now split by reason (it was one label,
+`static-policy-or-native-shadow`, covering four different verdicts):
+
+```
+JIT skip-seal census: 2498 method(s) sealed before any compile
+  | calls-native-shadowed-method=1279  clinit=1219
+```
+
+**1,279 methods are excluded from the JIT because they call a method that has a
+native shadow** — more than the 1,155 that reach C2 in the same run. Nothing
+from the static policy table, nothing from the `ForkJoinTask` rule. This is the
+largest single population touching the gap and it was invisible before today.
+
+Not yet established: how much of the 20x it is worth. The obvious probe
+(`SealProbe`) shows a JDK-leaf call costs ~50 ns/iter against 8 ns/iter for pure
+integer work, and `String.charAt` ~460 ns/iter — but it did **not** reproduce
+the caller-sealing at scale (only `main` was sealed), so "1279 sealed methods"
+and "calls to JDK leaves are slow" are two facts that are not yet joined. Join
+them before acting: an A/B that narrows the seal on this class is the experiment,
+not another microbenchmark.
 
 ### 2. Annotation *attribute reads* cost ~10.5 us — and 94% of that is not where it looks
 
@@ -250,15 +304,20 @@ is now known, and what the next attempt should not repeat:
   are different measurements, and here they disagreed by 4x versus 0%.
 - Both previously-unmeasured angles are now measured (see the section above).
   The three leads they produced, in the order worth taking them:
-  1. **Name the 26 `reason=unrecorded` compile refusals.** Cheapest, unblocks
-     the rest, and it is a diagnostic-completeness fix rather than a codegen
-     one: every `None` return after `backend_attempted = true` needs to call
-     `note_jit_bail_site`. 69 hot methods are permanently interpreted behind it.
-  2. **The annotation-proxy entry path**, which is ~94% of a ~14 us attribute
+  1. ~~Name the 26 `reason=unrecorded` compile refusals.~~ **DONE 2026-08-10** —
+     63 of the 69 were policy verdicts mislabelled as codegen failures; 7 real
+     ones remain, each with a named bail site.
+  2. **The skip seal: 1,279 methods excluded for `calls-native-shadowed-method`,
+     against 1,155 that reach C2.** Now the largest measured population, and the
+     natural successor to lead 1. The question to answer first is not "how do we
+     narrow it" but "how much is it worth" — see the caveat in 1b: the
+     microbenchmark did not reproduce caller-sealing, so the two facts are not
+     yet joined. A/B a narrowed seal on this class.
+  3. **The annotation-proxy entry path**, which is ~94% of a ~14 us attribute
      read. `ann-proxy-prof` already brackets the dispatcher, so the next probe
      only has to bracket what comes before it: the generated `$ProxyN` body and
      the native proxy dispatch.
-  3. **OSR-only loops at 7-16x**, which is not this class's problem but is
+  4. **OSR-only loops at 7-16x**, which is not this class's problem but is
      probably somebody's.
 - Do **not** change `try_lambda_dispatch` on the strength of reading it. That
   function carries a long list of named correctness regressions in its own

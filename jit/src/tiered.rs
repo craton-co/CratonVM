@@ -1238,6 +1238,22 @@ pub fn dump_method_stats_to_stderr() {
             .filter(|(_, _, fail, inelig, _, _)| *fail > 0 && !*inelig)
             .count(),
     );
+    // Methods sealed out of compilation BEFORE any attempt, by reason. A
+    // different and larger population than `hot_but_stuck` — a Spring Boot
+    // context startup seals ~856 here against ~69 refused compiles — and until
+    // the reasons were split they all read as one opaque label.
+    let seal_census = crate::jit_skip_seal_census();
+    if !seal_census.is_empty() {
+        let total: u64 = seal_census.iter().map(|(_, n)| *n).sum();
+        eprintln!(
+            "[cratonvm] JIT skip-seal census: {total} method(s) sealed before any compile | {}",
+            seal_census
+                .iter()
+                .map(|(r, n)| format!("{r}={n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
     if !hot_but_stuck.is_empty() {
         hot_but_stuck.sort_by(|a, b| b.0.cmp(&a.0));
         eprintln!(
