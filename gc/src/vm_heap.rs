@@ -1091,7 +1091,13 @@ impl VmHeap {
     }
 
     /// Read an array element with auto-unboxing of wrapper types.
-    /// G1 falls back to plain get_array_element (no unboxing support yet).
+    ///
+    /// Only the generational collector needs a separate entry point: G1 and ZGC
+    /// un-box inside their own `get_array_element`, so routing them here would
+    /// double-decode nothing and the plain accessor already satisfies this
+    /// method's contract. Both arms below are therefore un-boxing reads, not
+    /// fallbacks — ZGC's was a genuine fallback until 2026-08-09, which is what
+    /// made `Stream.mapToLong(...).toArray()` return zeros under `-XX:+UseZGC`.
     pub fn get_array_element_unboxing(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         match self {
             VmHeap::Generational(h) => h.get_array_element_unboxing(obj, index),
