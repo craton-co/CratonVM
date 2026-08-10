@@ -12330,14 +12330,16 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             #[cfg(unix)]
             let connect_result = if legacy_dsa_client {
                 crate::servlet::s2_legacy_dsa_tls_connect(&host, port as u16, &legacy_dsa_roots)
+                    .map_err(|e| e.to_string())
             } else {
                 crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
                     .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
-                    .map_err(std::io::Error::other)
+                    .map_err(|e| e.to_string())
             };
             #[cfg(not(unix))]
             let connect_result = crate::t27_tls::rustls_client_connect(cfg, &host, port as u16)
-                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid);
+                .map(|rid| crate::servlet::RUSTLS_SOCK_ID_BASE + rid)
+                .map_err(|e| e.to_string());
             ctx.end_blocking_region();
             let id = connect_result.map_err(|e| ioex(format!("TLS connect: {e}")))?;
             let sock = try_alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", 5)?;
