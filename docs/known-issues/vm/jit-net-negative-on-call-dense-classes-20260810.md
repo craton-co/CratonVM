@@ -246,8 +246,58 @@ produced a confident wrong answer read on CPU time alone.
 * `probes/ByteBufferScalarSplitProbe.java` — run it under `--nojit` too; that
   control is what refuted the dispatch-floor reading.
 
+## Confirmed on a second, unrelated workload — where it costs a test FAILURE
+
+`org.h2.test.db.TestTransaction.testMergeUsing`, found 2026-08-10 while triaging
+the H2 three-GC-variant sweep. Different suite, different binary, no ByteBuffer
+accessors anywhere near it — and the arm ordering this page reports reproduces
+exactly.
+
+Two connections each run a 50-statement `MERGE` batch against one table; the
+loser of the race must take the table lock inside H2's own
+`TestAll.lockTimeout = 50` ms. Batch time, **min of 5** (min, not mean: the host
+carried three concurrent suite runs at `load1` ~13-19, and the minimum is the
+least contaminated statistic available):
+
+| arm | min batch ms |
+|---|---:|
+| HotSpot 25 | **22** |
+| CratonVM, JIT, `CRATONVM_JIT_THRESHOLD=500` (default) | 108 |
+| CratonVM, `--nojit` | 92 |
+| CratonVM, JIT, `CRATONVM_JIT_THRESHOLD=500000` | **87** |
+
+**Default-threshold JIT is the worst CratonVM arm and JIT-with-almost-nothing-
+compiled is the best, beating `--nojit` as well** — the same three-way ordering
+as the `ZipContentTests` sweep, on a workload that shares nothing with it.
+Whole-process CPU moves the same way (5 runs each: 1.2 s at threshold 500,
+1.1 s at 50 000, 0.86 s at 500 000).
+
+What this workload adds that a CPU number cannot: **the admission policy is
+visible as a wrong test result.** At the fixture's real 50 ms budget the loser's
+whole batch dies with
+`JdbcSQLTimeoutException: Timeout trying to lock table "TEST"`, its update
+counts are swallowed by the test's own `catch (SQLException e) { // Ignore }`,
+and the assertion reads `Expected: 100 actual: 50`. HotSpot passes 5/5;
+CratonVM fails 5/5 on every arm.
+
+And the honest limit: **the threshold lever does not recover it.** 87 ms is
+still ~1.7x over the 50 ms budget and ~4x HotSpot, so this class needs the
+throughput work, not just a better admission policy. The lever moves it 20%,
+which is real and consistent with this page — it just is not enough here.
+
+Repro, 1.25 s and deterministic (the full class takes ~20 s and hides the
+exception):
+
+* copy `testMergeUsing` verbatim into a probe that **still**
+  `extends TestDb` — a standalone `DriverManager` probe with the same URL
+  options does NOT reproduce — and print what the original swallows;
+* `--nojit` reproducing the FAIL identically is also what rules out a JIT
+  *miscompile* here in one run, as distinct from the tier-up cost this page is
+  about.
+
 ## Affected classes
 
 Caught on `ZipContentTests`, and nothing about it is special: any class whose
 time goes into many short calls from frames that never go hot — which is most
-of a JUnit suite — is in the same regime.
+of a JUnit suite — is in the same regime. Second confirmed instance:
+`org.h2.test.db.TestTransaction` (see above), where it turns into a FAIL.
