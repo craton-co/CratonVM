@@ -339,7 +339,31 @@ the run. The A/B/C that would settle it here (default vs
 `CloudFoundryActuatorAutoConfigurationTests` under the default collector (§5).
 Everything else in the 2026-08-08 table is disposed of in §2.
 
----
+## 8. 2026-08-10 reconciliation — `SpringApplicationTests` confirmed collector-agnostic, still "does not reproduce" as a G1 defect
+
+Reconciling the 139-class non-passed union from the 2026-08-08 `default`/`g1`/`zgc`
+rerun (binaries `cratonvm-{default,g1,zgc}-20260808f.exe`, `dev@6365de194`).
+`SpringApplicationTests` is TIMEOUT/HANG at ~300s under **all three** collectors this
+round (default 300.139s, G1 300.166s, ZGC 300.031s) — logs at
+`apps/spring-boot-suite-runner/.suite/results/craton-nonpassed-{default,g1,zgc}-20260808f-s1/all-jit/logs/core_spring-boot.org.springframework.boot.SpringApplicationTests.{out,err}.log`.
+
+This confirms, rather than contradicts, §2's "does not reproduce" verdict and the
+2026-08-10 update's note that this class "reproduce[s] on the DEFAULT collector too."
+All three `.out.log`s show the same signature: steady, evenly-spaced progress — a
+fresh `SpringApplication` context started roughly every 3.5–4.5s (`Started SbRunner
+in 3.5-4.7 seconds`), 1464-1674 lines of output each, still advancing at the moment
+of the kill, no repeated timestamp, no stack trace at the point of the cut. All three
+`.err.log`s are only 7-8 lines (the routine post-clinit-fixup/Mockito-self-attach
+boilerplate) — **silent**, zero GC/JIT diagnostic activity for the entire ~300s run.
+That is the same shape as §2's `PASS 544-695s` measurement without a ceiling: this
+class simply needs roughly 2x the 300s budget on every collector, with no crash, no
+deadlock signature (no repeating timestamp, no STW-stall line), and no
+collector-dependent divergence in either symptom or timing (293.978s / 294.64s /
+296.442s of process uptime reached at the kill, across the three collectors,
+essentially identical). **Collector-agnostic (reproduces under Generational, G1, and
+ZGC)** — consistent with §2's classification as timeout-boundary noise on an
+intrinsically slow class, not a new finding and not a reopening of §3's G1-only
+defect.
 
 ## The 2026-08-08 page, verbatim
 
