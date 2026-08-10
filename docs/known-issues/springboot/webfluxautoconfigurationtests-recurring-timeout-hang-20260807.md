@@ -151,6 +151,91 @@ classes byte-identical before and after), but it is not a fix for this page.
   with. That one is a disk-capacity failure (it needs ~15 GB free), not a
   throughput ceiling.
 
+## Where the gap actually is (2026-08-10 measurement pass)
+
+Three measurements, each answering one of the questions the section above left
+open. None of them is "the class is doing something wrong".
+
+### 1. The JIT is asked, and refuses, on exactly the hot annotation methods
+
+`CRATONVM_DBG=jit-method-stats` on a full run (202s on a quiet box):
+
+```
+1571 distinct methods tracked, 1570 ever invoked, 22,960,010 total invocations
+still-interpreted=80  c1=335  c2=1156
+compiles: c1=1552 c2=1158 osr=1 deopts=220 c2_bailouts=136 total_compile_time_ms=166
+hot_but_stuck_in_interpreter=79 (ineligible-by-policy=0, compile-failures=69)
+```
+
+So the JIT is not failing to *reach* this workload — 1156 methods make C2, and it
+spends 166 ms doing it. But **69 hot methods asked the compiler and were
+refused**, then hit `tier_fail_count=3` and were bail-listed permanently. The
+list is the annotation machinery the sampling profile already pointed at:
+
+| invocations | method |
+|---:|---|
+| 269,876 | `BeanFactoryUtils.transformedBeanName` |
+| 93,108 | `AnnotationTypeMappings.forAnnotationType` |
+| 39,412 | `TypeMappedAnnotations$IsPresent.doWithAnnotations` |
+| 31,988 | `AttributeMethods.forAnnotationType` |
+| 21,684 | `TypeMappedAnnotation.createIfPossible` |
+| 7,860 | `AnnotatedElementUtils.findMergedAnnotation` |
+
+**26 of the top 30 report `reason=unrecorded`** — the compiler refused and did
+not say why. Four name `rbc6-handler-reads-unsafe-local`. That diagnostic gap is
+the first thing to close: `try_compile` records a reason only when some bail
+site called `note_jit_bail_site`, and the `None`-returning paths after
+`backend_attempted = true` (jit/src/lib.rs:17753) evidently include some that do
+not. Until those are named, the refusals cannot be fixed.
+
+### 2. Annotation *attribute reads* cost ~10.5 us — and 94% of that is not where it looks
+
+`ReflProbe2` (each accessor in its own small, tiering method — see the artifact
+warning below), CratonVM against HotSpot, net of each VM's own control:
+
+| accessor | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| `Marker.value()` (annotation attribute) | ~10 ns | **~10,400 ns** | **~1000x** |
+| `Marker.count()` (annotation attribute) | ~17 ns | **~11,200 ns** | **~660x** |
+| `Class.getDeclaredMethods()` | 57 ns | 4,830 ns | 85x |
+| `Annotation.annotationType()` | 9 ns | 1,350 ns | 150x |
+| `Method.getDeclaredAnnotations()` | 16 ns | 1,610 ns | 100x |
+| `Class.getDeclaredAnnotations()` | 23 ns | 1,150 ns | 50x |
+| `Method.getModifiers()` | ~0 ns | 475 ns | — |
+
+Attribute reads are 7x worse than any neighbouring accessor, which makes them
+the one outlier worth chasing on this surface. But `CRATONVM_DBG=ann-proxy-prof`
+(added for this) shows `annotation_proxy_dispatch_impl` — the element walk that
+looks like the obvious culprit — costs only **~750 ns/call of the ~14,000 ns**.
+**~94% is the entry path** from the Java call site through the generated
+`$ProxyN` body and the native proxy dispatch, *before* the dispatcher runs.
+Inside the dispatcher the split was `flagread=155 namecmp=200-290 rest=260`; the
+flag read (an environment lookup per element access, for a value that cannot
+change after startup) is now latched — but that is a 2% fix on a 6% component,
+and A/B'ing it confirmed exactly that: 15798/15993 ns before against
+15665/14887 ns after, i.e. nothing outside the noise. It stays because a
+per-call `getenv` on a dispatch path is wrong regardless of payoff, not because
+it bought anything.
+
+### 3. A measurement artifact worth keeping: OSR-only loops run ~10x slower
+
+The first version of the reflection probe put every loop inline in `main` — a
+method called once, so its loops are reachable only by OSR. `FloorProbe`, three
+identical loops in each shape:
+
+| | small method, called often | inline in `main`, run once |
+|---|---:|---:|
+| loop arithmetic only | 8 ns/iter | **131 ns/iter** |
+| + static call | 34 ns/iter | **314 ns/iter** |
+| + static field read-modify-write | 105 ns/iter | **745 ns/iter** |
+
+HotSpot: 2/0/0 against 2/1/1 — no difference at all. So on CratonVM the same
+loop is **7-16x slower** when it can only be reached through OSR, and the first
+probe's ~700 ns "floor" was that, not reflection. Every ratio it produced was
+wrong and has been recomputed above. This is a real finding in its own right and
+does not belong to this class; it is filed here only because it is where it was
+found.
+
 ## What is left
 
 A ~10-30x gap on Spring context startup with **no single dominant term**. What
@@ -163,11 +248,18 @@ is now known, and what the next attempt should not repeat:
   gets hypothesised, **A/B it on this class before believing it** — the
   microbenchmark that motivates a change and the workload that has to improve
   are different measurements, and here they disagreed by 4x versus 0%.
-- The two remaining unmeasured angles: (a) how much of the annotation machinery
-  is CratonVM-side reflection cost versus interpreted Spring code — a
-  per-accessor probe diffed against the host JDK, the same technique that
-  produced the `Method.getModifiers()` finding, would separate them; (b) why the
-  JIT is worth only 17% here, which is a question about *reach*, not speed.
+- Both previously-unmeasured angles are now measured (see the section above).
+  The three leads they produced, in the order worth taking them:
+  1. **Name the 26 `reason=unrecorded` compile refusals.** Cheapest, unblocks
+     the rest, and it is a diagnostic-completeness fix rather than a codegen
+     one: every `None` return after `backend_attempted = true` needs to call
+     `note_jit_bail_site`. 69 hot methods are permanently interpreted behind it.
+  2. **The annotation-proxy entry path**, which is ~94% of a ~14 us attribute
+     read. `ann-proxy-prof` already brackets the dispatcher, so the next probe
+     only has to bracket what comes before it: the generated `$ProxyN` body and
+     the native proxy dispatch.
+  3. **OSR-only loops at 7-16x**, which is not this class's problem but is
+     probably somebody's.
 - Do **not** change `try_lambda_dispatch` on the strength of reading it. That
   function carries a long list of named correctness regressions in its own
   comments (`ProcessInfoTests.memoryInfoIsAvailable`,
