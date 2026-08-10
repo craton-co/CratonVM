@@ -335,6 +335,67 @@ wrong and has been recomputed above. This is a real finding in its own right and
 does not belong to this class; it is filed here only because it is where it was
 found.
 
+## 4. The annotation-proxy entry path — also worth ~1%. Measured 2026-08-10.
+
+The remaining lead was the ~94% of a ~14 us attribute read that sits *before*
+`annotation_proxy_dispatch_impl`. Two measurements settle it.
+
+**Where the entry cost splits.** `ProxyProbe` compares a plain
+`java.lang.reflect.Proxy` with a trivial hand-written `InvocationHandler`
+against an annotation proxy, arm-A shape, net of each VM's own control:
+
+| | HotSpot | CratonVM |
+|---|---:|---:|
+| direct interface call (control) | 8 ns | 760 ns |
+| **plain** JDK proxy `.value()` | 10 ns | 6,126 ns |
+| **annotation** proxy `.value()` | 14 ns | 16,175 ns |
+
+So ~35% of the annotation cost is **generic dynamic-proxy dispatch** — shared
+with every JDK proxy, including Spring AOP's — and ~65% is annotation-specific.
+Both are ~500-1000x HotSpot. The generated `$ProxyN` body allocates an
+`Object[]` per call (`ICONST_0; ANEWARRAY`) and the native
+`Proxy$Dispatch.invokeProxy` does a `class_name_of_id` String allocation, a
+by-name field lookup on the `Method`, and a String materialisation of the member
+name — all per call.
+
+**And it does not matter here**, because the call volume is small:
+
+```
+[PROXY-DISPATCH-PROF] native invokeProxy calls=300000 total=9532ns/call cumulative=2859ms
+```
+
+~300-400k dispatches at ~9.5 us = **~2.9-3.8 s of a 357 s run, ~1%**. The
+interpreter-side hook adds ~0.3-0.5 s. Making the entire annotation and proxy
+machinery *infinitely fast* would save about three seconds.
+
+**A measurement caveat worth keeping.** The first version of this count
+instrumented only `annotation_proxy_dispatch_impl` and reported ~100k
+dispatches — implying <0.5 s and a tidy conclusion. That was wrong by ~10x:
+proxy dispatch is a **two-branch funnel** (the interpreter hook *and* the native
+`invokeProxy` entry, which deliberately does not route through the other), and
+counting one branch under-reports by exactly the factor that decides the answer.
+Both branches are now counted under the same flag.
+
+## Conclusion: there is no single term, and three leads have proved it
+
+| lead | headline | measured worth |
+|---|---|---|
+| compile refusals | "69 hot methods refused" | 63 were mislabelled policy; 7 real |
+| native-shadow seal | "1,279 sealed > 1,155 at C2" | removing it entirely: **0** |
+| annotation/proxy path | "~1000x HotSpot per call" | **~1%** of the run |
+
+Every per-call gap above is real and large. None of them is where the 20x lives,
+because none of them happens often enough. What is left is ordinary Java
+throughput across Spring's own code — the sampling profile says exactly that
+(largest single leaf 3.9%; 50.7% under `springframework/core/annotation`, which
+is Spring's *own Java classes*, not VM annotation calls) and three independent
+ceiling measurements have now failed to contradict it.
+
+**Anyone picking this up should stop looking for a mechanism and start on
+breadth**: the interpreter and the compiled-code quality across ordinary
+application bytecode. And they should keep pricing ceilings first — it has cost
+one build each time and saved three large changes.
+
 ## What is left
 
 A ~10-30x gap on Spring context startup with **no single dominant term**. What
@@ -356,18 +417,16 @@ is now known, and what the next attempt should not repeat:
      **CLOSED 2026-08-10, ceiling measured at zero** (§1c). Removing the seal
      entirely frees 1,264 methods, moves 56 more to C2, and does not improve wall
      clock. Do not rebuild it per-site for this workload's sake.
-  3. **The annotation-proxy entry path**, which is ~94% of a ~14 us attribute
-     read — now the largest *unexplained* single term on this page, and the next
-     lead by default. `ann-proxy-prof` already brackets the dispatcher, so the
-     next probe only has to bracket what comes before it: the generated `$ProxyN`
-     body and the native proxy dispatch.
+  3. ~~The annotation-proxy entry path.~~ **CLOSED 2026-08-10 at ~1%** (§4).
+     ~300-400k dispatches at ~9.5 us = ~3 s of a 357 s run.
   4. **OSR-only loops at 7-16x**, which is not this class's problem but is
-     probably somebody's.
+     probably somebody's — the one item on this page still worth someone's time,
+     and it belongs to whoever owns tier-up, not to this class.
 
-  Note the pattern across leads 1 and 2: both headline numbers ("69 refused
-  compiles", "more sealed than compiled") looked like causes and were not. Price
-  the ceiling with a lever before building the fix — twice now that has cost one
-  build and saved a large one.
+  The pattern across all three closed leads: every headline number ("69 refused
+  compiles", "more sealed than compiled", "1000x per call") looked like a cause
+  and none was. Price the ceiling with a lever or a counter before building the
+  fix — three times now that has cost one build and saved a large one.
 - Do **not** change `try_lambda_dispatch` on the strength of reading it. That
   function carries a long list of named correctness regressions in its own
   comments (`ProcessInfoTests.memoryInfoIsAvailable`,
