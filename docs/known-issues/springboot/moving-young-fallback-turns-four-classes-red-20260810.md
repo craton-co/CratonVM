@@ -207,7 +207,47 @@ count with it on and off. The resolution it gates never succeeds there, so
 turning it off changes nothing. An inert lever is not an elimination; here it is
 positive evidence that the decode is failing rather than being skipped.
 
-### …but fixing it may shift the reason rather than remove the fallback
+### Measured: repairing it would convert NOTHING in a real workload
+
+`CRATONVM_DBG_GC_FALLBACK_REASONS=1` records the full per-cycle reason **set**
+(the stored reason is first-wins, so it cannot answer "would repairing X have
+helped"). `attributable-innermost-rbp=yes` marks a cycle whose entire
+incompleteness traces to the indirect-call resolution — counting the
+`compiled-frame-band-unbounded` bit that the same `innermost_frame_method`
+failure co-emits from the band walk.
+
+| Workload | threads | cycles | attributable |
+|---|---|---:|---:|
+| probe `iface` (megamorphic) | 1 | 23 | **23 — 100%** |
+| probe `virtual` (final receiver) | 1 | 45 | **45 — 100%** |
+| probe `static` (direct `E8`) | 1 | 111 | 0 — different pair |
+| **`Log4J2LoggingSystemTests`** | many | **478** | **0 — 0%** |
+
+Every one of Log4J2's 478 cycles carries a **third, independent** reason:
+
+```
+all=xt-helper-window-conservative-scan,compiled-frame-band-unbounded,innermost-rbp-belongs-to-unguarded-callee
+```
+
+`xt-helper-window-conservative-scan` is a **cross-thread** obligation — "a
+blocked peer's JIT helper window was scanned conservatively" — and nothing about
+`innermost_frame_method` touches it. Repair the indirect-call resolution
+perfectly and all 478 cycles still fall back on that reason alone.
+
+**So the indirect-call repair is not the fix for these classes, and was not
+attempted.** It would cost a store on every compiled frame push across three
+compile doors and convert zero real cycles. The single-threaded probe said 100%
+precisely *because* it is single-threaded; the discriminator is peer threads,
+which every one of the four affected classes has and the probe does not. A
+20-second synthetic reproducer generalised exactly backwards here.
+
+The target is `XT_HELPER_WINDOW` (`vm/src/jit/xt_root_scan.rs`), not
+`innermost_frame_method`. It has its own opt-out,
+`CRATONVM_XT_HELPER_WINDOW_SCAN=0`, which is where a next pass should start —
+price the ceiling with the existing lever before writing anything, the same way
+`CRATONVM_GC_NO_CALLEE_RESOLVE` priced this one at zero.
+
+### The earlier worry, resolved
 
 Normalised per unit of work the three arms are comparable — static 2.3
 fallbacks per million iterations, iface 3.6, virtual 2.8. The direct-call arm
