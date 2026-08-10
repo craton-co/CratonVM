@@ -32,12 +32,48 @@ public final class ByteBufferScalarSplitProbe {
 		handRolled(buffer, 100_000);
 		rawArray(array, 100_000);
 
+		relativeShort(buffer, 100_000);
+		relativeInt(buffer, 100_000);
+
 		System.out.println("arm,ops,millis,ns_per_op");
 		time("buffer.get(int)      ", () -> singleByte(buffer, OPS));
 		time("buffer.getShort(int) ", () -> getShort(buffer, OPS));
 		time("buffer.getInt(int)   ", () -> getInt(buffer, OPS));
+		time("buffer.getShort()    ", () -> relativeShort(buffer, OPS));
+		time("buffer.getInt()      ", () -> relativeInt(buffer, OPS));
 		time("hand-rolled LE short ", () -> handRolled(buffer, OPS));
 		time("raw byte[] read      ", () -> rawArray(array, OPS));
+	}
+
+	/**
+	 * The RELATIVE forms, which is what Spring Boot's zip header reader
+	 * actually calls — eleven `getShort()` and six `getInt()` per central
+	 * directory record, and the absolute forms never.
+	 *
+	 * `position(0)` every 1024 reads rather than every read: rewinding is
+	 * itself a call, and paying it per iteration would bury the thing being
+	 * measured.
+	 */
+	private static long relativeShort(ByteBuffer buffer, int ops) {
+		long sink = 0;
+		for (int i = 0; i < ops; i++) {
+			if ((i & 1023) == 0) {
+				buffer.position(0);
+			}
+			sink += buffer.getShort();
+		}
+		return sink;
+	}
+
+	private static long relativeInt(ByteBuffer buffer, int ops) {
+		long sink = 0;
+		for (int i = 0; i < ops; i++) {
+			if ((i & 1023) == 0) {
+				buffer.position(0);
+			}
+			sink += buffer.getInt();
+		}
+		return sink;
 	}
 
 	private static long singleByte(ByteBuffer buffer, int ops) {

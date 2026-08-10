@@ -2279,6 +2279,16 @@ mod tests {
 
     #[test]
     fn test_check_access_thread_and_group() {
+        // `checkAccess` has routed through `check_permission_impl` since the V10
+        // security fix, so this test reads the process-global `ACTIVE_POLICY`
+        // like every other `checkXxx` test — it asserts the no-policy ALLOW.
+        // Without the lock it was the one policy-sensitive test in this module
+        // running unserialized, and a policy-installing sibling scheduled
+        // alongside it turned the ALLOW into a DENY: `assert!(result.is_ok())`
+        // failed roughly once in twenty whole-suite runs, and 27 times in 30
+        // when the two are run as a pair on two threads.
+        let _guard = policy_test_lock();
+        clear_policy_and_stack();
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
 
@@ -2308,6 +2318,7 @@ mod tests {
             &[Value::Object(Some(sm_obj)), Value::Object(Some(group))],
         );
         assert!(result.is_ok());
+        clear_policy_and_stack();
     }
 
     #[test]
@@ -2335,6 +2346,17 @@ mod tests {
     /// Serialize tests that mutate the global policy so parallel test
     /// execution doesn't cause one test's `clear_policy_and_stack()` to
     /// race another's `set_active_policy(Some(...))`.
+    ///
+    /// **Readers need it too, not just writers.** `ACTIVE_POLICY` is a process
+    /// global, so a test that merely *observes* the no-policy default is racing
+    /// every policy-installing sibling — the writers taking this lock among
+    /// themselves does nothing for a reader that does not. Since the V10
+    /// security fix every `checkXxx` native routes through
+    /// `check_permission_impl`, which reads `ACTIVE_POLICY`; so the rule is:
+    /// **a test that calls any `checkXxx` native, or `set_active_policy`, or
+    /// `clear_policy_and_stack`, holds this guard for its whole body.**
+    /// `test_check_access_thread_and_group` was the one test in this module
+    /// that did not, and it failed about once in twenty whole-suite runs.
     fn policy_test_lock() -> std::sync::MutexGuard<'static, ()> {
         security_state_test_lock()
     }

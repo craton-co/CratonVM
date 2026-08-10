@@ -4554,6 +4554,10 @@ impl G1Collector {
                         obj_ptr as usize,
                         trail.render(),
                     );
+                    eprintln!(
+                        "[g1][DESYNC-COVER] {}",
+                        describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor)
+                    );
                 }
                 break;
             }
@@ -4575,6 +4579,11 @@ impl G1Collector {
                         header.array_length(),
                         header.num_slots(),
                         trail.render(),
+                    );
+                    eprintln!(
+                        "[g1][WALKBRK-COVER] {} {}",
+                        describe_skip_coverage(&jit_skips, obj_ptr as usize, base, cursor),
+                        hexdump_around(base, cursor, offset),
                     );
                 }
                 break;
@@ -9386,6 +9395,81 @@ fn jit_tlab_skip_span_len(spans: &[(usize, usize)], addr: usize) -> Option<usize
         .iter()
         .find(|&&(s, e)| addr >= s && addr < e)
         .map(|&(_, e)| e - addr)
+}
+
+/// Whether a desync landing address is covered by a published frozen-peer TLAB
+/// skip span, and how far it sits from the nearest one.
+///
+/// This is the question that separates the two candidate producers of an
+/// unwalkable hole. If the address IS inside a published span, some live
+/// thread owns that memory and the walkers simply were not told in time. If it
+/// is NOT — and especially if it sits a small fixed distance past a span's end
+/// — the hole belongs to no live thread, which points at a TLAB whose tail was
+/// never filled (an abandoned/`Tlab::new`-trimmed span) rather than a walker
+/// gap. Printing the neighbourhood rather than a bare yes/no is deliberate: the
+/// interesting case so far is a gap of a few bytes adjacent to a legitimate
+/// span, which a boolean would hide.
+fn describe_skip_coverage(
+    spans: &[(usize, usize)],
+    addr: usize,
+    region_base: *mut u8,
+    region_cursor: usize,
+) -> String {
+    let off = addr.saturating_sub(region_base as usize);
+    if let Some(&(s, e)) = spans.iter().find(|&&(s, e)| addr >= s && addr < e) {
+        return format!(
+            "addr={addr:#x} off={off:#x} INSIDE published skip span [{s:#x},{e:#x}) \
+             (len={}) — a live thread owns this memory",
+            e - s
+        );
+    }
+    // Nearest span by absolute distance to either endpoint, so an adjacent
+    // sliver shows up as `dist=8` rather than as "uncovered".
+    let nearest = spans
+        .iter()
+        .map(|&(s, e)| {
+            let d = if addr < s { s - addr } else { addr.saturating_sub(e) };
+            (d, s, e)
+        })
+        .min_by_key(|(d, _, _)| *d);
+    match nearest {
+        Some((d, s, e)) => format!(
+            "addr={addr:#x} off={off:#x} region_cursor={region_cursor:#x} NOT covered by any of \
+             {} published skip span(s); nearest [{s:#x},{e:#x}) dist={d:#x}",
+            spans.len()
+        ),
+        None => format!(
+            "addr={addr:#x} off={off:#x} region_cursor={region_cursor:#x} NOT covered — \
+             ZERO published skip spans this pause"
+        ),
+    }
+}
+
+/// 32 bytes before and 48 bytes from a walk-break offset, as 8-byte words.
+///
+/// The break offset alone cannot distinguish "these bytes are garbage" from
+/// "these bytes are a real object header the walker arrived at off-grid". The
+/// words on either side settle it: a real header shows a plausible class_id in
+/// the low dword of word 0, and the preceding words show whether the zero run
+/// that led here is 8, 16 or more bytes long.
+fn hexdump_around(base: *mut u8, cursor: usize, offset: usize) -> String {
+    let lo = offset.saturating_sub(32);
+    let hi = (offset + 48).min(cursor);
+    let mut out = String::from("bytes[");
+    let mut o = lo & !7;
+    while o + 8 <= hi {
+        // SAFETY: `[lo, hi)` is clamped to `[0, cursor)`, inside the region's
+        // committed data; reads are 8-aligned and within the same allocation.
+        let w = unsafe { std::ptr::read_unaligned(base.add(o) as *const u64) };
+        if o == offset {
+            out.push_str(&format!(" >>{o:#x}={w:#018x}<<"));
+        } else {
+            out.push_str(&format!(" {o:#x}={w:#018x}"));
+        }
+        o += 8;
+    }
+    out.push(']');
+    out
 }
 
 /// How many walked objects [`WalkTrail`] keeps.

@@ -212,6 +212,28 @@ looked right:
 
 4. **"It is one of the JIT's allocation fast paths."** Three gates tested
    individually, all still corrupt — see §3b. `emit_inline_tlab_new` is out.
+5. **"A dying worker thread abandons its TLAB without retiring it."** The most
+   promising lead yet, and wrong. The evidence for it was strong: a
+   `WALKBRK-COVER` hexdump showed the break sitting in a ~900 KB **zeroed** span
+   below `region_cursor=0xfffa8`, immediately after a correctly-retired TLAB's
+   8-byte `GAP_FILLER` sentinel, with **"ZERO published skip spans this pause"** —
+   i.e. no live thread claimed that memory:
+
+   ```
+   0x207f0 = 0x00000008f111e701   GAP_FILLER sentinel (cid=0xF111E701, len=8)
+   0x207f8 = 0x0000000000000000
+   0x20800 = 0x0000000a00000000
+ >>0x20808 = 0x0001000000000000<< class_id=0 num_slots=0x10000 -> obj_size 0x100010, BREAK
+   0x20810..0x20830 all zero
+   ```
+
+   And `vm/src/vm/vm_exec.rs` really did have the asymmetry: the main-thread
+   teardown retires before its `clear_tlab_addr`, the spawned-worker teardown
+   did not — so a worker withdrew from `collect_reserved_tlab_tails` having
+   never stamped a filler. Adding `jvm_thread.tlab.retire()` there **did not
+   fix it**: 18/61 failures, 239 and 252 guard hits, 8 walk breaks per run,
+   unchanged. The retire is kept (it closes the asymmetry on its own terms and
+   is idempotent) but is explicitly *not* the fix.
 
 **Open question:** with the JIT on, what leaves an object in an Eden region whose
 **header is all zero while its body holds real data**, with neighbours allocated
@@ -230,6 +252,62 @@ Two concrete next steps, in order:
   a walker gap.
 * Walk the remaining JIT gates the same way §3b walked the allocation ones,
   starting with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`.
+* **START HERE: is the reserved-TLAB-tail publication reached on every G1
+  pause?** This is the best-founded remaining hypothesis and it is consistent
+  with every measurement above.
+
+  `G1Collector::refill_tlab` carves `actual = requested_size.min(remaining)`,
+  so a single refill can take an entire region's remainder — driving
+  `region.cursor` to exactly `region_size`. Both problem regions show precisely
+  that: 117 and 167 each report `cursor=0x100000` with `region_size` = 1 MiB.
+  Such a chunk is covered by exactly two things: `Tlab::retire()` (stamps a
+  filler) or `collect_reserved_tlab_tails` → `set_jit_tlab_skip_regions`
+  (publishes the span so walkers stride it). The hexdump shows **neither** —
+  ~900 KB of zeroes below the cursor and *"ZERO published skip spans this
+  pause"*.
+
+  The publication lives in `vm/src/runtime/interpreter/gc_and_alloc.rs`
+  (~line 485) inside **`stw_take_over_and_wait`**, behind
+  `if taken.count() > 0 || helper_windows > 0 || !regions.is_empty()`. If a G1
+  pause can run without going through `stw_take_over_and_wait`, then no span is
+  published on that pause even when a live thread is holding a large
+  un-retired TLAB — which is exactly the observed state. Check whether every
+  G1 collection path reaches that publication, and if not, hoist it so it runs
+  unconditionally before any region is walked.
+
+  Two sub-cases are already excluded, which sharpens the question a lot.
+  `collect_reserved_tlab_tails` only sees threads that registered a
+  `tlab_addr`, and spawned workers **do** register (`vm_exec.rs:12637` and
+  `:12733`, alongside main at `:4371`, JNI at `jni.rs:598`, init at
+  `vm_init.rs:7731`) — so an unregistered owner is out. And `reserved_tail`
+  returns `None` only for `cursor == 0`, `end == 0`, or `cursor >= end`, none
+  of which fit a barely-used 900 KB chunk. So if the span really is a live
+  TLAB, publication should have seen it; and if its owner had retired, a filler
+  would be there. **Neither holds** — which means the span may not be a TLAB at
+  all, and the question becomes: what else advances `region.cursor` over memory
+  no object header was ever written into?
+
+  **Every production writer of `region.cursor`** (g1.rs, excluding tests), so
+  the "what else advances it?" question is closed as an enumeration:
+  `G1Region::reset` → `0`; `G1Region::bump_alloc` → `end`;
+  `alloc_humongous_locked` → `size` on the start and `0` on continuations
+  (g1.rs:1944/1947); and the **parallel evacuator's** `retire_tlab`
+  (g1.rs:461) → `tlab.offset`, which is opt-in behind
+  `CRATONVM_G1_PARALLEL_EVAC` and off by default. If a run reproducing this
+  ever has that flag set, suspect g1.rs:461 first — it *assigns* rather than
+  maxes the cursor.
+
+  **And every production site that installs a `Tlab`:**
+  `gc_and_alloc.rs:3245` (retires the outgoing TLAB first, at :3221) and
+  `vm_init.rs:9368` (the main thread's initial install, so nothing prior to
+  leak). So "a TLAB was replaced without retiring" is closed as well.
+
+  **Ruled out while forming this:** a humongous region being retyped without a
+  reset. `cleanup`'s humongous reclaim calls `region.reset(generation)` on
+  every region of the span, so those Free regions do carry `cursor = 0`; and
+  the problem regions report `reuse_epoch=0`, meaning `reset()` was never
+  called on them at all (they came fresh from the arena), which is
+  incompatible with the humongous-recycle story.
 * **Explain the ~16 zero bytes that sit immediately after a TLAB filler.** This
   is the one invariant across every trail, and it is the desync point:
 
