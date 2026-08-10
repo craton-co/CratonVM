@@ -486,11 +486,28 @@ point of surfacing, exactly as it said.
 
 ### A/B regression sweep
 
-The change can only reach a process that has a user-defined loader AND a
-name with two definitions, so the sweep targeted exactly that: every
-spring-framework test class that uses `@CompileWithForkedClassLoader`, plus
+The change can only reach a process that has a user-defined loader AND a name
+with two definitions, so the sweep targeted exactly that population rather than
+a random slice: every spring-framework test class that uses
+`@CompileWithForkedClassLoader` (13 of them), plus
 `BeanRegistrationsAotContributionTests`, `MergedAnnotationsTests` and
-`ResolvableTypeTests`. Results in `/data/aot-runs/ab-{base,fix}/results.tsv`.
+`ResolvableTypeTests`. One process per class, 900 s cap, both binaries on the
+same host in the same window.
+
+**16 classes: 15 byte-identical, 1 improved, 0 regressed.**
+
+| | base `58ffc3e60` | fix `3f8c53583` |
+|---|---|---|
+| `TestContextAotGeneratorIntegrationTests` | `found=4 succ=3 fail=1` | **`found=4 succ=4 fail=0`** |
+| `ApplicationContextAotGeneratorTests` | `found=40 succ=33 fail=7` | same 33/40 — pre-existing, untouched |
+| `BeanRegistrationsAotContributionTests` | timeout at 900 s | timeout at 900 s — same in both, and the box was running six of these at once |
+| the other 13 | all `status=OK` | identical |
+
+The improvement is the same defect: `processAheadOfTimeWithXmlTests` failed on
+base with `TestContextAotException` and passes with the owner resolved in the
+caller's loader.
+
+Raw output: `/data/aot-runs/ab-{base,fix}/`.
 
 ### Still open, and NOT this page's defect
 
