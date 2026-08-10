@@ -4508,12 +4508,17 @@ impl G1Collector {
         };
 
         let jit_skips = self.jit_tlab_skip_spans();
+        let dbg_walk = gc_flags().g1_dbg_reach;
+        let mut trail = WalkTrail::default();
         let mut offset = 0usize;
         while offset < cursor {
             let obj_ptr = unsafe { base.add(offset) };
             // INT-3 — frozen-peer TLAB tail: uninitialized, no walkable
             // filler; must be skipped before any byte is interpreted.
             if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                if dbg_walk {
+                    trail.record(offset, u32::MAX, b'S', skip);
+                }
                 offset += skip;
                 continue;
             }
@@ -4521,6 +4526,9 @@ impl G1Collector {
             // header — see `gap_filler_len`; `break`ing here would skip the
             // rest of a possibly-pinned source region's objects).
             if let Some(gap) = gap_filler_len(obj_ptr) {
+                if dbg_walk {
+                    trail.record(offset, u32::MAX, b'G', gap);
+                }
                 offset += gap;
                 continue;
             }
@@ -4539,11 +4547,12 @@ impl G1Collector {
                 if n <= 8 || n.is_power_of_two() {
                     let r = &regions[source_idx];
                     tracing::warn!(
-                        "[g1] rset-source walk DESYNCED (#{n}): region={source_idx} type={:?} reuse_epoch={} recycled_in_generation={} offset={offset:#x} cursor={cursor:#x} obj=0x{:x} — the bytes there are not an object header, so this region's object grid does not describe its contents. Abandoning the walk; the pause continues.",
+                        "[g1] rset-source walk DESYNCED (#{n}): region={source_idx} type={:?} reuse_epoch={} recycled_in_generation={} offset={offset:#x} cursor={cursor:#x} obj=0x{:x} — the bytes there are not an object header, so this region's object grid does not describe its contents. Abandoning the walk; the pause continues. trail=[{}]",
                         r.region_type,
                         r.reuse_epoch,
                         r.recycled_in_generation,
                         obj_ptr as usize,
+                        trail.render(),
                     );
                 }
                 break;
@@ -4556,13 +4565,27 @@ impl G1Collector {
             }
             let obj_size = object_total_size(header);
             if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                if gc_flags().g1_dbg_reach {
+                if dbg_walk {
                     eprintln!(
                         "[g1][WALKBRK] source-scan region={source_idx} off={offset:#x} \
-                         cursor={cursor:#x} obj_size={obj_size:#x}"
+                         cursor={cursor:#x} obj_size={obj_size:#x} \
+                         cid={} kind={} alen={} slots={} trail=[{}]",
+                        header.class_id.as_u32(),
+                        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                        header.array_length(),
+                        header.num_slots(),
+                        trail.render(),
                     );
                 }
                 break;
+            }
+            if dbg_walk {
+                trail.record(
+                    offset,
+                    header.class_id.as_u32(),
+                    ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                    obj_size,
+                );
             }
 
             // Walk reference slots; mirror scan_and_evacuate_refs's slot
@@ -4685,6 +4708,7 @@ impl G1Collector {
         // `add_reference` dedups.)
         let mut new_rset_edges: Vec<(usize, usize)> = Vec::new();
         let jit_skips = self.jit_tlab_skip_spans();
+        let dbg_walk = gc_flags().g1_dbg_reach;
 
         for i in 0..regions.len() {
             if cset.contains(&i) || regions[i].region_type == RegionType::Free {
@@ -4694,12 +4718,16 @@ impl G1Collector {
             let cursor = regions[i].cursor;
             let base = regions[i].data.as_mut_ptr();
             let mut offset = 0usize;
+            let mut trail = WalkTrail::default();
 
             while offset < cursor {
                 let obj_ptr = unsafe { base.add(offset) };
                 // INT-3 — frozen-peer TLAB tail: uninitialized, no walkable
                 // filler; must be skipped before any byte is interpreted.
                 if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_ptr as usize) {
+                    if dbg_walk {
+                        trail.record(offset, u32::MAX, b'S', skip);
+                    }
                     offset += skip;
                     continue;
                 }
@@ -4707,6 +4735,9 @@ impl G1Collector {
                 // here would leave the rest of this region's references
                 // un-fixed-up after evacuation (stale pointers).
                 if let Some(gap) = gap_filler_len(obj_ptr) {
+                    if dbg_walk {
+                        trail.record(offset, u32::MAX, b'G', gap);
+                    }
                     offset += gap;
                     continue;
                 }
@@ -4719,13 +4750,30 @@ impl G1Collector {
                 let obj_size = object_total_size(header);
 
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                    if gc_flags().g1_dbg_reach {
+                    if dbg_walk {
                         eprintln!(
                             "[g1][WALKBRK] phase4 region={i} off={offset:#x} \
-                             cursor={cursor:#x} obj_size={obj_size:#x}"
+                             cursor={cursor:#x} obj_size={obj_size:#x} \
+                             type={:?} reuse_epoch={} cid={} kind={} alen={} slots={} \
+                             trail=[{}]",
+                            regions[i].region_type,
+                            regions[i].reuse_epoch,
+                            header.class_id.as_u32(),
+                            ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                            header.array_length(),
+                            header.num_slots(),
+                            trail.render(),
                         );
                     }
                     break;
+                }
+                if dbg_walk {
+                    trail.record(
+                        offset,
+                        header.class_id.as_u32(),
+                        ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+                        obj_size,
+                    );
                 }
 
                 update_object_refs(obj_ptr, header, pointer_map);
@@ -9338,6 +9386,53 @@ fn jit_tlab_skip_span_len(spans: &[(usize, usize)], addr: usize) -> Option<usize
         .iter()
         .find(|&&(s, e)| addr >= s && addr < e)
         .map(|&(_, e)| e - addr)
+}
+
+/// How many walked objects [`WalkTrail`] keeps.
+const WALK_TRAIL_LEN: usize = 8;
+
+/// The last few objects a linear region walk consumed, so a break can name the
+/// step that desynchronized the grid instead of only the offset it landed on.
+///
+/// A linear walk derives each step from the previous object's RECORDED size. So
+/// when the walk lands on bytes that are not a header, the defect is almost
+/// never at that offset — it is the last object whose recorded size understated
+/// (or overstated) the space it actually occupies. Printing only the landing
+/// offset, as the two break sites did, names the victim and hides the culprit.
+///
+/// Recorded only under `CRATONVM_G1_DBG_REACH=1`; one branch per object
+/// otherwise, and nothing is rendered unless a walk actually breaks.
+#[derive(Default)]
+struct WalkTrail {
+    /// `(offset, class_id, kind_tag, recorded_size)`, oldest-to-newest once
+    /// wrapped. Fixed-size so the trail cannot allocate inside a GC pause.
+    entries: [(usize, u32, u8, usize); WALK_TRAIL_LEN],
+    len: usize,
+    next: usize,
+}
+
+impl WalkTrail {
+    #[inline]
+    fn record(&mut self, offset: usize, class_id: u32, kind: u8, size: usize) {
+        self.entries[self.next] = (offset, class_id, kind, size);
+        self.next = (self.next + 1) % WALK_TRAIL_LEN;
+        self.len = (self.len + 1).min(WALK_TRAIL_LEN);
+    }
+
+    /// Oldest-first rendering of the trail, `off=+size(cid,kind)` per step, so
+    /// the arithmetic that produced the landing offset can be checked by eye.
+    fn render(&self) -> String {
+        let mut out = String::new();
+        let start = if self.len == WALK_TRAIL_LEN { self.next } else { 0 };
+        for i in 0..self.len {
+            let (off, cid, kind, size) = self.entries[(start + i) % WALK_TRAIL_LEN];
+            if i > 0 {
+                out.push(' ');
+            }
+            out.push_str(&format!("{off:#x}+{size:#x}(cid={cid},k={kind})"));
+        }
+        out
+    }
 }
 
 #[inline]
