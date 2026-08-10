@@ -252,6 +252,20 @@ Two concrete next steps, in order:
   a walker gap.
 * Walk the remaining JIT gates the same way §3b walked the allocation ones,
   starting with `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE=1`.
+* **Check whether a humongous region is being retyped without a reset.**
+  Unverified, but it is the one hypothesis that explains a cursor covering
+  memory that was never object-allocated, which is what the hexdump shows.
+  `alloc_humongous_locked` sets the START region's `cursor` to the FULL object
+  size (spanning continuation regions) and gives continuations `cursor = 0`;
+  `G1Region::reset` is what returns a cursor to 0. Two data points to test it
+  against, both from regions reported `type=Eden reuse_epoch=0`:
+  region 167 broke on bytes decoding to `obj_size=0x1500010` (21 MiB — a
+  humongous-scale size) with `cursor=0x100000` exactly equal to `region_size`,
+  and region 117's cursor was likewise exactly `0x100000`. A region whose
+  cursor equals the region size, or exceeds what was ever bump-allocated into
+  it, would present precisely as "committed span with no object grid, claimed
+  by no thread". Instrument `region.cursor` at every retype/free site and
+  assert it is `0` on the Free→Eden transition.
 * **Explain the ~16 zero bytes that sit immediately after a TLAB filler.** This
   is the one invariant across every trail, and it is the desync point:
 
