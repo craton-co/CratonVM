@@ -6491,6 +6491,7 @@ impl Compiler {
                                     }
                                 }
                                 self.emit_epilogue_without_ret();
+                                self.dbg_unserviced_direct_call("invokestatic-tailcall", pc, false, false);
                                 self.emit_jmp_absolute(callee_entry);
                                 // Consume the invokestatic (3) and the
                                 // xreturn (1) — no fall-through.
@@ -6537,6 +6538,13 @@ impl Compiler {
                             self.emit_stack_arg_cleanup(total_sub);
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                            } else {
+                                self.dbg_unserviced_direct_call(
+                                    "invokestatic",
+                                    pc,
+                                    info_ptr.is_some(),
+                                    service_args_base.is_some(),
+                                );
                             }
 
                             // A directly-called compiled callee that throws
@@ -8565,6 +8573,13 @@ impl Compiler {
                             self.emit_stack_arg_cleanup(total_sub);
                             if let (Some(info), Some(args_base)) = (info_ptr, service_args_base) {
                                 self.emit_inline_callee_deopt_check(info as *const crate::JitInvokeInfo, arg_slots.len(), args_base);
+                            } else {
+                                self.dbg_unserviced_direct_call(
+                                    "invokespecial/virtual",
+                                    pc,
+                                    info_ptr.is_some(),
+                                    service_args_base.is_some(),
+                                );
                             }
 
                             // A directly-called compiled callee that throws (or
