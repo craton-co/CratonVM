@@ -25255,6 +25255,125 @@ mod tests {
         clear_jit_recursive_cycle_methods_for_test();
     }
 
+    /// A statically-bound JIT-to-JIT direct call MUST still carry a
+    /// `JitInvokeInfo` for its pc.
+    ///
+    /// `emit_inline_callee_deopt_check` is emitted only when the codegen has
+    /// one, and it is the only thing that can notice the raw CALL's callee
+    /// trapped: without it the callee's `i64::MIN` sentinel reaches the
+    /// caller's shared exception-check stub, which reloads the sentinel and
+    /// returns, and the frame the callee stashed under ITS OWN key travels up
+    /// to a consumer that cannot attribute it. Measured on H2 `TestScript`:
+    /// 582 unserviced direct call sites, one of which
+    /// (`ValueVarchar.get(String,CastDataProvider)` → `StringUtils.cache`)
+    /// produced the orphan in
+    /// `jit-inlined-callee-deopt-frame-has-no-caller-chain`.
+    ///
+    /// The bind used to `continue` straight past the registration at the end
+    /// of the scan loop, so this asserted 0 before the fix.
+    #[test]
+    fn statically_bound_direct_callee_call_still_registers_invoke_info() {
+        crate::x64::set_moving_young_override(Some(false));
+        use std::sync::Arc;
+
+        clear_jit_recursive_cycle_methods_for_test();
+        let _direct_callee_calls = cratonvm_types::flags::override_thread(
+            cratonvm_types::flags::VmFlags::from_env_with_edits(&[(
+                "CRATONVM_JIT_DIRECT_CALLEE_CALLS",
+                Some("1"),
+            )]),
+        );
+
+        let mk = |class: &str, name: &str, id: u32, code: &[u8]| CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(id),
+            class_name: Arc::from(class),
+            method_name: Arc::from(name),
+            method_descriptor: Arc::from("()V"),
+            source_file: None,
+            code: Arc::from(code),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 0,
+            max_locals: 0,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        };
+        // `d` calls `e` once and returns; `e` is a leaf, so nothing marks it a
+        // recursive-cycle target and the direct bind actually happens.
+        let d_cached = mk("pkg/D", "d", 11, &[0xb8, 0x00, 0x01, 0xb1, 0x00, 0x00]);
+        let e_cached = mk("pkg/E", "e", 12, &[0xb1, 0x00, 0x00]);
+
+        // SAFETY: every helper address is an integer slot. This test only
+        // inspects emitted metadata and never executes the generated code.
+        let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
+        let d_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
+            (cp_idx == 1).then(|| ("pkg/E".to_string(), "e".to_string(), "()V".to_string()))
+        };
+        let callee_compiler =
+            |class_name: &str, method_name: &str, descriptor: &str| -> Option<(usize, bool)> {
+                assert_eq!((class_name, method_name, descriptor), ("pkg/E", "e", "()V"));
+                let compiled_e = try_compile(
+                    &e_cached, None, None, None, None, None, None, None, None, None, &helpers,
+                    None, None, None, None, false, false, false, false, false, false, None,
+                )?;
+                let compiled_e = Box::leak(Box::new(compiled_e));
+                Some((compiled_e.entry_ptr() as usize, compiled_e.needs_context()))
+            };
+
+        let compiled_d = try_compile(
+            &d_cached,
+            None,
+            None,
+            None,
+            Some(&d_resolver),
+            Some(&callee_compiler),
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("D should compile");
+
+        assert!(
+            !jit_direct_call_requires_dispatch("pkg/E", "e", "()V"),
+            "the fixture must exercise the DIRECT bind, not the dispatch fallback"
+        );
+        // Non-vacuity: without this the assertion below passes on a compile
+        // where the site fell back to `jit_invoke_dispatch` (which registers a
+        // `JitInvokeInfo` of its own), i.e. on a fixture that never exercised
+        // the direct bind at all.
+        assert_eq!(
+            compiled_d._direct_callee_entries.len(),
+            1,
+            "the fixture must bind E's compiled entry as a DIRECT call"
+        );
+        assert_eq!(
+            compiled_d._jit_invoke_infos.len(),
+            1,
+            "a direct JIT-to-JIT call must still register a JitInvokeInfo for its pc, \
+             or the codegen cannot emit the callee-deopt service check"
+        );
+
+        clear_jit_recursive_cycle_methods_for_test();
+    }
+
     #[test]
     fn tomcat_bcel_read_interfaces_direct_calls_use_dispatch() {
         assert!(jit_direct_call_requires_dispatch(
