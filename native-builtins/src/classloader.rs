@@ -187,6 +187,14 @@ pub fn forget_vm_loader_singletons(vm_identity: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(vm, _)| *vm != vm_identity);
+    // The GC marker's three liveness-pin registries hold raw heap addresses
+    // from the heap that is going away. They used to be wiped wholesale when
+    // the NEXT VM was created, which is both too late (the addresses were
+    // stale in between) and too broad (it took a concurrently-live VM's rows
+    // with them). Dropping them here, per VM, is neither.
+    cratonvm_types::loader_pin::forget_vm_loader_pins(vm_identity);
+    cratonvm_types::mirror_pin::forget_vm_mirror_pins(vm_identity);
+    cratonvm_types::metadata_pin::forget_vm_metadata_pins(vm_identity);
 }
 
 /// Reset the process-wide (not yet VM-scoped) classloader side-tables.
@@ -222,13 +230,25 @@ pub fn reset_loader_singletons() {
     // and namespace id the moment an address is reused.
     loader_meta_store().lock()
         .clear();
-    // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
-    cratonvm_types::loader_pin::clear_loader_pins();
-    // Companion: drop the GC marker's mirror_pin registry for the new VM too
-    // (see `cratonvm_types::mirror_pin`).
-    cratonvm_types::mirror_pin::clear_mirror_pins();
-    cratonvm_types::metadata_pin::clear_metadata_pins();
-    cratonvm_types::jit_activation::clear();
+    // NOT cleared here any more either, for exactly the reason just above —
+    // these four were the same mistake, sixteen lines below the note that
+    // explains it:
+    //
+    //   * `loader_pin` / `mirror_pin` / `metadata_pin` are the GC marker's
+    //     liveness-pin registries. Every row now carries the `vm_identity` that
+    //     wrote it, and `forget_vm_loader_singletons` drops this VM's rows at
+    //     teardown. A fresh VM has none, so the only rows a wipe here could
+    //     reach were a CONCURRENTLY LIVE VM's — and losing a pin is the
+    //     dangerous direction: the marker drops a root for a loader that is
+    //     still reachable.
+    //   * `jit_activation` needs no wipe at all. A slot is owned by the thread
+    //     running the compiled frame and cleared by that same thread's `exit`;
+    //     a foreign wipe is the only way to lose a record whose frame is still
+    //     running. A record stranded by a thread that died mid-frame
+    //     over-retains one loader for one collection, and the reader
+    //     (`vm::memory::roots`) already filters every id it finds through
+    //     `defining_loader_for(vm_identity, ..)`, so another VM's class id
+    //     cannot resolve to a root here.
     local_url_class_path_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -407,7 +427,7 @@ pub fn gc_reconcile_defining_loaders(
         .filter(|((vm, _), _)| *vm == vm_identity)
         .map(|(&(_vm, cid), obj_ref)| (cid, obj_ref.as_ptr() as usize))
         .collect();
-    cratonvm_types::loader_pin::replace_loader_pins(&pins);
+    cratonvm_types::loader_pin::replace_loader_pins(vm_identity, &pins);
 
     // Same treatment for the loader-namespace side-table (object-keyed): drop
     // entries whose loader was collected this cycle, remap survivors that
@@ -494,7 +514,7 @@ pub fn forget_unloaded_classes(vm_identity: usize, class_ids: &[u32]) {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(vm, id)| *vm != vm_identity || !ids.contains(id));
     for id in class_ids {
-        cratonvm_types::loader_pin::remove_loader_pin(*id);
+        cratonvm_types::loader_pin::remove_loader_pin(vm_identity, *id);
     }
 }
 
@@ -720,7 +740,7 @@ pub fn register_defining_loader(vm: usize, class_id: u32, loader: ObjectRef) {
     // HIB-CV-24: mirror into the loader-pin registry the GC marker consults so a
     // live instance of this class keeps its defining loader alive (the
     // instance→loader edge HotSpot gets for free via `Class.getClassLoader`).
-    cratonvm_types::loader_pin::set_loader_pin(class_id, loader.as_ptr() as usize);
+    cratonvm_types::loader_pin::set_loader_pin(vm, class_id, loader.as_ptr() as usize);
 }
 
 /// Look up the user-defined `ClassLoader` object that defined `class_id`.

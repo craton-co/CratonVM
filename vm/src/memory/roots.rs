@@ -129,8 +129,8 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // and the generational collector consults it to pick the non-moving sweep.
     cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
     let conditional_metadata = conditional_loader_metadata(shared);
-    cratonvm_types::metadata_pin::set_metadata_weak_mode(conditional_metadata);
-    cratonvm_types::metadata_pin::replace_metadata_pins(&[]);
+    cratonvm_types::metadata_pin::set_metadata_weak_mode(shared.vm_identity, conditional_metadata);
+    cratonvm_types::metadata_pin::replace_metadata_pins(shared.vm_identity, &[]);
 
     // A live activation keeps its defining loader and class metadata alive,
     // including static methods that carry no receiver oop. Interpreter frames
@@ -233,6 +233,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                             cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                         {
                             cratonvm_types::metadata_pin::add_metadata_pin(
+                                shared.vm_identity,
                                 loader,
                                 obj_ref.as_ptr() as usize,
                             );
@@ -258,6 +259,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        shared.vm_identity,
                         loader,
                         obj_ref.as_ptr() as usize,
                     );
@@ -656,6 +658,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        shared.vm_identity,
                         loader,
                         object.as_ptr() as usize,
                     );

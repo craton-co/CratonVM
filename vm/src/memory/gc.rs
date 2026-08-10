@@ -286,7 +286,7 @@ pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_
         }
     }
     drop(class_mirrors);
-    cratonvm_types::mirror_pin::replace_mirror_pins(&entries);
+    cratonvm_types::mirror_pin::replace_mirror_pins(shared.vm_identity, &entries);
 }
 
 /// Update all root locations in the VM state after a GC collection.

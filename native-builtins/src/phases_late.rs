@@ -4895,6 +4895,7 @@ pub fn gc_scan_classvalue_cache_roots(
                     .and_then(cratonvm_types::loader_pin::loader_pin_addr)
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        vm_identity,
                         loader,
                         entry.value.as_ptr() as usize,
                     );
