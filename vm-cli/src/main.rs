@@ -3089,22 +3089,14 @@ fn run() -> Result<()> {
     // (matches HotSpot, where the more specific flag wins).
     let xverify_mode = if let Some(spec) = args.xverify.as_deref() {
         match cratonvm_vm::config::XverifyMode::parse(spec) {
-            Some(m) => {
-                // `All` parses and is stored, but nothing reads it — the
-                // verifier dispatcher branches on `skip_verification`, and
-                // boot-class skipping is decided by a predicate that takes no
-                // configuration. Accepting it silently tells a user asking for
-                // maximum verification that they got it. Say so instead; the
-                // analogous unimplemented control, `-agentlib:`, already fails
-                // loudly rather than quietly.
-                if m == cratonvm_vm::config::XverifyMode::All {
-                    eprintln!(
-                        "Warning: -Xverify:all is not implemented; boot classes are \
-                         not typestate-verified. Running as -Xverify:remote."
-                    );
-                }
-                Some(m)
-            }
+            // `All` used to parse, be stored, and be read by nothing, so the
+            // launcher warned rather than silently telling a user asking for
+            // maximum verification that they had it. It is wired now
+            // (`ClassManager::set_strict_verification`, from `vm_init`): the
+            // boot image is typestate-verified strictly, the Pass-3 deferral
+            // for user-loader classes is withdrawn, and the link-time
+            // bootstrap skip is off. See `config::XverifyMode`.
+            Some(m) => Some(m),
             None => {
                 eprintln!(
                     "Warning: ignoring unknown -Xverify mode {spec:?}; expected none|remote|all"

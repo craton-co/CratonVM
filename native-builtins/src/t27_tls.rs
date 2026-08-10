@@ -2315,7 +2315,7 @@ fn is_abstract_method_error(
 ) -> bool {
     match result {
         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => {
-            ctx.class_name_of_id(ctx.class_id_of_object(*exc))
+            ctx.class_name_arc_of_id(ctx.class_id_of_object(*exc))
                 .as_deref()
                 == Some("java/lang/AbstractMethodError")
         }
@@ -6023,7 +6023,7 @@ mod tests {
         let ctx = fake_object_ref(1);
         let mut mock_ctx = crate::test_utils::mock_ctx();
         set_pending_tm_trust_roots(vec![ca_der.clone()]);
-        attach_pending_identity_to_ctx(&mut mock_ctx, ctx, None);
+        attach_pending_identity_to_ctx(&mut mock_ctx, ctx, None).unwrap();
 
         assert!(ctx_identity(&mut mock_ctx, ctx).unwrap().is_none());
         let selected = selected_context_trust_roots().expect("context trust roots selected");

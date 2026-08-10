@@ -1031,6 +1031,13 @@ impl SharedVm {
         // this repo has already paid for process-global native state leaking
         // across VM instances more than once.
         class_manager.set_compatibility_mode(config.compatibility_mode);
+        // `-Xverify:all`. Same placement rule as the line above: before any
+        // class is loaded, so no class escapes the policy it was started under.
+        // `XverifyMode::None` is carried by `skip_verification` (which the
+        // dispatcher in `vm_util` reads) and `Remote` is the default, so `All`
+        // is the only mode this line has to say anything about.
+        class_manager
+            .set_strict_verification(config.xverify_mode == crate::config::XverifyMode::All);
         let native_shim_selection =
             cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(|resource| {
                 class_manager.application_contains_resource(resource)

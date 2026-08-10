@@ -2174,6 +2174,14 @@ pub struct ClassManager {
     /// byte-for-byte.
     compatibility_mode: CompatibilityMode,
 
+    /// `-Xverify:all` — verify every class strictly, boot image included.
+    ///
+    /// A field for the same reason `compatibility_mode` is: verification policy
+    /// is per-VM, and two VMs in one process must be able to differ. Defaults
+    /// to `false`, which is `-Xverify:remote` — HotSpot's default and today's
+    /// behaviour byte-for-byte. See [`Self::set_strict_verification`].
+    strict_verification: bool,
+
     /// Class-fabrication violations recorded this run, in first-observation
     /// order.
     ///
@@ -2684,6 +2692,9 @@ impl ClassManager {
             // (`--jdk-only`), never inferred from a build feature or a stray
             // env var — see contract §6.
             compatibility_mode: CompatibilityMode::Compatible,
+            // `-Xverify:remote`, HotSpot's default. `vm_init` raises it to
+            // `all` when the launcher was given `-Xverify:all`.
+            strict_verification: false,
             origin_violations: Vec::new(),
             origin_violations_seen: FxHashSet::default(),
             origin_requesters: FxHashMap::default(),
@@ -2777,6 +2788,36 @@ impl ClassManager {
     /// The compatibility policy in force for this manager.
     pub fn compatibility_mode(&self) -> CompatibilityMode {
         self.compatibility_mode
+    }
+
+    /// Install `-Xverify:all` — verify EVERY class strictly, including the
+    /// bootstrap image and classes from user-defined loaders.
+    ///
+    /// Call once at VM init before any class is loaded, exactly like
+    /// [`Self::set_compatibility_mode`]; `vm_init` propagates
+    /// `VmConfig::xverify_mode` here. Per-manager rather than process-global so
+    /// two VMs in one process can run under different verification policies.
+    ///
+    /// Three things change when this is on, all of them "stop taking a
+    /// shortcut":
+    ///
+    /// * `class_is_bootstrap_trusted` stops earning the lenient branch-target
+    ///   path, so the JDK image is checked against the spec-literal rule
+    ///   (`bytecode_verifier::verify_bytecode_strict`, which until now had no
+    ///   production caller at all despite being documented as this flag's entry
+    ///   point);
+    /// * `defer_loader_sensitive_pass3` stops deferring the Pass-3 type-state
+    ///   verdict for user-loader classes — i.e. for every Spring / Tomcat / H2
+    ///   application class;
+    /// * `vm_util::verifier_skip_eligible` stops skipping link-time Pass 2 for
+    ///   bootstrap classes.
+    pub fn set_strict_verification(&mut self, strict: bool) {
+        self.strict_verification = strict;
+    }
+
+    /// Whether `-Xverify:all` is in force for this manager.
+    pub fn strict_verification(&self) -> bool {
+        self.strict_verification
     }
 
     /// The `--dump-class-origins` census: one row per class currently in the
@@ -5907,8 +5948,16 @@ impl ClassManager {
         // areturn/checkcast VerifyErrors for otherwise valid forked bytecode.
         // Keep structural validation and defer that loader-sensitive Pass 3,
         // matching the link-time verifier policy in vm_util.
-        let defer_loader_sensitive_pass3 =
-            loader_aware_resolution() && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
+        //
+        // `-Xverify:all` withdraws the deferral. The deferral trades a
+        // type-state verdict for loader fidelity, and that trade is exactly
+        // what a deployment asking for maximum scrutiny is refusing to make —
+        // it is also how a `multianewarray` with more dimensions than its
+        // descriptor has brackets reached the interpreter unchallenged from
+        // every Spring/Tomcat/H2 application class (fixed in a01ccc442).
+        let defer_loader_sensitive_pass3 = !self.strict_verification
+            && loader_aware_resolution()
+            && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
         // TYPE MAPS (arch-2026-07-26/access-control-and-map-coverage): the
         // deferral above is about the verifier's *load decision*, not about
         // its type maps. Deferring the whole of Pass 3 also deferred the
@@ -5976,9 +6025,12 @@ impl ClassManager {
                      structural bytecode verification enforced",
                 );
                 crate::verifier::publish_deferred_class_type_maps(&class, &hierarchy);
-            } else if let Err(verify_err) =
-                crate::verifier::verify_class(&class, &self.class_store, &hierarchy)
-            {
+            } else if let Err(verify_err) = crate::verifier::verify_class_with_strictness(
+                &class,
+                &self.class_store,
+                &hierarchy,
+                self.strict_verification,
+            ) {
                 // Verifier rejected the bytecode. Drop the guard set
                 // entry so retry attempts are not erroneously blocked.
                 self.loading_guard.remove(name);
