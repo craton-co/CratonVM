@@ -7545,6 +7545,11 @@ mod elidable_ctor_policy_tests {
     fn vm_with(mode: CompatibilityMode, kind: NativeKind) -> SharedVm {
         let mut config = crate::config::VmConfig::default();
         config.compatibility_mode = mode;
+        // `JdkOnly` + the synthetic library is a rejected pair (the synthetic
+        // library IS ~5,200 synthetic stubs), and `VmConfig::default()` selects
+        // the synthetic library. Turn it off for BOTH arms rather than only the
+        // strict one, so the two VMs differ in exactly the variable under test.
+        config.use_synthetic_jdk = false;
         let mut vm = SharedVm::new(config);
         vm.natives.native_methods.register_with_kind(
             "cratonvm/test/ElidableCtorFixture",
