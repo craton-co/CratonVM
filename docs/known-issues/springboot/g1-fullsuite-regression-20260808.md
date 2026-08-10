@@ -212,6 +212,28 @@ looked right:
 
 4. **"It is one of the JIT's allocation fast paths."** Three gates tested
    individually, all still corrupt — see §3b. `emit_inline_tlab_new` is out.
+5. **"A dying worker thread abandons its TLAB without retiring it."** The most
+   promising lead yet, and wrong. The evidence for it was strong: a
+   `WALKBRK-COVER` hexdump showed the break sitting in a ~900 KB **zeroed** span
+   below `region_cursor=0xfffa8`, immediately after a correctly-retired TLAB's
+   8-byte `GAP_FILLER` sentinel, with **"ZERO published skip spans this pause"** —
+   i.e. no live thread claimed that memory:
+
+   ```
+   0x207f0 = 0x00000008f111e701   GAP_FILLER sentinel (cid=0xF111E701, len=8)
+   0x207f8 = 0x0000000000000000
+   0x20800 = 0x0000000a00000000
+ >>0x20808 = 0x0001000000000000<< class_id=0 num_slots=0x10000 -> obj_size 0x100010, BREAK
+   0x20810..0x20830 all zero
+   ```
+
+   And `vm/src/vm/vm_exec.rs` really did have the asymmetry: the main-thread
+   teardown retires before its `clear_tlab_addr`, the spawned-worker teardown
+   did not — so a worker withdrew from `collect_reserved_tlab_tails` having
+   never stamped a filler. Adding `jvm_thread.tlab.retire()` there **did not
+   fix it**: 18/61 failures, 239 and 252 guard hits, 8 walk breaks per run,
+   unchanged. The retire is kept (it closes the asymmetry on its own terms and
+   is idempotent) but is explicitly *not* the fix.
 
 **Open question:** with the JIT on, what leaves an object in an Eden region whose
 **header is all zero while its body holds real data**, with neighbours allocated
