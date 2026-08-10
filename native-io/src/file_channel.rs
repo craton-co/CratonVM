@@ -1063,12 +1063,6 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         native_fcimpl_open,
     );
     r.register(
-        fci,
-        "open",
-        "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;",
-        native_fcimpl_open,
-    );
-    r.register(
         "sun/nio/ch/FileChannelImpl$Closer",
         "run",
         "()V",
@@ -1083,21 +1077,10 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "()V",
         native_native_thread_set_signal_and_wait,
     );
-    r.register(fci, "map0", "(IJJZ)J", native_fc_map0_legacy);
-    r.register(fci, "map0", "(IJJ)J", native_fc_map0_legacy);
-    r.register(fci, "unmap0", "(JJ)I", native_fc_unmap0);
-    r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
-    r.register(fci, "transferTo0", "(IJJI)J", native_fc_transfer_to0);
     // Raw-int-fd shapes of `transferFrom0`, for the JDKs that pass fd numbers
     // rather than `FileDescriptor` objects. Same decline as the object forms.
     r.register(fci, "transferFrom0", "(IIJJZ)J", native_fc_transfer_from0);
     r.register(fci, "transferFrom0", "(IIJJ)J", native_fc_transfer_from0);
-    r.register(
-        fci,
-        "maxDirectTransferSize0",
-        "()I",
-        native_fc_max_direct_transfer_size0,
-    );
     // sun/nio/ch/FileKey.init — the file-identity triple used by FileLockTable.
     // A missing native here is an UnsatisfiedLinkError on the FIRST file-backed
     // DB open (H2 `SingleFileStore.lockFileChannel` -> `FileChannelImpl.tryLock`

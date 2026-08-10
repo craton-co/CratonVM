@@ -3633,12 +3633,6 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/channels/Selector;",
         selector_open_native,
     );
-    r.register(
-        sel,
-        "open0",
-        "()Lsun/nio/ch/SelectorImpl;",
-        selector_open_native,
-    );
     // JDK 21+ on Windows defaults to `sun.nio.ch.WEPollSelectorProvider`, whose
     // `openSelector()` builds a `WEPollSelectorImpl` backed by the native
     // `sun.nio.ch.WEPoll` (a wepoll/epoll-emulation layer) that CratonVM does
@@ -3664,18 +3658,8 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             selector_open_native,
         );
     }
-    r.register(sel, "close0", "()V", selector_close_native);
-    r.register(sel, "wakeup0", "()V", selector_wakeup_native);
-    r.register(sel, "select0", "(J)I", selector_select_native);
-    r.register(sel, "selectNow0", "()I", selector_select_now_native);
 
     // SelectableChannel.register.
-    r.register(
-        "java/nio/channels/SelectableChannel",
-        "register0",
-        "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
-        channel_register_native,
-    );
     r.register(
         "java/nio/channels/SelectableChannel",
         "register",
@@ -3725,8 +3709,6 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
 
     // SelectionKeyImpl.
     let ski = "sun/nio/ch/SelectionKeyImpl";
-    r.register(ski, "interestOps0", "(I)V", key_set_interest_ops_native);
-    r.register(ski, "cancel0", "()V", key_cancel_native);
 
     // SelectionKey accessors. The real-JDK abstract methods on
     // java.nio.channels.SelectionKey have no Code attribute, and the
@@ -3864,12 +3846,6 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         epoll_data_offset_native,
         NativeKind::Bridge,
     );
-    r.register(
-        "sun/nio/ch/EPoll",
-        "epollCreate",
-        "()I",
-        epoll_create_native,
-    );
     r.register_with_kind(
         "sun/nio/ch/EPoll",
         "create",
@@ -3877,19 +3853,12 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         epoll_create_native,
         NativeKind::Bridge,
     );
-    r.register("sun/nio/ch/EPoll", "epollCtl", "(IIII)I", epoll_ctl_native);
     r.register_with_kind(
         "sun/nio/ch/EPoll",
         "ctl",
         "(IIII)I",
         epoll_ctl_native,
         NativeKind::Bridge,
-    );
-    r.register(
-        "sun/nio/ch/EPoll",
-        "epollWait",
-        "(IJII)I",
-        epoll_wait_native,
     );
     r.register_with_kind(
         "sun/nio/ch/EPoll",

@@ -2571,71 +2571,40 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
 // duplicate definition the moment anyone "fixed" the missing newline.
 // Deleted 2026-08-06.
 
-/// Allocate a synthetic object, trying to load the real class first.
-///
-/// `#[track_caller]` so the class-origin census's `requested_by` names the
-/// native that wanted the shape, not this one forwarding line — see the
-/// matching note on `NativeContext::ensure_synthetic_class`.
-#[track_caller]
-fn alloc_synthetic(ctx: &mut dyn NativeContext, class_name: &str, num_fields: usize) -> ObjectRef {
-    // S111r7: when `<clinit>` fails (e.g. transient state where a class
-    // is mid-initialization on a parent frame), fall back to a name-only
-    // lookup before degrading to bare `Object`. The previous behaviour
-    // returned objects whose `class_id_of` reported `java/lang/Object`,
-    // which then propagated to virtual dispatch sites (e.g.
-    // `HashSet.iterator()`'s `invokeinterface Set.iterator()` on the
-    // HashMap.keySet result) and surfaced as a swallowed
-    // `NoSuchMethodError Object.iterator()`.
-    let cid = match ctx.ensure_class_initialized(class_name) {
-        Ok(class_id) => {
-            let resolved_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-            if resolved_name == class_name || class_name == "java/lang/Object" {
-                class_id
-            } else {
-                // Some class-loading fallbacks report success with the legacy
-                // java/lang/Object id. A named synthetic helper must keep its
-                // requested identity; otherwise field writes for that helper's
-                // layout land on Object's zero-slot layout.
-                match ctx.class_id_by_name(class_name) {
-                    Some(id) => id,
-                    None => ctx.ensure_synthetic_class(class_name, num_fields),
-                }
-            }
-        }
-        Err(_) => match ctx.class_id_by_name(class_name) {
-            Some(id) => id,
-            // No real or already-registered class with this name. Previously
-            // this degraded to `ClassId::new(0)` (`java/lang/Object`), which
-            // (a) the GC field-bounds guard rejects as an undersized layout
-            // and (b) loses the class identity — natives registered on
-            // `class_name` (e.g. the `hasMoreElements`/`nextElement` on
-            // `cratonvm/internal/SnapshotEnumeration`) no longer resolve, so
-            // callers hit a `NoSuchMethodError`. Instead create a synthetic
-            // class carrying THIS name + `num_fields`, so those name-keyed
-            // natives dispatch and the object layout is well-sized.
-            None => ctx.ensure_synthetic_class(class_name, num_fields),
-        },
-    };
-    ctx.alloc_object(cid, num_fields)
-}
+// The infallible `alloc_synthetic` twin is DELETED (JDK-only wave 2, step 3,
+// 2026-08-10). It reached `ensure_synthetic_class` — the entry point step 3
+// removes — and its last caller, `native_ksv_iterator`, moved to the fallible
+// spelling with the trade stated at that site. There is no infallible spelling
+// in this crate any more, which is what makes the grep gate meaningful.
 
-/// The fallible spelling of [`alloc_synthetic`] — same operation, with the
+/// Allocate a synthetic object, trying to load the real class first, with the
 /// refusal `--jdk-only` requires.
 ///
-/// [`alloc_synthetic`] reaches `ensure_synthetic_class`, which under
-/// [`CompatibilityMode::JdkOnly`] records a `CompatibilityClassRequested`
-/// violation and then fabricates anyway, because its signature has no error
+/// The deleted infallible twin reached `ensure_synthetic_class`, which under
+/// [`CompatibilityMode::JdkOnly`] recorded a `CompatibilityClassRequested`
+/// violation and then fabricated anyway, because its signature had no error
 /// channel. This one goes through `try_ensure_synthetic_class`, so the policy's
-/// refusal actually reaches the caller as a `ClassNotFoundException` naming the
+/// refusal actually reaches the caller as a `NoClassDefFoundError` naming the
 /// class — which for a shape like `java/util/HashMap$KeyItr` is the honest
 /// answer: no class file with that name exists in any JDK, so a strict run that
 /// gets one is running a synthetic collection iterator in place of the real
 /// bytecode.
 ///
-/// Under the default `Compatible` mode the two are byte-for-byte identical.
+/// Under the default `Compatible` mode this is byte-for-byte what the deleted
+/// twin did.
 ///
 /// Every native returning `MethodCallResult` should prefer this spelling;
 /// `ClassIdentityError` converts with `?`.
+///
+/// It keeps the twin's two real-class preferences, and the reason for each:
+/// when `<clinit>` fails (a class mid-initialization on a parent frame) a
+/// name-only lookup comes before any fabrication, because degrading to bare
+/// `Object` produced objects whose `class_id_of` reported `java/lang/Object`
+/// and surfaced downstream as a swallowed `NoSuchMethodError Object.iterator()`;
+/// and a success that resolves to a DIFFERENT name is re-asked by name, because
+/// some class-loading fallbacks report success with the legacy
+/// `java/lang/Object` id and a named synthetic helper must keep its requested
+/// identity or its field writes land on Object's zero-slot layout.
 ///
 /// [`CompatibilityMode::JdkOnly`]: cratonvm_types::compat::CompatibilityMode
 #[track_caller]
@@ -44824,29 +44793,34 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let (arr, total) = ksv_snapshot_array(ctx, this);
     let arr_pin = ctx.pin_native_root(arr);
-    // THE ONE MINT SITE DELIBERATELY LEFT ON THE INFALLIBLE FUNNEL.
+    // THE LAST MINT SITE ON THE INFALLIBLE FUNNEL — migrated 2026-08-10, and
+    // the trade it makes is not the one the two previous notes describe.
     //
-    // Every other snapshot iterator lands on a real `Arrays$ArrayItr` when
-    // `--jdk-only` refuses the fabricated shape, and the trade was argued as
+    // Every other snapshot iterator LANDS on a real `Arrays$ArrayItr` when
+    // `--jdk-only` refuses the fabricated shape, and that trade was argued as
     // free: "on the strict path the alternative was never a working `remove()`
-    // — it was an iteration that did not reach `next()`"
-    // (`jdk-only-strict-boot-refused-five-classes-FIXED-20260806.md`).
+    // — it was an iteration that did not reach `next()`". That argument does
+    // NOT hold here, and `RChmKeySetView` is what measured it: HotSpot's
+    // `ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
+    // `remove()` writes through to the map, the test exercises exactly that,
+    // and a fixed-size list's iterator answers
+    // `UnsupportedOperationException: remove`. So this site still must NOT be
+    // landed on the array iterator, and it is not.
     //
-    // That argument does NOT hold here, and `RChmKeySetView` is what measured
-    // it. HotSpot's `ConcurrentHashMap$KeySetView.iterator()` returns a
-    // `KeyIterator` whose `remove()` writes through to the map, the test
-    // exercises exactly that, and a fixed-size list's iterator answers
-    // `UnsupportedOperationException: remove`. So landing on the real array
-    // iterator here would trade a WORKING capability for a fidelity gain,
-    // which is the wrong direction.
+    // REFUSING is a different thing from landing, and it is what step 3 needs.
+    // In the default `Compatible` mode `try_alloc_synthetic` is byte-for-byte
+    // what the infallible spelling did, so `RChmKeySetView` and every ordinary
+    // run are unchanged. Under `--jdk-only` the fabrication of
+    // `java/util/HashMap$KeyItr` — a name NO JDK image declares — now raises a
+    // `NoClassDefFoundError` naming that class instead of silently running a
+    // synthetic collection iterator in place of `java.base`'s bytecode, which
+    // is what contract §11 asks for and what `counts.compatibility_classes`
+    // was reporting as its last non-zero row.
     //
-    // Leaving it infallible means a strict run still fabricates
-    // `java/util/HashMap$KeyItr` for this one path, and
-    // `counts.compatibility_classes` will report it. That is the honest
-    // reading: the refusal is not free until CratonVM's `ConcurrentHashMap`
-    // carries a real `table[]` its own `KeyIterator` can walk, which is the
-    // collections reclassification wave, not this one.
-    let itr = alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS);
+    // The capability is recovered, not traded away, when CratonVM's
+    // `ConcurrentHashMap` carries a real `table[]` its own `KeyIterator` can
+    // walk — the collections reclassification wave, not this one.
+    let itr = try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)?;
     let arr = ctx.read_native_pin(arr_pin, arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));

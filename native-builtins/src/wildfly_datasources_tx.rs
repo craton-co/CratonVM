@@ -523,17 +523,27 @@ fn obj_arg_or_null(args: &[Value], idx: usize) -> Option<ObjectRef> {
     }
 }
 
-fn alloc_object_for(ctx: &mut dyn NativeContext, class_name: &str, min_slots: usize) -> ObjectRef {
+fn alloc_object_for(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    min_slots: usize,
+) -> Result<ObjectRef, MethodCallFailed> {
     // Fall back to a synthetic class (declaring `min_slots` fields) rather
     // than `ClassId::new(0)` when the real class can't be loaded: an object
     // allocated with `java/lang/Object`'s id but a non-zero slot count is an
     // undersized layout the GC's `get_field` bounds guard rejects.
+    //
+    // The fallback is the FALLIBLE spelling (JDK-only wave 2, step 3): under
+    // `--jdk-only` the policy refuses to fabricate rather than recording the
+    // violation and fabricating anyway, and the refusal arrives as the
+    // catchable `NoClassDefFoundError` contract §5 names rather than the
+    // uncatchable `MethodCallFailed::InternalError` the `?` conversion builds.
     let cid = match ctx.ensure_class_initialized(class_name) {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class(class_name, min_slots),
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, class_name, min_slots)?,
     };
     let real = ctx.class_num_total_fields(cid).max(min_slots);
-    ctx.alloc_object(cid, real)
+    Ok(ctx.alloc_object(cid, real))
 }
 
 fn throw_ise(msg: impl Into<String>) -> MethodCallFailed {
@@ -640,7 +650,7 @@ fn native_ds_get_connection(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Err(throw_ise(format!("SQLException: {}", e)));
         }
     };
-    let conn = alloc_object_for(ctx, "org/h2/jdbc/JdbcConnection", 4);
+    let conn = alloc_object_for(ctx, "org/h2/jdbc/JdbcConnection", 4)?;
     ctx.set_field(conn, 0, Value::Long(conn_id));
     ctx.set_field(conn, 1, Value::Object(Some(this)));
     ctx.set_field(conn, 2, Value::Int(pool_id));
@@ -704,7 +714,7 @@ fn native_tm_get_transaction(ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
     match current_tx() {
         Some(tx) => {
             // Allocate a thin Transaction mirror whose slot 0 carries the TX id.
-            let t = alloc_object_for(ctx, CLS_TX, 2);
+            let t = alloc_object_for(ctx, CLS_TX, 2)?;
             ctx.set_field(t, 0, Value::Long(tx.id as i64));
             Ok(Some(Value::Object(Some(t))))
         }
@@ -739,7 +749,7 @@ fn native_narayana_tm_singleton(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     // Return a freshly-allocated singleton holder; the synthetic model
     // doesn't care about reference equality since the real work lives in
     // the thread-local CURRENT_TX.
-    let tm = alloc_object_for(ctx, CLS_NARAYANA_TM, 1);
+    let tm = alloc_object_for(ctx, CLS_NARAYANA_TM, 1)?;
     ctx.set_field(tm, 0, Value::Long(1));
     Ok(Some(Value::Object(Some(tm))))
 }

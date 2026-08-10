@@ -9687,7 +9687,11 @@ pub(crate) fn bc_argon2_alloc_block(
     let block_class = "org/bouncycastle/crypto/generators/Argon2BytesGenerator$Block";
     let class_id = match ctx.ensure_class_initialized(block_class) {
         Ok(cid) => cid,
-        Err(_) => ctx.ensure_synthetic_class(block_class, 1),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): `Argon2BytesGenerator$Block`
+        // is a Bouncy Castle class, so a fabricated stand-in for it is a
+        // dependency substitution — exactly what contract §5 refuses. On a run
+        // that actually has BC on the classpath the `Ok` arm is what runs.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, block_class, 1)?,
     };
     let n_fields = ctx.class_num_total_fields(class_id).max(1);
     let block = ctx.alloc_object(class_id, n_fields);

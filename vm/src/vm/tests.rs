@@ -617,7 +617,7 @@ use std::sync::Arc;
         num_fields: usize,
     ) -> ObjectRef {
         let mut ctx = NativeContextImpl { shared, thread };
-        let cid = ctx.ensure_synthetic_class(class_name, num_fields);
+        let cid = ctx.try_ensure_synthetic_class(class_name, num_fields).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         ctx.alloc_object(cid, num_fields)
     }
 
@@ -39542,7 +39542,7 @@ use std::sync::Arc;
                 shared: &shared,
                 thread: &mut thread,
             };
-            ctx.ensure_synthetic_class("java/util/spi/ToolProvider", 0)
+            ctx.try_ensure_synthetic_class("java/util/spi/ToolProvider", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
         };
         let class_mirror = get_or_create_class_mirror(&shared, service_cid);
         let sl = call_native(
@@ -47546,7 +47546,7 @@ use std::sync::Arc;
                 shared: &shared,
                 thread: &mut thread,
             };
-            ctx.ensure_synthetic_class("java/util/spi/ToolProvider", 0)
+            ctx.try_ensure_synthetic_class("java/util/spi/ToolProvider", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
         };
         let service_mirror = get_or_create_class_mirror(&shared, service_cid);
         let sl = call_native(
@@ -47594,7 +47594,7 @@ use std::sync::Arc;
                 shared: &shared,
                 thread: &mut thread,
             };
-            ctx.ensure_synthetic_class("java/util/spi/ToolProvider", 0)
+            ctx.try_ensure_synthetic_class("java/util/spi/ToolProvider", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only")
         };
         let service_mirror = get_or_create_class_mirror(&shared, service_cid);
         let sl = call_native(
@@ -74979,7 +74979,7 @@ public class SkippedTest {
             .classes
             .class_manager
             .write()
-            .ensure_synthetic_class("Animal", 0);
+            .try_ensure_synthetic_class("Animal", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
         let animal_cid_u32 = animal_id.as_u32();
 
         // Install a compiled entry for `Animal.speak:()V`. The JitCache
@@ -75039,7 +75039,7 @@ public class SkippedTest {
             .classes
             .class_manager
             .write()
-            .ensure_synthetic_class("Unrelated", 0);
+            .try_ensure_synthetic_class("Unrelated", 0).expect("Compatible mode fabricates; this fixture never runs under --jdk-only");
 
         // Install one unrelated compiled entry.
         let buf =
