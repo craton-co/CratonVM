@@ -73,6 +73,43 @@ Not yet checked whether this reproduces standalone (single class, no shard
 contention) or only appears under the full-suite run's allocation pressure —
 all 4 occurrences here came from a 651-class, 2-shard run.
 
+### 2026-08-10: it does NOT reproduce standalone — and that blocks the discriminator
+
+Run exactly as prescribed above (`-Xmx2g -XX:+UseG1GC`, one class per process,
+`JUnitCore`, quiet box), each class in two arms — plain G1, and G1 under
+`CRATONVM_G1_COVERAGE_PIN=1`. Binary `cratonvm-g1fix-20260810.exe`
+(`dev` + the diagnostics from the Spring Boot G1 page), 600 s cap:
+
+| Class | G1 baseline | G1 + `COVERAGE_PIN` |
+|---|---|---|
+| `…AutomaticDeploymentModification` | TIMEOUT 600 s | TIMEOUT 600 s |
+| `…AutomaticDeploymentWar` | **EXIT=0 (passed), 287 s** | TIMEOUT 600 s |
+| `…AutomaticDeploymentWarXml` | EXIT=1 (test failure), 152 s | EXIT=1, 532 s |
+| `TestHttpServletDoHeadInvalidWrite1ValidWrite511` | **EXIT=0 (passed), 85 s** | EXIT=1, 575 s |
+
+**Zero `EXCEPTION_ACCESS_VIOLATION` in any of the eight runs.**
+`…DeploymentWar` — one of the three that crashed at the *identical* faulting
+instruction in the suite run — passes cleanly standalone in 287 s, and
+`TestHttpServletDoHead…` passes in 85 s. So the crash needs the full-suite
+conditions (allocation pressure, 2-shard concurrency, or cross-class state);
+it is not a property of these classes in isolation.
+
+**Consequence: `CRATONVM_G1_COVERAGE_PIN` cannot be used this way.** The lever
+only tells you something when a crash is there to survive it, and standalone
+there is no crash. Running it under the full suite is possible in principle but
+expensive and probably impractical: the lever makes G1 refuse to evacuate, and
+its cost is visible even here — `…DeploymentWar` goes from a 287 s pass to a
+600 s timeout, and `TestHttpServletDoHead…` from an 85 s pass to a 575 s
+failure. Those pin-arm timeouts are the lever's documented no-op-pause cost,
+**not** evidence about the defect, and must not be read as either a pass or a
+fix. (`…DeploymentModification` times out on *both* arms, so it carries no
+signal at all here; and `…DeploymentWarXml`'s EXIT=1 is an ordinary test
+failure on both arms, not a crash.)
+
+Next attempt should therefore reproduce under suite-like conditions — several
+of these classes concurrently, or the shard that contained them — before
+reaching for any lever.
+
 ## Very likely the same defect as the Spring Boot G1 corruption — and the mechanism above may be the wrong one
 
 See [`../springboot/g1-fullsuite-regression-20260808.md`](../springboot/g1-fullsuite-regression-20260808.md)
