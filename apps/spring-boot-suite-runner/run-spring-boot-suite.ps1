@@ -968,7 +968,38 @@ function Complete-ProcessRecord {
     $noteMatch = [regex]::Match($combined, '(?im)^(?!\s+at\s)(.*(?:Exception|Error|Caused by|SBRUNNER_LOAD_FAIL|panicked|not implemented|NoClassDef|NoSuchMethod|AbstractMethod|AssertionError).*)$')
     if ($noteMatch.Success) { $note = (($noteMatch.Groups[1].Value -replace "`t", ' ') -replace "`r|`n", ' ') }
   }
-  if ($note.Length -gt 180) { $note = $note.Substring(0, 180) }
+  # Record how far the [moving-young] GC fallback escalated, because that count
+  # is what distinguishes the two very different rows that both surface as a
+  # 300s HANG:
+  #
+  #   * a handful of fallbacks is harmless -- FlywayAutoConfigurationTests hits
+  #     7 and still completes (496s standalone, 73/73);
+  #   * a count in the thousands is a death spiral -- the young free list
+  #     fragments until allocation fails. IntegrationAutoConfigurationTests
+  #     reaches #16384 and dies of OutOfMemoryError after 3.8 HOURS;
+  #     QuartzEndpointWebIntegrationTests reaches #4096 and does not finish in
+  #     2400s. Both pass in ~220-260s under `--nojit`, with zero fallbacks.
+  #
+  # Without this, all three read as "the class is slow, raise its timeout" --
+  # which is the wrong fix for the latter two and costs a multi-hour standalone
+  # rerun to discover. Same mechanism as the ZipContentTests OOM (512
+  # consecutive fallbacks, clean under `--nojit`).
+  $fallbacks = [regex]::Matches($combined, '\[moving-young\] fallback #(\d+)')
+  if ($fallbacks.Count -gt 0) {
+    $peak = 0
+    foreach ($m in $fallbacks) {
+      $n = [int]$m.Groups[1].Value
+      if ($n -gt $peak) { $peak = $n }
+    }
+    $reason = ''
+    $rm = [regex]::Match($combined, '\[moving-young\] fallback #\d+: reason=([a-z-]+)')
+    if ($rm.Success) { $reason = " $($rm.Groups[1].Value)" }
+    $gcNote = "moving-young-fallback peak=#$peak$reason"
+    $note = if ($note) { "$gcNote | $note" } else { $gcNote }
+  }
+  # Truncate AFTER the GC note is prepended, so a long exception string cannot
+  # push the fallback count out of the row.
+  if ($note.Length -gt 240) { $note = $note.Substring(0, 240) }
 
   # Reclassify a failure the reference VM shares, and in every other case still
   # record what HotSpot did, so a row that stayed FAIL despite a failing
