@@ -45,7 +45,13 @@ gradle.allprojects { p ->
             doLast {
                 try {
                     def rc = p.sourceSets.test.runtimeClasspath.asPath
-                    def missing = rc.split(File.pathSeparator).findAll { it && !new File(it).exists() }
+                    // A source set's output DIRECTORY is on the path whether or
+                    // not it produced anything, and Gradle does not create it
+                    // when empty — that is benign. A missing JAR is not: once
+                    // its producing task runs Gradle always writes the file.
+                    def missing = rc.split(File.pathSeparator).findAll {
+                        it && !new File(it).exists() && it.endsWith('.jar')
+                    }
                     def f = new File(p.layout.buildDirectory.get().asFile, 'cratonvm-testcp.txt')
                     f.parentFile.mkdirs()
                     f.text = rc

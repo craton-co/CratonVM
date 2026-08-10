@@ -181,8 +181,22 @@ ensure_idx() { [ -s "$ALLIDX" ] || discover; }
 # exactly like a VM defect. That is what happened in the 2026-08-10 full-suite
 # GC-variant sweep: 789 of 1156 failure-cause lines (68%) were this and nothing
 # else. `dumpcp` (below) now builds what it dumps; `check-cp` proves it did.
+#
+# Not every absent entry is a defect. Gradle puts a source set's output
+# DIRECTORY on the classpath whether or not that source set produced anything,
+# and does not create the directory when it is empty. Four such entries are
+# expected in this tree and are harmless — an absent directory contributes no
+# classes, which is the correct outcome for a source set that has none:
+#   spring-instrument, framework-docs   — no src/test at all
+#   spring-context-indexer              — no src/test/resources
+#   spring-aspects                      — no src/test/java; ajc compiles its 27
+#                                         test sources to build/classes/aspectj/test,
+#                                         which IS present and IS on the path
+# A missing *jar* is never benign: once `jar`/`testFixturesJar` runs Gradle
+# always produces the file, even for an empty project. So only jars (and any
+# absent entry that is not a Gradle build-output directory) count as failures.
 check_cp() {
-  local strict="${1:-0}" bad=0 mod f n nmiss e
+  local strict="${1:-0}" bad=0 mod f n nmiss nsoft e
   ensure_idx
   local mods; mods="$(mktemp)"; cut -f1 "$ALLIDX" | sort -u > "$mods"
   while IFS= read -r mod; do
@@ -192,17 +206,23 @@ check_cp() {
       echo "CP-MISSING-DUMP $(basename "$mod")  ($f)"
       bad=$((bad+1)); continue
     fi
-    n=0; nmiss=0
+    n=0; nmiss=0; nsoft=0
     while IFS= read -r e; do
       [ -n "$e" ] || continue
       n=$((n+1))
-      if [ ! -e "$e" ]; then nmiss=$((nmiss+1)); echo "    CP-MISSING-ENTRY $(basename "$mod") $e"; fi
+      [ -e "$e" ] && continue
+      case "$e" in
+        *.jar) nmiss=$((nmiss+1)); echo "    CP-MISSING-ENTRY $(basename "$mod") $e" ;;
+        */build/classes/*|*/build/resources/*)
+          nsoft=$((nsoft+1)); echo "    CP-EMPTY-SOURCESET $(basename "$mod") $e" ;;
+        *) nmiss=$((nmiss+1)); echo "    CP-MISSING-ENTRY $(basename "$mod") $e" ;;
+      esac
     done < <(tr ':' '\n' < "$f" | tr -d '\r')
     if [ "$nmiss" -gt 0 ]; then
-      echo "CP-INCOMPLETE $(basename "$mod")  entries=$n missing=$nmiss"
+      echo "CP-INCOMPLETE $(basename "$mod")  entries=$n missing=$nmiss empty-sourceset=$nsoft"
       bad=$((bad+1))
     else
-      echo "CP-OK $(basename "$mod")  entries=$n"
+      echo "CP-OK $(basename "$mod")  entries=$n empty-sourceset=$nsoft"
     fi
   done < "$mods"
   rm -f "$mods"
