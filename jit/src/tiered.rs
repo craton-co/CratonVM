@@ -1254,6 +1254,21 @@ pub fn dump_method_stats_to_stderr() {
                 .join(" "),
         );
     }
+    // Which arm of the native-shadow predicate fired. `direct`/`inherited` are
+    // precise facts about a specific call; `interface-blind` is the class-blind
+    // probe, and its share is the number that says whether making that arm
+    // precise is worth anything.
+    let shadow_census = crate::jit_native_shadow_cause_census();
+    if !shadow_census.is_empty() {
+        eprintln!(
+            "[cratonvm] JIT native-shadow verdicts by arm: {}",
+            shadow_census
+                .iter()
+                .map(|(r, n)| format!("{r}={n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
     if !hot_but_stuck.is_empty() {
         hot_but_stuck.sort_by(|a, b| b.0.cmp(&a.0));
         eprintln!(

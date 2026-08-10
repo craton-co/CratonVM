@@ -1680,6 +1680,27 @@ pub fn execute(
                 .is_some()
             {
                 true
+            } else if !crate::runtime::env_cache::jit_native_shadow_caller_seal() {
+                // MEASUREMENT LEVER ONLY — `CRATONVM_JIT=-native-shadow-caller-seal`.
+                //
+                // This seal is a CORRECTNESS guard: a compiled direct call
+                // bypasses the interpreter's native-vs-bytecode decision, so a
+                // caller compiled in spite of it can enter JDK bytecode the VM
+                // deliberately replaced. Running with it off is expected to
+                // MISBEHAVE, and it must never be a shipping configuration.
+                //
+                // It exists because the seal excludes 1,281 methods from the JIT
+                // on a Spring Boot context startup — more than the 1,155 that
+                // reach C2 — and the per-arm census shows the population is
+                // dominated by PRECISE hits (`direct=1015`), not by the
+                // class-blind arm (169, whose removal was measured worth
+                // nothing). So the question is no longer "is the detection too
+                // wide" but "is the per-METHOD granularity worth replacing with
+                // per-SITE", and that is a large compiler change. Pricing the
+                // ceiling first is cheaper than building it: if the whole seal
+                // is worth ~0 on this workload, the change should not be
+                // attempted at all.
+                false
             } else {
                 jit_method_calls_native_shadowed(
                     shared,

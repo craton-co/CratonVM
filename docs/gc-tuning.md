@@ -15,11 +15,30 @@ module.
 CratonVM ships three collector backends, selected via `VmConfig::gc_algorithm`
 ([`vm/src/config.rs`](../vm/src/config.rs)):
 
+> **The default collector changed on 2026-08-10: it is now ZGC, not
+> Generational.** If you pinned nothing, your runs moved. Two things follow.
+>
+> **(1) Budget more heap.** ZGC does not compact, so a buffer-churning workload
+> needs roughly **1.5x** the heap the generational collector needed:
+> `ZipContentTests` OOMs under ZGC at `-Xmx 2g` and passes from 3g up, where
+> Generational passes at 2g. If something started throwing `OutOfMemoryError`
+> after this change, raise `-Xmx` before investigating anything else.
+>
+> **(2) The escape hatch is `-XX:+UseGenerationalGC`**, available in every
+> build including `--no-default-features`. `-XX:-UseZGC` does the same thing.
+>
+> Why the flip: on the 651-class Tomcat suite, one commit, all three backends —
+> ZGC 604 PASS / 29 HANG / 0 CRASH in 247 min against Generational's
+> 519 / 115 / 1 in 356 min. 63 classes are non-PASS under Generational while
+> passing under *both* other backends, and 62 of those log
+> `[moving-young] fallback`. See
+> [`docs/known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md`](known-issues/tomcat/gc-backend-3way-fullsuite-comparison-20260810.md).
+
 | Backend | Module | Status | Best for |
 |---|---|---|---|
-| **Generational** (default) | [`gc/src/gen_heap.rs`](../gc/src/gen_heap.rs) | Production | Latency-sensitive workloads. Young copying + old free-list + write barriers + card table. STW pauses bounded by live young-set size. |
+| **ZGC** (default since 2026-08-10) | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Default, and still **not a real ZGC** | Most workloads, on the suite evidence above. A stop-the-world, non-moving, non-generational whole-heap mark-sweep. Fewest hangs and zero crashes across the Tomcat suite; costs ~1.5x heap. |
+| **Generational** | [`gc/src/gen_heap.rs`](../gc/src/gen_heap.rs) | Production; the escape hatch (`-XX:+UseGenerationalGC`) | Tight heap budgets, and anything that regressed on the flip. Young copying + old free-list + write barriers + card table. Carries the `[moving-young] fallback` throughput problem the flip exists to escape. |
 | **G1** (Garbage-First) | [`gc/src/g1.rs`](../gc/src/g1.rs) | Production | Throughput-oriented workloads on larger heaps. Region-based, mixed young/old collections, optional concurrent marking. STW today; parallel evacuator deferred. |
-| **ZGC** | [`gc/src/zgc.rs`](../gc/src/zgc.rs) | Experimental, gated behind `--features zgc` (default **off**) | Wired and selectable, but **not a real ZGC**: a stop-the-world, non-moving, whole-heap mark-sweep. Treat as a research vehicle. |
 
 Trade-offs at a glance:
 
@@ -41,11 +60,16 @@ Trade-offs at a glance:
   production consumer. On the 1975-class Spring Boot suite:
   1860 PASS vs. Generational's 1902, with 49 HANG vs. 18 — see
   [`docs/internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md`](internal/fixed-suite-bugs/springboot/zgc-real-fullsuite-regression-RETIRED-20260808.md).
-  **Do not depend on it in production.** The path to a real one is
+  The path to a real one is
   [`docs/feature-designs/zgc-production-implementation-plan.md`](feature-designs/zgc-production-implementation-plan.md).
-- Because the `zgc` feature is default-off, a stock build has only two backends
-  compiled in; `-XX:+UseZGC` there warns and falls back to Generational. A
-  ZGC-capable launcher is `cargo build -p cratonvm-cli --features zgc`.
+  Those Spring Boot numbers are from 2026-08-08 and are **stale in ZGC's
+  disfavour**: two ZGC-only defects behind them were fixed on 2026-08-10 (see
+  the retired page). The suite has not been re-run under ZGC since, which is
+  the main measurement this default flip is still owed.
+- The `zgc` feature is **on by default** as of 2026-08-10, because the default
+  `GcAlgorithm` is `Zgc` and that variant is `#[cfg(feature = "zgc")]`. A
+  `--no-default-features` build has no ZGC at all and falls back to
+  Generational; `-XX:+UseZGC` there warns and falls back too.
 
 ## Sizing knobs
 

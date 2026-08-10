@@ -42573,6 +42573,47 @@ pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
 /// probe cost 130M `getenv` calls per CratonBench `hashmap` run before
 /// `c258662e4`. Keep these reads as the LEFT operand of any `&&` whose right
 /// operand is a string compare, exactly as that fix required.
+
+/// Volume and cost of the NATIVE proxy-dispatch entry
+/// (`Proxy$Dispatch.invokeProxy`), armed by `CRATONVM_DBG=ann-proxy-prof`.
+///
+/// The companion counter in `annotation_proxy_dispatch_impl` covers only the
+/// interpreter's hook. This is the other half of the funnel, and on a workload
+/// whose annotations are reached through generated `$ProxyN` bodies it is the
+/// half that carries the traffic. Printed on the same flag so one run reports
+/// both.
+static PROXY_DISPATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROXY_DISPATCH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn proxy_dispatch_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANN_PROXY_PROF").is_ok())
+}
+
+pub(crate) fn note_proxy_dispatch_ns(ns: u64) {
+    use std::sync::atomic::Ordering;
+    PROXY_DISPATCH_NS.fetch_add(ns, Ordering::Relaxed);
+    let n = PROXY_DISPATCH_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 100_000 == 0 {
+        eprintln!(
+            "[PROXY-DISPATCH-PROF] native invokeProxy calls={n} total={}ns/call cumulative={}ms",
+            PROXY_DISPATCH_NS.load(Ordering::Relaxed) / n,
+            PROXY_DISPATCH_NS.load(Ordering::Relaxed) / 1_000_000,
+        );
+    }
+}
+
+/// Final tally, for the exit dump — the number that turns "this call is 1000x
+/// too slow" into "and it is worth N seconds of the run".
+pub fn proxy_dispatch_prof_summary() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    let calls = PROXY_DISPATCH_CALLS.load(Ordering::Relaxed);
+    if calls == 0 {
+        return None;
+    }
+    Some((calls, PROXY_DISPATCH_NS.load(Ordering::Relaxed)))
+}
+
 #[inline(always)]
 pub(crate) fn nbflags() -> &'static cratonvm_types::flags::NativeFlags {
     &cratonvm_types::flags().natives

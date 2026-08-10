@@ -141,6 +141,39 @@ defect, the cheaper Spring Boot reproducer (`Log4J2LoggingSystemTests`, ~9 min,
 200-560 zeroed-header reads per run) is a far better vehicle for the fix than
 a 651-class Tomcat shard, and a fix validated there should be re-checked here.
 
+## 2026-08-10: the Spring Boot G1 corruption is ROOT-CAUSED — re-test before investigating further
+
+[`../springboot/g1-fullsuite-regression-20260808.md`](../springboot/g1-fullsuite-regression-20260808.md)
+§3c: `G1Collector::refill_tlab` carved TLABs whose size was not a multiple of 8.
+`bump_alloc` commits the full size to `region.cursor` while `Tlab::new` rounds
+its `end` DOWN to 8, so the bytes between the two ends were covered by no
+filler, no skip span and no object. A linear walk read them as an all-zero
+16-byte object, desynced 8 bytes off the real grid, and abandoned the walk —
+leaving every heap reference past that offset un-rewritten by the pause.
+`GenerationalHeap::refill_tlab` has masked with `& !7` since 2026-07-18; G1's
+copy never got it, which is exactly why it was G1-only. Fixed; the reproducer
+goes FAIL 18/61 → **PASS 61/61** with zero walk breaks.
+
+**This is very likely these crashes too, and the fix is cheap to test.** The
+symptom here — a read through a stale pointer under G1 where the default
+collector is merely slow — is what "references past the desync point are never
+rewritten" produces: the pause moves an object, the reference in the un-walked
+tail still names the old address, and the region is later reset and reused.
+
+**Before spending anything else on this page, re-run the shard on a binary with
+the fix** (`gc/src/g1.rs`, `tlab_carve_size`). Everything below was written
+before the root cause was known.
+
+**The mechanism this page proposes is now positively refuted, not merely
+doubted.** Root scanning was never the problem: the frame's roots are
+enumerated correctly, and the fix touches neither root scanning nor frame
+registration. `innermost-rbp-belongs-to-unguarded-callee` is a real condition
+and it is what pushes the collector onto the *linear-walk* path — which is where
+the unaligned carve bites. So the reason string is a genuine **precondition**
+for reaching the bug, which is why it correlates so well, but "an unguarded JIT
+frame's root points at freed memory" is the wrong story and the suggested fix
+(conservative treatment in G1's root scanner) would not have fixed it.
+
 ## Very likely the same defect as the Spring Boot G1 corruption — and the mechanism above may be the wrong one
 
 See [`../springboot/g1-fullsuite-regression-20260808.md`](../springboot/g1-fullsuite-regression-20260808.md)
