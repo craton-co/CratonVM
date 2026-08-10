@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-423 tokens.
+424 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -283,6 +283,7 @@ export inherited from a parent shell.
 | `loadclass` | `CRATONVM_DBG_LOADCLASS` |
 | `loader-chain` | `CRATONVM_DBG_LOADER_CHAIN` |
 | `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
+| `load-transform-no-memo` | `CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO` |
 | `logprov` | `CRATONVM_DBG_LOGPROV` |
 | `longroot` | `CRATONVM_DBG_LONGROOT` |
 | `lookup` | `CRATONVM_DBG_LOOKUP` |

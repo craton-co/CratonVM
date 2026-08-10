@@ -229,6 +229,10 @@ pub fn forget_vm_transformers(vm: usize) {
         .write()
         .unwrap_or_else(PoisonError::into_inner);
     chains.remove(&vm);
+    // The load-time offer memo is keyed on the same identity and must go with
+    // it — a later VM that reuses the identity would otherwise start life
+    // believing it had already offered every class the previous one loaded.
+    forget_vm_load_time_offers(vm);
 }
 
 /// Set once any VM in this process registers a transformer, and never cleared.
@@ -281,8 +285,13 @@ pub fn transformer_count(vm: usize) -> usize {
 }
 
 /// Reset `vm`'s chain. Used by VM shutdown / test isolation.
+///
+/// Clears the load-time offer memo with it: "start over" has to mean the next
+/// transformer registered in this VM sees class loads again, not that it
+/// inherits the previous chain's already-offered set.
 pub fn reset_transformer_chain(vm: usize) {
     with_chain_mut(vm, |chain| chain.clear());
+    forget_vm_load_time_offers(vm);
 }
 
 /// Public hook for Agent 2.4-C's `agent_loader.rs`. After a `-javaagent:`
@@ -1558,6 +1567,92 @@ thread_local! {
 /// turning the walk into an unbounded recursion.
 const SUPERTYPE_STAGE_DEPTH: u32 = 24;
 
+/// Class names already offered to `vm`'s load-time transformer chain.
+///
+/// # Why the load-time hook needs a memo at all
+///
+/// [`pre_transform_for_load`] does not sit at a class *definition* site — it
+/// sits on the constant-pool resolution path, which runs for every `new`,
+/// `checkcast`, `instanceof`, field owner and method owner the interpreter
+/// executes. It approximated "this class is not defined yet, so a definition is
+/// about to follow" with `ClassManager::resolve_fast_path_class_id`, and that
+/// approximation has a hole with a name-shaped edge: when a class is defined by
+/// a **user loader** *and* the same name is also reachable on the built-in
+/// delegation chain, `resolve_fast_path_class_id` deliberately answers `None`
+/// (it will not hand a `UserDefined` ClassId to a request the delegation chain
+/// can answer itself). So for every such class the "already defined" early-out
+/// never fires, and each resolution paid, in full:
+///
+///   * `find_class_bytes_for_transform` — a jar read + inflate + `to_vec`,
+///   * the same again for the supertype/interface pre-stage walk,
+///   * a Java `byte[]` allocation of the whole class file, and
+///   * an interpreted call into every registered `transform`.
+///
+/// That is not a small constant. Under Mockito's inline mock maker — which
+/// self-attaches a `ClassFileTransformer` in essentially every Spring Boot test
+/// — a class whose test runs under a `URLClassLoader` (Spring Boot's
+/// `@ClassPathExclusions` / `ModifiedClassPathClassLoader`, where *every*
+/// application class takes the shadowed shape above) went from a 21 s pass to a
+/// 300 s timeout with no forward progress at all.
+///
+/// # Why keying on the name alone is the right granularity
+///
+/// The seam this hook writes through — `ClassManager::stage_transformed_class`
+/// / `pending_transformed_classes` — is itself keyed by name, with "a second
+/// stage for the same name overwrites the first". A second offer for a name
+/// therefore *cannot* reach a second definition even in principle; it can only
+/// overwrite bytes staged for the first. Offering once per name per VM is
+/// exactly the granularity the staging mechanism supports, so the memo costs no
+/// coverage the seam could have delivered.
+///
+/// Keyed per VM for the same reason [`TransformerChains`] is: one process can
+/// own several heaps, and a name offered in VM A says nothing about VM B.
+/// Dropped by [`forget_vm_transformers`] when the VM goes away.
+type LoadTimeOffered = HashMap<usize, std::collections::HashSet<Box<str>>>;
+
+fn load_time_offered() -> &'static RwLock<LoadTimeOffered> {
+    static INSTANCE: OnceLock<RwLock<LoadTimeOffered>> = OnceLock::new();
+    INSTANCE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Claim the single load-time offer for `name` in `vm`.
+///
+/// Returns `true` for the caller that should go on and do the work, and
+/// `false` for every caller after it. Read-locked on the repeat path (which is
+/// the overwhelmingly common one — one `true` per class against arbitrarily
+/// many `false`s), and write-locked only to record a first offer.
+///
+/// `CRATONVM_DBG=load-transform-no-memo` makes this always answer `true`, i.e.
+/// restores the pre-fix "re-offer on every resolution" behaviour. It exists as
+/// the red control for the fix above: with it set, the hang reproduces.
+fn claim_load_time_offer(vm: usize, name: &str) -> bool {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_LOAD_TRANSFORM_NO_MEMO").is_ok() {
+        return true;
+    }
+    {
+        let offered = load_time_offered()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        if offered.get(&vm).is_some_and(|set| set.contains(name)) {
+            return false;
+        }
+    }
+    let mut offered = load_time_offered()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    offered.entry(vm).or_default().insert(name.into())
+}
+
+/// Drop `vm`'s load-time offer memo. Paired with [`forget_vm_transformers`]:
+/// an identity that gets reused by a later VM must not inherit the names the
+/// previous one already offered.
+fn forget_vm_load_time_offers(vm: usize) {
+    let mut offered = load_time_offered()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    offered.remove(&vm);
+}
+
 /// True when this VM has at least one registered `ClassFileTransformer`.
 ///
 /// The load path consults this before doing anything else. The relaxed global
@@ -1594,6 +1689,16 @@ pub fn pre_transform_for_load(
     }
     let reentrant = TRANSFORM_IN_FLIGHT.with(|s| s.borrow().iter().any(|n| n == name));
     if reentrant {
+        return;
+    }
+    // One offer per name per VM. This is the load path's own bound on how much
+    // work a registered transformer can cost: without it every *resolution* of
+    // a class the "already defined" check below cannot recognise (see
+    // [`LoadTimeOffered`] for the exact shape — a user-loader class whose name
+    // the delegation chain also answers) re-read the class file, re-walked its
+    // supertypes and re-entered Java. Claimed BEFORE the read lock below so the
+    // repeat path is one hash probe and nothing else.
+    if !claim_load_time_offer(shared.vm_identity, name) {
         return;
     }
     // Already defined: transform-on-load is over for this class. (A retransform
@@ -3255,5 +3360,75 @@ mod tests {
         assert!(r
             .find(bridge, "redefineClass", "(Ljava/lang/Class;[B)Z")
             .is_some());
+    }
+
+    // ---- Load-time transform: one offer per name per VM ----------------
+    //
+    // The bug these pin: `pre_transform_for_load` sits on the constant-pool
+    // resolution path, so a name whose "already defined" early-out cannot fire
+    // (a user-loader class the delegation chain also answers) was re-offered —
+    // class file re-read, supertypes re-walked, Java re-entered — on EVERY
+    // resolution. See [`LoadTimeOffered`].
+    //
+    // Identities are picked high and distinct so these never collide with a
+    // real VM identity or with each other under the test harness's shared
+    // process.
+
+    #[test]
+    fn load_time_offer_is_claimed_exactly_once_per_name() {
+        let vm = 0x10ad_0001_usize;
+        assert!(
+            claim_load_time_offer(vm, "com/foo/Bar"),
+            "the first resolution must do the work"
+        );
+        for _ in 0..1000 {
+            assert!(
+                !claim_load_time_offer(vm, "com/foo/Bar"),
+                "every later resolution of the same name must be a no-op"
+            );
+        }
+        // A different name is still its own first offer.
+        assert!(claim_load_time_offer(vm, "com/foo/Baz"));
+        forget_vm_load_time_offers(vm);
+    }
+
+    #[test]
+    fn load_time_offer_memo_is_per_vm() {
+        let a = 0x10ad_0002_usize;
+        let b = 0x10ad_0003_usize;
+        assert!(claim_load_time_offer(a, "com/foo/Bar"));
+        assert!(
+            claim_load_time_offer(b, "com/foo/Bar"),
+            "a name offered in VM A says nothing about VM B — its heap, its \
+             transformer chain, its class file"
+        );
+        assert!(!claim_load_time_offer(a, "com/foo/Bar"));
+        forget_vm_load_time_offers(a);
+        forget_vm_load_time_offers(b);
+    }
+
+    #[test]
+    fn forgetting_a_vm_drops_its_offer_memo() {
+        let vm = 0x10ad_0004_usize;
+        assert!(claim_load_time_offer(vm, "com/foo/Bar"));
+        assert!(!claim_load_time_offer(vm, "com/foo/Bar"));
+        // An identity a later VM reuses must not inherit the previous VM's
+        // already-offered set, or that VM's agent never sees a class load.
+        forget_vm_transformers(vm);
+        assert!(claim_load_time_offer(vm, "com/foo/Bar"));
+        forget_vm_load_time_offers(vm);
+    }
+
+    #[test]
+    fn resetting_the_chain_drops_the_offer_memo() {
+        let vm = 0x10ad_0005_usize;
+        assert!(claim_load_time_offer(vm, "com/foo/Bar"));
+        assert!(!claim_load_time_offer(vm, "com/foo/Bar"));
+        reset_transformer_chain(vm);
+        assert!(
+            claim_load_time_offer(vm, "com/foo/Bar"),
+            "\"start over\" has to mean the next transformer sees class loads"
+        );
+        forget_vm_load_time_offers(vm);
     }
 }
