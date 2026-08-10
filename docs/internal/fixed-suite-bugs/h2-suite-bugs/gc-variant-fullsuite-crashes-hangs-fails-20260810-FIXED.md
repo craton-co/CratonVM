@@ -14,10 +14,10 @@ guard output; that was the background, not the signal.
 
 ## Result
 
-62-class non-passing union of the original sweep, rerun under all three
-collectors from one `--features zgc` binary selecting the collector by runtime
-flag, plus a stock-HotSpot-25 control over the same list, same host, same
-classpath, 300 s per class, `--Xmx 1g`.
+The original sweep's non-passing union (65 classes as the runner's `--only`
+regex resolves it), rerun under all three collectors from one `--features zgc`
+binary selecting the collector by runtime flag, plus a stock-HotSpot-25 control
+over the same list, same host, same classpath, 300 s per class, `--Xmx 1g`.
 
 | variant | CRASH before | CRASH after | PASS before | PASS after |
 |---|---:|---:|---:|---:|
@@ -32,6 +32,12 @@ classpath, 300 s per class, `--Xmx 1g`.
 * The end-of-sweep `LIVE_IN_DEAD_SPANS` guard the old page's §2 was about now
   reports **0 hits across all three variants** (was: 8 classes, repeatedly, on
   the same victim address).
+
+Re-verified after merging current `dev` in: 8 of the previously-crashing classes
+across all three collectors give an identical PASS=6 / HANG=3 / **CRASH=0**, with
+zero `addr=0x10` faults and zero precise-deopt `InternalError`s.
+`cargo test -p cratonvm-native-builtins --lib` 3396 passed,
+`cargo test -p cratonvm-gc --lib` 1006 passed.
 
 ## 1. The SIGSEGV — a real-JDK `ByteBufferAs<T>Buffer` view read `address` as a pointer
 
@@ -127,7 +133,7 @@ sorted. The parallel chunk walker gets the same test and abandons its attempt,
 handing report and recovery to the sequential walk as it does for every other
 grid anomaly.
 
-Measured over the same 62 classes × 3 collectors:
+Measured over the same 65 classes × 3 collectors:
 
 | | before | after |
 |---|---:|---:|
@@ -174,13 +180,18 @@ Fixed narrowly, by aligning the outlier with its own sibling: when the stash is
 foreign, de-speculate the frame's real owner, drop the orphan, and let this
 (innocent) method fall through to interpreted execution — exactly what
 `jit-callsite-b` (`vm/src/runtime/interpreter/jit_bridge.rs`) already did for
-the same case. **The orphan-producing defect is upstream and still open**;
-it has its own page (see Related).
+the same case.
+
+**Both classes go CRASH → HANG, not CRASH → PASS.** They stop killing the VM and
+then run out the 300 s cap — `TestScript` was dying at ~212 s, so surviving the
+orphan buys it more work, not a pass. That residual is the throughput programme
+in §4, not this defect. **The orphan-producing defect is upstream and still
+open**; it has its own page (see Related).
 
 ## 4. The FAILs — a HotSpot control settles most of them
 
 The old page left 15-22 FAILs per variant "not individually triaged". They are
-now, against a stock HotSpot 25 control over the same 62 classes.
+now, against a stock HotSpot 25 control over the same class list.
 
 **HotSpot fails or hangs on 21 of them**, so they are H2-suite / environment
 issues, not CratonVM defects: `TestFunctions`, `TestLob`, `TestOutOfMemory`,
@@ -279,7 +290,7 @@ throughput, not correctness.
 
 ```bash
 cd apps/h2database-suite-runner
-ONLY='<the 62-class non-passing union, | -separated>'
+ONLY='<the non-passing union, | -separated>'
 for v in default g1 zgc; do
   JDK25=/data/toolchain/jdk-25 OUTROOT=/tmp/out CRATONVM_BIN=<cv-$v> \
     ./run-h2-suite.sh run --category all --only "$ONLY" \
