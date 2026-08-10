@@ -8154,6 +8154,7 @@ mod tests {
                 .collect(),
         );
         let view = ctx.alloc_object(view_class_id, 10);
+        ctx.set_field_by_name(view, "bb", Value::Object(Some(bb)));
         ctx.set_field_by_name(view, "mark", Value::Int(-1));
         ctx.set_field_by_name(view, "position", Value::Int(0));
         ctx.set_field_by_name(view, "limit", Value::Int(4));
@@ -8176,6 +8177,11 @@ mod tests {
         let (view, _bb, _arr) =
             make_real_typed_view(&mut ctx, "java/nio/ByteBufferAsLongBufferB", 0);
 
+        assert!(
+            s2_bb_heap_window(&ctx, view).is_some(),
+            "the view's storage must resolve through its backing `bb` — this is the \
+             mechanism, the address guard below is only the backstop"
+        );
         assert_eq!(
             s2_bb_direct_addr(&ctx, view),
             None,
