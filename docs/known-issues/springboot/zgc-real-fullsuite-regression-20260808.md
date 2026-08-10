@@ -80,11 +80,19 @@ CRASH at 234.6s. The `.err.log` shows a clean, catchable
 length 8192)` mid-test (`nestedZip64CanBeRead`, reading a zip64 nested-jar
 stream through `BufferedReader`/`AssertJ`'s `Diff`), not a native crash — no
 fatal-error report header, just a normal Java exception the harness records
-as CRASH because the process then exits non-zero. This matches a hypothesis
-already on file from the 2026-08-07 default-GC triage
-(`zipcontenttests-gc-pressure-timeout-not-disk-capacity-20260807.md`, which
-ruled out the disk-capacity theory and suspected GC/heap pressure at `-Xmx
-2g`) — direct confirmation under ZGC specifically. Plausible mechanism:
+as CRASH because the process then exits non-zero. This used to be read as
+confirming a hypothesis on file from the 2026-08-07 default-GC triage — but
+that page's GC/heap-pressure reading was **refuted** on 2026-08-10 for the
+DEFAULT collector: `-Xmx 8g` moves the default-GC runtime by 2%, and the class's
+cost is `ByteBuffer` accessor calls, not allocation (live page:
+`zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`; retired page:
+`internal/fixed-suite-bugs/springboot/zipcontenttests-gc-pressure-theory-REFUTED-20260810.md`).
+
+So this ZGC `OutOfMemoryError` no longer has that corroboration and stands on
+its own evidence. It may still be real and ZGC-specific — the default collector
+completing the class comfortably does not say ZGC does — but the heap-size A/B
+that settled the default arm has NOT been run under ZGC, and it is one run.
+Plausible mechanism:
 ZGC-real's non-moving, whole-arena mark-sweep (`docs/GC.md`) has no
 compaction, so fragmentation from this test's many nested-zip byte-array
 allocations could exhaust usable space well before Generational's copying

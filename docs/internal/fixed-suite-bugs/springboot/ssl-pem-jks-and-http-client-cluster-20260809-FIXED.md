@@ -189,10 +189,15 @@ and `setKeyEntry` refuses an empty chain. The second failure
 the server that could not start.
 
 This is the same signature as
-`known-issues/springboot/zipcontenttests-gc-pressure-timeout-not-disk-capacity-20260807.md`
-and `known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md`.
-It is tracked there, not here: nothing in this cluster's three defects touches
-it, and no SSL change can fix it.
+`known-issues/vm/jit-young-heap-exhaustion-after-header-16-20260807.md`. It is
+tracked there, not here: nothing in this cluster's three defects touches it, and
+no SSL change can fix it.
+
+Note that `ZipContentTests`, long filed alongside it as the other GC-pressure
+case, turned out **not** to be one — quadrupling its heap changes its runtime by
+2%. See
+`known-issues/springboot/zipcontenttests-bytebuffer-accessor-call-cost-20260810.md`.
+The heap-size A/B is what separates the two, and it is one run.
 
 ## Blast radius, measured
 
