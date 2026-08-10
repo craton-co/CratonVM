@@ -10414,13 +10414,14 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
 // state that cannot occur. If either gate above is ever removed, this comment
 // is the reason these bodies look unguarded.
 //
-// JDK-ONLY-WAVE2: these helpers should not need a policy gate at all. What
-// must replace the arrangement above: the compile-time recognition in
-// `jit::try_compile` should ask the shared resolver whether the triple's
-// registered native may shadow bytecode, instead of the JIT crate carrying a
-// latched process-global mirror of the policy because it cannot see
-// `NativeKind`. That is the same layering fix `jit/src/lib.rs`'s own WAVE2
-// marker on `set_jit_execution_policy` describes.
+// JDK-ONLY-WAVE2 §4, layering half CLOSED 2026-08-06/08-10. The ask was that
+// the compile-time recognition in `jit::try_compile` consult the shared
+// resolver about the triple's registered native, instead of the JIT crate
+// carrying a latched process-global mirror of a policy it could not evaluate
+// because it cannot see `NativeKind`. Both halves landed:
+// `direct_native_helper` takes an `intrinsic_resolver` the VM answers out of
+// the registry's kind, and the policy is threaded per compilation rather than
+// read from the latch. The gates above are those, not a mirror.
 // ---------------------------------------------------------------------------
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites

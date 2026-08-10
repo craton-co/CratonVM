@@ -13613,7 +13613,8 @@ pub fn try_compile_with_invokespecial_resolver(
     // JDK-only execution policy for THIS VM's compilations.
     //
     // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
-    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // (JDK-ONLY-WAVE2 §2 of the wave-2 markers record — the record's §6 is the
+    // JNI table, a different process global). The latch only ever
     // moved toward strict, so one `JdkOnly` VM silently took the thin
     // direct-call helpers away from every `Compatible` VM sharing the process
     // — the hazard contract §2's no-process-globals rule exists to prevent.
@@ -14376,7 +14377,8 @@ fn try_compile_inner(
     // JDK-only execution policy for THIS VM's compilations.
     //
     // Was the process-global `JIT_COMPATIBILITY_MODE` latch until 2026-08-06
-    // (JDK-ONLY-WAVE2 §6 of the wave-2 markers record). The latch only ever
+    // (JDK-ONLY-WAVE2 §2 of the wave-2 markers record — the record's §6 is the
+    // JNI table, a different process global). The latch only ever
     // moved toward strict, so one `JdkOnly` VM silently took the thin
     // direct-call helpers away from every `Compatible` VM sharing the process
     // — the hazard contract §2's no-process-globals rule exists to prevent.
