@@ -174,7 +174,7 @@ fn native_inflater_input_stream_init(
         }
     };
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(source))
+        .class_name_arc_of_id(ctx.class_id_of_object(source))
         .as_deref()
         != Some("java/io/ByteArrayInputStream")
     {
@@ -1505,7 +1505,7 @@ fn native_input_stream_transfer_to(
     );
     if byte_array_stream_layout
         && ctx
-            .class_name_of_id(ctx.class_id_of_object(output))
+            .class_name_arc_of_id(ctx.class_id_of_object(output))
             .as_deref()
             == Some("java/io/OutputStream$1")
     {

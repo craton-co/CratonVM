@@ -1430,7 +1430,7 @@ fn spring_configuration_cglib_display_name(
         return None;
     }
     let is_enhanced_configuration = ctx.class_interfaces(class_id).iter().any(|iface_id| {
-        ctx.class_name_of_id(*iface_id).as_deref() == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
+        ctx.class_name_arc_of_id(*iface_id).as_deref() == Some(SPRING_ENHANCED_CONFIGURATION_IFACE)
     });
     if !is_enhanced_configuration {
         return None;
@@ -2492,7 +2492,7 @@ pub(crate) fn class_for_name_one_arg_caller_loader(
 ) -> Option<ObjectRef> {
     for caller_cid in ctx.frame_class_ids() {
         if matches!(
-            ctx.class_name_of_id(caller_cid).as_deref(),
+            ctx.class_name_arc_of_id(caller_cid).as_deref(),
             Some("java/lang/Class")
         ) {
             continue;
@@ -3429,7 +3429,7 @@ pub(crate) fn loader_aware_reflect_assignable(
         return false;
     }
 
-    if ctx.class_name_of_id(source_class_id).as_deref() == Some(target_class_name) {
+    if ctx.class_name_arc_of_id(source_class_id).as_deref() == Some(target_class_name) {
         return true;
     }
 
@@ -3441,7 +3441,7 @@ pub(crate) fn loader_aware_reflect_assignable(
         // global copy.  The ids legitimately differ, but the superclass edge
         // is an exact loader-resolved relation.  Treat the matching binary
         // name as assignable just as the same-name receiver case above does.
-        if ctx.class_name_of_id(class_id).as_deref() == Some(target_class_name) {
+        if ctx.class_name_arc_of_id(class_id).as_deref() == Some(target_class_name) {
             return true;
         }
         queue.extend(ctx.class_interfaces(class_id));
@@ -3458,7 +3458,7 @@ pub(crate) fn loader_aware_reflect_assignable(
             continue;
         }
         seen.push(iface_id);
-        if ctx.class_name_of_id(iface_id).as_deref() == Some(target_class_name) {
+        if ctx.class_name_arc_of_id(iface_id).as_deref() == Some(target_class_name) {
             return true;
         }
         queue.extend(ctx.class_interfaces(iface_id));
@@ -5403,7 +5403,7 @@ pub(crate) fn accessible_override_is_set(ctx: &dyn NativeContext, obj: ObjectRef
         }
     }
     match ctx
-        .class_name_of_id(ctx.class_id_of_object(obj))
+        .class_name_arc_of_id(ctx.class_id_of_object(obj))
         .as_deref()
     {
         Some("java/lang/reflect/Field") => read_field_accessible(ctx, obj),
@@ -6957,7 +6957,7 @@ fn synthetic_declared_field_alias(
     ctx: &dyn NativeContext,
     class_id: ClassId,
 ) -> Option<FieldMetadata> {
-    match ctx.class_name_of_id(class_id).as_deref() {
+    match ctx.class_name_arc_of_id(class_id).as_deref() {
         Some("java/util/Collections$UnmodifiableMap" | "cratonvm/internal/UnmodifiableMap") => {
             Some(FieldMetadata {
                 name: "m".to_string(),
@@ -8616,7 +8616,7 @@ pub(crate) fn native_method_invoke(
         // including array receivers) is exempt.
         if let Some(declaring_id) = mirror_class_id(ctx, declaring_mirror) {
             let declaring_is_object =
-                ctx.class_name_of_id(declaring_id).as_deref() == Some("java/lang/Object");
+                ctx.class_name_arc_of_id(declaring_id).as_deref() == Some("java/lang/Object");
             if !declaring_is_object {
                 let is_instance = matches!(
                     native_class_is_instance(
@@ -13307,7 +13307,7 @@ fn is_annotation_type(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
         return true;
     }
     ctx.class_interfaces(class_id).into_iter().any(|i| {
-        ctx.class_name_of_id(i).as_deref() == Some("java/lang/annotation/Annotation")
+        ctx.class_name_arc_of_id(i).as_deref() == Some("java/lang/annotation/Annotation")
     })
 }
 
@@ -14365,7 +14365,7 @@ pub(crate) fn annotation_element_to_java_typed(
                 };
                 if sentinel_index.is_none() {
                     if let Value::Object(Some(o)) = v_cur {
-                        if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref()
+                        if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref()
                             == Some("java/lang/TypeNotPresentException")
                         {
                             sentinel_index = Some(i);
@@ -17652,7 +17652,7 @@ pub(crate) fn unnamed_module_for_loader(
     // constructor already built its unnamed module hands back THAT object.
     if let Value::Object(Some(existing)) = ctx.get_field_by_name(loader, "unnamedModule") {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(existing))
+            .class_name_arc_of_id(ctx.class_id_of_object(existing))
             .as_deref()
             == Some("java/lang/Module")
         {
@@ -18184,7 +18184,7 @@ fn class_is_declared_enum(ctx: &dyn NativeContext, class_id: ClassId) -> bool {
         return parent_id == enum_id;
     }
     matches!(
-        ctx.class_name_of_id(parent_id).as_deref(),
+        ctx.class_name_arc_of_id(parent_id).as_deref(),
         Some("java/lang/Enum")
     )
 }
@@ -21079,7 +21079,7 @@ mod tests {
             exceptions: Vec::new(),
             signature: None,
         };
-        let method = create_method_object(&mut ctx, &meta);
+        let method = create_method_object(&mut ctx, &meta).unwrap();
         ctx.set_method_return_type_annotations(
             owner,
             "nullableReturn",
@@ -21114,7 +21114,7 @@ mod tests {
             exceptions: Vec::new(),
             signature: None,
         };
-        let method = create_method_object(&mut ctx, &meta);
+        let method = create_method_object(&mut ctx, &meta).unwrap();
         ctx.set_method_parameter_type_annotations(
             owner,
             "nullableParameter",
@@ -23059,7 +23059,7 @@ mod tests {
             signature: None,
         };
 
-        let method_obj = create_method_object(&mut ctx, &meta);
+        let method_obj = create_method_object(&mut ctx, &meta).unwrap();
 
         // getDeclaringClass в†’ returns the String class mirror (name
         // "java/lang/String"), NOT java/lang/Object.
@@ -23851,7 +23851,7 @@ Implementation-Title: opensaml-core-api\r\n\
     fn t19_h10_alloc_byte_array_input_stream_layout() {
         let mut ctx = mock_ctx();
         let bytes = b"hello".to_vec();
-        let stream = t19_h10_alloc_byte_array_input_stream(&mut ctx, &bytes);
+        let stream = t19_h10_alloc_byte_array_input_stream(&mut ctx, &bytes).unwrap();
         let count = ctx.get_field(stream, 3).as_int().unwrap_or(-1);
         assert_eq!(count, 5);
         let pos = ctx.get_field(stream, 1).as_int().unwrap_or(-1);
@@ -24398,7 +24398,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         let v = ctx.get_field_by_name(m, "exceptionTypes");
         match v {
@@ -24430,7 +24430,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         let v = ctx.get_field_by_name(m, "parameterTypes");
         match v {
@@ -24522,7 +24522,7 @@ Implementation-Title: opensaml-core-api\r\n\
             exceptions: Vec::new(),
             signature: None,
         };
-        let m = create_method_object(&mut ctx, &meta);
+        let m = create_method_object(&mut ctx, &meta).unwrap();
 
         for field in &["annotations", "parameterAnnotations", "annotationDefault"] {
             match ctx.get_field_by_name(m, field) {
@@ -24641,7 +24641,7 @@ Implementation-Title: opensaml-core-api\r\n\
         // what provides that; exercise it directly, since the mock context has
         // no classpath to drive the synthesis path.
         let mut ctx = mock_ctx();
-        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo");
+        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo").unwrap();
         let handle = ctx.add_global_root(pkg);
         defined_package_memo()
             .lock()
@@ -24791,7 +24791,7 @@ Implementation-Title: opensaml-core-api\r\n\
         ctx.set_superclass(iface_cid, object_cid);
         ctx.set_is_interface(iface_cid, true);
 
-        let methods = collect_public_methods(&mut ctx, iface_cid);
+        let methods = collect_public_methods(&mut ctx, iface_cid).unwrap();
         // Only `doIt` from the interface вЂ” Object methods are skipped.
         let n = ctx.array_length(methods);
         assert_eq!(
@@ -24847,7 +24847,7 @@ Implementation-Title: opensaml-core-api\r\n\
             ],
         );
 
-        let methods = collect_public_methods(&mut ctx, child);
+        let methods = collect_public_methods(&mut ctx, child).unwrap();
         let mut closes = Vec::new();
         let mut shutdowns = Vec::new();
         for i in 0..ctx.array_length(methods) {

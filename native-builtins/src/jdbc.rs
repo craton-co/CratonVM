@@ -303,7 +303,7 @@ fn sql_datetime_millis(ctx: &dyn NativeContext, obj: ObjectRef) -> i64 {
 /// in class_manager.rs, which has no `java/sql/Timestamp` case).
 fn timestamp_nanos_index(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<usize> {
     let class_id = ctx.class_id_of_object(obj);
-    if ctx.class_name_of_id(class_id).as_deref() != Some("java/sql/Timestamp") {
+    if ctx.class_name_arc_of_id(class_id).as_deref() != Some("java/sql/Timestamp") {
         return None;
     }
     let num_fields = ctx.object_num_fields(obj);

@@ -301,7 +301,7 @@ fn unmodifiable_wrapper_roots_backing_and_wrapper_across_allocation() {
     ctx.set_relocate_pins_on_alloc(false);
 
     assert_eq!(
-        ctx.class_name_of_id(ctx.class_id_of_object(wrapper)).as_deref(),
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(wrapper)).as_deref(),
         Some(UNMOD_COLLECTION)
     );
     let forwarded_backing = match ctx.get_field(wrapper, 0) {

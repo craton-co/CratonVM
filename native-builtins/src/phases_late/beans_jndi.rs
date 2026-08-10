@@ -1078,7 +1078,7 @@ fn vcs_is_property_veto(ctx: &dyn NativeContext, failure: &MethodCallFailed) -> 
         return false;
     };
     let thrown = ctx.class_id_of_object(*exc);
-    if ctx.class_name_of_id(thrown).as_deref() == Some("java/beans/PropertyVetoException") {
+    if ctx.class_name_arc_of_id(thrown).as_deref() == Some("java/beans/PropertyVetoException") {
         return true;
     }
     match ctx.class_id_by_name("java/beans/PropertyVetoException") {

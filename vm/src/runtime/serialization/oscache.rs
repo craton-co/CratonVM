@@ -163,13 +163,14 @@ impl OscCache {
     /// collection in another VM can neither see nor mark these refs.
     /// Direct ownership also lets loader metadata remain a conditional
     /// edge during a full class-unloading mark.
-    pub fn scan_roots(&self, roots: &mut Vec<ObjectRef>) {
+    pub fn scan_roots(&self, vm_identity: usize, roots: &mut Vec<ObjectRef>) {
         for (&class_id, desc) in self.inner.read().iter() {
             if cratonvm_types::metadata_pin::metadata_weak_mode() {
                 if let Some(loader) =
                     cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
+                        vm_identity,
                         loader,
                         desc.as_ptr() as usize,
                     );
@@ -317,7 +318,7 @@ mod tests {
         cache.insert_if_absent(ClassId::new(5001), seeded);
 
         let mut roots = Vec::new();
-        cache.scan_roots(&mut roots);
+        cache.scan_roots(0, &mut roots);
         assert!(
             roots.contains(&seeded),
             "scan must surface the cached descriptor as a GC root"
@@ -341,7 +342,7 @@ mod tests {
         vm_b.insert_if_absent(ClassId::new(5101), theirs);
 
         let mut roots = Vec::new();
-        vm_a.scan_roots(&mut roots);
+        vm_a.scan_roots(0, &mut roots);
         assert!(roots.contains(&mine), "own descriptor must be rooted");
         assert!(
             !roots.contains(&theirs),

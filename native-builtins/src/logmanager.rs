@@ -862,7 +862,7 @@ pub(crate) fn jul_logger_name_object(
     // `ConfigurationData`.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, 0) {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .class_name_arc_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
@@ -878,7 +878,7 @@ pub(crate) fn jul_logger_name_object(
     // The `logmanager` synthetic layout.
     if let Value::Object(Some(name_obj)) = ctx.get_field(logger, LOGGER_FIELD_NAME) {
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(name_obj))
+            .class_name_arc_of_id(ctx.class_id_of_object(name_obj))
             .as_deref()
             == Some("java/lang/String")
         {
@@ -940,7 +940,7 @@ fn tomcat_context_loader_key(ctx: &mut dyn NativeContext) -> i32 {
 fn tomcat_juli_root_logger(ctx: &mut dyn NativeContext) -> Result<Option<ObjectRef>, MethodCallFailed> {
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager))
+        .class_name_arc_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         != Some("org/apache/juli/ClassLoaderLogManager")
     {
@@ -1003,7 +1003,7 @@ fn get_or_create_tomcat_juli_logger(ctx: &mut dyn NativeContext, name: &str) -> 
     let manager = ensure_singleton(ctx, CLS_JUL_LOG_MANAGER)?;
     logger = ctx.read_native_pin(logger_pin, logger);
     if ctx
-        .class_name_of_id(ctx.class_id_of_object(manager))
+        .class_name_arc_of_id(ctx.class_id_of_object(manager))
         .as_deref()
         == Some("org/apache/juli/ClassLoaderLogManager")
     {
@@ -4072,7 +4072,7 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> R
     // ClassLoaderLogManager creates a real per-webapp logger.
     let synthetic_layout = matches!(ctx.get_field(logger, LOGGER_FIELD_NAME),
         Value::Object(Some(name))
-            if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(name)).as_deref()
                 == Some("java/lang/String"));
     if synthetic_layout {
         // `allocate_logger` now populates this same slot with a real parent
@@ -4080,7 +4080,7 @@ fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> R
         // don't misread it as one.
         if let Value::Object(Some(list)) = ctx.get_field(logger, LOGGER_FIELD_PARENT) {
             if ctx
-                .class_name_of_id(ctx.class_id_of_object(list))
+                .class_name_arc_of_id(ctx.class_id_of_object(list))
                 .as_deref()
                 != Some(CLS_JUL_LOGGER)
             {
@@ -4472,7 +4472,7 @@ fn jul_is_throwable(ctx: &dyn NativeContext, o: ObjectRef) -> bool {
     let mut cid = ctx.class_id_of_object(o);
     // Depth guard: a corrupt or self-referential chain must not spin here.
     for _ in 0..64 {
-        match ctx.class_name_of_id(cid).as_deref() {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
             Some("java/lang/Throwable") => return true,
             // `Object` terminates the chain; `None` means the id is not a
             // real loaded class (synthetic lambda proxy, stale ref).
@@ -6490,8 +6490,8 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        let logger = allocate_logger(&mut ctx, "org.example.capture");
-        let handler = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0)?;
+        let logger = allocate_logger(&mut ctx, "org.example.capture").unwrap();
+        let handler = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/Handler", 0).unwrap();
         native_jul_logger_add_handler(
             &mut ctx,
             &[Value::Object(Some(logger)), Value::Object(Some(handler))],
@@ -6506,7 +6506,7 @@ mod tests {
             Some(1)
         );
 
-        let record = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5)?;
+        let record = try_alloc_concurrent_synthetic(&mut ctx, "java/util/logging/LogRecord", 5).unwrap();
         ctx.set_field(record, 1, Value::Long(42));
         log_record_messages()
             .lock()
@@ -6577,7 +6577,7 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        let log_context = ensure_jboss_log_context(&mut ctx);
+        let log_context = ensure_jboss_log_context(&mut ctx).unwrap();
         assert!(
             matches!(ctx.get_field(log_context, 0), Value::Object(Some(_))),
             "real LogContext.addCloseHandler synchronizes on treeLock"
@@ -6668,7 +6668,7 @@ mod tests {
         let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
         reset_state_for_tests();
         let mut ctx = mock_ctx();
-        let logger = get_or_create_jboss_logger(&mut ctx, "com.example.App");
+        let logger = get_or_create_jboss_logger(&mut ctx, "com.example.App").unwrap();
         let handlers =
             match native_jboss_logger_get_handlers(&mut ctx, &[Value::Object(Some(logger))])
                 .unwrap()
@@ -6690,7 +6690,7 @@ mod tests {
             _ => panic!(),
         };
         // Build a Logger manually.
-        let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS)?;
+        let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
         let name_obj = ctx.create_string("dup.logger");
         ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
 
@@ -6780,7 +6780,7 @@ mod tests {
             "foo\tbar",
             "foo\u{0000}bar",
         ] {
-            let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS)?;
+            let logger = try_alloc_concurrent_synthetic(&mut ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS).unwrap();
             let name_obj = ctx.create_string(bad);
             ctx.set_field(logger, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
             let r = native_add_logger(
@@ -7194,9 +7194,9 @@ mod tests {
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
         let recv =
-            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
-        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1)?;
-        let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS).unwrap();
+        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
+        let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let _ = native_jboss_logger_attach(
             &mut ctx,
             &[
@@ -7246,9 +7246,9 @@ mod tests {
         .unwrap();
         let _ = ensure_jboss_log_context(&mut ctx);
         let recv =
-            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS)?;
-        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1)?;
-        let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS).unwrap();
+        let key = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
+        let val = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1).unwrap();
         let _ = native_jboss_logger_attach(
             &mut ctx,
             &[

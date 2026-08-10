@@ -1,7 +1,7 @@
 # ZGC-real vs. Generational, full Spring Boot suite — rerun 2026-08-08 on a clean binary
 
 **Status: OPEN — characterized, not root-caused.** Supersedes
-[`zgc-real-fullsuite-regression-20260807.md`](zgc-real-fullsuite-regression-20260807.md)
+[`zgc-real-fullsuite-regression-20260808.md`](zgc-real-fullsuite-regression-20260808.md)
 as the current data point (that page is not wrong, just stale — it ran
 against a binary with a near-total heap-corruption bug active). This run is
 the first clean, apples-to-apples ZGC-vs-Generational comparison since the

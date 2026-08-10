@@ -1076,25 +1076,86 @@ static UNQUEUED_PUBLISHED_CODE_FREES: std::sync::atomic::AtomicUsize =
 /// Entries are never freed. The table is bounded by the number of DISTINCT
 /// class names that appear at a type-check site in the program, not by the
 /// number of compilations.
+/// # Interning by (name, resolved target), not by name
+///
+/// A type-check site carries only a class NAME to the runtime helper, and the
+/// class dictionary is keyed by `(ClassLoaderId, name)` — so a name alone does
+/// not name a class. When two loaders each define `Foo`, resolving the site's
+/// name at run time picks a winner that may not be the copy the compiling
+/// method's own constant pool meant, and the helper then had to fall back to a
+/// loader-blind name walk to avoid refusing a cast the interpreter would pass.
+///
+/// The compiler already knows the answer: `cp_new_resolver` resolves the site's
+/// `CONSTANT_Class` entry through the compiling class's loader and hands back
+/// the exact `ClassId`. Interning by `(name, that id)` gives each resolved
+/// target its own pointer and records the id in [`TYPECHECK_TARGET_BY_SITE`],
+/// so the helper can compare identities instead of spelling. `None` — a site
+/// whose target was not loaded at compile time — keeps the old name-only
+/// identity and the old behaviour.
 static TYPECHECK_NAME_INTERN: std::sync::OnceLock<
-    parking_lot::Mutex<rustc_hash::FxHashSet<&'static str>>,
+    parking_lot::Mutex<rustc_hash::FxHashMap<Option<u32>, rustc_hash::FxHashSet<&'static str>>>,
 > = std::sync::OnceLock::new();
+
+/// `interned name pointer -> the `ClassId` that site's target resolved to at
+/// compile time`. Read by `vm::jit::helpers::jit_typecheck_resolve`.
+///
+/// Entries are never removed, for the same reason the intern table's are not:
+/// the pointer is leaked for the life of the process, so a row can never come
+/// to describe a different site.
+///
+/// A `ClassId` is per-VM, and this table is process-wide, so the reader must
+/// confirm the recorded id still names the site's class in *its* VM before
+/// trusting it — see the check in `jit_typecheck_resolve`.
+static TYPECHECK_TARGET_BY_SITE: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<usize, u32>>,
+> = std::sync::OnceLock::new();
+
+fn typecheck_target_table() -> &'static parking_lot::RwLock<rustc_hash::FxHashMap<usize, u32>> {
+    TYPECHECK_TARGET_BY_SITE.get_or_init(|| parking_lot::RwLock::new(Default::default()))
+}
 
 /// Intern `name` and return the stable `(ptr, len)` pair for it. Repeated calls
 /// with equal contents return the identical pointer, for the life of the
 /// process.
+///
+/// Equivalent to [`intern_typecheck_target`] with no resolved target: the site
+/// answers "I could not resolve this name at compile time".
 pub fn intern_typecheck_class_name(name: &str) -> (*const u8, usize) {
+    intern_typecheck_target(name, None)
+}
+
+/// Intern `name` under the identity of the `ClassId` its `CONSTANT_Class` entry
+/// resolved to through the compiling class's own loader.
+///
+/// Two loaders' same-named copies get two distinct pointers, so the per-thread
+/// memos keyed on that pointer stay exact, and the runtime helper recovers the
+/// resolved id with [`typecheck_target_for_site`].
+pub fn intern_typecheck_target(name: &str, target_class_id: Option<u32>) -> (*const u8, usize) {
     let table = TYPECHECK_NAME_INTERN.get_or_init(|| parking_lot::Mutex::new(Default::default()));
     let mut table = table.lock();
-    let interned: &'static str = match table.get(name) {
+    let names = table.entry(target_class_id).or_default();
+    let interned: &'static str = match names.get(name) {
         Some(existing) => existing,
         None => {
             let leaked: &'static str = Box::leak(String::from(name).into_boxed_str());
-            table.insert(leaked);
+            names.insert(leaked);
+            if let Some(id) = target_class_id {
+                typecheck_target_table()
+                    .write()
+                    .insert(leaked.as_ptr() as usize, id);
+            }
             leaked
         }
     };
     (interned.as_ptr(), interned.len())
+}
+
+/// The `ClassId` the site whose class name lives at `name_ptr` resolved to at
+/// compile time, if it resolved at all.
+#[inline]
+pub fn typecheck_target_for_site(name_ptr: *const u8) -> Option<u32> {
+    let table = TYPECHECK_TARGET_BY_SITE.get()?;
+    table.read().get(&(name_ptr as usize)).copied()
 }
 
 /// Published bodies unmapped, and how many of those bypassed the retirement
@@ -15005,11 +15066,21 @@ fn try_compile_inner(
                 let mut cc_im = std::collections::HashMap::new();
                 let mut io_im = std::collections::HashMap::new();
                 for &(pc, cp_idx) in &scan.typecheck_ops {
-                    if matches!(new_resolver(cp_idx), Some(JitNewSite::Resolved { .. })) {
+                    if let Some(JitNewSite::Resolved {
+                        class_id: target_id,
+                        ..
+                    }) = new_resolver(cp_idx)
+                    {
                         if let Some(name) = name_resolver(cp_idx) {
                             // Interned process-wide, NOT owned by this
-                            // compilation — see `intern_typecheck_class_name`.
-                            let (ptr, len) = intern_typecheck_class_name(&name);
+                            // compilation — see `intern_typecheck_target`.
+                            //
+                            // `class_id` is the copy this method's OWN constant
+                            // pool resolves to, through its own loader. It was
+                            // previously discarded, leaving the runtime helper
+                            // to re-resolve a bare name against a dictionary
+                            // keyed by `(ClassLoaderId, name)`.
+                            let (ptr, len) = intern_typecheck_target(&name, Some(target_id));
                             let entry = (ptr as usize, len);
                             if checkcast_pcs.contains(&pc) {
                                 cc_im.insert(pc, entry);
@@ -16302,8 +16373,18 @@ fn try_compile_inner(
             };
             // Interned process-wide, NOT owned by this compilation — the
             // type-check helpers memoize on `(ptr, len)` from thread-locals
-            // that outlive us. See `intern_typecheck_class_name`.
-            let (ptr, len) = intern_typecheck_class_name(&class_name);
+            // that outlive us. See `intern_typecheck_target`.
+            //
+            // When the `new` resolver can name the exact `ClassId` this site's
+            // `CONSTANT_Class` entry resolves to through the compiling class's
+            // loader, the site is interned under that identity so the runtime
+            // helper compares ids rather than re-resolving a bare name against
+            // a `(ClassLoaderId, name)`-keyed dictionary.
+            let target_id = cp_new_resolver.and_then(|r| match r(cp_idx) {
+                Some(JitNewSite::Resolved { class_id, .. }) => Some(class_id),
+                _ => None,
+            });
+            let (ptr, len) = intern_typecheck_target(&class_name, target_id);
             typecheck_info.push((pc, ptr, len));
         }
     }
@@ -24623,6 +24704,40 @@ mod tests {
             let s = unsafe { std::str::from_utf8(std::slice::from_raw_parts(ptr, len)) }.unwrap();
             assert_eq!(s, expect);
         }
+    }
+
+    /// Two loaders' same-named classes are two classes, and a type-check site
+    /// must be able to say which one it meant.
+    ///
+    /// The class dictionary is keyed by `(ClassLoaderId, name)`, but a
+    /// compiled type-check site used to carry only the name — so
+    /// `jit_typecheck_resolve` re-resolved it at run time, could land on the
+    /// wrong copy, and covered for that with a loader-blind name walk that
+    /// accepted *either* copy. Interning by `(name, resolved ClassId)` gives
+    /// each copy its own site identity and lets the helper answer by identity.
+    #[test]
+    fn a_typecheck_site_is_interned_under_the_class_id_its_loader_resolved() {
+        let (p_a, l_a) = intern_typecheck_target("com/example/Forked", Some(4_242));
+        let (p_b, l_b) = intern_typecheck_target("com/example/Forked", Some(4_243));
+        assert_eq!(l_a, l_b);
+        assert_ne!(
+            p_a, p_b,
+            "one name resolved to two loaders' classes must be two sites"
+        );
+        assert_eq!(typecheck_target_for_site(p_a), Some(4_242));
+        assert_eq!(typecheck_target_for_site(p_b), Some(4_243));
+
+        // Stable: recompiling the same site rejoins the same identity.
+        assert_eq!(
+            intern_typecheck_target("com/example/Forked", Some(4_242)),
+            (p_a, l_a)
+        );
+
+        // A site whose target was not loaded at compile time records nothing,
+        // and so keeps the pre-existing name-resolution behaviour.
+        let (p_none, _) = intern_typecheck_class_name("com/example/Forked");
+        assert_ne!(p_none, p_a);
+        assert_eq!(typecheck_target_for_site(p_none), None);
     }
 
     /// T10.3 — Verify the FxHashMap swap preserves insert/lookup semantics for

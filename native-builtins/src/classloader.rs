@@ -187,6 +187,14 @@ pub fn forget_vm_loader_singletons(vm_identity: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(vm, _)| *vm != vm_identity);
+    // The GC marker's three liveness-pin registries hold raw heap addresses
+    // from the heap that is going away. They used to be wiped wholesale when
+    // the NEXT VM was created, which is both too late (the addresses were
+    // stale in between) and too broad (it took a concurrently-live VM's rows
+    // with them). Dropping them here, per VM, is neither.
+    cratonvm_types::loader_pin::forget_vm_loader_pins(vm_identity);
+    cratonvm_types::mirror_pin::forget_vm_mirror_pins(vm_identity);
+    cratonvm_types::metadata_pin::forget_vm_metadata_pins(vm_identity);
 }
 
 /// Reset the process-wide (not yet VM-scoped) classloader side-tables.
@@ -222,13 +230,25 @@ pub fn reset_loader_singletons() {
     // and namespace id the moment an address is reused.
     loader_meta_store().lock()
         .clear();
-    // HIB-CV-24: drop the GC marker's loader-pin mirror for the new VM.
-    cratonvm_types::loader_pin::clear_loader_pins();
-    // Companion: drop the GC marker's mirror_pin registry for the new VM too
-    // (see `cratonvm_types::mirror_pin`).
-    cratonvm_types::mirror_pin::clear_mirror_pins();
-    cratonvm_types::metadata_pin::clear_metadata_pins();
-    cratonvm_types::jit_activation::clear();
+    // NOT cleared here any more either, for exactly the reason just above —
+    // these four were the same mistake, sixteen lines below the note that
+    // explains it:
+    //
+    //   * `loader_pin` / `mirror_pin` / `metadata_pin` are the GC marker's
+    //     liveness-pin registries. Every row now carries the `vm_identity` that
+    //     wrote it, and `forget_vm_loader_singletons` drops this VM's rows at
+    //     teardown. A fresh VM has none, so the only rows a wipe here could
+    //     reach were a CONCURRENTLY LIVE VM's — and losing a pin is the
+    //     dangerous direction: the marker drops a root for a loader that is
+    //     still reachable.
+    //   * `jit_activation` needs no wipe at all. A slot is owned by the thread
+    //     running the compiled frame and cleared by that same thread's `exit`;
+    //     a foreign wipe is the only way to lose a record whose frame is still
+    //     running. A record stranded by a thread that died mid-frame
+    //     over-retains one loader for one collection, and the reader
+    //     (`vm::memory::roots`) already filters every id it finds through
+    //     `defining_loader_for(vm_identity, ..)`, so another VM's class id
+    //     cannot resolve to a root here.
     local_url_class_path_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -407,7 +427,7 @@ pub fn gc_reconcile_defining_loaders(
         .filter(|((vm, _), _)| *vm == vm_identity)
         .map(|(&(_vm, cid), obj_ref)| (cid, obj_ref.as_ptr() as usize))
         .collect();
-    cratonvm_types::loader_pin::replace_loader_pins(&pins);
+    cratonvm_types::loader_pin::replace_loader_pins(vm_identity, &pins);
 
     // Same treatment for the loader-namespace side-table (object-keyed): drop
     // entries whose loader was collected this cycle, remap survivors that
@@ -494,7 +514,7 @@ pub fn forget_unloaded_classes(vm_identity: usize, class_ids: &[u32]) {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(vm, id)| *vm != vm_identity || !ids.contains(id));
     for id in class_ids {
-        cratonvm_types::loader_pin::remove_loader_pin(*id);
+        cratonvm_types::loader_pin::remove_loader_pin(vm_identity, *id);
     }
 }
 
@@ -720,7 +740,7 @@ pub fn register_defining_loader(vm: usize, class_id: u32, loader: ObjectRef) {
     // HIB-CV-24: mirror into the loader-pin registry the GC marker consults so a
     // live instance of this class keeps its defining loader alive (the
     // instance→loader edge HotSpot gets for free via `Class.getClassLoader`).
-    cratonvm_types::loader_pin::set_loader_pin(class_id, loader.as_ptr() as usize);
+    cratonvm_types::loader_pin::set_loader_pin(vm, class_id, loader.as_ptr() as usize);
 }
 
 /// Look up the user-defined `ClassLoader` object that defined `class_id`.
@@ -2220,7 +2240,7 @@ pub(crate) fn invoke_single_load_class_override(
 /// defined by application loader` — the two loaders are unrelated objects
 /// with disjoint URLs, not aliases of the single real Application loader.
 fn is_bare_url_class_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
-    ctx.class_name_of_id(ctx.class_id_of_object(this))
+    ctx.class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
         == Some("java/net/URLClassLoader")
 }
@@ -2623,7 +2643,7 @@ fn find_loaded_class_for_loader_inner(
         .collect();
     for cid in defined_here {
         let cid = cratonvm_types::ClassId::new(cid);
-        if ctx.class_name_of_id(cid).as_deref() == Some(internal_name) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(internal_name) {
             return Some(ctx.get_class_mirror(cid));
         }
     }
@@ -5173,7 +5193,7 @@ fn loader_overrides_find_resources(ctx: &mut dyn NativeContext, this_ref: Object
     const FIND_RESOURCES_DESC: &str = "(Ljava/lang/String;)Ljava/util/Enumeration;";
     let mut cid = Some(ctx.class_id_of_object(this_ref));
     while let Some(c) = cid {
-        match ctx.class_name_of_id(c).as_deref() {
+        match ctx.class_name_arc_of_id(c).as_deref() {
             // Reached the base class (or an untyped class): no override found.
             Some("java/lang/ClassLoader") | Some("java/lang/Object") | None => return false,
             _ => {}
@@ -6745,7 +6765,7 @@ fn probe_resource_exists(ctx: &mut dyn NativeContext, url: ObjectRef) -> bool {
 pub(crate) fn object_extends(ctx: &dyn NativeContext, obj: ObjectRef, target: &str) -> bool {
     let mut class_id = ctx.class_id_of_object(obj);
     for _ in 0..64 {
-        match ctx.class_name_of_id(class_id).as_deref() {
+        match ctx.class_name_arc_of_id(class_id).as_deref() {
             Some(name) if name == target => return true,
             None => return false,
             _ => {}
@@ -11938,7 +11958,7 @@ mod classloader_tests {
     #[test]
     fn new8_define_hidden_class_rejects_null_bytes() {
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
         let result = lk_define_hidden_class(
             &mut ctx,
             &[
@@ -11961,7 +11981,7 @@ mod classloader_tests {
         let mut ctx = crate::test_utils::MockNativeContext::new();
         // Build a byte[] of zeros (no magic).
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
         let result = lk_define_hidden_class(
             &mut ctx,
             &[
@@ -11989,7 +12009,7 @@ mod classloader_tests {
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
         }
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
 
         let result = lk_define_hidden_class(
             &mut ctx,
@@ -12049,7 +12069,7 @@ mod classloader_tests {
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr2, i, Value::Int((*b as i8) as i32));
         }
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
 
         lk_define_hidden_class(
             &mut ctx,
@@ -12104,12 +12124,12 @@ mod classloader_tests {
             &mut ctx,
             "java/lang/invoke/MethodHandles$Lookup$ClassOption",
             1,
-        )?;
+        ).unwrap();
         ctx.set_field(option, 0, Value::Int(0)); // NESTMATE ordinal
         let options_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(options_arr, 0, Value::Object(Some(option)));
 
-        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lookup = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
 
         let result = lk_define_hidden_class(
             &mut ctx,
@@ -12348,7 +12368,7 @@ mod classloader_tests {
         // The mock declares no fields for a fresh class, so `allowedModes` is
         // absent and the MOCK's `get_field_by_name` answers `Int(0)` for it.
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let lk = alloc_lookup(&mut ctx, LK_FULL_POWER);
+        let lk = alloc_lookup(&mut ctx, LK_FULL_POWER).unwrap();
         assert_eq!(lk_modes_of(&ctx, lk), LK_FULL_POWER);
     }
 

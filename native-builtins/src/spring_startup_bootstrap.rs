@@ -529,7 +529,7 @@ fn ensure_bean_post_processors_list(ctx: &mut dyn NativeContext, bean_factory: O
     let cur = ctx.get_field_by_name(bean_factory, "beanPostProcessors");
     if let Value::Object(Some(obj)) = cur {
         let cid = ctx.class_id_of_object(obj);
-        if ctx.class_name_of_id(cid).as_deref() == Some(BPP_LIST) {
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(BPP_LIST) {
             let needs_outer = match ctx.get_field_by_name(obj, "this$0") {
                 Value::Object(Some(o)) => o != bean_factory,
                 _ => true,
@@ -2574,7 +2574,7 @@ fn try_build_method_injection(
                         // so we don't probe a non-existent method and log spurious
                         // NoSuchMethodError warnings.
                         let ovr_cid = ctx.class_id_of_object(ovr);
-                        if ctx.class_name_of_id(ovr_cid).as_deref()
+                        if ctx.class_name_arc_of_id(ovr_cid).as_deref()
                             == Some("org/springframework/beans/factory/support/ReplaceOverride")
                         {
                             continue;
@@ -2966,7 +2966,7 @@ fn try_build_replace_override(
                     // Only ReplaceOverride entries — LookupOverride is handled
                     // upstream by `try_build_method_injection`.
                     let ovr_cid = ctx.class_id_of_object(ovr);
-                    if ctx.class_name_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
+                    if ctx.class_name_arc_of_id(ovr_cid).as_deref() != Some(REPLACE_OVERRIDE) {
                         continue;
                     }
                     // GC-safety: `getMethodName`/`getMethodReplacerBeanName`/
@@ -3686,7 +3686,7 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
     let name: Option<String> = match ctx.get_field_by_name(recv, "beanClass") {
         Value::Object(Some(o)) => {
             let cid = ctx.class_id_of_object(o);
-            if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/Class") {
+            if ctx.class_name_arc_of_id(cid).as_deref() == Some("java/lang/Class") {
                 // Already resolved — return the mirror unchanged.
                 return BeanClassResolution::Resolved(o);
             }
@@ -4147,7 +4147,7 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     let already_resolved = matches!(
         ctx.get_field_by_name(mbd, "beanClass"),
         Value::Object(Some(o))
-            if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some("java/lang/Class")
+            if ctx.class_name_arc_of_id(ctx.class_id_of_object(o)).as_deref() == Some("java/lang/Class")
     );
 
     // Resolve from the real `beanClass` field (already-resolved mirror, or the
@@ -4426,7 +4426,7 @@ fn abstract_bean_definition_has_bean_class(
     };
     if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "beanClass") {
         let type_cid = ctx.class_id_of_object(o);
-        if ctx.class_name_of_id(type_cid).as_deref() == Some("java/lang/Class") {
+        if ctx.class_name_arc_of_id(type_cid).as_deref() == Some("java/lang/Class") {
             return Ok(Some(Value::Int(1)));
         }
     }

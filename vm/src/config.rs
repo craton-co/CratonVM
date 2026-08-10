@@ -644,16 +644,23 @@ pub enum AotMode {
 /// `skip_verification`, which the verifier dispatcher in `vm/src/vm/vm_util.rs`
 /// reads.
 ///
-/// **`All` is not implemented.** This field is written at CLI parse time and
-/// never read: the dispatcher branches on `skip_verification`, and whether a
-/// boot class is skipped is decided by `verifier_skip_eligible(&Class)`, which
-/// takes no configuration and so cannot observe this mode.
-/// `classloading::bytecode_verifier::verify_bytecode_strict` — documented as the
-/// `-Xverify:all` entry point — has no production caller. `Remote` and `All`
-/// therefore behave identically, which is why the launcher warns when `All` is
-/// requested rather than accepting it silently. Wiring it up would turn strict
-/// typestate verification on for the whole JDK boot image; that is a product
-/// decision with real regression surface, not a mechanical change.
+/// `All` is propagated to `ClassManager::set_strict_verification` at VM init
+/// (`vm_init`, before any class is loaded) and withdraws three shortcuts:
+///
+/// * `bytecode_verifier::class_is_bootstrap_trusted` stops earning the lenient
+///   branch-target path, so the boot image is checked against the spec-literal
+///   JVMS §4.10.1 rule via `verify_bytecode_strict` — which is what that
+///   function was documented as being for, and now actually is;
+/// * `class_manager`'s `defer_loader_sensitive_pass3` stops withholding the
+///   Pass-3 type-state verdict for user-loader classes, i.e. for every
+///   Spring / Tomcat / H2 application class;
+/// * `vm_util::verifier_skip_eligible` stops skipping link-time Pass 2 for
+///   bootstrap classes.
+///
+/// This is genuinely stricter than the default and can reject class files
+/// HotSpot's own `-Xverify:all` also rejects, plus — until the verifier's
+/// remaining gaps close — some it does not. That is the point of the flag, and
+/// it is why `Remote` remains the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum XverifyMode {
     /// Equivalent to `-Xverify:none` / `-noverify`.

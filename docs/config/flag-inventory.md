@@ -982,8 +982,8 @@ applies to `flag_env_mutation_guard.rs`.
 | `CRATONVM_DEBUG_SFI` | DBG | `CRATONVM_DBG=debug-sfi` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DEBUG_STACKWALK` | DBG | `CRATONVM_DBG=debug-stackwalk` | opt-in | off | diag | snapshot | types |
 | `CRATONVM_DEBUG_STACK_TAG` | DBG | `CRATONVM_DBG=debug-stack-tag` | opt-in | off | diag | snapshot | vm |
-| `CRATONVM_DEFAULT_HEAP_ERGONOMICS` | GC | `CRATONVM_GC=default-heap-ergonomics` | opt-in | off | behaviour | snapshot | vm-cli |
-| `CRATONVM_DEFAULT_HEAP_MAX_MB` | GC | `CRATONVM_GC=default-heap-max-mb` | opt-in | off | behaviour | snapshot | vm-cli |
+| `CRATONVM_DEFAULT_HEAP_ERGONOMICS` | GC | `CRATONVM_GC=default-heap-ergonomics` | opt-in | off | behaviour | snapshot | vm |
+| `CRATONVM_DEFAULT_HEAP_MAX_MB` | GC | `CRATONVM_GC=default-heap-max-mb` | opt-in | off | behaviour | snapshot | vm |
 | `CRATONVM_DEFAULT_WATCHDOG_SEC` | THREADS | `CRATONVM_THREADS=default-watchdog-sec` | opt-in | off | behaviour | snapshot | vm-cli |
 | `CRATONVM_DEOPT_EAGER` | DBG | `CRATONVM_DBG=deopt-eager` | opt-in | off | diag | snapshot | difftest, jit |
 | `CRATONVM_DEOPT_EAGER_BCI` | DBG | `CRATONVM_DBG=deopt-eager-bci` | opt-in | off | diag | snapshot | jit |

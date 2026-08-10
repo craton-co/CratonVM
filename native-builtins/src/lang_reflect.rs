@@ -1426,7 +1426,7 @@ pub(crate) fn is_subclass_or_unreadable(
                 // hierarchy that never met `ancestor` — deny. A chain that ended
                 // anywhere else ended somewhere unreadable — allow.
                 return !matches!(
-                    ctx.class_name_of_id(cursor).as_deref(),
+                    ctx.class_name_arc_of_id(cursor).as_deref(),
                     Some("java/lang/Object")
                 );
             }

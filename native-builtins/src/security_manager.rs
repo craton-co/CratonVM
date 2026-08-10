@@ -1818,7 +1818,7 @@ mod tests {
         // Initially null
         assert!(get_security_manager(&ctx).is_none());
 
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
 
         // Set the SM
         set_security_manager(&mut ctx, Some(sm_obj));
@@ -1835,7 +1835,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -1862,8 +1862,8 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -1886,7 +1886,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let file_str = ctx.create_string("/etc/passwd");
 
         let result = call_native(
@@ -1909,7 +1909,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let host = ctx.create_string("example.com");
 
         let result = call_native(
@@ -1936,7 +1936,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -1956,7 +1956,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -2000,7 +2000,7 @@ mod tests {
         assert_eq!(result.unwrap(), Some(Value::Object(None)));
 
         // Set a SecurityManager
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let set_sm = registry
             .find(
                 "java/lang/System",
@@ -2038,7 +2038,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let action = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedAction", 0)?;
+        let action = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedAction", 0).unwrap();
 
         // Pre-arm the mock to return a value from invoke_virtual (action.run())
         unsafe {
@@ -2069,7 +2069,7 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
         let action =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedExceptionAction", 0)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedExceptionAction", 0).unwrap();
 
         // Pre-arm: return Int(42) from action.run()
         unsafe {
@@ -2105,8 +2105,8 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let action = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedAction", 0)?;
-        let acc = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1)?;
+        let action = try_alloc_concurrent_synthetic(&mut ctx, "java/security/PrivilegedAction", 0).unwrap();
+        let acc = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1).unwrap();
 
         // Pre-arm
         unsafe {
@@ -2159,8 +2159,8 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let acc = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1)?;
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0)?;
+        let acc = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AccessControlContext", 1).unwrap();
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -2182,7 +2182,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -2204,7 +2204,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let file_str = ctx.create_string("/tmp/test.txt");
 
         // checkWrite
@@ -2239,7 +2239,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let cmd = ctx.create_string("/usr/bin/ls");
 
         let result = call_native(
@@ -2262,7 +2262,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         let prop = ctx.create_string("java.home");
 
         let result = call_native(
@@ -2283,9 +2283,9 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
-        let thread = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 0)?;
-        let group = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ThreadGroup", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
+        let thread = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Thread", 0).unwrap();
+        let group = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/ThreadGroup", 0).unwrap();
 
         // checkAccess(Thread)
         let result = call_native(
@@ -2389,9 +2389,9 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         // Ask for a Socket permission — not granted.
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2)?;
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2).unwrap();
         let host = ctx.create_string("example.com:443");
         ctx.set_field(perm, 0, Value::Object(Some(host)));
         let actions = ctx.create_string("connect");
@@ -2425,8 +2425,8 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/io/FilePermission", 2)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/io/FilePermission", 2).unwrap();
         let target = ctx.create_string("/tmp/foo.txt");
         ctx.set_field(perm, 0, Value::Object(Some(target)));
         let actions = ctx.create_string("read");
@@ -2456,8 +2456,8 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2)?;
+        let sm_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2).unwrap();
         let host = ctx.create_string("example.com:80");
         ctx.set_field(perm, 0, Value::Object(Some(host)));
         let actions = ctx.create_string("connect");
@@ -2486,7 +2486,7 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
         // Class name: com/acme/PrivilegedBlob
-        let action = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/PrivilegedBlob", 0)?;
+        let action = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/PrivilegedBlob", 0).unwrap();
 
         // While action.run() executes, the stack depth should be 1 and the
         // top frame should reflect com/acme/PrivilegedBlob.
@@ -2577,7 +2577,7 @@ mod tests {
         );
 
         // Now B (under com/acme) calls doPrivileged with its own action class.
-        let b_action = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/Helper$1", 0)?;
+        let b_action = try_alloc_concurrent_synthetic(&mut ctx, "com/acme/Helper$1", 0).unwrap();
 
         // Inside the doPrivileged invocation, our wrapper must push B's code
         // base — overriding the caller's. We verify this by intercepting
@@ -3175,7 +3175,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 0)?;
+        let class_mirror = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Class", 0).unwrap();
 
         let result = call_native(
             &registry,
@@ -3244,7 +3244,7 @@ mod tests {
         assert_eq!(result.unwrap(), None, "void method must return None");
 
         // Live-object case.
-        let obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0)?;
+        let obj = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 0).unwrap();
         let result = call_native(
             &registry,
             &mut ctx,
@@ -3277,7 +3277,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1)?;
+        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1).unwrap();
 
         // setPolicy(p)
         let set_p = registry
@@ -3315,7 +3315,7 @@ mod tests {
 
         let mut ctx = MockNativeContext::new();
         // First install a real Policy so we can verify null clears it.
-        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1)?;
+        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1).unwrap();
         let set_p = registry
             .find(
                 "java/security/Policy",
@@ -3388,7 +3388,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1)?;
+        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1).unwrap();
         let set_p = registry
             .find(
                 "java/security/Policy",
@@ -3436,7 +3436,7 @@ mod tests {
         assert_eq!(r, Some(Value::Int(0)));
 
         // After install: true.
-        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1)?;
+        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1).unwrap();
         let set_p = registry
             .find(
                 "java/security/Policy",
@@ -3464,8 +3464,8 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4)?;
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0)?;
+        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4).unwrap();
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/security/AllPermission", 0).unwrap();
 
         let implies = registry
             .find(
@@ -3511,10 +3511,10 @@ mod tests {
             .expect("implies should be registered");
 
         let mut ctx = MockNativeContext::new();
-        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4)?;
+        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4).unwrap();
 
         // Not granted: a SocketPermission must be DENIED (implies -> 0).
-        let denied = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2)?;
+        let denied = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2).unwrap();
         let host = ctx.create_string("example.com:443");
         ctx.set_field(denied, 0, Value::Object(Some(host)));
         let act = ctx.create_string("connect");
@@ -3527,7 +3527,7 @@ mod tests {
         assert_eq!(r, Some(Value::Int(0)), "ungranted permission must imply 0");
 
         // Granted: a FilePermission read on /tmp/* must be ALLOWED (-> 1).
-        let granted = try_alloc_concurrent_synthetic(&mut ctx, "java/io/FilePermission", 2)?;
+        let granted = try_alloc_concurrent_synthetic(&mut ctx, "java/io/FilePermission", 2).unwrap();
         let path = ctx.create_string("/tmp/foo.txt");
         ctx.set_field(granted, 0, Value::Object(Some(path)));
         let act2 = ctx.create_string("read");
@@ -3560,8 +3560,8 @@ mod tests {
             .unwrap();
 
         let mut ctx = MockNativeContext::new();
-        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4)?;
-        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2)?;
+        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4).unwrap();
+        let perm = try_alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2).unwrap();
         let r = implies(
             &mut ctx,
             &[Value::Object(Some(pd)), Value::Object(Some(perm))],
@@ -3602,7 +3602,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4)?;
+        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4).unwrap();
 
         let get_perms = registry
             .find(
@@ -3643,7 +3643,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let cs = try_alloc_concurrent_synthetic(&mut ctx, "java/security/CodeSource", 2)?;
+        let cs = try_alloc_concurrent_synthetic(&mut ctx, "java/security/CodeSource", 2).unwrap();
 
         let get_perms = registry
             .find(
@@ -3673,7 +3673,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4)?;
+        let pd = try_alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4).unwrap();
 
         let get_perms = registry
             .find(
@@ -3705,7 +3705,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1)?;
+        let policy_obj = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1).unwrap();
 
         let set_p = registry
             .find(
@@ -3739,7 +3739,7 @@ mod tests {
         register_security_manager_natives(&mut registry);
 
         let mut ctx = MockNativeContext::new();
-        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
 
         let set_sm = registry
             .find(
@@ -3780,8 +3780,8 @@ mod tests {
     fn two_vms_hold_independent_security_managers() {
         let mut a = vm_scoped_ctx(VM_A);
         let mut b = vm_scoped_ctx(VM_B);
-        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0)?;
-        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0)?;
+        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0).unwrap();
+        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0).unwrap();
 
         // Installing in A must not be visible in B, and vice versa. Before the
         // per-VM keying this read handed B the raw `sm_a` address — a pointer
@@ -3805,8 +3805,8 @@ mod tests {
     fn clearing_one_vms_security_manager_leaves_the_other_armed() {
         let mut a = vm_scoped_ctx(VM_A + 0x10);
         let mut b = vm_scoped_ctx(VM_B + 0x10);
-        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0)?;
-        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0)?;
+        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0).unwrap();
+        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0).unwrap();
         set_security_manager(&mut a, Some(sm_a));
         set_security_manager(&mut b, Some(sm_b));
 
@@ -3831,7 +3831,7 @@ mod tests {
         let mut a = vm_scoped_ctx(VM_A + 0x20);
         let mut b = vm_scoped_ctx(VM_B + 0x20);
 
-        let policy_a = try_alloc_concurrent_synthetic(&mut a, "java/security/Policy", 1)?;
+        let policy_a = try_alloc_concurrent_synthetic(&mut a, "java/security/Policy", 1).unwrap();
         set_policy_object(&mut a, Some(policy_a));
         assert_eq!(get_policy_object(&a), Some(policy_a));
         assert_eq!(get_policy_object(&b), None);
@@ -3840,18 +3840,18 @@ mod tests {
 
         // The lazy default and the shared Permissions collection are per-VM
         // too: each VM gets its own, allocated from its own heap.
-        let default_b = ensure_default_policy_object(&mut b);
+        let default_b = ensure_default_policy_object(&mut b).unwrap();
         assert_eq!(get_policy_object(&a), Some(policy_a));
         assert_eq!(get_policy_object(&b), Some(default_b));
 
-        let perms_a = ensure_shared_permission_collection(&mut a);
-        let perms_b = ensure_shared_permission_collection(&mut b);
+        let perms_a = ensure_shared_permission_collection(&mut a).unwrap();
+        let perms_b = ensure_shared_permission_collection(&mut b).unwrap();
         assert_eq!(
-            ensure_shared_permission_collection(&mut a),
+            ensure_shared_permission_collection(&mut a).unwrap(),
             perms_a,
             "identity of the shared collection must be stable within a VM"
         );
-        assert_eq!(ensure_shared_permission_collection(&mut b), perms_b);
+        assert_eq!(ensure_shared_permission_collection(&mut b).unwrap(), perms_b);
 
         forget_vm_security_state(VM_A + 0x20);
         forget_vm_security_state(VM_B + 0x20);
@@ -3864,9 +3864,9 @@ mod tests {
         let mut a = vm_scoped_ctx(vm_a);
         let mut b = vm_scoped_ctx(vm_b);
 
-        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0)?;
-        let policy_a = try_alloc_concurrent_synthetic(&mut a, "java/security/Policy", 1)?;
-        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0)?;
+        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0).unwrap();
+        let policy_a = try_alloc_concurrent_synthetic(&mut a, "java/security/Policy", 1).unwrap();
+        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0).unwrap();
         set_security_manager(&mut a, Some(sm_a));
         set_policy_object(&mut a, Some(policy_a));
         set_security_manager(&mut b, Some(sm_b));
@@ -3885,7 +3885,8 @@ mod tests {
         // Remap: stand in for a moving collection that relocated `sm_a` onto a
         // second, genuinely-allocated object's address. An empty map is a
         // no-op (the non-moving sweep).
-        let relocated = alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0);
+        let relocated =
+            try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0).unwrap();
         gc_update_security_manager_refs(vm_a, &cratonvm_types::PointerMap::default());
         assert_eq!(get_security_manager(&a), Some(sm_a));
 
@@ -3918,9 +3919,9 @@ mod tests {
         let vm_b = VM_B + 0x40;
         let mut a = vm_scoped_ctx(vm_a);
         let mut b = vm_scoped_ctx(vm_b);
-        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0)?;
-        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0)?;
-        let perms_b = ensure_shared_permission_collection(&mut b);
+        let sm_a = try_alloc_concurrent_synthetic(&mut a, "java/lang/SecurityManager", 0).unwrap();
+        let sm_b = try_alloc_concurrent_synthetic(&mut b, "java/lang/SecurityManager", 0).unwrap();
+        let perms_b = ensure_shared_permission_collection(&mut b).unwrap();
         set_security_manager(&mut a, Some(sm_a));
         set_security_manager(&mut b, Some(sm_b));
 
@@ -3938,7 +3939,7 @@ mod tests {
         );
 
         assert_eq!(get_security_manager(&b), Some(sm_b));
-        assert_eq!(ensure_shared_permission_collection(&mut b), perms_b);
+        assert_eq!(ensure_shared_permission_collection(&mut b).unwrap(), perms_b);
         let mut roots_b = Vec::new();
         gc_scan_security_manager_roots(vm_b, &mut roots_b);
         assert!(roots_b.contains(&sm_b));
@@ -3956,31 +3957,31 @@ mod tests {
         let mut ctx = vm_scoped_ctx(vm);
 
         assert!(get_security_manager(&ctx).is_none());
-        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0)?;
+        let sm = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/SecurityManager", 0).unwrap();
         set_security_manager(&mut ctx, Some(sm));
         assert_eq!(get_security_manager(&ctx), Some(sm));
         set_security_manager(&mut ctx, None);
         assert!(get_security_manager(&ctx).is_none());
 
         assert!(!policy_object_installed(&ctx));
-        let default_policy = ensure_default_policy_object(&mut ctx);
+        let default_policy = ensure_default_policy_object(&mut ctx).unwrap();
         assert_eq!(
-            ensure_default_policy_object(&mut ctx),
+            ensure_default_policy_object(&mut ctx).unwrap(),
             default_policy,
             "the lazy default must be allocated exactly once per VM"
         );
         assert!(policy_object_installed(&ctx));
         assert_eq!(get_policy_object(&ctx), Some(default_policy));
 
-        let installed = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1)?;
+        let installed = try_alloc_concurrent_synthetic(&mut ctx, "java/security/Policy", 1).unwrap();
         set_policy_object(&mut ctx, Some(installed));
         assert_eq!(get_policy_object(&ctx), Some(installed));
         set_policy_object(&mut ctx, None);
         assert_eq!(get_policy_object(&ctx), None);
         assert!(!policy_object_installed(&ctx));
 
-        let perms = ensure_shared_permission_collection(&mut ctx)?;
-        assert_eq!(ensure_shared_permission_collection(&mut ctx), perms);
+        let perms = ensure_shared_permission_collection(&mut ctx).unwrap();
+        assert_eq!(ensure_shared_permission_collection(&mut ctx).unwrap(), perms);
 
         forget_vm_security_state(vm);
     }

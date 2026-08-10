@@ -2404,6 +2404,57 @@ mod tests {
         assert!(verify_bytecode_strict(&class, &MockHierarchy).is_err());
     }
 
+    /// `-Xverify:all` reaches the boot image.
+    ///
+    /// `verify_bytecode_strict` was documented as this flag's entry point and
+    /// had no production caller: `XverifyMode::All` was parsed, stored, and
+    /// read by nothing, so `all` and `remote` behaved identically and the
+    /// launcher warned about it. The flag now arrives as
+    /// `ClassManager::strict_verification` and is threaded to
+    /// `verify_class_bytecode_with_strictness`.
+    ///
+    /// The class here is bootstrap-trusted — the exact population `all` exists
+    /// to subject to the spec-literal check, and the one `verify_bytecode`
+    /// deliberately verifies leniently. Its `goto` targets offset 6, which
+    /// declares no StackMapTable frame (JVMS §4.10.1 requires one at every
+    /// branch target for a Java 7+ class), so the two policies must disagree
+    /// about it. If they ever agree, the flag is inert again.
+    #[test]
+    fn xverify_all_makes_a_trusted_class_reject_what_remote_accepts() {
+        let mut class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        );
+        // Bootstrap loader AND a trusted package prefix — both halves are
+        // required by `class_is_bootstrap_trusted`, and the name alone earns
+        // nothing (SECURITY FIX V4).
+        class.loader_id = ClassLoaderId::Bootstrap;
+        class.name = Arc::from("java/lang/TrustedFixture");
+        assert!(
+            class_is_bootstrap_trusted(&class),
+            "fixture must be the trusted population, or this test proves nothing"
+        );
+
+        let remote =
+            crate::verifier::verify_class_bytecode_with_strictness(&class, &MockHierarchy, false);
+        assert!(
+            remote.is_ok(),
+            "-Xverify:remote must keep the lenient boot-image path, got {remote:?}"
+        );
+
+        let all =
+            crate::verifier::verify_class_bytecode_with_strictness(&class, &MockHierarchy, true);
+        assert!(
+            all.is_err(),
+            "-Xverify:all must apply the spec-literal branch-target rule to a \
+             trusted class too — that is the whole of what the flag buys"
+        );
+    }
+
     // =======================================================================
     // cl-verifier — forward-edge type-state merge at the BRANCH SITE.
     //

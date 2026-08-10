@@ -3543,7 +3543,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(1)));
         }
         if ctx
-            .class_name_of_id(ctx.class_id_of_object(other))
+            .class_name_arc_of_id(ctx.class_id_of_object(other))
             .as_deref()
             != Some("java/lang/reflect/Method")
         {

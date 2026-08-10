@@ -1441,7 +1441,7 @@ impl PeClassMemo {
         if raw == self.miss.load(relaxed) {
             return false;
         }
-        let matched = ctx.class_name_of_id(class_id).as_deref() == Some(expected);
+        let matched = ctx.class_name_arc_of_id(class_id).as_deref() == Some(expected);
         if matched {
             self.hit.store(raw, relaxed);
         } else {
@@ -2065,7 +2065,7 @@ pub(crate) fn downcall_option_captures_call_state(
     option: ObjectRef,
 ) -> bool {
     matches!(
-        ctx.class_name_of_id(ctx.class_id_of_object(option))
+        ctx.class_name_arc_of_id(ctx.class_id_of_object(option))
             .as_deref(),
         Some("jdk/internal/foreign/abi/LinkerOptions$CaptureCallState")
     )
@@ -4508,7 +4508,7 @@ mod tests {
 
     /// Helper: create an arena object of the given kind using the actual registration logic.
     fn make_arena(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-        let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4)?;
+        let a = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 4).unwrap();
         let ids = ctx.new_array(cratonvm_types::ArrayElementType::Long, 256);
         ctx.set_field(a, 0, Value::Int(kind));
         ctx.set_field(a, 1, Value::Object(Some(ids)));
@@ -4619,7 +4619,7 @@ mod tests {
 
     /// Helper: create a ValueLayout object
     fn make_layout(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-        pe_make_layout(ctx, kind)
+        pe_make_layout(ctx, kind).unwrap()
     }
 
     #[test]
@@ -4667,7 +4667,7 @@ mod tests {
         let layout_int = make_layout(&mut ctx, LAYOUT_INT);
 
         // Create a segment with null pointer
-        let seg = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6)?;
+        let seg = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
         ctx.set_field(seg, 0, Value::Long(0)); // null ptr
         ctx.set_field(seg, 1, Value::Long(100));
         ctx.set_field(seg, 5, Value::Long(0));
@@ -4870,7 +4870,7 @@ mod tests {
         pe_segment_set_impl(&mut ctx, seg, layout_int, 16, Value::Int(0xCAFE)).unwrap();
 
         // Create a slice starting at offset 16, size 32
-        let slice = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6)?;
+        let slice = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
         let base_ptr = match ctx.get_field(seg, 0) {
             Value::Long(n) => n,
             _ => 0,
@@ -4916,7 +4916,7 @@ mod tests {
 
         // Reinterpret with new size 128
         let reinterpreted =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
         ctx.set_field(reinterpreted, 0, Value::Long(orig_ptr));
         ctx.set_field(reinterpreted, 1, Value::Long(128));
         ctx.set_field(reinterpreted, 2, ctx.get_field(seg, 2));
@@ -4970,12 +4970,12 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
         // Build DowncallHandle
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
         ctx.set_field(handle, 0, Value::Long(strlen_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
@@ -5015,11 +5015,11 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
@@ -5065,12 +5065,12 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
         // Build a DowncallHandle with 4 fields (the new cache layout).
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4).unwrap();
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -5133,7 +5133,7 @@ mod tests {
         // Simpler smoke test: if we don't actually call, field 3 stays 0.
         // Only the invoke path populates the cache slot.
         let mut ctx = mock_ctx();
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 4).unwrap();
         ctx.set_field(handle, 3, Value::Long(0));
         match ctx.get_field(handle, 3) {
             Value::Long(0) => {}
@@ -5233,11 +5233,11 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(None)); // void
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 2).unwrap();
         ctx.set_field(handle, 0, Value::Long(abs_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
 
@@ -5265,7 +5265,7 @@ mod tests {
         let mut ctx = mock_ctx();
 
         // Create a "MethodHandle" target object
-        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)?;
+        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
 
         let entry = ffi::UpcallEntry {
             target,
@@ -5301,7 +5301,7 @@ mod tests {
             let mut ctx = mock_ctx();
 
             // Create target, descriptor
-            let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)?;
+            let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
 
             let ret_layout = make_layout(&mut ctx, LAYOUT_INT);
             let param_layout = make_layout(&mut ctx, LAYOUT_INT);
@@ -5309,11 +5309,11 @@ mod tests {
             ctx.set_array_element(params_arr, 0, Value::Object(Some(param_layout)));
 
             let descriptor =
-                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+                try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
             ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
             ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-            let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1)?;
+            let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1).unwrap();
             let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
             // Register upcall handle
@@ -5353,7 +5353,7 @@ mod tests {
 
             // Create an UpcallStub handle object for pe_upcall_invoke
             // (uses the VM upcall slot 0, not the trampoline address)
-            let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2)?;
+            let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2).unwrap();
             ctx.set_field(stub, 0, Value::Long(0)); // slot 0 in the VM's upcall table
 
             // Create args array
@@ -5375,7 +5375,7 @@ mod tests {
         // Invoking an upcall with an invalid slot should return an error
         let mut ctx = mock_ctx();
 
-        let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2)?;
+        let stub = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/UpcallStub", 2).unwrap();
         ctx.set_field(stub, 0, Value::Long(999)); // non-existent slot
 
         let result = pe_upcall_invoke(&mut ctx, &[Value::Object(Some(stub))]);
@@ -5431,11 +5431,11 @@ mod tests {
             ctx.set_array_element(params_arr, i, Value::Object(Some(p)));
         }
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
         ctx.set_field(handle, 0, Value::Long(fn_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -5479,11 +5479,11 @@ mod tests {
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_flt)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
         ctx.set_field(handle, 0, Value::Long(fn_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         ctx.set_field(handle, 2, Value::Long(-1));
@@ -5549,11 +5549,11 @@ mod tests {
         ctx.set_array_element(params_arr, 3, Value::Object(Some(p_var)));
 
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3)?;
+        let handle = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/DowncallHandle", 3).unwrap();
         ctx.set_field(handle, 0, Value::Long(snprintf_addr));
         ctx.set_field(handle, 1, Value::Object(Some(descriptor)));
         // First 3 args fixed; everything from index 3 is variadic.
@@ -5600,12 +5600,12 @@ mod tests {
         ctx.set_array_element(params_arr, 0, Value::Object(Some(p1)));
         ctx.set_array_element(params_arr, 1, Value::Object(Some(p2)));
         let descriptor =
-            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2)?;
+            try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/FunctionDescriptor", 2).unwrap();
         ctx.set_field(descriptor, 0, Value::Object(Some(ret_layout)));
         ctx.set_field(descriptor, 1, Value::Object(Some(params_arr)));
 
-        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2)?;
-        let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1)?;
+        let target = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/invoke/MethodHandle", 2).unwrap();
+        let linker = try_alloc_concurrent_synthetic(&mut ctx, "java/lang/foreign/Linker", 1).unwrap();
         let arena = make_arena(&mut ctx, ffi::ARENA_CONFINED);
 
         // Pre-arm the mock NativeContext to return Int(123) from invoke_virtual.
@@ -5770,7 +5770,7 @@ mod tests {
     /// in-bounds accesses are sound while out-of-bounds accesses are caught by
     /// the bounds checks before any dereference.
     fn make_segment(ctx: &mut dyn NativeContext, ptr: i64, size: i64, base_off: i64) -> ObjectRef {
-        let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6)?;
+        let seg = try_alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6).unwrap();
         ctx.set_field(seg, 0, Value::Long(ptr));
         ctx.set_field(seg, 1, Value::Long(size));
         ctx.set_field(seg, 2, Value::Object(None));
@@ -5781,7 +5781,7 @@ mod tests {
     }
 
     fn make_layout_kind(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
-        pe_make_layout(ctx, kind)
+        pe_make_layout(ctx, kind).unwrap()
     }
 
     #[test]

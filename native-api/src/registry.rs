@@ -508,7 +508,35 @@ pub trait NativeClassAccess {
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
     /// Get the class name for a ClassId.
+    ///
+    /// Allocates. Prefer [`Self::class_name_arc_of_id`] unless an owned
+    /// `String` is genuinely what the caller needs.
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String>;
+
+    /// The class name for a `ClassId`, **without allocating**.
+    ///
+    /// The VM stores a class's name as an `Arc<str>` and
+    /// [`Self::class_name_of_id`] copies it into a fresh `String` on every
+    /// call. That copy is pure waste at the overwhelmingly common shape —
+    /// `ctx.class_name_arc_of_id(cid).as_deref() == Some("java/util/HashMap")`
+    /// — where the name is compared and dropped. This hands back a clone of the
+    /// `Arc` instead: one refcount increment, no allocation, no copy. And
+    /// `Option<Arc<str>>::as_deref()` yields exactly the `Option<&str>` the old
+    /// shape did, so converting a call site is a drop-in the compiler checks.
+    ///
+    /// `native-collections` measured what the `String` costs: its receiver
+    /// classification paid 5-6 of these per `HashMap.put`, which is part of the
+    /// 21.2x row against JDK 25 C2 that its `RECEIVER_FACTS` / `RECEIVER_NAMES`
+    /// memos exist to remove. Those memos also remove the `class_manager` read
+    /// lock, which this does NOT — a caller on a path hot enough to care about
+    /// the lock still wants a memo, and this is not a substitute for one.
+    ///
+    /// Default-implemented in terms of `class_name_of_id` so every existing
+    /// `NativeContext` (six test mocks among them) keeps compiling unchanged;
+    /// the VM overrides it with an `Arc::clone`.
+    fn class_name_arc_of_id(&self, class_id: ClassId) -> Option<Arc<str>> {
+        self.class_name_of_id(class_id).map(Arc::from)
+    }
 
     /// Get the class id of a heap object.
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;

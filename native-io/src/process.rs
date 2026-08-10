@@ -1385,7 +1385,7 @@ fn handle_of(ctx: &mut dyn NativeContext, proc_ref: ObjectRef) -> i64 {
 /// and `probes/UserProcessInterceptProbe.java`.
 fn is_vm_process(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
-    ctx.class_name_of_id(cid).as_deref() == Some(SYNTHETIC_PROCESS_CLASS)
+    ctx.class_name_arc_of_id(cid).as_deref() == Some(SYNTHETIC_PROCESS_CLASS)
 }
 
 /// `java.lang.Process.exitValue()` on `this`, as the JDK's own concrete methods

@@ -51,7 +51,7 @@ fn object_array_element_hash_code(
         return Ok(ctx.identity_hash_code(obj));
     }
 
-    match ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() {
+    match ctx.class_name_arc_of_id(ctx.class_id_of_object(obj)).as_deref() {
         Some("java/lang/String") => {
             match native_string_hash_code(ctx, &[Value::Object(Some(obj))])? {
                 Some(Value::Int(v)) => Ok(v),
@@ -5513,7 +5513,7 @@ fn es_get_backing(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Object
 
 fn es_real_kind(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<&'static str> {
     match ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
+        .class_name_arc_of_id(ctx.class_id_of_object(this))
         .as_deref()
     {
         Some("java/util/RegularEnumSet") => Some("regular"),
@@ -8897,7 +8897,7 @@ fn fjt_is_unchecked_throwable(ctx: &mut dyn NativeContext, ex: ObjectRef) -> boo
     let mut cur = Some(ctx.class_id_of_object(ex));
     for _ in 0..64 {
         let Some(cid) = cur else { return false };
-        match ctx.class_name_of_id(cid).as_deref() {
+        match ctx.class_name_arc_of_id(cid).as_deref() {
             Some("java/lang/RuntimeException") | Some("java/lang/Error") => return true,
             Some("java/lang/Exception") | Some("java/lang/Throwable") | Some("java/lang/Object") => {
                 return false
@@ -12444,7 +12444,7 @@ fn p52_isa_addr_ip(ctx: &mut dyn NativeContext, addr: ObjectRef) -> String {
 fn p52_is_isa_holder(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let class_id = ctx.class_id_of_object(obj);
     matches!(
-        ctx.class_name_of_id(class_id).as_deref(),
+        ctx.class_name_arc_of_id(class_id).as_deref(),
         Some("java/net/InetSocketAddress$InetSocketAddressHolder")
     )
 }
@@ -22961,7 +22961,7 @@ mod t2_tests {
         input: &str,
         delims: &str,
     ) -> cratonvm_types::ObjectRef {
-        let st = crate::try_alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3)?;
+        let st = crate::try_alloc_concurrent_synthetic(ctx, "java/util/StringTokenizer", 3).unwrap();
         let input_s = ctx.create_string(input);
         let delim_s = ctx.create_string(delims);
         ctx.set_field(st, ST_FIELD_INPUT, Value::Object(Some(input_s)));
@@ -23589,7 +23589,7 @@ mod t2_tests {
     // -----------------------------------------------------------------------
 
     fn make_arraylist(ctx: &mut dyn NativeContext, values: &[Value]) -> cratonvm_types::ObjectRef {
-        let list = crate::try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
+        let list = crate::try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2).unwrap();
         let data = make_ref_array(ctx, values);
         ctx.set_field(list, 0, Value::Object(Some(data)));
         ctx.set_field(list, 1, Value::Int(values.len() as i32));
@@ -23719,7 +23719,7 @@ mod t2_tests {
         data: &[i32],
     ) -> cratonvm_types::ObjectRef {
         let arr = make_int_array(ctx, data);
-        let spl = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2)?;
+        let spl = crate::try_alloc_concurrent_synthetic(ctx, "java/util/Spliterator$OfInt", 2).unwrap();
         ctx.set_field(spl, SPL_FIELD_DATA, Value::Object(Some(arr)));
         ctx.set_field(spl, SPL_FIELD_CURSOR, Value::Int(0));
         spl
@@ -23771,7 +23771,7 @@ mod t2_tests {
 
     /// Allocate a default BitSet via the real init native.
     fn make_bitset(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
-        let bs = crate::try_alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2)?;
+        let bs = crate::try_alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2).unwrap();
         native_bs_init(ctx, &[Value::Object(Some(bs))]).unwrap();
         bs
     }

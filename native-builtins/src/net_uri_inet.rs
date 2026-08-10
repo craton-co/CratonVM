@@ -1800,7 +1800,7 @@ mod new2_net_tests {
     /// Helper: allocate a minimal `InetAddress` synthetic carrying a
     /// hostname / address pair. Mirrors what the real natives produce.
     fn alloc_inet(ctx: &mut MockNativeContext, host: &str, addr: &str) -> ObjectRef {
-        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2)?;
+        let ia = try_alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2).unwrap();
         let h = ctx.create_string(host);
         let a = ctx.create_string(addr);
         ctx.set_field(ia, 0, Value::Object(Some(h)));
