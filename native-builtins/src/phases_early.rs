@@ -20425,13 +20425,21 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
                 let p = ctx.create_string(path_and_rest);
                 Value::Object(Some(p))
             };
-            ctx.set_field(obj, 0, scheme);
-            ctx.set_field(obj, 1, host);
-            ctx.set_field(obj, 2, port);
-            ctx.set_field(obj, 3, path_val);
-            ctx.set_field(obj, 4, Value::Object(None));
-            ctx.set_field(obj, 5, Value::Object(None));
-            ctx.set_field(obj, 6, Value::Object(Some(raw_str)));
+            // JDK-ONLY-LAYOUT: raw slots only on OUR layout. On a real
+            // `java.net.URI` slots 1..6 are `fragment, authority, userInfo,
+            // host, port, path`, so this block wrote the host into the
+            // fragment, the port into the authority and the raw text into the
+            // path — six writes, five of them the wrong field.
+            if crate::net_phase_e::uri_has_synthetic_layout(ctx, obj) {
+                ctx.set_field(obj, 0, scheme);
+                ctx.set_field(obj, 1, host);
+                ctx.set_field(obj, 2, port);
+                ctx.set_field(obj, 3, path_val);
+                ctx.set_field(obj, 4, Value::Object(None));
+                ctx.set_field(obj, 5, Value::Object(None));
+                ctx.set_field(obj, 6, Value::Object(Some(raw_str)));
+            }
+            crate::net_phase_e::uri_publish_named(ctx, obj, &raw, None);
             Ok(Some(Value::Object(Some(obj))))
         },
     );

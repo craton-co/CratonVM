@@ -3104,7 +3104,39 @@ fn uri_recompose(
 /// break `getPath()`/`new File(URI)`.
 fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodCallFailed> {
     let uri_obj = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 18)?;
+    uri_publish_named(ctx, uri_obj, raw, None);
+    Ok(uri_obj)
+}
+
+/// Write a URI's components into `uri_obj` under the names the real
+/// `java.net.URI` declares.
+///
+/// JDK-ONLY-LAYOUT. Eleven sites in four files allocate a `java/net/URI` and
+/// then stamp its components in by RAW SLOT INDEX, under three mutually
+/// inconsistent fabricated models (`raw@0 scheme@1 path@4`, `raw@0 raw@4`, and
+/// the `scheme@0 host@1 port@2 path@3 query@4` block that `http2.rs` and
+/// `servlet.rs` used to read). In real-JDK mode every one of those objects is a
+/// genuine `java.net.URI` whose slots are `scheme, fragment, authority,
+/// userInfo, host, port, path, query`, so each write landed on a different
+/// field than it named. It went unnoticed because the accessors read the SAME
+/// wrong slots back: writer and reader agreed, and the object was wrong only
+/// from real bytecode's point of view — which is precisely what
+/// `URI.getAuthority()` is.
+///
+/// `path_override` is for the callers that know a better path than the generic
+/// split produces (a `jar:` inner entry, a Windows drive-letter path).
+///
+/// This function writes ONLY by name. Its callers keep their raw-slot writes
+/// for a receiver that genuinely has a fabricated layout, asked by NAME through
+/// [`uri_has_synthetic_layout`].
+pub(crate) fn uri_publish_named(
+    ctx: &mut dyn NativeContext,
+    uri_obj: ObjectRef,
+    raw: &str,
+    path_override: Option<&str>,
+) {
     let (scheme, authority, path, query, fragment) = uri_split(raw);
+    let path = path_override.map_or(path, str::to_string);
     let ssp = {
         let mut s = String::new();
         if let Some(a) = &authority {
@@ -3145,7 +3177,23 @@ fn make_uri(ctx: &mut dyn NativeContext, raw: &str) -> Result<ObjectRef, MethodC
         "decodedSchemeSpecificPart",
         Value::Object(Some(dssp)),
     );
-    Ok(uri_obj)
+    // `host`, `userInfo` and `port` come out of the authority, and a real
+    // `java.net.URI` declares all three. Writing them keeps a receiver that
+    // real bytecode reads directly consistent with what the accessors answer.
+    if let Some(a) = authority.as_deref().filter(|a| !a.is_empty()) {
+        let (user_info, host, port) = uri_parse_authority(a);
+        if let Some(h) = host {
+            let s = ctx.create_string(&h);
+            ctx.set_field_by_name(uri_obj, "host", Value::Object(Some(s)));
+        }
+        if let Some(u) = user_info {
+            let s = ctx.create_string(&u);
+            ctx.set_field_by_name(uri_obj, "userInfo", Value::Object(Some(s)));
+        }
+        ctx.set_field_by_name(uri_obj, "port", Value::Int(port));
+    } else {
+        ctx.set_field_by_name(uri_obj, "port", Value::Int(-1));
+    }
 }
 
 fn register_uri_natives(r: &mut NativeMethodRegistry) {
@@ -7654,20 +7702,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         // Layout per http2.rs:
         //   scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
-        let raw_s = ctx.create_string(&url_str);
-        ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
-                                                           // Parse scheme.
-        if let Some(colon) = url_str.find(':') {
-            let scheme = &url_str[..colon];
-            let scheme_s = ctx.create_string(scheme);
-            ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
-            // For file: URIs, the path is everything after "file:".
-            if scheme == "file" {
-                let path = &url_str[colon + 1..];
-                let path_s = ctx.create_string(path);
-                ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+        // JDK-ONLY-LAYOUT: raw slots only on OUR layout. On a real
+        // `java.net.URI` slot 6 is `path` and slot 3 is `userInfo`, so the full
+        // text went into the path and the path into the user information.
+        if uri_has_synthetic_layout(ctx, uri) {
+            let raw_s = ctx.create_string(&url_str);
+            ctx.set_field(uri, 6, Value::Object(Some(raw_s))); // raw
+            if let Some(colon) = url_str.find(':') {
+                let scheme = &url_str[..colon];
+                let scheme_s = ctx.create_string(scheme);
+                ctx.set_field(uri, 0, Value::Object(Some(scheme_s)));
+                // For file: URIs, the path is everything after "file:".
+                if scheme == "file" {
+                    let path = &url_str[colon + 1..];
+                    let path_s = ctx.create_string(path);
+                    ctx.set_field(uri, 3, Value::Object(Some(path_s)));
+                }
             }
         }
+        // The file: path override preserves this site's own rule: everything
+        // after `file:` is the path, including a Windows `/C:/…` form that the
+        // generic split would treat as an opaque scheme-specific part.
+        let file_path = url_str
+            .strip_prefix("file:")
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        uri_publish_named(ctx, uri, &url_str, file_path.as_deref());
         Ok(Some(Value::Object(Some(uri))))
     });
 

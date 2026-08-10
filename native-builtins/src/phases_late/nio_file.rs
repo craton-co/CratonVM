@@ -248,12 +248,19 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let encoded = encode_file_uri_path(&abs);
         let uri_str = format!("file://{encoded}");
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 7)?;
-        let raw = ctx.create_string(&uri_str);
-        ctx.set_field(uri, 0, Value::Object(Some(raw)));
-        let scheme = ctx.create_string("file");
-        ctx.set_field(uri, 1, Value::Object(Some(scheme)));
-        let path_str = ctx.create_string(&abs);
-        ctx.set_field(uri, 4, Value::Object(Some(path_str)));
+        // JDK-ONLY-LAYOUT: raw slots only on OUR layout. On a real
+        // `java.net.URI` these three are `scheme`, `fragment` and `host`, so a
+        // `Path.toUri()` used to store its full text as the scheme, the literal
+        // "file" as the fragment, and the path as the host.
+        if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri) {
+            let raw = ctx.create_string(&uri_str);
+            ctx.set_field(uri, 0, Value::Object(Some(raw)));
+            let scheme = ctx.create_string("file");
+            ctx.set_field(uri, 1, Value::Object(Some(scheme)));
+            let path_str = ctx.create_string(&abs);
+            ctx.set_field(uri, 4, Value::Object(Some(path_str)));
+        }
+        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(&abs));
         Ok(Some(Value::Object(Some(uri))))
     });
 
@@ -6595,10 +6602,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh URI (native stale-local family).
             let uri_pin = ctx.pin_native_root(uri);
-            let s = ctx.create_string(&uri_str);
             let uri = ctx.read_native_pin(uri_pin, uri);
-            ctx.set_field(uri, 0, Value::Object(Some(s)));
-            ctx.set_field(uri, 4, Value::Object(Some(s)));
+            // JDK-ONLY-LAYOUT: raw slots only on OUR layout — slot 0 is
+            // `scheme` and slot 4 is `host` on a real `java.net.URI`.
+            if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri) {
+                let s = ctx.create_string(&uri_str);
+                let uri = ctx.read_native_pin(uri_pin, uri);
+                ctx.set_field(uri, 0, Value::Object(Some(s)));
+                ctx.set_field(uri, 4, Value::Object(Some(s)));
+            }
+            let uri = ctx.read_native_pin(uri_pin, uri);
+            crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, None);
+            let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.unpin_native_roots(uri_pin);
             return Ok(Some(Value::Object(Some(uri))));
         }
@@ -6611,10 +6626,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // Pin across the create_string below — a moving young GC there
             // would relocate the fresh URI (native stale-local family).
             let uri_pin = ctx.pin_native_root(uri);
-            let s = ctx.create_string(&uri_str);
             let uri = ctx.read_native_pin(uri_pin, uri);
-            ctx.set_field(uri, 0, Value::Object(Some(s)));
-            ctx.set_field(uri, 4, Value::Object(Some(s)));
+            // JDK-ONLY-LAYOUT: raw slots only on OUR layout — slot 0 is
+            // `scheme` and slot 4 is `host` on a real `java.net.URI`.
+            if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri) {
+                let s = ctx.create_string(&uri_str);
+                let uri = ctx.read_native_pin(uri_pin, uri);
+                ctx.set_field(uri, 0, Value::Object(Some(s)));
+                ctx.set_field(uri, 4, Value::Object(Some(s)));
+            }
+            let uri = ctx.read_native_pin(uri_pin, uri);
+            crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, None);
+            let uri = ctx.read_native_pin(uri_pin, uri);
             ctx.unpin_native_roots(uri_pin);
             return Ok(Some(Value::Object(Some(uri))));
         }
@@ -6651,14 +6674,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // Pin across the create_strings below — a moving young GC there would
         // relocate the fresh URI (native stale-local family).
         let uri_pin = ctx.pin_native_root(uri);
-        let s = ctx.create_string(&uri_str);
         let uri = ctx.read_native_pin(uri_pin, uri);
-        ctx.set_field(uri, 0, Value::Object(Some(s)));
-        // field 4 = (decoded) path component, with the leading-slash form the JDK
-        // exposes via `URI.getPath()` (e.g. `/C:/…/resource#test1.txt`).
-        let path_s = ctx.create_string(slash_p);
+        // JDK-ONLY-LAYOUT: raw slots only on OUR layout. Slot 0 is `scheme` and
+        // slot 4 is `host` on a real `java.net.URI`; the leading-slash path the
+        // JDK exposes via `getPath()` is carried by the named publish below.
+        if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri) {
+            let s = ctx.create_string(&uri_str);
+            let uri = ctx.read_native_pin(uri_pin, uri);
+            ctx.set_field(uri, 0, Value::Object(Some(s)));
+            let path_s = ctx.create_string(slash_p);
+            let uri = ctx.read_native_pin(uri_pin, uri);
+            ctx.set_field(uri, 4, Value::Object(Some(path_s)));
+        }
         let uri = ctx.read_native_pin(uri_pin, uri);
-        ctx.set_field(uri, 4, Value::Object(Some(path_s)));
+        crate::net_phase_e::uri_publish_named(ctx, uri, &uri_str, Some(slash_p));
+        let uri = ctx.read_native_pin(uri_pin, uri);
         ctx.unpin_native_roots(uri_pin);
         Ok(Some(Value::Object(Some(uri))))
     });
