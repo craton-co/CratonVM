@@ -37,17 +37,60 @@ ALLIDX="$META/all-classes.tsv"          # module<TAB>fqcn   (stable, sorted)
 PASSED="$META/passed.tsv"               # subset: baseline status==OK
 OTHERS="$META/others.tsv"               # all-classes minus passed
 
+detect_jdk_home() {
+  if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then printf '%s' "$JAVA_HOME"; return 0; fi
+  local c
+  for c in "/c/Program Files/Microsoft/jdk-25.0.3.9-hotspot" /data/toolchain/jdk-25; do
+    [ -x "$c/bin/java" ] && { printf '%s' "$c"; return 0; }
+  done
+  if command -v java >/dev/null 2>&1; then
+    c="$(cd "$(dirname "$(command -v java)")/.." && pwd)"
+    [ -x "$c/bin/java" ] && { printf '%s' "$c"; return 0; }
+  fi
+  return 1
+}
 # HotSpot JDK 25 (real-JDK mode + javac for KRun + the `hotspot` baseline).
-JDK25="${JDK25:-/c/Program Files/Microsoft/jdk-25.0.3.9-hotspot}"
-JDK25_WIN="${JDK25_WIN:-C:\\Program Files\\Microsoft\\jdk-25.0.3.9-hotspot}"
+# Resolution order: explicit $JDK25 -> $JAVA_HOME -> the two known toolchain
+# locations (Windows dev box, Azure Linux box) -> `java` on PATH -> fail fast
+# with a clear error. This used to hardcode the Windows-only default, which
+# silently made EVERY class instant-fail on any other host — indistinguishable
+# from real test failures unless you read a per-class log. Measured 2026-08-10:
+# all 1239 classes across 6 GC-variant reruns came back bogus-FAIL that way
+# until JDK25/JDK25_WIN were overridden by hand.
+JDK25="${JDK25:-}"
+[ -n "$JDK25" ] && [ -x "$JDK25/bin/java" ] || JDK25="$(detect_jdk_home || true)"
+if [ -z "$JDK25" ] || [ ! -x "$JDK25/bin/java" ]; then
+  echo "ERROR: JDK25 not set and no environment JDK found (checked \$JDK25, \$JAVA_HOME, the known toolchain paths, and \`java\` on PATH). Set JDK25=/path/to/jdk-25 explicitly, e.g. JDK25=/data/toolchain/jdk-25 on Linux." >&2
+  exit 1
+fi
+# JDK25_WIN: the --java-home value actually passed to cratonvm for the
+# jit-real/nojit-real modes. On native Windows/git-bash this needs Windows path
+# syntax (backslashes) — `cygpath -w` performs that conversion. On Linux the
+# cygpath shim defined above echoes the path back unchanged, so JDK25_WIN
+# collapses to the same value as JDK25 — no separate Linux default is needed.
+JDK25_WIN="${JDK25_WIN:-$(cygpath -w "$JDK25" 2>/dev/null || printf '%s' "$JDK25")}"
 
-# cratonvm.exe — env override, else common build locations.
+# A JDK tool by name, with or without the Windows `.exe` suffix. Hardcoding
+# `javac.exe`/`java.exe` made `compile_krun` and the whole `hotspot` mode
+# unusable on Linux — the failure was masked for a while because a KRun.class
+# left over from a Windows run made compile_krun return early.
+jdk_tool() {
+  local t
+  for t in "$JDK25/bin/$1.exe" "$JDK25/bin/$1"; do
+    [ -x "$t" ] && { printf '%s' "$t"; return 0; }
+  done
+  return 1
+}
+
+# cratonvm binary — env override, else common build locations (both platforms).
 find_vm() {
   local c
   for c in "${CRATONVM_BIN:-}" \
            "/c/craton/cratonvm/target/release/cratonvm.exe" \
            "/c/craton/cratonvm/target/debug/cratonvm.exe" \
-           "/c/craton/CratonVM/target/release/cratonvm.exe"; do
+           "/c/craton/CratonVM/target/release/cratonvm.exe" \
+           "/data/cratonvm/target/release/cratonvm" \
+           "/data/cratonvm/target/debug/cratonvm"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
   done
   return 1
@@ -72,12 +115,32 @@ EXTRA_VM_ARGS="${EXTRA_VM_ARGS:-}"   # extra cratonvm CLI args (verbatim)
 #     without the flag, 18/18 and 1/1 with it (and Gradle agrees).
 #   * -Xshare:off is HotSpot-only (CratonVM has no CDS archive) and is added
 #     to the hotspot mode alone.
+#
+# `junit.vintage.discovery.issue.reporting.enabled=false` is NOT from
+# TestConventions — it comes from `spring-test/spring-test.gradle`, which is the
+# only module that puts the JUnit Vintage engine on its test classpath. It is
+# required *because of* the line above it: `severity.critical=INFO` promotes
+# every discovery issue of severity INFO or worse to fatal, and the Vintage
+# engine emits an INFO-level "this engine is deprecated" notice on every single
+# discovery. Copying TestConventions' flags without spring-test.gradle's
+# counterpart therefore turns that deprecation notice into a
+# `DiscoveryIssueException` and fails the class outright. Spring's own build
+# comment says exactly this — "we disable reporting of the 'deprecated'
+# discovery issue, because that would otherwise fail the build".
+#
+# Measured 2026-08-10: 40 of the 81 remaining FAILs in the full-index default
+# sweep were this and nothing else, every one of them an
+# `org.springframework.test.context.junit4.*` / `*VintageTests` class. It is
+# applied unconditionally here rather than per-module because spring-test is the
+# only module carrying junit-vintage (verified against every module's
+# cratonvm-testcp.txt), so the flag is inert everywhere else.
 SPRING_JVM_ARGS=(
   --add-opens=java.base/java.lang=ALL-UNNAMED
   --add-opens=java.base/java.util=ALL-UNNAMED
   -Djava.awt.headless=true
   -Dio.netty.leakDetection.level=paranoid
   -Djunit.platform.discovery.issue.severity.critical=INFO
+  -Djunit.vintage.discovery.issue.reporting.enabled=false
 )
 
 # ------------------------------------------------------------------ helpers ---
@@ -90,12 +153,16 @@ PRIO="spring-core spring-beans spring-expression spring-aop spring-context sprin
 rank() { local b="$1" i=1 p; for p in $PRIO; do [ "$p" = "$b" ] && { printf '%03d' "$i"; return; }; i=$((i+1)); done; echo 050; }
 
 compile_krun() {
-  [ -f "$HERE/KRun.class" ] && return 0
+  # Rebuild when the source is newer — a stale KRun.class silently pins the
+  # launcher's output format (and once hid the fact that `javac.exe` does not
+  # exist on Linux, because the class file had been carried over from Windows).
+  [ -f "$HERE/KRun.class" ] && [ ! "$HERE/KRun.java" -nt "$HERE/KRun.class" ] && return 0
   log "compiling KRun.java (HotSpot javac)"
   local cpf="$SPRING/spring-core/build/cratonvm-testcp.txt"
   [ -f "$cpf" ] || die "no spring-core testcp for compiling KRun: $cpf (build the suite first)"
   local cp; cp="$(tr -d '\r' < "$cpf")"
-  "$JDK25/bin/javac.exe" -cp "$cp" -d "$(cygpath -w "$HERE")" "$(cygpath -w "$HERE/KRun.java")" \
+  local javac; javac="$(jdk_tool javac)" || die "no javac under $JDK25/bin"
+  "$javac" -cp "$cp" -d "$(cygpath -w "$HERE")" "$(cygpath -w "$HERE/KRun.java")" \
     || die "KRun.java failed to compile"
 }
 
@@ -138,6 +205,92 @@ discover() {
 
 ensure_idx() { [ -s "$ALLIDX" ] || discover; }
 
+# ------------------------------------------------------- classpath integrity ---
+# `build/cratonvm-testcp.txt` is a dump of Gradle's own
+# `sourceSets.test.runtimeClasspath`. For a cross-project or test-fixtures
+# dependency Gradle names the OTHER project's published artifact
+# (`build/libs/<name>-<ver>.jar`), NOT its `build/classes/java/main` directory.
+# Dumping that path does not build it — so a build that ran only `testClasses`
+# leaves the dump naming jars that do not exist.
+#
+# A JVM SILENTLY SKIPS a missing classpath element. There is no warning, no
+# non-zero exit — the classes simply are not there, and every test that touches
+# them dies with `NoClassDefFoundError` deep inside Spring/JUnit, which reads
+# exactly like a VM defect. That is what happened in the 2026-08-10 full-suite
+# GC-variant sweep: 789 of 1156 failure-cause lines (68%) were this and nothing
+# else. `dumpcp` (below) now builds what it dumps; `check-cp` proves it did.
+#
+# Not every absent entry is a defect. Gradle puts a source set's output
+# DIRECTORY on the classpath whether or not that source set produced anything,
+# and does not create the directory when it is empty. Four such entries are
+# expected in this tree and are harmless — an absent directory contributes no
+# classes, which is the correct outcome for a source set that has none:
+#   spring-instrument, framework-docs   — no src/test at all
+#   spring-context-indexer              — no src/test/resources
+#   spring-aspects                      — no src/test/java; ajc compiles its 27
+#                                         test sources to build/classes/aspectj/test,
+#                                         which IS present and IS on the path
+# A missing *jar* is never benign: once `jar`/`testFixturesJar` runs Gradle
+# always produces the file, even for an empty project. So only jars (and any
+# absent entry that is not a Gradle build-output directory) count as failures.
+check_cp() {
+  local strict="${1:-0}" bad=0 mod f n nmiss nsoft e
+  ensure_idx
+  local mods; mods="$(mktemp)"; cut -f1 "$ALLIDX" | sort -u > "$mods"
+  while IFS= read -r mod; do
+    [ -n "$mod" ] || continue
+    f="$mod/build/cratonvm-testcp.txt"
+    if [ ! -s "$f" ]; then
+      echo "CP-MISSING-DUMP $(basename "$mod")  ($f)"
+      bad=$((bad+1)); continue
+    fi
+    n=0; nmiss=0; nsoft=0
+    while IFS= read -r e; do
+      [ -n "$e" ] || continue
+      n=$((n+1))
+      [ -e "$e" ] && continue
+      case "$e" in
+        *.jar) nmiss=$((nmiss+1)); echo "    CP-MISSING-ENTRY $(basename "$mod") $e" ;;
+        */build/classes/*|*/build/resources/*)
+          nsoft=$((nsoft+1)); echo "    CP-EMPTY-SOURCESET $(basename "$mod") $e" ;;
+        *) nmiss=$((nmiss+1)); echo "    CP-MISSING-ENTRY $(basename "$mod") $e" ;;
+      esac
+    done < <(tr ':' '\n' < "$f" | tr -d '\r')
+    if [ "$nmiss" -gt 0 ]; then
+      echo "CP-INCOMPLETE $(basename "$mod")  entries=$n missing=$nmiss empty-sourceset=$nsoft"
+      bad=$((bad+1))
+    else
+      echo "CP-OK $(basename "$mod")  entries=$n empty-sourceset=$nsoft"
+    fi
+  done < "$mods"
+  rm -f "$mods"
+  if [ "$bad" -gt 0 ]; then
+    echo
+    echo "*** $bad module classpath(s) name files that do not exist on disk."
+    echo "*** Every test class in those modules will fail with NoClassDefFoundError,"
+    echo "*** and those failures are HARNESS artifacts, not CratonVM defects."
+    echo "*** Fix with:  $0 dumpcp        (builds the artifacts, then re-dumps)"
+    [ "$strict" = "1" ] && return 1
+  fi
+  return 0
+}
+
+# Regenerate every module's cratonvm-testcp.txt, BUILDING the artifacts it names.
+# `dumpTestCp` declares `dependsOn sourceSets.test.runtimeClasspath`, so asking
+# for the task is enough to produce every jar/test-fixtures jar on the path.
+dumpcp() {
+  local init="$HERE/dump-testcp.init.gradle"
+  [ -f "$init" ] || die "missing $init"
+  [ -x "$SPRING/gradlew" ] || die "no gradlew at $SPRING/gradlew"
+  log "regenerating test classpaths (this BUILDS the jars they name) ..."
+  ( cd "$SPRING" && JAVA_HOME="${GRADLE_JAVA_HOME:-${JAVA_HOME:-}}" \
+      ./gradlew --console=plain -I "$(cygpath -m "$init" 2>/dev/null || printf '%s' "$init")" \
+        testClasses dumpTestCp "$@" ) || die "gradle dumpTestCp failed"
+  log "verifying ..."
+  check_cp 1 || die "classpath still incomplete after dumpcp — see CP-INCOMPLETE lines above"
+  log "all module classpaths complete"
+}
+
 # --------------------------------------------------------------- categorize ---
 # Build passed.tsv / others.tsv from a results.tsv. If none given, run the
 # canonical baseline mode (jit-real) over the whole suite first.
@@ -171,11 +324,24 @@ run_mode() {
   local FC="$outdir/failcauses.log" RUN="$outdir/run.log" TIMING="$outdir/timing.tsv"
   : > "$RES"; : > "$RAW"; : > "$CRASH"; : > "$FC"; : > "$RUN"; : > "$TIMING"
 
+  # Anti-vacuous-green guard. A run whose classpath names files that do not
+  # exist yields a pass rate that means nothing: the JVM skips the missing
+  # entries in silence and the resulting NoClassDefFoundErrors are
+  # indistinguishable from VM defects. Refuse to produce such a number.
+  local cpreport="$outdir/classpath-check.log"
+  if ! check_cp 1 > "$cpreport" 2>&1; then
+    grep -E '^(CP-INCOMPLETE|CP-MISSING-DUMP|\*\*\*)' "$cpreport" | head -40
+    if [ "${ALLOW_INCOMPLETE_CP:-0}" != "1" ]; then
+      die "incomplete test classpath — refusing to run (full report: $cpreport). Fix with '$0 dumpcp', or set ALLOW_INCOMPLETE_CP=1 to override deliberately."
+    fi
+    echo "WARNING: INCOMPLETE CLASSPATH (ALLOW_INCOMPLETE_CP=1) — these results are NOT a CratonVM pass-rate baseline" | tee -a "$RUN"
+  fi
+
   # mode -> VM/binary + flags. STACK_ARGS is cratonvm-only (java.exe rejects it).
   local VM JH_ARGS=() JIT_ARGS=() label="$mode"
   local STACK_ARGS=(--stack-dump-on-timeout 0)
   case "$mode" in
-    hotspot)   VM="$JDK25/bin/java.exe"; STACK_ARGS=(); SPRING_JVM_ARGS+=(-Xshare:off) ;;
+    hotspot)   VM="$(jdk_tool java)" || die "no java under $JDK25/bin"; STACK_ARGS=(); SPRING_JVM_ARGS+=(-Xshare:off) ;;
     jit-real)  VM="$(find_vm)" || die "cratonvm.exe not found (set CRATONVM_BIN or build it)"; JH_ARGS=(--java-home "$JDK25_WIN") ;;
     nojit-real)VM="$(find_vm)" || die "cratonvm.exe not found"; JH_ARGS=(--java-home "$JDK25_WIN"); JIT_ARGS=(--nojit) ;;
     jit-syn)   VM="$(find_vm)" || die "cratonvm.exe not found"; JH_ARGS=(--synthetic-jdk) ;;
@@ -412,6 +578,13 @@ run-suite.sh — Spring suite driver for CratonVM
 
 COMMANDS
   discover                       Build the master class index (meta/all-classes.tsv)
+  dumpcp                         (Re)generate every module's build/cratonvm-testcp.txt,
+                                 BUILDING the jars/test-fixtures jars it names, then
+                                 verify. Run this after any Spring rebuild.
+  check-cp                       Verify every module's dumped classpath points at
+                                 files that exist. Exits non-zero if any do not.
+                                 run/quad/hotspot refuse to start when it fails
+                                 (override: ALLOW_INCOMPLETE_CP=1).
   categorize [results.tsv]       Build meta/passed.tsv + meta/others.tsv.
                                  With no arg, runs the jit-real baseline over the
                                  whole suite first, then splits by status==OK.
@@ -434,6 +607,9 @@ ENV
   CRATONVM_BIN=...   override cratonvm.exe path
   EXTRA_VM_ARGS=...  extra cratonvm CLI args (e.g. "-Xmx2g")
   CRATONVM_*=...     any CratonVM env knob — inherited by the VM automatically
+  ALLOW_INCOMPLETE_CP=1  run even though some classpath entries are missing
+                     (results are NOT a pass-rate baseline — see check-cp)
+  GRADLE_JAVA_HOME=... JDK used to run gradlew for `dumpcp` (default $JAVA_HOME)
   SPRING=...  OUTROOT=...  JDK25=...  BATCH=...  BATCH_TO=...  ONE_TO=...
 
 OUTPUT (per mode dir under out/)
@@ -447,6 +623,8 @@ EOF
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   discover)   discover ;;
+  dumpcp)     dumpcp "$@" ;;
+  check-cp)   check_cp 1 ;;
   categorize) categorize "${1:-}" ;;
   run)        cmd_run "$@" ;;
   quad)       cmd_quad "$@" ;;

@@ -1,6 +1,33 @@
 # `WebFluxAutoConfigurationTests` — recurring full-timeout HANG: **not a hang**, and not one dominant term
 
-**Status: OPEN as a throughput item, but no longer un-triaged (2026-08-09).**
+**Status: RETIRED — 2026-08-10** (branch `docs/retire-webflux-throughput-20260810`).
+Supersedes `docs/known-issues/springboot/webfluxautoconfigurationtests-recurring-timeout-hang-20260807.md`.
+
+Retired because **every question this page asked has been answered and every
+lead it generated has been closed by measurement** — not because the class is
+fast. It is still ~10-30x HotSpot and can still exhaust a 300s budget under
+load; what is retired is the *investigation*, which had become a generator of
+plausible mechanisms that measurement kept refuting.
+
+| lead | headline | measured worth |
+|---|---|---|
+| compile refusals | "69 hot methods refused" | 63 were mislabelled policy verdicts; **7** real ([FIXED](#1-the-jit-is-asked-and-refuses-on-exactly-the-hot-annotation-methods)) |
+| native-shadow seal | "1,279 sealed > 1,155 at C2" | removing the seal entirely: **0** |
+| annotation/proxy path | "~1000x HotSpot per call" | **~1%** of the run |
+| lambda SAM dispatch | "220x a named-class call" | fixed, ~4x on the mechanism, **0%** here |
+| OSR-only loops | "7-16x" | **180x**, split out to `../../../known-issues/jit/osr-refused-for-a-loop-inline-in-main-20260810.md` |
+
+**If this class goes red again, it is a budget/throughput event, not a new
+defect** — start from the tables below rather than re-triaging. The one live
+item to come out of all this is the OSR page above, and it is a measurement
+hazard rather than this class's problem.
+
+**What is left is breadth, not a mechanism**: ordinary Java throughput across
+Spring's own code. Three independent ceiling measurements failed to contradict
+that, and the sampling profile said it from the start (largest single leaf 3.9%).
+
+---
+
 The class does **not** stall — it completes all 70 tests every time it is given
 enough budget, its cost is flat per test method, and 99.1% of stack-sample
 requests are serviced across a full run. It is ~10-30x HotSpot on a workload
@@ -420,7 +447,7 @@ is now known, and what the next attempt should not repeat:
   3. ~~The annotation-proxy entry path.~~ **CLOSED 2026-08-10 at ~1%** (§4).
      ~300-400k dispatches at ~9.5 us = ~3 s of a 357 s run.
   4. ~~OSR-only loops at 7-16x.~~ **Split out 2026-08-10 to
-     `jit/osr-refused-for-a-loop-inline-in-main-20260810.md`**, where it is
+     [`known-issues/jit/osr-refused-for-a-loop-inline-in-main-20260810.md`](../../../known-issues/jit/osr-refused-for-a-loop-inline-in-main-20260810.md)**, where it is
      reproduced at **180x** (1 ns/iter for a loop in a called method against
      180 ns/iter for the identical loop inline in `main`) and the refusal is
      named: `osr-entry-unresumable-exit`, from a deopt point in the method's own

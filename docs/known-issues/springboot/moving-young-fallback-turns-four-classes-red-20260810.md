@@ -262,6 +262,50 @@ The measurement is sensitive and the answer is still zero: the fallback rate is
 flat across all four arms, because `cross-thread-jit-peer` is in **100% of
 cycles in both**.
 
+### Do not build pinning: it already exists in G1, and it works
+
+The pinning design priced below **is already implemented**, in the G1 backend.
+`G1::jit_pinned_region_set` (`gc/src/g1.rs`) takes
+`gc_quiescence::pinned_jit_roots_snapshot()` — the same conservative JIT roots
+counted above — maps each to its containing region, and excludes those regions
+from the collection set, "exactly like JNI-pinned regions" (JEP 423). That is
+precisely "pin the conservative roots, compact around them", at region
+granularity.
+
+Measured on `MovingYoungFallbackPeerParkProbe`, 20s, 4 parked peers, `--Xmx 512m`:
+
+| collector | iters | conservative roots found | reason cycles | fallback lines | collections |
+|---|---:|---:|---:|---:|---|
+| default (Generational) | 5.39M | 193 | 20 | 9 | `young: cycles=0 coverage_fallbacks=17` |
+| **G1** (`-XX:+UseG1GC`) | 6.21M | 161 | **0** | **0** | **`evacuates=7 pauses=7`** |
+
+G1 still *finds* the conservative roots — it is not ignoring them — and performs
+**7 evacuating collections** where the default performs 17 collections and moves
+on **none** of them. The zero is not vacuous: `evacuates=7` is the check that it
+actually compacted, and it was made specifically because "0 fallbacks" and "0
+collections" are indistinguishable in the fallback counter alone.
+
+### Why there is no pinning "hook" to add to the default collector
+
+The default young collector is a **Cheney semispace**: it evacuates from-space
+to to-space and then recycles from-space wholesale. A semispace has nowhere to
+leave a pinned object — the space it sits in is the space being reclaimed. The
+source says so directly: *"a semispace cannot pin a conservative JIT root nor
+rewrite a register-resident one"* (`gen_heap.rs`). Adding pinning there is not a
+hook; it is replacing the algorithm with a region- or block-based one, at which
+point it is G1.
+
+**So the route to un-redding these four classes is G1 maturity, not new pinning
+code.** That is a different and much better-scoped problem, and it is already
+owned elsewhere — G1 has its own open regressions (see the 3-way collector
+comparison recording G1 SIGSEGVs, and `fix/g1-fullsuite-regression-20260809`).
+This page's contribution is the measurement that says the collector question is
+the whole question.
+
+Caveat: the table above is a synthetic probe with four peers parked under a
+depth-12 recursion. Before G1 is proposed as the default for these classes, the
+same comparison should be run on one of them.
+
 ### Priced: pinning is CHEAP — ~50 conservative roots per parked peer, linear
 
 The one structural option that can be priced without building it, because the
