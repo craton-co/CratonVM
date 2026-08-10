@@ -105,7 +105,7 @@ an immediate discovery error) does not match regardless.
 **Not the same signature as `DevToolsEmbeddedDataSourceAutoConfigurationTests`'s
 hang in this same run** — that one is now root-caused and FIXED (2026-08-09),
 see
-[`devtoolsembeddeddatasourceautoconfigurationtests-load-time-transform-rescan-FIXED.md`](../../internal/fixed-suite-bugs/springboot/devtoolsembeddeddatasourceautoconfigurationtests-load-time-transform-rescan-FIXED.md).
+`fixed-suite-bugs/springboot/devtoolsembeddeddatasourceautoconfigurationtests-load-time-transform-rescan-FIXED.md`.
 It was the `java.lang.instrument` load-time transform hook re-offering every
 class to Mockito's self-attached `ClassFileTransformer` on every constant-pool
 resolution, which only reaches classes loaded through a **user loader** — that
