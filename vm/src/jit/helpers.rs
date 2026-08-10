@@ -9132,6 +9132,72 @@ fn handle_jit_dispatch_error(
     }
 }
 
+/// The loader-faithful owner of a compiled `invokestatic` — but ONLY when it is
+/// a different class from the one the flat global binary-name map would hand
+/// back. `None` means "the by-name answer is already right; take the path this
+/// arm has always taken".
+///
+/// Returning `None` for the agreeing case is not an optimization, it is the
+/// safety property: `invoke_or_native` carries a large amount of behaviour that
+/// the on-class form does not reproduce (the native-registry override order, the
+/// `SyntheticStub`-yields-to-real-bytecode rule, the `DowncallHandle` and
+/// signature-polymorphic intercepts). Diverting every static dispatch through a
+/// second path to fix the case where they disagree would be trading a rare wrong
+/// answer for a common one.
+///
+/// The gates are ordered cheapest-first, because this sits on every compiled
+/// static call:
+///
+/// 1. no call-site class (`0`) — synthetic call sites naming JDK classes that
+///    have exactly one definition, per `JitInvokeInfo::declaring_class_id`;
+/// 2. no user-defined loader has ever defined ANY class in this process — one
+///    relaxed atomic, and it is the precondition for a name to have two
+///    definitions at all;
+/// 3. this NAME has one definition — `classify_loaded_name` is O(1) against the
+///    definition-count index, and `Unique`/`Absent` both mean the by-name answer
+///    cannot be the wrong copy.
+///
+/// Only past all three does it ask the caller's own loader, via the same
+/// `find_class_by_name_for_class` the direct-call path's `callee_compiler`
+/// already uses to pick a callee — a pure lookup, so unlike
+/// `resolve_class_loader_aware` it cannot re-enter Java `loadClass` from a
+/// dispatch helper.
+fn jit_static_owner_override(vm: &SharedVm, info: &JitInvokeInfo) -> Option<ClassId> {
+    if info.declaring_class_id == 0 {
+        return None;
+    }
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
+    let caller = ClassId::new(info.declaring_class_id);
+    let cm = vm.classes.class_manager.read();
+    if !matches!(
+        cm.classify_loaded_name(info.class_name),
+        cratonvm_classloading::NameResolution::Ambiguous { .. }
+    ) {
+        return None;
+    }
+    let owner = cm.find_class_by_name_for_class(info.class_name, caller)?;
+    if cm.get_loaded_class_id(info.class_name) == Some(owner) {
+        return None;
+    }
+    // DIAG (`CRATONVM_DBG=coerce`, the loader-split diagnostic this shares a
+    // subject with): a silent fix cannot be told from a fix that never fires.
+    // This line is what proves the arm ran on the run that went green.
+    if crate::runtime::env_cache::dbg_coerce() {
+        eprintln!(
+            "[DBG_COERCE] jit invokestatic: {}.{}{} from cid={:?} -- by-name owner {:?} \
+is NOT the caller's loader's copy {owner:?}; dispatching on the caller's",
+            info.class_name,
+            info.method_name,
+            info.descriptor,
+            caller,
+            cm.get_loaded_class_id(info.class_name),
+        );
+    }
+    Some(owner)
+}
+
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
 // info_ptr must point to a live JitInvokeInfo (heap-allocated, outlives this call).
 // args_ptr/num_args form a valid i64 slice of JIT-encoded arguments.
@@ -10016,17 +10082,57 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             }
         }
         3 => {
-            // invokestatic: no receiver, no retarget concern. The historical
-            // `invoke_or_native` path is correct here (static method lookup
-            // by class name with native-override priority and superclass walk).
-            let r = crate::vm::invoke_or_native(
-                vm,
-                thread,
-                info.class_name,
-                info.method_name,
-                info.descriptor,
-                &values,
-            );
+            // invokestatic: no receiver, so no dispatch retarget can happen —
+            // but the OWNER is still constant-pool text, and a class NAME is
+            // not a class identity. This arm used to read "no retarget
+            // concern. The historical `invoke_or_native` path is correct
+            // here", which was true of the DISPATCH and false of the
+            // IDENTITY: `invoke_or_native` resolves `info.class_name` through
+            // the flat global binary-name map, so when two loaders define
+            // that name it binds the call to whichever copy the map holds.
+            // Exactly the defect the `invoke_kind == 1` arm above was fixed
+            // for (BUG-JIT-INVOKESPECIAL-LOADER-20260726) — the fix landed on
+            // invokespecial and stopped there.
+            //
+            // Measured 2026-08-10 on `AotIntegrationTests
+            // .endToEndTestsForBeanOverrides` (spring-test, under
+            // `@CompileWithForkedClassLoader`, which defines its own copy of
+            // every `org.springframework.*` class): a compiled static call
+            // made from the FORKED copy of `ResolvableType` landed in the
+            // APPLICATION copy, so the `ResolvableType` it returned belonged
+            // to the other class. `ResolvableType$WildcardBounds.get` then
+            // ran `while (…) candidate = candidate.resolveType()` against a
+            // `NONE` singleton from the wrong copy, `candidate == NONE` could
+            // never hold, and one core spun for as long as the machine was
+            // given — the hang this test was known for. The same method
+            // passes under `--nojit`, because the interpreter resolves the
+            // owner through the caller's own loader.
+            //
+            // STRICTLY ADDITIVE, by construction: the loader-faithful owner
+            // is consulted only behind `jit_static_owner_override`'s gates
+            // and used only when it DIFFERS from the global by-name answer,
+            // so a process with one copy of the name takes the identical
+            // previous path — including every special case
+            // `invoke_or_native` carries that the on-class form does not.
+            let r = match jit_static_owner_override(vm, info) {
+                Some(owner) => crate::vm::invoke_static_shared_on_class(
+                    vm,
+                    thread,
+                    owner,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+                None => crate::vm::invoke_or_native(
+                    vm,
+                    thread,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+            };
             match r {
                 Ok(v) => v,
                 Err(e) => {

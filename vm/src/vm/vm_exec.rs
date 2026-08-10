@@ -17278,6 +17278,40 @@ pub fn invoke_special_shared_on_class(
     )
 }
 
+/// `invokestatic` on an owner class that is ALREADY resolved, for the one case
+/// where the owner's binary NAME is not enough to name it.
+///
+/// A static call has no receiver, so there is no virtual retarget to suppress
+/// and nothing about the dispatch depends on an instance — which is exactly why
+/// [`invoke_special_shared_impl`] is the right body: its "walk from the resolved
+/// class to the class that declares this method, then dispatch on that class and
+/// only that class" is also JVMS §5.4.3.3's static-method lookup, and its
+/// native-override probe is name-keyed and unaffected. What it must NOT do is
+/// re-resolve `class_name` through the global map, which is the whole point of
+/// the caller passing `class_id`.
+///
+/// Callers: `jit_invoke_dispatch`'s `invoke_kind == 3` arm, and only when the
+/// loader-faithful owner DIFFERS from the global by-name answer — see there.
+pub fn invoke_static_shared_on_class(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_id: ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    invoke_special_shared_impl(
+        shared,
+        thread,
+        Some(class_id),
+        class_name,
+        method_name,
+        descriptor,
+        args,
+    )
+}
+
 fn invoke_special_shared_impl(
     shared: &SharedVm,
     thread: &mut JvmThread,
