@@ -1851,7 +1851,30 @@ pub fn execute(
             // rarely pays — but leaving it out would make `already_skipped`
             // unreachable for it, which is the trap this seal exists to avoid.)
             if static_skip_reason.is_some() || fjp_skip || native_skip || clinit_skip {
-                note_jit_skip_seal("static-policy-or-native-shadow", &skip_key);
+                // Name WHICH of the four fired. The single label
+                // `static-policy-or-native-shadow` covered all of them, and a
+                // Spring Boot context startup seals 856 methods through here —
+                // more than the 69 whose compile was attempted and refused —
+                // with no way to tell a policy-table entry from a native-shadow
+                // scan hit. Those want opposite fixes: one is a list somebody
+                // can shorten, the other is a scan that may be over-matching.
+                // Priority order, not a set: the reasons can co-occur, and the
+                // first one listed is the one that would still seal the method
+                // if every other were lifted.
+                let seal_site = if static_skip_reason.is_some() {
+                    "static-policy-table"
+                } else if native_skip {
+                    "calls-native-shadowed-method"
+                } else if fjp_skip {
+                    "forkjointask-subclass"
+                } else {
+                    "clinit"
+                };
+                note_jit_skip_seal(seal_site, &skip_key);
+                // Counted as well as traced: `CRATONVM_DBG_JITC` produces ~1 GB
+                // on a Spring startup, so the census has to be readable from the
+                // one-line `jit-method-stats` dump instead.
+                cratonvm_jit::note_jit_skip_seal_reason(seal_site);
                 shared.jit.jit_skip_set.write().insert(skip_key.clone());
             }
         } else {
