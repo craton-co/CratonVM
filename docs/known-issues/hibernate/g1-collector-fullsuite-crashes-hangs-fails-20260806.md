@@ -372,6 +372,63 @@ too, because a second notion of "is this address in this heap" in front of
 3. The SATB `reuse_epoch` stamping remains a real asymmetry with the remembered
    set. Worth closing, but on its own merits — it is not this bug.
 
+## Update 2026-08-10 — reproduces on H2, on Linux, at the same 1 MiB-aligned address; and it is now the ONLY G1 crash left there
+
+Found while retiring the H2 three-GC-variant sweep
+(`../../internal/fixed-suite-bugs/h2-suite-bugs/gc-variant-fullsuite-crashes-hangs-fails-20260810-FIXED.md`).
+That sweep had 53 SIGSEGVs across default/G1/ZGC. **51 of them were not a GC
+defect at all** — a real-JDK `ByteBufferAs<T>Buffer` view whose `Buffer.address`
+(an array-relative `Unsafe` offset) was dereferenced as a process pointer,
+`addr=0x10`, fixed there. The **other 2 are this page's defect**, and with that
+noise removed they stand out cleanly:
+
+| class | pc | addr | collector |
+|---|---|---|---|
+| `org.h2.test.poweroff.TestReorderWrites` | `0x560dfa121049` | `0x20084400000` | G1 only |
+| `org.h2.test.store.TestKillProcessWhileWriting` | `0x6218e5d6c049` | `0x20084400000` | G1 only |
+
+Both symbolize, against the exact binary, to one function:
+
+```
+addr2line -f -C -e <binary> 0x8c3049
+  <cratonvm_gc::g1::G1Collector as cratonvm_gc::collector::GarbageCollector>::collect_garbage
+```
+
+(RVA from the report's own `maps:` line — exe base `0x560df985e000`.)
+`collect_garbage` is where `scan_and_evacuate_refs` inlines, so this is the
+function the 2026-08-07 update named, and `addr = 0x20084400000` is the same
+**1 MiB-aligned region base** — a read that walked *to* a region boundary, not a
+dereference of a random word. Compare this page's Hibernate figure,
+`0x200a0400000`.
+
+What this adds:
+
+* **A second, independent workload.** Everything above came from one Hibernate
+  class. These are two H2 classes: different suite, different binary, days of
+  dev movement later, same function, same address shape. The defect is not
+  workload-specific and it did not go away.
+* **A cheaper repro.** Both are `poweroff`/`kill`-family classes that spawn and
+  kill child processes mid-write, i.e. they churn short-lived object graphs
+  across many young collections — the allocation profile the "a full,
+  never-recycled Eden region is not walkable" lead predicts.
+  `TestKillProcessWhileWriting` crashed under G1 in the 2026-08-10 run and
+  needs no Hibernate build:
+
+```bash
+cd apps/h2database-suite-runner
+JDK25=/data/toolchain/jdk-25 CRATONVM_BIN='<cv-g1-wrapper>' \
+  ./run-h2-suite.sh run --category all \
+  --only 'org\.h2\.test\.store\.TestKillProcessWhileWriting' --class-to 300
+```
+
+* **G1-only, by construction.** All three collectors ran the same 62 classes
+  from ONE binary selecting the collector by runtime flag. Zero region-aligned
+  faults outside G1.
+
+The open question is unchanged (*why is a full, never-recycled Eden region
+unwalkable?*) and the Next-step list above still applies — only the recommended
+repro changes.
+
 ## Related
 
 - `zgc-collector-fullsuite-crash-fails-20260806.md` — the ZGC sibling run,

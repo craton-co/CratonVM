@@ -8081,11 +8081,11 @@ pub(crate) mod p57_posix_path_tests {
         // `Paths.get`, `resolve`, `getParent`, `toAbsolutePath` — funnels here,
         // and the stored string is what the file-IO bridge syscalls with.
         let mut ctx = crate::test_utils::MockNativeContext::new();
-        let p = p57_alloc_path(&mut ctx, "/tmp/one/two/three/");
+        let p = p57_alloc_path(&mut ctx, "/tmp/one/two/three/").expect("alloc Path");
         assert_eq!(p57_read_path(&mut ctx, p), "/tmp/one/two/three");
-        let root = p57_alloc_path(&mut ctx, "/");
+        let root = p57_alloc_path(&mut ctx, "/").expect("alloc Path");
         assert_eq!(p57_read_path(&mut ctx, root), "/");
-        let collapsed = p57_alloc_path(&mut ctx, "/tmp//x/");
+        let collapsed = p57_alloc_path(&mut ctx, "/tmp//x/").expect("alloc Path");
         assert_eq!(p57_read_path(&mut ctx, collapsed), "/tmp/x");
     }
 
