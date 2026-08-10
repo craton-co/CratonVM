@@ -752,6 +752,13 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   That is the whole argument for measuring a workaround's premise before
   deleting it, and for keeping the pre-fix binary: Compatible mode is
   byte-identical across the change, so the A/B says exactly which mode moved.
+
+  The probe also surfaced an FFM defect that is **not** this family and is filed
+  on its own: `seg.set(ValueLayout.JAVA_DOUBLE, 16, 1.5)` raises
+  `AbstractMethodError … has no Code attribute` while the `int`, `long` and
+  `byte` stores beside it succeed. Identical on the pre-fix binary, so
+  pre-existing — see
+  [`memorysegment-set-ofdouble-has-no-code-attribute.md`](../../known-issues/jdk-only/memorysegment-set-ofdouble-has-no-code-attribute.md).
 * ~~**Step 4**, making `safe` verdicts checkable rather than asserted.~~ —
   **DONE 2026-08-10.** `shadow_layout::SAFE_POSITIONAL_CLAIMS` writes each claim
   down as `(class, index, name, descriptor, site)` and `check_positional_claims`

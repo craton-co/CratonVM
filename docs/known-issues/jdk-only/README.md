@@ -119,6 +119,24 @@ unbounded thread-local map on every raw-entry native dispatch. Pre-existing on
 `dev`; the strict gate saw it in BOTH CratonVM arms of `JdkOnlyPlatformProbe`,
 which is the gate's third arm doing exactly what it is for.
 
+## 2026-08-10 — two records retired, one added
+
+The object-layout pair is **RETIRED** (see row 2 of the ranked list below):
+index-based field access against fabricated layouts is closed, the shadow-layout
+census is at zero NAME and zero `_vmN` rows on both standing probes, and both
+records moved to the internal tree as
+`fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md` and
+`fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`.
+
+[`memorysegment-set-ofdouble-has-no-code-attribute.md`](memorysegment-set-ofdouble-has-no-code-attribute.md)
+— found while verifying the FFM half of that work and filed separately because
+it is **not** a layout defect: every one of the thirteen `ValueLayout`
+properties matches Temurin 25.0.3, and then
+`seg.set(ValueLayout.JAVA_DOUBLE, 16, 1.5)` raises `AbstractMethodError … has no
+Code attribute` while the `int`, `long` and `byte` stores beside it succeed.
+Identical on the pre-fix binary, so it is pre-existing rather than a regression;
+`probes/W2ValueLayoutProbe` is the reproducer.
+
 ## 2026-08-05 — three records added
 
 [`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
