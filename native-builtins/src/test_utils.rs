@@ -1277,6 +1277,27 @@ impl MockNativeContext {
         unsafe { (*self.declared_methods_override.get()).insert(class_id.as_u32(), methods) };
     }
 
+    /// A SECOND class carrying a name that is already registered — the other
+    /// loader's copy.
+    ///
+    /// Deliberately does not touch `name_to_id`: `(loader, name)` is the real
+    /// identity and a mock keyed on name alone cannot hold two entries, so the
+    /// new id gets a name while by-name resolution keeps answering the first
+    /// copy. That is exactly what a caller with no loader context observes on
+    /// the real VM, and the state the reflective-coercion loader-split arm
+    /// exists for.
+    ///
+    /// Only sound for code that reads `class_name_of_id` / `superclass_of` off
+    /// an id it already holds. Do not use it in a test that exercises name
+    /// resolution — there the second copy is invisible by construction.
+    #[allow(dead_code)]
+    pub(crate) fn declare_second_copy(&mut self, name: &str) -> ClassId {
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        self.class_names.insert(id, name.to_string());
+        ClassId::new(id)
+    }
+
     /// WP0.2: set the direct super-class of `class_id`.
     #[allow(dead_code)]
     pub(crate) fn set_superclass(&self, class_id: ClassId, super_id: ClassId) {
