@@ -1098,21 +1098,33 @@ impl VmConfig {
     /// Parse an `--add-exports` or `--add-opens` value:
     /// `"module/package=target_module"`.
     ///
-    /// `target_module` may be `ALL-UNNAMED` (the JDK convention), which we
-    /// store as an empty string (our unnamed-module sentinel).
-    /// Multiple targets can be comma-separated.
+    /// `target_module` may be `ALL-UNNAMED` (the JDK convention). It is passed
+    /// through **verbatim**, not folded into the empty string: the empty string
+    /// is `ModuleRegistry`'s *unqualified* marker — open to every module in the
+    /// process — and `ALL-UNNAMED` opens to the unnamed module only.
+    /// `ModuleRegistry::add_opens` resolves the token
+    /// (`classloading::module::ALL_UNNAMED_TARGET`).
+    ///
+    /// Folding it here was a real over-grant, measured 2026-08-09 by
+    /// `probes/AddOpensFlagProbe.java` against Temurin 25: under
+    /// `--add-opens=java.base/java.net=ALL-UNNAMED`, HotSpot answers
+    /// `Module.isOpen("java.net")` **false** and CratonVM answered **true**,
+    /// and any *named* module got the deep-reflection grant along with the
+    /// unnamed one. Same conflation the `Module.addOpens(String, Module)`
+    /// native already had to fix with its own sentinel — see
+    /// `native-builtins/.../reflect_invoke.rs`'s `UNRESOLVED_TARGET_MODULE`.
+    ///
+    /// Note this is deliberately NOT symmetric with `parse_add_reads`, which
+    /// does map `ALL-UNNAMED` to the empty string: a *read* edge names a source
+    /// module rather than a target set, and `""` is the unnamed module's own
+    /// name there, not a wildcard.
     pub fn parse_add_exports(s: &str) -> Option<(String, String, String)> {
         let (left, target) = s.split_once('=')?;
         let (module, pkg) = left.split_once('/')?;
-        let target = if target.trim() == "ALL-UNNAMED" {
-            String::new()
-        } else {
-            target.trim().to_string()
-        };
         Some((
             module.trim().to_string(),
             pkg.trim().replace('.', "/"),
-            target,
+            target.trim().to_string(),
         ))
     }
 }
@@ -2216,13 +2228,17 @@ mod tests {
 
     #[test]
     fn parse_add_exports_all_unnamed() {
+        // `ALL-UNNAMED` survives parsing verbatim. Collapsing it to `""` here
+        // is what made `--add-opens ...=ALL-UNNAMED` an unqualified open, so
+        // this assertion is the guard on the over-grant, not a formatting
+        // preference: `""` is `ModuleRegistry`'s open-to-everyone marker.
         let result = VmConfig::parse_add_exports("java.base/java.lang=ALL-UNNAMED");
         assert_eq!(
             result,
             Some((
                 "java.base".to_string(),
                 "java/lang".to_string(),
-                String::new()
+                "ALL-UNNAMED".to_string()
             ))
         );
     }

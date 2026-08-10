@@ -870,23 +870,36 @@ function New-ProcessRecord {
   $outFile = Join-Path $logDir "$safe.out.log"
   $errFile = Join-Path $logDir "$safe.err.log"
 
+  # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
+  # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
+  # websocket -- reflective field reset in their web-server test fixtures, via
+  # @DirtiesUrlFactories -> ReflectionTestUtils.setField(URL.class, "factory", null)).
+  # This runner launches SbRunner directly instead of through Gradle's test task,
+  # so none of those per-module jvmArgs apply; without it those classes fail with
+  # "IllegalStateException: Unable to reset field", which is a harness gap, not a
+  # genuine VM behavior difference. Apply it universally -- opens are additive and
+  # harmless for modules that don't need it.
+  #
+  # "Universally" has to mean BOTH launch arms, and for three weeks it did not:
+  # the flag was added (948df715a, 2026-07-17) to the hotspot branch only,
+  # deliberately, because CratonVM did not enforce the module boundary at all and
+  # the flag was moot there. Commit 7c92363bd (2026-08-06) closed that
+  # encapsulation hole, and the same seven-plus classes that had always needed the
+  # flag on HotSpot started failing 100% on CratonVM -- a harness asymmetry that
+  # had been invisible only because the VM was wrong in a compensating direction.
+  # Keep the argument in one variable so a future arm cannot silently omit it. See
+  # docs/internal/fixed-suite-bugs/springboot/dirtiesurlfactories-craton-launcher-missing-add-opens-FIXED-20260809.md.
+  $addOpensJavaNet = '--add-opens=java.base/java.net=ALL-UNNAMED'
+
   if ($Vm -eq 'hotspot') {
     $file = $JavaExe
-    # Several modules' own build.gradle add --add-opens=java.base/java.net=ALL-UNNAMED
-    # to their Gradle `test` task JVM args (jetty/security/servlet/tomcat/webflux/
-    # websocket -- reflective field reset in their web-server test fixtures). This
-    # runner launches SbRunner directly instead of through Gradle's test task, so
-    # none of those per-module jvmArgs apply; without it those classes fail with
-    # "IllegalStateException: Unable to reset field" on real HotSpot too, which is
-    # a harness gap, not a genuine VM behavior difference. Apply it universally --
-    # opens are additive and harmless for modules that don't need it.
-    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '--add-opens=java.base/java.net=ALL-UNNAMED')
+    $args = @("-Xmx$MaxHeap", '-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', $addOpensJavaNet)
     if ($NoJit) { $args += '-Xint' }
     if ($LaunchSpec.kind -eq 'jar') { $args += @('-jar', $LaunchSpec.value, $class) }
     else { $args += @('-cp', $LaunchSpec.value, 'SbRunner', $class) }
   } else {
     $file = $ExePath
-    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap)
+    $args = @('--java-home', $JdkPath, '--Xmx', $MaxHeap, $addOpensJavaNet)
     # The suite normally disables the VM watchdog because it owns the
     # per-class timeout.  Preserve that default, but let a caller provide a
     # real watchdog value through -CratonArgs for a diagnostic run.

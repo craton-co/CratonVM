@@ -171,6 +171,43 @@ pub const UNNAMED_MODULE: &str = "";
 /// The `java.base` module — every named module implicitly reads it.
 pub const JAVA_BASE: &str = "java.base";
 
+/// The literal target token `--add-exports`/`--add-opens` accept to mean "every
+/// *unnamed* module".
+///
+/// It is deliberately NOT the same thing as an unqualified edge, and the
+/// distinction is observable: `--add-opens java.base/java.net=ALL-UNNAMED`
+/// leaves `Module.isOpen("java.net")` answering **false** on HotSpot, because
+/// the package is open to the unnamed module rather than to everyone. The
+/// launcher used to fold `ALL-UNNAMED` into the empty string on the way in, and
+/// the empty string is [`add_opens`](ModuleRegistry::add_opens)' unqualified
+/// marker, so the flag over-granted: it reached named modules too, and
+/// `isOpen(pkg)` answered true.
+///
+/// That is the same conflation, one layer up, that
+/// `UNRESOLVED_TARGET_MODULE` (native-builtins) already fixed for the
+/// `Module.addOpens(String, Module)` path after it broke
+/// `AotIntegrationTests#endToEndTestsForBeanOverrides`. [`add_opens`] and
+/// [`add_exports`](ModuleRegistry::add_exports) resolve this token to
+/// [`UNNAMED_MODULE`] as a *qualified* target, which grants exactly the
+/// classpath's unnamed module and nobody else.
+pub const ALL_UNNAMED_TARGET: &str = "ALL-UNNAMED";
+
+/// Resolve a raw dynamic-edge target string into the stored
+/// [`DynamicExport::to_module`].
+///
+/// * `""`             → `None`, genuinely unqualified (`opens p;`).
+/// * `"ALL-UNNAMED"`  → `Some("")`, qualified to the unnamed module only.
+/// * anything else    → `Some(name)`, qualified to that named module.
+fn resolve_edge_target(target: &str) -> Option<String> {
+    if target.is_empty() {
+        None
+    } else if target == ALL_UNNAMED_TARGET {
+        Some(UNNAMED_MODULE.to_string())
+    } else {
+        Some(target.to_string())
+    }
+}
+
 /// A dynamic export or open edge added at runtime via `Module.addExports()`,
 /// `Module.addOpens()`, or CLI `--add-exports`/`--add-opens`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -714,7 +751,8 @@ impl ModuleRegistry {
     }
 
     /// Add a dynamic export: `module_name` now exports `pkg` to `target`
-    /// (empty `target` = unqualified, to all modules).
+    /// (empty `target` = unqualified, to all modules;
+    /// [`ALL_UNNAMED_TARGET`] = the unnamed module only).
     ///
     /// Backing store for `java.lang.Module.addExports()` and `--add-exports`.
     pub fn add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
@@ -723,16 +761,13 @@ impl ModuleRegistry {
             .or_default()
             .push(DynamicExport {
                 package: pkg.to_string(),
-                to_module: if target.is_empty() {
-                    None
-                } else {
-                    Some(target.to_string())
-                },
+                to_module: resolve_edge_target(target),
             });
     }
 
     /// Add a dynamic open: `module_name` now opens `pkg` to `target`
-    /// (empty `target` = unqualified, to all modules).
+    /// (empty `target` = unqualified, to all modules;
+    /// [`ALL_UNNAMED_TARGET`] = the unnamed module only).
     ///
     /// Backing store for `java.lang.Module.addOpens()` and `--add-opens`.
     pub fn add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
@@ -741,11 +776,7 @@ impl ModuleRegistry {
             .or_default()
             .push(DynamicExport {
                 package: pkg.to_string(),
-                to_module: if target.is_empty() {
-                    None
-                } else {
-                    Some(target.to_string())
-                },
+                to_module: resolve_edge_target(target),
             });
     }
 
@@ -2296,9 +2327,8 @@ mod tests {
 
     #[test]
     fn deep_reflection_unnamed_accessor_allowed_with_add_opens() {
-        // Same denied case, but `--add-opens modA/com.secret=ALL-UNNAMED`
-        // (represented here as dynamic add_opens with empty target) grants
-        // access to the unnamed accessor.
+        // Same denied case, but an unqualified `opens` (empty target) grants
+        // access to every accessor, the unnamed one included.
         let mut reg = ModuleRegistry::new();
         reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
         reg.build_readability_graph();
@@ -2307,8 +2337,81 @@ mod tests {
         assert!(
             reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret")
                 .is_ok(),
-            "--add-opens should grant unnamed accessor deep access"
+            "an unqualified open should grant unnamed accessor deep access"
         );
+    }
+
+    /// `--add-opens modA/com.secret=ALL-UNNAMED` grants the unnamed module and
+    /// **only** the unnamed module.
+    ///
+    /// The three assertions are one fact each, and the flag is only correct if
+    /// all three hold — a version that merely grants the unnamed accessor
+    /// (assertion 1) passes the reflection path while still lying to
+    /// `Module.isOpen` and over-granting every named module.
+    ///
+    /// Oracle: Temurin 25 under
+    /// `--add-opens=java.base/java.net=ALL-UNNAMED`, via
+    /// `probes/AddOpensFlagProbe.java` (2026-08-09) —
+    /// `open java.net unqualified=false`, `open java.net toSelf=true`.
+    #[test]
+    fn add_opens_all_unnamed_is_qualified_to_the_unnamed_module_only() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.build_readability_graph();
+        reg.add_opens("modA", "com/secret", ALL_UNNAMED_TARGET);
+
+        assert!(
+            reg.check_deep_reflection_access(UNNAMED_MODULE, "modA", "com/secret")
+                .is_ok(),
+            "ALL-UNNAMED must grant the unnamed accessor deep access"
+        );
+        assert!(
+            !reg.is_package_open_unqualified("modA", "com/secret"),
+            "ALL-UNNAMED is a qualified open; Module.isOpen(pkg) must stay false"
+        );
+        assert!(
+            !reg.is_package_open_to("modA", "com/secret", "modB"),
+            "ALL-UNNAMED must not reach a named module"
+        );
+    }
+
+    /// The `--add-exports` half of the same token, so a later edit cannot fix
+    /// one direction and leave the other conflated.
+    #[test]
+    fn add_exports_all_unnamed_is_qualified_to_the_unnamed_module_only() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec!["com/secret".to_string()]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.build_readability_graph();
+        reg.add_exports("modA", "com/secret", ALL_UNNAMED_TARGET);
+
+        assert!(
+            reg.is_package_exported_to("modA", "com/secret", UNNAMED_MODULE),
+            "ALL-UNNAMED must export to the unnamed module"
+        );
+        assert!(
+            !reg.is_package_exported_unqualified("modA", "com/secret"),
+            "ALL-UNNAMED is a qualified export; Module.isExported(pkg) must stay false"
+        );
+        assert!(
+            !reg.is_package_exported_to("modA", "com/secret", "modB"),
+            "ALL-UNNAMED must not reach a named module"
+        );
+    }
+
+    /// The launcher's parse and the registry's resolution have to agree on the
+    /// token. They live in different crates (`vm::config` and this one) and the
+    /// bug was precisely that they disagreed, so pin the spelling here too.
+    #[test]
+    fn all_unnamed_token_matches_the_jdk_spelling() {
+        assert_eq!(ALL_UNNAMED_TARGET, "ALL-UNNAMED");
+        assert_eq!(resolve_edge_target(""), None);
+        assert_eq!(
+            resolve_edge_target(ALL_UNNAMED_TARGET),
+            Some(UNNAMED_MODULE.to_string())
+        );
+        assert_eq!(resolve_edge_target("modB"), Some("modB".to_string()));
     }
 
     #[test]

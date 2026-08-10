@@ -8,8 +8,11 @@ and `ZipContentTests` docs, not a hard deadlock as far as the evidence goes.**
 
 `module/spring-boot-webflux` has two different classes in this triage batch:
 `WebFluxManagementChildContextConfigurationIntegrationTests` (FAIL 5/5, a
-harness `--add-opens` gap — see
-`webfluxmanagementchildcontext-add-opens-not-forwarded-to-craton-20260807.md`)
+harness `--add-opens` gap — fixed 2026-08-09, see
+`docs/internal/fixed-suite-bugs/springboot/dirtiesurlfactories-craton-launcher-missing-add-opens-FIXED-20260809.md`;
+the doc it used to point at,
+`webfluxmanagementchildcontext-add-opens-not-forwarded-to-craton-20260807.md`,
+was one of three duplicates folded into that one)
 and this one, `WebFluxAutoConfigurationTests` (HANG). Different class,
 different symptom, unrelated root causes — noted explicitly because the
 names are easy to conflate.
