@@ -17332,6 +17332,68 @@ fn try_compile_inner(
                                     if callee_needs_ctx {
                                         needs_heap = true;
                                     }
+                                    // A raw JIT-to-JIT CALL has no Rust frame
+                                    // in between, so the ONLY thing that can
+                                    // notice the callee trapped is the
+                                    // callee-deopt service check the codegen
+                                    // emits after the CALL — and that check
+                                    // needs a `JitInvokeInfo` for this pc to
+                                    // name the callee it just invoked. The
+                                    // `continue` below skips the generic
+                                    // fallback registration at the end of this
+                                    // loop, so register one here, exactly as
+                                    // the `ArraycopyPrimitive` arm below does
+                                    // for the same reason.
+                                    //
+                                    // Without it the callee's `i64::MIN`
+                                    // sentinel reached THIS method's shared
+                                    // exception-check stub, which reloads the
+                                    // sentinel and returns — the callee's
+                                    // reconstructed frame stayed in the
+                                    // thread's one stash slot and travelled up
+                                    // to a consumer that could not attribute
+                                    // it. Measured on H2 `TestScript`:
+                                    // `ValueVarchar.get(String,
+                                    // CastDataProvider)` at pc 38 calls
+                                    // `StringUtils.cache`, which guard-bailed
+                                    // at its own bci 54, and the orphan
+                                    // surfaced two frames up
+                                    // (jit-inlined-callee-deopt-frame-has-no-caller-chain).
+                                    // 582 sites in one run had no service
+                                    // check; every one of them is a place an
+                                    // orphan can be minted.
+                                    //
+                                    // Note the sibling arm below (the
+                                    // INLINE-BAIL FALLBACK) already documents
+                                    // that it deliberately does NOT `continue`
+                                    // so this registration still happens; only
+                                    // this copy of the bind skipped it.
+                                    let class_box: Box<str> =
+                                        class_name.clone().into_boxed_str();
+                                    let method_box: Box<str> =
+                                        method_name.clone().into_boxed_str();
+                                    let desc_box: Box<str> =
+                                        descriptor.clone().into_boxed_str();
+                                    let class_ref = &*class_box as *const str;
+                                    let method_ref = &*method_box as *const str;
+                                    let desc_ref = &*desc_box as *const str;
+                                    owned_strings.push(class_box);
+                                    owned_strings.push(method_box);
+                                    owned_strings.push(desc_box);
+                                    let info = Box::new(JitInvokeInfo {
+                                        class_name: unsafe { &*class_ref },
+                                        method_name: unsafe { &*method_ref },
+                                        descriptor: unsafe { &*desc_ref },
+                                        num_jit_args,
+                                        return_type: ret_type,
+                                        invoke_kind,
+                                        declaring_class_id: cached
+                                            .declaring_class_id
+                                            .as_u32(),
+                                    });
+                                    let info_ptr: *const JitInvokeInfo = &*info;
+                                    owned_invoke_infos.push(info);
+                                    invoke_info.push((pc, info_ptr));
                                     direct_callee_entries.push(entry);
                                     direct_calls.push((
                                         pc,
