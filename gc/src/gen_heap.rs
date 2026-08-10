@@ -9378,6 +9378,14 @@ impl GenerationalHeap {
         // (walk start, or the end of a known free block). Entries above the
         // watermark were collected while striding an unverified stretch.
         let mut dead_watermark: usize = 0;
+        // H2-GCVAR: where the walk was last standing on ground truth (walk
+        // start, the parallel prefix's verified end, or a free block's end),
+        // and the object it strode immediately before the current cursor.
+        // The phantom-extent report needs both: it fires where the break is
+        // DETECTED, and the stride that caused it is upstream of that.
+        let mut last_anchor_off: usize = 0;
+        let mut objects_since_anchor: usize = 0;
+        let mut prev_obj: (usize, usize, u32, u8) = (0, 0, 0, 0);
         let mut objects_live: usize = 0;
 
         let mut cursor: usize = 0;
@@ -9497,6 +9505,8 @@ impl GenerationalHeap {
                 // sequential walk's trustworthy anchor for any later unwind.
                 dead_watermark = dead_regions.len();
                 cursor = sweep_anchors[sweep_anchors.len() - 1];
+                last_anchor_off = cursor;
+                objects_since_anchor = 0;
             }
         }
         report_phase("sweep-walk-parallel-prefix");
@@ -9543,6 +9553,8 @@ impl GenerationalHeap {
                 if resynced {
                     // A free block's end is ground truth — a fresh anchor.
                     dead_watermark = dead_regions.len();
+                    last_anchor_off = cursor;
+                    objects_since_anchor = 0;
                     continue;
                 }
             }
@@ -9986,6 +9998,18 @@ impl GenerationalHeap {
                             num_slots = header.num_slots(),
                             victim = format!("{victim:#x}"),
                             victim_interior_offset = victim - abs,
+                            // Where the walk last stood on ground truth, and the
+                            // stride that took it from there to here. The break is
+                            // upstream of the detection: if `prev_*` sizes an object
+                            // that does not end at this offset, `prev_` IS the
+                            // mis-sized stride; if it does, look further back, and
+                            // `objects_since_anchor` says how far there is to look.
+                            last_anchor_off,
+                            objects_since_anchor,
+                            prev_off = prev_obj.0,
+                            prev_size = prev_obj.1,
+                            prev_class_id = prev_obj.2,
+                            prev_kind_byte = prev_obj.3,
                             "young non-moving sweep: the header at this offset claims an \
                              extent that SUBSUMES a live (marked) object. Live objects never \
                              nest, so the walk is off the object grid here. Re-anchoring at \
@@ -10004,16 +10028,27 @@ impl GenerationalHeap {
                                 free_iter.next();
                             }
                             cursor = a;
+                            last_anchor_off = cursor;
+                            objects_since_anchor = 0;
                             continue;
                         }
                     }
                     if resync_to_next_free_block(&mut cursor, &mut free_iter) {
+                        last_anchor_off = cursor;
+                        objects_since_anchor = 0;
                         continue;
                     }
                     break;
                 }
             }
 
+            prev_obj = (
+                cursor,
+                total_size,
+                header.class_id.as_u32(),
+                ObjectHeader::kind_tag(header.mark_word.load(Ordering::Relaxed)),
+            );
+            objects_since_anchor += 1;
             walked_count += 1;
             if retain_full_walk {
                 walked.push_back((
