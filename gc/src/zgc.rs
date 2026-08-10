@@ -5551,6 +5551,23 @@ impl GarbageCollector for ZgcRealHeap {
                     arena.add_free_block(off, sz);
                 }
             }
+            // Un-bump a wholly-free tail. Coalescing above has made the topmost
+            // span maximal, so this is one comparison — and it is the only
+            // thing on a non-compacting heap that can restore a large
+            // CONTIGUOUS region. Objects die young, so the top of the arena is
+            // usually all garbage; without this the cursor is a one-way ratchet
+            // and a 16 MB array becomes unservable forever once the process has
+            // allocated its capacity, with 1.8 GB free and 15% live. See
+            // `Arena::retract_cursor_into_free_tail`.
+            let reclaimed_tail = arena.retract_cursor_into_free_tail();
+            if reclaimed_tail != 0 {
+                tracing::debug!(
+                    target: "cratonvm::gc",
+                    bytes = reclaimed_tail,
+                    cursor = arena.used(),
+                    "zgc sweep: retracted the bump cursor into a free tail",
+                );
+            }
         }
 
         if unsizable != 0 {
