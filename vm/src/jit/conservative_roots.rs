@@ -1580,6 +1580,14 @@ impl UnregMemo {
         // `verified_ranges` is still recorded, so
         // `CRATONVM_DBG_UNREG_MEMO_AUDIT` can still report on it, but it no
         // longer gates the verdict.
+        // Never verified anything: there is no band to be frozen, so scan the
+        // whole stack. Stated explicitly rather than falling out of
+        // `floor == usize::MAX` arithmetic, which reaches the same answer only
+        // because the call site clamps an out-of-range `hi` back to
+        // `stack_high`.
+        if self.verified_lo == usize::MAX {
+            return UnregScan::Detect { hi: None };
+        }
         if search_lo >= floor {
             return UnregScan::AlreadyClean;
         }
