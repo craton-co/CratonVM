@@ -33,14 +33,17 @@ set -uo pipefail
 export MSYS2_ARG_CONV_EXCL='*'
 export MSYS_NO_PATHCONV=1
 
-# --- locations (Windows-form paths: the VM and JVM need native paths) --------
-HERE="C:/craton/CratonVM/apps/hib-suite-runner"
+# --- locations ----------------------------------------------------------------
+# $HERE resolves to wherever THIS script actually lives, not a hardcoded
+# checkout path -- so a worktree with its own generated fixture data
+# ($COMMON, the test lists, the compiled runner -- none of them tracked in
+# git) is fully self-contained, while a copy of the script that still sits
+# next to the original fixture data keeps resolving there exactly as before.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 COMMON="$HERE/common.args"          # -cp + sysprops + junit timeout
 RUNNER_CLASS="CratonRunner"         # compiled in $HERE, already on the classpath
-# The fixture data ($COMMON, the test lists, the compiled runner) only ever
-# exists in the main checkout, hence the hardcoded $HERE. The override table is
-# different: it is tracked, so it also exists next to whichever copy of this
-# script is being executed. Prefer that one, fall back to $HERE.
+# The override table below is tracked, so it exists next to whichever copy of
+# this script is being executed -- same $SELF_DIR-vs-$HERE fallback shape.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 OVERRIDES="${HIB_CLASS_OVERRIDES:-}"
 if [ -z "$OVERRIDES" ]; then
@@ -66,7 +69,7 @@ detect_jdk() {
            "C:/Program Files/Java"/jdk-25* \
            "C:/Program Files/Eclipse Adoptium"/jdk-2* \
            "C:/Program Files/Java"/jdk-2*; do
-    [ -x "$c/bin/java.exe" ] && { printf '%s' "$c"; return 0; }
+    [ -x "$c/bin/java.exe" ] && { printf "%s" "$c"; return 0; }; [ -x "$c/bin/java" ] && { printf "%s" "$c"; return 0; }
   done
   return 1
 }
@@ -295,7 +298,7 @@ cd "$HERE" || { echo "ERROR: cannot cd to fixture dir: $HERE" >&2; exit 1; }
 
 [ -f "$CV_BIN" ] || { echo "ERROR: cratonvm binary not found: $CV_BIN (set --bin or CV_BIN)" >&2; exit 1; }
 [ -f "$COMMON" ] || { echo "ERROR: common.args not found: $COMMON" >&2; exit 1; }
-[ -x "$JDK/bin/java.exe" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set --jdk-home via JDK=... env)" >&2; exit 1; }
+[ -x "$JDK/bin/java.exe" ] || [ -x "$JDK/bin/java" ] || { echo "ERROR: real JDK not found: '${JDK:-<none detected>}' (set --jdk-home via JDK=... env)" >&2; exit 1; }
 mkdir -p "$OUTROOT"
 TS="$(date +%Y%m%d-%H%M%S)"
 
