@@ -386,14 +386,14 @@ unsafe fn object_from_u64(addr: u64) -> ObjectRef {
 /// field layout — the difference is purely the `getClass()` mirror the
 /// bytecode observes.
 ///
-/// # This is the state that blocks `java/util/logging`'s retirement
+/// # The state that blocked `java/util/logging`'s retirement
 ///
-/// The singleton is ALLOCATED here and never CONSTRUCTED: `<init>` does not
-/// run, and only four of its fourteen slots are written. Measured against
-/// HotSpot 25.0.3 on 2026-08-11 (`--add-opens
+/// Until 2026-08-11 the singleton was ALLOCATED here and never CONSTRUCTED:
+/// `<init>` did not run, and only four of its fourteen slots were written.
+/// Measured against HotSpot 25.0.3 on 2026-08-11 (`--add-opens
 /// java.logging/java.util.logging=ALL-UNNAMED`, reflecting the object
-/// `LogManager.getLogManager()` returns), eight reference fields are null here
-/// and real there: `props`, `systemContext`, `userContext`, `rootLogger`,
+/// `LogManager.getLogManager()` returns), eight reference fields were null
+/// here and real there: `props`, `systemContext`, `userContext`, `rootLogger`,
 /// `configurationLock`, `closeOnResetLoggers`, `listeners`, `loggerRefQueue`.
 ///
 /// That was survivable for as long as every accessor was a native. It stopped
@@ -407,23 +407,115 @@ unsafe fn object_from_u64(addr: u64) -> ObjectRef {
 /// `synthetic-stub` scores 0/17. Compatible mode is unaffected, because a
 /// `SyntheticStub` still dispatches there.
 ///
-/// So the "null is safe" argument below is no longer true in strict mode, and
-/// the fix is one of two things — hold the four `systemContext`/`rootLogger`
-/// dereferencing triples back in `native-api/src/retired_shadow.rs` the way
-/// `Logger.log(Level, Supplier, Throwable)` is held back, or build the
-/// singleton through its real constructor. Both are written out in
-/// docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md.
-/// Do not "simplify" the nulls away without reading it: they are what several
-/// natives in this file assume.
+/// # The fix taken here: run the real `<init>`
+///
+/// The campaign's own rule is that a class's state has to become REAL before
+/// its shadow can retire, so the hold-back is the interim and this is the
+/// answer. `javap -p -c --module java.logging java.util.logging.LogManager` on
+/// Temurin 25.0.3 — the ctor is 114 bytes and every one of them is a field
+/// store:
+///
+/// ```text
+///   props               = new Properties()
+///   systemContext       = new LogManager$SystemLoggerContext(this)
+///   userContext         = new LogManager$LoggerContext(this)
+///   configurationLock   = new ReentrantLock()
+///   closeOnResetLoggers = new CopyOnWriteArrayList()
+///   listeners           = Collections.synchronizedMap(new IdentityHashMap())
+///   initializedCalled = false; initializationDone = false
+///   loggerRefQueue      = new ReferenceQueue()
+///   Runtime.getRuntime().addShutdownHook(new Cleaner(this))  // catches ISE
+/// ```
+///
+/// That is SEVEN of the eight null fields, including the `systemContext` whose
+/// dereference is the NPE. It calls nothing that re-enters `getLogManager()`,
+/// so running it from inside the singleton's own construction cannot recurse.
+///
+/// **`rootLogger` stays null, and that is not a residual defect — it is what
+/// the JDK does for a manager that is not the static one.** `rootLogger` is
+/// written only by `ensureLogManagerInitialized`, which returns immediately
+/// unless `this == LogManager.manager`, and this singleton is never installed
+/// in that static field. Every consumer on the `getLogger` path is guarded to
+/// match: `LoggerContext.requiresDefaultLoggers()` is `getOwner() ==
+/// LogManager.manager` and so answers `false`, which short-circuits
+/// `ensureInitialized`/`ensureAllDefaultLoggers` before they read it;
+/// `ensureDefaultLogger` branches on `arg == null` to a bare `return` (the
+/// `AssertionError` after it is behind `$assertionsDisabled`); and
+/// `processParentHandlers` only compares against it with `if_acmpeq`. Read off
+/// the bytecode, not inferred. Making it real means making this object BE
+/// `LogManager.manager`, which is a much larger change than the one the
+/// regression needs — see the W7-25 record for why that was not taken.
+///
+/// **Compatible mode is unchanged, and by the mechanism rather than by a mode
+/// test.** `java/util/logging/LogManager.<init>()V` is a retired shadow, and a
+/// retired shadow still DISPATCHES in `Compatible` — to `native_jboss_init`,
+/// which is a bare `Ok(None)`. So the `invoke` below writes nothing there and
+/// runs the real ctor only in `--jdk-only`, where the retirement refuses the
+/// native. Nothing here branches on the mode, which is deliberate: a mode test
+/// would be a second thing to keep in sync with `retired_shadow.rs`.
+///
+/// **Nothing in this crate reads the slots the ctor now fills.** Checked, not
+/// assumed: `LM_FIELD_PROPERTIES` and `LM_FIELD_ROOT_LOGGER` appear at exactly
+/// two sites each in `native-builtins/`, both of them the writes in this
+/// function. The four slots have always been write-only, which is why handing
+/// them real values cannot change what any native in this file answers — only
+/// what the real bytecode reading the same object sees.
+///
+/// A failure is swallowed rather than propagated, so the worst case is
+/// today's behaviour rather than a new one — same disposition, and for the
+/// same reason, as `try_allocate_property_log_manager`'s `<init>` call below.
 fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
-    let obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
-    // Leave slot 0 as `null` — a properly-initialized `Properties` would
-    // round-trip through synthetic HashMap natives, but most Quarkus/JBoss
-    // code reads it via accessors we no-op, so null is safe. TRUE ONLY IN
-    // COMPATIBLE MODE since the shadow retirement; see the doc comment.
-    ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
+    let mut obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
+    // Only the JDK class has a real ctor to run. `org.jboss.logmanager.LogManager`
+    // is a fabricated class with no bytecode at all, and its `<init>` is the
+    // same no-op native by design (see `native_jboss_init`), so asking for it
+    // would be a call that cannot do anything.
+    if class_name == CLS_JUL_LOG_MANAGER {
+        // GC SAFETY: the ctor above allocates eight objects, several of them
+        // (`IdentityHashMap`, `ConcurrentHashMap` inside each `LoggerContext`)
+        // large enough to trigger a moving collection, so the receiver can be
+        // relocated by its own constructor. `ctx.invoke` — unlike
+        // `new_object_initialized` — does not forward it for us, and the caller
+        // caches this address as the process-wide singleton, so a stale one
+        // here would be handed out for the lifetime of the VM.
+        let pin = ctx.pin_native_root(obj);
+        let init = ctx.invoke(
+            CLS_JUL_LOG_MANAGER,
+            "<init>",
+            "()V",
+            &[Value::Object(Some(obj))],
+        );
+        obj = ctx.read_native_pin(pin, obj);
+        ctx.unpin_native_roots(pin);
+        if let Err(e) = init {
+            // A throw can leave the object half-constructed, which is a state
+            // neither this file's natives nor the real bytecode were written
+            // for. Put the two slots this function has always owned back to
+            // the shape the rest of the file assumes and carry on: strict-mode
+            // JUL is then as broken as it was before this change, and no worse.
+            tracing::warn!(
+                error = ?e,
+                "java.util.logging.LogManager.<init> threw; the singleton keeps the \
+                 pre-2026-08-11 null-field shape and strict-mode Logger.getLogger \
+                 will still NPE on the null systemContext"
+            );
+            ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
+            ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
+        }
+    } else {
+        // Leave slot 0 as `null` — a properly-initialized `Properties` would
+        // round-trip through synthetic HashMap natives, but the JBoss-classed
+        // singleton is read through accessors we no-op, so null is safe. That
+        // argument was the whole file's until 2026-08-11 and now holds only
+        // for the class that has no bytecode to run.
+        ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
+        ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
+    }
+    // The two VM-internal slots are written LAST on purpose: they live past
+    // `LM_REAL_FIELDS`, so a real `<init>` cannot reach them, but writing them
+    // before an `invoke` that can move the object would mean writing them
+    // through a reference the ctor then invalidates.
     ctx.set_field(obj, LM_FIELD_LOGGER_REGISTRY, Value::Object(None));
-    ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_READY, Value::Int(1));
     Ok(obj)
 }
