@@ -4477,18 +4477,24 @@ mod jar_mtime_memo_tests {
     ///
     /// Two things worth one test between them:
     ///
-    /// * `enforcement_active()` is unconditionally true in debug builds, which
+    /// * `enforcement_active()` is unconditionally true in DEBUG builds, which
     ///   is what makes every other test in this module a live check of the
     ///   ordering claim rather than a run with the checker asleep. Asserting it
-    ///   here means a future change that makes enforcement conditional turns
-    ///   this module from silently vacuous into loudly red.
+    ///   there means a future change that makes debug enforcement conditional
+    ///   turns this module from silently vacuous into loudly red. The
+    ///   assertion is `cfg`-gated because in RELEASE enforcement is off unless
+    ///   `CRATONVM_LOCK_ORDER_CHECK` is set, and `cargo test --release` runs
+    ///   this test too — an ungated assert here fails on a correct tree, which
+    ///   is how the first version of it was caught.
     /// * `jar_path_mtime` on a MISS takes the memo lock, drops it, and only
     ///   then calls `jar_path_mtime_probe`, which takes it again. The guard
     ///   used to live in an `if let` scrutinee, where it outlives the body —
     ///   and `parking_lot` is not reentrant, so getting that wrong is a hang,
-    ///   not a failure. A hang is exactly what this asserts the absence of.
+    ///   not a failure. A hang is exactly what this asserts the absence of, and
+    ///   it is profile-independent, so that half runs in both.
     #[test]
     fn memo_lock_is_order_checked_and_not_re_entered_on_a_miss() {
+        #[cfg(debug_assertions)]
         assert!(
             cratonvm_types::lock_order::enforcement_active(),
             "debug builds must enforce lock order, or this module's ordering \
