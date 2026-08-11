@@ -16,6 +16,27 @@ apps\tomcat-suite-runner\run-one.ps1 `
   -Exe <cratonvm.exe> -TimeoutSec 900
 ```
 
+**Before 2026-08-10 this did not reach the assertion at all.** The fixture died
+in `LifecycleBase.start` with
+
+```
+Unable to create WebResourceSet from [<docBase>\file:\C:\…\WEB-INF\lib\bug69135-lib.jar]
+```
+
+which is a **different defect that masks this one**: `URL.toURI()` allocated a
+real `java/net/URI` and wrote only the SYNTHETIC positional slots into it, so
+the field the real bytecode reads (`string`) stayed null and every
+`url.toURI()` stringified to empty. `StandardRoot.processWebInfLib`'s
+`new File(uri)` then produced a File whose path was the whole URL text, which
+is not absolute, so it was resolved against the doc base. Fixed by populating
+the named fields the way `File.toURI()` always has (`url_parse` +
+`uri_store_named`); `probes/FileUrlShapeProbe.java` is the differential and is
+byte-identical to HotSpot on both platforms now.
+
+Worth knowing before trusting a green run here: **any** webapp test with a
+`WEB-INF/lib/*.jar` was failing at startup, so a Tomcat suite result from
+before that fix is not evidence about this test's own assertion.
+
 ## It is NOT the defect that was fixed three times
 
 Every lever the previous three writeups turned is inert now. This matters more
