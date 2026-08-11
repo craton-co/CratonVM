@@ -3528,23 +3528,36 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
 /// bug: all topic states share one consumer-set key, so only the last topic was
 /// grouped → rack-aware assignment skipped for the others). Invoking the real
 /// `equals` closes the gap for arbitrary key types.
-fn group_key_equal(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> bool {
+///
+/// Fallible for the reason [`map_keys_equal`] already states, and this is the
+/// same defect one function over: `if let Ok(..)` folded a thrown or refused
+/// `equals` into `false`, so a failing key comparison did not fail — it opened
+/// a new group. `groupingBy` then answered a map with one bucket per element
+/// and no exception, which is a wrong answer wearing the shape of a correct
+/// one. A non-exceptional contract violation (the callee returned a non-`Int`)
+/// still falls through as `false`, exactly as in `map_keys_equal`.
+fn group_key_equal(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, MethodCallFailed> {
     if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
         if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
-            return true;
+            return Ok(true);
         }
-        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+        return match ctx.invoke_virtual(
             *oa,
             "equals",
             "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(*ob))],
         ) {
-            return v != 0;
-        }
-        return false;
+            Ok(Some(Value::Int(v))) => Ok(v != 0),
+            Err(e) => Err(e),
+            _ => Ok(false),
+        };
     }
     // Primitives / null: the cheap structural comparison is exact.
-    values_equal(&*ctx, a, b)
+    Ok(values_equal(&*ctx, a, b))
 }
 
 /// `List.contains`/`indexOf` element comparison with full JDK semantics.
@@ -17578,10 +17591,18 @@ fn stream_read_chain(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<LazyOp> {
 
 /// Raw SOURCE elements of a (lazy) synthetic stream — slot 0, BEFORE the op-chain
 /// is applied. Drains a lazy spliterator source first.
-fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+///
+/// The drain is the fallible part, and the `let _ =` on it was the launderer:
+/// a spliterator whose `tryAdvance` refused or threw left slot 0 holding
+/// whatever it held before, and the pull below then read that as the stream's
+/// source — a truncated or empty pipeline, with no exception anywhere.
+fn stream_source_elems(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
     let this_pin = ctx.pin_native_root(this);
     let this_cur = ctx.read_native_pin(this_pin, this);
-    let _ = materialize_lazy_stream(ctx, this_cur);
+    let drained = materialize_lazy_stream(ctx, this_cur);
     let this_cur = ctx.read_native_pin(this_pin, this);
     let elems = match ctx.get_field(this_cur, STREAM_FIELD_ELEMENTS) {
         Value::Object(Some(arr)) => {
@@ -17590,8 +17611,11 @@ fn stream_source_elems(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Valu
         }
         _ => Vec::new(),
     };
+    // Unpin before propagating: a `?` on `drained` at its own line would skip
+    // the truncate below.
     ctx.unpin_native_roots(this_pin);
-    elems
+    drained?;
+    Ok(elems)
 }
 
 /// Build a lazy derived stream that appends op `(kind, lambda, aux)` to `src`'s
@@ -18032,7 +18056,7 @@ fn stream_pull_internal(
             });
         }
 
-        let base = stream_source_elems(ctx, stream);
+        let base = stream_source_elems(ctx, stream)?;
         let (_, base_pins) = pin_value_slice(ctx, &base);
         // GC-SAFETY (register-invisible-root closeable gap -- see
         // `NativeContext::refresh_root_snapshot`'s doc comment): same
@@ -18190,7 +18214,7 @@ fn stream_pull_synthetic_downstream(
             });
         }
 
-        let base = stream_source_elems(ctx, stream_cur);
+        let base = stream_source_elems(ctx, stream_cur)?;
         let (_, base_pins) = pin_value_slice(ctx, &base);
         let mut state = stream_new_pull_state(chain.len());
         for (idx, v) in base.iter().copied().enumerate() {
@@ -18851,28 +18875,36 @@ fn stream_elements_mut(
 /// `toArray()` (`()[I` / `()[J` / `()[D`, NOT `()[Ljava/lang/Object;`). `toarray_desc`
 /// selects the right one. Used by `flatMap`, whose mapper commonly returns such
 /// real primitive streams.
+///
+/// Fallible for the reason on [`collection_elements_generic`]: the receiver
+/// here is frequently a REAL JDK pipeline, so `toArray` is real bytecode that
+/// can throw — and the `let _ =` on the drain plus the catch-all
+/// `_ => Vec::new()` turned both a thrown exception and a strict refusal into
+/// "that sub-stream was empty", which `flatMap` then concatenated into its
+/// result as if it were.
 fn prim_stream_values(
     ctx: &mut dyn NativeContext,
     stream: ObjectRef,
     toarray_desc: &str,
-) -> Vec<Value> {
-    let _ = materialize_lazy_stream(ctx, stream);
+) -> Result<Vec<Value>, MethodCallFailed> {
+    materialize_lazy_stream(ctx, stream)?;
     let cn = ctx
         .class_name_of_id(ctx.class_id_of_object(stream))
         .unwrap_or_default();
     if is_synthetic_stream(&cn) {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
-            return (0..len).map(|i| ctx.get_array_element(arr, i)).collect();
+            return Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect());
         }
-        return Vec::new();
+        return Ok(Vec::new());
     }
     match ctx.invoke_virtual(stream, "toArray", toarray_desc, &[]) {
         Ok(Some(Value::Object(Some(arr)))) => {
             let len = ctx.array_length(arr);
-            (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+            Ok((0..len).map(|i| ctx.get_array_element(arr, i)).collect())
         }
-        _ => Vec::new(),
+        Err(e) => Err(e),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -23820,7 +23852,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     for (gi, (gk, _)) in groups.iter().enumerate() {
                         let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
                         let key_cur = read_pinned_elem(ctx, key_handle, key);
-                        if group_key_equal(ctx, &gk, &key_cur) {
+                        if group_key_equal(ctx, &gk, &key_cur)? {
                             found_idx = Some(gi);
                             break;
                         }
@@ -23946,7 +23978,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     for (gi, (gk, _)) in groups.iter().enumerate() {
                         let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
                         let key_cur = read_pinned_elem(ctx, key_handle, key);
-                        if group_key_equal(ctx, &gk, &key_cur) {
+                        if group_key_equal(ctx, &gk, &key_cur)? {
                             found_idx = Some(gi);
                             break;
                         }
@@ -24056,7 +24088,7 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     for (gi, (gk, _)) in groups.iter().enumerate() {
                         let gk = read_pinned_elem(ctx, group_key_handles[gi], *gk);
                         let key_cur = read_pinned_elem(ctx, key_handle, key);
-                        if group_key_equal(ctx, &gk, &key_cur) {
+                        if group_key_equal(ctx, &gk, &key_cur)? {
                             found_idx = Some(gi);
                             break;
                         }
@@ -24948,13 +24980,26 @@ fn native_int_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // `stream_elements_mut` (toArray) which handles both synthetic and real.
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
-    let els = prim_stream_values(ctx, this, "()[I");
+    // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
+    let els = match prim_stream_values(ctx, this, "()[I") {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(f_pin);
+            return Err(e);
+        }
+    };
     let mut out = Vec::new();
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(I)Ljava/lang/Object;", &[*e]) {
             Ok(Some(Value::Object(Some(sub)))) => {
-                out.extend(prim_stream_values(ctx, sub, "()[I"));
+                match prim_stream_values(ctx, sub, "()[I") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -26134,13 +26179,26 @@ fn native_long_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
-    let els = prim_stream_values(ctx, this, "()[J");
+    // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
+    let els = match prim_stream_values(ctx, this, "()[J") {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(f_pin);
+            return Err(e);
+        }
+    };
     let mut out = Vec::new();
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(J)Ljava/lang/Object;", &[*e]) {
             Ok(Some(Value::Object(Some(sub)))) => {
-                out.extend(prim_stream_values(ctx, sub, "()[J"));
+                match prim_stream_values(ctx, sub, "()[J") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -26808,13 +26866,26 @@ fn native_double_stream_flat_map(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let f_pin = ctx.pin_native_root(f);
-    let els = prim_stream_values(ctx, this, "()[D");
+    // `f_pin` is live, so this unwinds exactly as the `apply` arm below does.
+    let els = match prim_stream_values(ctx, this, "()[D") {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.unpin_native_roots(f_pin);
+            return Err(e);
+        }
+    };
     let mut out = Vec::new();
     for e in &els {
         let f = ctx.read_native_pin(f_pin, f);
         match ctx.invoke_virtual(f, "apply", "(D)Ljava/lang/Object;", &[*e]) {
             Ok(Some(Value::Object(Some(sub)))) => {
-                out.extend(prim_stream_values(ctx, sub, "()[D"));
+                match prim_stream_values(ctx, sub, "()[D") {
+                    Ok(v) => out.extend(v),
+                    Err(e) => {
+                        ctx.unpin_native_roots(f_pin);
+                        return Err(e);
+                    }
+                }
             }
             Ok(_) => {}
             Err(e) => {
