@@ -1640,9 +1640,25 @@ pub(crate) fn cv_trace_enabled() -> bool {
 /// `get(Ljava/lang/Class;)Ljava/lang/Object;` signature the `ClassValue`
 /// native answers? (Class-blind on purpose — the probe wants every route.)
 fn cv_trace_match(info: &JitInvokeInfo) -> bool {
+    // `CRATONVM_DBG_MIC_METHOD=<substring>` retargets this trace at any method.
+    // It was hardcoded to one investigation's `get(Class)Object` site, which
+    // made it useless for the next one; the MIC is the single hardest place in
+    // the VM to observe, so the instrument should not need a rebuild to move.
+    if let Some(want) = mic_trace_method_filter() {
+        return info.method_name.contains(want);
+    }
     info.method_name == "get"
         && info.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
         && cv_trace_enabled()
+}
+
+/// `CRATONVM_DBG_MIC_METHOD` — retarget [`cv_trace_match`] at an arbitrary
+/// method name (substring match).
+fn mic_trace_method_filter() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static F: OnceLock<Option<String>> = OnceLock::new();
+    F.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MIC_METHOD").ok())
+        .as_deref()
 }
 
 // SAFETY: `vm` must be live for the call, and `receiver` must be a valid
@@ -12718,6 +12734,19 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 true,
             )
         };
+        if cv_trace {
+            eprintln!(
+                "[cv-mic-compile] site={}.{}{} recv_cid={} resolved_class={} cacheable={} globally_named={} compiled={}",
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+                receiver_cid,
+                class_name,
+                cacheable_receiver,
+                globally_named,
+                compile_res.is_some(),
+            );
+        }
         // Keep handler-bearing methods on the helper path. A raw compiled
         // entry can leave a pending exceptional frame that the caller cannot
         // safely resume while the HTTP request is still active.
