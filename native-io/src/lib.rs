@@ -850,7 +850,7 @@ fn file_not_found(path: &str) -> MethodCallFailed {
 /// The stat happens before the open rather than on the resulting descriptor
 /// (the fd table hands back an `FdId`, not a `File`); the resulting TOCTOU
 /// window can only mis-decide if the path changes kind mid-open.
-fn reject_directory_open(path: &str) -> Result<(), MethodCallFailed> {
+pub(crate) fn reject_directory_open(path: &str) -> Result<(), MethodCallFailed> {
     if fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
         return Err(file_not_found(&format!("{path} (Is a directory)")));
     }
