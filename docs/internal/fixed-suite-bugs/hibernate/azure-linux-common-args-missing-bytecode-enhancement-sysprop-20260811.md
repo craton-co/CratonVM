@@ -69,7 +69,7 @@ Verified: rerunning the 396 classes in `others.txt` (the full non-passed
 set from the broken run) with this line added produced `PASS=295`,
 collapsing `FAIL` from 305 to 7 and `HANG` from 4 to 2, leaving only the
 genuine CratonVM-vs-HotSpot residual (see the companion doc,
-`hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md`).
+`../../../known-issues/hibernate/hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md`).
 
 ## Not yet done
 
@@ -98,6 +98,6 @@ test runs, on both CratonVM and real HotSpot.
 
 ## Related
 
-- `hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md` — the genuine
+- `../../../known-issues/hibernate/hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md` — the genuine
   CratonVM-specific residual left after this fix, verified against real
   HotSpot on the same host/classpath.

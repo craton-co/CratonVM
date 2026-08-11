@@ -127,7 +127,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::Hasher;
 
 // ---------------------------------------------------------------------------
@@ -16781,6 +16781,10 @@ fn try_compile_inner(
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
     let mut ldc_string_info: Vec<(usize, *const u8, usize)> = Vec::new();
     let mut ldc_class_info: Vec<(usize, u32, u16)> = Vec::new();
+    // The `is_float`/`is_double` halves the codegen throws away. The deopt
+    // operand-stack snapshot has no consuming opcode to ask for the width, so
+    // it needs the constant-pool tag itself — see `Compiler::ldc_fp_pcs`.
+    let mut ldc_fp_pcs: FxHashSet<usize> = FxHashSet::default();
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
@@ -16788,7 +16792,12 @@ fn try_compile_inner(
                     // The single-pass backend ignores `is_float`: it pushes the
                     // bits and the consuming opcode picks the width. See the
                     // variant's doc for why the IR builder cannot.
-                    Some(JitLdcConstant::Immediate { bits, .. }) => ldc_info.push((pc, bits)),
+                    Some(JitLdcConstant::Immediate { bits, is_float }) => {
+                        ldc_info.push((pc, bits));
+                        if is_float {
+                            ldc_fp_pcs.insert(pc);
+                        }
+                    }
                     Some(JitLdcConstant::ClassMirror {
                         holder_class_id,
                         cp_idx,
@@ -16839,7 +16848,7 @@ fn try_compile_inner(
             jitc_bail!("cp_ldc2w_resolver")
         };
         for &(pc, cp_idx) in &scan.ldc2w_ops {
-            let (val, _is_double) = match resolver(cp_idx) {
+            let (val, is_double) = match resolver(cp_idx) {
                 Some(v) => v,
                 None => {
                     // RBC.7 twin: a non-Long/Double constant at this ldc2_w
@@ -16849,6 +16858,9 @@ fn try_compile_inner(
                 }
             };
             ldc2w_info.push((pc, val));
+            if is_double {
+                ldc_fp_pcs.insert(pc);
+            }
         }
     }
 
@@ -18236,6 +18248,7 @@ fn try_compile_inner(
         ldc_string_info,
         ldc_class_info,
         ldc2w_info,
+        ldc_fp_pcs,
         branch_hints,
         loop_unroll_hints,
         helpers,

@@ -90,6 +90,6 @@ companion doc, or every class in this suite fails for an unrelated reason.
 
 ## Related
 
-- `azure-linux-common-args-missing-bytecode-enhancement-sysprop-20260811.md`
+- `../../internal/fixed-suite-bugs/hibernate/azure-linux-common-args-missing-bytecode-enhancement-sysprop-20260811.md`
   — the harness config gap that produced the other 296 false positives this
   same run.

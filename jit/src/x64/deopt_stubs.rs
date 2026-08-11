@@ -131,11 +131,23 @@ impl Compiler {
             .chain(self.ldc_class_info.iter().map(|&(pc, _, _)| pc))
             .collect();
 
+        // Only pcs the constant-pool resolver actually reduced to an immediate.
+        // A site it never saw must stay `Unknown` rather than default to the
+        // non-floating-point member of its pair.
+        let ldc_resolved: FxHashSet<usize> = self
+            .ldc_info
+            .iter()
+            .map(|&(pc, _)| pc)
+            .chain(self.ldc2w_info.iter().map(|&(pc, _)| pc))
+            .collect();
+
         let inputs = StackKindInputs {
             field_types,
             static_types,
             calls,
             ldc_refs: &ldc_refs,
+            ldc_fp: &self.ldc_fp_pcs,
+            ldc_resolved: &ldc_resolved,
         };
         self.stack_kinds = analyze(code, code_len, &inputs);
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STACK_KINDS").is_some() {
