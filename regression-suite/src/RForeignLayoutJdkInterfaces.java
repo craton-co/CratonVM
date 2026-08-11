@@ -324,12 +324,111 @@ public class RForeignLayoutJdkInterfaces {
         System.out.println("CK RForeignLayoutJdkInterfaces realProcess=ok");
     }
 
+    /**
+     * java.lang.management (ThreadMXBean 26, RuntimeMXBean 17) and
+     * javax.management.MBeanServer (15). The MXBean interfaces are the family
+     * an agent or a JMX connector most often stands a proxy in front of -- the
+     * JDK's own {@code ManagementFactory.newPlatformMXBeanProxy} does exactly
+     * this -- so a native intercepting them would answer THIS VM's numbers for
+     * a bean that is not this VM.
+     */
+    static void managementBeans() throws Exception {
+        Recorder t = new Recorder("thr");
+        java.lang.management.ThreadMXBean tb =
+                proxy(java.lang.management.ThreadMXBean.class, t);
+        check(tb.getThreadCount() == I, "ThreadMXBean.getThreadCount");
+        check(tb.getPeakThreadCount() == I, "ThreadMXBean.getPeakThreadCount");
+        check(tb.getDaemonThreadCount() == I, "ThreadMXBean.getDaemonThreadCount");
+        check(tb.getTotalStartedThreadCount() == L, "ThreadMXBean.getTotalStartedThreadCount");
+        check(tb.getCurrentThreadCpuTime() == L, "ThreadMXBean.getCurrentThreadCpuTime");
+        check(tb.isThreadCpuTimeSupported() == B, "ThreadMXBean.isThreadCpuTimeSupported");
+        check(tb.getAllThreadIds() == null, "ThreadMXBean.getAllThreadIds");
+        check(tb.findDeadlockedThreads() == null, "ThreadMXBean.findDeadlockedThreads");
+        check(t.seen.size() == 8, "ThreadMXBean: 8 calls, saw " + t.seen.size());
+
+        Recorder rt = new Recorder("rt");
+        java.lang.management.RuntimeMXBean rb =
+                proxy(java.lang.management.RuntimeMXBean.class, rt);
+        check(rb.getUptime() == L, "RuntimeMXBean.getUptime");
+        check(rb.getStartTime() == L, "RuntimeMXBean.getStartTime");
+        check("SENTINEL-rt-getName".equals(rb.getName()), "RuntimeMXBean.getName");
+        check("SENTINEL-rt-getVmName".equals(rb.getVmName()), "RuntimeMXBean.getVmName");
+        check("SENTINEL-rt-getVmVersion".equals(rb.getVmVersion()), "RuntimeMXBean.getVmVersion");
+        check(rb.getInputArguments() == null, "RuntimeMXBean.getInputArguments");
+        check(rb.getSystemProperties() == null, "RuntimeMXBean.getSystemProperties");
+        check(rt.seen.size() == 7, "RuntimeMXBean: 7 calls, saw " + rt.seen.size());
+
+        Recorder ms = new Recorder("mbs");
+        javax.management.MBeanServer srv = proxy(javax.management.MBeanServer.class, ms);
+        check(srv.getMBeanCount() == null, "MBeanServer.getMBeanCount");
+        check(srv.getDefaultDomain() == null, "MBeanServer.getDefaultDomain");
+        check(srv.getDomains() == null, "MBeanServer.getDomains");
+        check(srv.queryNames(null, null) == null, "MBeanServer.queryNames");
+        check(srv.isRegistered(null) == B, "MBeanServer.isRegistered");
+        check(ms.seen.size() == 5, "MBeanServer: 5 calls, saw " + ms.seen.size());
+        System.out.println("CK RForeignLayoutJdkInterfaces thr=" + t.seen.size()
+                + " rt=" + rt.seen.size() + " mbs=" + ms.seen.size());
+
+        // The REAL beans are unaffected.
+        check(java.lang.management.ManagementFactory.getThreadMXBean().getThreadCount() > 0,
+                "the real ThreadMXBean reports at least one thread");
+        check(java.lang.management.ManagementFactory.getRuntimeMXBean().getUptime() >= 0,
+                "the real RuntimeMXBean reports a non-negative uptime");
+        System.out.println("CK RForeignLayoutJdkInterfaces realBeans=ok");
+    }
+
+    /**
+     * javax.xml.stream.XMLStreamReader (43) and
+     * java.nio.file.attribute.DosFileAttributes (13). Both are interfaces an
+     * application implements directly: a custom StAX source, and the attribute
+     * view a custom FileSystemProvider hands back.
+     */
+    static void xmlAndAttributes() throws Exception {
+        Recorder x = new Recorder("xml");
+        javax.xml.stream.XMLStreamReader xr = proxy(javax.xml.stream.XMLStreamReader.class, x);
+        check(xr.getEventType() == I, "XMLStreamReader.getEventType");
+        check(xr.next() == I, "XMLStreamReader.next");
+        check(xr.hasNext() == B, "XMLStreamReader.hasNext");
+        check(xr.isStartElement() == B, "XMLStreamReader.isStartElement");
+        check(xr.isEndElement() == B, "XMLStreamReader.isEndElement");
+        check(xr.isCharacters() == B, "XMLStreamReader.isCharacters");
+        check(xr.getAttributeCount() == I, "XMLStreamReader.getAttributeCount");
+        check("SENTINEL-xml-getText".equals(xr.getText()), "XMLStreamReader.getText");
+        check("SENTINEL-xml-getLocalName".equals(xr.getLocalName()),
+                "XMLStreamReader.getLocalName");
+        check(xr.getName() == null, "XMLStreamReader.getName");
+        check(xr.getLocation() == null, "XMLStreamReader.getLocation");
+        xr.close();
+        check(x.seen.size() == 12, "XMLStreamReader: 12 calls, saw " + x.seen.size());
+
+        Recorder a = new Recorder("dos");
+        java.nio.file.attribute.DosFileAttributes da =
+                proxy(java.nio.file.attribute.DosFileAttributes.class, a);
+        check(da.isReadOnly() == B, "DosFileAttributes.isReadOnly");
+        check(da.isHidden() == B, "DosFileAttributes.isHidden");
+        check(da.isArchive() == B, "DosFileAttributes.isArchive");
+        check(da.isSystem() == B, "DosFileAttributes.isSystem");
+        check(da.isDirectory() == B, "DosFileAttributes.isDirectory");
+        check(da.isRegularFile() == B, "DosFileAttributes.isRegularFile");
+        check(da.isSymbolicLink() == B, "DosFileAttributes.isSymbolicLink");
+        check(da.isOther() == B, "DosFileAttributes.isOther");
+        check(da.size() == L, "DosFileAttributes.size");
+        check(da.lastModifiedTime() == null, "DosFileAttributes.lastModifiedTime");
+        check(da.creationTime() == null, "DosFileAttributes.creationTime");
+        check(da.fileKey() == null, "DosFileAttributes.fileKey");
+        check(a.seen.size() == 12, "DosFileAttributes: 12 calls, saw " + a.seen.size());
+        System.out.println("CK RForeignLayoutJdkInterfaces xml=" + x.seen.size()
+                + " dos=" + a.seen.size());
+    }
+
     public static void main(String[] args) throws Exception {
         sqlConnection();
         sqlResultSet();
         sqlStatements();
         nioPath();
         processAndSession();
+        managementBeans();
+        xmlAndAttributes();
         System.out.println("CK RForeignLayoutJdkInterfaces checks=" + checks);
         System.out.println("PASS RForeignLayoutJdkInterfaces (" + checks + " checks)");
     }
