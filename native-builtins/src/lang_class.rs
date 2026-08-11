@@ -13694,9 +13694,12 @@ fn create_annotation_proxy_with_type(
     // creates without a class file. Minted through
     // `try_alloc_concurrent_synthetic` alone it looked like a §5 compatibility
     // stand-in, and `--jdk-only` refused it: measured, that took
-    // `getAnnotation` to null on RReflect/RJdkReflect (the four
-    // `if let Ok(Some(proxy))` sites below swallow the refusal — residual R1 of
-    // the record) and to `NoClassDefFoundError` on RJdkJmx.
+    // `getAnnotation` to null on RReflect/RJdkReflect and to
+    // `NoClassDefFoundError` on RJdkJmx. The reason ONE cause wore two faces
+    // was that the single-annotation entry points below spelled the call
+    // `if let Ok(Some(proxy)) = …` and dropped this `?`'s error on the floor;
+    // that was residual R1 of the record and is fixed separately under W7-26,
+    // so a refusal here now reaches its caller by both routes.
     //
     // The refusal is the ONLY half that moves. `--dump-native-registry` over a
     // boot in each mode reports **zero** natives registered under this class
@@ -15131,7 +15134,31 @@ pub(crate) fn native_class_get_declared_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+            // W7-26 — `?`, not `if let Ok(..)`. This was the first of five
+            // single-annotation sites that dropped the builder's `Err` and fell
+            // through to the `Ok(Some(Value::Object(None)))` below, i.e. to
+            // **null**. Null is a LEGITIMATE answer here — it means "not
+            // present" — so the caller has no way to tell a VM failure from an
+            // absent annotation, which is why the refusal measured in W7-12
+            // surfaced three frames away as a bare `AssertionError` instead of
+            // naming its class. Its array-valued siblings
+            // (`build_class_annotation_array` and friends) have always used
+            // `?`, and so does `native_method_get_annotation` a few hundred
+            // lines down; one run of the pre-fix binary showed both faces of the
+            // same cause at once — `RJdkJmx` (array path) got
+            // `NoClassDefFoundError: java/lang/annotation/AnnotationProxy`
+            // verbatim while `RReflect` (this path) got null.
+            //
+            // The discrimination line is the one W7-20 drew for the collection
+            // helpers: **`Err` propagates; `Ok`-with-nothing-usable stays
+            // empty.** `cached_annotation_proxy_resolving` still answers
+            // `Ok(None)` for an annotation type it cannot resolve, and that
+            // keeps falling through to null exactly as before — only the `Err`
+            // arm moves. `MethodCallFailed::ExceptionThrown` is the arm that
+            // matters most: it means a real exception is already pending in the
+            // VM, and the old spelling both hid it and kept calling back into
+            // the VM underneath it.
+            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann)? {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
         }
@@ -15170,7 +15197,10 @@ pub(crate) fn native_class_get_annotation(
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+            // W7-26 — `?`. See `native_class_get_declared_annotation` above for
+            // the full argument; this is the site the `RReflect` and
+            // `RJdkReflect` assertions actually ran through.
+            if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann)? {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
         }
@@ -15185,7 +15215,14 @@ pub(crate) fn native_class_get_annotation(
                 if ann.type_descriptor == target_desc {
                     // Key by the queried class (class_id), matching HotSpot's
                     // per-class annotationData for inherited annotations.
-                    if let Ok(Some(proxy)) = cached_annotation_proxy_resolving(ctx, class_id, ann) {
+                    //
+                    // W7-26 — `?`. Propagating matters more here than at the
+                    // two flat sites, not less: this is a LOOP, so the old
+                    // spelling walked on to the next superclass with an
+                    // exception already pending in the VM and kept calling
+                    // `class_annotations` / the builder underneath it. HotSpot
+                    // would have bailed at the first `CHECK`.
+                    if let Some(proxy) = cached_annotation_proxy_resolving(ctx, class_id, ann)? {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
                 }
@@ -15661,7 +15698,16 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = annotation_container_loader(ctx, class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            if let Ok(Some(proxy)) = create_annotation_proxy(ctx, ann, Some(class_id), container_loader)
+            // W7-26 — `?`. Same species as the three `Class` sites above; this
+            // one reaches the builder directly rather than through the cache,
+            // but `create_annotation_proxy` has the identical
+            // `Result<Option<_>, MethodCallFailed>` shape, so `Ok(None)` (an
+            // annotation type that would not resolve) still falls through to
+            // null and only the `Err` arm changes. Caller-visible: a
+            // `Field.getAnnotation` that fails now throws instead of agreeing
+            // with `Field.isAnnotationPresent` = true and answering null.
+            if let Some(proxy) =
+                create_annotation_proxy(ctx, ann, Some(class_id), container_loader)?
             {
                 return Ok(Some(Value::Object(Some(proxy))));
             }
@@ -20712,9 +20758,19 @@ pub(crate) fn native_annotated_type_get_annotation(
                 // proxy is invalid and turns a valid type-use annotation into a
                 // false negative. The public Annotation contract supplies the
                 // precise type mirror for both representations.
-                if let Ok(Some(Value::Object(Some(tm)))) =
-                    ctx.invoke_virtual(proxy, "annotationType", "()Ljava/lang/Class;", &[])
-                {
+                // W7-26 — `?` on the call, match on the VALUE. Found by the
+                // sweep that followed the four `getAnnotation` sites: this is
+                // the fifth instance of the same species and the only one
+                // outside the `Class`/`Field` pair. `annotationType()` here is
+                // a real virtual dispatch into a JDK dynamic proxy's
+                // invocation handler, so it can genuinely throw; swallowing
+                // that turned `AnnotatedType.getAnnotation(X)` into null, which
+                // reads as "no such type-use annotation". A non-Class return
+                // or a void return is still just "not this element" and keeps
+                // scanning, as before.
+                let ann_type =
+                    ctx.invoke_virtual(proxy, "annotationType", "()Ljava/lang/Class;", &[])?;
+                if let Some(Value::Object(Some(tm))) = ann_type {
                     if mirror_class_id(ctx, tm) == Some(want) {
                         return Ok(Some(Value::Object(Some(proxy))));
                     }
