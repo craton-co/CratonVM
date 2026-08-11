@@ -1231,6 +1231,14 @@ fn extract_iv_bytes(ctx: &mut dyn NativeContext, spec: ObjectRef) -> Vec<u8> {
 
 /// Parse a Cipher transformation string (`"AES/GCM/NoPadding"`) into
 /// `(cipherName, mode_uppercase, padding_bool)`.
+///
+/// **Post-admission only.** This is a lenient splitter, not a validator: it
+/// accepts any shape, defaults an absent mode to `ECB` and an absent padding to
+/// "padded". Those defaults are correct for the AES family (SunJCE really does
+/// read a bare `AES` as `AES/ECB/PKCS5Padding`) and wrong for everything else,
+/// which is how a nameless-mode `ChaCha20` became AES-ECB. Call it only on a
+/// transformation [`classify_transformation`] has already admitted;
+/// [`tokenize_transformation`] is the validating one.
 fn parse_transformation(algo: &str) -> (String, String, bool) {
     let parts: Vec<&str> = algo.split('/').collect();
     let cipher_name = parts.first().copied().unwrap_or("AES").to_string();
@@ -1246,18 +1254,17 @@ fn parse_transformation(algo: &str) -> (String, String, bool) {
 /// `AESWrap` and the size-specific `AESWrap_128` aliases are used by
 /// Keycloak/Elytron; JDK callers may also use the canonical
 /// `AES/KW/NoPadding` transformation.
+/// Asked of the ONE admission table rather than restated as a second literal
+/// list. The old list carried `"AESWRAP128"` (no underscore) and `"AES/KW"`
+/// (two tokens) — neither of which is a transformation `Cipher.getInstance`
+/// accepts — while omitting `AES_128/KW/NoPadding`, which SunJCE advertises and
+/// this engine can serve. A predicate that disagrees with the gate in front of
+/// it is how `wrap()` and `doFinal()` came to answer differently for the same
+/// cipher.
 fn is_aes_key_wrap_transformation(algo: &str) -> bool {
     matches!(
-        algo.to_ascii_uppercase().as_str(),
-        "AESWRAP"
-            | "AESWRAP_128"
-            | "AESWRAP128"
-            | "AESWRAP_192"
-            | "AESWRAP192"
-            | "AESWRAP_256"
-            | "AESWRAP256"
-            | "AES/KW"
-            | "AES/KW/NOPADDING"
+        classify_transformation(algo),
+        TransformVerdict::Serviceable(CipherFamily::AesKeyWrap)
     )
 }
 
@@ -1595,14 +1602,33 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         let route: Option<(&'static str, &'static str, &'static str)> = if is_pbes2_aes {
             Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC"))
         } else {
-            match (cn.to_ascii_uppercase().as_str(), cm.as_str()) {
-                ("AES", "CBC") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC")),
-                ("AES", "CFB") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CFB")),
-                ("AES", "OFB") => Some(("com/sun/crypto/provider/AESCipher$General", "AES", "OFB")),
-                ("DESEDE", _) | ("TRIPLEDES", _) => {
+            // Match on the FAMILY, not the spelling. `("AES", "CBC")` missed
+            // every `AES_128`/`AES_192`/`AES_256` transformation, which then
+            // fell through to the mode-only dispatch below and died on
+            // `mode 'CBC' not implemented`. The mode is still matched on the
+            // token the caller wrote, because for this family it selects real
+            // behaviour — see the DESede note.
+            match (cipher_family(&cn), cm.as_str()) {
+                (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "CBC") => {
+                    Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CBC"))
+                }
+                (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "CFB") => {
+                    Some(("com/sun/crypto/provider/AESCipher$General", "AES", "CFB"))
+                }
+                (Some(CipherFamily::Aes | CipherFamily::AesFixed(_)), "OFB") => {
+                    Some(("com/sun/crypto/provider/AESCipher$General", "AES", "OFB"))
+                }
+                // These two hardcode `"CBC"` whatever the caller wrote, which
+                // is sound ONLY because `classify_transformation` admits no
+                // other mode for this family. Widening the admission table
+                // without widening this line would serve CBC under another
+                // mode's name — the same substitution, one field over.
+                (Some(CipherFamily::DesFamily), _) if cn.eq_ignore_ascii_case("DES") => {
+                    Some(("com/sun/crypto/provider/DESCipher", "DES", "CBC"))
+                }
+                (Some(CipherFamily::DesFamily), _) => {
                     Some(("com/sun/crypto/provider/DESedeCipher", "DESede", "CBC"))
                 }
-                ("DES", _) => Some(("com/sun/crypto/provider/DESCipher", "DES", "CBC")),
                 _ => None,
             }
         };
@@ -1636,6 +1662,51 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         }
     }
 
+    // `pad` was `_pad` — parsed, then thrown away. Every consequence of
+    // ignoring it is below; see the ECB arm.
+    //
+    // `_cipher_name` was the OTHER half of the defect this lane fixed: the
+    // algorithm the caller asked for was parsed out here and then discarded,
+    // so the `match mode_str` below decided everything. With a missing mode
+    // defaulting to ECB, `Cipher.getInstance("ChaCha20")` landed in the ECB arm
+    // with a 32-byte key that `Aes::key_expansion` was happy to accept as
+    // AES-256. It is bound and CHECKED now: the mode-only dispatch is valid for
+    // the AES family alone, and every other family has already returned above
+    // (RSA, PBES2 and DES/DESede each route earlier in this function).
+    let (cipher_name, parsed_mode, pad) = parse_transformation(&algo);
+    let encrypt = mode == 1;
+
+    let family = cipher_family(&cipher_name);
+    match family {
+        Some(CipherFamily::Aes | CipherFamily::AesFixed(_) | CipherFamily::AesKeyWrap) => {}
+        // Not reachable through `Cipher.getInstance`, which now refuses every
+        // name outside the table — so reaching it means the admission table and
+        // this dispatch have drifted apart, not that a user asked for something
+        // odd. Say so, rather than computing AES and calling it success.
+        other => {
+            return Err(RuntimeError::IllegalStateException {
+                message: format!(
+                    "Cipher dispatch reached the AES path for transformation '{algo}' \
+                     (family {other:?}); `classify_transformation` admitted a name this \
+                     arm cannot compute. Refusing to encrypt with a substitute algorithm."
+                ),
+            }
+            .into())
+        }
+    }
+
+    // `AESWrap`, `AESWrap_128/192/256` carry no mode token, so
+    // `parse_transformation` hands back the ECB default for them — which would
+    // send `Cipher.getInstance("AESWrap").doFinal(..)` into the ECB arm and
+    // return AES-ECB blocks where SunJCE returns an RFC 3394 wrap. The name IS
+    // the mode for that family (`Alg.Alias.Cipher.AESWrap = AES/KW/NoPadding`
+    // on SunJCE), so say so once, here, rather than letting a default decide.
+    let mode_str = if matches!(family, Some(CipherFamily::AesKeyWrap)) {
+        "KW".to_string()
+    } else {
+        parsed_mode
+    };
+
     let aes_key = match Aes::key_expansion(&key_bytes) {
         Ok(k) => k,
         Err(e) => {
@@ -1645,11 +1716,6 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
             .into())
         }
     };
-
-    // `pad` was `_pad` — parsed, then thrown away. Every consequence of
-    // ignoring it is below; see the ECB arm.
-    let (_cipher_name, mode_str, pad) = parse_transformation(&algo);
-    let encrypt = mode == 1;
 
     let result_bytes: Result<Vec<u8>, String> = match mode_str.as_str() {
         "GCM" => {
@@ -1785,9 +1851,54 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 }
             }
         }
+        // RFC 3394 key wrap reached through `doFinal` rather than
+        // `wrap`/`unwrap`. SunJCE serves both surfaces from the same
+        // `AESKeyWrap` SPI, and this engine's `aes_key_wrap`/`aes_key_unwrap`
+        // are byte-identical to it — measured on jdk-25.0.3.9-hotspot with a
+        // 256-bit KEK: wrap of a 16-byte key gives
+        // `bc3b4783f41958fdef7f32ef69f09086da1a6666e883f93f` on both. Before
+        // this arm existed, `AES/KW/NoPadding` was advertised by
+        // `provider_chain`, worked through `wrap()`, and raised an UNCHECKED
+        // `IllegalStateException` through `doFinal` — one algorithm with two
+        // answers depending on which method the caller reached for.
+        "KW" => {
+            let wrapped = if encrypt {
+                aes_key_wrap(&key_bytes, &data)
+            } else {
+                aes_key_unwrap(&key_bytes, &data)
+            };
+            match wrapped {
+                Ok(bytes) => Ok(bytes),
+                // SunJCE reports both a bad input length and a failed integrity
+                // check from `doFinal` as `IllegalBlockSizeException` — measured
+                // `javax.crypto.IllegalBlockSizeException: Integrity check
+                // failed` for a wrapped key with one bit flipped. It is a
+                // checked `GeneralSecurityException`, so a caller's
+                // `catch` matches; the `Err(String)` tail below would have made
+                // it an unchecked `IllegalStateException` that sails past.
+                // (The detail text is this module's own, which is more specific
+                // than HotSpot's; the CLASS is what a handler selects on.)
+                Err(message) => {
+                    return Err(crate::phases_early::throw_jca_exc(
+                        ctx,
+                        "javax/crypto/IllegalBlockSizeException",
+                        &message,
+                    ))
+                }
+            }
+        }
+        // No default arm. `classify_transformation` admits exactly the modes
+        // above for the AES family, so an unadmitted mode cannot arrive here
+        // through `Cipher.getInstance` — and if one does, the two tables have
+        // drifted and the honest answer is to say which mode, not to fall back
+        // on ECB. The retired arm produced `IllegalStateException("Cipher mode
+        // 'CTR' not implemented in WP6.3 dispatch")`: unchecked, so
+        // uncatchable by `catch (GeneralSecurityException)`, and raised at
+        // `doFinal` rather than at `getInstance` where the spec puts it.
         other => Err(format!(
-            "Cipher mode '{}' not implemented in WP6.3 dispatch (probe scope: AES/GCM/NoPadding)",
-            other
+            "Cipher mode '{other}' is admitted by `classify_transformation` but not \
+             computed by this dispatch — the admission table and the AES dispatch \
+             have drifted. Refusing to substitute another mode."
         )),
     };
 
