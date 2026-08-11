@@ -6410,7 +6410,13 @@ fn native_al_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             let d_cur = ctx.read_native_pin(d_pin, d);
             let val = ctx.get_array_element(d_cur, i);
             // List.hashCode contract: 31*acc + e.hashCode() (0 for null).
-            let elem_hash = element_hash_code(ctx, &val);
+            let elem_hash = match element_hash_code(ctx, &val) {
+                Ok(h) => h,
+                Err(e) => {
+                    ctx.unpin_native_roots(d_pin);
+                    return Err(e);
+                }
+            };
             hash = hash.wrapping_mul(31).wrapping_add(elem_hash);
         }
         ctx.unpin_native_roots(d_pin);
@@ -7158,15 +7164,27 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
 /// distribution). `null` hashes to 0. Strings and primitive wrappers are
 /// hashed by value to match the JDK; arbitrary objects dispatch to their
 /// virtual `hashCode()`.
-fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
+///
+/// Fallible for the reason `map_hash_key` already documents one screen up —
+/// this is the same swallow, in the helper the *collection* `hashCode`
+/// contracts run through instead of the bucket path. `_ => identity_hash_code`
+/// answered a plausible number for a `hashCode()` that threw or was refused,
+/// and a plausible number is the worst possible answer here: the aggregate
+/// `List`/`Set`/`Map` hash comes out stable and wrong, so the collection is
+/// filed under a bucket its own equal twin will never be found in.
+///
+/// A callee that returns something other than an `Int` — a contract violation
+/// with no exceptional control flow — still falls back to the identity hash,
+/// exactly as `map_hash_key` does.
+fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> Result<i32, MethodCallFailed> {
     match v {
-        Value::Object(None) => 0,
-        Value::Int(x) => *x,
-        Value::Long(x) => (*x ^ (*x >> 32)) as i32,
-        Value::Float(x) => x.to_bits() as i32,
+        Value::Object(None) => Ok(0),
+        Value::Int(x) => Ok(*x),
+        Value::Long(x) => Ok((*x ^ (*x >> 32)) as i32),
+        Value::Float(x) => Ok(x.to_bits() as i32),
         Value::Double(x) => {
             let bits = x.to_bits() as i64;
-            (bits ^ (bits >> 32)) as i32
+            Ok((bits ^ (bits >> 32)) as i32)
         }
         Value::Object(Some(obj)) => {
             // String hashCode by value (UTF-16 code units, wrapping mul+add).
@@ -7175,7 +7193,7 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
                 for cu in s.encode_utf16() {
                     h = h.wrapping_mul(31).wrapping_add(cu as i32);
                 }
-                return h;
+                return Ok(h);
             }
             // Primitive wrapper types hash by their boxed primitive value.
             if let Some(prim) = unbox_wrapper(ctx, *obj) {
@@ -7183,12 +7201,13 @@ fn element_hash_code(ctx: &mut dyn NativeContext, v: &Value) -> i32 {
             }
             // Arbitrary objects: honour the contract via their virtual hashCode().
             match ctx.invoke_virtual(*obj, "hashCode", "()I", &[]) {
-                Ok(Some(Value::Int(h))) => h,
-                _ => ctx.identity_hash_code(*obj),
+                Ok(Some(Value::Int(h))) => Ok(h),
+                Err(e) => Err(e),
+                _ => Ok(ctx.identity_hash_code(*obj)),
             }
         }
         // Internal VM values that cannot legitimately be collection elements.
-        Value::ReturnAddress(_) | Value::Uninitialized => 0,
+        Value::ReturnAddress(_) | Value::Uninitialized => Ok(0),
     }
 }
 
@@ -10940,9 +10959,21 @@ fn native_map_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let key = read_pinned_elem(ctx, handles[2 * i], flat[2 * i]);
         // Map.hashCode contract: sum of Map.Entry hashes,
         // where Entry hash = keyHash ^ valueHash.
-        let kh = element_hash_code(ctx, &key);
+        let kh = match element_hash_code(ctx, &key) {
+            Ok(h) => h,
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
         let value = read_pinned_elem(ctx, handles[2 * i + 1], flat[2 * i + 1]);
-        let vh = element_hash_code(ctx, &value);
+        let vh = match element_hash_code(ctx, &value) {
+            Ok(h) => h,
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        };
         hash = hash.wrapping_add(kh ^ vh);
     }
     ctx.unpin_native_roots(pin_base);
@@ -12532,7 +12563,13 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for i in 0..keys.len() {
         let k = read_pinned_elem(ctx, handles[i], keys[i]);
         // Set.hashCode contract: sum of element hashCode()s (0 for null).
-        h = h.wrapping_add(element_hash_code(ctx, &k));
+        match element_hash_code(ctx, &k) {
+            Ok(eh) => h = h.wrapping_add(eh),
+            Err(e) => {
+                ctx.unpin_native_roots(pin_base);
+                return Err(e);
+            }
+        }
     }
     ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Int(h)))
@@ -16126,9 +16163,9 @@ fn native_entry_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             .unwrap_or(Value::Object(None));
         let value_pin = pin_value(ctx, value);
         let key = read_pinned_elem(ctx, key_pin, key);
-        let kh = element_hash_code(ctx, &key);
+        let kh = element_hash_code(ctx, &key)?;
         let value = read_pinned_elem(ctx, value_pin, value);
-        Ok(kh ^ element_hash_code(ctx, &value))
+        Ok(kh ^ element_hash_code(ctx, &value)?)
     })();
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Int(hashes?)))
@@ -46276,7 +46313,15 @@ fn native_ksv_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     for i in 0..elems.len() {
         let e = read_pinned_elem(ctx, handles[i], elems[i]);
         // `Set.hashCode` contract: the sum of the elements' hash codes.
-        h = h.wrapping_add(element_hash_code(ctx, &e));
+        match element_hash_code(ctx, &e) {
+            Ok(eh) => h = h.wrapping_add(eh),
+            Err(err) => {
+                if elems_pin != usize::MAX {
+                    ctx.unpin_native_roots(elems_pin);
+                }
+                return Err(err);
+            }
+        }
     }
     if elems_pin != usize::MAX {
         ctx.unpin_native_roots(elems_pin);
@@ -58329,7 +58374,7 @@ mod tests {
             assert_eq!(unbox_wrapper(&ctx, entity), None);
             let expected_identity = ctx.identity_hash_code(entity);
             assert_eq!(
-                element_hash_code(&mut ctx, &Value::Object(Some(entity))),
+                element_hash_code(&mut ctx, &Value::Object(Some(entity))).unwrap(),
                 expected_identity
             );
 
@@ -58339,7 +58384,10 @@ mod tests {
             ctx.set_field(boxed, 0, Value::Long(42));
 
             assert_eq!(unbox_wrapper(&ctx, boxed), Some(Value::Long(42)));
-            assert_eq!(element_hash_code(&mut ctx, &Value::Object(Some(boxed))), 42);
+            assert_eq!(
+                element_hash_code(&mut ctx, &Value::Object(Some(boxed))).unwrap(),
+                42
+            );
         }
 
         // ------------------------------------------------------------------
