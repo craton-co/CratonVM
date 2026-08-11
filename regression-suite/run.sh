@@ -85,7 +85,14 @@ CORE_CLASSES="RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflec
 # default set: `--jdk-only` is an internal-diagnostic policy in wave 1 and is
 # *expected* to fail where --real-jdk passes, so these must not move the green
 # baseline of a plain `bash regression-suite/run.sh`.
-JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure"
+#
+# RJdkStampedStamps / RJdkLookupIn / RJdkDefineClass landed 2026-08-11 as the
+# executable form of the three predictions in the native-precedence re-audit
+# that no existing vector covered. Each asks a question only an UNREGISTERED
+# decoder can answer — the JDK's own static stamp predicates, dropLookupMode,
+# a defined class read back through java.lang.Class — so a registered surface
+# agreeing with itself cannot make them pass.
+JDKONLY_CLASSES="RJdkHello RJdkStrict RJdkCollections RJdkLambdas RJdkHandles RJdkProxy RJdkReflect RJdkFieldModule RJdkRecords RJdkHidden RJdkModule RJdkServices RJdkAqs RJdkPhaser RJdkExecutors RJdkForkJoin RJdkNio RJdkNet RJdkProcess RJdkSecurity RJdkJmx RJdkJni RJdkFailure RJdkStampedStamps RJdkLookupIn RJdkDefineClass"
 
 # Vectors that deliberately belong to NO class list. Every entry needs a
 # reason, because "not scheduled" is indistinguishable from "forgotten" once
