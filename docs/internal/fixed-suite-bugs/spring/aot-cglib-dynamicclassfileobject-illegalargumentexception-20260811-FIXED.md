@@ -110,6 +110,8 @@ Same harness, same classpath, same `KRun` driver, JIT on, `--jdk real`.
 | `cratonvm-goal-base` (repeat) | `59e3b0039` | default (ZGC) | `found=40 succ=40 fail=0` |
 | `cratonvm-goal-base` | `59e3b0039` | `-XX:+UseG1GC` | `found=40 succ=40 fail=0` |
 | `cratonvm-goal-base` | `59e3b0039` | `-XX:+UseGenerationalGC` | `found=40 succ=40 fail=0` |
+| `cratonvm-goal-merged` | `177d9a355` (branch + `origin/dev` merge) | default (ZGC) | `found=40 succ=40 fail=0` |
+| `cratonvm-goal-merged` | `177d9a355` | `-XX:+UseG1GC` | `found=40 succ=40 fail=0` |
 | HotSpot (real JDK 25) | — | — | `found=40 succ=40 fail=0` |
 
 The red arm was re-taken *this session*, on the same host, before the green

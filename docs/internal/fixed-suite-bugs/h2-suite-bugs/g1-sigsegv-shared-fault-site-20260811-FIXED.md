@@ -104,6 +104,12 @@ binaries built from the same tree (`cratonvm-goal-base` = the branch point,
 | --- | --- | --- | --- |
 | pre-fix (`cratonvm-goal-base`, `-XX:+UseG1GC`) | 15 | **4** | n/a (no guard) |
 | post-fix (`cratonvm-goal-g1fix`, `-XX:+UseG1GC`) | 15 | **0** | fired in 8 of 15 runs (3, twice 6) |
+| pre-fix, re-run against the `origin/dev` merge | 6 | **3** | n/a |
+| post-fix, on the merged branch | 6 | **0** | fired in 4 of 6 runs |
+
+The last two rows are the verification re-taken on the branch *after* merging
+`origin/dev` (`177d9a355`), not only at the branch point — 21 pre-fix runs, 7
+crashes; 21 post-fix runs, 0.
 
 Every one of the four pre-fix crashes carries the identical fault address
 (`addr=0x20084400000`) and the identical image offset (`0x90C7CB`), which `gdb`
