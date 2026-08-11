@@ -1306,16 +1306,13 @@ impl<T: NativeContext + ?Sized> ReadStringFieldExt for T {
 /// Mirrors `native-io`'s `real_raf_enabled()`, which flipped the same way for
 /// the same reason.
 pub(crate) fn real_mxbean_mapping_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if cfg!(feature = "synthetic-jdk") {
-            return false;
-        }
-        !matches!(
-            std::env::var("CRATONVM_SYNTHETIC_MXBEAN_MAPPING").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+    if cfg!(feature = "synthetic-jdk") {
+        return false;
+    }
+    !matches!(
+        std::env::var("CRATONVM_SYNTHETIC_MXBEAN_MAPPING").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
@@ -1323,9 +1320,8 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
 }
 
 /// [`register_jmx_openmbean_natives`] with the type-mapping decision supplied
-/// rather than read from the environment, so both arms are testable in one
-/// process (`real_mxbean_mapping_enabled` caches its answer for the life of
-/// the VM, which is right for a VM and useless for a test).
+/// rather than read from the environment, so a test can exercise both arms
+/// without touching process-wide state.
 ///
 /// `synthetic_mapping = true` reinstates the pre-2026-08-11 overlay that types
 /// unrecognised Java types as `SimpleType.STRING` and converts nothing.
