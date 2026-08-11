@@ -106,3 +106,18 @@ org.hibernate.orm.test.type.temporal.OffsetTimeTest	396	176	88
 # staleness crash was fixed — before that it died in JUnit discovery. See
 # fixed-suite-bugs/hibernate/offsetdatetimetest-junit-discovery-nullptr-sigsegv-20260805-FIXED.md
 org.hibernate.orm.test.type.temporal.OffsetDateTimeTest	488	324	164
+
+# `ZonedDateTimeTest` — the fifth and last of the temporal family, and the only
+# one never observable long enough to be listed: until 2026-08-11 it was killed
+# at its 900s floor on every full-suite run and recorded HANG with no counts at
+# all. The cause was not the class — it was the ZGC conservative-root scan
+# resolving every interior-pointer probe with an O(arena-span) walk of the
+# object-start bitmap (`perf record`: 80.7% of all CPU samples in
+# `VmHeap::is_heap_addr`), fixed by the backwards bit scan in gc/src/zgc.rs. It
+# now finishes in 381s with found=608 ok=404 failed=0 aborted=204 — the same
+# counts the real-HotSpot control recorded (found=608 ok=404 failed=0
+# aborted=204, ms=17051), byte for byte. Its 900s floor in class-overrides.tsv
+# stays: this entry stops `categorize` re-flagging the aborts, the floor stops
+# the flat 300s cap re-flagging the runtime. See fixed-suite-bugs/hibernate/
+# hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811-FIXED.md
+org.hibernate.orm.test.type.temporal.ZonedDateTimeTest	608	404	204

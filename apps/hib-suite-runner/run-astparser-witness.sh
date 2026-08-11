@@ -58,7 +58,7 @@ for ((i=0; i<RUNS; i++)); do
   CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 timeout "$TIMEOUT" "$BIN" "${VMFLAGS[@]}" \
       -Dcraton.batch=1 "$RUNNER_CLASS" "$CLS" >"$log" 2>&1
   rc=$?
-  rline=$(grep -m1 "^@@RESULT " "$log")
+  rline=$(grep -m1 -o "@@RESULT .*" "$log")
   if [ -z "$rline" ]; then
     echo "run=$i STATUS=$([ $rc -eq 124 ] && echo HANG || echo CRASH) rc=$rc"
     total_fail_runs=$((total_fail_runs+1))

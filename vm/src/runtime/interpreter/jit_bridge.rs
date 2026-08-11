@@ -6134,6 +6134,28 @@ fn resolve_inline_site_from(
         }
     }
 
+    // `ldc` / `ldc_w` in an INLINE CANDIDATE.
+    //
+    // The inline mini-emitter (`x64/inlining.rs`) materialises these as bare
+    // x86 immediates and has no path to `helpers.ldc_string` /
+    // `helpers.ldc_class_cp`. So only the two constant kinds that ARE an
+    // immediate — `Integer` and `Float` — can be recorded. Every other kind
+    // (String, Class, MethodHandle, MethodType, condy) names a *reference*
+    // materialised at run time, and there is no i64 that stands for it.
+    //
+    // This used to end `_ => 0`, which recorded a perfectly well-formed entry
+    // claiming the constant's value was zero. The emitter then trusted it and
+    // pushed `null`. A one-line `Dialect.extractPattern(unit) { return
+    // "extract(?1 from ?2)"; }` spliced into `H2Dialect.extractPattern`
+    // compiled to `xor eax,eax; ret`, and every Hibernate HQL `extract()` /
+    // `cast()` / `str()` query then died in `PatternRenderer.<init>` with
+    // `NullPointerException: ... because "pattern" is null` (2026-08-11 Linux
+    // full suite: 17 of 34 method failures across four HQL classes, all green
+    // under `--nojit`).
+    //
+    // Refuse the whole inline site instead. The callee still compiles and is
+    // still CALLED — it just is not spliced — which is what "cannot model it"
+    // has to mean.
     let mut ldc_info = Vec::new();
     if has_ldc {
         let mut fpc = 0;
@@ -6143,7 +6165,7 @@ fn resolve_inline_site_from(
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
                     Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => 0,
+                    _ => return None,
                 };
                 ldc_info.push((fpc, val));
                 fpc += 2;
@@ -6152,7 +6174,7 @@ fn resolve_inline_site_from(
                 let val = match callee_class_info.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::Integer(v)) => *v as i64, // JVM spec: bounded float-to-long conversion
                     Some(ConstantPoolEntry::Float(v)) => (*v as f32).to_bits() as i32 as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => 0,
+                    _ => return None,
                 };
                 ldc_info.push((fpc, val));
                 fpc += 3;
@@ -6162,6 +6184,9 @@ fn resolve_inline_site_from(
         }
     }
 
+    // Same contract for `ldc2_w`: `Long` and `Double` are the only entries the
+    // JVMS permits here, so a third kind means the constant pool disagrees with
+    // the bytecode — refuse rather than splice a zero.
     let mut ldc2w_info = Vec::new();
     if has_ldc2w {
         let mut fpc = 0;
@@ -6171,7 +6196,7 @@ fn resolve_inline_site_from(
                 let val = match callee_class_info.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Long(v) => *v,
                     ConstantPoolEntry::Double(v) => v.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
-                    _ => 0,
+                    _ => return None,
                 };
                 ldc2w_info.push((fpc, val));
                 fpc += 3;
