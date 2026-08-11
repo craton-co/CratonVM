@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> The Lookup residual this record reported out-of-file IS applied — `native-builtins/src/classloader.rs::alloc_lookup` now gates the synthetic index writes on a class-side witness and leaves `cachedProtectionDomain` null, carrying this record's `// W6-3:` comment. It owns **no corpus vector of its own** — it is a sweep record, and the 53/1 run says nothing about it directly; what discharges it is the source, plus the fact that the two `MISMATCH` families the species was found in (`W4-4`) have their vectors green. The other two items under "Reported, not edited" are not this record's to close and remain owned by records that stay open: `build_string_set` by `W4-4-slot-index-species-sweep.md`, and `lk_in_method`/`lk_drop_lookup_mode` by `W4-1-publiclookup-allowedmodes-never-checked.md`.
+>
+> Previous location: `docs/known-issues/jdk-only/W6-3-slot-index-species-residuals.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # W6-3 — slot-index species: the last Lookup residual, and the Panama verdict
 
 Status: one residual FIXED out-of-file (reported as a patch, see below), two

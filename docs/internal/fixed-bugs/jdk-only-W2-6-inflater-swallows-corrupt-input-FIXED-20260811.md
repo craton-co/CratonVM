@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkJni` passes in the 53/1 run. Entirely in-lane; the one "Adjacent, out of this lane's files" item — `System.loadLibrary`/`System.load` discarding the load error — was taken by W5-1 (allowlist narrowed) and W6-6 (`NativeLibraries.load`) and is fixed.
+>
+> Previous location: `docs/known-issues/jdk-only/W2-6-inflater-swallows-corrupt-input.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `Inflater` swallowed a corrupt-stream error and answered "no progress"
 
 **Status:** FIXED in source 2026-08-07 (lane W2-6, JDK-only wave 2). Not yet

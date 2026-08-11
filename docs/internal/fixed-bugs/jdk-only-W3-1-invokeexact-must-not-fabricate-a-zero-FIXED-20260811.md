@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkHandles` passes in the 53/1 run. The out-of-file patch this record said the check depends on IS applied — `vm/src/runtime/interpreter/invoke.rs:3541` routes through `unbox_poly_return_checked`, which is the funnel the failing call site uses. The record's status line ("behind an opt-in flag that defaults to today's behaviour") is **stale**: `CRATONVM_MH_STRICT_INVOKEEXACT` was flipped on 2026-08-07 and `vm/src/vm/vm_exec.rs:1588` now reads it as an opt-OUT (`=0` restores the old behaviour). The decision record for that flip, W5-4, is retired alongside this one.
+>
+> Previous location: `docs/known-issues/jdk-only/W3-1-invokeexact-must-not-fabricate-a-zero.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `MethodHandle.invokeExact` fabricated a zero instead of `WrongMethodTypeException`
 
 **Status:** FIXED in source 2026-08-07 (lane W3-1, JDK-only wave 3), **behind an

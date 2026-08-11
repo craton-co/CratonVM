@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkHandles` passes in the 53/1 run. The "Required out-of-file change (not applied)" IS applied: `vm/src/vm/vm_exec.rs:23032` carries `asVarargsCollector` in the `check_override` disjunct, with this record's rationale comment verbatim.
+>
+> Previous location: `docs/known-issues/jdk-only/L2-methodtypeform-lambdaforms-null.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # A fabricated `MethodTypeForm` left both lazy caches null — `RJdkHandles` died on `asVarargsCollector`
 
 **Status:** FIXED in source 2026-08-06 (lane L2, JDK-only wave 2). Not yet

@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkModule` passes all 44 checks in the 53/1 run. The "Companion patch outside this lane's files" IS applied — `vm/src/config.rs::parse_add_reads` now folds `ALL-UNNAMED` to the empty-string sentinel, with this record's measurement (`java.logging.canRead(unnamed)` false bare, true under `--add-reads`) written into the comment. Both items under "Still open on this vector (not fixed here)" were taken by successor records and closed: `Module.getResourceAsStream` by W5-3, `moduleServices()`/the `provider()` factory form by W6-2 and W6-11.
+>
+> Previous location: `docs/known-issues/jdk-only/W3-3-named-module-must-not-read-unnamed.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # A named module implicitly read the unnamed module, because every named module looked unnamed
 
 Status: fix written, unbuilt (lane W3-3 cannot run cargo or the VM).

@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkNio` passes in the 53/1 run. All three out-of-file patches are in the tree, including the one marked OPTIONAL: `p57_file_already_exists` fires from `native-builtins/src/phases_late/nio_file.rs:4996` (patch A), the `REPLACE_EXISTING` scan is at `:10994-11018` (patch B), and the shadowed duplicate in `native-io/src/lib.rs:12255` now raises `file_already_exists` too (patch C). "What this does NOT fix" — the 64 unmeasured checks past `filesApi:102` — is discharged by the vector passing all 78.
+>
+> Previous location: `docs/known-issues/jdk-only/L5-files-copy-alreadyexists-and-filevisitoption-dispatch.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `Files.copy` silently overwrote, and every plain `Files.walk` logged a `NoSuchMethodError`
 
 **Status:** ROOT-CAUSED in source 2026-08-06 (lane L5, JDK-only wave 2).

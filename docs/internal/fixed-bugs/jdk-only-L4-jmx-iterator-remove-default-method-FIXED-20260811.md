@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkJmx` passes in the 53/1 run. **Both** arms are fixed, not one: the `--real-jdk` half landed in-lane (`getObjectName` is registered, `native-builtins/src/jmx.rs:745`), and the `--jdk-only` half this record filed as "DIAGNOSED, NOT FIXED — the patch this needs (not applied)" was landed by lane L13 in `native-collections/src/lib.rs` (the `Arrays$ArrayItr` side table and the `Intrinsic` re-registration of `java/util/Iterator.remove()V`). The bridge-ratchet re-freeze it asked for is superseded: `scripts/baselines/jdk-only-bridge-ratchet.json` was re-seeded by the bridge-reclassification wave and now reads `bridge_without_acc_native` 8912, not the 9528 this record predicted from.
+>
+> Previous location: `docs/known-issues/jdk-only/L4-jmx-iterator-remove-default-method.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `RJdkJmx`: two different defects, one per arm — a missing `getObjectName()` and a snapshot iterator that cannot `remove()`
 
 **Status:** the `--real-jdk` arm is FIXED in source 2026-08-06 (lane L4, JDK-only

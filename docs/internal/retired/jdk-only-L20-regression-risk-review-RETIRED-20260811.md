@@ -1,3 +1,10 @@
+> **RETIRED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> An adversarial source review, not a defect record: it owns no corpus vector, changed nothing, and returned SAFE on all seven change clusters. Its question — *can this campaign make something that works today stop working?* — was answered by execution on 2026-08-07: the strict corpus went to 53 passed / 1 failed with Compatible mode unchanged at 30/1, so none of the seven clusters regressed anything. Its two patches were both conditional ("apply **only** if the Tomcat `catalina.webresources` cluster regresses"; "not required for `RJdkForkJoin`") and neither condition fired.
+>
+> Previous location: `docs/known-issues/jdk-only/L20-regression-risk-review.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # L20 — adversarial regression review of the JDK-only wave-2 campaign
 
 **Status:** SOURCE REVIEW ONLY, 2026-08-06. Nothing built, nothing run. Seven

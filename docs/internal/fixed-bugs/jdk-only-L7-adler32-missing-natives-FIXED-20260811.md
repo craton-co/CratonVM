@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkJni` passes in the 53/1 run. Entirely in-lane, no out-of-file patch, no residual, and the record itself states no baseline needs re-freezing.
+>
+> Previous location: `docs/known-issues/jdk-only/L7-adler32-missing-natives.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `java.util.zip.Adler32` had no natives at all — `RJdkJni` died on the third checksum line
 
 **Status:** FIXED in source 2026-08-06 (lane L7, JDK-only wave 2). Not yet

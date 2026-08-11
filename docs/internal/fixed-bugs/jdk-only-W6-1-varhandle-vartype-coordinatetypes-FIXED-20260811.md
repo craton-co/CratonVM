@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkHandles` passes in the 53/1 run. Both things this record left outside its own files are in the tree. The "Required out-of-file change (not applied)" is applied — `is_method_handles_varhandle_factory_native_override` exists (`vm/src/runtime/interpreter/native_override.rs:716`) and `vm/src/vm/vm_exec.rs:23008` names `("coordinateTypes", "()Ljava/util/List;")` in the `check_override` disjunct. Defect **6**, filed as "NOT FIXED — outside this lane's files" (a wrong-type `VarHandle` reference return not throwing), is **also fixed**: `vm/src/vm/vm_exec.rs:1717-1760` carries `vh_strict_reference_return`, a `CRATONVM_VH_STRICT_REFERENCE_RETURN` kill switch documented as restoring "the pre-W6-1 silent wrong answer", plus the `boxed_primitive_supertypes` assignability table behind it.
+>
+> Previous location: `docs/known-issues/jdk-only/W6-1-varhandle-vartype-coordinatetypes.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `VarHandle` could not describe itself — and four more defects behind `varHandles()`
 
 **Status:** fix written 2026-08-07 (lane W6-1, JDK-only wave 2 / strict-corpus

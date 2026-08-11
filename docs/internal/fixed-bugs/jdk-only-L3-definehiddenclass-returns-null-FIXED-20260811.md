@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vectors `RJdkHidden` and `RJdkStrict` both pass in the 53/1 run. This record changed no code and listed three "Required out-of-file changes"; **all three are in the tree.** Patch 1 — the `lang_invoke.rs` placeholder is gone, and `defineHiddenClass` is now registered exactly once (`native-builtins/src/classloader.rs:9946`). Patch 2 — `native-builtins/src/lookup_define.rs:467-479` mangles the hidden name from the class file's own `this_class`. Patch 3 (the one this record called "recommended, not required") — `alloc_lookup_for` now writes `prevLookupClass`/`allowedModes`/`cachedProtectionDomain` by name behind a class-side witness, landed by lane W6-3.
+>
+> Previous location: `docs/known-issues/jdk-only/L3-definehiddenclass-returns-null.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `Lookup.defineHiddenClass` answered a Lookup with a null `lookupClass` — a placeholder stub outranks the real implementation
 
 **Status:** DIAGNOSED 2026-08-06 (lane L3, JDK-only wave 2). **No code change was

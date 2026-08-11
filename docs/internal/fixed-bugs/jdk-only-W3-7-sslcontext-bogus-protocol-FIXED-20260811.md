@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkSecurity` passes in the 53/1 run. The out-of-file patches ARE applied: both `native-builtins/src/net_phase_e.rs:11992` and `native-builtins/src/phases_late/ssl_security.rs:1518` now raise through `jca::provider_chain::throw_no_such_algorithm_public` with HotSpot's `"<name> SSLContext not available"` wording. "The next failure behind it, and its patch" — `Security.getAlgorithms` writing a `String[]` into slot 0 of a real `java.util.HashSet` — was taken by W4-3 and fixed; `phases_early.rs` now builds that set with `make_hashset_with_elements`.
+>
+> Previous location: `docs/known-issues/jdk-only/W3-7-sslcontext-bogus-protocol.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `SSLContext.getInstance("<bogus>")` threw an `IOException` wrapping the words "NoSuchAlgorithmException"
 
 **Status:** FIXED in source 2026-08-07 (lane W3-7, JDK-only wave 3). Not yet

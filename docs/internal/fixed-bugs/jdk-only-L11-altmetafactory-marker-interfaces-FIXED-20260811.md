@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkLambdas` passes in the 53/1 run. All four "Out-of-file (patches handed to the orchestrator)" are in the tree: `lambda_proxy_marker_satisfies` is called from `vm/src/runtime/interpreter/typecheck.rs:285` and defined at `vm/src/runtime/invokedynamic.rs:1452`; the `register_lambda_proxy_markers` trait method is at `native-api/src/registry.rs:663`; `vm/src/vm/vm_exec.rs:7213` implements it and forwards to `record_lambda_proxy_markers`; and `native-builtins/src/lang_invoke.rs:6494,7498` parses the `FLAG_MARKERS` block and registers it.
+>
+> Previous location: `docs/known-issues/jdk-only/L11-altmetafactory-marker-interfaces.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # altMetafactory marker interfaces were parsed nowhere and modelled nowhere
 
 Status: fix written 2026-08-06 (lane L11). Not yet built or run — this worktree

@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkModule` passes all 44 checks in the 53/1 run. "The patch that is not mine" IS applied — `native-builtins/src/lib.rs:18376-18388` now points the last `java/lang/Module.getResourceAsStream` registration at `jboss_jdkspecific::native_module_get_resource_as_stream`, carrying this record's own comment verbatim, so the encapsulating native is no longer overwritten. "Expected next wall" (`moduleServices()`) was predicted correctly, taken by W6-2/W6-11, and cleared.
+>
+> Previous location: `docs/known-issues/jdk-only/W5-3-module-resource-encapsulation.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `Module.getResourceAsStream` served every module resource — the encapsulation check was registered, then overwritten
 
 **Status:** FIX WRITTEN, UNVERIFIED (no binary was built in the session that

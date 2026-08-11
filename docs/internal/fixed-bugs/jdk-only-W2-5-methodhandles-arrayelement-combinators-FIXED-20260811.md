@@ -1,3 +1,10 @@
+> **FIXED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> Vector `RJdkHandles` passes in the 53/1 run. This record required no out-of-file patch, and the one thing it diagnosed and deliberately did not fix — "The next failure (diagnosed, NOT fixed)": `invokeExact` silently yielding `Value::Long(0)` instead of `WrongMethodTypeException` — got its own lane (W3-1), landed in `vm/src/vm/vm_exec.rs::unbox_poly_return_checked`, and is now ON by default.
+>
+> Previous location: `docs/known-issues/jdk-only/W2-5-methodhandles-arrayelement-combinators.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `MethodHandles.arrayElementGetter` returned an INERT handle — `RJdkHandles` read 0 from `a[1]`
 
 **Status:** FIXED in source 2026-08-07 (lane W2-5, JDK-only wave 2). Not yet

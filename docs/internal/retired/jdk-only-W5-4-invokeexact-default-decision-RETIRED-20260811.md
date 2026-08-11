@@ -1,3 +1,10 @@
+> **RETIRED 2026-08-11 — moved out of `docs/known-issues/jdk-only/`.**
+>
+> A decision record whose decision has been taken. It recommended FLIP, named one accepted residual, and left the flip itself unapplied pending an A/B. The flip landed on 2026-08-07: `vm/src/vm/vm_exec.rs:1588` reads `CRATONVM_MH_STRICT_INVOKEEXACT` as an opt-OUT (only the literal `"0"` disables it), and `types/src/flag_groups.rs:1264` declares it with `off_word: Some("0")` and no `off_key` — exactly the shape §6 "The flip" prescribed. Its expectation was also correct and is now moot: flipping did not by itself make `RJdkHandles` pass; the `varHandles()` failures behind it were closed by W6-1, and the vector passes in the 53/1 run.
+>
+> Previous location: `docs/known-issues/jdk-only/W5-4-invokeexact-default-decision.md`.
+> Audit that moved it: `docs/known-issues/jdk-only/RETIREMENT-20260811.md`.
+
 # `CRATONVM_MH_STRICT_INVOKEEXACT` — should the default flip?
 
 **Status:** DECISION recorded 2026-08-07 (lane W5-4, JDK-only wave 5). **No default
