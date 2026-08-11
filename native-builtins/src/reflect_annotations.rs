@@ -517,6 +517,35 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // identity/return-this no-ops are available without the JIT/interpreter
     // having to resolve the override on the receiver's pipeline class.
     crate::streams::register_stream_overrides(registry);
+    // `IntStream/LongStream/DoubleStream.summaryStatistics()` are ABSTRACT on
+    // the real JDK 25 interfaces (`javap java.util.stream.IntStream`), and
+    // `native-collections` mints its primitive streams as instances of those
+    // interfaces themselves (`try_alloc_synthetic(ctx, "java/util/stream/
+    // IntStream", ..)` in `make_int_stream`). With no native for the exact
+    // triple the call resolves to the bodiless interface declaration and dies
+    // with `AbstractMethodError: … has no Code attribute` — the same shape that
+    // `LongStream.mapToObj` and `Stream.forEachOrdered` already hit. The only
+    // registration of these three lived in `register_phase56_stream_extras`,
+    // which is reachable solely from `register_synthetic_overrides` and so is
+    // compiled out of the default CLI entirely; a Cargo feature is a build-time
+    // answer to a runtime question (docs/architecture/natives-over-real-jdk-classes.md
+    // §2). `register_phase56_primitive_stream_terminals` is the NARROWED
+    // registrar carrying just the terminal operations that are safe on the
+    // real-JDK path — the parent registrar cannot be wired wholesale, because
+    // it also registers STATIC interface methods (`Stream.iterate/generate/
+    // ofNullable`, `{Int,Long,Double}Stream.concat`) that keep the native check
+    // in real-JDK mode and would hand real pipelines our 1-field eager stream.
+    // See docs/known-issues/jdk-only/W7-5-registrars-that-never-shipped.md.
+    //
+    // ORDERING: safe in both directions. No triple registered here is
+    // registered by any live registrar (checked against the whole live
+    // registration set — the three `summaryStatistics` triples appear nowhere
+    // else), so this cannot take over a key something else is serving. And
+    // `register_annotation_overrides` runs from `register_essential_natives`,
+    // i.e. before `register_collections_natives` in `vm_init`, so even a future
+    // overlap would be resolved in native-collections' favour by
+    // last-registration-wins rather than against it.
+    crate::phases_late::register_phase56_primitive_stream_terminals(registry);
     // Predicate's compositional defaults are invokedynamic captures in the
     // real JDK. Register the GC-visible bridge implementations in real-JDK
     // mode as well so field-filter composition does not retain a stale capture
