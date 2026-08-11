@@ -8345,6 +8345,16 @@ impl G1Collector {
     /// neither rewrite the slot nor drop what it might point at. Pin the region
     /// instead — precisely what this collector already does with a conservative
     /// JIT root it cannot rewrite.
+    ///
+    /// **What this does not catch.** The screen reads the bytes AT the address,
+    /// so an interior pointer whose bytes happen to decode as a header is
+    /// indistinguishable from an object start — a zeroed field cell is the
+    /// standard example (`class_id=0, num_slots=0, kind=Object` sizes to exactly
+    /// `HEADER_SIZE`), and the rset-source walk documents the same hole. Every
+    /// non-object root measured on H2 was of the shape this DOES catch
+    /// (`BadElementTag`, `ImplausibleShape`), but "no such root reached the
+    /// evacuator" is not what this guarantees; "no root whose bytes are not a
+    /// header did" is.
     fn pinned_region_set_including_non_object_roots(
         &self,
         regions: &[G1Region],
@@ -10589,12 +10599,35 @@ mod tests {
                 .contains(&idx),
             "a real object root must leave its region collectable"
         );
-        let interior =
+        // The limitation, pinned so it cannot be forgotten: the screen reads the
+        // BYTES at the address, so an interior pointer whose bytes happen to
+        // decode is indistinguishable from an object start. A zeroed field cell
+        // is the standard example — `class_id=0, num_slots=0, kind=Object`
+        // yields exactly `HEADER_SIZE`, which is why the rset-source walk
+        // documents the same hole.
+        let zeroed_cell =
             unsafe { ObjectRef::from_raw((obj.as_ptr() as usize + HEADER_SIZE) as *mut u8) };
         assert!(
-            gc.pinned_region_set_including_non_object_roots(&regions, &[interior])
+            !gc.pinned_region_set_including_non_object_roots(&regions, &[zeroed_cell])
                 .contains(&idx),
-            "an address inside the object's body is not an object start"
+            "a zeroed cell decodes as a plausible header — this screen cannot \
+             see it, and a test claiming otherwise would be describing a \
+             collector we do not have"
+        );
+
+        // What it DOES catch is the measured shape: bytes that do not decode.
+        let garbage_addr = obj.as_ptr() as usize + HEADER_SIZE;
+        // SAFETY: the first field cell of a live 1-slot object this test owns.
+        unsafe {
+            (garbage_addr as *mut u8)
+                .add(cratonvm_types::KIND_TAGS_BYTE_OFFSET)
+                .write(0x7f);
+        }
+        let garbage = unsafe { ObjectRef::from_raw(garbage_addr as *mut u8) };
+        assert!(
+            gc.pinned_region_set_including_non_object_roots(&regions, &[garbage])
+                .contains(&idx),
+            "an address whose tag bytes do not decode is not an object start"
         );
     }
 
