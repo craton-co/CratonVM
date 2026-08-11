@@ -5,6 +5,16 @@ Status: **fix written (unbuilt, unmeasured)**. Wave 6, lane W6-9. Takes the
 defect W6-7 found and declined ("live long-standing registrations, blast radius
 unmeasured").
 
+**2026-08-11 — §7's four divergences are now addressed** (landed in source,
+unbuilt). Three are landed in
+`native-builtins/src/phases_late/concurrent.rs`
+(`register_forkjointask_w6_9_residual_bridge`): `getException()` on a cancelled
+task, `reinitialize()`, and the missing `RecursiveAction.complete(Object)`. The
+fourth — the `setRawResult` half of `complete(v)` on a cancelled task — and the
+three edits the first three imply outside that file are written out verbatim in
+§8, **not applied**. §7 now records the disposition of each rather than
+deferring it.
+
 Predecessors: `W2-8-forkjointask-invoke-returns-computes-null.md`,
 `W3-4-forkjointask-status-flags-and-the-eager-default.md`,
 `W6-7-forkjointask-quietly-family.md`.
@@ -165,11 +175,18 @@ No. Argued from the callers, which are the complete set (`grep -n
 | `fjp_gc_tests::gc_hooks_scan_result_and_remap_key_and_result` | **No** — asserts key/result remapping only. |
 
 The one API that legitimately wants a reset is `reinitialize()` (see the
-disassembly in §1: it clears `DONE`/`ABNORMAL`/`THROWN` and nulls `aux`).
-**`reinitialize` is registered nowhere** — `grep -rn '"reinitialize"'
---include=*.rs .` is empty — so it is not a caller of this primitive and cannot
-become one without its own lane. That is what makes deleting the erasure safe
-rather than merely convenient: there is no reuse path in the tree that needs it.
+disassembly in §1: it clears `DONE`/`ABNORMAL`/`THROWN` and nulls `aux`). When
+this was written **`reinitialize` was registered nowhere** — `grep -rn
+'"reinitialize"' --include=*.rs .` was empty — so it was not a caller of this
+primitive and could not become one without its own lane. That is what made
+deleting the erasure safe rather than merely convenient: there was no reuse path
+in the tree that needed it.
+
+**Still true after §7's `reinitialize` landed.** `fjt_reinitialize`
+(`native-builtins/src/phases_late/concurrent.rs`) does not call
+`fjp_state_set_done` or any other reset variant of it — it REMOVES the entry, so
+the reset is "no entry", which every reader already treats as a pristine task.
+The erasing variant has gained no caller.
 
 ## 4. Blast radius
 
@@ -243,28 +260,292 @@ Before: `isCompletedAbnormally()` false and `getException()` null — for two
 independent reasons (the erasure, and `completeExceptionally` never reaching the
 side table). After: true / false / ISE. `t.join()` must still throw the ISE.
 
-## 7. Known divergences left open (NOT fixed here)
+## 7. The four divergences this lane left open — disposition (2026-08-11)
 
-* **`getException()` on a cancelled task answers `null`.** The real
-  `getException(boolean)` returns a fresh `CancellationException` when the task
-  is `ABNORMAL` with no recorded throwable. Today `isCompletedAbnormally()` says
-  `true` for a cancelled task while `getException()` says "nothing went wrong" —
-  the two contradict each other. Fixing it means allocating a
-  `CancellationException` (or the `IllegalStateException` proxy
-  `fjp_state_get_checked` already uses) from inside `getException`, which changes
-  behaviour for every cancelled task; it needs its own measurement.
-* **`reinitialize()` is unregistered.** In real-JDK mode it resets the real
-  `status`/`aux`, which this model never reads, so a reused task keeps its
-  side-table completion and the next `join()` returns the stale result instead of
-  recomputing. Latent: no caller in the tree.
-* **`RecursiveAction.complete(Object)` is not registered** (only `ForkJoinTask`
-  and `RecursiveTask` are, in both boot paths). In real-JDK mode the resolved
-  declaring class for an `ra` receiver is `ForkJoinTask`, so the `fjt`
-  registration covers it; in synthetic mode there is a hole. Left as found —
-  adding it is a 5th registration this lane has no evidence for.
-* **`complete(v)` on a cancelled task is a full no-op here**, where the real
-  `complete` still runs `setRawResult(v)` and only the status write is
-  suppressed. Diverges on a bare `getRawResult()` alone; `join()`/`get()` raise
-  `CancellationException` either way. Deliberately left: changing it would also
-  change what `ForkJoinPool.invoke` hands back for a cancelled task, which is a
-  separate (larger) divergence.
+All four were left because each needed its own measurement, not because any was
+unclear. Three are now landed in source (unbuilt); the fourth is written out in
+§8 and not applied. The disassembly quoted below is `javap -p -c
+java.util.concurrent.ForkJoinTask` / `javap -p
+java.util.concurrent.RecursiveAction` re-taken against JDK 25.0.3.9 — the same
+image §1 used.
+
+### 7.1 `getException()` on a cancelled task answered `null` — LANDED
+
+The one that mattered: `isCompletedAbnormally()` said `true` for a cancelled task
+while `getException()` said "nothing went wrong". Two accessors over one task,
+opposite verdicts, and the campaign's dominant species (§2) in miniature.
+
+The real `getException(boolean)`, which the `public final getException()`
+delegates to with `false`:
+
+```text
+   1: getfield status; 6: ifge 16           //  status >= 0          -> null
+  10: ldc 65536;  iand; 13: ifne 18         // (status&ABNORMAL)==0  -> null
+  19: ldc 131072; iand; 22: ifeq 45         // (status&THROWN)==0    -> 45
+  32: aux ifnull 45;    42: aux.ex ifnonnull 53
+  45: new java/util/concurrent/CancellationException; <init>()V; areturn
+```
+
+Branch 45 is what every cancelled task reaches — `trySetCancelled` ORs
+`DONE|ABNORMAL` and never touches `aux` — so the spec'd answer is a **fresh
+`CancellationException`**, not null, and not the `IllegalStateException` proxy
+either: the proxy exists because `RuntimeError` has no `CancellationException`
+variant to *raise*, but nothing stops this VM from *allocating* the real class.
+It is constructible in both modes (`<init>()V` is registered for it in
+`native-builtins/src/lang_misc.rs` and `native-builtins/src/lib.rs`, and the
+synthetic path fabricates the class on demand).
+
+`fjt_get_exception` (`native-builtins/src/phases_late/concurrent.rs`) answers the
+recorded throwable first, then `done && cancelled` -> a fresh
+`CancellationException`, then null — the real method's own branch order, and now
+the same predicate `isCompletedAbnormally()` answers.
+
+It is **not** written back into the side table. `fjp_state_set_thrown` refuses to
+record on a cancelled entry anyway, so a write would be a no-op today; if it were
+not, `fjp_state_get_for_join` replays a recorded throwable, and an accessor that
+silently changed what the next `join()` raises is a worse bug than the one being
+fixed.
+
+The behaviour change is exactly the one this bullet flagged — every cancelled
+task now answers non-null from `getException()`. That is the point. §4's blast
+radius survey applies unchanged: no Java or Rust source in the tree reads
+`getException()` on a *cancelled* task (`RJdkForkJoin.java:261` and
+`probes/FjpMatrixProbe.java` reach the record through a throwing `compute()`, and
+`:294` reads the cancelled flags without asking for the exception).
+
+**Cost:** it re-registers a triple `phases_early.rs` already registers, so the
+tree now holds one dead `getException` body. §8's first patch deletes it; see
+there for the `duplicate_registration_gate.rs` consequence.
+
+### 7.2 `reinitialize()` was unregistered — LANDED (synthetic mode only until §8)
+
+```text
+public void reinitialize();
+   0: aconst_null; putfield aux
+   5: getfield status; ldc int 16777216; iand; putfield status
+```
+
+The only method on the class that clears a status bit, and the bit it keeps is
+`1<<24`, the pool-submit marker. Real bytecode cleared the real `status`/`aux`,
+which this model never reads, so the `fjp_state` entry survived and the next
+`join()` replayed the stale result.
+
+`fjt_reinitialize` REMOVES the entry rather than resetting it in place. "Never
+seen" is the state `reinitialize` restores here — every reader already treats a
+missing key and a fresh entry identically — and it is the only choice that keeps
+`fjp_queued_task_count()` honest, since that count is over `!done` entries and a
+reset-in-place entry would report a task in nobody's queue as forked-and-pending.
+The `1<<24` bit has no reader in this model. Dropping the key drops a GC root,
+which is safe here for a reason that does not generalise: the caller is executing
+a method *on* the task, so the task is live on its stack.
+
+**Incomplete without §8.** `("reinitialize", "()V")` is in neither allow-list,
+and on the default real-ForkJoinPool path `native-api/src/registry.rs` DROPS any
+Bridge on these classes whose triple `keep_real_forkjointask_bridge` does not
+name. So until §8's two one-line entries land, this registration is live only
+under `CRATONVM_SYNTHETIC_FORKJOINPOOL`. Stated rather than assumed away — a
+registration named in neither list is the `awaitQuiescence` failure mode this
+file's §5 already records.
+
+### 7.3 `RecursiveAction.complete(Object)` was unregistered — LANDED
+
+```text
+public final java.lang.Void getRawResult();
+protected final void setRawResult(java.lang.Void);
+```
+
+Both **final**, and `setRawResult`'s body is empty. So no subclass can give a
+`RecursiveAction` a raw-result slot, and `complete(v)` =
+`setRawResult(v); setDone();` reduces on this receiver to exactly `setDone()` —
+which is `fjp_state_set_done_preserving_thrown`, the W6-7 primitive, not
+`fjp_complete_body`. Routing it through `fjp_complete_body` would park `v` in the
+side table where nothing can read it back, because `RecursiveAction
+.getRawResult()` is a constant-null registration on both boot paths.
+
+That is the evidence this bullet said the lane did not have, and it also settles
+the cost: no allow-list entry, because `("complete", "(Ljava/lang/Object;)V")` is
+already named for all three classes in both lists. Real-JDK mode was never
+affected (the resolved declaring class for an `ra` receiver is `ForkJoinTask`);
+this closes the synthetic-mode hole.
+
+### 7.4 Falsifier for the three landed items
+
+```java
+ForkJoinTask<Integer> c = new RecursiveTask<>() { protected Integer compute() { return 1; } };
+check(c.cancel(false),                              "cancel reports true");
+check(c.isCompletedAbnormally(),                    "cancelled is abnormal");
+check(c.getException() instanceof CancellationException, "7.1 — and it SAYS so");
+
+ForkJoinTask<Integer> r = new RecursiveTask<>() { protected Integer compute() { return 7; } };
+check(r.invoke() == 7, "first run");
+r.reinitialize();
+check(!r.isDone(), "7.2 — reinitialize un-completes");
+check(r.invoke() == 7, "7.2 — and the body runs again, not a replay");
+
+RecursiveAction a = new RecursiveAction() { protected void compute() {} };
+a.completeExceptionally(new IllegalStateException("boom"));
+a.complete(null);
+check(a.isCompletedAbnormally(), "7.3 — ra.complete is setDone, not an erase");
+```
+
+Before: line 3 answered null; `reinitialize()` left `isDone()` true and the
+second `invoke()` replayed the memoised 7 without running `compute()`; under
+`--synthetic-jdk` the `a.complete(null)` call had no native at all. The
+`reinitialize` pair only discriminates once §8.3/§8.4 land — without them it is
+dropped in real-JDK mode, so a green there proves nothing about that mode.
+
+### 7.5 `complete(v)` on a cancelled task is still a full no-op — NOT LANDED
+
+Recorded in §8 as an applied-by-someone-else patch, because the write belongs
+inside `fjp_complete_body` (`native-builtins/src/phases_early.rs`), outside this
+lane's files. It is small; what follows is the verdict on the consequence that
+made the original bullet defer it, since "changing it also changes
+`ForkJoinPool.invoke`" is a reason to look, not a reason to stop.
+
+**The consequence is acceptable, and here is why.** `ForkJoinPool.invoke(task)`
+in this VM does `let (done, cached) = fjp_state_get(task); if done { return
+cached }` (`phases_early.rs`), so for a cancelled task it returns the cached
+result — null today, `v` after the patch. The real
+`ForkJoinPool.invoke` is `externalSubmit(task); return task.join();`, and
+`join()` on a cancelled task reaches `reportException` and **throws
+`CancellationException`**. So `pool.invoke` on a cancelled task is *already*
+wrong in the fabricated-success direction, and the patch swaps one wrong answer
+for another wrong answer of the same shape. It does not create the divergence and
+it does not deepen it.
+
+The divergence that is actually worth its own lane is the one underneath: that
+`pool.invoke` reads `fjp_state_get` where `join()` reads `fjp_state_get_checked`,
+so the two disagree about a cancelled task — the same two-accessors-one-task
+shape as 7.1, one level up. Naming it here rather than fixing it: it changes what
+every cancelled-task `pool.invoke` call site sees, from a value to a raised
+exception, and that needs the blast-radius survey §4 did for `complete`.
+
+The narrow scope is worth stating: the divergence is only visible through a bare
+`getRawResult()` on a `ForkJoinTask`/`RecursiveTask` receiver whose raw-result
+slot IS the side table. A receiver with its own slot never had the bug —
+`fjp_complete_body` invokes the virtual `setRawResult` unconditionally, exactly
+like the real `complete`. `RecursiveAction` cannot have it (7.3).
+
+## 8. Out-of-file patch (not applied)
+
+Four edits, none inside this lane's files. Ordered by what they unblock.
+
+### 8.1 `native-builtins/src/phases_early.rs` — the cancelled-task `setRawResult` (7.5)
+
+Add beside `fjp_state_set_done`:
+
+```rust
+/// The `setRawResult(v)` half of `complete(V)`, for a receiver whose
+/// raw-result slot IS the side table.
+///
+/// Split out from [`fjp_state_set_done`] because the two halves have
+/// different write-once rules: `setDone()` ORs into a status word that
+/// `trySetCancelled` has already stamped, so it is suppressed on a cancelled
+/// task — but `setRawResult` is an ordinary virtual call that the real
+/// `complete(V)` runs BEFORE it, cancelled or not. Suppressing both made
+/// `t.cancel(false); t.complete(v); t.getRawResult()` answer null where the
+/// real one answers `v`.
+pub(crate) fn fjp_state_set_raw_result(o: ObjectRef, result: Value) {
+    let mut m = fjp_state().lock();
+    m.entry(fjp_key(o)).or_insert_with(FjpEntry::new).result = result;
+}
+```
+
+and in `fjp_complete_body`, replace
+
+```rust
+    if !fjt_has_own_raw_result_slot(ctx, this) {
+        fjp_state_set_done(this, val);
+        return Ok(());
+    }
+```
+
+with
+
+```rust
+    if !fjt_has_own_raw_result_slot(ctx, this) {
+        // `setRawResult(v); setDone();` — as two calls, because only the
+        // second is write-once. `fjp_state_set_done` re-stores `result` for
+        // the ordinary path, which is the same value; the extra lock
+        // acquisition is on a path with no caller in the whole tree (§4).
+        fjp_state_set_raw_result(this, val);
+        fjp_state_set_done(this, val);
+        return Ok(());
+    }
+```
+
+No allow-list change: this moves no triple.
+
+### 8.2 `native-builtins/src/phases_early.rs` — delete the shadowed `getException` (7.1)
+
+In `register_real_jdk_forkjoin_essentials`, the `for task_class in [...]` loop
+registers `getException` and `completeExceptionally`.
+`register_forkjointask_w6_9_residual_bridge` now re-registers `getException` on
+the same three classes and runs later on both boot paths, so the body in that
+loop is unreachable. Delete **only** the `getException` `r.register(...)` call
+(keep the `completeExceptionally` one, and keep the loop), and leave a pointer:
+
+```rust
+        // `getException()` is registered by
+        // `phases_late::concurrent::register_forkjointask_w6_9_residual_bridge`,
+        // which runs later on both boot paths — the body that used to be here
+        // answered null for a cancelled task (W6-9 §7.1). Do not re-add one:
+        // registration is last-write-wins, so a copy here would look live and
+        // be dead.
+```
+
+**Until this is applied, `native-builtins/tests/duplicate_registration_gate.rs`
+measures more shadowed registrations than its frozen baseline and its
+`shadowed <= BASELINE_SHADOWED` assertion FIRES** (`BASELINE_SHADOWED_MANAGEMENT`
+seeded at `1201`, `..._NO_MANAGEMENT` at `1148`). At least three rows — one per
+task class for `getException` — and possibly more, because
+`register_forkjointask_w6_9_residual_bridge` rides both boot hooks and both may
+run in the measured configuration, in which case it also shadows *itself* on
+`reinitialize` and `RecursiveAction.complete`, exactly as the `quietly*` family
+already does inside the seeded baseline. **Do not compute the new number** — that
+gate prints the paste line from a real run, and a count nobody has taken is the
+one thing it says not to seed from.
+
+Applying 8.2 is what keeps the baseline where it is for `getException`;
+re-seeding is the fallback, not the answer. The gate is not currently wired into
+CI (its own header records that), which is why this is a note rather than a
+blocker — but it is precisely the "one duplicate removed and one added" case a
+count cannot distinguish from nothing happening.
+
+### 8.3 `native-api/src/registry.rs` — allow-list `reinitialize` (7.2)
+
+In `keep_real_forkjointask_bridge`, immediately after the
+`("completeExceptionally", "(Ljava/lang/Throwable;)V")` entry:
+
+```rust
+                    // W6-9 §7.2: the only method on the class that CLEARS a
+                    // status bit. Unregistered, real bytecode reset the real
+                    // `status`/`aux`, which nothing here reads — the side-table
+                    // completion survived and the next `join()` replayed the
+                    // stale result. Must stay in step with
+                    // `is_forkjoin_native_override`.
+                    | ("reinitialize", "()V")
+```
+
+### 8.4 `vm/src/runtime/interpreter/native_override.rs` — the other half of 8.3
+
+In `is_forkjoin_native_override`, after the same neighbour:
+
+```rust
+            // W6-9 §7.2: registered by
+            // `native-builtins/src/phases_late/concurrent.rs::
+            // register_forkjointask_w6_9_residual_bridge`. Must stay in step
+            // with `keep_real_forkjointask_bridge` in native-api/src/registry.rs.
+            | ("reinitialize", "()V")
+```
+
+8.3 and 8.4 are one edit in two files, per §5's three-edit rule: either alone
+leaves `reinitialize` inert in real-JDK mode. Expected counts afterwards:
+
+```
+grep -c '"reinitialize"' native-api/src/registry.rs                          -> 1
+grep -c '"reinitialize"' vm/src/runtime/interpreter/native_override.rs       -> 1
+grep -c '"reinitialize"' native-builtins/src/phases_late/concurrent.rs       -> 1
+```
+
+(1 rather than 3 in the last: the registration loops over the three class names.)

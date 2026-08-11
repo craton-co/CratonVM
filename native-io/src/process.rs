@@ -3250,17 +3250,103 @@ fn build_process_handle(
     }
 }
 
+/// A process-enumeration syscall that FAILED, as opposed to one that honestly
+/// found nothing.
+///
+/// The point of the type is that `Vec::new()` cannot express that difference.
+/// `os_snapshot_processes` (Windows) used to answer with an empty vector both when
+/// `CreateToolhelp32Snapshot` refused to take a snapshot and when the machine
+/// genuinely had nothing to report, and every caller was infallible — so
+/// `getProcessPids0` reported `0` found and `parent0` reported `-1`, which are
+/// precisely the answers a machine running nothing and a process with no parent
+/// produce. `ProcessHandle.allProcesses()` was then an empty stream, and
+/// `ProcessHandle.parent()` an empty `Optional`, with nothing anywhere saying a
+/// syscall had failed.
+///
+/// That is the campaign's dominant defect species — a fabricated success where
+/// the spec mandates a failure — re-entering through the ERROR path after wave 3
+/// removed it from the default arms (W2-7 is the species inventory; W6-10
+/// finding 4 is this instance).
+///
+/// HotSpot is the oracle and does not do it: `ProcessHandleImpl_md.c` throws
+/// `java.lang.RuntimeException` when `CreateToolhelp32Snapshot` returns
+/// `INVALID_HANDLE_VALUE` and again when `Process32First` fails, and
+/// `ProcessHandleImpl_unix.c` throws it when `opendir("/proc")` fails.
+/// `allProcesses()` being *restricted* is documented and legal; a list
+/// truncated by an error is a different thing and is not.
+struct ProcessScanError {
+    /// The `RuntimeException`'s message. Names the syscall AND carries the OS
+    /// error, because "the snapshot failed" alone cannot be triaged from a log
+    /// — `ERROR_ACCESS_DENIED` (a locked-down session) and `ERROR_BAD_LENGTH`
+    /// (a snapshot taken while the process table churns, which the caller may
+    /// legitimately retry) are the same sentence without it.
+    detail: String,
+}
+
+impl ProcessScanError {
+    fn new(detail: String) -> Self {
+        Self { detail }
+    }
+}
+
+/// Turn a failed process scan into the `java.lang.RuntimeException` HotSpot
+/// raises for it.
+///
+/// `RuntimeError` (`types/src/error.rs`) has no plain `RuntimeException`
+/// variant, and the nearest one it does have — `IllegalStateException` — is a
+/// *subclass*: catchable by the same `catch`, but the wrong `getClass()`, and a
+/// subclass is not good enough when the spec names a class. So the throwable is
+/// constructed directly, which is how this crate already raises every exception
+/// class `RuntimeError` cannot spell (`stream_decoder.rs`'s
+/// `UnsupportedEncodingException`, `socket_channel.rs`'s `java.nio.channels`
+/// family). No new mechanism.
+///
+/// GC: the fresh exception is pinned across `create_string`, which allocates and
+/// can therefore relocate it under a moving young collection — the same
+/// stale-native-local hazard `nio_native::file_already_exists` documents — so
+/// the ref is re-read from the pin before every use.
+///
+/// The `IllegalStateException` fallback fires only if `java/lang/RuntimeException`
+/// itself cannot be constructed, i.e. when there is no `RuntimeException` to
+/// throw at all; a thrown subclass still beats a fabricated empty list.
+fn process_scan_exception(ctx: &mut dyn NativeContext, err: ProcessScanError) -> MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object("java/lang/RuntimeException") {
+        let pin = ctx.pin_native_root(exc);
+        let detail = ctx.create_string(&err.detail);
+        let exc_cur = ctx.read_native_pin(pin, exc);
+        let _ = ctx.invoke(
+            "java/lang/RuntimeException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc_cur)), Value::Object(Some(detail))],
+        );
+        let exc_cur = ctx.read_native_pin(pin, exc);
+        ctx.unpin_native_roots(pin);
+        return MethodCallFailed::ExceptionThrown(exc_cur);
+    }
+    RuntimeError::IllegalStateException {
+        message: err.detail,
+    }
+    .into()
+}
+
 /// Direct child pids of `pid`, sourced from /proc/<pid>/task/*/children —
 /// every thread's children file is read since a child can be reparented to
-/// any thread of a multi-threaded parent. Empty on non-Linux targets (no
-/// portable equivalent; matches this module's existing Linux-only process
-/// introspection, see native_unix_fork_and_exec).
+/// any thread of a multi-threaded parent.
+///
+/// Fallible only in the sense the caller needs: an unreadable
+/// `/proc/<pid>/task` is `Ok` with whatever was collected, because the node
+/// being expanded is a single process that may simply have exited mid-walk —
+/// the unix oracle does not throw for that either, and a walk that aborted
+/// every time a descendant died would be useless. The `Err` arm exists for a
+/// platform that has no probe AT ALL (below), where an empty answer would be
+/// the fabrication this lane is removing.
 #[cfg(target_os = "linux")]
-fn direct_child_pids(pid: i64) -> Vec<i64> {
+fn direct_child_pids(pid: i64) -> Result<Vec<i64>, ProcessScanError> {
     let mut children = Vec::new();
     let task_dir = format!("/proc/{pid}/task");
     let Ok(entries) = std::fs::read_dir(&task_dir) else {
-        return children;
+        return Ok(children);
     };
     for entry in entries.flatten() {
         let children_path = entry.path().join("children");
@@ -3272,12 +3358,25 @@ fn direct_child_pids(pid: i64) -> Vec<i64> {
             }
         }
     }
-    children
+    Ok(children)
 }
 
+/// No process-tree probe is wired up for this target.
+///
+/// The `Vec::new()` this replaces is the same fabrication wave 3 removed from
+/// the Windows arm and this lane removes from the error path: "this VM cannot
+/// enumerate processes here" and "this process has no children" are different
+/// facts, and only one of them is true. Reporting it as a failure is the honest
+/// answer until a `sysctl(KERN_PROC_ALL)` arm exists — HotSpot has one on
+/// macOS/BSD and answers a real tree, so an empty stream is not oracle-faithful
+/// either way.
 #[cfg(not(any(target_os = "linux", windows)))]
-fn direct_child_pids(_pid: i64) -> Vec<i64> {
-    Vec::new()
+fn direct_child_pids(_pid: i64) -> Result<Vec<i64>, ProcessScanError> {
+    Err(ProcessScanError::new(
+        "process enumeration is not implemented on this platform: \
+         no /proc and no Toolhelp snapshot"
+            .to_string(),
+    ))
 }
 
 /// Every live descendant (children, grandchildren, ...) of `pid`, in
@@ -3309,18 +3408,23 @@ fn direct_child_pids(_pid: i64) -> Vec<i64> {
 /// `/proc/<pid>/task/*/children`, a direct read of the node being expanded
 /// rather than a machine-wide scan, so there is no re-enumeration to hoist.
 #[cfg(windows)]
-fn collect_descendant_pids(pid: i64) -> Vec<i64> {
+fn collect_descendant_pids(pid: i64) -> Result<Vec<i64>, ProcessScanError> {
     let mut result = Vec::new();
     if pid <= 0 {
-        return result;
+        return Ok(result);
     }
     // The one snapshot, turned into parent -> children before the walk starts.
     // `os_snapshot_processes` only emits rows with `pid > 0`, so every value
     // reachable through this map already satisfies `direct_child_pids`' old
     // `pid <= 0` guard.
+    //
+    // The `?` is the whole of finding 4 on this arm: a snapshot that FAILED
+    // used to arrive here as an empty `Vec`, and an empty `by_parent` makes
+    // every node a leaf — so `descendants()` reported a childless tree for a
+    // process that had a subtree, and said nothing.
     let mut by_parent: std::collections::HashMap<i64, Vec<i64>> =
         std::collections::HashMap::new();
-    for (child, parent) in os_snapshot_processes() {
+    for (child, parent) in os_snapshot_processes()? {
         by_parent.entry(parent).or_default().push(child);
     }
     let mut seen = std::collections::HashSet::new();
@@ -3340,28 +3444,33 @@ fn collect_descendant_pids(pid: i64) -> Vec<i64> {
             }
         }
     }
-    result
+    Ok(result)
 }
 
 /// Every live descendant (children, grandchildren, ...) of `pid`, in
 /// breadth-first discovery order — the same "descendants" contract as
 /// java.lang.Process.descendants()/ProcessHandle.descendants().
+///
+/// The `?` propagates a probe that could not run at all (a platform with no
+/// `/proc`); a node whose own `task/` directory is unreadable is an `Ok` empty
+/// expansion inside [`direct_child_pids`], because that is a process that
+/// exited, not a scan that failed.
 #[cfg(not(windows))]
-fn collect_descendant_pids(pid: i64) -> Vec<i64> {
+fn collect_descendant_pids(pid: i64) -> Result<Vec<i64>, ProcessScanError> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
     seen.insert(pid);
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(pid);
     while let Some(cur) = queue.pop_front() {
-        for child in direct_child_pids(cur) {
+        for child in direct_child_pids(cur)? {
             if seen.insert(child) {
                 result.push(child);
                 queue.push_back(child);
             }
         }
     }
-    result
+    Ok(result)
 }
 
 /// java.lang.Process.descendants() -> Stream<ProcessHandle> (JDK 9+).
@@ -3392,7 +3501,15 @@ fn native_process_descendants(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Value::Long(p) => p,
         _ => -1,
     };
-    let descendant_pids = collect_descendant_pids(pid);
+    // A scan that FAILED must not arrive here as an empty list: `descendants()`
+    // would then hand back an empty stream, which is what a genuinely childless
+    // process returns, and the caller (keycloak-test-framework's
+    // `ProcessUtils.getKeycloakPid()` is the known one) would conclude the
+    // wrapper script had exec'd nothing. See [`ProcessScanError`].
+    let descendant_pids = match collect_descendant_pids(pid) {
+        Ok(pids) => pids,
+        Err(err) => return Err(process_scan_exception(ctx, err)),
+    };
 
     let al_class = "java/util/ArrayList";
     let al_cid = ctx.ensure_class_initialized(al_class).map_err(|_| {
@@ -3831,22 +3948,30 @@ fn native_process_get_output_stream(
 /// Parent pid of `pid`, or `-1` when unknown. `/proc/<pid>/status` is used
 /// rather than `/proc/<pid>/stat` because the latter embeds the (unescaped,
 /// possibly space- and paren-containing) executable name in field 2.
+///
+/// `Result` for the signature's sake only — this arm never fails. That is the
+/// oracle's own shape: `ProcessHandleImpl_unix.c` throws `RuntimeException` for
+/// a failed `opendir("/proc")` (see [`os_list_processes`]) but its `parent0`
+/// returns `-1` for a process it cannot read, because a single unreadable
+/// `/proc/<pid>/status` means that process is gone or not ours, not that the
+/// procfs scan failed. The uniform return type is what lets `parent0` stay one
+/// un-`cfg`'d body across all three platform arms.
 #[cfg(target_os = "linux")]
-fn os_parent_pid(pid: i64) -> i64 {
+fn os_parent_pid(pid: i64) -> Result<i64, ProcessScanError> {
     if pid <= 0 {
-        return -1;
+        return Ok(-1);
     }
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
-        return -1;
+        return Ok(-1);
     };
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("PPid:") {
             if let Ok(v) = rest.trim().parse::<i64>() {
-                return if v > 0 { v } else { -1 };
+                return Ok(if v > 0 { v } else { -1 });
             }
         }
     }
-    -1
+    Ok(-1)
 }
 
 /// One `(pid, ppid)` row per visible process — Win32 Toolhelp snapshot.
@@ -3867,8 +3992,15 @@ fn os_parent_pid(pid: i64) -> i64 {
 /// The System Idle Process (pid 0) is dropped: it is not a process a handle can
 /// name, and Linux's `/proc` has no `0` entry either, so both arms report the
 /// same universe.
+///
+/// **Fallible, since 2026-08-11 (W6-10 finding 4).** An `Err` means the
+/// enumeration did not happen; `Ok(vec![])` would mean the machine reported no
+/// processes. Those were the same value until now, which is why a refused
+/// snapshot read back as an empty machine — see [`ProcessScanError`]. The two
+/// failure points are the two HotSpot's `ProcessHandleImpl_md.c` throws
+/// `RuntimeException` at, in the same order.
 #[cfg(windows)]
-fn os_snapshot_processes() -> Vec<(i64, i64)> {
+fn os_snapshot_processes() -> Result<Vec<(i64, i64)>, ProcessScanError> {
     use std::ffi::c_void;
     type Handle = *mut c_void;
     type Bool = i32;
@@ -3912,11 +4044,33 @@ fn os_snapshot_processes() -> Vec<(i64, i64)> {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap.is_null() || snap as isize == -1 {
-            return out;
+            // Read the OS error BEFORE anything else can overwrite it — there
+            // is no handle to close on this path, but the ordering rule is the
+            // same one the `Process32FirstW` arm below depends on.
+            return Err(ProcessScanError::new(format!(
+                "CreateToolhelp32Snapshot failed: {}",
+                std::io::Error::last_os_error()
+            )));
         }
         let mut entry: ProcessEntry32W = std::mem::zeroed();
         entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
-        let mut more = Process32FirstW(snap, &mut entry) != 0;
+        let first = Process32FirstW(snap, &mut entry) != 0;
+        if !first {
+            // `CloseHandle` succeeds here and would reset the thread's last
+            // error, so the failure is captured first. HotSpot throws on this
+            // condition unconditionally — including for `ERROR_NO_MORE_FILES`,
+            // which would mean a snapshot with no rows at all — and diverging
+            // to "empty machine" is exactly the fabrication being removed. A
+            // Toolhelp snapshot always contains at least the System process, so
+            // there is no honest empty case to protect.
+            let err = ProcessScanError::new(format!(
+                "Process32First failed: {}",
+                std::io::Error::last_os_error()
+            ));
+            CloseHandle(snap);
+            return Err(err);
+        }
+        let mut more = true;
         while more {
             let pid = entry.th32_process_id as i64;
             if pid > 0 {
@@ -3927,34 +4081,62 @@ fn os_snapshot_processes() -> Vec<(i64, i64)> {
         }
         CloseHandle(snap);
     }
-    out
+    Ok(out)
 }
 
+/// Parent pid of `pid`, or `-1` when the snapshot ran and simply does not
+/// contain `pid` — Win32.
+///
+/// The distinction the `Result` carries is the whole of finding 4 on this path:
+/// `-1` now means "enumerated, no such row", and an `Err` means "not
+/// enumerated". They were the same `-1` before, so a refused snapshot made
+/// `ProcessHandle.parent()` answer `Optional.empty()` — the documented answer
+/// for the process with no parent — for every process on the machine.
 #[cfg(windows)]
-fn os_parent_pid(pid: i64) -> i64 {
+fn os_parent_pid(pid: i64) -> Result<i64, ProcessScanError> {
     if pid <= 0 {
-        return -1;
+        return Ok(-1);
     }
-    os_snapshot_processes()
+    Ok(os_snapshot_processes()?
         .into_iter()
         .find(|(p, _)| *p == pid)
         .map(|(_, ppid)| if ppid > 0 { ppid } else { -1 })
-        .unwrap_or(-1)
+        .unwrap_or(-1))
 }
 
+/// No parent-pid probe is wired up for this target.
+///
+/// `Err` rather than `-1` for the same reason [`direct_child_pids`]' fallback
+/// arm reports one: `-1` is the JDK's answer for a process that HAS no parent
+/// (pid 1, or a reparented orphan), and claiming that for every process on a
+/// platform this VM simply cannot inspect is the fabrication, not the report.
 #[cfg(not(any(target_os = "linux", windows)))]
-fn os_parent_pid(_pid: i64) -> i64 {
-    -1
+fn os_parent_pid(_pid: i64) -> Result<i64, ProcessScanError> {
+    Err(ProcessScanError::new(
+        "ProcessHandleImpl.parent0: no parent-pid probe on this platform".to_string(),
+    ))
 }
 
 /// `(pid, ppid)` for every visible process when `of_pid == 0`, or for the
 /// direct children of `of_pid` otherwise — the two modes the JDK's
 /// `getProcessPids0` contract defines.
+///
+/// The one failure this arm reports is the one the oracle reports: a `/proc`
+/// that will not open at all. `ProcessHandleImpl_unix.c` throws
+/// `RuntimeException` there, and it is the same fact the Windows arm's refused
+/// snapshot is — the enumeration did not run. A per-entry read that fails
+/// (`os_parent_pid` below, on a process that exited between `read_dir` and the
+/// read) is NOT that: the scan ran, and one row of it is stale.
 #[cfg(target_os = "linux")]
-fn os_list_processes(of_pid: i64) -> Vec<(i64, i64)> {
+fn os_list_processes(of_pid: i64) -> Result<Vec<(i64, i64)>, ProcessScanError> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(e) => {
+            return Err(ProcessScanError::new(format!(
+                "Unable to open /proc: {e}"
+            )))
+        }
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -3962,26 +4144,36 @@ fn os_list_processes(of_pid: i64) -> Vec<(i64, i64)> {
         let Ok(pid) = name.parse::<i64>() else {
             continue;
         };
-        let ppid = os_parent_pid(pid);
+        let ppid = os_parent_pid(pid)?;
         if of_pid == 0 || ppid == of_pid {
             out.push((pid, ppid.max(0)));
         }
     }
-    out
+    Ok(out)
 }
 
 #[cfg(windows)]
-fn os_list_processes(of_pid: i64) -> Vec<(i64, i64)> {
-    os_snapshot_processes()
+fn os_list_processes(of_pid: i64) -> Result<Vec<(i64, i64)>, ProcessScanError> {
+    Ok(os_snapshot_processes()?
         .into_iter()
         .filter(|(_, ppid)| of_pid == 0 || *ppid == of_pid)
         .map(|(pid, ppid)| (pid, ppid.max(0)))
-        .collect()
+        .collect())
 }
 
+/// No process-enumeration probe is wired up for this target.
+///
+/// The `Vec::new()` this replaces made `ProcessHandle.allProcesses()` an empty
+/// stream and `children()` an empty stream, which are the answers a machine
+/// running nothing gives — the same fabrication wave 3 removed from the Windows
+/// arm by implementing it. Until a `sysctl(KERN_PROC_ALL)` arm exists, the
+/// honest report is that the enumeration did not happen.
 #[cfg(not(any(target_os = "linux", windows)))]
-fn os_list_processes(_of_pid: i64) -> Vec<(i64, i64)> {
-    Vec::new()
+fn os_list_processes(_of_pid: i64) -> Result<Vec<(i64, i64)>, ProcessScanError> {
+    Err(ProcessScanError::new(
+        "ProcessHandleImpl.getProcessPids0: no process-enumeration probe on this platform"
+            .to_string(),
+    ))
 }
 
 /// `(command, arguments)` from `/proc/<pid>/cmdline` (NUL-separated).
@@ -4009,7 +4201,12 @@ fn os_process_cmdline(_pid: i64) -> Option<(String, Vec<String>)> {
 }
 
 /// `java.lang.ProcessHandleImpl.parent0(long pid, long startTime) -> long`
-fn native_proc_handle_parent0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+///
+/// `-1` is the JDK's "no parent" answer and yields `Optional.empty()` from
+/// `ProcessHandle.parent()`. It is reported only for a scan that RAN and did not
+/// find `pid`; a scan that could not run throws, because otherwise every process
+/// on the machine looks parentless and nothing says why (W6-10 finding 4).
+fn native_proc_handle_parent0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let pid = match args.first() {
         Some(Value::Long(p)) => *p,
         _ => return Ok(Some(Value::Long(-1))),
@@ -4021,7 +4218,10 @@ fn native_proc_handle_parent0(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     } else {
         pid
     };
-    Ok(Some(Value::Long(os_parent_pid(pid))))
+    match os_parent_pid(pid) {
+        Ok(ppid) => Ok(Some(Value::Long(ppid))),
+        Err(err) => Err(process_scan_exception(ctx, err)),
+    }
 }
 
 /// `java.lang.ProcessHandleImpl.getProcessPids0(long, long[], long[], long[]) -> int`
@@ -4029,6 +4229,13 @@ fn native_proc_handle_parent0(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// Returns the number of processes found. The JDK caller grows its arrays and
 /// retries whenever the count exceeds their length, so filling only as far as
 /// each array reaches (and still reporting the true total) is the contract.
+///
+/// A count of `0` is therefore a load-bearing claim — `allProcesses()` and
+/// `children()` become empty streams on it — and it is only ever made for an
+/// enumeration that RAN. One that failed throws `java.lang.RuntimeException`,
+/// which is what HotSpot's `ProcessHandleImpl_md.c` / `_unix.c` do at the same
+/// two points; `allProcesses()` being *restricted* is documented and legal, a
+/// list truncated by an error is not (W6-10 finding 4).
 fn native_proc_handle_get_process_pids0(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4037,7 +4244,10 @@ fn native_proc_handle_get_process_pids0(
         Some(Value::Long(p)) => *p,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let found = os_list_processes(of_pid);
+    let found = match os_list_processes(of_pid) {
+        Ok(found) => found,
+        Err(err) => return Err(process_scan_exception(ctx, err)),
+    };
     let arr_of = |idx: usize| -> Option<ObjectRef> {
         match args.get(idx) {
             Some(Value::Object(Some(a))) => Some(*a),

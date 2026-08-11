@@ -8199,15 +8199,30 @@ pub(crate) fn fjp_state_get(o: ObjectRef) -> (bool, Value) {
 /// and `join()`/`get()` handed back `v` instead of raising — a fabricated
 /// success for a task the caller had explicitly failed. Nothing clears `thrown`
 /// any more. The one real API that DOES reset a task's status is
-/// `reinitialize()` (`aux = null; status &= 1<<24`), and this VM registers no
-/// native for it, so no caller here wants the reset.
+/// `reinitialize()` (`aux = null; status &= 1<<24`), which as of W6-9 §7.2 IS
+/// registered — by `register_forkjointask_w6_9_residual_bridge`, and it drops
+/// the side-table entry rather than reaching through this function. No caller
+/// here wants the reset.
 ///
 /// A cancelled task stays cancelled and keeps its null result: `cancel()`
 /// already completed it, and the real `setDone()` likewise cannot clear
-/// `CANCELLED` once `trySetCancelled` has stamped it. (The real `setRawResult`
-/// inside `complete` IS still executed for a cancelled task, so this diverges
-/// on a bare `getRawResult()` alone — `join()`/`get()` raise
-/// `CancellationException` either way.)
+/// `CANCELLED` once `trySetCancelled` has stamped it. The real `setRawResult`
+/// inside `complete` IS still executed for a cancelled task; that half is
+/// [`fjp_state_set_raw_result`], which `fjp_complete_body` now calls first, so
+/// a bare `getRawResult()` no longer diverges (W6-9 §7.4).
+/// The `setRawResult(v)` half of `complete(V)`, for a receiver whose
+/// raw-result slot IS the side table.
+///
+/// Split out from [`fjp_state_set_done`] because the two halves have different
+/// write-once rules: `setDone()` ORs into a status word that `trySetCancelled`
+/// has already stamped, so it is suppressed on a cancelled task — but
+/// `setRawResult` is an ordinary virtual call that the real `complete(V)` runs
+/// before it, cancelled or not.
+pub(crate) fn fjp_state_set_raw_result(o: ObjectRef, result: Value) {
+    let mut m = fjp_state().lock();
+    m.entry(fjp_key(o)).or_insert_with(FjpEntry::new).result = result;
+}
+
 pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
     let mut m = fjp_state().lock();
     {
@@ -8881,6 +8896,13 @@ fn fjp_complete_body(
     val: Value,
 ) -> Result<(), MethodCallFailed> {
     if !fjt_has_own_raw_result_slot(ctx, this) {
+        // `setRawResult(v); setDone();` — as two calls, because only the
+        // second is write-once. The real `complete(V)` runs `setRawResult`
+        // BEFORE `setDone()`, cancelled or not; suppressing both made
+        // `t.cancel(false); t.complete(v); t.getRawResult()` answer null where
+        // the real one answers `v` (W6-9 §7.4). `fjp_state_set_done` re-stores
+        // `result` for the ordinary path, which is the same value.
+        fjp_state_set_raw_result(this, val);
         fjp_state_set_done(this, val);
         return Ok(());
     }
@@ -9900,20 +9922,17 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "java/util/concurrent/RecursiveTask",
         "java/util/concurrent/RecursiveAction",
     ] {
-        r.register(
-            task_class,
-            "getException",
-            "()Ljava/lang/Throwable;",
-            |_ctx, args| {
-                let this = obj_arg(args, 0)?;
-                Ok(Some(match fjp_state_thrown(this) {
-                    Some(t) => Value::Object(Some(t)),
-                    None => Value::Object(None),
-                }))
-            },
-        );
+        // `getException()` is registered by
+        // `phases_late::concurrent::register_forkjointask_w6_9_residual_bridge`,
+        // which runs later on both boot paths — the body that used to be here
+        // answered null for a cancelled task, contradicting the
+        // `isCompletedAbnormally()` that reads the same side table (W6-9 §7.1).
+        // Do not re-add one: registration is last-write-wins, so a copy here
+        // would look live and be dead, and would also cost the duplicate-
+        // registration gate three shadowed rows per task class.
+        //
         // W6-9: `completeExceptionally(Throwable)` — the WRITER for the record
-        // `getException()` above reads. It was registered nowhere and named in
+        // `getException()` reads. It was registered nowhere and named in
         // neither allow-list, so real bytecode CASed the real `aux`/`status`
         // fields that nothing here reads: the task stayed `done == false`, the
         // next `join()` ran its body, and the trio `getException()` /
