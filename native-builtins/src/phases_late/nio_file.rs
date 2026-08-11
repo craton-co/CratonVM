@@ -8790,7 +8790,7 @@ pub(crate) fn p57_no_such_file(ctx: &mut dyn NativeContext, path: &str) -> Resul
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh exception (native stale-local family).
     let exc_pin = ctx.pin_native_root(exc);
-    let file_str = ctx.create_string(path);
+    let file_str = p57_exception_path_string(ctx, path);
     let exc = ctx.read_native_pin(exc_pin, exc);
     // FileSystemException stores the offending path in its `file` field.
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
@@ -8809,7 +8809,7 @@ pub(crate) fn p57_access_denied(ctx: &mut dyn NativeContext, path: &str) -> Resu
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh exception (native stale-local family).
     let exc_pin = ctx.pin_native_root(exc);
-    let file_str = ctx.create_string(path);
+    let file_str = p57_exception_path_string(ctx, path);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
@@ -8869,11 +8869,51 @@ pub(crate) fn p57_delete_error(
     match error.kind() {
         std::io::ErrorKind::NotFound => Ok(p57_no_such_file(ctx, path)?),
         std::io::ErrorKind::PermissionDenied => Ok(p57_access_denied(ctx, path)?),
-        // `DirectoryNotEmpty` is the JDK's `DirectoryNotEmptyException`, which
-        // is a `FileSystemException` subclass; we do not model the subclass, so
-        // the reason string carries the distinction.
+        _ if is_directory_not_empty(error) => Ok(p57_directory_not_empty(ctx, path)?),
         _ => p57_filesystem_exception(ctx, path, None, &error.to_string()),
     }
+}
+
+/// ENOTEMPTY (`ERROR_DIR_NOT_EMPTY` on Windows), matched on the raw OS code
+/// rather than on `ErrorKind`, which reports it as `Uncategorized` on the
+/// toolchains this tree builds with.
+fn is_directory_not_empty(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    let code = Some(libc::ENOTEMPTY);
+    #[cfg(windows)]
+    let code = Some(WIN_ERROR_DIR_NOT_EMPTY);
+    #[cfg(not(any(unix, windows)))]
+    let code: Option<i32> = None;
+    match code {
+        Some(c) => error.raw_os_error() == Some(c),
+        None => false,
+    }
+}
+
+/// Build a *typed* `java.nio.file.DirectoryNotEmptyException`.
+///
+/// It used to be reported as a bare `FileSystemException` with the distinction
+/// carried only in the reason text, on the reasoning that "we do not model the
+/// subclass". But the subclass is the whole point of the type: a recursive
+/// delete walks children exactly when it catches `DirectoryNotEmptyException`,
+/// and `catch (DirectoryNotEmptyException)` does not match a supertype instance,
+/// so that branch silently never ran. HotSpot on the same host raises
+/// `DirectoryNotEmptyException` for `Files.delete` of a non-empty directory —
+/// verified by `NioExcShape` against JDK 25.
+///
+/// The JDK's constructor takes only the directory and leaves the reason null,
+/// which is why nothing is written to `detailMessage` here.
+pub(crate) fn p57_directory_not_empty(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/DirectoryNotEmptyException", 4)?;
+    let exc_pin = ctx.pin_native_root(exc);
+    let file_str = p57_exception_path_string(ctx, path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
+    Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
 /// Build a *typed* `java.nio.file.NotLinkException` for `path` (mirrors
@@ -8883,7 +8923,7 @@ pub(crate) fn p57_delete_error(
 pub(crate) fn p57_not_link(ctx: &mut dyn NativeContext, path: &str) -> Result<MethodCallFailed, MethodCallFailed> {
     let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/NotLinkException", 4)?;
     let exc_pin = ctx.pin_native_root(exc);
-    let file_str = ctx.create_string(path);
+    let file_str = p57_exception_path_string(ctx, path);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     ctx.unpin_native_roots(exc_pin);
@@ -8891,17 +8931,39 @@ pub(crate) fn p57_not_link(ctx: &mut dyn NativeContext, path: &str) -> Result<Me
 }
 
 /// Build a *typed* `java.nio.file.FileSystemException` carrying the JDK's
-/// three-part `(file, other, reason)` shape. `getMessage()` on the real class
-/// assembles `"<file> -> <other>: <reason>"` from exactly these fields, so we
-/// leave `Throwable.detailMessage` null (same reasoning as
-/// [`p57_no_such_file`]).
+/// three-part `(file, other, reason)` shape.
+///
+/// **The reason is not a field of this class.** `java.nio.file.FileSystemException`
+/// declares exactly two instance fields, `file` and `other`; its constructor
+/// passes the reason to `super(reason)` and `getReason()` returns
+/// `Throwable.getMessage()`. Verified against the host JDK 25:
+///
+/// ```text
+/// declaredFields: serialVersionUID, file, other        (no `reason`)
+/// new FileSystemException("F","O","R")
+///     getReason() = R   getMessage() = "F -> O: R"   detailMessage = R
+/// new FileSystemException("F")
+///     getReason() = null getMessage() = "F"          detailMessage = null
+/// ```
+///
+/// So the reason goes to `detailMessage`. Writing it to a `"reason"` field
+/// instead resolves nothing and is silently dropped — the by-name-write failure
+/// mode — which left every `FileSystemException` CratonVM raised reaching Java
+/// with `getReason() == null` and a message truncated to `"<file> -> <other>"`.
+/// `getMessage()` is overridden by the real class and assembles the three parts
+/// itself, so it must NOT be pre-rendered here.
 ///
 /// This is the type the JDK raises for an OS-level link failure that is not one
 /// of the specific subclasses — most visibly Windows' `ERROR_PRIVILEGE_NOT_HELD`
 /// ("A required privilege is not held by the client"), which is what a symlink
 /// creation gets on any Windows host without Developer Mode or an elevated
 /// token. Reporting it as `UnsupportedOperationException` (the old behaviour)
-/// made a *host* limitation look like a missing JDK feature.
+/// made a *host* limitation look like a missing JDK feature — and dropping the
+/// reason string put it right back, because the text naming the host gap was the
+/// part being discarded.
+///
+/// The one-argument builders ([`p57_no_such_file`] and friends) correctly leave
+/// `detailMessage` null: HotSpot likewise reports `getReason() == null` there.
 pub(crate) fn p57_filesystem_exception(
     ctx: &mut dyn NativeContext,
     file: &str,
@@ -8910,28 +8972,57 @@ pub(crate) fn p57_filesystem_exception(
 ) -> Result<MethodCallFailed, MethodCallFailed> {
     let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileSystemException", 4)?;
     let exc_pin = ctx.pin_native_root(exc);
-    let file_str = ctx.create_string(file);
+    let file_str = p57_exception_path_string(ctx, file);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
     if let Some(other) = other {
-        let other_str = ctx.create_string(other);
+        let other_str = p57_exception_path_string(ctx, other);
         let exc = ctx.read_native_pin(exc_pin, exc);
         ctx.set_field_by_name(exc, "other", Value::Object(Some(other_str)));
     }
     let reason_str = ctx.create_string(reason);
     let exc = ctx.read_native_pin(exc_pin, exc);
-    ctx.set_field_by_name(exc, "reason", Value::Object(Some(reason_str)));
+    ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(reason_str)));
     ctx.unpin_native_roots(exc_pin);
     Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
-/// Windows error code for "a required privilege is not held by the client",
-/// which `CreateSymbolicLinkW` returns unless the process token holds
-/// `SeCreateSymbolicLinkPrivilege` (administrator) or the machine is in
-/// Developer Mode. Rust surfaces it as an uncategorised `io::Error`, so the
-/// raw OS code is the only reliable discriminator.
+/// Render a VM-internal path the way the platform's `Path.toString()` does,
+/// for embedding in an exception's `file`/`other` field.
+///
+/// CratonVM stores paths in one internal form that uses `/` on every platform.
+/// `java.nio.file.Path.toString()` converts back to the platform separator, but
+/// the exception builders here were handing the *internal* string straight to
+/// the exception, so on Windows every `java.nio.file` exception named
+/// `C:/Users/...` where HotSpot names `C:\Users\...`. It is not symlink-specific
+/// — `newByteChannel`, `createDirectory` and `delete` were all affected — and it
+/// breaks any test that compares an exception message against a `Path`.
+///
+/// On Unix the separator already matches, so this is the identity function and
+/// costs nothing.
+pub(crate) fn p57_exception_path(path: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if path.contains('/') {
+            return std::borrow::Cow::Owned(path.replace('/', "\\"));
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// `create_string` for a path that is about to be stored in an exception, with
+/// [`p57_exception_path`] applied. Every `java.nio.file` exception builder goes
+/// through this rather than converting at its own call site, so a new builder
+/// cannot reintroduce the divergence by forgetting.
+pub(crate) fn p57_exception_path_string(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
+    let rendered = p57_exception_path(path);
+    ctx.create_string(rendered.as_ref())
+}
+
+/// `ERROR_DIR_NOT_EMPTY`, Windows' ENOTEMPTY. Rust reports it as an
+/// uncategorised `io::Error`, so the raw OS code is the only discriminator.
 #[cfg(windows)]
-const WIN_ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+const WIN_ERROR_DIR_NOT_EMPTY: i32 = 145;
 
 /// Map an `io::Error` from a link syscall onto the exception type the JDK
 /// raises for it. `link` is the path being created/read (the `file` slot);
@@ -8946,18 +9037,23 @@ fn p57_link_io_error(
         std::io::ErrorKind::AlreadyExists => Ok(p57_file_already_exists(ctx, link)),
         std::io::ErrorKind::NotFound => p57_no_such_file(ctx, link),
         std::io::ErrorKind::PermissionDenied => p57_access_denied(ctx, link),
+        _ if is_directory_not_empty(e) => p57_directory_not_empty(ctx, link),
         _ => {
-            #[cfg(windows)]
-            if e.raw_os_error() == Some(WIN_ERROR_PRIVILEGE_NOT_HELD) {
-                return p57_filesystem_exception(
-                    ctx,
-                    link,
-                    other,
-                    "A required privilege is not held by the client",
-                );
-            }
-            // Strip Rust's trailing " (os error N)" so the reason reads like
-            // the JDK's, which carries only the system message text.
+            // The reason is whatever the OS said, not a string of ours.
+            //
+            // Windows' `ERROR_PRIVILEGE_NOT_HELD` (1314) — what
+            // `CreateSymbolicLinkW` returns without `SeCreateSymbolicLinkPrivilege`
+            // or Developer Mode — used to be special-cased to the hardcoded
+            // English "A required privilege is not held by the client". That is
+            // exactly what the JDK does NOT do: it formats the message through
+            // the Win32 error table, so on a non-English host the text arrives
+            // localized. Hardcoding English made CratonVM's message differ from
+            // HotSpot's on precisely the host where this error is common. Rust's
+            // `io::Error` Display already goes through `FormatMessage`, so
+            // deleting the special case is what makes the two agree.
+            //
+            // Strip Rust's trailing " (os error N)" so the reason reads like the
+            // JDK's, which carries only the system message text.
             let text = e.to_string();
             let reason = text.split(" (os error ").next().unwrap_or(&text).to_string();
             p57_filesystem_exception(ctx, link, other, &reason)
@@ -9013,7 +9109,13 @@ pub(crate) fn p57_create_symbolic_link(
     };
     match result {
         Ok(()) => Ok(()),
-        Err(e) => Err(p57_link_io_error(ctx, &e, link, Some(target))?),
+        // Only the LINK is named. Both JDK providers funnel a failed
+        // `createSymbolicLink` through `rethrowAsIOException(link)` — one path —
+        // so a CratonVM message reading `"<link> -> <target>: <reason>"` where
+        // HotSpot reads `"<link>: <reason>"` is a divergence any test comparing
+        // the message notices. `createLink` below is the genuine two-path case
+        // (`rethrowAsIOException(link, existing)`) and keeps both.
+        Err(e) => Err(p57_link_io_error(ctx, &e, link, None)?),
     }
 }
 
@@ -10942,7 +11044,7 @@ pub(crate) fn p57_file_already_exists(
         ctx.new_object("java/nio/file/FileAlreadyExistsException")
     {
         let exc_pin = ctx.pin_native_root(exc);
-        let file_str = ctx.create_string(path);
+        let file_str = p57_exception_path_string(ctx, path);
         let exc_cur = ctx.read_native_pin(exc_pin, exc);
         let _ = ctx.invoke(
             "java/nio/file/FileAlreadyExistsException",
@@ -16615,6 +16717,79 @@ mod registry_content_type_tests {
     fn an_embedded_nul_is_refused_rather_than_truncated() {
         assert_eq!(hkcr_string_value(".txt\0.exe", "Content Type"), None);
         assert_eq!(hkcr_string_value(".txt", "Content\0Type"), None);
+    }
+}
+
+/// Tests for the shape of the `java.nio.file` exceptions this module raises.
+///
+/// Each case is anchored to a measured HotSpot answer (JDK 25, `NioExcShape`
+/// probe, 2026-08-11) rather than to what the code used to do.
+#[cfg(test)]
+mod exception_shape_tests {
+    use super::{is_directory_not_empty, p57_exception_path};
+
+    /// HotSpot names `C:\Users\...\missing.txt` in every `java.nio.file`
+    /// exception; CratonVM named `C:/Users/.../missing.txt`, because the
+    /// builders were handed the VM's internal path form. `Path.toString()`
+    /// itself was already correct, so only the exception text diverged.
+    #[test]
+    fn an_exception_path_uses_the_platform_separator() {
+        let internal = "C:/Users/x/AppData/Local/Temp/nioexc/missing.txt";
+        let rendered = p57_exception_path(internal);
+        if cfg!(windows) {
+            assert_eq!(rendered, "C:\\Users\\x\\AppData\\Local\\Temp\\nioexc\\missing.txt");
+        } else {
+            assert_eq!(rendered, internal);
+        }
+    }
+
+    /// A path already in platform form must come back untouched, and borrowed
+    /// rather than copied — this runs on every exception CratonVM raises.
+    #[test]
+    fn an_exception_path_without_slashes_is_not_rewritten() {
+        let already = if cfg!(windows) { "C:\\tmp\\x" } else { "/tmp/x" };
+        assert!(matches!(
+            p57_exception_path(already),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(p57_exception_path(already), already);
+    }
+
+    /// `Files.delete` of a non-empty directory is `DirectoryNotEmptyException`
+    /// on HotSpot, and was a bare `FileSystemException` here — so a caller's
+    /// `catch (DirectoryNotEmptyException)` recursion branch never ran. The
+    /// discriminator is the raw OS code: `ErrorKind` reports ENOTEMPTY as
+    /// `Uncategorized`, which is what made the distinction unavailable.
+    #[test]
+    fn a_non_empty_directory_removal_is_recognised() {
+        let dir = std::env::temp_dir().join(format!(
+            "cratonvm-notempty-{}-{}",
+            std::process::id(),
+            "a"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("child")).expect("create nested dir");
+        let error = std::fs::remove_dir(&dir).expect_err("removing a non-empty dir must fail");
+        assert!(
+            is_directory_not_empty(&error),
+            "ENOTEMPTY not recognised: kind={:?} raw={:?}",
+            error.kind(),
+            error.raw_os_error()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The negative half: a missing path must not be mistaken for ENOTEMPTY,
+    /// or every `NoSuchFileException` would come back as the wrong type.
+    #[test]
+    fn a_missing_path_is_not_directory_not_empty() {
+        let missing = std::env::temp_dir().join(format!(
+            "cratonvm-notempty-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let error = std::fs::remove_dir(&missing).expect_err("removing a missing dir must fail");
+        assert!(!is_directory_not_empty(&error));
     }
 }
 
