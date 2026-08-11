@@ -4100,6 +4100,11 @@ const LK_MODE_PRIVATE: i32 = 0x02;
 const LK_MODE_PROTECTED: i32 = 0x04;
 const LK_MODE_PACKAGE: i32 = 0x08;
 const LK_MODE_MODULE: i32 = 0x10;
+/// `Lookup.UNCONDITIONAL`. The ONLY mode `publicLookup()` carries, and the one
+/// whose access rule is about the target CLASS rather than the member: an
+/// UNCONDITIONAL lookup reaches public members of PUBLIC types in
+/// unconditionally-exported packages, and nothing else.
+const LK_MODE_UNCONDITIONAL: i32 = 0x20;
 /// `FULL_POWER_MODES` = PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE (no ORIGINAL,
 /// no UNCONDITIONAL).
 const LK_MODE_FULL_POWER: i32 =
@@ -4169,12 +4174,16 @@ fn lk_member_access_flags(
 ///   `private` needs PRIVATE, `protected` needs PRIVATE|PROTECTED|PACKAGE,
 ///   package-private needs PRIVATE|PACKAGE, and `public` needs nothing.
 ///
-/// Everything the JLS §6.6 / `Lookup` contract additionally requires —
-/// nestmate relationships, `protected`-receiver rules, module `exports`/
-/// `opens`, and the `UNCONDITIONAL` "public member of a public exported type"
-/// rule — is NOT enforced. That residual is one-directional: it can only
-/// admit something HotSpot would refuse, never refuse something HotSpot
-/// admits.
+/// One rule is NOT about the member at all and is enforced separately:
+/// `UNCONDITIONAL` (`publicLookup()`, 0x20) reaches public members of PUBLIC
+/// types only, so the target CLASS's own accessibility decides. That half is
+/// checked; the "unconditionally exported package" half is not, for want of a
+/// module graph.
+///
+/// Everything else the JLS §6.6 / `Lookup` contract requires — nestmate
+/// relationships, `protected`-receiver rules, module `exports`/`opens` — is NOT
+/// enforced. That residual is one-directional: it can only admit something
+/// HotSpot would refuse, never refuse something HotSpot admits.
 fn lk_enforce_find_access(
     ctx: &dyn NativeContext,
     args: &[Value],
@@ -4210,6 +4219,29 @@ fn lk_enforce_find_access(
         return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
             message: format!(
                 "no access: {} from Lookup with modes 0x0000 (no lookup modes remain)",
+                owner.replace('/', ".")
+            ),
+        }
+        .into());
+    }
+    // UNCONDITIONAL's rule is about the TARGET CLASS, not the member.
+    // `publicLookup()` reaches public members of PUBLIC types only, so a public
+    // member of a package-private class is refused — accessibility is the
+    // class's, not the member's. Measured on OpenJDK 25.0.3:
+    // `publicLookup().findStatic(<package-private class>, <a public static>)`
+    // raises `IllegalAccessException: symbolic reference class is not
+    // accessible`, while the same call against a public class succeeds.
+    //
+    // The other half of the JDK's rule — that the package be UNCONDITIONALLY
+    // EXPORTED — still is not enforced, because there is no module graph to ask.
+    // That residual stays one-directional (it can only admit what HotSpot
+    // refuses), and this half removes the case a program actually meets:
+    // publicLookup() over an application class that is not public.
+    if modes == LK_MODE_UNCONDITIONAL && !crate::lang_class::mirror_is_public(ctx, target) {
+        let owner = mirror_class_name(ctx, target).unwrap_or_else(|| "?".to_string());
+        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+            message: format!(
+                "symbolic reference class is not accessible: class {}, from public Lookup",
                 owner.replace('/', ".")
             ),
         }
