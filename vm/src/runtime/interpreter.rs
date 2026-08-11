@@ -4129,7 +4129,17 @@ pub fn pop_and_recycle_frame_with_reason(
     }
     // T17.Δ.5 — JVMTI FramePop before the frame vanishes.
     fire_jvmti_frame_pop_if_requested(shared.vm_identity, thread, was_popped_by_exception);
-    if let Some(f) = thread.frames.pop() {
+    // The dying frame is read THROUGH THE STACK, not moved out of it.
+    //
+    // This block used to open with `if let Some(f) = thread.frames.pop()`, and
+    // `f` then travelled into `recycle_frame_with_shared` and again into
+    // `take_pool_parts` — three moves of a ~300-byte `Frame` to arrive at four
+    // `Vec` headers. `perf` on the interpreted-invoke probe put `memcpy` under
+    // `Vec::pop<Frame>` here, inside a frame-lifecycle group worth ~24.7% of
+    // the invoke arm (see the annotation-scan known-issues page). Nothing below
+    // needs the frame anywhere but where it already is.
+    let depth = thread.frames.len();
+    if depth > 0 {
         // Root-snapshot cache correctness: the frame that becomes the top again
         // (the caller this return/unwind exposes) is about to RE-EXECUTE and may
         // reassign its locals. Bump its `exec_epoch` so the `(seq, exec_epoch)`
@@ -4139,9 +4149,15 @@ pub fn pop_and_recycle_frame_with_reason(
         // the `Frame::seq` / `exec_epoch` docs. Cheap: one add on the (cold)
         // return/unwind path. `wrapping_add` so a (practically impossible) u64
         // overflow can never alias a live cache key into a false match.
-        if let Some(caller) = thread.frames.last_mut() {
+        //
+        // Hoisted above the borrow of the dying frame: with that frame still on
+        // the stack the caller is at `depth - 2`, and the bump needs `&mut`.
+        if depth >= 2 {
+            let caller = &mut thread.frames[depth - 2];
             caller.exec_epoch = caller.exec_epoch.wrapping_add(1);
         }
+        let thread_id = thread.thread_id;
+        let f = &thread.frames[depth - 1];
         // Harvest this activation's loop work towards the method's tier-up
         // counter. This is the ONLY point at which the count is complete and
         // still attributable: `Frame::backward_count` is reset on every reuse,
@@ -4225,20 +4241,21 @@ pub fn pop_and_recycle_frame_with_reason(
             // but silently swallowing loses diagnostics on monitor-state
             // corruption (e.g. user code that manually `monitorexit`ed past
             // the sync method's own counter). Log via tracing for visibility.
-            if let Err(e) =
-                crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread.thread_id)
+            if let Err(e) = crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread_id)
             {
                 tracing::warn!(
                     class = %f.class_name(),
                     method = %f.method_name(),
                     descriptor = %f.method_descriptor(),
-                    thread_id = ?thread.thread_id,
+                    thread_id = ?thread_id,
                     error = ?e,
                     "implicit monitorexit on synchronized-method-frame-pop failed"
                 );
             }
         }
-        thread.recycle_frame_with_shared(f, &shared.mem.operand_stack_pool, &shared.mem.tag_pool);
+        // Harvest the four pooled `Vec`s out of the frame where it lies and let
+        // `truncate` drop the husk in place — no `Frame` is moved.
+        thread.recycle_top_frame_in_place(&shared.mem.operand_stack_pool, &shared.mem.tag_pool);
     }
 }
 
