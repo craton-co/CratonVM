@@ -8,6 +8,201 @@
 | **CratonVM** | PASS since 2026-08-06 on the two classes this doc named; still slow (timing only — no wrong results, no crash) |
 | **Discovered** | 2026-08-03, after fixing the `seek0`/`ExpandWar` defect that had been masking it (`fixed-suite-bugs/tomcat/testmanagerwebapp-expandwar-seek0-bad-fd-FIXED.md`) |
 
+> **Update 2026-08-11 — every `--stack-sample-ms` profile on this page has
+> been read wrong, and the correction moves the target. Also: the 08-11
+> `JarFile` fix does NOT move this page, and criterion 2 is re-verified.**
+>
+> ### The reading error: `pc=0 last_pc=0` is the INVOKE, not the callee
+>
+> The sampling hook lives at the top of the interpreter's dispatch loop
+> (`vm/src/runtime/interpreter.rs`, the `stack_dump_pending()` block). An
+> `invokevirtual` resolves, coerces arguments, pushes the callee frame and
+> `continue`s — so the **first loop iteration that can observe a re-armed
+> sample request after an invoke sees the CALLEE, at `pc=0 last_pc=0`, having
+> executed nothing.** The invoke operation's own cost is therefore reported
+> against the callee's *entry*. Aggregating leaf frames by method — which is
+> what this page has done three times — files that cost under the callee's
+> name, where it reads as "this body is slow".
+>
+> Calibrated, not argued. `probes/InvokeAttributionProbe.java` puts a
+> three-bytecode `callee()` behind an `invokevirtual` in a loop, so nearly all
+> of the loop's cost is invoke overhead **by construction**, and prints the
+> per-iteration delta against the same loop with the call written out:
+>
+> | | |
+> |---|---|
+> | `withCall` | 388–512 ns/iteration |
+> | `noCall` (control) | 94–124 ns/iteration |
+> | **invoke delta** | **290–417 ns per interpreted invoke** |
+> | samples at `callee` `pc=0 last_pc=0` | **37 of 69 = 53.6%** |
+> | samples anywhere in `callee`'s body | 1 |
+>
+> A body-weighted profiler would put ~3/14 of that loop in `callee`. The entry
+> bucket alone takes 54%, and it tracks the timed invoke share. Confirmed.
+>
+> ### What this page's profile actually says
+>
+> Re-taken 2026-08-11 on `dev` `08c8e1891`, Windows, `AnnotationScanCostProbe`
+> over all 35 `output/build/lib` jars (38 s, `--stack-sample-ms 100`, 373 leaf
+> samples), split by whether the frame had executed anything:
+>
+> | bucket | samples | share |
+> |---|---:|---:|
+> | **`pc=0 last_pc=0` — the invoke that pushed the frame** | **197** | **52.8%** |
+> |   …of which `ConstantPool.getConstant(I,Class)` | 147 | 39.4% |
+> |   …of which `BufferedInputStream.read` | 34 | 9.1% |
+> | in-body, `BufferedInputStream.read1` | 83 | 22.3% |
+> | in-body, `ConstantPool.getConstant` | 37 | 9.9% |
+> | in-body, `ConstantPool.<init>` | 23 | 6.2% |
+>
+> **Over half of this workload's interpreted time is the invoke operation**,
+> and one call-site family — BCEL's per-constant-pool-access
+> `getConstant(int, Class)` — is 39% of it.
+>
+> That re-reads both profiles this page argued from:
+>
+> * § Handoff 2026-08-07's "**55.21% `ConstantPool.getConstant`**" is not
+>   `getConstant`'s body. It is the cost of *invoking* it, 1.77 M times.
+> * The 2026-08-06 update's "**78.3% of all interpreted time in five
+>   `BufferedInputStream` bodies**" is the same shape, and its conclusion —
+>   "none of them can compile … that is why every tier-up lever moved nothing"
+>   — reached the right verdict for the wrong reason. Compiling those bodies
+>   would not have helped, because the time is not in them.
+>
+> It also explains the negative result this page found most interesting: every
+> lever that compiled or admitted a *callee* moved nothing, because the cost is
+> **reaching** the callee. `CRATONVM_JIT=sync-methods`, `loop-work-tierup` and
+> `special-tierup` were all aimed one frame too deep.
+>
+> What is left is the interpreted invoke path itself, at ~350 ns against
+> HotSpot's interpreter at ~4 ns for the same operation. § The number that
+> actually sizes this reached ~260–490 ns independently, and is the one row on
+> this page that was already measuring the right thing. This is criterion 3's
+> project, now with a profile that points straight at it and an 8-second A/B
+> harness (`InvokeAttributionProbe`) to price candidate changes without paying
+> for a 35-second scan.
+>
+> ### The 2026-08-11 `JarFile`-accessor fix does not move this page
+>
+> Recorded so it is not assumed.
+> `fixed-bugs/jarfile-accessors-stat-the-file-on-every-call-FIXED-20260811.md`
+> removed a `std::fs::metadata` (20–54 us on Windows) from every `JarFile`
+> accessor call — worth 5–18x on a jar walk and −27% on
+> `TomcatServletWebServerFactoryTests`. On this probe it is **inside the
+> noise**. Four interleaved passes, arm order reversed on even passes, HotSpot
+> control every pass, `taglibs-standard-impl`, us/class:
+>
+> | arm | p1 | p2 | p3 | p4 | mean |
+> |---|---:|---:|---:|---:|---:|
+> | before (`dev` `e05bbe374`) | 854.1 | 730.8 | 593.0 | 668.6 | **711.6** |
+> | after (`dev` `08c8e1891`) | 876.3 | 680.0 | 524.6 | 850.8 | **732.9** |
+> | HotSpot 25 | 6.7 | 12.6 | 17.0 | 19.9 | **14.1** |
+>
+> Total overlap in both orders. The reason is structural rather than
+> surprising: the probe reports `parse` as `read+parse` minus `read`, and the
+> per-entry `getInputStream` the fix speeds up is paid in **both** terms, so it
+> cancels out of the headline. A real deploy cancels nothing, which is why the
+> same fix is large there and absent here — one more reason not to use this
+> probe as the profile of record (§ Methodological finding).
+>
+> ### Criterion 2, re-verified
+>
+> 711.6 / 732.9 us/class against the 813.5 us/class band set on 2026-08-06:
+> **within band, no regression.** The cross-VM ratio reads ~50x here against
+> the ~116x recorded on Azure, which is a host difference (this host's HotSpot
+> column is 6.7–19.9 us/class) and not progress. Take the
+> CratonVM-vs-CratonVM column, as § Measuring this at all already says.
+>
+> ### The ~350 ns invoke, decomposed under `perf` — with a control arm
+>
+> Azure `20.80.105.49`, `--nojit`, `perf record -F 997`, flat, load average 11
+> (so read the shares, not any wall clock). `InvokeAttributionProbe` reproduces
+> on Linux at **450–455 ns with the call, 94–101 ns without, delta 353–370 ns**,
+> matching the Windows figure.
+>
+> The point of the probe's two arms is that the **`nocall` arm is a control**,
+> and it is a remarkably clean one — three symbols and nothing else:
+>
+> | `nocall` (no invoke at all) | |
+> |---|---:|
+> | `execute_frame_from_index` | 77.40% |
+> | `safepoint_check` | 18.17% |
+> | `try_osr_with_backoff` | 3.07% |
+>
+> **So every other symbol in the `call` arm is the invoke path**, which is what
+> makes the following a decomposition rather than a list:
+>
+> | `call` arm symbol | share | group |
+> |---|---:|---|
+> | `execute_frame_from_index` | 25.67% | *(loop — also in the control)* |
+> | `execute_invokevirtual_cached` | 15.43% | dispatcher body |
+> | `pop_and_recycle_frame_with_reason` | 6.97% | frame lifecycle |
+> | `__memmove_avx512_unaligned_erms` | 6.43% | frame lifecycle |
+> | `safepoint_check` | 4.33% | *(control)* |
+> | `Frame::new_pooled_cached` | 4.25% | frame lifecycle |
+> | `CachedInvokeTarget::clone` | 2.55% | cache |
+> | `InvokeCache::get` | 2.46% | cache |
+> | `VmHeap::is_object_address` | 2.28% | receiver checks |
+> | `ZObjectStarts::contains` | 1.98% | receiver checks |
+> | `init_locals_from_parts` | 1.98% | frame lifecycle |
+> | `try_osr_with_backoff` | 1.70% | *(control)* |
+> | `copy_args_to_locals` | 1.69% | frame lifecycle |
+> | `CompactValue::decode_by_descriptor` | 1.65% | arg decode |
+> | `execute_invokevirtual_cached::{closure#9}` | 1.65% | dispatcher body |
+> | `OrderedPlRwLock<ClassManager>::try_read` / `::read` / guard drop | 1.53 / 1.14 / 0.99% | class-manager lock |
+> | `real_http_url_connection_native` | 1.50% | native-interception chain |
+> | `intercept_force_registered_native_cached` | 1.47% | native-interception chain |
+> | `drop_glue<FrameInner>` | 1.29% | frame lifecycle |
+> | `__memset_avx512_unaligned_erms` | 1.08% | frame lifecycle |
+> | `ValueStack::from_pooled` | 0.99% | frame lifecycle |
+> | `refresh_stale_object_args` | 0.92% | receiver checks |
+> | `VmHeap::class_id_of` / `load_and_forward` | 0.72 / 0.68% | receiver checks |
+> | `push_frame_and_fire_entry` | 0.72% | JVMTI |
+> | `pop_arg_for_descriptor_checked` | 0.63% | arg decode |
+>
+> Grouped, as a share of the whole `call` arm:
+>
+> | group | share |
+> |---|---:|
+> | **frame lifecycle** (construct, fill locals, move in, move out, drop) | **~24.7%** |
+> | dispatcher body (`execute_invokevirtual_cached` + its closure) | ~17.1% |
+> | receiver / heap checks | ~6.6% |
+> | inline-cache lookup + `CachedInvokeTarget::clone` | ~5.0% |
+> | class-manager `RwLock` read, per invoke | ~3.7% |
+> | native-interception chain | ~3.0% |
+> | argument decode | ~2.3% |
+>
+> **The largest single item is not the dispatcher, it is the frame.** A
+> call-graph run (`--call-graph=dwarf`) puts the `memcpy` under
+> `pop_and_recycle_frame_with_reason` → `Vec::pop<Frame>` and under
+> `push_frame_and_fire_entry`: `Frame` is a large by-value struct and it is
+> **moved on every push and every pop**. That is the shape of the remaining
+> gap, and it is a data-structure change to the interpreter's frame stack —
+> the "genuine interpreter rewrite" this page has been calling for, now with a
+> number on it.
+>
+> Two smaller items are ordinary defects rather than architecture, and are the
+> only things here a point fix could reach:
+>
+> * **The native-interception chain, ~3.0%, is per-call-site constant.**
+>   `real_http_url_connection_native` appearing at 1.50% in a probe whose only
+>   call is `int callee(int)` is the tell: a `(class, method, descriptor)`
+>   match chain runs on every inline-cache **hit**. § Correction: it is not
+>   `try_stackless_invoke` already identified this as "where the precomputed
+>   flags half of the project belongs" — it now has a price.
+> * **A class-manager `RwLock` read per invoke, ~3.7%**, the invoke-side twin
+>   of the field-path finding in § The clusters, by mechanism.
+>
+> **One caution about that call-graph run**, because it nearly cost a session:
+> `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
+> inside `execute_invokevirtual_cached`, which would have been a spectacular
+> find — a debug predicate copying memory on every invoke. It is not real.
+> `dbg_loader_trace()` is `cached_is_ok!`, a memoised `MemoSlot` load that
+> cannot copy anything. `--call-graph=dwarf` mis-nests inlined frames, so an
+> inline attribution has to be checked against the source before it is
+> believed; the two non-inlined attributions in the same output
+> (`Vec::pop<Frame>`, `push_frame_and_fire_entry`) are the trustworthy ones.
+
 > **Update 2026-08-07 — I tried to close this and could not. Here is the
 > measured ceiling, three corrections to what is written below, and a re-scope.**
 >
@@ -145,6 +340,12 @@
 >    `regression-suite/perf/c2-reach.sh` plus a CratonBench pass in scope, as
 >    § Untaken levers already says. Setting a throughput number before that
 >    project scopes itself would be inventing one.
+>
+>    **2026-08-11: that project now has a measured target.** Over half of this
+>    workload's interpreted time is the invoke operation, ~350 ns of it, and
+>    the biggest piece is not dispatch logic but **moving a by-value `Frame`
+>    in and out of the frame stack** (~24.7% of the invoke arm). See the
+>    2026-08-11 update at the top for the control-arm decomposition.
 >
 > `probes/NativeBridgeCostProbe.java` (added with this update) is the tool for
 > the recurring "is this bridge worth it" question: it prices a registered

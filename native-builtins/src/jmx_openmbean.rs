@@ -1309,10 +1309,15 @@ pub(crate) fn real_mxbean_mapping_enabled() -> bool {
     if cfg!(feature = "synthetic-jdk") {
         return false;
     }
-    !matches!(
-        std::env::var("CRATONVM_SYNTHETIC_MXBEAN_MAPPING").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    // The latched `VmFlags` snapshot, not a live `getenv`. An undeclared flag
+    // read straight from `std::env` is unreachable from
+    // `CRATONVM_REAL=-mxbean-mapping` and invisible to
+    // `flags::with_thread_overrides`, so a test that arranges it through the
+    // supported hook silently measures the developer's ambient environment
+    // instead. `one_true_yes_exact` also accepts `yes`, which the previous
+    // `Ok("1") | Ok("true")` did not — a strict widening of an opt-out escape
+    // hatch, and one fewer bespoke truth table.
+    !crate::nbflags().synthetic_mxbean_mapping
 }
 
 pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {

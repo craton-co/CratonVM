@@ -623,6 +623,18 @@ struct Args {
     #[arg(long = "stack-dump-on-timeout", value_name = "SECONDS")]
     stack_dump_on_timeout: Option<u64>,
 
+    /// READ THIS BEFORE AGGREGATING BY METHOD NAME: a leaf frame at
+    /// `pc=0 last_pc=0` has executed NOTHING, and the time it represents
+    /// belongs to the **invoke that pushed it**, not to its body. The hook
+    /// that emits a sample sits at the top of the dispatch loop, and an
+    /// invoke pushes the callee frame and `continue`s — so the first
+    /// iteration able to observe a re-armed request after an expensive
+    /// invoke reports the callee at its entry. Bucket those separately or an
+    /// invoke-dense workload reads as "the callee body is slow". Calibrated
+    /// by `probes/InvokeAttributionProbe.java`, where a three-bytecode callee
+    /// takes 54% of samples at `pc=0` and one sample anywhere else; three
+    /// profiles on the Tomcat annotation-scan page were misread this way.
+    ///
     /// If set, sample every interpreter thread's Java frame chain to stderr
     /// every `MILLIS` and keep running (no abort). Unlike
     /// `--stack-dump-on-timeout`, which emits one dump per nested interpreter

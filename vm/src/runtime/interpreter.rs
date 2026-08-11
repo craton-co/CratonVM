@@ -4756,6 +4756,20 @@ fn execute_frame_from_index(
         // resulting "profile" ranks methods by call count rather than by time
         // (a cheap method entered 100k times outranks the one that actually
         // burned the wall clock).
+        //
+        // What the sample POSITION means, because three profiles on
+        // docs/known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md
+        // were read wrong: this hook is the first thing a loop iteration does,
+        // and an invoke pushes the callee frame and `continue`s. So the time
+        // an expensive INVOKE burns is reported against the callee at
+        // `pc=0 last_pc=0` — a frame that has executed nothing. Anyone
+        // aggregating leaf frames by method name files invoke cost under the
+        // callee's name, where it reads as a slow body. Bucket
+        // `pc == 0 && last_pc == 0` separately.
+        // `probes/InvokeAttributionProbe.java` is the calibration: a
+        // three-bytecode callee behind an `invokevirtual` takes 54% of the
+        // samples at its entry and one sample anywhere in its body, and that
+        // share tracks the separately-timed invoke delta (290-417 ns).
         if (!stack_dump_emitted || shared.stack_sample_mode()) && shared.stack_dump_pending() {
             shared.dump_current_thread_frames(thread);
             if shared.stack_sample_mode() {

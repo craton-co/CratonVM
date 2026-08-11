@@ -177,17 +177,54 @@ public class RJdkDefineClass {
         check(a != b, "two loaders define two distinct Zz7 classes");
         check(a.getName().equals(b.getName()), "…with the same name");
 
-        // NOT ASSERTED: HotSpot raises `LinkageError: attempted duplicate class
-        // definition` when one loader defines the same name twice, and CratonVM
-        // deliberately serves the already-defined mirror instead
-        // (`lang_system.rs::same_loader_already_defined_mirror`, a tolerance for
-        // the delegation gaps that make a user loader re-reach findClass). That
-        // is a real fidelity divergence, measured here on 2026-08-11 in both
-        // modes, but it is a decision about duplicate-definition semantics with
-        // a blast radius across every suite that stacks loaders — not part of
-        // defineClass1/2's DECODE fidelity, which is what this vector exists to
-        // pin. Asserting it here would make the vector a permanently-red gate
-        // rather than a measurement. It is filed separately.
+        // JVMS 5.3.5: one loader may not define the same name twice. HotSpot
+        // raises `java.lang.LinkageError` ITSELF (not a subclass), with the
+        // message "loader <L> attempted duplicate class definition for Zz7." —
+        // the parenthetical tail HotSpot appends carries an identity hash, so
+        // only the type and the stable phrase are asserted.
+        //
+        // This was NOT ASSERTED until 2026-08-11: CratonVM served the
+        // already-defined mirror for every "already defined" backend error,
+        // because that tolerance covers a DIFFERENT shape — two distinct
+        // loaders colliding inside one of CratonVM's flat namespaces, which is
+        // what a Tomcat webapp stop/start loop produces by its ~14th
+        // WebappClassLoader. The two are now told apart by defining-loader
+        // OBJECT identity; the case below is the same object, twice.
+        boolean dup = false;
+        String dupMessage = null;
+        try {
+            l.viaArray("Zz7");
+        } catch (LinkageError e) {
+            dup = true;
+            dupMessage = String.valueOf(e.getMessage());
+            check(e.getClass() == LinkageError.class,
+                    "a duplicate definition raises LinkageError itself, not "
+                            + e.getClass().getName());
+        }
+        check(dup, "a duplicate definition in one loader raises LinkageError");
+        check(dupMessage != null && dupMessage.contains("attempted duplicate class definition")
+                        && dupMessage.contains("Zz7"),
+                "the LinkageError names the offence and the class: " + dupMessage);
+
+        // …and it does NOT depend on which defineClass overload was used first:
+        // the array form defined Zz7, the ByteBuffer form must refuse it too.
+        boolean dupAcrossOverloads = false;
+        try {
+            l.viaBuffer("Zz7");
+        } catch (LinkageError e) {
+            dupAcrossOverloads = true;
+        }
+        check(dupAcrossOverloads,
+                "defineClass2 refuses a name defineClass1 already defined in this loader");
+
+        // The CONTROL, and the half that must not regress: a DIFFERENT loader
+        // defining the same name is legal on HotSpot and stays legal here.
+        // `other` already defined its own Zz7 above; define one more name in
+        // both loaders to show the rule is about the loader, not the name.
+        L third = new L();
+        defined(third.viaArray("Zz7"), "Zz7", third, "a third loader defines Zz7 too");
+        check(third.viaArray("Zz9") != l.viaArray("Zz9"),
+                "two loaders defining the same fresh name get two distinct classes");
 
         // Truncated bytes are a ClassFormatError, not a crash and not a stub.
         boolean malformed = false;

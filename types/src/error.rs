@@ -834,6 +834,30 @@ pub enum LinkageError {
     #[error("incompatible class change: {message}")]
     IncompatibleClassChangeError { message: String },
 
+    /// JVMS §5.3.5: a class loader that has already defined a class of this
+    /// name must not define another one. HotSpot raises
+    /// `java.lang.LinkageError` ITSELF here, not a subclass — measured on
+    /// OpenJDK 25.0.4:
+    ///
+    /// ```text
+    /// java.lang.LinkageError: loader DupProbe$L @1dbd16a6 attempted duplicate
+    /// class definition for Dp1. (Dp1 is in unnamed module of loader
+    /// DupProbe$L @1dbd16a6, parent loader 'bootstrap')
+    /// ```
+    ///
+    /// Distinct from [`IncompatibleClassChangeError`](Self::IncompatibleClassChangeError),
+    /// which the class-manager backend raises for the same underlying
+    /// condition: that one is a VM-internal signal the `defineClass` natives
+    /// interpret, and it can also fire when a name collides inside a namespace
+    /// two DIFFERENT loaders share (CratonVM's flat store). Only this variant
+    /// means "the same loader object, twice", which is the one shape HotSpot
+    /// refuses.
+    ///
+    /// The parenthetical module tail is deliberately not reproduced: it carries
+    /// an identity hash, so no test could assert it.
+    #[error("loader {loader} attempted duplicate class definition for {class_name}")]
+    DuplicateClassDefinition { class_name: String, loader: String },
+
     #[error("no such field: {class_name}.{field_name}")]
     NoSuchFieldError {
         class_name: String,

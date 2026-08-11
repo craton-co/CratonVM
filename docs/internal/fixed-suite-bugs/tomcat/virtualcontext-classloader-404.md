@@ -42,6 +42,14 @@ Key fixes:
 - The active `ClassLoader.defineClass0/1/2` natives now recover only from
   backend "already defined" errors when the exact same loader namespace already
   owns the requested class.
+  - **Narrowed 2026-08-11.** "The same loader NAMESPACE" was too broad: a
+    namespace is a synthetic number two distinct `ClassLoader` objects can
+    share, so the recovery also swallowed the duplicate definition JVMS §5.3.5
+    forbids and HotSpot raises `LinkageError` for. The recovery is now keyed on
+    the defining-loader OBJECT, which leaves this Tomcat case on the recovery
+    arm (each stop/start cycle is a different `WebappClassLoader`) and takes the
+    genuine same-object duplicate off it. Record:
+    fixed-bugs/duplicate-defineclass-served-the-mirror-instead-of-linkageerror-FIXED-20260811.md
 
 Validation on Azure host with final binary
 `/data/data/bin/cratonvm-virtualcontext-threadgroup-20260709-r37`:

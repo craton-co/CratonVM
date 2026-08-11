@@ -2554,6 +2554,57 @@ pub(crate) fn proxy_hidden_from(
 ///      defines under the Application namespace but registers itself as definer).
 /// Otherwise it is not visible to this loader as "already loaded" → `None`,
 /// which lets the loader's `loadClass` override proceed to `findClass`/define.
+/// The `ClassId` of a class named `internal_name` that **this exact loader
+/// object** is recorded as the defining loader of.
+///
+/// This is the strongest identity statement the VM can make about "who defined
+/// it", and it is deliberately narrower than a namespace-id match. CratonVM
+/// keys its class store on `(loader_id, name)`, and a `loader_id` is a
+/// synthetic NAMESPACE number, not a loader: two distinct `ClassLoader` objects
+/// can end up sharing one. That is not hypothetical — it is the measured shape
+/// behind the Tomcat webapp stop/start family, where the ~14th
+/// `WebappClassLoader` in a process started colliding with an earlier, already
+/// finished one over `org/apache/catalina/loader/JdbcLeakPrevention`. On
+/// HotSpot each of those loaders defines its own copy and none of them
+/// conflicts.
+///
+/// So the two questions must not be confused:
+///
+/// * *"does this NAMESPACE hold the name"* — `class_id_defined_by_loader_exact`,
+///   which is what the store can answer cheaply and what the duplicate-define
+///   probe in the class manager uses; and
+/// * *"did THIS OBJECT define it"* — this function, which is the one JVMS
+///   §5.3.5 turns on and the only one that may raise a `LinkageError`.
+///
+/// **A `None` here is never proof of the negative.** The record is an
+/// `ObjectRef` and a moving collection can leave a stale pointer, so a genuine
+/// same-loader define can read back as "not recorded". Every caller must treat
+/// `None` as "cannot tell" and take the permissive branch: a missed
+/// `LinkageError` is the pre-existing behaviour, a spurious one is a new way to
+/// break a workload.
+pub(crate) fn class_defined_by_this_loader_object(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    internal_name: &str,
+) -> Option<cratonvm_types::ClassId> {
+    let vm = ctx.vm_identity();
+    let defined_here: Vec<u32> = defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(&(row_vm, cid), loader)| {
+            (row_vm == vm && loader.as_ptr() == this.as_ptr()).then_some(cid)
+        })
+        .collect();
+    for cid in defined_here {
+        let cid = cratonvm_types::ClassId::new(cid);
+        if ctx.class_name_arc_of_id(cid).as_deref() == Some(internal_name) {
+            return Some(cid);
+        }
+    }
+    None
+}
+
 pub(crate) fn find_loaded_class_for_loader(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -2662,20 +2713,8 @@ fn find_loaded_class_for_loader_inner(
     // exact defining loader object per ClassId; consult that authoritative
     // relation so a parent fork loader can recover its own already-defined
     // class before delegating to a global same-named copy.
-    let vm = ctx.vm_identity();
-    let defined_here: Vec<u32> = defining_loader_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter_map(|(&(row_vm, cid), loader)| {
-            (row_vm == vm && loader.as_ptr() == this.as_ptr()).then_some(cid)
-        })
-        .collect();
-    for cid in defined_here {
-        let cid = cratonvm_types::ClassId::new(cid);
-        if ctx.class_name_arc_of_id(cid).as_deref() == Some(internal_name) {
-            return Some(ctx.get_class_mirror(cid));
-        }
+    if let Some(cid) = class_defined_by_this_loader_object(ctx, this, internal_name) {
+        return Some(ctx.get_class_mirror(cid));
     }
     // 2. A globally-known class THIS loader is the defining loader of.
     if let Some(cid) = ctx.class_id_by_name(internal_name) {

@@ -4141,28 +4141,147 @@ pub(crate) fn preload_isolated_loader_supertypes(
     Ok(())
 }
 
-fn same_loader_already_defined_mirror(
+/// What a backend "already defined" failure means for the `defineClass` call
+/// that provoked it.
+///
+/// The backend probe is keyed on `(loader_id, name)` where `loader_id` is a
+/// synthetic NAMESPACE number
+/// (`class_manager.rs::define_class_shared_with_options`), so the error alone
+/// cannot tell the two cases below apart. Only the DEFINING LOADER OBJECT can.
+enum DuplicateDefine {
+    /// Not an "already defined" failure — the caller keeps its own error path.
+    NotDuplicate,
+    /// **This exact loader object has already defined this name.** JVMS §5.3.5
+    /// forbids it and HotSpot raises `java.lang.LinkageError`.
+    SameLoaderObject,
+    /// A class of this name exists and this loader did NOT define it — a
+    /// namespace collision inside CratonVM's flat store, or a delegation gap
+    /// that re-reached `findClass`. Serve the existing mirror.
+    ServeExisting(ObjectRef),
+}
+
+/// Decide which of the two an "already defined" backend error is.
+///
+/// # Why this exists, and why it is not simply "delete the tolerance"
+///
+/// Until 2026-08-11 every "already defined" error served the existing mirror,
+/// so `defineClass` NEVER raised the `LinkageError` HotSpot raises for a
+/// duplicate definition — measured in both modes with a `ClassLoader` subclass
+/// calling `defineClass(name, bytes, 0, len)` twice.
+///
+/// The tolerance is not decoration, though, and the case it covers is real:
+/// during a Tomcat webapp stop/start loop the ~14th `WebappClassLoader` in a
+/// process began colliding with an earlier, already-finished one over
+/// `org/apache/catalina/loader/JdbcLeakPrevention`, and surfacing the backend
+/// error there broke the container lifecycle. On HotSpot those are two
+/// DIFFERENT loaders, each entitled to its own copy; what collided was
+/// CratonVM's namespace numbering, not the loaders.
+///
+/// So the discriminator is loader-OBJECT identity, and the two shapes separate
+/// cleanly:
+///
+/// | shape | HotSpot | here |
+/// |---|---|---|
+/// | same loader object defines a name twice | `LinkageError` | `SameLoaderObject` |
+/// | two distinct loaders, one namespace | both succeed | `ServeExisting` |
+///
+/// # The bias, stated
+///
+/// `SameLoaderObject` is only ever returned on a POSITIVE identification. The
+/// defining-loader record is an `ObjectRef` and a moving collection can leave a
+/// stale pointer, so "not recorded" and "recorded elsewhere" both fall to
+/// `ServeExisting`. A missed `LinkageError` is what this VM did yesterday; a
+/// spurious one is a new way to break a workload that was working.
+fn classify_duplicate_define(
     ctx: &mut dyn NativeContext,
     loader_obj: ObjectRef,
     internal_name: &str,
     loader_id: u32,
     msg: &str,
-) -> Option<ObjectRef> {
+) -> DuplicateDefine {
     if internal_name.is_empty() || !msg.contains("already defined") {
-        return None;
+        return DuplicateDefine::NotDuplicate;
     }
-    if let Some(mirror) =
-        crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name)
+    // `CRATONVM_DBG_DUPDEF=1` -- name every "already defined" backend error and
+    // the verdict it got. This exists because the two verdicts are otherwise
+    // indistinguishable from outside: a workload that never reaches
+    // `ServeExisting` proves nothing about the tolerance still working, and one
+    // that never reaches `SameLoaderObject` proves nothing about the refusal.
+    // Both arms print, so a probe can assert it exercised the arm it claims to.
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPDEF").is_some();
+    // THE one question that may raise: did this exact object define it?
+    if crate::classloader::class_defined_by_this_loader_object(ctx, loader_obj, internal_name)
+        .is_some()
     {
-        return Some(mirror);
+        if dbg {
+            eprintln!("[DUPDEF] SameLoaderObject {internal_name} loader_id={loader_id}");
+        }
+        return DuplicateDefine::SameLoaderObject;
     }
+    // A namespace hit whose recorded defining loader IS this object is the same
+    // fact reached the other way round — the record can be keyed by namespace
+    // before the object association is made.
     if loader_id != 0 {
         if let Some(class_id) = ctx.class_id_defined_by_loader_exact(internal_name, loader_id) {
-            crate::classloader::register_defining_loader(ctx.vm_identity(), class_id.as_u32(), loader_obj);
-            return Some(ctx.get_class_mirror(class_id));
+            let same = crate::classloader::defining_loader_for(ctx.vm_identity(), class_id.as_u32())
+                .is_some_and(|def| def.as_ptr() == loader_obj.as_ptr());
+            if same {
+                if dbg {
+                    eprintln!(
+                        "[DUPDEF] SameLoaderObject(via namespace) {internal_name} loader_id={loader_id}"
+                    );
+                }
+                return DuplicateDefine::SameLoaderObject;
+            }
+            // A namespace hit this loader did not define: the collision shape.
+            if dbg {
+                eprintln!(
+                    "[DUPDEF] ServeExisting(namespace collision) {internal_name} loader_id={loader_id}"
+                );
+            }
+            crate::classloader::register_defining_loader(
+                ctx.vm_identity(),
+                class_id.as_u32(),
+                loader_obj,
+            );
+            return DuplicateDefine::ServeExisting(ctx.get_class_mirror(class_id));
         }
     }
-    None
+    match crate::classloader::find_loaded_class_for_loader(ctx, loader_obj, internal_name) {
+        Some(mirror) => {
+            if dbg {
+                eprintln!("[DUPDEF] ServeExisting(visible) {internal_name} loader_id={loader_id}");
+            }
+            DuplicateDefine::ServeExisting(mirror)
+        }
+        None => {
+            if dbg {
+                eprintln!("[DUPDEF] NotDuplicate {internal_name} loader_id={loader_id}");
+            }
+            DuplicateDefine::NotDuplicate
+        }
+    }
+}
+
+/// The `LinkageError` a duplicate definition raises, named after the loader the
+/// way HotSpot names it.
+fn duplicate_define_error(
+    ctx: &mut dyn NativeContext,
+    loader_obj: ObjectRef,
+    internal_name: &str,
+) -> MethodCallFailed {
+    // HotSpot prints `<loader class name> @<identity hash>`. The class name is
+    // the part that identifies the loader to a reader; the hash is why no test
+    // may assert the whole string.
+    let loader = ctx
+        .class_name_of_id(ctx.class_id_of_object(loader_obj))
+        .map(|n| n.replace('/', "."))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    LinkageError::DuplicateClassDefinition {
+        class_name: internal_name.to_string(),
+        loader,
+    }
+    .into()
 }
 
 pub(crate) fn native_classloader_define_class1(
@@ -4264,10 +4383,14 @@ pub(crate) fn native_classloader_define_class1(
         }
         Err(msg) => {
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                if let Some(mirror) =
-                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
-                {
-                    return Ok(Some(Value::Object(Some(mirror))));
+                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+                    DuplicateDefine::SameLoaderObject => {
+                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                    }
+                    DuplicateDefine::ServeExisting(mirror) => {
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
+                    DuplicateDefine::NotDuplicate => {}
                 }
             }
             tracing::warn!("ClassLoader.defineClass1({name}) failed: {msg}");
@@ -4348,10 +4471,14 @@ pub(crate) fn native_classloader_define_class2(
         }
         Err(msg) => {
             if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                if let Some(mirror) =
-                    same_loader_already_defined_mirror(ctx, *loader_obj, &name, loader_id, &msg)
-                {
-                    return Ok(Some(Value::Object(Some(mirror))));
+                match classify_duplicate_define(ctx, *loader_obj, &name, loader_id, &msg) {
+                    DuplicateDefine::SameLoaderObject => {
+                        return Err(duplicate_define_error(ctx, *loader_obj, &name));
+                    }
+                    DuplicateDefine::ServeExisting(mirror) => {
+                        return Ok(Some(Value::Object(Some(mirror))));
+                    }
+                    DuplicateDefine::NotDuplicate => {}
                 }
             }
             tracing::warn!("ClassLoader.defineClass2({name}) failed: {msg}");
@@ -4479,16 +4606,26 @@ pub(crate) fn native_classloader_define_class0(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
+            // `hidden` is excluded on purpose and always was: a hidden class
+            // is never registered under its name, so "already defined" cannot
+            // be about it, and JVMS §5.3.5's rule does not apply to a class
+            // that has no binary name in any loader's namespace.
             if !hidden {
                 if let Some(Value::Object(Some(loader_obj))) = args.first() {
-                    if let Some(mirror) = same_loader_already_defined_mirror(
+                    match classify_duplicate_define(
                         ctx,
                         *loader_obj,
                         &effective_name,
                         loader_id,
                         &msg,
                     ) {
-                        return Ok(Some(Value::Object(Some(mirror))));
+                        DuplicateDefine::SameLoaderObject => {
+                            return Err(duplicate_define_error(ctx, *loader_obj, &effective_name));
+                        }
+                        DuplicateDefine::ServeExisting(mirror) => {
+                            return Ok(Some(Value::Object(Some(mirror))));
+                        }
+                        DuplicateDefine::NotDuplicate => {}
                     }
                 }
             }

@@ -333,6 +333,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "dispatch-tally", on_key: Some("CRATONVM_DBG_DISPATCH_TALLY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dopriv", on_key: Some("CRATONVM_DBG_DOPRIV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dropped-stubs", on_key: Some("CRATONVM_DBG_DROPPED_STUBS"), off_key: None, off_word: None },
+    // Names every "already defined" defineClass backend error and the verdict
+    // `classify_duplicate_define` gave it. Declared rather than left to a live
+    // getenv so `CRATONVM_DBG=dupdef` reaches it and a test can arrange it:
+    // both arms print, which is how a probe proves it exercised the one it claims.
+    E { group: Group::DBG, token: "dupdef", on_key: Some("CRATONVM_DBG_DUPDEF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dump-jit", on_key: Some("CRATONVM_DBG_DUMP_JIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupcall-filter", on_key: Some("CRATONVM_DBG_DUPCALL_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupclass", on_key: Some("CRATONVM_DBG_DUPCLASS"), off_key: None, off_word: None },
@@ -1095,8 +1100,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: None },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
     // `adapt_young_trigger_to_pause` reads. Default 200 since 2026-08-11
-    // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`); `0` is the opt-out.
-    E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: None },
+    // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`), so it is a default-ON knob
+    // whose parser reads `0` as false — which is exactly what `off_word` is
+    // for. Without it the generated inventory row says `opt-in | off`, which
+    // has been untrue since the default flipped, and
+    // `CRATONVM_GC=-young-pause-goal-ms` has no way to turn it off.
+    E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
@@ -1117,6 +1126,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::REAL, token: "forkjoinpool", on_key: Some("CRATONVM_REAL_FORKJOINPOOL"), off_key: Some("CRATONVM_SYNTHETIC_FORKJOINPOOL"), off_word: None },
     E { group: Group::REAL, token: "jca", on_key: Some("CRATONVM_REAL_JCA"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "msc-real-start", on_key: Some("CRATONVM_MSC_REAL_START"), off_key: None, off_word: Some("off") },
+    // Declared 2026-08-11. The real JDK MXBean type-mapping machinery became
+    // the default that day (`jmx_openmbean::real_mxbean_mapping_enabled`);
+    // this is its opt-out, and it has no `on_key` for the same reason `raf`
+    // and `pqc` do not — the ON side is the default, not a variable.
+    E { group: Group::REAL, token: "mxbean-mapping", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_MXBEAN_MAPPING"), off_word: None },
     E { group: Group::REAL, token: "net-sockets", on_key: Some("CRATONVM_REAL_NET_SOCKETS"), off_key: Some("CRATONVM_SYNTHETIC_NET_SOCKETS"), off_word: None },
     E { group: Group::REAL, token: "pqc", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_PQC"), off_word: None },
     E { group: Group::REAL, token: "proxy", on_key: Some("CRATONVM_REAL_PROXY"), off_key: None, off_word: Some("0") },
