@@ -160,6 +160,26 @@ pub mod mic_prof {
     pub static PUB_BARRED: AtomicU64 = AtomicU64::new(0);
     pub static PUB_PUBLISHED: AtomicU64 = AtomicU64::new(0);
 
+    /// `pub_probe_none` collapses FOUR distinct events into one number. On
+    /// `ZipContentTests` it read *exactly* equal to `hit_noentry` with
+    /// `pub_published=0` — a signature that says "the cache never learns a
+    /// target" but cannot say why, because three of the four ways to reach it
+    /// never run a probe at all:
+    ///
+    ///   * `not_probed_disabled`    — `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`
+    ///   * `not_probed_redefine`    — a redefinition has quiesced JIT dispatch
+    ///   * `not_probed_uncacheable` — the receiver is not cacheable at this site
+    ///   * `probe_returned_none`    — a probe DID run and `try_jit_compile_callee`
+    ///                                declined it
+    ///
+    /// Only the last is a compile refusal; the other three are gates, and the
+    /// fix for each is a different piece of code. `pub_probe_none` stays as
+    /// their sum so numbers from earlier runs still compare.
+    pub static NOT_PROBED_DISABLED: AtomicU64 = AtomicU64::new(0);
+    pub static NOT_PROBED_REDEFINE: AtomicU64 = AtomicU64::new(0);
+    pub static NOT_PROBED_UNCACHEABLE: AtomicU64 = AtomicU64::new(0);
+    pub static PROBE_RETURNED_NONE: AtomicU64 = AtomicU64::new(0);
+
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
@@ -181,24 +201,86 @@ pub mod mic_prof {
         unsafe { core::arch::x86_64::_rdtsc() }
     }
 
+    /// Counter families for the re-entrancy gate. Depth is tracked PER FAMILY,
+    /// not globally: `cyc_invoke` is nested inside `cyc_mic_total` by
+    /// construction, so one shared depth would silently stop `cyc_invoke` ever
+    /// accumulating — which is precisely the number the funnel question needs.
+    const CYC_FAMILIES: usize = 5;
+
+    fn cyc_family(ctr: &'static AtomicU64) -> usize {
+        if std::ptr::eq(ctr, &CYC_MIC_TOTAL) {
+            0
+        } else if std::ptr::eq(ctr, &CYC_HIT_ENTRY_CALL) {
+            1
+        } else if std::ptr::eq(ctr, &CYC_INVOKE) {
+            2
+        } else if std::ptr::eq(ctr, &CYC_COMPILE_PROBE) {
+            3
+        } else {
+            4 // CYC_DISP_TOTAL
+        }
+    }
+
+    thread_local! {
+        /// Re-entrancy depth per counter family, so a nested dispatch does not
+        /// add its cycles to an enclosing span of the SAME family.
+        static CYC_DEPTH: std::cell::Cell<[u32; CYC_FAMILIES]> =
+            const { std::cell::Cell::new([0; CYC_FAMILIES]) };
+    }
+
     /// Cycle accumulator that survives early returns.
+    ///
+    /// **Only the OUTERMOST guard accumulates.** These spans cover the whole
+    /// helper *including execution of the callee*, and a compiled callee
+    /// routinely dispatches again — so a naive guard counts the inner call's
+    /// cycles at every enclosing level. That is not a small distortion: on
+    /// `ZipContentTests` the naive `cyc_mic_total` + `cyc_disp_total` summed to
+    /// 2.9e12 cycles against a ~260 s CPU run, i.e. roughly 4x more time than
+    /// the process actually had, which makes the totals unusable as a share of
+    /// anything and quietly invites reading them as one.
+    ///
+    /// Gating on depth makes them true wall-of-the-outermost-call totals, so
+    /// `cyc_mic_total - cyc_invoke` is the funnel's own cost rather than a
+    /// number contaminated by every callee beneath it.
     pub struct CycGuard {
         t0: u64,
         ctr: &'static AtomicU64,
+        family: usize,
     }
     impl CycGuard {
         pub fn new(ctr: &'static AtomicU64) -> Option<Self> {
-            if enabled() {
-                Some(Self { t0: now(), ctr })
-            } else {
-                None
+            if !enabled() {
+                return None;
             }
+            let family = cyc_family(ctr);
+            let outermost = CYC_DEPTH.with(|d| {
+                let mut cur = d.get();
+                let was = cur[family];
+                cur[family] = was + 1;
+                d.set(cur);
+                was == 0
+            });
+            // `u64::MAX` marks "nested — hold the depth, accumulate nothing".
+            Some(Self {
+                t0: if outermost { now() } else { u64::MAX },
+                ctr,
+                family,
+            })
         }
     }
     impl Drop for CycGuard {
         fn drop(&mut self) {
-            self.ctr
-                .fetch_add(now().wrapping_sub(self.t0), Ordering::Relaxed);
+            let family = self.family;
+            CYC_DEPTH.with(|d| {
+                let mut cur = d.get();
+                cur[family] = cur[family].saturating_sub(1);
+                d.set(cur);
+            });
+            // `u64::MAX` is the "nested, do not accumulate" marker set in `new`.
+            if self.t0 != u64::MAX {
+                self.ctr
+                    .fetch_add(now().wrapping_sub(self.t0), Ordering::Relaxed);
+            }
         }
     }
 
@@ -240,7 +322,9 @@ pub mod mic_prof {
             "[MIC_PROF] quiesce_depth={} mic_calls={} hit_entry={} hit_noentry={} miss={} lambda={} \
              cyc_mic_total={} cyc_hit_entry_call={} cyc_invoke={} cyc_compile_probe={} \
              disp_calls={} cyc_disp_total={} \
-             pub_probe_none={} pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
+             pub_probe_none={} (not_probed_disabled={} not_probed_redefine={} \
+             not_probed_uncacheable={} probe_returned_none={}) \
+             pub_barred={} pub_published={} ic_refusals={} ic_unowned_pub={}",
             cratonvm_gc::gc_quiescence::depth(),
             g(&MIC_CALLS),
             g(&MIC_HIT_ENTRY),
@@ -254,6 +338,10 @@ pub mod mic_prof {
             g(&DISP_CALLS),
             g(&CYC_DISP_TOTAL),
             g(&PUB_PROBE_NONE),
+            g(&NOT_PROBED_DISABLED),
+            g(&NOT_PROBED_REDEFINE),
+            g(&NOT_PROBED_UNCACHEABLE),
+            g(&PROBE_RETURNED_NONE),
             g(&PUB_BARRED),
             g(&PUB_PUBLISHED),
             cratonvm_jit::unowned_ic_entry_refusals(),
@@ -1640,9 +1728,25 @@ pub(crate) fn cv_trace_enabled() -> bool {
 /// `get(Ljava/lang/Class;)Ljava/lang/Object;` signature the `ClassValue`
 /// native answers? (Class-blind on purpose — the probe wants every route.)
 fn cv_trace_match(info: &JitInvokeInfo) -> bool {
+    // `CRATONVM_DBG_MIC_METHOD=<substring>` retargets this trace at any method.
+    // It was hardcoded to one investigation's `get(Class)Object` site, which
+    // made it useless for the next one; the MIC is the single hardest place in
+    // the VM to observe, so the instrument should not need a rebuild to move.
+    if let Some(want) = mic_trace_method_filter() {
+        return info.method_name.contains(want);
+    }
     info.method_name == "get"
         && info.descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;"
         && cv_trace_enabled()
+}
+
+/// `CRATONVM_DBG_MIC_METHOD` — retarget [`cv_trace_match`] at an arbitrary
+/// method name (substring match).
+fn mic_trace_method_filter() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static F: OnceLock<Option<String>> = OnceLock::new();
+    F.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MIC_METHOD").ok())
+        .as_deref()
 }
 
 // SAFETY: `vm` must be live for the call, and `receiver` must be a valid
@@ -4629,6 +4733,18 @@ fn stash_jit_monitor_error(
 /// JIT monitorexit helper. A successful thin unlock is one release CAS. An
 /// ownership failure becomes the ordinary catchable
 /// `IllegalMonitorStateException` and is reported with the common JIT sentinel.
+///
+/// Releases through [`crate::vm::vm_exec::monitor_exit_and_retract_jmx`], NOT
+/// through a bare `monitors.exit`. `jit_monitor_enter` reaches
+/// `complete_jmx_monitor_enter` by way of `monitor_enter_blocking`, so a
+/// compiled `monitorenter` publishes into the thread's `jmx_locked_monitors`
+/// exactly as the interpreter's does; a bare release here left every one of
+/// those publishes standing. The list is membership-scanned on each
+/// acquisition, so it grew to every distinct object the thread had ever locked
+/// from compiled code and made `monitorenter` quadratic — on `ZipContentTests`,
+/// `complete_jmx_monitor_enter` + `remove_jmx_locked_monitor` were **54% of the
+/// run**, which is the bulk of the JIT's CPU deficit against `--nojit` on
+/// lock-dense code. The entries also pinned their objects as GC roots forever.
 pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 {
@@ -4640,7 +4756,7 @@ pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
         return i64::MIN;
     };
     let obj = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
-    match vm.threads.monitors.exit(obj, thread.thread_id) {
+    match crate::vm::vm_exec::monitor_exit_and_retract_jmx(vm, obj, thread.thread_id) {
         Ok(()) => 1,
         Err(err) => {
             stash_jit_monitor_error(vm, thread, err);
@@ -7007,6 +7123,81 @@ fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> 
 // SAFETY: Caller must ensure vm_ptr (via `vm`) is a valid SharedVm reference and obj_ref is
 // derived from a live heap object. Only short-lived class_manager read/write locks are held;
 // the heap is never reborrowed. The null case must be handled by the caller before entry.
+/// `CRATONVM_DBG=typecheck-filter=<substring>` — name the branch that decided a
+/// compiled `checkcast`/`instanceof` whose TARGET class name contains the
+/// substring.
+///
+/// A compiled type check leaves no other trace. By the time anything observable
+/// happens the answer has already collapsed into a taken/not-taken branch, so a
+/// disagreement with the interpreter surfaces only as a wrong result far
+/// downstream. `CRATONVM_JIT_DENY=<Class>.<method>` says WHICH compiled body is
+/// wrong; this says WHY, by printing the ids actually compared.
+///
+/// Prints the RECEIVER's class id and name beside the target so a two-ids-one-name
+/// split is visible directly, which is the failure this was written to catch.
+/// A compiled type check reached its helper with NO target class name.
+///
+/// `bytecode_walk`'s `0xc0`/`0xc1` emission falls back to
+/// `(pc, ptr::null(), 0)` when the pc is absent from `typecheck_info_idx`, and
+/// both helpers answer that shape defensively — `instanceof` with `0`,
+/// `checkcast` fails closed. Defensible as a guard against a malformed
+/// artifact; catastrophic if it is reachable from a NORMAL compile, because
+/// then a live `instanceof` has been compiled to constant `false` and nothing
+/// downstream can tell. This fires only when `CRATONVM_DBG_TYPECHECK_FILTER`
+/// is set, and its whole purpose is to answer "is this shape actually
+/// reachable?" — which no other instrument can, since the answer never reaches
+/// `jit_typecheck_resolve`.
+fn jit_typecheck_null_name_trace(kind: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TYPECHECK_FILTER").is_some()
+    }) {
+        return;
+    }
+    eprintln!("[DBG_TYPECHECK] NULL-TARGET-NAME: {kind} compiled with no target class -> answering false/closed WITHOUT resolving");
+}
+
+fn jit_typecheck_trace(
+    vm: &SharedVm,
+    obj_class_id: ClassId,
+    class_name: &str,
+    lenient: bool,
+    stage: &str,
+    target: Option<ClassId>,
+) {
+    use std::sync::OnceLock;
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    let filter = FILTER
+        .get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_TYPECHECK_FILTER").ok())
+        .as_deref();
+    let Some(filter) = filter else {
+        return;
+    };
+    if !class_name.contains(filter) {
+        return;
+    }
+    let cm = vm.classes.class_manager.read();
+    let obj_name = cm
+        .get_class(obj_class_id)
+        .map(|c| c.name.to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let target_desc = match target {
+        Some(t) => format!(
+            "{} (id={})",
+            cm.get_class(t)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            t.as_u32()
+        ),
+        None => "<none>".to_string(),
+    };
+    eprintln!(
+        "[DBG_TYPECHECK] {stage}: target_name={class_name} lenient={lenient} recv={obj_name} (id={}) resolved_target={target_desc}",
+        obj_class_id.as_u32()
+    );
+}
+
 unsafe fn jit_typecheck_resolve(
     vm: &SharedVm,
     obj_class_id: ClassId,
@@ -7109,6 +7300,7 @@ unsafe fn jit_typecheck_resolve(
     // does not has its own carve-outs at the bottom of this function
     // (`Object`/`Serializable`/`Cloneable`, and `Object[]`), which an id
     // comparison cannot reproduce.
+    jit_typecheck_trace(vm, obj_class_id, class_name, lenient, "enter", None);
     if let Some(recorded) = cratonvm_jit::typecheck_target_for_site(class_name.as_ptr())
         .filter(|_| !recv_is_array)
     {
@@ -7118,6 +7310,18 @@ unsafe fn jit_typecheck_resolve(
             cm.get_class(target_class_id)
                 .is_some_and(|c| &*c.name == class_name)
         };
+        jit_typecheck_trace(
+            vm,
+            obj_class_id,
+            class_name,
+            lenient,
+            if names_this_site {
+                "site-recorded"
+            } else {
+                "site-recorded-names-OTHER-class"
+            },
+            Some(target_class_id),
+        );
         if names_this_site {
             if obj_class_id == target_class_id {
                 return true;
@@ -7145,6 +7349,14 @@ unsafe fn jit_typecheck_resolve(
             ) {
                 return true;
             }
+            jit_typecheck_trace(
+                vm,
+                obj_class_id,
+                class_name,
+                lenient,
+                "REFUSED-by-recorded-site",
+                Some(target_class_id),
+            );
             return false;
         }
     }
@@ -7185,6 +7397,14 @@ unsafe fn jit_typecheck_resolve(
         }
         resolved
     };
+    jit_typecheck_trace(
+        vm,
+        obj_class_id,
+        class_name,
+        lenient,
+        "by-name-fallback",
+        target_class_id_opt,
+    );
     if let Some(target_class_id) = target_class_id_opt {
         if obj_class_id == target_class_id {
             return true;
@@ -7563,6 +7783,7 @@ pub unsafe extern "C" fn jit_instanceof(
         return 0;
     }
     if class_name_len <= 0 || class_name_ptr.is_null() {
+        jit_typecheck_null_name_trace("instanceof");
         return 0;
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
@@ -12815,22 +13036,75 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
+        // LOADER IDENTITY: `try_jit_compile_callee` resolves the callee BY NAME.
+        // When the receiver's class is not the class that name globally
+        // resolves to, that hands back ANOTHER loader's copy of the method, and
+        // the entry is then cached against THIS receiver's class id — so every
+        // monomorphic hit machine-CALLs a body compiled for a different copy.
+        //
+        // Measured 2026-08-11 on ApplicationContextAotGeneratorTests: each
+        // `@CompileWithForkedClassLoader` test defines its own
+        // `DynamicJavaFileManager`, so one run showed that name resolving to
+        // eight-plus distinct class ids (2690, 8510, 10377, 14030, 15877,
+        // 17724, 19569, 21414, ...). The copy that got compiled has its
+        // `instanceof DynamicClassFileObject` site interned against ITS OWN
+        // `DynamicClassFileObject` id, so the check correctly answered false for
+        // the receiver's file object, `super.inferBinaryName` ran, and
+        // `JavacFileManager` threw on a file object it did not create.
+        //
+        // `globally_named` already gates `publish_mic_rust_cached_entry` two
+        // arms below for exactly this reason; the by-name compile that feeds the
+        // machine-code MIC/PIC was left ungated. Not globally named -> do not
+        // compile by name, leave the site on the dispatch helper, which resolves
+        // on the actual receiver.
         let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
             || redefine_jit_quiesced
             || !cacheable_receiver
+            || !globally_named
         {
+            // Attribute the skip. All three of these land in `pub_probe_none`
+            // below without a probe ever running, which is why that counter
+            // reading equal to `hit_noentry` could not distinguish "the compiler
+            // refused every callee" from "we never asked".
+            if !direct_virtual_compiled_callee_entry_enabled() {
+                mic_prof::bump(&mic_prof::NOT_PROBED_DISABLED);
+            } else if redefine_jit_quiesced {
+                mic_prof::bump(&mic_prof::NOT_PROBED_REDEFINE);
+            } else {
+                mic_prof::bump(&mic_prof::NOT_PROBED_UNCACHEABLE);
+            }
             None
         } else {
             let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
-            crate::runtime::interpreter::try_jit_compile_callee(
+            let probed = crate::runtime::interpreter::try_jit_compile_callee(
                 vm,
                 &class_name,
                 info.method_name,
                 info.descriptor,
                 // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
                 true,
-            )
+            );
+            if probed.is_none() {
+                // A probe ACTUALLY ran and the compiler declined. This is the
+                // only one of the four `pub_probe_none` causes that names a
+                // compile refusal, and `CRATONVM_DBG=callee-probe` says which.
+                mic_prof::bump(&mic_prof::PROBE_RETURNED_NONE);
+            }
+            probed
         };
+        if cv_trace {
+            eprintln!(
+                "[cv-mic-compile] site={}.{}{} recv_cid={} resolved_class={} cacheable={} globally_named={} compiled={}",
+                info.class_name,
+                info.method_name,
+                info.descriptor,
+                receiver_cid,
+                class_name,
+                cacheable_receiver,
+                globally_named,
+                compile_res.is_some(),
+            );
+        }
         // Keep handler-bearing methods on the helper path. A raw compiled
         // entry can leave a pending exceptional frame that the caller cannot
         // safely resume while the HTTP request is still active.
@@ -13018,9 +13292,31 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
+    // LOADER IDENTITY: `try_jit_compile_callee` resolves the callee BY NAME.
+    // When the receiver's class is not the class that name globally
+    // resolves to, that hands back ANOTHER loader's copy of the method, and
+    // the entry is then cached against THIS receiver's class id — so every
+    // monomorphic hit machine-CALLs a body compiled for a different copy.
+    //
+    // Measured 2026-08-11 on ApplicationContextAotGeneratorTests: each
+    // `@CompileWithForkedClassLoader` test defines its own
+    // `DynamicJavaFileManager`, so one run showed that name resolving to
+    // eight-plus distinct class ids (2690, 8510, 10377, 14030, 15877,
+    // 17724, 19569, 21414, ...). The copy that got compiled has its
+    // `instanceof DynamicClassFileObject` site interned against ITS OWN
+    // `DynamicClassFileObject` id, so the check correctly answered false for
+    // the receiver's file object, `super.inferBinaryName` ran, and
+    // `JavacFileManager` threw on a file object it did not create.
+    //
+    // `globally_named` already gates `publish_mic_rust_cached_entry` two
+    // arms below for exactly this reason; the by-name compile that feeds the
+    // machine-code MIC/PIC was left ungated. Not globally named -> do not
+    // compile by name, leave the site on the dispatch helper, which resolves
+    // on the actual receiver.
     let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
         || redefine_jit_quiesced
         || !cacheable_receiver
+        || !globally_named
     {
         None
     } else {
@@ -16966,5 +17262,165 @@ mod jit_native_dispatch_profile {
                 recv,
             );
         });
+    }
+}
+
+/// The JIT's `monitorenter`/`monitorexit` helpers must leave the thread's JMX
+/// owned-monitor set exactly as they found it.
+///
+/// This is a performance test wearing a correctness test's clothes, and the
+/// correctness half is real: `getLockedMonitors()` must not name a monitor the
+/// thread released, and the list is a GC root set, so a stale entry pins its
+/// object for the life of the thread.
+///
+/// The performance half is why it exists. `ThreadRegistry::jmx_locked_monitors`
+/// is **membership-scanned linearly on every acquisition**, so a publish with no
+/// matching retract does not cost one wasted slot — it grows the list to every
+/// distinct object the thread has ever locked and makes `monitorenter` O(that).
+/// `jit_monitor_exit` released the monitor and stopped there, and on
+/// `ZipContentTests` the two scan functions measured **54% of the whole JIT run**
+/// — the bulk of the JIT's CPU deficit against `--nojit` on lock-dense code.
+///
+/// The same defect had already been found and fixed once, at a different exit
+/// site, where it was 14.9% of a Tomcat webapp deploy. Two occurrences of one
+/// shape is what makes this a test rather than a comment.
+#[cfg(test)]
+mod jit_monitor_jmx_pairing {
+    use super::*;
+    use crate::config::VmConfig;
+    use crate::threading::jvm_thread::{JvmThread, ThreadId};
+    use std::sync::Arc;
+
+    /// Addresses of the monitors the registry currently believes `tid` owns.
+    fn owned(shared: &SharedVm, tid: ThreadId) -> Vec<usize> {
+        shared
+            .threads
+            .thread_registry
+            .jmx_lock_snapshot(tid)
+            .map(|snap| snap.2.iter().map(|o| o.as_ptr() as usize).collect())
+            .unwrap_or_default()
+    }
+
+    /// Boot a VM with one registered thread whose JIT thread-pointer is
+    /// installed, so `jit_monitor_enter`/`jit_monitor_exit` can be called
+    /// exactly as generated code calls them.
+    fn vm_with_jit_thread() -> (Arc<SharedVm>, Box<JvmThread>, ThreadId) {
+        let shared: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
+        let tid = ThreadId(1);
+        let thread = Box::new(JvmThread::new(tid, "jit-monitor-probe"));
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "jit-monitor-probe", None);
+        (shared, thread, tid)
+    }
+
+    #[test]
+    fn the_jit_helpers_publish_and_retract_the_same_monitor() {
+        let (shared, mut thread, tid) = vm_with_jit_thread();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+
+        let scope = set_jit_thread(&mut thread);
+        // SAFETY: `vm_ptr` names the live `SharedVm` above, `obj` is a live
+        // heap object, and the JIT thread pointer is installed for this OS
+        // thread — the exact contract compiled code satisfies.
+        unsafe {
+            assert_ne!(
+                jit_monitor_enter(vm_ptr, obj.as_ptr() as i64),
+                i64::MIN,
+                "the helper failed to acquire an uncontended monitor"
+            );
+            // Prove the RED first: without a publish here there would be
+            // nothing for the retract to remove, and the assertion after the
+            // exit would pass on a helper that does no bookkeeping at all.
+            assert_eq!(
+                owned(&shared, tid),
+                vec![obj.as_ptr() as usize],
+                "a compiled monitorenter must publish JMX ownership"
+            );
+            assert_ne!(
+                jit_monitor_exit(vm_ptr, obj.as_ptr() as i64),
+                i64::MIN,
+                "the helper failed to release a monitor it holds"
+            );
+        }
+        restore_jit_thread(scope);
+
+        assert!(
+            owned(&shared, tid).is_empty(),
+            "a compiled monitorexit left its JMX ownership publish standing — \
+             the owned-monitor list is scanned on every acquisition, so this is \
+             an unbounded list and a quadratic monitorenter, not one stale slot"
+        );
+    }
+
+    /// The failure mode is about DISTINCT objects, and one balanced pair cannot
+    /// see it: the leak only becomes quadratic once the list has more entries
+    /// than the thread's real lock nesting depth.
+    #[test]
+    fn locking_many_distinct_objects_leaves_no_residue() {
+        const OBJECTS: usize = 64;
+        let (shared, mut thread, tid) = vm_with_jit_thread();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        let objs: Vec<_> = (0..OBJECTS)
+            .map(|_| shared.mem.heap.alloc_object(ClassId::new(0), 0))
+            .collect();
+
+        let scope = set_jit_thread(&mut thread);
+        // SAFETY: as above; every ref comes from this heap and is still live.
+        unsafe {
+            for obj in &objs {
+                jit_monitor_enter(vm_ptr, obj.as_ptr() as i64);
+                jit_monitor_exit(vm_ptr, obj.as_ptr() as i64);
+            }
+        }
+        restore_jit_thread(scope);
+
+        assert_eq!(
+            owned(&shared, tid).len(),
+            0,
+            "{OBJECTS} balanced compiled lock/unlock pairs left {} monitors \
+             recorded as owned; each one is a permanent GC root and a permanent \
+             entry in the scan every subsequent monitorenter runs",
+            owned(&shared, tid).len()
+        );
+    }
+
+    /// A re-entrant acquisition is still held after the inner release, and
+    /// retracting there would under-report a monitor the thread really owns.
+    /// The retract is conditional on `holds` precisely for this case.
+    #[test]
+    fn a_reentrant_release_keeps_the_publish_until_the_outermost_exit() {
+        let (shared, mut thread, tid) = vm_with_jit_thread();
+        let vm_ptr = Arc::as_ptr(&shared) as i64;
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as i64;
+
+        let scope = set_jit_thread(&mut thread);
+        // SAFETY: as above.
+        unsafe {
+            jit_monitor_enter(vm_ptr, addr);
+            jit_monitor_enter(vm_ptr, addr);
+            jit_monitor_exit(vm_ptr, addr);
+        }
+        let after_inner = owned(&shared, tid);
+        // SAFETY: as above.
+        unsafe {
+            jit_monitor_exit(vm_ptr, addr);
+        }
+        let after_outer = owned(&shared, tid);
+        restore_jit_thread(scope);
+
+        assert_eq!(
+            after_inner,
+            vec![addr as usize],
+            "the inner release of a re-entrant lock retracted a monitor the \
+             thread still holds"
+        );
+        assert!(
+            after_outer.is_empty(),
+            "the outermost release left the publish standing"
+        );
     }
 }

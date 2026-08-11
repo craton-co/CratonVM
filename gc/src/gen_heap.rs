@@ -391,6 +391,12 @@ pub static SWEEP_WALK_OVERSHOOT_HITS: AtomicU64 = AtomicU64::new(0);
 /// live memory).
 pub static SWEEP_ZERO_SPAN_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// `CRATONVM_DBG_MARK_WHY_CLASS` straddle reports emitted — the sweep walk
+/// striding OVER the watched base, inside some earlier object's computed
+/// extent. Bounds the log: a desynced grid can straddle one watched address on
+/// many consecutive objects.
+static MARKWHY_STRADDLE_HITS: AtomicU64 = AtomicU64::new(0);
+
 /// DoHead walk-desync hardening — count of forwarded young objects whose
 /// forwarding target failed validation (not inside old gen). Such a header is
 /// a phantom write from a desynced walk or corruption; the span is retained
@@ -9375,6 +9381,28 @@ impl GenerationalHeap {
         // `existing_free` is already the MERGE of the arena free list and the
         // JIT TLAB reservations, so the two are tested separately here — a
         // reserved TLAB tail and a genuine free block are not the same finding.
+        // MARKWHY: this sweep RAN, and here is where the watch is relative to it.
+        //
+        // Every other MARKWHY line is gated on the watch being inside
+        // from-space, so all of them go silent together — and that silence has
+        // three causes wanting three different next steps: this sweep never
+        // ran; it ran and the watched object is not in from-space (promoted, or
+        // in the other semispace); or it ran with the object in range and the
+        // walk never reached it. Only the third is a statement about the
+        // object. Reading it off an absence is how a fact about the collector's
+        // schedule becomes a measurement about the heap — which is exactly what
+        // happened here: the fourth-recurrence writeup's central chain rests on
+        // a sweep that, measured, does not run in that test at all.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 {
+                let used_now = young_from.used();
+                eprintln!(
+                    "[MARKWHY] sweep enter: watch={w:#x} from_base={from_base:#x} used={used_now:#x}                      in_from_space={} cycle={sweep_zero_cycle}",
+                    w >= from_base && w < from_base + used_now,
+                );
+            }
+        }
         {
             let w = crate::heap::young_mark_watch();
             if w != 0 && w >= from_base && w < from_base + young_from.used() {
@@ -9591,6 +9619,15 @@ impl GenerationalHeap {
             }
         }
         report_phase("sweep-walk-parallel-prefix");
+        // How much of from-space the PARALLEL prefix consumed.
+        //
+        // Every MARKWHY sweep hook lives in the SEQUENTIAL walk. When the
+        // prefix is accepted it consumes `[0, sweep_anchors.last())` and the
+        // sequential walk starts there, so a watched address inside the prefix
+        // is one the sequential walk never visits BY CONSTRUCTION — and "the
+        // walk never stops at that base" would then be a property of where the
+        // instrument is rather than of the object grid.
+        let par_prefix_end = cursor;
 
         // H2-CID0: anchor-validity probe. The parallel sweep prefix splits
         // from-space at `sweep_anchors` and starts an independent chain at each
@@ -10193,6 +10230,42 @@ impl GenerationalHeap {
             // The two can disagree: `late_pinned` retains a span from an
             // INTERIOR conservative candidate, an address that never equals
             // the object base and so never trips the edge trace.
+            // MARKWHY, the STRADDLE case — the one that matters when the hook
+            // below never fires. "The walk covers the address and never stops
+            // at it" is a statement about SOME OTHER object: the base is inside
+            // an extent computed for an object that starts earlier. The hook
+            // below tests EQUALITY with the base, so it is silent in exactly
+            // that case and cannot name the culprit stride. This prints the raw
+            // header words the stride was computed from, not a re-read — a
+            // re-read after the fact is what a desync corrupts.
+            if sweep_mark_why != 0 {
+                let base = from_base + cursor;
+                if base < sweep_mark_why && sweep_mark_why < base + total_size {
+                    let n = MARKWHY_STRADDLE_HITS.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        // SAFETY: `cursor + HEADER_SIZE <= used` for any object
+                        // the walk sized, so both header words are in bounds.
+                        let (raw0, raw1) = unsafe {
+                            (*(obj_ptr as *const u64), *((obj_ptr as *const u64).add(1)))
+                        };
+                        eprintln!(
+                            "[MARKWHY] STRADDLE: object @{base:#x} off={cursor:#x} size={total_size}                              swallows watch={sweep_mark_why:#x} (+{} into it) class_id={}                              kind={:?} elem={:?} shape={} compact={} body_size={} array_len={}                              raw0={raw0:#018x} raw1={raw1:#018x} since_anchor={objects_since_anchor}                              anchor={last_anchor_off:#x} prev=({:#x},{},{},{})",
+                            sweep_mark_why - base,
+                            header.class_id.as_u32(),
+                            header.kind(),
+                            header.element_type(),
+                            header.shape,
+                            is_compact_object(header),
+                            object_body_size(header),
+                            header.array_length(),
+                            prev_obj.0,
+                            prev_obj.1,
+                            prev_obj.2,
+                            prev_obj.3,
+                        );
+                    }
+                }
+            }
             if sweep_mark_why != 0 && from_base + cursor == sweep_mark_why {
                 eprintln!(
                     "[MARKWHY] sweep @{:#x} size={total_size} side_marked={side_marked_survivor}                      late_pinned={late_pinned} forwarded={} header_marked={}",
@@ -10656,8 +10729,17 @@ impl GenerationalHeap {
             let w = crate::heap::young_mark_watch();
             if w != 0 && w >= from_base {
                 eprintln!(
-                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} objects_swept={objects_swept}",
+                    // NOT `objects_swept`: its only increment is in the
+                    // publication loop several hundred lines below, so reading
+                    // it here prints a structural zero on every run and every
+                    // workload. It did exactly that, and the zero was read as
+                    // "this sweep reclaimed NOTHING" — a whole-VM reclamation
+                    // failure inferred from a counter not yet written. The real
+                    // total is on the `sweep done` line after the loop.
+                    "[MARKWHY] walk ended: cursor={cursor:#x} used={used:#x} watch_off={:#x}                      objects_live={objects_live} dead_regions={} par_prefix_end={par_prefix_end:#x}                      watch_in_par_prefix={}",
                     w - from_base,
+                    dead_regions.len(),
+                    (w - from_base) < par_prefix_end,
                 );
                 eprintln!(
                     "[MARKWHY] disposition census: side_marked={mw_side} late_pinned={mw_late}                      forwarded={mw_fwd} header_marked={mw_hdr_marked} dead_pushed={mw_dead_pushed}                      unwinds={mw_unwinds} sites={mw_site:?} unwound_entries={mw_unwound_entries}                      dead_regions_final={} side_sorted={} late_pins={}",
@@ -11047,6 +11129,19 @@ impl GenerationalHeap {
             );
         }
         report_phase("zero-and-publish");
+
+        // MARKWHY: what this sweep ACTUALLY reclaimed, read after the only
+        // place that writes it. Companion to the note on `walk ended` above.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 && w >= from_base {
+                eprintln!(
+                    "[MARKWHY] sweep done: objects_swept={objects_swept} bytes_swept={bytes_swept}                      dead_regions={} reclaimed_regions={} deferred={defer_reclamation}",
+                    dead_regions.len(),
+                    reclaimed_regions.len(),
+                );
+            }
+        }
 
         // DBG (CRATONVM_DBG_SWEEP_CENSUS): per-cycle census of what this sweep
         // reclaimed, by class. A continuously-live workload class (e.g. the

@@ -5248,7 +5248,10 @@ pub(crate) fn check_class_loader_define_class_is_encapsulated(
             _ => None,
         },
     };
-    match declaring.and_then(|m| mirror_class_name(ctx, m)).as_deref() {
+    let Some(declaring) = declaring else {
+        return Ok(());
+    };
+    match mirror_class_name(ctx, declaring).as_deref() {
         Some("java/lang/ClassLoader") => {}
         _ => return Ok(()),
     }
@@ -5287,6 +5290,30 @@ pub(crate) fn check_class_loader_define_class_is_encapsulated(
     // an agent that opens the package at runtime is honoured too. With neither,
     // nothing changes: the registry has no `java.base` open edge and the denial
     // stands, which is what keeps CratonVM matching a bare `java` invocation.
+    // Ask the module registry the SAME question the general gate asks: the
+    // last thing `check_reflection_module_access_with_target_id` does is this
+    // call, and it is what already makes `setAccessible` on `String.value`
+    // track HotSpot exactly - denied bare, allowed under
+    // `--add-opens=java.base/java.lang=ALL-UNNAMED`. Routing this carve-out
+    // through the same query is what keeps the two from disagreeing about a
+    // grant the user did make.
+    //
+    // The two narrower queries below could not see that grant. `ALL-UNNAMED`
+    // is not an unqualified open, so `is_package_open_unqualified` says no;
+    // and a classpath caller has no module name at all, so
+    // `module_name_of_class` answers `None` and the second arm never runs.
+    // Both escape hatches were therefore dead code and the flag was a no-op
+    // here, which is the whole of `BshScriptFactoryTests` 5/18 and
+    // `Spr15042Tests` 0/1. They are kept as a fallback for the one input the
+    // delegation cannot take: a mirror with no resolvable `ClassId`.
+    if let Some(target_cid) = mirror_class_id(ctx, declaring) {
+        if ctx.check_deep_reflection_access(accessor_cid, target_cid).is_ok() {
+            if trace {
+                eprintln!("[setacc] allowed: java.base opens java.lang to the accessor");
+            }
+            return Ok(());
+        }
+    }
     if ctx.is_package_open_unqualified("java.base", "java/lang") {
         if trace {
             eprintln!("[setacc] allowed: java.base/java.lang is open (unqualified)");

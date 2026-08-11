@@ -4214,7 +4214,9 @@ pub fn pop_and_recycle_frame_with_reason(
             // but silently swallowing loses diagnostics on monitor-state
             // corruption (e.g. user code that manually `monitorexit`ed past
             // the sync method's own counter). Log via tracing for visibility.
-            if let Err(e) = shared.threads.monitors.exit(obj, thread.thread_id) {
+            if let Err(e) =
+                crate::vm::vm_exec::monitor_exit_and_retract_jmx(shared, obj, thread.thread_id)
+            {
                 tracing::warn!(
                     class = %f.class_name(),
                     method = %f.method_name(),
@@ -4223,12 +4225,6 @@ pub fn pop_and_recycle_frame_with_reason(
                     error = ?e,
                     "implicit monitorexit on synchronized-method-frame-pop failed"
                 );
-            }
-            if !shared.threads.monitors.holds(obj, thread.thread_id) {
-                shared
-                    .threads
-                    .thread_registry
-                    .remove_jmx_locked_monitor(thread.thread_id, obj);
             }
         }
         thread.recycle_frame_with_shared(f, &shared.mem.operand_stack_pool, &shared.mem.tag_pool);

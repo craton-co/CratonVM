@@ -3382,6 +3382,7 @@ impl SharedVm {
                 class_mirrors_reverse: RwLock::new(FxHashMap::default()),
                 initiating_resolution_cache: RwLock::new(FxHashMap::default()),
                 lambda_proxies: RwLock::new(FxHashMap::default()),
+                proxy_method_cache: RwLock::new(FxHashMap::default()),
                 lambda_impl_owner_memo: RwLock::new(FxHashMap::default()),
                 lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
                 next_lambda_id: AtomicU32::new(0x8000_0000),

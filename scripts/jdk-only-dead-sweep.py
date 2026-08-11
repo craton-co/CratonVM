@@ -7,13 +7,16 @@ nothing?
 WHY THIS EXISTS
 ---------------
 
-Three separate readings of the census have called some bucket "the deletion
-list", and all three were wrong, each for a different reason:
+Four separate readings of the census have called some bucket "the deletion
+list", and all four were wrong, each for a different reason:
 
   * `ABSENT` on one image is not dead — the class may be the correct one for
     the other platform (`WinNTFileSystem`, `WindowsSocketOptions`).
   * `ABSENT` on both platforms of one JDK is not dead either — a registration
     dead on 25 may be the live one on 21.
+  * `ABSENT` on linux AND windows is *still* not dead: `sun/nio/ch/KQueuePort`
+    and `sun/nio/fs/PollingWatchService` are on both macOS images, and a
+    four-image sweep put 13 of their rows on the deletion list.
   * A name in a JDK package is not necessarily a JDK class. This VM mints
     `java/util/HashMap$KeyItr`, `java/util/TreeSet$Itr`,
     `java/util/concurrent/atomic/AtomicIntegerFieldUpdater$RustJvmImpl` and
@@ -21,27 +24,57 @@ list", and all three were wrong, each for a different reason:
     and they are dispatched thousands of times.
 
 So this takes a census per (version, platform) image, intersects them, and then
-subtracts everything any workload actually dispatched. What survives is dead on
-every image the project supports AND unreached: the honest candidates.
+subtracts everything any workload actually dispatched.
 
-    for arm in linux21 linux25 windows21 windows25; do
+    for arm in linux21 linux25 windows21 windows25 macos21 macos25; do
         cratonvm --real-jdk --java-home <image-$arm> --explain-jdk-only \\
             --dump-native-registry reg-$arm.json -cp probes <Probe>
     done
     sh scripts/jdk-only-inherited-decl.sh reg-linux25.json inh.tsv
     python3 scripts/jdk-only-dead-sweep.py --images reg-*.json \\
-        --inherited inh.tsv --dispatched reg-load.json reg-breadth.json reg-h2.json
+        --inherited inh.tsv --dispatched reg-load.json reg-breadth.json reg-reach.json
 
 `--inherited` matters: `declared: false` on one class is not "the method is
 nowhere", and 1,919 of 2,522 such rows resolve to a supertype. Without it this
 tool over-reports by roughly four times, which is exactly the mistake it exists
 to stop repeating.
 
-Result on JDK 21.0.12 + 25.0.4, linux + windows, three workloads, 2026-08-05:
-**796 registrations** — 243 whose class no image has, 553 whose method is
-nowhere in its hierarchy on any of them. Nine candidates were removed by the
-dispatch filter, and every one of the nine was a VM-minted class wearing a JDK
-name.
+WHAT THIS TOOL WILL NOT DO ANY MORE, AND WHY
+--------------------------------------------
+
+**`class ABSENT from every image` is no longer a deletion bucket.** It is
+reported, and it is written to the *gated* section, next to the synthetic
+stubs. Three measurements, 2026-08-10:
+
+  * `probes/DeadSweepReachProbe.java` — one workload written against the
+    committed list rather than against JDK surface — dispatched **30 of its
+    791 rows**, every one a VM-minted class wearing a JDK name. Eight classes
+    ended up split down the middle: `AtomicIntegerFieldUpdater$RustJvmImpl` had
+    4 of its 12 registrations dispatched and the other 8 on the deletion list,
+    separated by nothing but which methods a probe happened to call.
+  * Adding the two macOS images moved 13 more rows out.
+  * Every one of the fourteen legacy names left over — `java/lang/Compiler`,
+    `java/lang/UNIXProcess`, `sun/misc/Cleaner`, `sun/reflect/Reflection`,
+    `java/net/PlainSocketImpl`, `sun/nio/ch/WindowsFileDispatcherImpl` and the
+    rest — **resolves under `--synthetic-jdk`**, where the VM mints a
+    `compatibility-stub` stand-in on demand and these registrations are its
+    only implementation. That is the fifth image, and this tool cannot census
+    it: `image_declaring_method` has no bytes to parse.
+
+The dispatch filter can only ever subtract what a workload reached, so it
+cannot decide a class that exists on demand. The disposition for the whole
+bucket is therefore a *kind*, not a deletion:
+`native-api/src/no_image_receiver.rs` tags those receivers
+`NativeKind::SyntheticStub` at registration, which gates them out of
+`--jdk-only` and leaves `Compatible` and `--synthetic-jdk` untouched.
+
+`method NOWHERE in its hierarchy on any image` is different and stays a
+candidate list: there the class IS a real JDK class, so the receiver's
+existence is not in question, only the method's.
+
+Result on JDK 21.0.12 + 25.0.4, linux + windows + macos, three workloads,
+2026-08-10: **199 gated** (class absent everywhere) and **549 candidates**
+(method nowhere in the hierarchy).
 """
 import argparse
 import json
@@ -90,12 +123,41 @@ def main(argv):
                                      "completion of the synthetic surface and is "
                                      "gated, whatever an image census says")
     ap.add_argument("--out", help="write the surviving list here as TSV")
+    ap.add_argument("--gated-out",
+                    help="write the gated (never-delete) rows here as TSV")
+    ap.add_argument("--allow-partial-platforms", action="store_true",
+                    help="score anyway when the image set does not name all "
+                         "three platforms — for a one-off diff, never for a "
+                         "list anyone will act on")
     args = ap.parse_args(argv[1:])
 
     if len(args.images) < 2:
         sys.exit("REFUSING: one image cannot answer 'dead everywhere'. Give at "
                  "least two, and cover both platforms if the project ships on "
                  "both.")
+
+    # Platform coverage, from the census filenames. Crude on purpose: the
+    # census does not record which OS its image was for, and inferring it from
+    # the class set would be a guess this tool then presents as a fact.
+    #
+    # It is checked because the omission is not hypothetical. The list this
+    # tool wrote on 2026-08-05 was built from linux+windows only, and put
+    # `sun/nio/ch/KQueuePort` (4 rows) and `sun/nio/fs/PollingWatchService`
+    # (9 rows) in the "class is in no image" bucket. Both are in both macOS
+    # images. A missing platform reads exactly like a dead class.
+    joined = " ".join(args.images).lower()
+    missing = [p for p in ("linux", "windows", "mac") if p not in joined]
+    if missing and not args.allow_partial_platforms:
+        sys.exit("REFUSING: no census filename mentions %s, so this image set "
+                 "cannot say whether a class is missing from every platform or "
+                 "only from the ones you swept. `sun/nio/ch/KQueuePort` is the "
+                 "worked example. Add the arm, or pass "
+                 "--allow-partial-platforms and do not write a list."
+                 % " or ".join(missing))
+    if missing:
+        print("WARNING: platforms not covered by this image set: %s. Verdicts "
+              "below are 'absent from the images swept', not 'absent "
+              "everywhere'.\n" % ", ".join(missing))
 
     arms = [(p, load(p)) for p in args.images]
     n = len(arms[0][1])
@@ -175,13 +237,73 @@ def main(argv):
     # `StampedLock.isLocked()` is. A contract test pinning the triple is the
     # statement of intent; the census cannot see it, and deleting such a row
     # breaks the test that exists to say so.
+    #
+    # `--pinned` takes a FILE OR A DIRECTORY, and pointing it at one file is how
+    # 179 registrations were deleted on 2026-08-10 with 24 tests pinning them.
+    # `registry_contracts.rs` is not the only place the tree states this intent:
+    # `.find(class, method, descriptor)` inside an `assert!` is the idiom, and it
+    # appears in `preconditions.rs`, `shared_secrets_bridge.rs`,
+    # `file_channel.rs`, `deprecated_verify.rs`, `http_client.rs`,
+    # `inet_address.rs`, `jca/provider_chain.rs` and `native-io/src/lib.rs` among
+    # others. Given a directory this walks every `.rs` under it.
+    #
+    # Two literal shapes are read, because the tree uses both:
+    #   ("class", "method", "descriptor")           -- tuple tables
+    #   .find(class_or_binding, "method", "desc")   -- direct assertions
+    # `const`/`let` string bindings are resolved within the same file, which is
+    # what `let fci = "sun/nio/ch/FileChannelImpl";` needs.
+    #
+    # A pin is a CLAIM, not proof. `file_channel.rs` pinned an
+    # `…ZZZLjava/lang/Object;` spelling of `FileChannelImpl.open` that no JDK
+    # declares, so the pin and the registration agreed with each other and with
+    # nothing else, and JDK 21 went uncovered for as long as both stood. Pins
+    # keep a row off the deletion list; they do not make it right.
     pinned = set()
     if args.pinned:
+        import os as _os
         import re as _re
-        src = open(args.pinned, encoding="utf-8").read()
-        consts = dict(_re.findall(r'const (\w+): &str = "([^"]+)"', src))
-        for c, m, d in _re.findall(r'\((\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)"\)', src):
-            pinned.add((consts.get(c, c.strip('"')), m, d))
+        if _os.path.isdir(args.pinned):
+            paths = [_os.path.join(root, f)
+                     for root, _dirs, files in _os.walk(args.pinned)
+                     for f in files if f.endswith(".rs")]
+        else:
+            paths = [args.pinned]
+        # The trailing `,?` is not cosmetic: rustfmt breaks a three-element
+        # tuple across four lines and leaves a comma before the `)`, which is
+        # how `shared_secrets_bridge.rs`'s 15-owner table is written. Without it
+        # this parser read 38 pins where the tree states 1,775.
+        tuple_re = _re.compile(r'\(\s*(\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)",?\s*\)')
+        find_re = _re.compile(r'\.find\(\s*(\w+|"[^"]+"),\s*"([^"]+)",\s*"([^"]+)",?\s*\)')
+        # The other shape a pin takes: a table of (method, descriptor) PAIRS
+        # looped over a class named once, as a literal, in the `.find` itself —
+        # `preconditions.rs` and `native-io/src/lib.rs` both do this. The class
+        # is recoverable, the pairs are, and nothing else in these files looks
+        # like a `("name", "(descriptor)")` tuple, so the pairs are attributed
+        # to every literal class the file probes. Over-pinning is the safe
+        # direction: a pin only keeps a row OFF the deletion list.
+        loopfind_re = _re.compile(r'\.find\(\s*"([^"]+/[^"]+)",\s*\w+,\s*\w+\s*\)')
+        pair_re = _re.compile(r'\(\s*"([A-Za-z_$<][\w$<>]*)",\s*"(\([^"]*)"\s*,?\s*\)')
+        bind_re = _re.compile(r'(?:const|let)\s+(\w+)(?:\s*:\s*&\s*\'?\w*\s*str)?\s*=\s*"([^"]+)"')
+        for path in paths:
+            try:
+                src = open(path, encoding="utf-8").read()
+            except OSError:
+                continue
+            binds = dict(bind_re.findall(src))
+            for rx in (tuple_re, find_re):
+                for c, m, d in rx.findall(src):
+                    cls = binds.get(c, c.strip('"'))
+                    # Require a class-shaped name and a descriptor-shaped
+                    # descriptor. A bare identifier the file never bound is a
+                    # local whose value is unknowable here, and guessing would
+                    # pin an arbitrary row.
+                    if "/" in cls and d.startswith("("):
+                        pinned.add((cls, m, d))
+            for cls in set(loopfind_re.findall(src)):
+                for m, d in pair_re.findall(src):
+                    pinned.add((cls, m, d))
+        print("pinned:     %d triples from %d file(s) under %s"
+              % (len(pinned), len(paths), args.pinned))
 
     absent, nowhere, live, gated = [], [], [], []
     for i in range(n):
@@ -190,7 +312,8 @@ def main(argv):
         vs = [verdict(rows[i]) for _, rows in arms]
         if not row["class"].startswith(JDK_NAMESPACES):
             continue                      # not a name a JDK image owes us
-        if all(v == "ABSENT" for v in vs):
+        class_absent = all(v == "ABSENT" for v in vs)
+        if class_absent:
             bucket = absent
         elif all(v in ("ABSENT", "UNDECL") for v in vs) and key in not_found:
             bucket = nowhere
@@ -221,7 +344,31 @@ def main(argv):
             # or, worse, a capability the real one has: `HashMap$KeyItr.remove`
             # writes through to the map.
             # Gate, never delete.
-            gated.append((row, 0))
+            gated.append((row, 0,
+                          "kind=synthetic-stub" if row["kind"] == "synthetic-stub"
+                          else "pinned by a contract test" if key in pinned
+                          else "class is minted by this VM"))
+        elif class_absent:
+            # THE SAME RULE, ARRIVED AT FROM THE OTHER SIDE — and this arm is
+            # the one that was missing. The clause above gates a row because
+            # somebody had already tagged it `synthetic-stub`; but the tag is
+            # what a reclassification wave is *deciding*, so gating on it makes
+            # the instrument agree with whatever the tree currently says
+            # instead of adjudicating it.
+            #
+            # The image-side fact is the same in both cases: no supported image
+            # declares the class. Then either this VM mints the receiver — and
+            # the registration is that stand-in's implementation — or nothing
+            # can ever produce one and the row decides nothing. Deletion is
+            # wrong in the first case and pointless in the second, so neither
+            # branch justifies it.
+            #
+            # Measured 2026-08-10, three ways: `DeadSweepReachProbe` dispatched
+            # 30 rows this bucket had called dead; the macOS arms took out 13
+            # more; and all fourteen surviving legacy names resolve under
+            # `--synthetic-jdk`, where the VM mints a `compatibility-stub` for
+            # each on demand. See the module docstring.
+            gated.append((row, 0, "class in no supported image"))
         else:
             bucket.append((row, 0))
 
@@ -229,9 +376,14 @@ def main(argv):
     print("rows:       %d" % n)
     print("workloads:  %d census(es), %d slots dispatched between them"
           % (len(args.dispatched), sum(1 for v in dispatched.values() if v)))
-    print("\nclass ABSENT from every image:                 %d" % len(absent))
-    print("method NOWHERE in its hierarchy on any image:  %d" % len(nowhere))
-    print("DEAD EVERYWHERE AND UNREACHED:                 %d" % (len(absent) + len(nowhere)))
+    # `absent` is now always empty — every class-absent row is gated above.
+    # The addend is kept in the arithmetic so a future edit that reopens the
+    # bucket cannot do it silently.
+    print("\nclass ABSENT from every image (all GATED, see below):  %d"
+          % sum(1 for _, _, why in gated if why == "class in no supported image"))
+    print("method NOWHERE in its hierarchy on any image:          %d" % len(nowhere))
+    print("DELETION CANDIDATES (method-nowhere, unreached):       %d"
+          % (len(absent) + len(nowhere)))
 
     print("\ndisqualified by the dispatch filter: %d" % len(live))
     for row, inv in sorted(live, key=lambda t: -t[1]):
@@ -240,13 +392,16 @@ def main(argv):
         print("  Every one of these is alive despite the images. A JDK-shaped "
               "name\n  can still be a class this VM mints — check before "
               "believing a census\n  that says a `java.util` class does not "
-              "exist.")
+              "exist.\n  This filter is a LOWER BOUND: it subtracts what these "
+              "workloads reached,\n  which is why the class-absent bucket is "
+              "gated by rule rather than by it.")
 
-    print("\ngated, and NOT deletion candidates (this VM mints the class, or "
-          "the row is\nkind=synthetic-stub): %d" % len(gated))
-    for row, _ in sorted(gated, key=lambda t: (t[0]["class"], t[0]["name"],
-                                               t[0]["descriptor"])):
-        print("  %s.%s%s" % (row["class"], row["name"], row["descriptor"]))
+    gated_by_reason = Counter(why for _, _, why in gated)
+    print("\ngated, and NOT deletion candidates: %d  %s"
+          % (len(gated), dict(gated_by_reason)))
+    for row, _, why in sorted(gated, key=lambda t: (t[2], t[0]["class"], t[0]["name"],
+                                                    t[0]["descriptor"])):
+        print("  [%s] %s.%s%s" % (why, row["class"], row["name"], row["descriptor"]))
     if gated:
         print("  These are CratonVM's own implementations. Where the row is "
               "tagged\n  `SyntheticStub`, `--jdk-only` already drops it and the "
@@ -255,8 +410,14 @@ def main(argv):
               "it ABSENT because no JDK owes us the class.\n  A method the "
               "sampled workloads did not reach is NOT a dead method on such a\n"
               "  class. They are omitted from the written list on purpose.")
-        print("  classes gated wholesale (image-absent + minted here): %s"
-              % ", ".join(sorted(minted_classes)) if minted_classes else "")
+        if minted_classes:
+            print("  classes gated wholesale (image-absent + minted here): %s"
+                  % ", ".join(sorted(minted_classes)))
+        print("  The runtime gate for the class-absent rows lives in\n"
+              "  `native-api/src/no_image_receiver.rs`, which tags them "
+              "`SyntheticStub` at\n  registration — so the `--minted` and "
+              "`--pinned` lists above and that table\n  are two readings of one "
+              "rule, not two rules.")
 
     survivors = absent + nowhere
     print("\nby kind: %s" % dict(Counter(r["kind"] for r, _ in survivors)))
@@ -266,7 +427,7 @@ def main(argv):
         print("  %5d  %s" % (c, f))
 
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
             fh.write("# class\tmethod\tdescriptor\tkind\tregistered_by\tbucket\n")
             for rows_, tag in ((absent, "class-absent"), (nowhere, "method-nowhere")):
                 for r, _ in sorted(rows_, key=lambda t: (t[0]["class"], t[0]["name"],
@@ -275,9 +436,19 @@ def main(argv):
                              % (r["class"], r["name"], r["descriptor"], r["kind"],
                                 r.get("registered_by"), tag))
         print("\nwritten: %s" % args.out)
+    if args.gated_out:
+        with open(args.gated_out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("# class\tmethod\tdescriptor\tkind\tregistered_by\tgated_because\n")
+            for r, _, why in sorted(gated, key=lambda t: (t[0]["class"], t[0]["name"],
+                                                          t[0]["descriptor"])):
+                fh.write("%s\t%s\t%s\t%s\t%s\t%s\n"
+                         % (r["class"], r["name"], r["descriptor"], r["kind"],
+                            r.get("registered_by"), why))
+        print("written: %s" % args.gated_out)
     print("\nThis is a candidate list, not a delete-me list: it covers the "
-          "images swept\nand the workloads run, and nothing else. Synthetic "
-          "stubs are excluded by\nrule — see the gated section above.")
+          "images swept\nand the workloads run, and nothing else. Classes no "
+          "supported image declares\nare excluded by rule — see the gated "
+          "section above.")
     return 0
 
 

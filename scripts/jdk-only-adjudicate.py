@@ -221,6 +221,56 @@ print(f"  total {len(shadow)}; dispatched this run {sum(1 for r in shadow if r['
 by_kind = Counter(r["kind"] for r in shadow)
 print(f"  by kind {dict(by_kind)}")
 
+# ---------------------------------------------------------------------------
+# Section 3b exists because every gate in this tree watches the wrong direction.
+#
+# L6's ratchet counts `Bridge` rows with no `ACC_NATIVE` target and refuses a
+# rise. `jdk-only-kind-map.py` freezes each row's kind and refuses a change.
+# Neither asks whether a `kind_stated` row's *claim* is true — and `kind_stated`
+# is exactly the column readers treat as "somebody checked this against the
+# image". Measured 2026-08-10 on JDK 25/linux: 87 of the 867 stated `Bridge`
+# rows have no `ACC_NATIVE` target here, and reading them cost three separate
+# checks to sort:
+#
+#   * 59 are `ACC_NATIVE` on ANOTHER supported image (`WinNTFileSystem`,
+#     `WindowsSocketOptions`, `PlatformGraphicsInfo.hasDisplays0`) — correctly
+#     stated, and a single-image census cannot say so;
+#   * 4 inherit an `ACC_NATIVE` supertype method (`ComponentSampleModel.initIDs`
+#     from `SampleModel`, three `FileDispatcherImpl.*` from
+#     `UnixFileDispatcherImpl`) — also correctly stated, and `--inherited` is
+#     what shows it;
+#   * 24 registrations / 12 triples on `java/util/concurrent/ForkJoinTask`,
+#     `RecursiveTask` and `RecursiveAction` are concrete bytecode on all six
+#     supported images. Those are §1.4 shadows wearing a §1.5 claim.
+#
+# So the section prints the count unconditionally and the *unexplained* subset
+# only when `--inherited` is available to discharge the second bucket. Without
+# it, it says so rather than listing four rows it cannot judge.
+print("\n=== 3b. rows that STATE Bridge with no ACC_NATIVE target here ===")
+overstated = [r for r in rows
+              if r["kind"] == "bridge" and r.get("kind_stated")
+              and not img(r).get("acc_native")]
+print(f"  {len(overstated)} of {sum(1 for r in rows if r['kind'] == 'bridge' and r.get('kind_stated'))} stated Bridge rows")
+if overstated:
+    if INHERITED_TSV:
+        unexplained = [
+            r for r in overstated
+            if "native" not in resolved.get(
+                (r["class"], r["name"], r["descriptor"]), ("", "", ""))[2]
+        ]
+        print(f"  {len(unexplained)} of them do NOT inherit an ACC_NATIVE"
+              f" supertype method either.")
+        print("  Each is EITHER a platform-variant class this image lacks"
+              " (correct) OR a\n  statement the image contradicts. Only a"
+              " second image can tell them apart:\n"
+              "    python3 scripts/jdk-only-platform-diff.py <this> <other> ...")
+        by_class = Counter(r["class"] for r in unexplained)
+        for cls, n in by_class.most_common(12):
+            print(f"    {n:5d}  {cls}")
+    else:
+        print("  hierarchy split NOT RUN — pass --inherited <tsv> to discharge"
+              "\n  the rows that inherit an ACC_NATIVE supertype method.")
+
 print("\n=== 4. unadjudicated BRIDGE rows by registering file ===")
 groups = defaultdict(lambda: [0, 0, 0])  # rows, inherited, invoked
 for r in bad:

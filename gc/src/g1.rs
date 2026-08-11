@@ -1820,6 +1820,18 @@ impl G1Collector {
         self.regions.lock().len()
     }
 
+    /// Bytes committed for the Java heap — this collector's single arena. See
+    /// [`crate::vm_heap::VmHeap::committed_bytes`] for what the quantity is for
+    /// and why it must not track live bytes.
+    ///
+    /// Fixed for the collector's lifetime: every region is a slice of one
+    /// allocation made in [`Self::new`] and never moved or reallocated (see the
+    /// `arena` field's own note), so this is `num_regions * region_size` and
+    /// needs no lock.
+    pub fn committed_bytes(&self) -> usize {
+        self.arena.len()
+    }
+
     /// Generate the next identity hash code.
     ///
     /// Relaxed ordering is sufficient: hash codes are monotonic counters with

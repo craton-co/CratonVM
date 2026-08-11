@@ -375,6 +375,16 @@ statement runs 50-1000 times. The 500-op probe above is at the optimistic end.
 `testMergeUsing`'s 50 merges never warm up at all, which is why its failure is
 identical with and without the JIT.
 
+Re-confirmed 2026-08-11, and worth recording because a JIT page briefly claimed
+this class as evidence of a tier-up admission defect. `MergeLockBudgetProbe
+contend 50 4`, three reps, losing-thread batch ms: HotSpot 4-27 (4/4 OK),
+CratonVM JIT 111-280 (FAIL), CratonVM `--nojit` 107-242 (FAIL). The JIT-vs-
+`--nojit` gap is ~10-15% and unchanged by the JMX-owned-monitor-leak fix that
+closed a genuine +52% JIT deficit elsewhere the same day — because that leak's
+cost is quadratic in *distinct objects locked from compiled code* and this probe
+runs about a second over a handful of monitors. **This class is a throughput
+gap, and it is this page's, not tier-up's.**
+
 ## The band is 10x only when the code is not call-dense: a call level costs ~700 ns (2026-08-10)
 
 Two H2 classes measured while retiring the

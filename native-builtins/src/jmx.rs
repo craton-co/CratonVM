@@ -1898,7 +1898,12 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             let obj = try_alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4)?;
             if is_heap {
                 let used = ctx.heap_allocated_bytes() as i64;
-                let committed = used.max(64 * 1024 * 1024);
+                // Same source as `Runtime.totalMemory()` (`committed_heap_bytes`),
+                // not the old `used.max(64 MiB)` floor: this bean and that
+                // accessor report the same quantity and used to disagree.
+                let committed = (ctx.committed_heap_bytes() as i64)
+                    .max(used)
+                    .min(ctx.max_heap_bytes().max(used));
                 ctx.set_field(obj, 0, Value::Long(ctx.initial_heap_bytes())); // init (real -Xms)
                 ctx.set_field(obj, 1, Value::Long(used)); // used (real)
                 ctx.set_field(obj, 2, Value::Long(committed)); // committed

@@ -165,6 +165,23 @@ pub(crate) fn register_printstream_fallback_natives(registry: &mut NativeMethodR
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
         native_printf,
     );
+    // The locale-taking overloads. `javap java.io.PrintStream` lists four
+    // format entry points, not two; only the two above were registered, so the
+    // other two fell through to real `Formatter`-over-`Appendable` bytecode and
+    // printed NOTHING — silently, beside a working sibling. See
+    // `native_printf_locale`.
+    registry.register(
+        "java/io/PrintStream",
+        "printf",
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+        native_printf_locale,
+    );
+    registry.register(
+        "java/io/PrintStream",
+        "format",
+        "(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;",
+        native_printf_locale,
+    );
     // PrintStream writer-path entries. JUnit's ConsoleLauncher wraps
     // `System.out` (a PrintStream) in a `PrintWriter`; `PrintWriter.write`
     // delegates `out.write(String,int,int)` straight onto the PrintStream

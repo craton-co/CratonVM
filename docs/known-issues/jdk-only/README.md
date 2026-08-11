@@ -145,15 +145,38 @@ the descriptor says `MemorySegment`. Record retired to the internal tree as
 
 ## 2026-08-05 — three records added
 
-[`l5-native-io-bridge-residuals.md`](l5-native-io-bridge-residuals.md) — the 117
-`native-io` `Bridge` registrations that L5's `register_with_kind` migration
-declined to claim, because the JDK 25 image declares no `ACC_NATIVE` target for
-them. Reclassification questions, not migration ones. The largest is 25 `Bridge`
+**Both L5 records left this directory on 2026-08-10** —
+`retired/l5-native-io-bridge-residuals-RETIRED-20260810.md` and
+`retired/l5bc-awt-builtins-bridge-residuals-RETIRED-20260810.md` in the internal
+tree. What they held is split in two:
+
+* the last of their own items — `Bridge` registrations on a receiver class no
+  supported image declares — is **fixed**: 246 rows across 50 classes are
+  `SyntheticStub`, measured against six images (21.0.12+8 and 25.0.4+7 × linux,
+  windows, macos) and applied centrally in
+  `native-api/src/no_image_receiver.rs`. Along the way the 791-row deletion list
+  they handed off turned out to be a list of registrations **nobody had
+  exercised**, not dead ones: one probe dispatches 30 of them, 13 are on a macOS
+  image nobody had swept, and all 14 remaining legacy names resolve under
+  `--synthetic-jdk`. Record:
+  `fixed-bugs/jdk-only-bridge-on-a-receiver-no-image-declares-FIXED-20260810.md`.
+* the reclassification question they carried is re-homed, with its numbers, as
+  [`bridge-reclassification-wave.md`](bridge-reclassification-wave.md) — 9,296
+  `Bridge` rows the image does not back, 8,319 of them owning a slot, per
+  registering file, with the blocker stated as the measurement that established
+  it.
+
+The original filings, for the record:
+
+*`l5-native-io-bridge-residuals.md`* — the 117 `native-io` `Bridge`
+registrations that L5's `register_with_kind` migration declined to claim,
+because the JDK 25 image declares no `ACC_NATIVE` target for them.
+Reclassification questions, not migration ones. The largest is 25 `Bridge`
 registrations on VM-minted `cratonvm/synthetic/Process*` classes — the
 `Function$Identity` shape (a surviving `Bridge` whose receiver class §5 forbids)
 found in a second place.
 
-[`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md)
+*`l5bc-awt-builtins-bridge-residuals.md`*
 — the same question at crate scale, after L5b/L5c repeated the migration for
 `native-awt` and `native-builtins`: 7,748 `Bridge` registrations across those two
 crates that the image does not back. It also records three things the migration
@@ -320,7 +343,7 @@ behaviour** — no exception, no log line, no failing test.
 
 | # | Record | Why it is dangerous |
 |---|---|---|
-| 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: 9,571 unadjudicated `Bridge` registrations, now in [`l5bc-awt-builtins-bridge-residuals.md`](l5bc-awt-builtins-bridge-residuals.md). |
+| 1 | `NativeKind` is ambient and defaults to `SyntheticStub` — **RETIRED 2026-08-06** | `current_category` is an `Option` now and is scoped by the save/restore the tree already used, so it restores the *absence* of a choice; nine registrars that had no scope state their kind; no registration in a real boot runs on the default; and `scripts/jdk-only-kind-map.py` freezes the kind of every registration, which is what the aggregate ratchet could never do (a `Bridge`→`SyntheticStub` mass re-tag makes its numbers FALL). It also closed 58 triples `--jdk-only` was admitting by registration order — including the `Function$Identity` copies L7 missed. **The reclassification it pointed at is not closed**: **9,296** unadjudicated `Bridge` registrations (8,319 of them owning a slot), now in [`bridge-reclassification-wave.md`](bridge-reclassification-wave.md). The 2026-08-10 re-tag of the receivers no supported image declares took 246 rows out of it and is done; the rest is blocked on item 4, measured — arming `CRATONVM_ENFORCE_NATIVE_SHADOW=1` takes the strict corpus from 32/17 to 3/46. |
 | 2 | Fabricated object layouts leak into native code — **RETIRED 2026-08-10** | Index-based field access against assumed synthetic layouts: on real bytes the index still resolves and points at a different field, with no fault and no log line. Closed across five lanes and a final residual pass. The shadow-layout census is at **zero** NAME rows, **zero** `_vmN` rows and zero `java/net/URI` access-site rows on both standing probes; the last live defects it found were `URI.getAuthority()` answering null, `ProxySelector.select()` returning an empty list, and every `getLogger(Foo.class)` logger being named `"unknown"`. Both `breaks-under-strict` sites and both `unknown` verdicts are adjudicated, and `safe` verdicts are now re-checked against the loaded image at every class definition instead of being remembered. Record retired to the internal tree as `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`, with the companion `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`. |
 | 4 | `ensure_synthetic_class` cannot enforce policy, only record it — **RETIRED 2026-08-10** | Returned a bare `ClassId`, so under `--jdk-only` it recorded the violation and fabricated anyway. The entry point is deleted, along with the `NativeSystemAccess` trait method, the `NativeContextImpl` override and all three infallible allocation funnels; the grep gate matches zero sites, tests included. See `fixed-bugs/jdk-only-ensure-synthetic-class-deleted-FIXED-20260810.md`. |
 

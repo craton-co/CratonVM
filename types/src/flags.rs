@@ -1044,6 +1044,18 @@ pub struct LoaderFlags {
     /// `CRATONVM_DBG_DUPCLASS_FILTER` -- [`parse::utf8`]. Restricts the
     /// `CRATONVM_DBG_DUPCLASS` trace to class names containing this substring.
     pub dbg_dupclass_filter: Option<String>,
+    /// `CRATONVM_DBG_TYPECHECK_FILTER` -- [`parse::utf8`]. Traces every compiled
+    /// `checkcast`/`instanceof` whose TARGET class name contains this substring,
+    /// naming the branch that decided it and the ids it compared.
+    ///
+    /// A compiled type check that disagrees with the interpreter has no other
+    /// witness. The bytecode has already collapsed to a taken/not-taken branch
+    /// by the time anything observable happens, so the only symptom is a wrong
+    /// answer somewhere downstream — `Spr15042`-style bean errors, or a
+    /// `super.` call that should never have been reached.
+    /// `CRATONVM_JIT_DENY=<Class>.<method>` localises WHICH method miscompiles;
+    /// this says WHY.
+    pub dbg_typecheck_filter: Option<String>,
     /// `CRATONVM_DBG_FBCGLIB`
     pub dbg_fbcglib: bool,
     /// `CRATONVM_DBG_GETRESOURCES` — [`parse::non_empty_non_zero`].
@@ -1089,6 +1101,7 @@ impl LoaderFlags {
             dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
             dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
             dbg_dupclass_filter: utf8(src, "CRATONVM_DBG_DUPCLASS_FILTER"),
+            dbg_typecheck_filter: utf8(src, "CRATONVM_DBG_TYPECHECK_FILTER"),
             dbg_fbcglib: present(src, "CRATONVM_DBG_FBCGLIB"),
             dbg_getresources: non_empty_non_zero(src, "CRATONVM_DBG_GETRESOURCES"),
             dbg_layout: present(src, "CRATONVM_DBG_LAYOUT"),

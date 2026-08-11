@@ -3508,6 +3508,49 @@ pub(crate) fn monitor_enter_blocking(
     fixed
 }
 
+/// Release a monitor AND retract the JMX ownership publish its acquisition
+/// made, in the one order that is correct.
+///
+/// Every `monitorenter` route in the VM ends in
+/// [`crate::threading::thread_registry::ThreadRegistry::complete_jmx_monitor_enter`],
+/// which appends the object to the thread's `jmx_locked_monitors`. That list is
+/// two things at once: what `ThreadMXBean.getLockedMonitors()` reports, and a GC
+/// root set. It is also **membership-scanned linearly on every acquisition**, so
+/// a publish with no matching retract does not merely misreport — it makes the
+/// list grow to "every distinct object this thread has ever locked" and turns
+/// `monitorenter` into an O(objects-ever-locked) scan.
+///
+/// That has now happened twice. The first time it was one synchronized-method
+/// path and cost 14.9% of a Tomcat webapp deploy (see
+/// [`SynchronizedMethodGuard`]). The second time it was the JIT's `monitorexit`
+/// helper (`jit::helpers::jit_monitor_exit`), which released the monitor and
+/// stopped there: on `ZipContentTests` the two scan functions were **54% of the
+/// whole JIT run** and were the bulk of the JIT's +52% CPU against `--nojit`.
+/// Both were a missing three-line tail on one of five otherwise identical exit
+/// sites, which is the shape of defect that recurs until the idiom is a
+/// function. This is that function — release through it, never through a bare
+/// `monitors.exit`.
+///
+/// The `holds` re-check is load-bearing and must stay INSIDE: a re-entrant
+/// acquisition is still held after this release, and retracting there would
+/// under-report a monitor the thread really does own.
+pub(crate) fn monitor_exit_and_retract_jmx(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    thread_id: ThreadId,
+) -> Result<(), crate::error::MethodCallFailed> {
+    let result = shared.threads.monitors.exit(obj, thread_id);
+    // Retract even when `exit` failed: an exit that reports "not held" leaves no
+    // ownership for the publish to describe, and keeping the entry is the leak.
+    if !shared.threads.monitors.holds(obj, thread_id) {
+        shared
+            .threads
+            .thread_registry
+            .remove_jmx_locked_monitor(thread_id, obj);
+    }
+    result
+}
+
 /// GC-safe acquire for an `ACC_SYNCHRONIZED` method monitor.
 ///
 /// Synchronized invoke paths pop arguments into Rust locals before pushing the
@@ -11808,6 +11851,10 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         self.shared.mem.heap.allocated_bytes()
     }
 
+    fn committed_heap_bytes(&self) -> usize {
+        self.shared.mem.heap.committed_bytes()
+    }
+
     // -- WP0.2 ObjectStreamClass cache --
 
     fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
@@ -12207,27 +12254,12 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     }
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
-        let _ = self
-            .shared
-            .threads
-            .monitors
-            .exit(obj, self.thread.thread_id);
         // `monitor_enter_gc_safe` publishes JMX ownership (it goes through
         // `monitor_enter_blocking`), so this is its retract. Plain
         // `monitor_enter` above never publishes, which makes the retract a
         // harmless no-op there rather than a wrong removal - the list is
         // address-keyed and `remove` on an absent address does nothing.
-        if !self
-            .shared
-            .threads
-            .monitors
-            .holds(obj, self.thread.thread_id)
-        {
-            self.shared
-                .threads
-                .thread_registry
-                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
-        }
+        let _ = monitor_exit_and_retract_jmx(self.shared, obj, self.thread.thread_id);
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -16225,8 +16257,23 @@ pub fn invoke_or_native(
             args.len()
         );
     }
-    // Skip expensive class loading for obviously invalid class names (e.g. "<unknown class 0>").
-    if class_name.contains('<') || class_name.contains(' ') {
+    // Skip expensive class loading for the VM's own placeholder names. Every
+    // one of them is built here and every one starts with '<' — "<unknown
+    // class {id}>", "<unknown class_id={id}>" — so '<' alone catches the set.
+    //
+    // A SPACE used to be part of this test and it is not a marker of anything:
+    // JVMS 4.2.1 forbids only '.', ';', '[' and '/' in a binary name, and
+    // Kotlin mints classes with spaces routinely — every anonymous object
+    // inside a backtick-quoted test method lands in a class named after that
+    // method. Refusing them here made a compiled virtual call on such a
+    // receiver raise NoSuchMethodError instead of dispatching, which
+    // `ParameterizedTypeReference.equals` then reported as "not equal":
+    // RestOperationsExtensionsTests, one test, JIT-only (--nojit passes, and
+    // so does CRATONVM_JIT_DENY=kotlin/jvm/internal/Intrinsics.areEqual).
+    // Two instances of the SAME class, same class bytes, differing only in a
+    // space in the binary name, compare equal 200000/200000 with the plain
+    // name and 1000/200000 with the spaced one.
+    if class_name.contains('<') {
         // Optional operator diagnostic: surface exactly which call had no
         // implementation. Gated on CRATONVM_TRACE_UNIMPLEMENTED so it never
         // spams normal runs. Uses var_os directly (no new env_cache accessor).
@@ -18159,132 +18206,171 @@ pub(crate) fn proxy_invoke_handler_shared(
         );
     }
 
-    // WP2.5 вЂ” build the Method object using **field-name-based** writes.
-    // See `proxy_method_set_field_by_name` for the rationale; mirrors the
-    // fix applied to `proxy_invoke_handler` above.
-    let method_class_id = shared
-        .classes
-        .class_manager
-        .write()
-        .load_class("java/lang/reflect/Method")
-        .unwrap_or(ClassId::new(0));
-    let total_fields = shared
-        .classes
-        .class_manager
-        .read()
-        .get_class(method_class_id)
-        .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
-        .unwrap_or(8);
-    // S111r11 — see `proxy_invoke_handler` above.
-    const METHOD_EXTRA_SLOTS: usize = 3;
-    const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
-    let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
-    let method_obj = shared
-        .mem
-        .heap
-        .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
-    let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
-    // Resolve the actual declaring-interface mirror for the synthesized
-    // Method's `clazz` field — see `proxy_resolve_declaring_class_mirror`
-    // for why `ClassId(0)` (== `Object` in production) is unsafe here.
-    let declaring_mirror =
-        proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
-    let name_str = super::create_java_string(shared, method_name);
     // Parse descriptor into per-parameter and return type descriptors —
-    // see `proxy_invoke_handler` above for rationale.
+    // needed either way below (arg-boxing uses `param_descs` regardless of
+    // whether the Method object itself is served from cache).
     let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
-    let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
-    let param_count = param_descs.len();
-    let param_arr = shared.mem.heap.alloc_array(
-        ClassId::new(0),
-        crate::memory::heap::ArrayElementType::Reference,
-        param_count,
+
+    // Proxy-dispatch Method cache (see `proxy_method_cache`'s doc comment in
+    // `class_realm.rs`): real JDK dynamic-proxy classes build this Method
+    // object ONCE per interface method in their static initializer, not per
+    // call. Before this cache, CratonVM rebuilt a fresh Method + two arrays +
+    // two strings on every single reflective dispatch — on
+    // allocation-heavy, reflection-driven workloads (ByteBuddy's
+    // `JavaDispatcher.INVOKER` in particular) that generated enough
+    // short-lived garbage to fragment the non-compacting old-gen arena and
+    // OOM even with most of the heap nominally free.
+    let proxy_class_id = shared.mem.heap.class_id_of(proxy);
+    let cache_key = (
+        proxy_class_id,
+        method_name.to_string(),
+        descriptor.to_string(),
     );
-    for (i, pdesc) in param_descs.iter().enumerate() {
-        let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
-        shared
-            .mem
-            .heap
-            .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
-            .ok();
-    }
-    let desc_str = super::create_java_string(shared, descriptor);
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "clazz",
-        Value::Object(Some(declaring_mirror)),
-    );
-    proxy_method_set_field_by_name(shared, method_obj, "name", Value::Object(Some(name_str)));
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "returnType",
-        Value::Object(Some(return_type_mirror)),
-    );
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "parameterTypes",
-        Value::Object(Some(param_arr)),
-    );
-    // Mirror the NativeContext dispatch path: InvocationHandler.invoke() must
-    // observe a non-null, accurately populated Method.exceptionTypes array.
-    let exception_arr =
-        proxy_method_exception_types(shared, declaring_mirror, method_name, descriptor);
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "exceptionTypes",
-        Value::Object(Some(exception_arr)),
-    );
-    proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
-    proxy_method_set_field_by_name(
-        shared,
-        method_obj,
-        "signature",
-        Value::Object(Some(desc_str)),
-    );
-    proxy_method_set_field_by_name(shared, method_obj, "slot", Value::Int(0));
-    // S111r11 — see `proxy_invoke_handler` above for rationale.
-    proxy_method_write_extra_slots(shared, method_obj, descriptor, param_count);
-    if total_fields < 8 {
-        // Synthetic-mode fallback (no JDK Method class loaded): keep the
-        // old hard-coded layout so callers reading raw slots still find
-        // the values.
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 1, Value::Object(Some(name_str)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 3, Value::Object(Some(param_arr)));
-        shared.mem.heap.set_field(method_obj, 4, Value::Int(1));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 5, Value::Object(Some(desc_str)));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 6, Value::Int(param_count as i32));
-        shared
-            .mem
-            .heap
-            .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
-    }
-    // Silence "zero_mirror unused" — kept above to preserve the original
-    // allocation flow.
-    let _ = zero_mirror;
+    let cached_method_obj = shared
+        .classes
+        .proxy_method_cache
+        .read()
+        .get(&cache_key)
+        .copied();
+    let method_obj = match cached_method_obj {
+        Some(obj) => obj,
+        None => {
+            // WP2.5 вЂ” build the Method object using **field-name-based** writes.
+            // See `proxy_method_set_field_by_name` for the rationale; mirrors the
+            // fix applied to `proxy_invoke_handler` above.
+            let method_class_id = shared
+                .classes
+                .class_manager
+                .write()
+                .load_class("java/lang/reflect/Method")
+                .unwrap_or(ClassId::new(0));
+            let total_fields = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(method_class_id)
+                .map(|c| c.first_field_index + c.fields.iter().filter(|f| !f.is_static()).count())
+                .unwrap_or(8);
+            // S111r11 — see `proxy_invoke_handler` above.
+            const METHOD_EXTRA_SLOTS: usize = 3;
+            const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
+            let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
+            let method_obj = shared
+                .mem
+                .heap
+                .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
+            let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
+            // Resolve the actual declaring-interface mirror for the synthesized
+            // Method's `clazz` field — see `proxy_resolve_declaring_class_mirror`
+            // for why `ClassId(0)` (== `Object` in production) is unsafe here.
+            let declaring_mirror =
+                proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
+            let name_str = super::create_java_string(shared, method_name);
+            let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
+            let param_count = param_descs.len();
+            let param_arr = shared.mem.heap.alloc_array(
+                ClassId::new(0),
+                crate::memory::heap::ArrayElementType::Reference,
+                param_count,
+            );
+            for (i, pdesc) in param_descs.iter().enumerate() {
+                let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
+                shared
+                    .mem
+                    .heap
+                    .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
+                    .ok();
+            }
+            let desc_str = super::create_java_string(shared, descriptor);
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "clazz",
+                Value::Object(Some(declaring_mirror)),
+            );
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "name",
+                Value::Object(Some(name_str)),
+            );
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "returnType",
+                Value::Object(Some(return_type_mirror)),
+            );
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "parameterTypes",
+                Value::Object(Some(param_arr)),
+            );
+            // Mirror the NativeContext dispatch path: InvocationHandler.invoke() must
+            // observe a non-null, accurately populated Method.exceptionTypes array.
+            let exception_arr =
+                proxy_method_exception_types(shared, declaring_mirror, method_name, descriptor);
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "exceptionTypes",
+                Value::Object(Some(exception_arr)),
+            );
+            proxy_method_set_field_by_name(shared, method_obj, "modifiers", Value::Int(1)); // PUBLIC
+            proxy_method_set_field_by_name(
+                shared,
+                method_obj,
+                "signature",
+                Value::Object(Some(desc_str)),
+            );
+            proxy_method_set_field_by_name(shared, method_obj, "slot", Value::Int(0));
+            // S111r11 — see `proxy_invoke_handler` above for rationale.
+            proxy_method_write_extra_slots(shared, method_obj, descriptor, param_count);
+            if total_fields < 8 {
+                // Synthetic-mode fallback (no JDK Method class loaded): keep the
+                // old hard-coded layout so callers reading raw slots still find
+                // the values.
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 1, Value::Object(Some(name_str)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 3, Value::Object(Some(param_arr)));
+                shared.mem.heap.set_field(method_obj, 4, Value::Int(1));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 5, Value::Object(Some(desc_str)));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 6, Value::Int(param_count as i32));
+                shared
+                    .mem
+                    .heap
+                    .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
+            }
+            // Silence "zero_mirror unused" — kept above to preserve the original
+            // allocation flow.
+            let _ = zero_mirror;
+            shared
+                .classes
+                .proxy_method_cache
+                .write()
+                .insert(cache_key, method_obj);
+            method_obj
+        }
+    };
 
     // Build Object[] of args вЂ” box primitives. Per
     // `java.lang.reflect.InvocationHandler.invoke` contract, when the
@@ -25187,6 +25273,13 @@ impl Drop for SynchronizedMethodGuard<'_> {
             thread.native_pin_roots.truncate(self.monitor_pin);
             cur
         };
+        // Retract the ownership publish `monitor_enter_synchronized_method`
+        // made, but only on the OUTERMOST exit: `holds` is still true while a
+        // recursive acquisition remains, and retracting there would
+        // under-report a monitor the thread really does hold. That rule now
+        // lives inside `monitor_exit_and_retract_jmx`, which this guard cannot
+        // reach through `SharedVm` (it holds only the two halves it borrowed),
+        // so it is spelled out here — the one site that must keep its own copy.
         if let Err(e) = self.monitor_pool.exit(obj, self.thread_id) {
             tracing::warn!(
                 thread_id = ?self.thread_id,
@@ -25194,12 +25287,6 @@ impl Drop for SynchronizedMethodGuard<'_> {
                 "implicit monitorexit on synchronized-method exit failed"
             );
         }
-        // Retract the ownership publish `monitor_enter_synchronized_method`
-        // made, but only on the OUTERMOST exit: `holds` is still true while a
-        // recursive acquisition remains, and retracting there would
-        // under-report a monitor the thread really does hold. Same shape as
-        // `JitSynchronizedMonitorGuard::drop` and the interpreter's
-        // `monitor_on_exit` frame-pop path, both of which already do this.
         if !self.monitor_pool.holds(obj, self.thread_id) {
             self.thread_registry
                 .remove_jmx_locked_monitor(self.thread_id, obj);
@@ -27413,12 +27500,30 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A space in a binary name is LEGAL (JVMS 4.2.1 forbids only `.`, `;`,
+    /// `[` and `/`), so this must not short-circuit on the name. It still
+    /// errors — there is no such class to load — but for that reason and not
+    /// because the name looked odd. The distinction is the whole bug: Kotlin
+    /// names every anonymous object inside a backtick-quoted test method after
+    /// that method, spaces included, and short-circuiting turned a compiled
+    /// virtual call on one into `NoSuchMethodError`.
     #[test]
-    fn invoke_or_native_class_with_space() {
+    fn invoke_or_native_class_with_space_is_a_normal_lookup() {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let result = invoke_or_native(&shared, &mut thread, "invalid class", "method", "()V", &[]);
+        let result = invoke_or_native(&shared, &mut thread, "a class", "method", "()V", &[]);
+        // Absent class -> still an error, but reached through the loader.
         assert!(result.is_err());
+        // The placeholder form keeps its short-circuit.
+        let placeholder = invoke_or_native(
+            &shared,
+            &mut thread,
+            "<unknown class 7>",
+            "method",
+            "()V",
+            &[],
+        );
+        assert!(placeholder.is_err());
     }
 
     // =====================================================================

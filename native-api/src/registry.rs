@@ -2850,6 +2850,20 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
+    /// Bytes currently COMMITTED for the Java heap — backing storage the VM
+    /// holds whether or not anything lives in it. `Runtime.totalMemory()`, the
+    /// JMX heap `MemoryUsage.getCommitted()`, and (minus
+    /// [`Self::heap_allocated_bytes`]) `Runtime.freeMemory()`.
+    ///
+    /// Capacity, never occupancy: `totalMemory()` is expected to move only when
+    /// the heap grows or shrinks. See `gc::vm_heap::VmHeap::committed_bytes`.
+    ///
+    /// The default is the historical `Runtime.totalMemory()` stub, kept for
+    /// mock/test contexts that have no heap; the VM overrides it.
+    fn committed_heap_bytes(&self) -> usize {
+        64 * 1024 * 1024
+    }
+
     // -- ObjectStreamClass descriptor cache (WP0.2) --
     //
     // Backs `java.io.ObjectStreamClass.lookup(Class)`. See
@@ -5736,8 +5750,47 @@ impl NativeMethodRegistry {
     /// caller two words of `&'static Location` at the call, not a `format!`.
     /// The string is built only if [`census`](Self::census) or the JDK-only
     /// refusal path actually needs it.
+    ///
+    /// # The one kind decision made here rather than at the site
+    ///
+    /// A `Bridge` whose receiver class no supported JDK image declares cannot
+    /// bind to an `ACC_NATIVE` method — §1.5's whole definition — so it is
+    /// re-tagged [`NativeKind::SyntheticStub`] before any of the policy arms
+    /// below run, and reports `kind_stated`, because a measurement adjudicated
+    /// it. See [`crate::no_image_receiver`] for the measurement, the six images
+    /// it was taken against, and why the reviewed VM services are excluded.
+    ///
+    /// Ordering is load-bearing: the re-tag has to happen before the `JdkOnly`
+    /// arm, or strict mode keeps admitting exactly the rows the re-tag exists to
+    /// exclude.
     #[track_caller]
     pub fn register(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        callback: NativeCallback,
+    ) {
+        if self.effective_category() == NativeKind::Bridge
+            && crate::no_image_receiver::receiver_declared_by_no_supported_image(class_name)
+        {
+            let prev = self.current_category;
+            let prev_stated = self.next_kind_stated;
+            self.current_category = Some(NativeKind::SyntheticStub);
+            self.next_kind_stated = true;
+            self.register_inner(class_name, method_name, descriptor, callback);
+            self.current_category = prev;
+            self.next_kind_stated = prev_stated;
+            return;
+        }
+        self.register_inner(class_name, method_name, descriptor, callback);
+    }
+
+    /// [`register`](Self::register)'s body. Split out only so the re-tag above
+    /// can set/restore around it: this function has a dozen early returns, and
+    /// restoring at each of them is the shape that eventually misses one.
+    #[track_caller]
+    fn register_inner(
         &mut self,
         class_name: &str,
         method_name: &str,

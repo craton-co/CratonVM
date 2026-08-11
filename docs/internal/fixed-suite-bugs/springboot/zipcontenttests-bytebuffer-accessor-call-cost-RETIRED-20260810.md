@@ -1,6 +1,6 @@
 ---
 name: zipcontenttests-bytebuffer-accessor-call-cost-RETIRED-20260810
-description: RETIRED 2026-08-10. ZipContentTests' 10-14x-HotSpot cost WAS correctly attributed to java.nio.ByteBuffer scalar accessors (287ns vs HotSpot's 2.19ns), but the intrinsic that page proposed is capped at ~10% by arithmetic and a powered 8-pair A/B cannot separate it from zero (+7.83%, 95% CI [-0.51%, +16.16%]) - so it ships default-OFF on evidence. The page's secondary claim that "--nojit is faster than JIT" is TRUE and far larger than the accessor question (+118.95s CPU, +83.1%, 5/5 pairs); it is not compilation, not slow compiled code, and not the JIT root scan, and is tracked separately.
+description: RETIRED 2026-08-10. ZipContentTests' 10-14x-HotSpot cost WAS correctly attributed to java.nio.ByteBuffer scalar accessors (287ns vs HotSpot's 2.19ns), but the intrinsic that page proposed is capped at ~10% by arithmetic and a powered 8-pair A/B cannot separate it from zero (+7.83%, 95% CI [-0.51%, +16.16%]) - so it ships default-OFF on evidence. The page's secondary claim that "--nojit is faster than JIT" is TRUE and far larger than the accessor question (+118.95s CPU, +83.1%, 5/5 pairs); it is not compilation, not slow compiled code, and not the JIT root scan - it was a leaked JMX owned-monitor set, FIXED 2026-08-11, after which the JIT beats --nojit by 36.5% on this class.
 metadata:
   type: retired-known-issue
   area: jit, nio, throughput, springboot
@@ -10,8 +10,12 @@ metadata:
 
 **RETIRED 2026-08-10.** Everything this page asked has an answer. The one thing
 it turned up on the way — that the JIT itself is a net negative on this class —
-is bigger than the page's own subject and moved to
-`docs/known-issues/vm/jit-net-negative-on-call-dense-classes-20260810.md`.
+is bigger than the page's own subject and moved out to its own page. That page
+is now closed too: the deficit was a leaked JMX owned-monitor set (a compiled
+`monitorexit` that never retracted the ownership publish its `monitorenter`
+made), the JIT arm went 144.48 s → 59.17 s CPU, and on this class the JIT now
+BEATS `--nojit` by 36.5%. See
+`internal/fixed-bugs/jit-net-negative-on-call-dense-classes-FIXED-20260811.md`.
 
 Superseded pages, both already retired:
 `zipcontenttests-gc-pressure-theory-REFUTED-20260810.md` (both of its hypotheses

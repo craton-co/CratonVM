@@ -3944,13 +3944,14 @@ pub(super) fn execute_instruction(
             // acquire. If/when a paired `monitorexit` event is wired in, the
             // emission site must consult the snapshot itself — there's no
             // value in a dead pre-read here.
-            shared.threads.monitors.exit(obj_ref, thread.thread_id)?;
-            if !shared.threads.monitors.holds(obj_ref, thread.thread_id) {
-                shared
-                    .threads
-                    .thread_registry
-                    .remove_jmx_locked_monitor(thread.thread_id, obj_ref);
-            }
+            // Release + JMX retract as ONE call — see
+            // `vm_exec::monitor_exit_and_retract_jmx` for why the pairing is a
+            // function rather than a convention repeated at five sites.
+            crate::vm::vm_exec::monitor_exit_and_retract_jmx(
+                shared,
+                obj_ref,
+                thread.thread_id,
+            )?;
         }
 
         // -- Unsupported / deprecated --

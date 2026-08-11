@@ -1062,6 +1062,22 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
         native_fcimpl_open,
     );
+    // JDK 21's real shape: one `boolean` shorter than JDK 25's above — 25 added
+    // the `direct` flag — and ending in `Closeable`.
+    //
+    // This entry used to end in `Ljava/lang/Object;`, a descriptor no JDK has
+    // ever declared, so it could never bind: on a JDK 21 image
+    // `FileChannelImpl.open` had NO usable registration, and the smoke test
+    // below asserted the unbindable spelling and passed on it. `dc55e8057`
+    // deleted the line as dead — correct on the evidence it had — and that
+    // turned a silent gap into a red test, which is how it was found. Verified
+    // against Temurin 21.0.12+8 with `javap -p -s`.
+    r.register(
+        fci,
+        "open",
+        "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
+        native_fcimpl_open,
+    );
     r.register(
         "sun/nio/ch/FileChannelImpl$Closer",
         "run",
@@ -1077,10 +1093,21 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "()V",
         native_native_thread_set_signal_and_wait,
     );
+    r.register(fci, "map0", "(IJJZ)J", native_fc_map0_legacy);
+    r.register(fci, "map0", "(IJJ)J", native_fc_map0_legacy);
+    r.register(fci, "unmap0", "(JJ)I", native_fc_unmap0);
+    r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
+    r.register(fci, "transferTo0", "(IJJI)J", native_fc_transfer_to0);
     // Raw-int-fd shapes of `transferFrom0`, for the JDKs that pass fd numbers
     // rather than `FileDescriptor` objects. Same decline as the object forms.
     r.register(fci, "transferFrom0", "(IIJJZ)J", native_fc_transfer_from0);
     r.register(fci, "transferFrom0", "(IIJJ)J", native_fc_transfer_from0);
+    r.register(
+        fci,
+        "maxDirectTransferSize0",
+        "()I",
+        native_fc_max_direct_transfer_size0,
+    );
     // sun/nio/ch/FileKey.init — the file-identity triple used by FileLockTable.
     // A missing native here is an UnsatisfiedLinkError on the FIRST file-backed
     // DB open (H2 `SingleFileStore.lockFileChannel` -> `FileChannelImpl.tryLock`
@@ -1670,14 +1697,31 @@ mod tests {
             .is_some(),
             "JDK 25 FileChannelImpl.open bridge must be registered"
         );
+        // JDK 21's shape, and the descriptor is the assertion. This read
+        // `…ZZZLjava/lang/Object;` until 2026-08-10 — a spelling no JDK
+        // declares — so it agreed with a registration that could never bind and
+        // said nothing about whether JDK 21 was covered. Checked with
+        // `javap -p -s` against Temurin 21.0.12+8, not against the source.
+        assert!(
+            r.find(
+                fci,
+                "open",
+                "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;"
+            )
+            .is_some(),
+            "JDK 21 FileChannelImpl.open bridge must be registered"
+        );
+        // The old unbindable spelling must not come back: re-adding it would
+        // make this test pass again for the wrong reason.
         assert!(
             r.find(
                 fci,
                 "open",
                 "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZLjava/lang/Object;)Ljava/nio/channels/FileChannel;"
             )
-            .is_some(),
-            "JDK 21 FileChannelImpl.open bridge must be registered"
+            .is_none(),
+            "no JDK declares an Object-tailed FileChannelImpl.open; \
+             registering one binds nothing and hides a missing arity"
         );
         let nts = "sun/nio/ch/NativeThreadSet";
         assert!(r.find(nts, "add", "()I").is_some());

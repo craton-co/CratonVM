@@ -246,3 +246,85 @@ Three prior fixes, three recurrences, and the 08-01 page's own lesson was that
 the predicate it repaired **had no test**, which is how a one-line default flip
 disarmed it in silence. Whatever closes this needs a vector that runs in
 `regression-suite` — not a `probes/` reproducer that nothing schedules.
+
+## Two independent additions, 2026-08-10 (separate session)
+
+Both were found while working the same page from the sweep side, and neither
+changes the root cause above. They are recorded because one of them contradicts
+a row this page still carries, and the other names a second retention path.
+
+### `objects_swept` on the `walk ended` line is a structural zero
+
+`objects_swept` is declared at `gen_heap.rs:9439`, printed by
+`[MARKWHY] walk ended`, and incremented in exactly one place — the publication
+loop several hundred lines below that print. It reads 0 in every run on every
+workload, whatever the sweep reclaimed.
+
+An earlier revision of this page took that 0 as "this sweep reclaimed NOTHING",
+and from there to "no young object is reclaimed at all" and "class unloading
+cannot work by construction". The disposition census above settles it the other
+way — `dead_pushed=27252` — and so does
+`regression-suite/src/RClassUnloadSweep.java` (new, scheduled): a class defined
+in a throwaway loader, used, dropped and collected is unloaded on HotSpot and on
+CratonVM under the default collector, `CRATONVM_NO_MOVING_YOUNG=1`,
+`-XX:+UseG1GC` and `-XX:+UseZGC`.
+
+The line now reports the walk-time facts it can see and a new
+`[MARKWHY] sweep done` reports `objects_swept`/`bytes_swept` after the loop that
+writes them. Two further instruments came from the same reading:
+
+* `[MARKWHY] sweep enter` — prints whenever a watch is ARMED, with **no**
+  from-space condition. Every other MARKWHY line is gated on the watch being in
+  from-space, so they go silent together, and that silence has three causes
+  wanting three different next steps ("the sweep never ran", "it ran and the
+  object is elsewhere", "it ran and the walk never reached the object"). Only
+  the third is about the object.
+* `[MARKWHY] STRADDLE` — names the object whose computed extent swallows the
+  watched base. The pre-existing sweep hook tests `cursor == watch`, so it is
+  silent in exactly the case *The marker is innocent* measures, and cannot name
+  the culprit stride. `par_prefix_end` / `watch_in_par_prefix` are on the
+  `walk ended` line for the same reason: every sweep hook lives in the
+  SEQUENTIAL walk, so a watch inside the accepted parallel prefix is one the
+  sequential walk never visits by construction.
+
+### A second retention path: `collection-overlays` roots the JDT compiler graph
+
+`CRATONVM_DBG_ROOT_SOURCE=1` is new and records which named entry of
+`VM_ROOT_SOURCES` contributed each root; `[MIRRORWHY]` now prints
+`[root=<source>]` on each rendered path. Measured twice on the failing run, for
+the evicted `annotations_jsp`:
+
+```
+  33 [root=collection-overlays]        11 [root=collection-overlays]
+   6 [root=<not-a-direct-root>]         2 [root=<not-a-direct-root>]
+```
+
+with every attributed path of the shape
+
+```
+StackMapFrame -> VerificationTypeInfo -> SourceTypeBinding -> LookupEnvironment
+  -> JDTCompiler$1 -> JDTCompiler
+  -> JspCompilationContext / JspServletWrapper -> loader / instance
+```
+
+**This contradicts two rows this page still carries.** *What is measured* records
+`live_instances_of_this_loader=0` and `root_held_paths=1`; today's dev reports
+**1** and **8**, with `is_marked=true` on the loader. And *Also eliminated*
+dismisses overlay over-rooting because the gate skips under
+`major_gc_requested()` — but the roots are contributed anyway, on the default
+collector, in the failing run. That entry was eliminated by reading the gate
+rather than by asking which source rooted the object, which nothing could do
+until now; its own "21 direct hits on exactly this JSP cluster" was the answer.
+
+Whether this is a *second* defect or the same one seen from the other end is
+not settled here: an object the marker marked is reachable, which is a different
+statement from "dead but unreclaimed". Worth resolving before the fix above
+lands, because if the mirror is genuinely rooted then repairing the all-zero
+screen will not clear this assertion on its own.
+
+The trap in the obvious fix, if it turns out to be needed:
+`scan_external_roots` exists because an overlay backing array can be the ONLY
+reference to a live object, so widening the gate trades over-retention for a
+use-after-free. A JDT `StackMapFrame` reachable only from an overlay after
+compilation finished suggests stale overlay ENTRIES, in which case pruning is
+the fix and costs nothing in safety.

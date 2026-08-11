@@ -482,6 +482,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
+    // 6b. Cached proxy-dispatch `Method` objects (see `proxy_method_cache`'s
+    // doc comment in `class_realm.rs`) — these are meant to be shared and
+    // reused across every future dispatch to the same proxy method, so they
+    // must stay alive unconditionally for as long as the cache entry exists,
+    // exactly like `class_mirrors` above.
+    {
+        for obj_ref in shared.classes.proxy_method_cache.read().values() {
+            roots.push(*obj_ref);
+        }
+    }
+
     // 7. System streams (System.out, System.err, System.in)
     //
     // try_read, NOT read: the singleton initializers (e.g.
