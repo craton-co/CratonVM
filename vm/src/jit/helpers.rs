@@ -12718,9 +12718,31 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
+        // LOADER IDENTITY: `try_jit_compile_callee` resolves the callee BY NAME.
+        // When the receiver's class is not the class that name globally
+        // resolves to, that hands back ANOTHER loader's copy of the method, and
+        // the entry is then cached against THIS receiver's class id — so every
+        // monomorphic hit machine-CALLs a body compiled for a different copy.
+        //
+        // Measured 2026-08-11 on ApplicationContextAotGeneratorTests: each
+        // `@CompileWithForkedClassLoader` test defines its own
+        // `DynamicJavaFileManager`, so one run showed that name resolving to
+        // eight-plus distinct class ids (2690, 8510, 10377, 14030, 15877,
+        // 17724, 19569, 21414, ...). The copy that got compiled has its
+        // `instanceof DynamicClassFileObject` site interned against ITS OWN
+        // `DynamicClassFileObject` id, so the check correctly answered false for
+        // the receiver's file object, `super.inferBinaryName` ran, and
+        // `JavacFileManager` threw on a file object it did not create.
+        //
+        // `globally_named` already gates `publish_mic_rust_cached_entry` two
+        // arms below for exactly this reason; the by-name compile that feeds the
+        // machine-code MIC/PIC was left ungated. Not globally named -> do not
+        // compile by name, leave the site on the dispatch helper, which resolves
+        // on the actual receiver.
         let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
             || redefine_jit_quiesced
             || !cacheable_receiver
+            || !globally_named
         {
             None
         } else {
@@ -12922,9 +12944,31 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
+    // LOADER IDENTITY: `try_jit_compile_callee` resolves the callee BY NAME.
+    // When the receiver's class is not the class that name globally
+    // resolves to, that hands back ANOTHER loader's copy of the method, and
+    // the entry is then cached against THIS receiver's class id — so every
+    // monomorphic hit machine-CALLs a body compiled for a different copy.
+    //
+    // Measured 2026-08-11 on ApplicationContextAotGeneratorTests: each
+    // `@CompileWithForkedClassLoader` test defines its own
+    // `DynamicJavaFileManager`, so one run showed that name resolving to
+    // eight-plus distinct class ids (2690, 8510, 10377, 14030, 15877,
+    // 17724, 19569, 21414, ...). The copy that got compiled has its
+    // `instanceof DynamicClassFileObject` site interned against ITS OWN
+    // `DynamicClassFileObject` id, so the check correctly answered false for
+    // the receiver's file object, `super.inferBinaryName` ran, and
+    // `JavacFileManager` threw on a file object it did not create.
+    //
+    // `globally_named` already gates `publish_mic_rust_cached_entry` two
+    // arms below for exactly this reason; the by-name compile that feeds the
+    // machine-code MIC/PIC was left ungated. Not globally named -> do not
+    // compile by name, leave the site on the dispatch helper, which resolves
+    // on the actual receiver.
     let compile_res = if !direct_virtual_compiled_callee_entry_enabled()
         || redefine_jit_quiesced
         || !cacheable_receiver
+        || !globally_named
     {
         None
     } else {
