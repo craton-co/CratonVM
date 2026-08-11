@@ -44,7 +44,7 @@ pub const ACC_MANDATED: u16 = 0x8000;
 // ---------------------------------------------------------------------------
 
 /// A single `requires` directive in a module declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleRequiresEntry {
     /// Binary module name, e.g. `"java.base"`.
     pub module_name: String,
@@ -53,15 +53,49 @@ pub struct ModuleRequiresEntry {
     pub is_transitive: bool,
     /// True if this is `requires static` — dependency is compile-time only.
     pub is_static: bool,
+    /// True if `ACC_SYNTHETIC` (0x1000) is set on the directive — the class-file
+    /// spelling of `Requires.Modifier.SYNTHETIC`.
+    pub is_synthetic: bool,
+    /// True if `ACC_MANDATED` (0x8000) is set — `Requires.Modifier.MANDATED`.
+    ///
+    /// This is the one modifier bit that really occurs in the wild. Scanning
+    /// JDK 25's own module declarations (`javap -v --module <m> module-info`,
+    /// grepping the `Module:` section for `ACC_MANDATED`/`ACC_SYNTHETIC` across
+    /// java.base, java.desktop, java.logging, java.sql and jdk.jfr) finds it on
+    /// **`requires java.base`, in every module, and nowhere else** — zero hits
+    /// on any `exports` or `opens` directive. So dropping it here is the loss
+    /// that visibly disagrees with HotSpot: there `java.base`'s
+    /// `Requires.modifiers()` is `[MANDATED]`, and it was `[]` here.
+    pub is_mandated: bool,
+    /// The `requires_version` string recorded by the producer, if any
+    /// (`requires_version_index != 0`).
+    ///
+    /// Raw, unparsed text — which is precisely what
+    /// `Requires.rawCompiledVersion()` answers; `Requires.compiledVersion()`
+    /// is the same text through `ModuleDescriptor.Version.parse`. The index was
+    /// previously discarded at parse time, leaving both accessors with no data
+    /// source anywhere in the VM.
+    pub compiled_version: Option<String>,
 }
 
 /// A single `exports` directive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleExportsEntry {
     /// Exported package in slash format, e.g. `"java/lang"`.
     pub package_name: String,
     /// Qualified targets.  Empty ⇒ unqualified (exported to all modules).
     pub to_modules: Vec<String>,
+    /// `ACC_SYNTHETIC` on the directive — `Exports.Modifier.SYNTHETIC`.
+    ///
+    /// No JDK 25 module declaration sets this or [`is_mandated`](Self::is_mandated)
+    /// on an `exports` (see `ModuleRequiresEntry::is_mandated` for the scan), so
+    /// an empty `Exports.modifiers()` is the right answer for every `javac`- or
+    /// `jlink`-emitted directive. It is parsed anyway so that the empty set is a
+    /// *measured* zero rather than a hardcoded one: a producer that does set the
+    /// bit is now representable instead of silently flattened.
+    pub is_synthetic: bool,
+    /// `ACC_MANDATED` on the directive — `Exports.Modifier.MANDATED`.
+    pub is_mandated: bool,
 }
 
 impl ModuleExportsEntry {
@@ -72,12 +106,17 @@ impl ModuleExportsEntry {
 }
 
 /// A single `opens` directive.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ModuleOpensEntry {
     /// Opened package in slash format.
     pub package_name: String,
     /// Qualified targets.  Empty ⇒ unqualified open.
     pub to_modules: Vec<String>,
+    /// `ACC_SYNTHETIC` on the directive — `Opens.Modifier.SYNTHETIC`. Same
+    /// measured-zero rationale as [`ModuleExportsEntry::is_synthetic`].
+    pub is_synthetic: bool,
+    /// `ACC_MANDATED` on the directive — `Opens.Modifier.MANDATED`.
+    pub is_mandated: bool,
 }
 
 impl ModuleOpensEntry {
@@ -1196,6 +1235,12 @@ pub fn descriptor_from_module_attribute(
 
     let is_open = (flags & ACC_MODULE_OPEN) != 0;
 
+    // Every directive's flag word and the `requires` version index are carried
+    // through here. They used to be dropped on the floor, which is what left
+    // `Requires.modifiers()`, `Exports.modifiers()`, `Opens.modifiers()` and
+    // `Requires.{compiledVersion,rawCompiledVersion}()` with no data source
+    // anywhere in the VM — the Java mirror could only fabricate an empty answer
+    // because nothing upstream had kept the bits to answer with.
     let requires: Vec<ModuleRequiresEntry> = requires_raw
         .iter()
         .filter_map(|r| {
@@ -1204,6 +1249,17 @@ pub fn descriptor_from_module_attribute(
                 module_name,
                 is_transitive: (r.requires_flags & ACC_REQUIRES_TRANSITIVE) != 0,
                 is_static: (r.requires_flags & ACC_REQUIRES_STATIC) != 0,
+                is_synthetic: (r.requires_flags & ACC_SYNTHETIC) != 0,
+                is_mandated: (r.requires_flags & ACC_MANDATED) != 0,
+                // `requires_version_index` is a plain Utf8 index (JVMS §4.7.25),
+                // NOT one of the CONSTANT_Module/Package indirections the
+                // `resolve_name` helper above exists for, so it is read
+                // directly. 0 means "no version recorded".
+                compiled_version: if r.requires_version_index != 0 {
+                    cp.get_utf8(r.requires_version_index).map(|s| s.to_string())
+                } else {
+                    None
+                },
             })
         })
         .collect();
@@ -1220,6 +1276,8 @@ pub fn descriptor_from_module_attribute(
             Some(ModuleExportsEntry {
                 package_name,
                 to_modules,
+                is_synthetic: (e.exports_flags & ACC_SYNTHETIC) != 0,
+                is_mandated: (e.exports_flags & ACC_MANDATED) != 0,
             })
         })
         .collect();
@@ -1236,6 +1294,8 @@ pub fn descriptor_from_module_attribute(
             Some(ModuleOpensEntry {
                 package_name,
                 to_modules,
+                is_synthetic: (o.opens_flags & ACC_SYNTHETIC) != 0,
+                is_mandated: (o.opens_flags & ACC_MANDATED) != 0,
             })
         })
         .collect();
@@ -1745,6 +1805,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB");
 
@@ -1765,6 +1826,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut desc_c = sample_desc("modC");
@@ -1772,6 +1834,7 @@ mod tests {
             module_name: "modA".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1802,6 +1865,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/foo".to_string(),
             to_modules: vec![],
+            ..Default::default()
         });
         assert!(desc.exports_package_to("com/foo", "modB"));
         assert!(desc.exports_package_to("com/foo", "modC"));
@@ -1814,6 +1878,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/foo".to_string(),
             to_modules: vec!["modB".to_string()],
+            ..Default::default()
         });
         assert!(desc.exports_package_to("com/foo", "modB"));
         assert!(!desc.exports_package_to("com/foo", "modC"));
@@ -1886,12 +1951,14 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_c = sample_desc("modC");
         desc_c.requires.push(ModuleRequiresEntry {
             module_name: "modD".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1921,12 +1988,14 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_c = sample_desc("modC");
         desc_c.requires.push(ModuleRequiresEntry {
             module_name: "modB".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -1949,6 +2018,7 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: true, // transitive + static → still compile-time only
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2008,6 +2078,7 @@ mod tests {
             module_name: "modC".to_string(),
             is_transitive: true,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2036,6 +2107,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: true,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2061,6 +2133,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
 
         let mut reg = ModuleRegistry::new();
@@ -2078,6 +2151,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/internal".to_string(),
             to_modules: vec!["modB".to_string()], // only exported to modB
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec!["com/internal".to_string()]);
@@ -2114,10 +2188,12 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/public".to_string(),
             to_modules: vec![], // unqualified
+            ..Default::default()
         });
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/private".to_string(),
             to_modules: vec!["modB".to_string()], // qualified
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec![]);
@@ -2133,6 +2209,7 @@ mod tests {
         desc.exports.push(ModuleExportsEntry {
             package_name: "com/foo".to_string(),
             to_modules: vec!["modB".to_string()],
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec![]);
@@ -2169,6 +2246,7 @@ mod tests {
         desc.opens.push(ModuleOpensEntry {
             package_name: "com/reflect".to_string(),
             to_modules: vec![], // unqualified
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc, vec![]);
@@ -2253,6 +2331,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc_a, vec![]);
@@ -2268,12 +2347,14 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_b = sample_desc("modB");
         desc_b.requires.push(ModuleRequiresEntry {
             module_name: "modA".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc_a, vec![]);
@@ -2421,6 +2502,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB");
         let mut reg = ModuleRegistry::new();
@@ -2441,11 +2523,13 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let mut desc_b = sample_desc("modB");
         desc_b.opens.push(ModuleOpensEntry {
             package_name: "com/secret".to_string(),
             to_modules: vec!["modA".to_string()],
+            ..Default::default()
         });
         let mut reg = ModuleRegistry::new();
         reg.register(desc_a, vec![]);
@@ -2464,6 +2548,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB");
         let mut reg = ModuleRegistry::new();
@@ -2494,6 +2579,7 @@ mod tests {
             module_name: "modB".to_string(),
             is_transitive: false,
             is_static: false,
+            ..Default::default()
         });
         let desc_b = sample_desc("modB"); // no exports
         let mut reg = ModuleRegistry::new();
