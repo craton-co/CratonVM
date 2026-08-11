@@ -576,7 +576,12 @@ $script:SymlinkGapSignature =
 # cannot match, and the row stays FAIL rather than being excused by evidence
 # that was never printed.
 function Resolve-EnvGatedStatus {
-  param([string]$Status, [string]$Combined, [int]$Failed, [int]$Aborted, [int]$ContainersFailed)
+  # Stdout ONLY, never the combined text. Every SBRUNNER_* marker is printed on
+  # stdout, and `$combined` appends stderr AFTER it -- so the last failure block
+  # would otherwise swallow the whole of stderr, and a stray `FileSystemException`
+  # logged there could satisfy the check for a failure that was nothing of the
+  # kind.
+  param([string]$Status, [string]$Stdout, [int]$Failed, [int]$Aborted, [int]$ContainersFailed)
   if ($Status -ne 'FAIL') { return '' }
   if ($ContainersFailed -gt 0) { return '' }
   if ($Failed -le 0 -and $Aborted -le 0) { return '' }
@@ -585,15 +590,17 @@ function Resolve-EnvGatedStatus {
   if ($Failed -gt 0) {
     # Split on the per-failure marker SbRunner prints, so each failure's own
     # stack trace is checked rather than the whole log at once (one symlink
-    # failure must not excuse an unrelated second one).
-    $blocks = @([regex]::Split($Combined, 'SBRUNNER_FAILURE_DETAIL ') | Select-Object -Skip 1)
+    # failure must not excuse an unrelated second one). The final block is
+    # bounded at the summary line for the same reason.
+    $blocks = @([regex]::Split($Stdout, 'SBRUNNER_FAILURE_DETAIL ') | Select-Object -Skip 1)
     if ($blocks.Count -ne $Failed) { return '' }
     foreach ($block in $blocks) {
-      if ($block -notmatch $script:SymlinkGapSignature) { return '' }
+      $body = ($block -split 'SBRUNNER_RESULT ')[0]
+      if ($body -notmatch $script:SymlinkGapSignature) { return '' }
     }
   }
   if ($Aborted -gt 0) {
-    $lines = @([regex]::Matches($Combined, '(?m)^SBRUNNER_ABORTED_DETAIL (.*)$'))
+    $lines = @([regex]::Matches($Stdout, '(?m)^SBRUNNER_ABORTED_DETAIL (.*)$'))
     if ($lines.Count -ne $Aborted) { return '' }
     foreach ($line in $lines) {
       if ($line.Groups[1].Value -notmatch $script:SymlinkGapSignature) { return '' }
@@ -1164,7 +1171,7 @@ function Complete-ProcessRecord {
     # Host-capability gating runs after the baseline reclassifier and can still
     # apply to a row the baseline left alone: it needs no reference VM, which
     # matters because no Windows full-suite HotSpot baseline has ever existed.
-    $envGated = Resolve-EnvGatedStatus -Status $status -Combined $combined `
+    $envGated = Resolve-EnvGatedStatus -Status $status -Stdout $Stdout `
       -Failed $failed -Aborted $aborted -ContainersFailed $containersFailed
     if ($envGated) {
       $status = $envGated

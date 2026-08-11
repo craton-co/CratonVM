@@ -81,41 +81,52 @@ $threeSymlink = (($symlinkFailure -f 'a()'), ($symlinkFailure -f 'b()'), ($symli
 $script:HostSymlinkSupport = $false
 
 Check 'three symlink failures are env-gated' 'ENV-GATED' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 0)
 
 Check 'one real failure among symlink ones stays FAIL' '' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined (($symlinkFailure -f 'a()'), $realFailure -join "`n") `
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout (($symlinkFailure -f 'a()'), $realFailure -join "`n") `
     -Failed 2 -Aborted 0 -ContainersFailed 0)
 
 Check 'fewer failure blocks than the counter stays FAIL' '' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined ($symlinkFailure -f 'a()') -Failed 3 -Aborted 0 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout ($symlinkFailure -f 'a()') -Failed 3 -Aborted 0 -ContainersFailed 0)
 
 $abortLog = "SBRUNNER_ABORTED_DETAIL whenSymlinkExistsInDirectoryLocationGetDirThrows() : org.opentest4j.TestAbortedException: Symlink creation not supported`nSBRUNNER_SKIPPED_DETAIL other() : Disabled on operating system: Windows 11"
 Check 'a symlink abort is env-gated' 'ENV-GATED' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined $abortLog -Failed 0 -Aborted 1 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout $abortLog -Failed 0 -Aborted 1 -ContainersFailed 0)
 
 # The stale-SbRunner.class case: aborted=1 and not a single reason line emitted.
 Check 'an abort with no printed reason stays FAIL' '' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined 'nothing useful here' -Failed 0 -Aborted 1 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout 'nothing useful here' -Failed 0 -Aborted 1 -ContainersFailed 0)
 
 Check 'an abort for an unrelated reason stays FAIL' '' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined 'SBRUNNER_ABORTED_DETAIL x() : org.opentest4j.TestAbortedException: Docker not available' `
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout 'SBRUNNER_ABORTED_DETAIL x() : org.opentest4j.TestAbortedException: Docker not available' `
     -Failed 0 -Aborted 1 -ContainersFailed 0)
 
+# The last failure block runs to the end of the text, so anything appended after
+# the summary line -- historically the whole of stderr -- used to be read as part
+# of it. A real failure followed by unrelated `FileSystemException` noise must
+# still be a real failure.
+$tail = "SBRUNNER_RESULT tests=1 failed=1 aborted=0 skipped=0 containersFailed=0`nWARN java.nio.file.FileSystemException: something else entirely"
+Check 'noise after the summary line cannot excuse a real failure' '' (
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout ($realFailure + "`n" + $tail) -Failed 1 -Aborted 0 -ContainersFailed 0)
+
+Check 'noise after the summary line does not break a genuine gate' 'ENV-GATED' (
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout (($symlinkFailure -f 'a()') + "`n" + $tail) -Failed 1 -Aborted 0 -ContainersFailed 0)
+
 Check 'a container failure stays FAIL' '' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 1)
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 1)
 
 Check 'a CRASH is never env-gated' '' (
-  Resolve-EnvGatedStatus -Status 'CRASH' -Combined $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'CRASH' -Stdout $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 0)
 
 Check 'a PASS is never env-gated' '' (
-  Resolve-EnvGatedStatus -Status 'PASS' -Combined '' -Failed 0 -Aborted 0 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'PASS' -Stdout '' -Failed 0 -Aborted 0 -ContainersFailed 0)
 
 # --- host WITH the privilege ----------------------------------------------
 # Same evidence, opposite verdict: on Linux these rows are real failures.
 $script:HostSymlinkSupport = $true
 Check 'symlink failures on a capable host stay FAIL' '' (
-  Resolve-EnvGatedStatus -Status 'FAIL' -Combined $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 0)
+  Resolve-EnvGatedStatus -Status 'FAIL' -Stdout $threeSymlink -Failed 3 -Aborted 0 -ContainersFailed 0)
 
 if ($script:Failures -gt 0) {
   Write-Host "ENV-GATED TESTS: $script:Failures failed"

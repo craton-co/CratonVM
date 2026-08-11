@@ -125,6 +125,17 @@ filesystem paths (jar and runtime-image entries) are exempt: entry names are
 `/`-separated on every platform, exactly as the JDK's own zipfs and jrtfs report
 them, and rewriting them would corrupt the encoding as well.
 
+**And that is not a hypothetical.** Re-running the probe after the first pass
+showed `createDirectory` on an existing directory *still* naming a forward-slash
+path: the `FileAlreadyExistsException` builder had been copied inline at each
+`ErrorKind::AlreadyExists` arm, so "fix every builder" reached neither copy. The
+duplicates now call one `p57_file_already_exists_synthetic`. `native-io` raises
+the same exception and cannot depend on `native-builtins` (the dependency runs
+the other way), so the helper itself lives in `native-io` and
+`p57_exception_path` delegates to it. The VFS sentinel each side needs is tied
+together with `const _: () = assert!(…)`, so a change to either is a compile
+error rather than archive-entry paths quietly getting rewritten.
+
 ### 3b. `FileSystemException`'s reason was written to a field that does not exist
 
 `java.nio.file.FileSystemException` declares `file` and `other` and nothing
@@ -175,7 +186,20 @@ Both JDK providers funnel a failed `createSymbolicLink` through
 `rethrowAsIOException(link)` — one path. `createLink` is the genuine two-path
 case (`rethrowAsIOException(link, existing)`) and is unchanged.
 
-### 3e. The Windows privilege reason was hardcoded English
+### 3e. `readSymbolicLink` on a regular file lost the OS's explanation
+
+```
+HotSpot   NotLinkException  reason=The file or directory is not a reparse point.
+CratonVM  NotLinkException  reason=null
+```
+
+The type was right; the reason was absent because CratonVM decides "not a link"
+from `symlink_metadata` and so never makes a call that can fail. It now performs
+the `read_link` and quotes the error the OS returns. The JDK's rule still
+decides the type — what changed is that the explanation belongs to the system
+instead of being invented or omitted.
+
+### 3f. The Windows privilege reason was hardcoded English
 
 `p57_link_io_error` special-cased `ERROR_PRIVILEGE_NOT_HELD` (1314) to the
 literal string "A required privilege is not held by the client". The JDK formats
