@@ -65,8 +65,15 @@
 //! * **Reviewed VM services.** §11 admits "a reviewed VM service" to strict
 //!   mode, and `NativeKind` has no variant that says so, so those keep `Bridge`
 //!   and are enumerated in [`VM_SERVICE_RECEIVERS`] with the reason. Tagging
-//!   them here would take `-javaagent`, dynamic proxies, the TLS self-test and
-//!   the JDBC SPI probe out of `--jdk-only`.
+//!   them here would take `-javaagent`, dynamic proxies, the TLS self-test,
+//!   the JDBC SPI probe and `LinkedList.listIterator()` out of `--jdk-only`.
+//!
+//!   The last of those is the 2026-08-11 correction, and it is the shape to
+//!   watch for: a `cratonvm/…` name is *not* self-evidently a stand-in. The
+//!   test is whether it stands in for a JDK shape a caller could otherwise
+//!   hold, and `LinkedListSnapshotListItr` was named out of the `java/util/*`
+//!   namespace precisely so it would NOT inherit `LinkedList$ListItr`'s
+//!   layout. It landed on the stand-in list by prefix, not by that test.
 //! * **Receivers strict mode still creates**, in [`STRICT_STILL_FABRICATES`].
 //!   Their natives are not bridges either; they cannot be re-tagged yet for a
 //!   reason that is not about them.
@@ -188,7 +195,11 @@ pub const NO_IMAGE_JDK_RECEIVERS: &[&str] = &[
 /// that this is one family with one answer and not a new policy.
 pub const VM_MINTED_STAND_IN_RECEIVERS: &[&str] = &[
     "cratonvm/internal/ArrayListSubList",
-    "cratonvm/internal/LinkedListSnapshotListItr",
+    // `cratonvm/internal/LinkedListSnapshotListItr` was here until 2026-08-11.
+    // It stands in for nobody — see the entry in [`VM_SERVICE_RECEIVERS`], and
+    // note that moving it is only half a change: the other half is the mint
+    // site in native-collections/src/lib.rs, and either alone is worse than
+    // neither.
     "cratonvm/internal/SnapshotEnumeration",
     "cratonvm/internal/StreamChainCollector",
     "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
@@ -213,6 +224,7 @@ pub const VM_MINTED_STAND_IN_RECEIVERS: &[&str] = &[
 /// | `cratonvm/Wp71JdbcSpi` | the JDBC service-provider probe |
 /// | `cratonvm/tls/T27SelfTest` | the TLS self-test entry point |
 /// | `cratonvm/Util`, `cratonvm/test/Util` | the regression corpus's own hooks |
+/// | `cratonvm/internal/LinkedListSnapshotListItr` | `LinkedList.listIterator()`, `subList`, `sort`, and `AbstractList.equals`/`hashCode`/`indexOf` against a foreign list |
 ///
 /// This list is not consulted by [`receiver_declared_by_no_supported_image`];
 /// it exists so that "why is this one still a `Bridge`" has an answer in the
@@ -222,6 +234,37 @@ pub const VM_SERVICE_RECEIVERS: &[&str] = &[
     "cratonvm/Instrument",
     "cratonvm/Util",
     "cratonvm/Wp71JdbcSpi",
+    // A `ListIterator` over an immutable snapshot of a native `LinkedList`, and
+    // the state that iteration needs: `Object[]` snapshot at slot 0, `Int`
+    // cursor at 1, backing list at 2. Contract §11's "reviewed VM service", and
+    // `Bridge` is the only tag that survives `allowed_in(JdkOnly)`.
+    //
+    // It is here rather than in [`VM_MINTED_STAND_IN_RECEIVERS`] because it
+    // stands in for nobody. It was deliberately NOT named
+    // `java/util/LinkedList$ListItr` — that name resolves to the real 5-field
+    // class, whose layout mangled the cursor write into the real `next:Node`
+    // slot and made `next()` never advance, so `AbstractList.equals` compared
+    // element 0 forever. The `cratonvm/` name is what keeps the layout ours.
+    //
+    // **Load-bearing pairing.** This move is inert on its own, and the mint
+    // site is inert on its own, and each alone is worse than neither — the two
+    // gates are independent and clearing one moves the failure rather than
+    // removing it. `register()` re-tags by name here, so re-tagging without
+    // minting drops nine natives strict then needs; minting without re-tagging
+    // hands strict a well-formed carrier with no implementation and turns the
+    // `NoClassDefFoundError` at `listIterator()` into an `UnsatisfiedLinkError`
+    // at the first `hasNext()`. That is [`STRICT_STILL_FABRICATES`]'s warning
+    // running in the other direction. The companion is
+    // `native_ll_list_iterator` / `_idx` in native-collections/src/lib.rs.
+    //
+    // Retiring this entry means making the natives stop owning `LinkedList`
+    // state, then dropping the `listIterator` interception — a collections
+    // reclassification, not an iterator change. It does NOT take the gap off
+    // the census either way: the row that names it is `native-shadows-bytecode`
+    // on `java/util/LinkedList.listIterator`, keyed on the REAL class and the
+    // registration, so no change to the carrier can move it. Measured in
+    // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
+    "cratonvm/internal/LinkedListSnapshotListItr",
     "cratonvm/internal/SystemLogger",
     "cratonvm/test/Util",
     "cratonvm/tls/T27SelfTest",
