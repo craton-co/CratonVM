@@ -119,7 +119,7 @@ unbounded thread-local map on every raw-entry native dispatch. Pre-existing on
 `dev`; the strict gate saw it in BOTH CratonVM arms of `JdkOnlyPlatformProbe`,
 which is the gate's third arm doing exactly what it is for.
 
-## 2026-08-10 — two records retired, one added
+## 2026-08-10 — three records retired
 
 The object-layout pair is **RETIRED** (see row 2 of the ranked list below):
 index-based field access against fabricated layouts is closed, the shadow-layout
@@ -128,14 +128,20 @@ records moved to the internal tree as
 `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md` and
 `fixed-bugs/jdk-only-newbufferedwriter-fd-in-writebuffer-FIXED-20260810.md`.
 
-[`memorysegment-set-ofdouble-has-no-code-attribute.md`](memorysegment-set-ofdouble-has-no-code-attribute.md)
-— found while verifying the FFM half of that work and filed separately because
-it is **not** a layout defect: every one of the thirteen `ValueLayout`
-properties matches Temurin 25.0.3, and then
-`seg.set(ValueLayout.JAVA_DOUBLE, 16, 1.5)` raises `AbstractMethodError … has no
-Code attribute` while the `int`, `long` and `byte` stores beside it succeed.
-Identical on the pre-fix binary, so it is pre-existing rather than a regression;
-`probes/W2ValueLayoutProbe` is the reproducer.
+`MemorySegment.set` had no implementation for five of its nine carriers —
+**FILED AND FIXED 2026-08-10**. Found while verifying the FFM half of the
+object-layout work and filed separately because it is **not** a layout defect:
+`java.lang.foreign.MemorySegment` declares nine `get`/`set` pairs, all eighteen
+`public abstract`, and a descriptor nobody registers raises
+`AbstractMethodError … has no Code attribute`. `panama.rs` enumerated all nine
+`get` descriptors and only the erased `set`; `foreign_ffm.rs` covered
+Byte/Short/Int/Long for both. So four worked and **boolean, char, float, double
+and address** did not — the original filing named `double` only because that is
+the one a probe happened to reach. `probes/FfmSegmentAccessProbe` also caught two
+`get` conversions nothing had reported: `char` sign-extended (`0xFFFE` → `-2`),
+and `get(ADDRESS)` returning `null` because a `Value::Long` was answered where
+the descriptor says `MemorySegment`. Record retired to the internal tree as
+`fixed-bugs/ffm-memorysegment-set-carriers-FIXED-20260810.md`.
 
 ## 2026-08-05 — three records added
 

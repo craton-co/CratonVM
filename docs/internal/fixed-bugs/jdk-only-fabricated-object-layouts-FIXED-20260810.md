@@ -758,7 +758,9 @@ because a primitive mirror has no legitimate `cachedConstructor` reader at all.
   `AbstractMethodError … has no Code attribute` while the `int`, `long` and
   `byte` stores beside it succeed. Identical on the pre-fix binary, so
   pre-existing — see
-  [`memorysegment-set-ofdouble-has-no-code-attribute.md`](../../known-issues/jdk-only/memorysegment-set-ofdouble-has-no-code-attribute.md).
+  [`ffm-memorysegment-set-carriers-FIXED-20260810.md`](ffm-memorysegment-set-carriers-FIXED-20260810.md)
+  (FIXED 2026-08-10: five of the nine `set` carriers had no implementation at
+  all, and two `get` conversions were wrong).
 * ~~**Step 4**, making `safe` verdicts checkable rather than asserted.~~ —
   **DONE 2026-08-10.** `shadow_layout::SAFE_POSITIONAL_CLAIMS` writes each claim
   down as `(class, index, name, descriptor, site)` and `check_positional_claims`

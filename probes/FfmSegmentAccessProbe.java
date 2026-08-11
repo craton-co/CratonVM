@@ -54,6 +54,14 @@ public class FfmSegmentAccessProbe {
         // the INTERFACE finds only its abstract methods; a real
         // NativeMemorySegmentImpl finds bytecode. The two failure modes read
         // nothing alike and this one line tells them apart.
+        //
+        // It is the ONE line that cannot match HotSpot, and deliberately so:
+        // CratonVM's Arena hands out an instance of java.lang.foreign.
+        // MemorySegment itself where the JDK builds a
+        // jdk.internal.foreign.NativeMemorySegmentImpl. That is a separate,
+        // pre-existing CompatibilityClassRequested matter, and printing it
+        // keeps a reader from mistaking it for one of the accessor defects --
+        // every other line here IS expected to be byte-identical.
         section("shape", FfmSegmentAccessProbe::shape);
         section("byte", FfmSegmentAccessProbe::carrierByte);
         section("boolean", FfmSegmentAccessProbe::carrierBoolean);
