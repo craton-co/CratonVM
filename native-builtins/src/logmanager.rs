@@ -385,11 +385,42 @@ unsafe fn object_from_u64(addr: u64) -> ObjectRef {
 /// `org.jboss.logmanager.LogManager`). The two share the same synthetic
 /// field layout — the difference is purely the `getClass()` mirror the
 /// bytecode observes.
+///
+/// # This is the state that blocks `java/util/logging`'s retirement
+///
+/// The singleton is ALLOCATED here and never CONSTRUCTED: `<init>` does not
+/// run, and only four of its fourteen slots are written. Measured against
+/// HotSpot 25.0.3 on 2026-08-11 (`--add-opens
+/// java.logging/java.util.logging=ALL-UNNAMED`, reflecting the object
+/// `LogManager.getLogManager()` returns), eight reference fields are null here
+/// and real there: `props`, `systemContext`, `userContext`, `rootLogger`,
+/// `configurationLock`, `closeOnResetLoggers`, `listeners`, `loggerRefQueue`.
+///
+/// That was survivable for as long as every accessor was a native. It stopped
+/// being survivable when the 2026-08-11 wave retired 84 `java/util/logging/`
+/// shadows: under `--jdk-only` those triples are now refused and the real
+/// bytecode runs, so `Logger.getLogger(name)` reaches
+/// `LogManager.demandSystemLogger`, dereferences the null `systemContext` and
+/// throws — on the FIRST call any JUL user makes. A/B'd across four binaries,
+/// discriminated by each one's own `--dump-native-registry` row for
+/// `Logger.getLogger`: `bridge` scores 16/17 on a 17-assertion probe,
+/// `synthetic-stub` scores 0/17. Compatible mode is unaffected, because a
+/// `SyntheticStub` still dispatches there.
+///
+/// So the "null is safe" argument below is no longer true in strict mode, and
+/// the fix is one of two things — hold the four `systemContext`/`rootLogger`
+/// dereferencing triples back in `native-api/src/retired_shadow.rs` the way
+/// `Logger.log(Level, Supplier, Throwable)` is held back, or build the
+/// singleton through its real constructor. Both are written out in
+/// docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md.
+/// Do not "simplify" the nulls away without reading it: they are what several
+/// natives in this file assume.
 fn allocate_log_manager(ctx: &mut dyn NativeContext, class_name: &str) -> Result<ObjectRef, MethodCallFailed> {
     let obj = try_alloc_concurrent_synthetic(ctx, class_name, LM_NUM_FIELDS)?;
     // Leave slot 0 as `null` — a properly-initialized `Properties` would
     // round-trip through synthetic HashMap natives, but most Quarkus/JBoss
-    // code reads it via accessors we no-op, so null is safe.
+    // code reads it via accessors we no-op, so null is safe. TRUE ONLY IN
+    // COMPATIBLE MODE since the shadow retirement; see the doc comment.
     ctx.set_field(obj, LM_FIELD_PROPERTIES, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_LOGGER_REGISTRY, Value::Object(None));
     ctx.set_field(obj, LM_FIELD_ROOT_LOGGER, Value::Object(None));
@@ -4669,6 +4700,19 @@ pub(crate) fn native_jul_logger_log_throwable(
 /// `java/util/logging/Logger.log(Level, Supplier<String>)` — message-supplier
 /// overload with no throwable. Resolve the supplier and emit (otherwise the
 /// synthetic JUL drops it, since the real LogRecord/handler path isn't wired).
+///
+/// **Known divergence, measured 2026-08-11, not fixed here.** This is the one
+/// `log` overload that emits to the console sink WITHOUT first fanning the
+/// record out to the logger's installed `Handler`s —
+/// `native_jul_logger_log_record` below does that fan-out and says why. So an
+/// application that installs a `Handler` and calls
+/// `logger.log(Level.INFO, () -> "…")` sees the record nowhere, while the
+/// other seven overloads reach it: right in the members with one
+/// implementation, wrong in the members with the other. HotSpot 25.0.3
+/// delivers it. Pre-dates the shadow retirement — reproduced on a binary
+/// without it — and is live in `Compatible` mode, so closing it is a
+/// Compatible-mode behaviour change and wants its own lane. Recorded in
+/// docs/known-issues/jdk-only/W7-22-shadow-retirement-logging-and-time.md §4.1.
 fn native_jul_logger_log_supplier(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
