@@ -6069,6 +6069,13 @@ impl NativeMethodRegistry {
                     // `join()` ran its body and returned a value. Must stay in
                     // step with `is_forkjoin_native_override`.
                     | ("completeExceptionally", "(Ljava/lang/Throwable;)V")
+                    // W6-9 §7.2: the only method on the class that CLEARS a
+                    // status bit. Unregistered, real bytecode reset the real
+                    // `status`/`aux`, which nothing here reads — the side-table
+                    // completion survived and the next `join()` replayed the
+                    // stale result. Must stay in step with
+                    // `is_forkjoin_native_override`.
+                    | ("reinitialize", "()V")
                     // L12: the STATIC `invokeAll` overloads. JDK 25's
                     // `invokeAll(t1, t2)` runs one task inline and then blocks
                     // in `awaitDone` for the FORKED sibling — which the lazy
