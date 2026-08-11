@@ -105,3 +105,9 @@ probes/out/
 # …including a probe compiled in place: the rule above only covers `out/`, so
 # `javac probes/Foo.java` left a `probes/Foo.class` that `git add -A` tracked.
 probes/*.class
+
+# local run artifacts
+dim4-*.log*
+build-win.log
+cv-url.txt
+hs-url.txt

@@ -14204,10 +14204,50 @@ pub(crate) fn annotation_element_to_java_typed(
                 }
                 let scoped = container_class_id
                     .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-                if let Some(cid) = scoped.or_else(|| ctx.class_id_by_name(class_name)) {
+                // A `Class`-valued member names a type the CONTAINER refers to,
+                // so it resolves with the container's initiating loader
+                // (HotSpot: `parseClassValue` -> `Class.forName(n, false,
+                // container.getClassLoader())`). `class_id_by_name_near` covers
+                // that loader's own namespace and the built-in delegation chain
+                // it inherits, but only for names ALREADY resolved there;
+                // driving the container's loader covers the first use too. The
+                // sibling `Enum` arm has taken that step since the
+                // `SpringBootContextLoaderAotTests` fix — this arm had not, and
+                // fell straight through to the loader-BLIND `class_id_by_name`
+                // instead.
+                //
+                // That fallback answers with whatever single loader happens to
+                // have the name, which under `@CompileWithForkedClassLoader` is
+                // the FORK: an Application-loaded log4j `@PluginAttribute`
+                // (loader 2) was handed the fork's (loader 3)
+                // `PluginAttributeVisitor`, and every class reached from there
+                // — `AbstractPluginVisitor`, `TypeConverters`,
+                // `TypeConverterRegistry` — was forked too, so an app-world
+                // `ConfigurationStrSubstitutor` could not be cast to the
+                // visitor's fork-world `StrSubstitutor`. log4j then dropped
+                // every `<Logger>` element of its configuration.
+                let driven = scoped.is_none().then(|| {
+                    container_class_id.and_then(|holder| {
+                        ctx.class_id_by_name_via_referencing_class(holder, class_name).ok()
+                    })
+                }).flatten();
+                if let Some(cid) = scoped.or(driven).or_else(|| ctx.class_id_by_name(class_name)) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
-                        eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
+                        eprintln!(
+                            "ANN-CLASS desc={desc} class={class_name} already-loaded ok \
+                             holder={:?}/L{:?} via={} answer=L{}",
+                            container_class_id.map(|h| h.as_u32()),
+                            container_class_id.map(|h| ctx.loader_id_of_class(h)),
+                            if scoped.is_some() {
+                                "scoped"
+                            } else if driven.is_some() {
+                                "container-loader"
+                            } else {
+                                "GLOBAL"
+                            },
+                            ctx.loader_id_of_class(cid),
+                        );
                     }
                     return Ok(Value::Object(Some(mirror)));
                 }
@@ -14490,6 +14530,17 @@ pub(crate) fn annotation_element_to_java_typed(
                 .or_else(|| {
                     container_class_id
                         .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
+                })
+                // Same step the scalar `Class` arm takes: `class_id_by_name_near`
+                // only sees names the container's loader has ALREADY resolved,
+                // so drive that loader before conceding to the loader-blind
+                // lookup below — otherwise a component this container has never
+                // touched is answered by whichever single loader happens to
+                // have it.
+                .or_else(|| {
+                    container_class_id.and_then(|holder| {
+                        ctx.class_id_by_name_via_referencing_class(holder, &comp_name_owned).ok()
+                    })
                 })
                 .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
