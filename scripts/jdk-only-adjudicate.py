@@ -131,8 +131,20 @@ def declared_anywhere(r):
 
 
 def acc_native_anywhere(r):
+    """Does the image declare this triple ACC_NATIVE anywhere that ADJUDICATES?
+
+    Not simply "anywhere": `java.lang.Object` declares `hashCode`, `clone`,
+    `getClass`, `notify`, `notifyAll` and `wait` ACC_NATIVE and everything
+    inherits them, so a plain hierarchy answer would discharge any
+    `X.hashCode()I` Bridge on any receiver. The census states the resolution
+    because it is factually right; the ratchet and this script both decline to
+    credit it. `ratchet._inherits_from_object` is the same rule, and the two
+    must not drift.
+    """
     i = img(r)
-    return i.get("acc_native") or i.get("inherited_acc_native")
+    if i.get("acc_native"):
+        return True
+    return bool(i.get("inherited_acc_native")) and not ratchet._inherits_from_object(i)
 
 
 def has_code_anywhere(r):
@@ -215,6 +227,9 @@ if HIERARCHY:
         if not i.get("image_has_class") or i.get("declared"):
             continue
         if i.get("inherited_acc_native"):
+            if ratchet._inherits_from_object(i):
+                split["INHERITED native (java.lang.Object - NOT credited)"] += 1
+                continue
             split["INHERITED native"] += 1
             creditable.append((r, i.get("inherited_from")))
         elif i.get("inherited_has_code"):

@@ -171,6 +171,28 @@ def _img(row):
     return row.get("image_declaring_method") or {}
 
 
+# `java.lang.Object` declares `hashCode`, `clone`, `getClass`, `notify`,
+# `notifyAll` and `wait` ACC_NATIVE, and EVERY class and interface inherits
+# them. Resolving a triple up the hierarchy therefore lands on Object for any
+# registration of one of those names on any receiver — measured, 4 of the 23
+# hierarchy credits on JDK 25.0.4/linux are `java/lang/reflect/*Type.hashCode()I
+# -> java/lang/Object`.
+#
+# That resolution is FACTUALLY correct (JVMS §5.4.3.3 reaches Object's public
+# methods for an interface too), which is why the census states it. It is not an
+# ADJUDICATION: a native on `ParameterizedType.hashCode` is not binding Object's
+# native, it stands in front of whatever the real implementor overrides
+# `hashCode` with. Crediting it would let any `X.hashCode()I` Bridge, on any
+# class, discharge its §1.5 claim by pointing at a method every object has.
+#
+# So the fact lives in the census and the policy lives here.
+_OBJECT = "java/lang/Object"
+
+
+def _inherits_from_object(img):
+    return img.get("inherited_from") == _OBJECT
+
+
 def adjudicate(doc):
     """Reduce a schema-4 census to the machine-readable adjudication block.
 
@@ -205,11 +227,16 @@ def adjudicate(doc):
                 shadow += 1
             else:
                 abstract_ += 1
-        elif img.get("inherited_acc_native"):
+        elif img.get("inherited_acc_native") and not _inherits_from_object(img):
             inh_native += 1
         elif img.get("inherited_has_code"):
             inh_shadow += 1
         elif img.get("inherited_abstract"):
+            inh_abstract += 1
+        elif img.get("inherited_acc_native"):
+            # Reached only via java.lang.Object — see `_inherits_from_object`.
+            # Still unadjudicated work, and it intercepts every implementor,
+            # so it is counted with the abstract-interception population.
             inh_abstract += 1
         else:
             # Genuinely nowhere in the hierarchy. THIS is the bucket that used
@@ -597,6 +624,13 @@ def selftest():
     #      nineteen `FileDispatcherImpl`/`ComponentSampleModel` rows.
     check("a Bridge inheriting ACC_NATIVE does not trip the ratchet", 0,
           _synthetic_census(extra=[_row("bridge", "p/INH", _INH_NATIVE)]))
+
+    #      …but NOT through java.lang.Object, which declares hashCode/clone/
+    #      wait/notify ACC_NATIVE and is inherited by everything. Crediting that
+    #      would discharge any X.hashCode()I Bridge on any class.
+    obj_inh = _verdict(inherited_from="java/lang/Object", inh_native=True)
+    check("a Bridge inheriting ACC_NATIVE from java.lang.Object still trips it", 1,
+          _synthetic_census(extra=[_row("bridge", "p/OBJINH", obj_inh)]))
 
     #  (b) a Bridge that inherits CONCRETE BYTECODE is a shadow and must trip
     #      both ratchets. Under schema 3 it landed in `undeclared` and tripped
