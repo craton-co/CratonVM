@@ -305,10 +305,13 @@ throughput, not correctness.
 4. **Interpreter throughput against hardcoded fixture budgets** —
    `TestTransaction`, `TestBnf`, `TestWeb`. Measured above; the fix is the
    throughput programme.
-5. **The HANG cluster** — unchanged and separately tracked in
-   `docs/known-issues/h2/bug-h2-hang-cluster-lirs-trace-mvstore-compact-20260807.md`.
-   HotSpot hangs on six of the same classes on this host, so part of that
-   cluster may be fixture/host rather than VM; needs an idle-host control.
+5. **The HANG cluster** — the three classes split out of it are RESOLVED
+   2026-08-10 (`bug-h2-hang-cluster-lirs-trace-mvstore-compact-20260807-RESOLVED-20260810.md`,
+   this folder): none is stuck, two PASS and one (`TestSynth`) is a `while
+   (true)` fuzzer that never terminates on any JVM. The suspicion recorded here
+   — that HotSpot hangs on six of the same classes, so part of the cluster is
+   fixture rather than VM — is confirmed for that one and refuted for the other
+   two, which are the throughput factor with a call-density multiplier.
 
 ## Reproducing the verification
 

@@ -375,6 +375,49 @@ statement runs 50-1000 times. The 500-op probe above is at the optimistic end.
 `testMergeUsing`'s 50 merges never warm up at all, which is why its failure is
 identical with and without the JIT.
 
+## The band is 10x only when the code is not call-dense: a call level costs ~700 ns (2026-08-10)
+
+Two H2 classes measured while retiring the
+`bug-h2-hang-cluster-lirs-trace-mvstore-compact` write-up
+(`fixed-suite-bugs/h2-suite-bugs/...-RESOLVED-20260810.md`) sit at **25-29x**
+interpreter-to-interpreter, not 10x — per-PROCESS CPU, so the host load the
+table above warns about is not what moved them:
+
+| class | HotSpot `-Xint` | cratonvm `--nojit` | ratio |
+| --- | --- | --- | --- |
+| `TestLIRSMemoryConsumption` | 51.5 s | 1475.9 s | **28.6x** |
+| `TestBtreeIndex` | 47.2 s | 1187.5 s | **25.1x** |
+
+Per the rule above, a ratio outside the band is a lead. This one resolves to a
+single quantity. `probes/CallShapeBench.java` times a three-deep chain of
+trivial accessors — bimorphic receiver, `invokevirtual` -> `invokevirtual` ->
+`invokeinterface`, four field loads, no allocation — and subtracts an
+otherwise-identical loop that makes no calls. Interleaved arms, same host, same
+window:
+
+| arm | 3-call chain, net of the loop | loop only |
+| --- | --- | --- |
+| HotSpot `-Xint` | 46 - 49 ns | 6 - 11 ns/iter |
+| cratonvm `--nojit` | 1756 - 2231 ns | 125 - 153 ns/iter |
+| ratio | **~40-48x** | **~13-21x** |
+
+**The call-free loop is in the band; the calls are ~4x outside it.** A CALL
+LEVEL COSTS ~700 ns interpreted, against ~15 ns on HotSpot `-Xint`. That is what
+puts a call-dense class at 25-29x, and it is a sharper target than "the
+interpreter is 10x": the arithmetic and the loop are ordinary, the frame
+push/pop and dispatch are not.
+
+Real-workload witness, the same measurement on H2's own code:
+`Trace.isDebugEnabled()` (`isEnabled(3)` -> `invokeinterface
+TraceSystem.isEnabled`) costs 2560-2990 ns under `--nojit` against 57-72 ns
+under `-Xint` — ~42x, i.e. what the synthetic control costs, so nothing about
+H2's tracing is special. `probes/TraceBench.java`. Measure it against `-Xint`,
+never against C2, which folds the whole gate away (0.00 ns/call) unless the two
+receivers give different answers and the result reaches a `volatile` sink.
+
+The JIT does not close this: the JIT arm of the same `Trace` bench is
+2060-3180 ns, within noise of `--nojit`.
+
 ## The INSERT loop lands in the same band, and its profile is flat (2026-08-07)
 
 Inherited from the retired
