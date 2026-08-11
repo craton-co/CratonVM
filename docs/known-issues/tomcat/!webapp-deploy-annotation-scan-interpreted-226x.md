@@ -289,6 +289,37 @@
 > `intercept_force_registered_native_cached` says so, so the shortcut does not
 > get reinvented.
 >
+> ### Third item, NOT taken: the per-invoke class-manager lock is unattributed
+>
+> `OrderedPlRwLock<ClassManager>::try_read` 1.30% + `::read` 1.12% + the read
+> guard's `drop_glue` 1.30% is **~3.7% of the invoke arm** spent acquiring and
+> releasing the class-manager read lock on a single-threaded probe — atomics,
+> not contention. It is the largest identified item left. **Which call site
+> takes it is still unknown, and two attempts to find out produced wrong
+> answers**, so the next person should start with the instrument, not the
+> hypothesis.
+>
+> `--call-graph=dwarf` on the release binary named two callers, both inlined,
+> and **both are false**:
+>
+> * the guard drop under `intercept_classloader_set_default_assertion_status` —
+>   that function's first statement is two `&str` comparisons and it takes no
+>   lock at all;
+> * `::read` under `init_locals_from_parts` — which touches only `Vec`s and
+>   also takes no lock.
+>
+> Re-running with `--no-inline` does not rescue it: the chains collapse to the
+> symbol itself, and one arm resolves to a bare `0x18700000000`. The dwarf
+> unwinder is not producing usable parent frames for this binary, and its
+> inline nesting is confidently wrong on top of that — the same trap recorded
+> below for the `dbg_loader_trace` arm, hit twice more.
+>
+> **The remedy is a frame-pointer build**: `RUSTFLAGS="-C force-frame-pointers=yes"`
+> plus `perf record --call-graph=fp`. Do that before forming any hypothesis
+> about which of the ~30 `class_manager.read()` sites in `dispatch_virtual.rs`
+> is the hot one. Checking a named attribution against the function's source
+> costs a minute and caught both false leads here.
+>
 > **One caution about that call-graph run**, because it nearly cost a session:
 > `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
 > inside `execute_invokevirtual_cached`, which would have been a spectacular
