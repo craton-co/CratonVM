@@ -8180,9 +8180,17 @@ pub(crate) fn is_safe_factory_class_name(s: &str) -> bool {
 /// T19_K3 — Resolve the desired factory-class internal name
 /// (slash-separated form) from the JVM's system properties.
 ///
-/// Returns the JDK-default
-/// `java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory`
-/// when the property is unset or fails the allowlist check.
+/// Returns `java/util/concurrent/ForkJoinPool$DefaultCommonPool` +
+/// `ForkJoinWorkerThreadFactory` when the property is unset or fails the
+/// allowlist check.
+///
+/// **That fallback is a JDK-21-era name and it is wrong on JDK 25** — see
+/// `common_factory_from_image` below for the measurement and the fix. It is
+/// deliberately still returned here: `Compatible` fabricates a class under this
+/// name today, and callers observe it through
+/// `getFactory().getClass().getName()`. Correcting the string would change that
+/// answer in `Compatible`, which is not this lane's call to make (contract
+/// §5/§10). `alloc_common_factory` repairs it on the `--jdk-only` path only.
 pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> String {
     let sf = ctx
         .get_system_property("java.util.concurrent.ForkJoinPool.common.threadFactory")
@@ -8191,6 +8199,56 @@ pub(crate) fn resolve_common_factory_internal_name(ctx: &dyn NativeContext) -> S
         sf.replace('.', "/")
     } else {
         "java/util/concurrent/ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory".to_string()
+    }
+}
+
+/// W7-14 — Ask the **image** for the common pool's factory instead of naming
+/// it: read the `defaultForkJoinWorkerThreadFactory` static field off the
+/// loaded `java/util/concurrent/ForkJoinPool`.
+///
+/// This is the substance of the fix, and it is not "update the string".
+/// `resolve_common_factory_internal_name`'s fallback is a *nested* JDK-internal
+/// class name from the JDK 21 era, when the common pool had its own
+/// permission-clearing factory. `javap` on JDK 25 (Adoptium 25.0.3.9) says the
+/// image declares exactly five nested classes and `…$DefaultCommonPool` +
+/// `ForkJoinWorkerThreadFactory` is not among them — it went out with the
+/// security manager. Substituting today's sibling name would buy one release
+/// and then rot the same way, which is the shape five separate defects in this
+/// campaign reduced to: never bind by name.
+///
+/// The field does not rot, for two reasons worth stating separately:
+///
+/// * `ForkJoinPool.defaultForkJoinWorkerThreadFactory` is **public API**
+///   (`public static final`, since Java 7), not an internal nested class. A
+///   name the specification publishes is a different risk class from a name the
+///   implementation happens to use this year.
+/// * On HotSpot 25 it is not merely the same *class* as the common pool's
+///   factory, it is the same *instance*. Measured on this host:
+///   `commonPool().getFactory() == ForkJoinPool.defaultForkJoinWorkerThreadFactory`
+///   is `true`, and both report
+///   `java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory`.
+///
+/// So returning the singleton rather than allocating a fresh instance is more
+/// faithful, not less: it reproduces HotSpot's reference identity as well as
+/// its class identity. `getFactory()` then caches it into `factory` exactly as
+/// before.
+///
+/// Returns `None` — never an error — when the class, the field, or the value is
+/// missing, so the caller keeps its existing fallback intact. A JDK that stops
+/// publishing the field degrades to the old behaviour instead of failing.
+fn common_factory_from_image(ctx: &mut dyn NativeContext) -> Option<cratonvm_types::ObjectRef> {
+    // `ensure_class_initialized`, not `class_id_by_name`: the field is written
+    // by `ForkJoinPool.<clinit>`, so an uninitialized class reads null and we
+    // would fall back for no reason. Re-entering initialization from a native
+    // on this very class is the ordinary already-initializing no-op.
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/ForkJoinPool")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, "defaultForkJoinWorkerThreadFactory")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(factory)) => Some(factory),
+        // Null or a non-reference: a synthetic-JDK build has no such field.
+        _ => None,
     }
 }
 
@@ -8209,7 +8267,52 @@ pub(crate) fn alloc_common_factory(ctx: &mut dyn NativeContext) -> Result<craton
             let nfields = ctx.class_num_total_fields(cid).max(1);
             Ok(ctx.alloc_object(cid, nfields))
         }
-        Err(_) => try_alloc_concurrent_synthetic(ctx, &target, 1),
+        Err(_) => {
+            // W7-14 — `target` is not in the image. Under `--jdk-only` the
+            // fabrication below is *refused*, and that refusal costs the whole
+            // call: `RJdkForkJoin` dies at `parallelStreams():209` with
+            // `NoClassDefFoundError: java/util/concurrent/ForkJoinPool$Default`
+            // `CommonPoolForkJoinWorkerThreadFactory` on the first
+            // `ForkJoinPool.commonPool()` — nothing in that vector is about
+            // factories. Pre-existing rather than a regression; the control
+            // measurement is in
+            // docs/known-issues/jdk-only/W7-11-strict-baseline-remeasured.md.
+            //
+            // ORDER IS THE CONTRACT HERE. The recovery runs *after*
+            // `try_alloc_concurrent_synthetic`, not before it, so that
+            // `Compatible` is untouched by construction rather than by
+            // argument: where fabrication is available it still succeeds, still
+            // succeeds first, and still returns the same object built by the
+            // same call — the operator's own `…common.threadFactory` class
+            // included, which is what Keycloak/Quarkus's
+            // `getFactory().getClass().getName().equals(property)` check reads.
+            // Probing the policy *first* (the variant recorded in W6-12) would
+            // mint the class one call earlier and route `Compatible`'s
+            // allocation through a different entry point; that is a smaller
+            // change than it sounds and still not one this lane may make.
+            //
+            // The price of this order is paid only on the refusing path: the
+            // discarded `Err` is a `NoClassDefFoundError` that was allocated
+            // and is now garbage. `getFactory()` caches into `factory`, so it
+            // happens about once per process, and a throwable per process is
+            // the right trade for a mode that cannot change.
+            match try_alloc_concurrent_synthetic(ctx, &target, 1) {
+                Ok(factory) => Ok(factory),
+                // Refused. Ask the image what it actually has. Falling back to
+                // the default factory when the requested one cannot be produced
+                // is also what real `ForkJoinPool.<clinit>` does — it catches
+                // the property-named factory's failure and keeps
+                // `defaultForkJoinWorkerThreadFactory` — so this is the
+                // specified behaviour, not a strict-mode-only concession.
+                Err(refusal) => match common_factory_from_image(ctx) {
+                    Some(factory) => Ok(factory),
+                    // No image either (synthetic-JDK build): the original
+                    // refusal is still the honest answer, so re-raise it
+                    // unchanged rather than inventing a second one.
+                    None => Err(refusal),
+                },
+            }
+        }
     }
 }
 
