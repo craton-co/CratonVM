@@ -769,6 +769,22 @@ fn check_transformation_supported(
     }
 }
 
+/// `true` when `Cipher.getInstance(transformation)` will hand back a working
+/// cipher rather than refusing.
+///
+/// Exists so `jca::provider_chain` can assert, in a test, that every
+/// transformation it ADVERTISES is one this engine can COMPUTE. The two lists
+/// drifted for three waves in both directions at once — `ChaCha20` advertised
+/// and served as AES, `DESede` served and never advertised — and a census that
+/// is only ever run by hand drifts again. See
+/// `provider_chain::every_advertised_sunjce_cipher_is_serviceable`.
+pub(crate) fn transformation_is_serviceable(transformation: &str) -> bool {
+    matches!(
+        classify_transformation(transformation),
+        TransformVerdict::Serviceable(_)
+    )
+}
+
 /// Which `Cipher.getInstance` overload is asking. The two differ in their
 /// REFUSAL wording and in whether an unavailable padding is reportable at all —
 /// both measured, both in `check_transformation_supported`.
