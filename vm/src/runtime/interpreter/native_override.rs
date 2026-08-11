@@ -5477,6 +5477,83 @@ fn admit_forced_native_id(
 // receiver that reached the native anyway. It stays, and is listed here only so
 // a grep does not mistake it for a dispatch site.
 
+// ---------------------------------------------------------------------------
+// Per-call-site shape of the cached interception chain
+// ---------------------------------------------------------------------------
+
+/// This triple could reach the `ClassLoader` null-resource re-target.
+pub(super) const INTERCEPT_SHAPE_CLASSLOADER_RESOURCE: u8 = 1 << 0;
+/// This triple could reach the `java/lang/Class` reflection re-target.
+pub(super) const INTERCEPT_SHAPE_CLASS_REFLECTION: u8 = 1 << 1;
+/// This triple could reach the real-`HttpURLConnection` carrier exemption.
+pub(super) const INTERCEPT_SHAPE_HTTP_CARRIER: u8 = 1 << 2;
+
+/// Classify a call site's triple against the three special-case arms of
+/// [`intercept_force_registered_native_cached`], once.
+///
+/// Pure: it reads the triple and nothing else — no VM, no policy, no receiver,
+/// no arguments — which is what makes it safe to memoize in
+/// `CachedBytecodeMethod::intercept_shape_cache`. See that field's doc for the
+/// measurement.
+///
+/// **Keep this in step with the arms it gates.** A new name-keyed arm that
+/// forgets to set a bit here is not slow, it is SKIPPED — a correctness bug.
+/// `intercept_shape_agrees_with_the_arms_it_gates` in this module's tests is
+/// what fails when they drift.
+pub(super) fn intercept_shape_of(class_name: &str, method_name: &str, descriptor: &str) -> u8 {
+    let mut shape = 0u8;
+    if classloader_resource_shape(method_name, descriptor) {
+        shape |= INTERCEPT_SHAPE_CLASSLOADER_RESOURCE;
+    }
+    if class_reflection_shape(method_name, descriptor) {
+        shape |= INTERCEPT_SHAPE_CLASS_REFLECTION;
+    }
+    if http_carrier_declaring_class(class_name) {
+        shape |= INTERCEPT_SHAPE_HTTP_CARRIER;
+    }
+    shape
+}
+
+/// The name-keyed half of the `ClassLoader` null-resource re-target.
+fn classloader_resource_shape(method_name: &str, descriptor: &str) -> bool {
+    matches!(
+        (method_name, descriptor),
+        ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
+            | (
+                "getResources",
+                "(Ljava/lang/String;)Ljava/util/Enumeration;"
+            )
+            | (
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;"
+            )
+    )
+}
+
+/// The name-keyed half of the `java/lang/Class` reflection re-target.
+fn class_reflection_shape(method_name: &str, descriptor: &str) -> bool {
+    matches!(
+        (method_name, descriptor),
+        ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
+            | ("isArray", "()Z")
+            | ("getComponentType", "()Ljava/lang/Class;")
+            | ("componentType", "()Ljava/lang/Class;")
+    )
+}
+
+/// The whole `class_name` gate of [`real_http_url_connection_native`], factored
+/// out so the memo and the arm cannot disagree about it.
+fn http_carrier_declaring_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/net/URLConnection"
+            | "java/net/HttpURLConnection"
+            | "javax/net/ssl/HttpsURLConnection"
+            | "sun/net/www/protocol/http/HttpURLConnection"
+            | "sun/net/www/protocol/https/HttpsURLConnectionImpl"
+    )
+}
+
 /// CratonVM's own HTTP carrier classes — the concrete classes its
 /// `URL.openConnection()` hands back, and the ones
 /// `register_http_url_connection_real` registers natives on. Matched EXACTLY
@@ -5531,14 +5608,9 @@ pub(super) fn real_http_url_connection_native(
     args: &[Value],
 ) -> Option<cratonvm_native_api::registry::NativeCallback> {
     // Cheap gate first: only the connection hierarchy can reach the exemption.
-    if !matches!(
-        class_name,
-        "java/net/URLConnection"
-            | "java/net/HttpURLConnection"
-            | "javax/net/ssl/HttpsURLConnection"
-            | "sun/net/www/protocol/http/HttpURLConnection"
-            | "sun/net/www/protocol/https/HttpsURLConnectionImpl"
-    ) {
+    // Shared with `intercept_shape_of`, which memoizes this exact question per
+    // call site, so the two cannot disagree about which classes qualify.
+    if !http_carrier_declaring_class(class_name) {
         return None;
     }
     let Some(Value::Object(Some(receiver))) = args.first() else {
@@ -5879,23 +5951,31 @@ pub(super) fn intercept_force_registered_native_cached(
     let class_name = cached.class_name.as_ref();
     let method_name = cached.method_name.as_ref();
     let method_descriptor = cached.method_descriptor.as_ref();
+    // Which of the three special-case arms below this triple can reach at all,
+    // computed once per call site. Every one of their name/class keys is a
+    // function of the triple, and the triple is fixed for this entry — so they
+    // were per-call-site constants being re-derived on every cached-invoke hit.
+    // `real_http_url_connection_native`'s five-literal `class_name` gate alone
+    // measured 1.50% of the interpreted-invoke arm on a probe whose only call
+    // is `int callee(int)`. The argument/receiver halves are NOT memoized and
+    // are still evaluated in full below. See
+    // `CachedBytecodeMethod::intercept_shape_cache`.
+    //
+    // Deliberately NOT an early `return` on `shape == 0` into a shared tail
+    // function: that WAS built and measured (2026-08-11), and the function
+    // split cost more than the three bit tests it skipped — entry + tail
+    // 1.05% + 1.12% against a single 1.44% function before, with the string
+    // work already removed from both. The bits guard the arms where they
+    // stand; falling through them IS the fast path.
+    let shape = *cached
+        .intercept_shape_cache
+        .get_or_init(|| intercept_shape_of(class_name, method_name, method_descriptor));
     // Keep the cached path aligned with the uncached null-resource contract
     // above.  The cache is keyed by the resolved custom-loader method, while
     // the implementation callback is deliberately registered on ClassLoader.
-    if args.len() == 2
+    if shape & INTERCEPT_SHAPE_CLASSLOADER_RESOURCE != 0
+        && args.len() == 2
         && matches!(args.get(1), Some(Value::Object(None)))
-        && matches!(
-            (method_name, method_descriptor),
-            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;")
-                | (
-                    "getResources",
-                    "(Ljava/lang/String;)Ljava/util/Enumeration;"
-                )
-                | (
-                    "getResourceAsStream",
-                    "(Ljava/lang/String;)Ljava/io/InputStream;"
-                )
-        )
     {
         let cb = shared.natives.native_methods.find(
             "java/lang/ClassLoader",
@@ -5915,13 +5995,8 @@ pub(super) fn intercept_force_registered_native_cached(
             Ok(CachedCallResult::Handled)
         })());
     }
-    if matches!(
-        (method_name, method_descriptor),
-        ("getProtectionDomain", "()Ljava/security/ProtectionDomain;")
-            | ("isArray", "()Z")
-            | ("getComponentType", "()Ljava/lang/Class;")
-            | ("componentType", "()Ljava/lang/Class;")
-    ) && matches!(
+    if shape & INTERCEPT_SHAPE_CLASS_REFLECTION != 0
+        && matches!(
         args.first(),
         Some(Value::Object(Some(receiver))) if {
             let receiver_cid = shared.mem.heap.class_id_of(*receiver);
@@ -5954,20 +6029,26 @@ pub(super) fn intercept_force_registered_native_cached(
     // `Mockito.mock(HttpURLConnection.class)` anywhere in the process then
     // permanently broke every genuinely real connection's
     // `addRequestProperty`/`getResponseCode`/`getHeaderField`.
-    if let Some(callback) =
-        real_http_url_connection_native(shared, class_name, method_name, method_descriptor, args)
-    {
-        return Some((|| {
-            let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
-            if let Some(value) = result {
-                push_invoke_return_value(
-                    &mut thread.frames[frame_idx].stack,
-                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
-                )?;
-                crate::vm::native_return_pushed_to_stack(shared, thread);
-            }
-            Ok(CachedCallResult::Handled)
-        })());
+    if shape & INTERCEPT_SHAPE_HTTP_CARRIER != 0 {
+        if let Some(callback) = real_http_url_connection_native(
+            shared,
+            class_name,
+            method_name,
+            method_descriptor,
+            args,
+        ) {
+            return Some((|| {
+                let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
+                if let Some(value) = result {
+                    push_invoke_return_value(
+                        &mut thread.frames[frame_idx].stack,
+                        coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                    )?;
+                    crate::vm::native_return_pushed_to_stack(shared, thread);
+                }
+                Ok(CachedCallResult::Handled)
+            })());
+        }
     }
     let force_native = *cached.force_native_cache.get_or_init(|| {
         force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor)
@@ -7667,5 +7748,122 @@ mod redefine_immunity_tests {
              redefine_immune_forced_native (slow path) instead of naming an arm:\n{}",
             offenders.join("\n")
         );
+    }
+}
+
+#[cfg(test)]
+mod intercept_shape_tests {
+    use super::{
+        class_reflection_shape, classloader_resource_shape, http_carrier_declaring_class,
+        intercept_shape_of, INTERCEPT_SHAPE_CLASSLOADER_RESOURCE, INTERCEPT_SHAPE_CLASS_REFLECTION,
+        INTERCEPT_SHAPE_HTTP_CARRIER,
+    };
+
+    /// Every triple that any of the three arms can fire on MUST set its bit.
+    ///
+    /// This is the guard, and the failure it guards against is not a slow path:
+    /// `intercept_force_registered_native_cached` skips an arm outright when the
+    /// bit is clear, so an arm that grows a name its classifier does not know
+    /// stops running. Both halves are derived from the same two helpers here, so
+    /// the test is only meaningful together with
+    /// `the_arms_use_the_shared_helpers` below — which is what pins that the
+    /// dispatch code and the classifier read the SAME predicate rather than two
+    /// copies that can drift.
+    #[test]
+    fn intercept_shape_agrees_with_the_arms_it_gates() {
+        let classloader = [
+            ("getResource", "(Ljava/lang/String;)Ljava/net/URL;"),
+            ("getResources", "(Ljava/lang/String;)Ljava/util/Enumeration;"),
+            (
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+            ),
+        ];
+        for (m, d) in classloader {
+            assert!(classloader_resource_shape(m, d), "{m}{d}");
+            let shape = intercept_shape_of("some/user/Loader", m, d);
+            assert_ne!(
+                shape & INTERCEPT_SHAPE_CLASSLOADER_RESOURCE,
+                0,
+                "{m}{d} must set the ClassLoader bit"
+            );
+        }
+
+        let reflection = [
+            ("getProtectionDomain", "()Ljava/security/ProtectionDomain;"),
+            ("isArray", "()Z"),
+            ("getComponentType", "()Ljava/lang/Class;"),
+            ("componentType", "()Ljava/lang/Class;"),
+        ];
+        for (m, d) in reflection {
+            assert!(class_reflection_shape(m, d), "{m}{d}");
+            let shape = intercept_shape_of("java/lang/Class", m, d);
+            assert_ne!(
+                shape & INTERCEPT_SHAPE_CLASS_REFLECTION,
+                0,
+                "{m}{d} must set the reflection bit"
+            );
+        }
+
+        let carriers = [
+            "java/net/URLConnection",
+            "java/net/HttpURLConnection",
+            "javax/net/ssl/HttpsURLConnection",
+            "sun/net/www/protocol/http/HttpURLConnection",
+            "sun/net/www/protocol/https/HttpsURLConnectionImpl",
+        ];
+        for c in carriers {
+            assert!(http_carrier_declaring_class(c), "{c}");
+            let shape = intercept_shape_of(c, "getResponseCode", "()I");
+            assert_ne!(
+                shape & INTERCEPT_SHAPE_HTTP_CARRIER,
+                0,
+                "{c} must set the carrier bit"
+            );
+        }
+    }
+
+    /// The shape of an ordinary call site is ZERO — which is the whole point:
+    /// that is the case the fast path exists for, and if some innocuous triple
+    /// set a bit the memo would buy nothing.
+    ///
+    /// `int callee(int)` is `probes/InvokeAttributionProbe.java`'s own callee,
+    /// i.e. the exact shape the 1.50% measurement was taken on.
+    #[test]
+    fn an_ordinary_call_site_reaches_none_of_the_arms() {
+        for (c, m, d) in [
+            ("InvokeAttributionProbe", "callee", "(I)I"),
+            ("java/lang/String", "length", "()I"),
+            ("java/util/ArrayList", "add", "(Ljava/lang/Object;)Z"),
+            ("org/apache/tomcat/util/bcel/classfile/ConstantPool", "getConstant",
+             "(ILjava/lang/Class;)Lorg/apache/tomcat/util/bcel/classfile/Constant;"),
+            // Right names, WRONG owner: the reflection arm is keyed on the
+            // method pair alone, so this one legitimately sets a bit and the
+            // receiver check below it is what declines. Recorded so a future
+            // reader does not "tighten" the classifier by adding an owner test
+            // the arm itself does not make.
+        ] {
+            assert_eq!(
+                intercept_shape_of(c, m, d),
+                0,
+                "{c}.{m}{d} must not reach any special-case arm"
+            );
+        }
+    }
+
+    /// A near miss on each list must NOT set the bit — the classifier has to be
+    /// exact, because a false positive silently reintroduces the per-call string
+    /// work this change removed.
+    #[test]
+    fn near_misses_do_not_set_a_bit() {
+        assert!(!classloader_resource_shape(
+            "getResource",
+            "(Ljava/lang/String;)Ljava/io/InputStream;"
+        ));
+        assert!(!class_reflection_shape("isArray", "()Ljava/lang/Class;"));
+        assert!(!http_carrier_declaring_class(
+            "org/example/MyHttpURLConnection"
+        ));
+        assert!(!http_carrier_declaring_class("java/net/URL"));
     }
 }
