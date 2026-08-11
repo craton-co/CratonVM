@@ -433,10 +433,71 @@ pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) 
         rootprof::report("scan_all_roots", t_all.elapsed().as_nanos(), &parts);
         return;
     }
+    if root_attribution_on() {
+        // CRATONVM_DBG_ROOT_SOURCE: remember which NAMED source contributed
+        // each root this cycle.
+        //
+        // The inventory has always had names and nothing has ever been able to
+        // answer "which of them rooted THIS object". The retention questions in
+        // this repo are almost always that question — the fourth
+        // `TestDefaultInstanceManager` recurrence spent four investigations
+        // eliminating root sources one at a time, by turning levers off and
+        // re-running, because there was no way to just ask. A `Vec` of
+        // (name, addr) built only under the flag turns that into one run.
+        let mut attribution = Vec::new();
+        for source in VM_ROOT_SOURCES {
+            let before = roots.len();
+            (source.scan)(shared, roots);
+            for r in &roots[before..] {
+                attribution.push((source.name, r.as_ptr() as usize));
+            }
+        }
+        set_root_attribution(attribution);
+        return;
+    }
     for source in VM_ROOT_SOURCES {
         debug_assert!(!source.name.is_empty());
         (source.scan)(shared, roots);
     }
+}
+
+/// `CRATONVM_DBG_ROOT_SOURCE` — record which named root source contributed
+/// each root, so a retained object can be attributed to one instead of having
+/// every source eliminated by bisection.
+pub fn root_attribution_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOT_SOURCE").is_some()
+    })
+}
+
+/// Last cycle's (source name, root address) pairs. Diagnostic only; written
+/// once per collection and only when the flag is on.
+static ROOT_ATTRIBUTION: std::sync::OnceLock<parking_lot::Mutex<Vec<(&'static str, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn root_attribution() -> &'static parking_lot::Mutex<Vec<(&'static str, usize)>> {
+    ROOT_ATTRIBUTION.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+fn set_root_attribution(v: Vec<(&'static str, usize)>) {
+    *root_attribution().lock() = v;
+}
+
+/// Which named root source contributed `addr` as a root this cycle, if any.
+///
+/// `None` means no source handed this exact address to the marker — the object
+/// is reachable THROUGH something, not rooted directly, which is a different
+/// finding and wants a different fix.
+pub fn root_source_of(addr: usize) -> Option<&'static str> {
+    if !root_attribution_on() {
+        return None;
+    }
+    root_attribution()
+        .lock()
+        .iter()
+        .find(|&&(_, a)| a == addr)
+        .map(|&(n, _)| n)
 }
 
 pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &cratonvm_types::PointerMap) {

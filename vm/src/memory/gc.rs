@@ -322,7 +322,21 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                                 format!("{n}@{a:#x}")
                             })
                             .collect();
-                        eprintln!("[MIRRORWHY]   {}", rendered.join(" -> "));
+                        // Name the ROOT SOURCE that put the head of this path
+                        // in the root set (`CRATONVM_DBG_ROOT_SOURCE=1`).
+                        // Without it the path says what holds the object and
+                        // stops exactly where the answer is: a head with no
+                        // parent is a root, and "which root" is the whole
+                        // question. `<not-a-direct-root>` is itself a finding —
+                        // the head is reachable through something the walk
+                        // could not attribute, not handed to the marker.
+                        let src = path
+                            .first()
+                            .and_then(|&(a, _)| {
+                                crate::memory::native_roots::root_source_of(a)
+                            })
+                            .unwrap_or("<not-a-direct-root>");
+                        eprintln!("[MIRRORWHY]   [root={src}] {}", rendered.join(" -> "));
                     }
                 };
                 render(&shared.mem.heap.root_held_paths(addr, 200_000, 8), &format!("mirror={addr:#x}"));
