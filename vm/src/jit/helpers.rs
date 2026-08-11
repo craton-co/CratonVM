@@ -6963,6 +6963,29 @@ fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> 
 ///
 /// Prints the RECEIVER's class id and name beside the target so a two-ids-one-name
 /// split is visible directly, which is the failure this was written to catch.
+/// A compiled type check reached its helper with NO target class name.
+///
+/// `bytecode_walk`'s `0xc0`/`0xc1` emission falls back to
+/// `(pc, ptr::null(), 0)` when the pc is absent from `typecheck_info_idx`, and
+/// both helpers answer that shape defensively — `instanceof` with `0`,
+/// `checkcast` fails closed. Defensible as a guard against a malformed
+/// artifact; catastrophic if it is reachable from a NORMAL compile, because
+/// then a live `instanceof` has been compiled to constant `false` and nothing
+/// downstream can tell. This fires only when `CRATONVM_DBG_TYPECHECK_FILTER`
+/// is set, and its whole purpose is to answer "is this shape actually
+/// reachable?" — which no other instrument can, since the answer never reaches
+/// `jit_typecheck_resolve`.
+fn jit_typecheck_null_name_trace(kind: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TYPECHECK_FILTER").is_some()
+    }) {
+        return;
+    }
+    eprintln!("[DBG_TYPECHECK] NULL-TARGET-NAME: {kind} compiled with no target class -> answering false/closed WITHOUT resolving");
+}
+
 fn jit_typecheck_trace(
     vm: &SharedVm,
     obj_class_id: ClassId,
@@ -7588,6 +7611,7 @@ pub unsafe extern "C" fn jit_instanceof(
         return 0;
     }
     if class_name_len <= 0 || class_name_ptr.is_null() {
+        jit_typecheck_null_name_trace("instanceof");
         return 0;
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
