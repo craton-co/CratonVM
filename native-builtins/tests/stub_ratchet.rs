@@ -326,7 +326,34 @@ use cratonvm_types::compat::CompatibilityMode;
 /// --lib` 436/2 -> **438/0**; the `--jdk-only` corpus goes 52 passed to **53**
 /// and compatible 35 to **36**, with the same six pre-existing failures. So the
 /// rise buys back two crates of unit tests and two corpus vectors.
-const BASELINE_SYNTHETIC_STUBS: usize = 939;
+///
+/// # 939 -> 1038, 2026-08-11: the first §1.4 shadow RETIREMENT
+///
+/// This ratchet's own message says "make the new native a real Bridge/Intrinsic
+/// instead of a fake — do NOT just raise the baseline", and that is the right
+/// instruction for the case it was built for: a NEW stub arriving. This rise is
+/// the opposite motion and the ratchet cannot tell them apart, because it
+/// counts stubs and both directions move the count.
+///
+/// 99 registrations went `Bridge` -> `SyntheticStub` and not one of them is
+/// new. They are `java/util/logging/` triples whose target the JDK image
+/// declares WITH A `Code` ATTRIBUTE — natives standing in front of real
+/// bytecode, which is what contract §1.4 calls a shadow and what
+/// `NativeKind::SyntheticStub` means. `--jdk-only` now refuses them and the
+/// real class runs; `--real-jdk` is unchanged.
+///
+/// The re-tag is a MEASUREMENT, not a judgement, and the acceptance evidence is
+/// the strict corpus rather than this count: armed through
+/// `CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/logging/` the corpus is 23 passed
+/// / 4 failed with the failing set unchanged, and with the retirement live it
+/// is the same 23/4 while the core corpus is 37/0. L6's bridge ratchet moved
+/// the other way by exactly the same population: `bridge_without_acc_native`
+/// 9,015 -> 8,911 and `bridge_shadows_bytecode` 6,170 -> 6,066.
+///
+/// The table is `native-api/src/retired_shadow.rs`, which states each triple
+/// and holds one back by name. Record: the retired
+/// `bridge-reclassification-wave` write-up, item 2.
+const BASELINE_SYNTHETIC_STUBS: usize = 1038;
 
 /// Slack added on top of the observed count when (re)freezing the baseline.
 /// Documented here so the recount instructions and the constant stay in sync.

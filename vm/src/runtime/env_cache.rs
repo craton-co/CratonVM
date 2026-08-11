@@ -1537,6 +1537,7 @@ pub fn real_bytecode_selector() -> &'static RealSelector {
 #[cfg(test)]
 mod tests {
     use super::parse_osr_backedge_enabled;
+    use super::{parse_enforce_shadow_scope, EnforceShadowScope};
 
     /// A `cached_is_set!` / `cached_is_ok!` predicate answers exactly one
     /// question: "was this environment variable explicitly set?". Call sites
