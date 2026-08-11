@@ -621,8 +621,11 @@ fn essential_registry_is_populated() {
 /// A registry shedding whole modules does not produce that diff.
 ///
 /// The 300 of headroom is deliberate and is not a prediction: it keeps the
-/// detector a detector after the next re-tag of this size, which
-/// `docs/known-issues/jdk-only/bridge-reclassification-wave.md` expects.
+/// detector a detector after the next re-tag of this size. The 2026-08-11
+/// retirement of `java.util.logging`'s 104 shadow rows is one such re-tag and
+/// moved this total by zero: a re-tag changes a registration's KIND, it does
+/// not remove the registration. Record: the retired
+/// `bridge-reclassification-wave` write-up.
 const STRICT_MIN_TOTAL_REGISTRATIONS: usize = 10_200;
 
 /// Build the default native registry the way `--jdk-only` does: set the
