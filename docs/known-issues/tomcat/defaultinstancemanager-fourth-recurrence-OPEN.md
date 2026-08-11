@@ -417,3 +417,95 @@ both. Root cause #1's fix is real, tested, and worth keeping regardless of
 when #2 lands — it is a correctness and throughput bug in its own right (see
 `## Scope` above: "everywhere else it costs throughput and footprint while
 failing nothing").
+
+## 2026-08-11, continued: root cause #2 fixed too — and two bigger findings underneath
+
+### The default collector is no longer Generational — it is ZGC, as of 2026-08-10
+
+This page's own header claims "reproduces default GC and ZGC; G1 passes,"
+written as if those were two different things. **They are the same thing.**
+`vm-cli/src/main.rs:3369`: *"Absent → keep the default, which is **ZGC** as of
+2026-08-10."* Confirmed empirically — a build with neither fix, run with no
+`-XX` flag at all, reports `gc_algo=Zgc` via a diagnostic added this session
+(`CRATONVM_DBG_OVERLAY_GATE=1`, `vm/src/memory/native_roots.rs`). **Every
+measurement on this page prior to this section, including the bisect, ran
+under whatever "default" meant at capture time — check the date against the
+flip before trusting any "reproduces on default" claim on an older page.**
+This one's bisect (`git bisect run`, 08-10) predates the flip, so it is
+unaffected, but the "Also eliminated" section's `major_gc_requested()` gate
+reasoning was evaluated as prose, not measured, and both fixes below target
+Generational specifically — neither one touches the actual default path.
+
+### Root cause #2 fixed: `scan_collection_overlays`'s gate used the wrong predicate
+
+`vm/src/memory/native_roots.rs`'s `scan_collection_overlays` skipped the
+unconditional external-root scan only when `is_active() ||
+unregistered_jit_frame_on_stack() || major_gc_requested()` — three JIT-safety
+diversion signals, not "will this cycle's precise marker handle overlay
+propagation itself." `gc_quiescence::young_marker_follows_side_tables()` is
+that exact predicate (same one `VmHeap::mirror_pin_deferrable` already uses
+for the analogous class-mirror case) and already folds in
+`major_gc_requested()` as its certain term. Swapped the three-condition OR
+for a direct call to it.
+
+**Verified working, precisely, under explicit `-XX:+UseGenerationalGC`:**
+`CRATONVM_DBG_OVERLAY_GATE=1` now reports `conditional=true` for this test's
+`System.gc()` (it reported `conditional=false` before, on both the pre-fix
+build and, unhelpfully, on a first re-check that forgot the companion
+`CRATONVM_DBG_MIRRORPIN*` flags and appeared to show zero overlay roots for
+the wrong reason). With the gate fixed, `CRATONVM_DBG_ROOT_SOURCE=1` +
+`CRATONVM_DBG_MIRRORPIN_WHY=1` shows **zero** `[root=collection-overlays]`
+attributions this run, down from 33 before either fix. That mechanism is
+closed under Generational.
+
+**The test still fails under explicit Generational with both fixes applied
+— confirmed by direct rerun, `FAILURES!!! Tests run: 1, Failures: 1`, still
+`expected:<8> but was:<9>`.** A third factor is now the blocker there:
+`CRATONVM_DBG_MIRRORPIN_WHY=1` shows the evicted loader as `is_marked=true`
+(a real MARK-phase result, not a sweep-time liveness misread) attributed to
+`[root=<not-a-direct-root>]` — the exact same generic attribution the two
+*genuinely live* control loaders (`bug36923_jsp`, `bug5nnnn/bug51544_jsp`)
+also get, so it does not discriminate a real root from this diagnostic's
+catch-all bucket for "marked, but not via a named external-root source."
+Tracing which actual heap edge earns that mark needs a finer instrument than
+exists today — not attempted here. `sites=[0, 73, 0, 0]` in the sweep census
+on this same run shows root cause #1's conservative arm still firing 73
+times (expected: it fires for spans that genuinely aren't side-marked, which
+this run still has plenty of), but `dead_regions_final=55` — up from the
+original page's measured 51 — so more genuine reclaims are surviving the
+sweep than before either fix.
+
+### The bigger problem: ZGC has no equivalent mechanism, and it is the default
+
+Both fixes on this page are Generational-only. `gc/src/zgc.rs` has:
+
+- No `external_roots_for_owner` / `external_roots_for_matching_owners` call
+  anywhere — no per-owner overlay propagation exists for ZGC at all, so the
+  "conditional" branch this page's fix enables can never apply there; ZGC
+  permanently takes the unconditional (safe, over-retentive) overlay scan.
+- Its own class-mirror/loader/metadata pin handling
+  (`collect_garbage`'s hand-pushed pin edges, `zgc.rs:4979-4984`), calling
+  `cratonvm_types::mirror_pin::mirrors_for_loader` **directly and
+  unconditionally** — never `mirror_pin_deferrable`, the conditional variant
+  `roots.rs` uses for Generational. Confirmed via `-XX:+UseZGC` (the actual
+  default): still fails, 3/3 runs.
+
+So under the current default, this test's mirror is pinned by design, not by
+a bug with a small patch — ZGC has not yet grown the precise,
+mark-time-propagated pin mechanism Generational has for either overlays or
+class mirrors. Building that is at minimum the same scope as root cause #2's
+fix, generalized to an architecture with no equivalent infrastructure yet to
+extend, and is not attempted here.
+
+### Where this leaves the test
+
+- **Fixed and verified, keep regardless:** root cause #1 (sweep anomaly
+  screen) and root cause #2 (overlay-rooting gate), both Generational-only,
+  both real defects independent of this specific test.
+- **Open, Generational-specific:** a third, not-yet-traced mark-phase edge
+  still keeps the evicted loader reachable even with both fixes. Needs a
+  finer root-attribution instrument than exists today.
+- **Open, and now the more consequential gap:** ZGC (the actual default
+  since 2026-08-10) has neither fix's underlying mechanism at all. This is
+  the one worth prioritizing next, precisely because it's what "default GC"
+  now means to anyone who runs this suite without flags.

@@ -558,6 +558,13 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "oom-bt", on_key: Some("CRATONVM_DBG_OOM_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "oop-span-probe", on_key: Some("CRATONVM_OOP_SPAN_PROBE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr", on_key: Some("CRATONVM_DBG_OSR"), off_key: None, off_word: None },
+    // Declared 2026-08-11. The probe `d1648f133` left behind in
+    // `memory::native_roots` after fixing `scan_collection_overlays`'s gate --
+    // it prints which of the four predicates the conditional actually turned
+    // on, which is the question that fix got wrong. It reads through
+    // `runtime_var_os` already; it was simply never named here, so the grouped
+    // `CRATONVM_DBG=overlay-gate` spelling could not reach it.
+    E { group: Group::DBG, token: "overlay-gate", on_key: Some("CRATONVM_DBG_OVERLAY_GATE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "owner-filter", on_key: Some("CRATONVM_DBG_OWNER_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-after", on_key: Some("CRATONVM_OSR_EXIT_AFTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-test", on_key: Some("CRATONVM_OSR_EXIT_TEST"), off_key: None, off_word: None },
@@ -1100,8 +1107,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::GC, token: "zgc-tlab", on_key: Some("CRATONVM_ZGC_TLAB"), off_key: None, off_word: None },
     // Declared 2026-08-06 with the DBG/JIT block: a millisecond goal that
     // `adapt_young_trigger_to_pause` reads. Default 200 since 2026-08-11
-    // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`); `0` is the opt-out.
-    E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: None },
+    // (`gen_heap::DEFAULT_YOUNG_PAUSE_GOAL_MS`), so it is a default-ON knob
+    // whose parser reads `0` as false — which is exactly what `off_word` is
+    // for. Without it the generated inventory row says `opt-in | off`, which
+    // has been untrue since the default flipped, and
+    // `CRATONVM_GC=-young-pause-goal-ms` has no way to turn it off.
+    E { group: Group::GC, token: "young-pause-goal-ms", on_key: Some("CRATONVM_GC_YOUNG_PAUSE_MS"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "bytebuffer-intrinsic", on_key: Some("CRATONVM_BYTEBUFFER_INTRINSIC"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
     // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
@@ -1121,7 +1132,17 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::REAL, token: "filewriter", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_FILEWRITER"), off_word: None },
     E { group: Group::REAL, token: "forkjoinpool", on_key: Some("CRATONVM_REAL_FORKJOINPOOL"), off_key: Some("CRATONVM_SYNTHETIC_FORKJOINPOOL"), off_word: None },
     E { group: Group::REAL, token: "jca", on_key: Some("CRATONVM_REAL_JCA"), off_key: None, off_word: None },
+    // Declared 2026-08-11 alongside `mxbean-mapping`, same shape and same
+    // reason: `MemoryUsage.toString()` is answered by the real JDK bytecode by
+    // default (`jmx::memoryusage_tostring_shim_enabled`) and this restores the
+    // shim.
+    E { group: Group::REAL, token: "memoryusage-tostring", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING"), off_word: None },
     E { group: Group::REAL, token: "msc-real-start", on_key: Some("CRATONVM_MSC_REAL_START"), off_key: None, off_word: Some("off") },
+    // Declared 2026-08-11. The real JDK MXBean type-mapping machinery became
+    // the default that day (`jmx_openmbean::real_mxbean_mapping_enabled`);
+    // this is its opt-out, and it has no `on_key` for the same reason `raf`
+    // and `pqc` do not — the ON side is the default, not a variable.
+    E { group: Group::REAL, token: "mxbean-mapping", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_MXBEAN_MAPPING"), off_word: None },
     E { group: Group::REAL, token: "net-sockets", on_key: Some("CRATONVM_REAL_NET_SOCKETS"), off_key: Some("CRATONVM_SYNTHETIC_NET_SOCKETS"), off_word: None },
     E { group: Group::REAL, token: "pqc", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_PQC"), off_word: None },
     E { group: Group::REAL, token: "proxy", on_key: Some("CRATONVM_REAL_PROXY"), off_key: None, off_word: Some("0") },
@@ -1752,6 +1773,51 @@ mod tests {
 
     fn case(pairs: &[(&str, &str)]) -> Case {
         Case::new(pairs)
+    }
+
+    /// The two names declared on 2026-08-11 reach their consumers through the
+    /// GROUPED spelling, which is the whole point of declaring them.
+    ///
+    /// Both were read by code and named nowhere, so each was served by a live
+    /// `getenv` rather than the latched snapshot: `CRATONVM_DBG=overlay-gate`
+    /// and `CRATONVM_REAL=-memoryusage-tostring` reached neither, and
+    /// `flags::with_thread_overrides` could not arrange either in a test. A row
+    /// in `INVENTORY` is what fixes that, so assert the expansion rather than
+    /// the row's existence — `every_token_is_unique` and the surface guards
+    /// already cover the row.
+    ///
+    /// `memoryusage-tostring` is an opt-OUT: the real JDK bytecode is the
+    /// default, so the token has no `on_key` and turning it OFF is what sets
+    /// the `CRATONVM_SYNTHETIC_*` key. Same shape as `mxbean-mapping` and
+    /// `aqs` above.
+    #[test]
+    fn the_20260811_declarations_expand_from_their_group_spelling() {
+        let c = case(&[("CRATONVM_DBG", "overlay-gate")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_DBG_OVERLAY_GATE"),
+            Some(OsString::from("1")),
+        );
+
+        // Opt-out: `-token` sets the SYNTHETIC key...
+        let c = case(&[("CRATONVM_REAL", "-memoryusage-tostring")]);
+        assert_eq!(
+            c.resolve().get("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING"),
+            Some(OsString::from("1")),
+        );
+        // ...and asking for the default explicitly clears it, without minting a
+        // `CRATONVM_REAL_*` twin. That twin's absence is deliberately NOT
+        // asserted by name: a whole-string `CRATONVM_*` literal anywhere in
+        // Rust source is exactly what `flag_declaration_guard` scans for, so
+        // naming a variable in order to say it does not exist would demand a
+        // declaration for it. One override says the same thing.
+        let c = case(&[("CRATONVM_REAL", "memoryusage-tostring")]);
+        let on = c.resolve();
+        assert_eq!(on.get("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING"), None);
+        assert_eq!(
+            on.overrides().count(),
+            1,
+            "the ON form clears the opt-out key and touches nothing else",
+        );
     }
 
     #[test]

@@ -4403,6 +4403,97 @@ fn legacy_dsa_acceptor(cert_pem: &str, key_pem: &str) -> Result<SslAcceptor, Str
     Ok(builder.build())
 }
 
+/// Name the algorithm of a PKCS#8 private key by its `AlgorithmIdentifier` OID.
+///
+/// Only used to explain a refusal. rustls reports every unusable key with the
+/// same "failed to parse private key as RSA, ECDSA, or EdDSA" no matter why, so
+/// a reader of that message cannot tell a corrupt key from a well-formed one of
+/// a type no backend here supports. Naming the algorithm is the difference
+/// between "the keystore is broken" and "this identity needs a TLS backend we
+/// do not have on this platform".
+pub(crate) fn pkcs8_algorithm_name(der: &[u8]) -> Option<&'static str> {
+    // SEQUENCE { INTEGER version, SEQUENCE { OID algorithm, ... }, ... }
+    fn tlv(buf: &[u8], at: usize) -> Option<(u8, usize, usize)> {
+        let tag = *buf.get(at)?;
+        let len_byte = *buf.get(at + 1)?;
+        let mut p = at + 2;
+        let len = if len_byte & 0x80 != 0 {
+            let n = (len_byte & 0x7f) as usize;
+            if n > 4 || p + n > buf.len() {
+                return None;
+            }
+            let mut len = 0usize;
+            for byte in &buf[p..p + n] {
+                len = len.checked_mul(256)?.checked_add(*byte as usize)?;
+            }
+            p += n;
+            len
+        } else {
+            len_byte as usize
+        };
+        // The declared end may lie past the buffer — callers here read only the
+        // header, and a truncated key still names its algorithm. Every actual
+        // byte read below goes through `get`, so an over-long length cannot
+        // reach past the slice.
+        Some((tag, p, p.checked_add(len)?))
+    }
+    let (tag, outer, _) = tlv(der, 0)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, _, after_version) = tlv(der, outer)?;
+    if tag != 0x02 {
+        return None;
+    }
+    let (tag, alg_body, _) = tlv(der, after_version)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, oid_start, oid_end) = tlv(der, alg_body)?;
+    if tag != 0x06 {
+        return None;
+    }
+    match der.get(oid_start..oid_end)? {
+        // 1.2.840.113549.1.1.1 rsaEncryption
+        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01] => Some("RSA"),
+        // 1.2.840.10040.4.1 id-dsa
+        [0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01] => Some("DSA"),
+        // 1.2.840.10045.2.1 id-ecPublicKey
+        [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01] => Some("EC"),
+        // 1.3.101.112 / 1.3.101.113 Ed25519 / Ed448
+        [0x2b, 0x65, 0x70] => Some("Ed25519"),
+        [0x2b, 0x65, 0x71] => Some("Ed448"),
+        _ => None,
+    }
+}
+
+/// Explain, in the exception text, why a server identity rustls refused has no
+/// second chance on this platform.
+///
+/// On Unix `legacy_dsa_acceptor` (OpenSSL) picks these up. On Windows there is
+/// no equivalent and there cannot be a platform one: TLS with a DSA certificate
+/// requires the `TLS_DHE_DSS_*` cipher suites, rustls implements no DHE at all,
+/// and Windows SChannel has offered zero DSS suites since Windows 10 (measured
+/// on Windows 11: `Get-TlsCipherSuite` lists 28 suites, none DSS). So
+/// `native_tls`'s failure there is not an import bug to be fixed by feeding it
+/// a PKCS#12 instead — the handshake could not be negotiated afterwards either.
+#[cfg(not(unix))]
+fn legacy_identity_hint(key_pem: &str) -> String {
+    let algorithm = parse_private_key_pem(key_pem)
+        .ok()
+        .and_then(|key| pkcs8_algorithm_name(key.secret_der()))
+        .unwrap_or("unrecognised");
+    if algorithm == "DSA" {
+        " -- the server identity carries a DSA key; TLS with a DSA certificate needs the \
+         TLS_DHE_DSS_* cipher suites, which neither rustls nor Windows SChannel provides. \
+         CratonVM's OpenSSL-backed legacy fallback is Unix-only (see \
+         native-builtins/src/t27_tls.rs, legacy_dsa_acceptor)"
+            .to_string()
+    } else {
+        format!(" -- server identity key algorithm: {algorithm}")
+    }
+}
+
 fn create_ssl_server_socket(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -4464,7 +4555,10 @@ fn create_ssl_server_socket(
             .and_then(native_tls::TlsAcceptor::new)
             .map(TlsServerConfig::Native)
             .map_err(|native_error| {
-                format!("{rustls_error}; platform TLS fallback: {native_error}")
+                format!(
+                    "{rustls_error}; platform TLS fallback: {native_error}{}",
+                    legacy_identity_hint(&identity.key_pem)
+                )
             })
         }
     })
@@ -5740,6 +5834,52 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
+
+    /// The exact PKCS#8 key CratonVM lifts out of Spring Boot's
+    /// `spring-boot-ldap` test keystore
+    /// (`.../ldap/autoconfigure/embedded/test.jks`, alias `mykey`, 335 bytes),
+    /// captured with `CRATONVM_DBG=tls-hs` on 2026-08-11. Truncated to the
+    /// header — the algorithm OID is all this test reads.
+    const LDAP_TEST_JKS_DSA_KEY_PREFIX: &[u8] = &[
+        0x30, 0x82, 0x01, 0x4b, 0x02, 0x01, 0x00, 0x30, 0x82, 0x01, 0x2c, 0x06, 0x07, 0x2a, 0x86,
+        0x48, 0xce, 0x38, 0x04, 0x01, 0x30, 0x82, 0x01, 0x1f, 0x02, 0x81, 0x00,
+    ];
+
+    /// `EmbeddedLdapAutoConfigurationTests.whenSslBundleIsConfiguredLdapsListenerIsConfigured`
+    /// fails on Windows with rustls's generic "failed to parse private key as
+    /// RSA, ECDSA, or EdDSA", which says nothing about why. It is a DSA key, and
+    /// naming that is what separates "broken keystore" from "no TLS backend on
+    /// this platform speaks DHE_DSS".
+    #[test]
+    fn ldap_test_keystore_key_is_reported_as_dsa() {
+        assert_eq!(
+            pkcs8_algorithm_name(LDAP_TEST_JKS_DSA_KEY_PREFIX),
+            Some("DSA")
+        );
+    }
+
+    #[test]
+    fn pkcs8_algorithm_name_reads_the_algorithm_oid() {
+        // Minimal PKCS#8 prefixes: SEQUENCE { INTEGER 0, SEQUENCE { OID .. } }
+        let rsa = [
+            0x30u8, 0x10, 0x02, 0x01, 0x00, 0x30, 0x0b, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7,
+            0x0d, 0x01, 0x01, 0x01,
+        ];
+        let ec = [
+            0x30u8, 0x0e, 0x02, 0x01, 0x00, 0x30, 0x09, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+            0x02, 0x01,
+        ];
+        let ed = [
+            0x30u8, 0x0a, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+        ];
+        assert_eq!(pkcs8_algorithm_name(&rsa), Some("RSA"));
+        assert_eq!(pkcs8_algorithm_name(&ec), Some("EC"));
+        assert_eq!(pkcs8_algorithm_name(&ed), Some("Ed25519"));
+        // Not a key at all, and a truncated one: both must decline rather than
+        // name an algorithm the bytes do not carry.
+        assert_eq!(pkcs8_algorithm_name(b"not der"), None);
+        assert_eq!(pkcs8_algorithm_name(&rsa[..6]), None);
+    }
 
     /// Guard so tests that mutate the global `RUNTIME_TLS_IDENTITY` slot
     /// don't race with each other. Each test acquires the lock for its

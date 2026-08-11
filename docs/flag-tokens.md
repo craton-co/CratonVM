@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-435 tokens.
+437 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -155,6 +155,7 @@ export inherited from a parent shell.
 | `dispatch-tally` | `CRATONVM_DBG_DISPATCH_TALLY` |
 | `dopriv` | `CRATONVM_DBG_DOPRIV` |
 | `dropped-stubs` | `CRATONVM_DBG_DROPPED_STUBS` |
+| `dupdef` | `CRATONVM_DBG_DUPDEF` |
 | `dump-jit` | `CRATONVM_DBG_DUMP_JIT` |
 | `dupcall-filter` | `CRATONVM_DBG_DUPCALL_FILTER` |
 | `dupclass` | `CRATONVM_DBG_DUPCLASS` |
@@ -349,6 +350,7 @@ export inherited from a parent shell.
 | `oom-bt` | `CRATONVM_DBG_OOM_BT` |
 | `oop-span-probe` | `CRATONVM_OOP_SPAN_PROBE` |
 | `osr` | `CRATONVM_DBG_OSR` |
+| `overlay-gate` | `CRATONVM_DBG_OVERLAY_GATE` |
 | `owner-filter` | `CRATONVM_DBG_OWNER_FILTER` |
 | `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
 | `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
@@ -726,7 +728,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-25 tokens.
+27 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -740,7 +742,9 @@ export inherited from a parent shell.
 | `filewriter` | `CRATONVM_SYNTHETIC_FILEWRITER` |
 | `forkjoinpool` | `CRATONVM_REAL_FORKJOINPOOL / CRATONVM_SYNTHETIC_FORKJOINPOOL` |
 | `jca` | `CRATONVM_REAL_JCA` |
+| `memoryusage-tostring` | `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING` |
 | `msc-real-start` | `CRATONVM_MSC_REAL_START` |
+| `mxbean-mapping` | `CRATONVM_SYNTHETIC_MXBEAN_MAPPING` |
 | `net-sockets` | `CRATONVM_REAL_NET_SOCKETS / CRATONVM_SYNTHETIC_NET_SOCKETS` |
 | `pqc` | `CRATONVM_SYNTHETIC_PQC` |
 | `proxy` | `CRATONVM_REAL_PROXY` |
