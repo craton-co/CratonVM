@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **bisected to a named commit**, root cause not yet isolated within it. One conclusion RETRACTED 2026-08-10 (`objects_swept=0`); read that section before acting on this page. |
+| **Status** | OPEN — **re-measured on dev 2026-08-10 and the mechanism moved.** Everything from *What is measured* down to *The open question* describes a tree that no longer behaves that way; start at *RE-MEASURED ON dev*. |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
@@ -73,7 +73,7 @@ BAD   1d2817c75  feat(types,gc,vm,jit): delete identity_hash_code from ObjectHea
 The switchover to the mark word is **good**; deleting the header field is bad.
 That is worth stating explicitly because the opposite is the natural guess.
 
-## What is measured, and what it rules out
+## STALE (pre-2026-08-10) — What is measured, and what it rules out
 
 All from the failing run, via `CRATONVM_DBG_MIRRORPIN=1 CRATONVM_DBG_MIRRORPIN_WHY=1`
 (this branch wires callers for `VmHeap::root_held_paths` / `find_referrers`,
@@ -121,7 +121,78 @@ Also eliminated:
   `mark_and_push_rescues_a_walked_base_the_plausibility_screen_rejects` passes
   on dev.
 
-## The marker is innocent. The SWEEP never visits the span.
+## 2026-08-10 RE-MEASURED ON dev: none of the chain below still holds
+
+Every row in *What is measured* and in the two sections after it was re-taken on
+today's `dev` with the same instrument (`CRATONVM_DBG_MIRRORPIN=1
+CRATONVM_DBG_MIRRORPIN_WHY=1`) and the same fixture, and **the measurements
+invert**:
+
+| question | this page | dev, 2026-08-10 |
+|---|---|---|
+| young-marker edges reaching the evicted loader | **0** | `is_marked=true`, `loader_marked=true` |
+| `young_survivor` arm for the mirror | **true** | **false** |
+| `live_instances_of_this_loader` | **0** | **1** |
+| `root_held_paths` for the loader | 1 (the target itself) | **8** |
+| non-moving young sweeps | "exactly 1, the `System.gc()`" | **zero — the cycle never runs** |
+
+The last row is the one that dismantles the chain. `[MARKWHY] sweep enter` is
+new and prints whenever a watch is ARMED, with no from-space condition; the
+arming line prints and the sweep line never does, on the default collector and
+under `CRATONVM_NO_MOVING_YOUNG=1` alike. `CRATONVM_DBG=heap-trace` agrees
+independently — `run_non_moving_young_cycle`'s own trace line never fires.
+**There is no non-moving young sweep in this test on dev**, so "the walk covers
+the address and strides over it" is not a live statement about anything.
+
+Read *The marker is innocent* and *Which skip arm* below as a record of a tree
+that no longer exists, not as findings to build on.
+
+## What dev shows instead: an ordinary reachability chain, and Jasper's JDT compiler is holding it
+
+The mirror is retained because the class has a **live instance**, whose loader
+`loader_pin` therefore keeps alive, whose mirror `mirror_pin` therefore keeps
+alive. That is the pin machinery working exactly as designed. The question is
+why an instance of an EVICTED JSP is still reachable, and the instrument
+renders the paths:
+
+```
+StackMapFrame -> VerificationTypeInfo -> VerificationTypeInfo
+  -> SourceTypeBinding -> LookupEnvironment
+  -> JDTCompiler$1 -> JDTCompiler
+  -> JspCompilationContext   -> <the evicted loader>
+  -> JspServletWrapper       -> <the evicted annotations_jsp instance>
+```
+
+Seven of the loader's eight paths are that chain; the eighth is
+`java/lang/Class -> loader`, i.e. the mirror pin itself. The LIVE control
+(`bug36923_jsp`) has the same JDT chain **plus** a legitimate one:
+
+```
+ArrayList -> Object -> StandardWrapper -> JspServlet -> JspRuntimeContext
+  -> FastRemovalDequeue -> FastRemovalDequeue$Entry -> JspServletWrapper -> instance
+```
+
+`FastRemovalDequeue` is Jasper's `maxLoadedJsps` LRU. The evicted JSP is
+correctly **absent** from it — eviction worked. What did not go away is the JDT
+compiler's own graph.
+
+So the open question is now the opposite of this page's premise, and it is a
+question about **roots**, the family this page declared innocent:
+
+> Every rendered path is headed by an `org.eclipse.jdt.internal.compiler`
+> object — `StackMapFrame`, or an `ArrayList` — with no parent. Those are
+> transient objects the JSP compiler produces while emitting a class file and
+> should be garbage the moment compilation ends. **What roots them?**
+
+That is worth checking against this page's own *Also eliminated* entry on
+overlay over-rooting (`roots.rs` step 17), which is recorded as retaining
+"exactly this JSP cluster (21 direct hits)" and as having been gated for the
+Generational `major_gc_requested()` path. The rendered heads are `ArrayList`
+and JDT nodes, which is what an overlay scan would produce, and the gate should
+be re-measured rather than trusted — its evidence predates every measurement
+above.
+
+## STALE (pre-2026-08-10) — The marker is innocent. The SWEEP never visits the span.
 
 `CRATONVM_DBG_MARK_WHY_CLASS=<internal/class/Name>` arms a watch on that class's
 loader (the address is not knowable before the class is defined) and labels
