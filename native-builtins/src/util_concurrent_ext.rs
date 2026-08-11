@@ -838,8 +838,16 @@ fn native_lock_support_get_blocker(
 ///   objects, see `native_cf_complete`'s slot-1 type discriminator below -- reads
 ///   or writes past the end of that object.
 ///
-/// It is reported, not refused: see the ENABLED note in the body for why turning
-/// it fatal needs a measurement first.
+/// It is reported, not refused, and one sub-population is why. `jca/kem.rs`,
+/// `jca/signature.rs`, `jca/key_factory.rs` and `jca/key_agreement.rs`
+/// over-allocate ON PURPOSE, through `synthetic_base_offset` (27 uses): it asks
+/// `class_num_total_fields` for the real width and appends private slots ABOVE
+/// it, *"so reference writes never land on a slot the real layout declares with
+/// an incompatible descriptor"*. That is the correct remedy for this species,
+/// and it necessarily shows up here as `over`. This funnel cannot tell it apart
+/// from a hard-coded wide guess -- both arrive as one integer -- so the census
+/// names both and the reader subtracts. See the ENABLED note in the body for
+/// what a follow-up must measure before this could be made fatal.
 ///
 /// `real == 0` is excluded from BOTH directions, because 0 is overloaded. It
 /// means "class not loaded yet" (the reason the `max` below exists at all) and
