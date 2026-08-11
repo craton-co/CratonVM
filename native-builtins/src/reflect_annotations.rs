@@ -3554,6 +3554,29 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             // Routing into the AnnotationProxy interception is by class+name;
             // the descriptor governs result coercion.
             //
+            // "By class+name" is the whole mechanism, and worth naming exactly
+            // because W7-12 depends on it. `ctx.invoke` is `invoke_shared`
+            // (`vm/src/vm/vm_exec.rs`), which loads the class, finds an EMPTY
+            // method table on it, and reaches the terminal-miss
+            // annotation-proxy rescue — keyed on the receiver's runtime class
+            // NAME (`&*c.name == "java/lang/annotation/AnnotationProxy"`),
+            // never on its `ClassOrigin`. Every other door into this class is
+            // name-keyed the same way: `invoke_or_native`'s `effective_class`
+            // arm, `execute_invoke_kind`'s S111r18 arm
+            // (`vm/src/runtime/interpreter/invoke.rs`), the three
+            // `dispatch_virtual.rs` arms, and the JIT retarget in
+            // `vm/src/jit/helpers.rs`.
+            //
+            // Measured 2026-08-11 (`--dump-native-registry`, real-JDK boot):
+            // **zero** natives are registered under this class name, against
+            // two under `java/lang/reflect/Proxy$Instance`. So the
+            // provenance-keyed "prefer a native registered under the receiver's
+            // own exact name" branches this class currently takes cannot answer
+            // any call on it — which is what lets W7-12 re-label the class
+            // `VmInternal` (so `--jdk-only` stops refusing to mint it, see
+            // docs/known-issues/jdk-only/W7-12-strict-annotation-proxy.md)
+            // without moving this call off its route.
+            //
             // `()Ljava/lang/Object;` is right for every member the proxy stores
             // — those are already boxed — but NOT for the one case it does not
             // store: a member ABSENT from the proxy's parallel arrays whose
