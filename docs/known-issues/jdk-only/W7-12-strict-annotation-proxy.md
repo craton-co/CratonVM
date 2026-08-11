@@ -292,18 +292,33 @@ $ grep 'Proxy\$Instance' <FILE>         # → 2 rows
 ```
 
 **Zero** natives are registered under `java/lang/annotation/AnnotationProxy`.
-Both consumers of `dispatch_lacks_class_file` ("prefer a native registered
-under this class's own exact name", in `invoke_or_native` and
-`invoke_on_class_shared_inner`) therefore have nothing to find for this
-receiver in either state of the bit, and every real door into the class is
-keyed on the **name**: `invoke_or_native`'s `effective_class` arm,
+The predicate has three read sites, and the bit is inert at all three for this
+class:
+
+* `invoke_or_native`'s exact-name native preference and
+  `invoke_on_class_shared_inner`'s `prefer_exact_class_native` — both do a
+  `native_methods.find(<this class name>, …)`, which has nothing to return;
+* `validate_native_coverage` (`vm/src/vm/vm_object.rs`) skips
+  dispatch-lacking-a-class-file classes, so after the flip it would scan this
+  one — over a method table with **zero** entries. Zero iterations either way.
+
+Every real door into the class is keyed on the **name**, not the origin:
+`invoke_or_native`'s `effective_class` arm,
 `invoke_on_class_shared_inner`'s terminal-miss rescue (which is what serves
 `reflect_annotations.rs`'s `ctx.invoke("java/lang/annotation/AnnotationProxy",
 …)` second call site), `execute_invoke_kind`'s S111r18 arm, the three
-`dispatch_virtual.rs` arms and the JIT retarget. The invariant
-`vm/tests/jdk_only_class_origin.rs::dispatch_predicate_matches_the_stub_bit`
-pins — predicate equals the stub bit — is preserved, because both sides flip
-together.
+`dispatch_virtual.rs` arms and the JIT retarget.
+
+The invariant `classloading/tests/jdk_only_class_origin.rs::dispatch_predicate_matches_the_stub_bit`
+pins — the predicate equals the stub bit for every class except
+`Proxy$Instance` — survives, because for this class both sides flip together
+(no compatibility stub, and no native-flagged method to keep it on the stub
+arm). Its sibling test in the same file asserts the §11 acceptance criterion:
+**zero `CompatibilityStub` classes for JDK/application/dependency classes**,
+which this patch moves one class closer to rather than away from. (That file
+is under `classloading/tests/`, not `vm/tests/` — `classloading/src/class.rs`'s
+own doc comment names it without a path, and the first place this record looked
+was wrong.)
 
 ## Before landing: the question-1 sites, unverified
 
