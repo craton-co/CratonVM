@@ -269,6 +269,42 @@ pub fn kept_seeds_rejected() -> usize {
     KEPT_SEED_REJECTED.load(Ordering::Relaxed)
 }
 
+/// Which step of [`G1Collector::classify_candidate_header`] decided an address
+/// is not the start of a live object.
+///
+/// The distinctions matter to whoever reads the rejection warnings:
+/// `AboveCursor` says the word is inside a live region but past everything ever
+/// allocated in it (a stale or recycled address), while `BadKindTag` says it is
+/// *below* the cursor and still not an object (a walk that lost the object
+/// grid). They have different upstream producers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderVerdict {
+    /// Passed every check: this is the start of a live object.
+    Object,
+    /// Null, or not 8-aligned.
+    NullOrUnaligned,
+    /// Not inside `[arena_base, arena_end)`.
+    OutsideArena,
+    /// `region_size == 0` — the collector has no region geometry.
+    NoRegionGeometry,
+    /// The computed region index is past the end of the region table.
+    NoSuchRegion,
+    /// The owning region is `Free`.
+    RegionFree,
+    /// Below the owning region's data base (region table / arena disagreement).
+    BelowRegionBase,
+    /// Inside the region's span but at or above its allocation cursor.
+    AboveCursor,
+    /// The `kind` tag byte does not decode to an `ObjectKind`.
+    BadKindTag,
+    /// The element-type tag byte does not decode to an `ArrayElementType`.
+    BadElementTag,
+    /// A humongous filler, which is not walkable.
+    HumongousFiller,
+    /// Tags decode, but the shape word claims an impossible slot/element count.
+    ImplausibleShape,
+}
+
 /// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
 pub fn evacuation_holder_counts() -> (usize, usize) {
     (
@@ -2255,8 +2291,41 @@ impl G1Collector {
             //     regions.
             {
                 let mut regions = self.regions.lock();
+                let mut rejected: Vec<usize> = Vec::new();
                 for &seed in &seeds {
-                    self.record_outgoing_rset_edges(&mut regions, seed);
+                    if !self.record_outgoing_rset_edges(&mut regions, seed) {
+                        rejected.push(seed);
+                    }
+                }
+                // A seed is an identity entry in the pause's own forwarding map,
+                // so "it is not an object" is a statement about the map, not
+                // just about the heap. Ask the map what else it says about the
+                // address before the pause ends and the answer is gone: an
+                // address that is ALSO another key's destination was evacuated
+                // INTO, which makes the identity entry stale rather than a live
+                // self-forward. One O(map) pass, only on a pause that already
+                // rejected something, and only while the warnings are still
+                // being printed.
+                if !rejected.is_empty()
+                    && KEPT_SEED_REJECTED.load(Ordering::Relaxed) <= rejected.len().max(8)
+                {
+                    for seed in rejected {
+                        let inbound = acc
+                            .pointer_map
+                            .iter()
+                            .filter(|(k, v)| **v == seed && **k != seed)
+                            .count();
+                        // Deliberately does NOT consult `kept_unresolved_*`:
+                        // those are behind their own mutexes and this runs
+                        // under the regions lock — the deadlock hazard
+                        // `candidate_header_is_plausible` already documents.
+                        tracing::warn!(
+                            "[g1] rejected seed 0x{seed:x}: seeds={} map={} inbound_forwards={inbound} \
+                             passes={passes}",
+                            seeds.len(),
+                            acc.pointer_map.len(),
+                        );
+                    }
                 }
             }
             let mut kept_regions = self.kept_unresolved_regions.lock();
@@ -2294,9 +2363,12 @@ impl G1Collector {
     /// counterpart of `post_write_barrier_rset` for slots the collector
     /// itself rewrote. See the unresolved-kept block in
     /// [`Self::retry_after_evacuation_failure`].
-    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) {
+    ///
+    /// Returns `false` iff the seed was refused as not-an-object, so the caller
+    /// can report on the ones it rejected.
+    fn record_outgoing_rset_edges(&self, regions: &mut [G1Region], obj_addr: usize) -> bool {
         let Some(src_idx) = self.lookup_region_for_addr(obj_addr) else {
-            return;
+            return false;
         };
         let obj_ptr = obj_addr as *mut u8;
         // `lookup_region_for_addr` only answers "is this word inside some
@@ -2319,13 +2391,14 @@ impl G1Collector {
         if !self.candidate_header_is_plausible(regions, obj_addr) {
             let n = KEPT_SEED_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
+                let why = self.describe_rejected_address(regions, obj_addr);
                 tracing::warn!(
                     "[g1] kept-seed rset recording REJECTED a non-object SEED (#{n}): \
-                     obj=0x{obj_addr:x} — walking its slots would have read outside any \
+                     obj=0x{obj_addr:x} {why} — walking its slots would have read outside any \
                      live region. Skipped; the pause continues."
                 );
             }
-            return;
+            return false;
         }
         // SAFETY: `candidate_header_is_plausible` validated the tag bytes and
         // placed the address inside a live region's committed span.
@@ -2367,6 +2440,7 @@ impl G1Collector {
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| record(raw));
         }
+        true
     }
 
     /// Minimal same-pause drain of evacuation-failed objects: evacuate exactly
@@ -4397,29 +4471,49 @@ impl G1Collector {
     /// direction for this guard: a false accept is only the pre-guard
     /// behaviour, whereas a false reject would drop a live reference.
     fn candidate_header_is_plausible(&self, regions: &[G1Region], addr: usize) -> bool {
+        self.classify_candidate_header(regions, addr).0 == HeaderVerdict::Object
+    }
+
+    /// [`Self::candidate_header_is_plausible`], but returning WHICH check said
+    /// no, plus the owning region index when there is one.
+    ///
+    /// The bool wrapper is what the hot guards call. This variant exists so the
+    /// two rejection warnings can name the failing step instead of reporting an
+    /// undifferentiated "not an object": "in-span but above the cursor" and
+    /// "in-span, below the cursor, but the tag bytes are garbage" are different
+    /// defects with different upstream producers, and a counter that cannot
+    /// tell them apart cannot start an investigation.
+    fn classify_candidate_header(
+        &self,
+        regions: &[G1Region],
+        addr: usize,
+    ) -> (HeaderVerdict, Option<usize>) {
         if addr == 0 || addr & 0x7 != 0 {
-            return false;
+            return (HeaderVerdict::NullOrUnaligned, None);
         }
         if addr < self.arena_base || addr >= self.arena_end {
-            return false;
+            return (HeaderVerdict::OutsideArena, None);
         }
         let region_size = self.config.region_size;
         if region_size == 0 {
-            return false;
+            return (HeaderVerdict::NoRegionGeometry, None);
         }
         let idx = (addr - self.arena_base) / region_size;
         let Some(r) = regions.get(idx) else {
-            return false;
+            return (HeaderVerdict::NoSuchRegion, None);
         };
         match r.region_type {
-            RegionType::Free => return false,
+            RegionType::Free => return (HeaderVerdict::RegionFree, Some(idx)),
             // A humongous continuation slice is live in its entirety; only the
             // start region carries the object's full `cursor`.
             RegionType::HumongousContinuation => {}
             _ => {
                 let base = r.data.as_ptr() as usize;
-                if addr < base || addr >= base + r.cursor {
-                    return false;
+                if addr < base {
+                    return (HeaderVerdict::BelowRegionBase, Some(idx));
+                }
+                if addr >= base + r.cursor {
+                    return (HeaderVerdict::AboveCursor, Some(idx));
                 }
             }
         }
@@ -4430,22 +4524,49 @@ impl G1Collector {
         // `is_object_address` does — this is the step that rejects a word which
         // is in-span but is not an object.
         let Some(kind) = (unsafe { object_kind_from_tag(cratonvm_types::kind_tag_at(ptr)) }) else {
-            return false;
+            return (HeaderVerdict::BadKindTag, Some(idx));
         };
         if unsafe { array_element_type_from_tag(cratonvm_types::element_type_tag_at(ptr)) }.is_none()
         {
-            return false;
+            return (HeaderVerdict::BadElementTag, Some(idx));
         }
         if kind == ObjectKind::HumongousFiller {
-            return false;
+            return (HeaderVerdict::HumongousFiller, Some(idx));
         }
         // SAFETY: tags validated above.
         let header = unsafe { &*(ptr as *const ObjectHeader) };
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
-        if kind == ObjectKind::Array {
+        let sane_shape = if kind == ObjectKind::Array {
             header.array_length() <= i32::MAX as u32
         } else {
             header.num_slots() <= MAX_PLAUSIBLE_SLOTS
+        };
+        if !sane_shape {
+            return (HeaderVerdict::ImplausibleShape, Some(idx));
+        }
+        (HeaderVerdict::Object, Some(idx))
+    }
+
+    /// One line of context for a rejected address: the verdict, and what the
+    /// owning region looks like right now.
+    fn describe_rejected_address(&self, regions: &[G1Region], addr: usize) -> String {
+        let (verdict, idx) = self.classify_candidate_header(regions, addr);
+        match idx.and_then(|i| regions.get(i).map(|r| (i, r))) {
+            Some((i, r)) => {
+                let base = r.data.as_ptr() as usize;
+                format!(
+                    "verdict={verdict:?} region={i} type={:?} base=0x{base:x} cursor=0x{:x} \
+                     off=0x{:x} age={} pinned={} reuse_epoch={} recycled_in_generation={}",
+                    r.region_type,
+                    r.cursor,
+                    addr.wrapping_sub(base),
+                    r.age,
+                    r.pinned,
+                    r.reuse_epoch,
+                    r.recycled_in_generation,
+                )
+            }
+            None => format!("verdict={verdict:?} region=none"),
         }
     }
 
@@ -4467,8 +4588,9 @@ impl G1Collector {
         if !self.candidate_header_is_plausible(regions, obj_ptr as usize) {
             let n = EVAC_HOLDER_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 8 || n.is_power_of_two() {
+                let why = self.describe_rejected_address(regions, obj_ptr as usize);
                 tracing::warn!(
-                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
+                    "[g1] evacuation ref-scan REJECTED a non-object HOLDER (#{n}):                      obj=0x{:x} {why} — walking its slots would have read outside any live                      region. Skipped; the pause continues.",
                     obj_ptr as usize,
                 );
             }
