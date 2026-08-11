@@ -18,6 +18,14 @@ import java.lang.foreign.ValueLayout;
  * hide the eight behind it; that is the whole reason this probe exists rather
  * than a single straight-line method.
  *
+ * Run it with `--enable-native-access=ALL-UNNAMED`. CratonVM gates every
+ * `MemorySegment.get` behind that flag as defence-in-depth (the accessor
+ * dereferences the segment's raw pointer), and measured on 2026-08-10 the four
+ * `set` carriers that had an implementation were the only ones NOT gated -- a
+ * raw-address write guarded less than a read. Routing all nine through the same
+ * implementation closes that too, so without the flag the probe now reports
+ * `IllegalCallerException` uniformly instead of on the reads alone.
+ *
  * The values are chosen to catch the conversions, not just the plumbing:
  *
  *   * `char` above 0x7FFF — a sign-extended read answers negative;
@@ -42,6 +50,11 @@ public class FfmSegmentAccessProbe {
     }
 
     public static void main(String[] args) {
+        // Which class is actually being dispatched on. A fabricated instance of
+        // the INTERFACE finds only its abstract methods; a real
+        // NativeMemorySegmentImpl finds bytecode. The two failure modes read
+        // nothing alike and this one line tells them apart.
+        section("shape", FfmSegmentAccessProbe::shape);
         section("byte", FfmSegmentAccessProbe::carrierByte);
         section("boolean", FfmSegmentAccessProbe::carrierBoolean);
         section("char", FfmSegmentAccessProbe::carrierChar);
@@ -52,7 +65,19 @@ public class FfmSegmentAccessProbe {
         section("double", FfmSegmentAccessProbe::carrierDouble);
         section("address", FfmSegmentAccessProbe::carrierAddress);
         section("atIndex", FfmSegmentAccessProbe::atIndex);
+        section("getBoolChar", FfmSegmentAccessProbe::getBoolChar);
+        section("getAddress", FfmSegmentAccessProbe::getAddress);
         System.out.println("FFMSEG sections=" + sections + " failed=" + failed);
+    }
+
+    static void shape() {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment s = a.allocate(64);
+            System.out.println("shape seg=" + s.getClass().getName()
+                    + " arena=" + a.getClass().getName()
+                    + " size=" + s.byteSize()
+                    + " native=" + s.isNative());
+        }
     }
 
     static void carrierByte() {
@@ -154,6 +179,36 @@ public class FfmSegmentAccessProbe {
             System.out.println("address sameAddr=" + (back.address() == target.address())
                     + " nonZero=" + (back.address() != 0)
                     + " isSegment=" + (back instanceof MemorySegment));
+        }
+    }
+
+    // The three GET conversions, reached WITHOUT the set overloads that were
+    // missing: write through a carrier that already works and read back
+    // through the one under test. That is what makes these three lines
+    // measurable on the pre-fix binary instead of only after the fix.
+    static void getBoolChar() {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment s = a.allocate(64);
+            s.set(ValueLayout.JAVA_BYTE, 0, (byte) 2);    // -> read back as boolean
+            s.set(ValueLayout.JAVA_SHORT, 2, (short) -2);  // -> read back as char (0xFFFE)
+            char c = s.get(ValueLayout.JAVA_CHAR, 2);
+            System.out.println("getBoolChar bool2=" + s.get(ValueLayout.JAVA_BOOLEAN, 0)
+                    + " charAsInt=" + ((int) c)
+                    + " charPositive=" + (c > 0));
+        }
+    }
+
+    // Its own section: this one returns a REFERENCE, so when it is wrong it is
+    // wrong by being null, and an NPE here would otherwise take the two
+    // conversions above down with it.
+    static void getAddress() {
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment s = a.allocate(64);
+            s.set(ValueLayout.JAVA_LONG, 8, 0x1234L);
+            MemorySegment addr = s.get(ValueLayout.ADDRESS, 8);
+            System.out.println("getAddress null=" + (addr == null)
+                    + " addr=" + (addr == null ? "-" : Long.toHexString(addr.address()))
+                    + " isSegment=" + (addr instanceof MemorySegment));
         }
     }
 
