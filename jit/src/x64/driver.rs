@@ -145,6 +145,10 @@ pub fn compile(
         Vec::new(),
         Vec::new(),
         ldc2w_info,
+        // ldc_fp_pcs: with no constant pool there is no tag to carry, and the
+        // empty set makes `stack_kinds` keep answering `Unknown` for these
+        // sites — the pre-existing behaviour for a caller that resolved nothing.
+        FxHashSet::default(),
         branch_hints,
         loop_unroll_hints,
         helpers,
@@ -319,6 +323,10 @@ pub fn compile_with_param_slots(
     // `ldc_string_info`.
     ldc_class_info: Vec<(usize, u32, u16)>,
     ldc2w_info: Vec<(usize, i64)>,
+    // The floating-point half of the `ldc`-family constant-pool tags — see
+    // `Compiler::ldc_fp_pcs`. Only the deopt operand-stack snapshot reads it;
+    // codegen still types these constants by their consuming opcode.
+    ldc_fp_pcs: FxHashSet<usize>,
     branch_hints: HashMap<usize, bool>,
     loop_unroll_hints: HashMap<usize, usize>,
     helpers: &JitRuntimeHelpers,
@@ -1616,6 +1624,7 @@ pub fn compile_with_param_slots(
     compiler.ldc_string_info = ldc_string_info;
     compiler.ldc_class_info = ldc_class_info;
     compiler.ldc2w_info = ldc2w_info;
+    compiler.ldc_fp_pcs = ldc_fp_pcs;
     compiler.fp_hoist_info = fp_hoist_info;
     compiler.fp_strength_reduction_pcs = fp_strength_reduction_pcs;
     compiler.simd_fp_loops = simd_fp_loops;
