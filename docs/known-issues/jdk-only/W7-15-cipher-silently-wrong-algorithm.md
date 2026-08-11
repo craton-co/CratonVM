@@ -564,8 +564,20 @@ and the rows that must **not**: every `AES/GCM/NoPadding`, `AES/CBC/*`,
 ciphertext must be byte-identical to what the pre-fix binary produced, which is
 also what HotSpot produces.
 
-`regression-suite/run.sh` must stay at its baseline in both modes;
-`RCrypto`, `RJdkSecurity` and `RJdkFailure` are the vectors that touch this code.
+The three corpus vectors that touch this code were baselined on the **pre-fix**
+binary, `--jdk-only`, so the rebuild has a number to match rather than a
+sentiment:
+
+```
+PASS RCrypto (7 checks)
+PASS RJdkFailure (43 checks)
+PASS RJdkSecurity (61 checks)
+```
+
+All three must still pass, with the same check counts. `RJdkFailure` is the one
+that exercises a refusal (`CRATONVM-NO-SUCH-CIPHER`) and it asserts the
+exception class, so the message change does not reach it. `regression-suite/run.sh`
+must stay at its baseline in both modes.
 
 ## The single falsifying observation
 
