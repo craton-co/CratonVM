@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **re-measured on dev 2026-08-10 and the mechanism moved.** Everything from *What is measured* down to *The open question* describes a tree that no longer behaves that way; start at *RE-MEASURED ON dev*. |
+| **Status** | OPEN — **root source NAMED 2026-08-10: `collection-overlays`.** Re-measured on dev; the mechanism moved. Everything from *What is measured* down to *The open question* describes a tree that no longer behaves that way; start at *RE-MEASURED ON dev*. |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
@@ -184,13 +184,58 @@ question about **roots**, the family this page declared innocent:
 > transient objects the JSP compiler produces while emitting a class file and
 > should be garbage the moment compilation ends. **What roots them?**
 
-That is worth checking against this page's own *Also eliminated* entry on
-overlay over-rooting (`roots.rs` step 17), which is recorded as retaining
-"exactly this JSP cluster (21 direct hits)" and as having been gated for the
-Generational `major_gc_requested()` path. The rendered heads are `ArrayList`
-and JDT nodes, which is what an overlay scan would produce, and the gate should
-be re-measured rather than trusted — its evidence predates every measurement
-above.
+### Answered, by measurement: `collection-overlays`
+
+`CRATONVM_DBG_ROOT_SOURCE=1` is new and records which NAMED entry of
+`VM_ROOT_SOURCES` contributed each root; `[MIRRORWHY]` now prints
+`[root=<source>]` on every rendered path. For the evicted JSP, over two runs:
+
+```
+  33 [root=collection-overlays]        11 [root=collection-overlays]
+   6 [root=<not-a-direct-root>]         2 [root=<not-a-direct-root>]
+```
+
+Every JDT-headed path is rooted by **`collection-overlays`** —
+`native_roots::scan_collection_overlays` → `external_roots::scan_external_roots`.
+The `<not-a-direct-root>` remainder is the mirror itself and the
+`java/lang/Class -> loader` pin edge, i.e. the pin machinery working as
+designed on top of a root that should not be there.
+
+**So this page's own *Also eliminated* entry was wrong.** It reads:
+
+> **Overlay over-rooting (`roots.rs` step 17).** … It has since been gated:
+> `native_roots::scan_collection_overlays` skips the unconditional scan when
+> `major_gc_requested()` under Generational, which is precisely this test's
+> path. … it cannot be the default-collector mechanism.
+
+The gate exists and its condition is right, but it does not cover the
+collection whose root set retains this cluster — the roots are contributed
+anyway, on the default collector, in the failing run. The entry was eliminated
+by reading the gate rather than by asking which source rooted the object, which
+is the question nothing could answer until now. Its own earlier evidence
+("21 direct hits" on exactly this JSP cluster, `gc_and_alloc.rs:2062`) was
+pointing at the answer the whole time.
+
+### What to do next, and the trap in doing it
+
+The obvious move — widen the gate so the overlay scan skips here too — is the
+one to be careful with. `scan_external_roots` exists because an overlay's
+backing array can be the ONLY reference to a live object; skipping it wholesale
+trades this over-retention for under-retention, which is a use-after-free rather
+than a failing assertion. The gate's shape (`is_active() ||
+unregistered_jit_frame_on_stack() || major_gc_requested()`) is a
+safety-conditional, not a feature flag.
+
+Two things to establish first, both one run each now that the source is
+nameable:
+
+1. **Which collection contributes them.** If it is a young/old cycle outside
+   the `System.gc()` window, the gate is simply not being consulted then, and
+   the question is whether that cycle can afford to skip.
+2. **Whether the overlay entries are stale.** A JDT `StackMapFrame` reachable
+   only from an overlay after compilation has finished suggests the overlay is
+   retaining entries whose Java-side owner is gone — in which case the fix is
+   pruning the overlay, not skipping the scan, and it costs nothing in safety.
 
 ## STALE (pre-2026-08-10) — The marker is innocent. The SWEEP never visits the span.
 
