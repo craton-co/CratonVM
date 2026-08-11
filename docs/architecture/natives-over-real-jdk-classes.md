@@ -406,8 +406,8 @@ tree; this section exists so they can be found from one place.
   *"Do not add fixed wall-clock bounds to any check. Both directions flake: an
   upper bound fails under contention, and a lower bound can pass while measuring
   nothing."* Line-bands rot the same way and have already done so in this
-  campaign — `census-asks-one-class-on-one-platform.md` records its own line
-  numbers as stale against `dev`, and
+  campaign — `fixed-bugs/jdk-only-census-one-class-one-platform-FIXED-20260810.md`
+  records its own line numbers as stale against `dev`, and
   `feature-designs/jdk-only-wave2/STRICT-CORPUS-CAMPAIGN-20260807.md`'s
   `run.sh` citations are stale as written (§9). Source-witness tests that scan a
   fixed window (`vm/tests/t11_safety_conformance.rs`'s five-line `// SAFETY:`

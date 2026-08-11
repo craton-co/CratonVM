@@ -2304,9 +2304,12 @@ fn detect_jdk_feature(java_home: Option<&str>) -> Option<u32> {
 ///   inside `Vm::new`, and the `vm-init` drain immediately follows it, so the
 ///   poll already reports them at their real time of occurrence.
 /// * The three process sinks behind `SharedVm::jdk_only_process_violations` —
-///   these are JIT/dispatch refusals, and they are *process*-global (see
-///   `docs/known-issues/jdk-only/additional-wave2-markers-not-in-the-original-inventory.md`
-///   §2). Giving them a live sink means giving them a VM first; a per-VM sink
+///   these are JIT/dispatch refusals, and they are *process*-global (retired
+///   record: feature-designs/jdk-only-wave2/
+///   additional-wave2-markers-not-in-the-original-inventory.md §2). Note that
+///   §2's own subject — the JIT compatibility latch — is no longer one of
+///   them; what remains process-global here is the violation SINKS, not the
+///   policy. Giving them a live sink means giving them a VM first; a per-VM sink
 ///   hung off process-global state would report another VM's violations as
 ///   this one's, which is worse than reporting them late.
 ///
@@ -4292,6 +4295,18 @@ fn run() -> Result<()> {
         eprintln!(
             "[cratonvm] compiled site-cached native dispatches (non-leaf): {}",
             cratonvm_vm::jit::helpers::site_cached_native_hit_count()
+        );
+        // The exact-receiver `java/util/regex/Matcher` leaf, which is neither of
+        // the two above: it is the one by-name fast path that decides per
+        // dispatch rather than at cache-fill time. Reported separately because
+        // its number is the only thing that distinguishes "the leaf served this
+        // call" from "the leaf declined and the generic tail served it, counting
+        // it properly" — the two are indistinguishable in the native census,
+        // which is what left the §4 gap this leaf was filed for unfalsifiable
+        // for as long as it stood.
+        eprintln!(
+            "[cratonvm] compiled Matcher-leaf dispatches: {}",
+            cratonvm_vm::jit::helpers::matcher_leaf_hit_count()
         );
         // A zero above is ambiguous — "nothing here is a leaf" and "every site
         // was refused for a reason nobody intended" look identical — so the

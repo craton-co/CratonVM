@@ -270,6 +270,119 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
                 is_marked(addr)
             );
         }
+        // TEMP-DIAG: for a still-marked JSP mirror, name the chain that is
+        // keeping it alive. "Still marked" alone cannot distinguish a direct
+        // root from a live heap edge, and this test has been closed three times
+        // on the direct-root half of that fork.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN_WHY").is_some() {
+            for (&class_id, obj_ref) in mirrors.iter() {
+                let name = cm
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if !name.starts_with("org/apache/jsp/") {
+                    continue;
+                }
+                let addr = obj_ref.as_ptr() as usize;
+                // WHICH ARM of the survivor verdict says "live"? Every rooting
+                // lever is inert and the object has no referrer, no instance
+                // and no root, so the live possibility is that the mirror is
+                // genuinely dead and the VERDICT is wrong.
+                let (old_alloc, young_surv, region) = shared.mem.heap.liveness_arms(addr);
+                eprintln!(
+                    "[MIRRORWHY] {name} mirror={addr:#x} is_marked={} region={region} \
+                     old_gen_allocated={old_alloc} young_survivor={young_surv}",
+                    is_marked(addr)
+                );
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    shared.vm_identity,
+                    class_id.as_u32(),
+                ) {
+                    let la = loader.as_ptr() as usize;
+                    let (lo, ly, lr) = shared.mem.heap.liveness_arms(la);
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader={la:#x} is_marked={} region={lr} \
+                         old_gen_allocated={lo} young_survivor={ly}",
+                        is_marked(la)
+                    );
+                }
+                if !is_marked(addr) {
+                    continue;
+                }
+                let render = |paths: &Vec<Vec<(usize, u32)>>, tag: &str| {
+                    eprintln!("[MIRRORWHY] {name} {tag} root_held_paths={}", paths.len());
+                    for path in paths.iter().take(8) {
+                        let rendered: Vec<String> = path
+                            .iter()
+                            .map(|&(a, cid)| {
+                                let n = cm
+                                    .get_class(cratonvm_types::ClassId::new(cid))
+                                    .map(|c| c.name.to_string())
+                                    .unwrap_or_else(|| format!("cid{cid}"));
+                                format!("{n}@{a:#x}")
+                            })
+                            .collect();
+                        eprintln!("[MIRRORWHY]   {}", rendered.join(" -> "));
+                    }
+                };
+                render(&shared.mem.heap.root_held_paths(addr, 200_000, 8), &format!("mirror={addr:#x}"));
+                // The mirror has no heap referrer; it is marked because
+                // `mirror_pin` propagates from its LOADER. So the real
+                // question is what keeps the LOADER alive.
+                if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(
+                    shared.vm_identity,
+                    class_id.as_u32(),
+                ) {
+                    let laddr = loader.as_ptr() as usize;
+                    eprintln!(
+                        "[MIRRORWHY] {name} loader={laddr:#x} loader_marked={}",
+                        is_marked(laddr)
+                    );
+                    render(
+                        &shared.mem.heap.root_held_paths(laddr, 200_000, 8),
+                        &format!("loader={laddr:#x}"),
+                    );
+                } else {
+                    eprintln!("[MIRRORWHY] {name} loader=NONE (defining_loader_for pruned)");
+                }
+                // The mirror/loader having no heap referrer is EXPECTED and
+                // says nothing: instance->class is the header's class_id, not
+                // a ref slot, and instance->loader is `loader_pin`, a side
+                // table. Both are invisible to a ref-slot walk. What actually
+                // pins the loader is a live INSTANCE of one of its classes, so
+                // enumerate those and say who holds them.
+                let mut live_instances: Vec<(usize, u32)> = Vec::new();
+                for (obj_ptr, _size) in shared.mem.heap.walk_objects() {
+                    // SAFETY: walk_objects yields live object starts.
+                    let cid = unsafe { &*(obj_ptr as *const cratonvm_gc::ObjectHeader) }
+                        .class_id
+                        .as_u32();
+                    if cratonvm_types::loader_pin::loader_pin_addr(cid)
+                        == cratonvm_native_builtins::classloader::defining_loader_for(
+                            shared.vm_identity,
+                            class_id.as_u32(),
+                        )
+                        .map(|l| l.as_ptr() as usize)
+                    {
+                        live_instances.push((obj_ptr as usize, cid));
+                    }
+                }
+                eprintln!(
+                    "[MIRRORWHY] {name} live_instances_of_this_loader={}",
+                    live_instances.len()
+                );
+                for &(iaddr, icid) in live_instances.iter().take(4) {
+                    let iname = cm
+                        .get_class(cratonvm_types::ClassId::new(icid))
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_else(|| format!("cid{icid}"));
+                    render(
+                        &shared.mem.heap.root_held_paths(iaddr, 200_000, 4),
+                        &format!("instance {iname}@{iaddr:#x}"),
+                    );
+                }
+            }
+        }
     }
     mirrors.retain(|_class_id, obj_ref| is_marked(obj_ref.as_ptr() as usize));
 }

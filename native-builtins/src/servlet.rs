@@ -1568,20 +1568,24 @@ fn s1_service_loader_ensure_loaded(
             return empty;
         }
     };
-    // Guard: the mirror must have at least one field (the ClassId slot).
-    // Test mocks may pass a 0-field dummy object.
-    if ctx.object_num_fields(mirror) == 0 {
-        ctx.set_field(sl, 1, Value::Object(Some(empty)));
-        return empty;
-    }
-    let class_id_val = match ctx.get_field(mirror, 0) {
-        Value::Int(v) => v as u32,
-        _ => {
+    // JDK-ONLY-LAYOUT: converted from `get_field(mirror, 0)` to
+    // `mirror_class_id`, which asks the authoritative reverse map first and
+    // only then the legacy Int-at-slot-0 overlay. Slot 0 of a real
+    // `java.lang.Class` is `cachedConstructor`, a reference; this read worked
+    // solely because `get_or_create_class_mirror` deliberately parks the
+    // ClassId there, and it was one of the readers that made that overlay
+    // load-bearing.
+    //
+    // The `object_num_fields == 0` guard went with it: a field count cannot
+    // tell a real mirror from a mock, and `mirror_class_id` answers `None` for
+    // both the empty-object and the no-such-mapping cases anyway.
+    let class_id = match crate::lang_class::mirror_class_id(ctx, mirror) {
+        Some(cid) => cid,
+        None => {
             ctx.set_field(sl, 1, Value::Object(Some(empty)));
             return empty;
         }
     };
-    let class_id = cratonvm_types::ClassId::new(class_id_val);
     let iface_name = match ctx.class_name_of_id(class_id) {
         Some(n) => n.replace('/', "."),
         None => {
@@ -7341,14 +7345,6 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
 // NOTE: HTTPS is supported via native-tls for TLS connections.
 // =============================================================================
 
-/// URI field indices (same layout as registered at line ~32569)
-const URI_SCHEME: usize = 0;
-const URI_HOST: usize = 1;
-const URI_PORT: usize = 2;
-const URI_PATH: usize = 3;
-const URI_QUERY: usize = 4;
-// field 5 = fragment, field 6 = raw — also useful for fallback
-
 /// HttpRequest field indices
 const HR_URI: usize = 0;
 const HR_METHOD: usize = 1;
@@ -7408,14 +7404,6 @@ pub(crate) fn register_s3_http_client(r: &mut NativeMethodRegistry) {
     ()
 }
 
-/// Extract a plain Rust String from a Java String field of an object, or return `None`.
-fn s3_read_str_field(ctx: &dyn NativeContext, obj: ObjectRef, field: usize) -> Option<String> {
-    match ctx.get_field(obj, field) {
-        Value::Object(Some(s)) => ctx.read_string(s),
-        _ => None,
-    }
-}
-
 /// Core HTTP/1.1 send implementation.
 fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use std::io::{Read, Write};
@@ -7434,22 +7422,26 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
 
     // ---- Extract URI components ----
-    let scheme = s3_read_str_field(ctx, uri_ref, URI_SCHEME)
+    //
+    // JDK-ONLY-LAYOUT: converted from raw slot indices to
+    // `net_phase_e::uri_components`. This block used to read a private
+    // `scheme=0, host=1, port=2, path=3, query=4` model — an exact duplicate of
+    // the one in `http2.rs` — which on a real `java.net.URI` names `scheme`,
+    // `fragment`, `authority`, `userInfo` and `host`. Only slot 0 was right,
+    // and the rest failed silently: a well-typed `String` from the wrong field.
+    let parts = crate::net_phase_e::uri_components(ctx, uri_ref);
+    let scheme = parts
+        .scheme
         .unwrap_or_else(|| "http".to_string())
         .to_lowercase();
-    let host = s3_read_str_field(ctx, uri_ref, URI_HOST).unwrap_or_default();
-    let port_field = ctx.get_field(uri_ref, URI_PORT).as_int().unwrap_or(-1);
-    let path = s3_read_str_field(ctx, uri_ref, URI_PATH).unwrap_or_else(|| "/".to_string());
-    let query = s3_read_str_field(ctx, uri_ref, URI_QUERY);
-
-    // If host is empty, try the raw URL string (field 6)
-    let (host, port_field, path, query, scheme) = if host.is_empty() {
-        // Fall back: parse raw URL
-        let raw = s3_read_str_field(ctx, uri_ref, 6).unwrap_or_default();
-        s3_parse_raw_url(&raw)
+    let host = parts.host.unwrap_or_default();
+    let port_field = parts.port;
+    let path = if parts.path.is_empty() {
+        "/".to_string()
     } else {
-        (host, port_field, path, query, scheme)
+        parts.path
     };
+    let query = parts.query;
 
     if host.is_empty() {
         return s3_stub_response(ctx, 400, "Cannot determine target host from URI");
@@ -7565,39 +7557,6 @@ fn s3_http_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     ctx.set_field(response, 2, Value::Object(None)); // headers not parsed
 
     Ok(Some(Value::Object(Some(response))))
-}
-
-/// Parse a raw URL string like "http://host:port/path?query" into components.
-/// Returns (host, port, path, query, scheme).
-fn s3_parse_raw_url(raw: &str) -> (String, i32, String, Option<String>, String) {
-    let (scheme, rest) = if let Some(pos) = raw.find("://") {
-        (raw[..pos].to_lowercase(), &raw[pos + 3..])
-    } else {
-        ("http".to_string(), raw)
-    };
-    let (authority, path_and_rest) = if let Some(pos) = rest.find('/') {
-        (&rest[..pos], &rest[pos..])
-    } else {
-        (rest, "/")
-    };
-    let (host, port) = if let Some(colon) = authority.rfind(':') {
-        if let Ok(p) = authority[colon + 1..].parse::<i32>() {
-            (authority[..colon].to_string(), p)
-        } else {
-            (authority.to_string(), -1i32)
-        }
-    } else {
-        (authority.to_string(), -1i32)
-    };
-    let (path, query) = if let Some(qmark) = path_and_rest.find('?') {
-        (
-            path_and_rest[..qmark].to_string(),
-            Some(path_and_rest[qmark + 1..].to_string()),
-        )
-    } else {
-        (path_and_rest.to_string(), None)
-    };
-    (host, port, path, query, scheme)
 }
 
 /// Extract HTTP status code from the first line of a response.

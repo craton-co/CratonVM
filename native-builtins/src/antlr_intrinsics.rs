@@ -6047,11 +6047,14 @@ fn antlr_alloc_common_token(
     let mut scope = NativeHandleScope::new(ctx);
     let source_h = antlr_root_value(&mut scope, source);
     let text_h = antlr_root_value(&mut scope, text);
-    let class_id = scope
-        .ensure_class_initialized(ANTLR_COMMON_TOKEN)
-        .or_else(|_| {
-            Ok::<ClassId, MethodCallFailed>(scope.ensure_synthetic_class(ANTLR_COMMON_TOKEN, 9))
-        })?;
+    let class_id = match scope.ensure_class_initialized(ANTLR_COMMON_TOKEN) {
+        Ok(id) => id,
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). `org.antlr`'s
+        // `CommonToken` is a dependency class, not a JDK one, so under
+        // `--jdk-only` fabricating a stand-in for it is exactly the
+        // substitution contract §5 refuses.
+        Err(_) => crate::util_concurrent_ext::refused_class(&mut *scope, ANTLR_COMMON_TOKEN, 9)?,
+    };
     let field_count = scope.class_num_total_fields(class_id).max(9);
     let token = scope.alloc_object(class_id, field_count);
     let token_h = scope.root(token);

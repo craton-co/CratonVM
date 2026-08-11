@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | OPEN — high severity, real crash |
 | **Discovered** | 2026-08-10, complete 651-class Tomcat suite run under `-XX:+UseG1GC`, 2 shards |
-| **Related** | [gc-moving-young-persistent-nonmoving-fallback-regression.md](gc-moving-young-persistent-nonmoving-fallback-regression.md) — same GC/JIT root-coverage condition, different (safe) consequence under the default generational collector |
+| **Related** | `fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md` — same GC/JIT root-coverage condition, different (safe) consequence under the default generational collector |
 
 ## Symptom
 
@@ -44,7 +44,7 @@ explicit line that names the mechanism directly:
 
 `innermost-rbp-belongs-to-unguarded-callee` is the exact reason string
 documented in
-[gc-moving-young-persistent-nonmoving-fallback-regression.md](gc-moving-young-persistent-nonmoving-fallback-regression.md)
+`fixed-suite-bugs/tomcat/gc-moving-young-persistent-nonmoving-fallback-regression-CLOSED.md`
 as the trigger for the default generational GC's persistent fallback to a
 non-moving sweep. Under the default GC, hitting this condition means the
 collector plays safe (skip compaction for that cycle) at a steep throughput

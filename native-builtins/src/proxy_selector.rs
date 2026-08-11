@@ -498,16 +498,49 @@ fn alloc_proxy(ctx: &mut dyn NativeContext, kind: i32, addr: Option<ObjectRef>) 
     Ok(p)
 }
 
+/// Does `list` have OUR two-slot `java/util/ArrayList` layout — `(size,
+/// elements)` — rather than the real class's?
+///
+/// Asked by NAME, for the reason [`has_synthetic_proxy_layout`] gives: a field
+/// count cannot separate the layouts. A real `java.util.ArrayList` declares
+/// `elementData`; a fabricated stub has `_fN` placeholders and does not.
+fn has_synthetic_list_layout(ctx: &mut dyn NativeContext, list: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(list);
+    !ctx
+        .declared_fields(class_id)
+        .iter()
+        .any(|f| !f.is_static && f.name == "elementData")
+}
+
+/// Build the `List<Proxy>` that `select(URI)` returns.
+///
+/// JDK-ONLY-LAYOUT (kind 2): this wrote `Int(size)` at slot 0 and the backing
+/// array at slot 1 — CratonVM's fabricated two-slot list model. A real
+/// `java.util.ArrayList` puts `modCount` at 0 (inherited from `AbstractList`),
+/// `elementData` at 1 and `size` at 2, so on a real image the count landed on
+/// `modCount` and `size` stayed 0. Measured 2026-08-10:
+/// `ProxySelector.getDefault().select(URI.create("http://example.com/"))`
+/// returned an EMPTY list where HotSpot returns `[DIRECT]`, and the caller's
+/// `get(0)` threw `IndexOutOfBoundsException`. There was no fault and no log
+/// line — the list was perfectly well-formed, it just had no elements.
 fn alloc_proxy_list(ctx: &mut dyn NativeContext, proxies: &[ObjectRef]) -> Result<ObjectRef, MethodCallFailed> {
-    // Build a synthetic ArrayList<Proxy>. We use the same shape the rest of
-    // the codebase does: 2 fields = (size, ref-array-storage).
     let list = try_alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2)?;
-    ctx.set_field(list, 0, Value::Int(proxies.len() as i32));
+    // Pin across the backing-array allocation: a moving young GC there would
+    // relocate the fresh list and leave this raw ref stale.
+    let list_pin = ctx.pin_native_root(list);
     let backing = ctx.new_ref_array(ClassId::new(0), proxies.len().max(1));
+    let list = ctx.read_native_pin(list_pin, list);
     for (i, p) in proxies.iter().enumerate() {
         ctx.set_array_element(backing, i, Value::Object(Some(*p)));
     }
-    ctx.set_field(list, 1, Value::Object(Some(backing)));
+    if has_synthetic_list_layout(ctx, list) {
+        ctx.set_field(list, 0, Value::Int(proxies.len() as i32));
+        ctx.set_field(list, 1, Value::Object(Some(backing)));
+    } else {
+        ctx.set_field_by_name(list, "elementData", Value::Object(Some(backing)));
+        ctx.set_field_by_name(list, "size", Value::Int(proxies.len() as i32));
+    }
+    ctx.unpin_native_roots(list_pin);
     Ok(list)
 }
 

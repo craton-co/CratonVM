@@ -173,37 +173,13 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
-        "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+        &format!("(Ljava/lang/String;)L{class};"),
         native_sb_append_string,
     );
     registry.register(
         class,
         "append",
-        "(Ljava/lang/String;)Ljava/lang/StringBuffer;",
-        native_sb_append_string,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/String;)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_string,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuilder;",
-        native_sb_append_charsequence,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/StringBuffer;)Ljava/lang/StringBuffer;",
-        native_sb_append_charsequence,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/StringBuffer;)Ljava/lang/AbstractStringBuilder;",
+        &format!("(Ljava/lang/StringBuffer;)L{class};"),
         native_sb_append_charsequence,
     );
     registry.register(
@@ -221,37 +197,13 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
-        "(I)Ljava/lang/StringBuilder;",
+        &format!("(I)L{class};"),
         native_sb_append_int,
     );
     registry.register(
         class,
         "append",
-        "(I)Ljava/lang/StringBuffer;",
-        native_sb_append_int,
-    );
-    registry.register(
-        class,
-        "append",
-        "(I)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_int,
-    );
-    registry.register(
-        class,
-        "append",
-        "(C)Ljava/lang/StringBuilder;",
-        native_sb_append_char,
-    );
-    registry.register(
-        class,
-        "append",
-        "(C)Ljava/lang/StringBuffer;",
-        native_sb_append_char,
-    );
-    registry.register(
-        class,
-        "append",
-        "(C)Ljava/lang/AbstractStringBuilder;",
+        &format!("(C)L{class};"),
         native_sb_append_char,
     );
     registry.register(
@@ -263,19 +215,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "appendCodePoint",
-        "(I)Ljava/lang/StringBuilder;",
-        native_sb_append_codepoint,
-    );
-    registry.register(
-        class,
-        "appendCodePoint",
-        "(I)Ljava/lang/StringBuffer;",
-        native_sb_append_codepoint,
-    );
-    registry.register(
-        class,
-        "appendCodePoint",
-        "(I)Ljava/lang/AbstractStringBuilder;",
+        &format!("(I)L{class};"),
         native_sb_append_codepoint,
     );
     // JDK 21+ `repeat(int codePoint, int count)` — intercept so it operates on
@@ -284,19 +224,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "repeat",
-        "(II)Ljava/lang/StringBuilder;",
-        native_sb_repeat_codepoint,
-    );
-    registry.register(
-        class,
-        "repeat",
-        "(II)Ljava/lang/StringBuffer;",
-        native_sb_repeat_codepoint,
-    );
-    registry.register(
-        class,
-        "repeat",
-        "(II)Ljava/lang/AbstractStringBuilder;",
+        &format!("(II)L{class};"),
         native_sb_repeat_codepoint,
     );
     registry.register(
@@ -308,127 +236,43 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
-        "([CII)Ljava/lang/StringBuilder;",
+        &format!("([CII)L{class};"),
         native_sb_append_char_array_off_len,
     );
     registry.register(
         class,
         "append",
-        "([CII)Ljava/lang/StringBuffer;",
-        native_sb_append_char_array_off_len,
-    );
-    registry.register(
-        class,
-        "append",
-        "([CII)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_char_array_off_len,
-    );
-    registry.register(
-        class,
-        "append",
-        "([C)Ljava/lang/StringBuilder;",
+        &format!("([C)L{class};"),
         native_sb_append_char_array,
     );
     registry.register(
         class,
         "append",
-        "([C)Ljava/lang/StringBuffer;",
-        native_sb_append_char_array,
-    );
-    registry.register(
-        class,
-        "append",
-        "([C)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_char_array,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Z)Ljava/lang/StringBuilder;",
+        &format!("(Z)L{class};"),
         native_sb_append_boolean,
     );
     registry.register(
         class,
         "append",
-        "(Z)Ljava/lang/StringBuffer;",
-        native_sb_append_boolean,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Z)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_boolean,
-    );
-    registry.register(
-        class,
-        "append",
-        "(J)Ljava/lang/StringBuilder;",
+        &format!("(J)L{class};"),
         native_sb_append_long,
     );
     registry.register(
         class,
         "append",
-        "(J)Ljava/lang/StringBuffer;",
-        native_sb_append_long,
-    );
-    registry.register(
-        class,
-        "append",
-        "(J)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_long,
-    );
-    registry.register(
-        class,
-        "append",
-        "(D)Ljava/lang/StringBuilder;",
+        &format!("(D)L{class};"),
         native_sb_append_double,
     );
     registry.register(
         class,
         "append",
-        "(D)Ljava/lang/StringBuffer;",
-        native_sb_append_double,
-    );
-    registry.register(
-        class,
-        "append",
-        "(D)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_double,
-    );
-    registry.register(
-        class,
-        "append",
-        "(F)Ljava/lang/StringBuilder;",
+        &format!("(F)L{class};"),
         native_sb_append_float,
     );
     registry.register(
         class,
         "append",
-        "(F)Ljava/lang/StringBuffer;",
-        native_sb_append_float,
-    );
-    registry.register(
-        class,
-        "append",
-        "(F)Ljava/lang/AbstractStringBuilder;",
-        native_sb_append_float,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
-        native_sb_append_object,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/Object;)Ljava/lang/StringBuffer;",
-        native_sb_append_object,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/Object;)Ljava/lang/AbstractStringBuilder;",
+        &format!("(Ljava/lang/Object;)L{class};"),
         native_sb_append_object,
     );
     // C36: intercept the (CharSequence, int, int) variants used by
@@ -438,19 +282,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
-        "(Ljava/lang/CharSequence;II)Ljava/lang/StringBuilder;",
-        native_sb_append_charsequence_off_len,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/CharSequence;II)Ljava/lang/StringBuffer;",
-        native_sb_append_charsequence_off_len,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/CharSequence;II)Ljava/lang/AbstractStringBuilder;",
+        &format!("(Ljava/lang/CharSequence;II)L{class};"),
         native_sb_append_charsequence_off_len,
     );
     registry.register(
@@ -462,19 +294,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "append",
-        "(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;",
-        native_sb_append_charsequence,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/CharSequence;)Ljava/lang/StringBuffer;",
-        native_sb_append_charsequence,
-    );
-    registry.register(
-        class,
-        "append",
-        "(Ljava/lang/CharSequence;)Ljava/lang/AbstractStringBuilder;",
+        &format!("(Ljava/lang/CharSequence;)L{class};"),
         native_sb_append_charsequence,
     );
     registry.register(
@@ -508,13 +328,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "appendCodePoint",
-        "(I)Ljava/lang/StringBuilder;",
-        native_sb_append_code_point,
-    );
-    registry.register(
-        class,
-        "appendCodePoint",
-        "(I)Ljava/lang/StringBuffer;",
+        &format!("(I)L{class};"),
         native_sb_append_code_point,
     );
     // BUG-TC0622: real-JDK bytecode (String.nonSyncContentEquals, reached via
@@ -528,13 +342,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "reverse",
-        "()Ljava/lang/StringBuilder;",
-        native_sb_reverse,
-    );
-    registry.register(
-        class,
-        "reverse",
-        "()Ljava/lang/StringBuffer;",
+        &format!("()L{class};"),
         native_sb_reverse,
     );
 
@@ -542,121 +350,55 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "insert",
-        "(ILjava/lang/String;)Ljava/lang/StringBuilder;",
+        &format!("(ILjava/lang/String;)L{class};"),
         native_sb_insert_string,
     );
     registry.register(
         class,
         "insert",
-        "(ILjava/lang/String;)Ljava/lang/StringBuffer;",
-        native_sb_insert_string,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(IC)Ljava/lang/StringBuilder;",
+        &format!("(IC)L{class};"),
         native_sb_insert_char,
     );
     registry.register(
         class,
         "insert",
-        "(IC)Ljava/lang/StringBuffer;",
-        native_sb_insert_char,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(II)Ljava/lang/StringBuilder;",
+        &format!("(II)L{class};"),
         native_sb_insert_int,
     );
     registry.register(
         class,
         "insert",
-        "(II)Ljava/lang/StringBuffer;",
-        native_sb_insert_int,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(ILjava/lang/Object;)Ljava/lang/StringBuilder;",
+        &format!("(ILjava/lang/Object;)L{class};"),
         native_sb_insert_object,
     );
     registry.register(
         class,
         "insert",
-        "(ILjava/lang/Object;)Ljava/lang/StringBuffer;",
-        native_sb_insert_object,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(I[CII)Ljava/lang/StringBuilder;",
+        &format!("(I[CII)L{class};"),
         native_sb_insert_char_array_off_len,
     );
     registry.register(
         class,
         "insert",
-        "(I[CII)Ljava/lang/StringBuffer;",
-        native_sb_insert_char_array_off_len,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(I[CII)Ljava/lang/AbstractStringBuilder;",
-        native_sb_insert_char_array_off_len,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(I[C)Ljava/lang/StringBuilder;",
-        native_sb_insert_char_array,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(I[C)Ljava/lang/StringBuffer;",
-        native_sb_insert_char_array,
-    );
-    registry.register(
-        class,
-        "insert",
-        "(I[C)Ljava/lang/AbstractStringBuilder;",
+        &format!("(I[C)L{class};"),
         native_sb_insert_char_array,
     );
     registry.register(
         class,
         "delete",
-        "(II)Ljava/lang/StringBuilder;",
-        native_sb_delete,
-    );
-    registry.register(
-        class,
-        "delete",
-        "(II)Ljava/lang/StringBuffer;",
+        &format!("(II)L{class};"),
         native_sb_delete,
     );
     registry.register(
         class,
         "deleteCharAt",
-        "(I)Ljava/lang/StringBuilder;",
-        native_sb_delete_char_at,
-    );
-    registry.register(
-        class,
-        "deleteCharAt",
-        "(I)Ljava/lang/StringBuffer;",
+        &format!("(I)L{class};"),
         native_sb_delete_char_at,
     );
     registry.register(
         class,
         "replace",
-        "(IILjava/lang/String;)Ljava/lang/StringBuilder;",
-        native_sb_replace,
-    );
-    registry.register(
-        class,
-        "replace",
-        "(IILjava/lang/String;)Ljava/lang/StringBuffer;",
+        &format!("(IILjava/lang/String;)L{class};"),
         native_sb_replace,
     );
     registry.register(class, "setCharAt", "(IC)V", native_sb_set_char_at);
@@ -752,25 +494,13 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     registry.register(
         class,
         "repeat",
-        "(Ljava/lang/CharSequence;I)Ljava/lang/StringBuffer;",
+        &format!("(Ljava/lang/CharSequence;I)L{class};"),
         native_sb_repeat_charsequence,
     );
     registry.register(
         class,
         "repeat",
-        "(Ljava/lang/CharSequence;I)Ljava/lang/AbstractStringBuilder;",
-        native_sb_repeat_charsequence,
-    );
-    registry.register(
-        class,
-        "repeat",
-        "(Ljava/lang/String;I)Ljava/lang/StringBuffer;",
-        native_sb_repeat_charsequence,
-    );
-    registry.register(
-        class,
-        "repeat",
-        "(Ljava/lang/String;I)Ljava/lang/AbstractStringBuilder;",
+        &format!("(Ljava/lang/String;I)L{class};"),
         native_sb_repeat_charsequence,
     );
     // Java 21: StringBuilder.repeat(int codePoint, int count). MUST be a native:
@@ -4306,7 +4036,11 @@ pub(crate) fn native_string_split_private(
 fn string_array_from_parts(ctx: &mut dyn NativeContext, parts: &[String]) -> MethodCallResult {
     let string_class_id = match ctx.ensure_class_initialized("java/lang/String") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/lang/String", 8),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3). `java.lang.String`
+        // is in every image, so this arm is unreachable on a working one; a run
+        // that reaches it has no `java.base`, and fabricating a `String`
+        // stand-in there is a second failure wearing the first one's name.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/lang/String", 8)?,
     };
     let arr = ctx.new_ref_array(string_class_id, parts.len());
     for (i, part) in parts.iter().enumerate() {
@@ -5064,7 +4798,11 @@ pub(crate) fn native_string_lines(ctx: &mut dyn NativeContext, args: &[Value]) -
     // Use the Stream pattern from collections
     let stream_class_id = match ctx.ensure_class_initialized("java/util/stream/Stream") {
         Ok(id) => id,
-        Err(_) => ctx.ensure_synthetic_class("java/util/stream/Stream", 1),
+        // Fallible since 2026-08-10 (JDK-only wave 2, step 3): a 1-field
+        // instance of the `java.util.stream.Stream` INTERFACE is a synthetic
+        // stream stand-in, which is precisely what a strict run must not get in
+        // place of `java.base`'s own pipeline.
+        Err(_) => crate::util_concurrent_ext::refused_class(ctx, "java/util/stream/Stream", 1)?,
     };
     let stream = ctx.alloc_object(stream_class_id, 1);
     let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), elements.len());

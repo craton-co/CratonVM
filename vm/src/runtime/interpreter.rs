@@ -765,12 +765,25 @@ fn resolve_native_for_dispatch(
         method_name,
         method_descriptor,
         Some((callback, kind)),
-        // JDK-ONLY-WAVE2: hard-coded `true` reproduces the pre-§7 "a registered
-        // native unconditionally wins here" of the `find` calls this replaces.
-        // Wave 2 replaces it with the real per-site compatibility verdict once
+        // JDK-ONLY-WAVE2 §10 — AUDITED 2026-08-06, not a live defect, and
+        // deliberately still a constant.
+        //
+        // The `true` reproduces the pre-§7 "a registered native unconditionally
+        // wins here" of the `find` calls this adapter replaced, and that is
+        // faithful rather than lazy: `resolve_native_dispatch_wave1` uses the
+        // flag only to choose between "the site preferred bytecode" and the
+        // kind-based ladder, and this site never preferred bytecode. The
+        // `NativeShadowsBytecode` observation a `false` would have produced is
+        // still recorded — by the `Bridge if bytecode_available` arm one level
+        // down — so nothing is lost from the report either.
+        //
+        // The record asks for "the real per-site compatibility verdict once
         // `force_native_over_real_jdk_bytecode` and the forced-native `String`
-        // list (both in `vm/src/runtime/interpreter/invoke.rs` /
-        // `vm/src/vm/vm_exec.rs`) are unified.
+        // list are unified". That unification is §11's exercise, not this
+        // site's: until those name lists collapse there is no per-site verdict
+        // to read, and inventing one here would be a THIRD answer for methods
+        // that already have two. Revisit when §11's Compatible-mode deletion
+        // lands; under `JdkOnly` the chain is already not consulted.
         true,
         bytecode_available,
     ) {

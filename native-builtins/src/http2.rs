@@ -715,36 +715,40 @@ fn init_websocket_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
 // Real HTTP/1.1 request helper
 // ---------------------------------------------------------------------------
 
-/// URI field layout (from phases_early.rs): scheme=0, host=1, port=2, path=3, query=4, fragment=5, raw=6
-const URI_SCHEME: usize = 0;
-const URI_HOST: usize = 1;
-const URI_PORT: usize = 2;
-const URI_PATH: usize = 3;
-
 /// Extract host, port, and path from a URI object.
+///
+/// JDK-ONLY-LAYOUT: converted from raw slot indices to
+/// [`crate::net_phase_e::uri_components`]. This function used to carry its own
+/// copy of the fabricated `scheme=0, host=1, port=2, path=3` URI model — the
+/// second of two identical copies, the other in `servlet.rs` — and on a real
+/// `java.net.URI` those indices are `fragment`, `authority` and `userInfo`. It
+/// read a well-typed `String` every time and it was the wrong one, so an HTTP
+/// request built from a real URI would dial the fragment as its host.
 fn extract_uri_parts(ctx: &dyn NativeContext, uri: ObjectRef) -> Option<(String, u16, String)> {
-    let host = match ctx.get_field(uri, URI_HOST) {
-        Value::Object(Some(s)) => ctx.read_string(s)?,
-        _ => return None,
+    let parts = crate::net_phase_e::uri_components(ctx, uri);
+    let host = parts.host?;
+    let port = if parts.port > 0 {
+        parts.port as u16
+    } else if parts.scheme.as_deref() == Some("https") {
+        443
+    } else {
+        80
     };
-    let port = match ctx.get_field(uri, URI_PORT) {
-        Value::Int(p) if p > 0 => p as u16,
-        _ => {
-            // Infer from scheme
-            match ctx.get_field(uri, URI_SCHEME) {
-                Value::Object(Some(s)) => match ctx.read_string(s).as_deref() {
-                    Some("https") => 443,
-                    _ => 80,
-                },
-                _ => 80,
-            }
-        }
-    };
-    let path = match ctx.get_field(uri, URI_PATH) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "/".to_string()),
-        _ => "/".to_string(),
+    let path = if parts.path.is_empty() {
+        "/".to_string()
+    } else {
+        parts.path
     };
     Some((host, port, path))
+}
+
+/// Does this URI's scheme call for TLS? Falls back to the port when the URI
+/// carries no scheme, which is what both call sites did through the raw slot.
+fn uri_wants_tls(ctx: &dyn NativeContext, uri: ObjectRef, port: u16) -> bool {
+    match crate::net_phase_e::uri_components(ctx, uri).scheme {
+        Some(s) => s == "https",
+        None => port == 443,
+    }
 }
 
 /// Maximum HTTP response body size (10 MB).
@@ -1050,10 +1054,7 @@ fn http2_send_async(
                     return Ok(Some(Value::Object(Some(cf))));
                 }
             };
-            let use_tls = match ctx.get_field(uri_obj, URI_SCHEME) {
-                Value::Object(Some(s)) => ctx.read_string(s).as_deref() == Some("https"),
-                _ => port == 443,
-            };
+            let use_tls = uri_wants_tls(ctx, uri_obj, port);
             // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body.
             ensure_no_dropped_payload(ctx, req)?;
             // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in request-line values.
@@ -1186,12 +1187,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
             };
 
             // Determine if TLS is needed based on URI scheme or port
-            let use_tls = match ctx.get_field(uri_obj, URI_SCHEME) {
-                Value::Object(Some(s)) => {
-                    ctx.read_string(s).as_deref() == Some("https")
-                }
-                _ => port == 443,
-            };
+            let use_tls = uri_wants_tls(ctx, uri_obj, port);
 
             // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body —
             // throw UnsupportedOperationException if the request carries either.
@@ -2055,8 +2051,14 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
     // uri() -> URI
     r.register(cls, "uri", "()Ljava/net/URI;", |ctx, _args| {
         let uri = try_alloc_concurrent_synthetic(ctx, "java/net/URI", 2)?;
-        ctx.set_field(uri, 0, Value::Int(0));
-        ctx.set_field(uri, 1, Value::Int(0));
+        // JDK-ONLY-LAYOUT: this placeholder wrote `Int(0)` into slots 0 and 1,
+        // which on a real `java.net.URI` are `scheme` and `fragment` — two
+        // reference fields taking a primitive. The object is a placeholder
+        // either way, so on a real layout it is simply left empty.
+        if crate::net_phase_e::uri_has_synthetic_layout(ctx, uri) {
+            ctx.set_field(uri, 0, Value::Int(0));
+            ctx.set_field(uri, 1, Value::Int(0));
+        }
         Ok(Some(Value::Object(Some(uri))))
     });
 

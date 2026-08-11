@@ -8,7 +8,7 @@
 //! reverse. That is a real signal, but it is only one of the ways a
 //! hand-numbered slot model goes wrong against a real JDK layout, and it is
 //! blind to the other two (see
-//! `docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`):
+//! `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`):
 //!
 //! * an `Int` written into the *wrong* `Int` slot type-checks and passes; and
 //! * a read of a slot whose real field is a different field entirely returns a
@@ -91,7 +91,7 @@ pub enum SlotVerdict {
     /// this index, so the VM's value is sitting on the JDK's storage.
     ///
     /// This is **kind 3** in
-    /// `docs/known-issues/jdk-only/fabricated-object-layouts-leak-into-native-code.md`,
+    /// `fixed-bugs/jdk-only-fabricated-object-layouts-FIXED-20260810.md`,
     /// and it is the one family a corrected model cannot fix: there is nowhere
     /// right to put the value, so it wants a side table (or an index anchored
     /// past the real field count, which reads back as
@@ -279,6 +279,123 @@ fn real_field_at_index<'a>(
         cid = cls.superclass;
     }
     None
+}
+
+/// One `JDK-ONLY-LAYOUT: safe` claim, made checkable.
+///
+/// A `safe` verdict in the marker sweep says "this raw slot index really is
+/// that field on the JDK we support". Every one of them was verified by a
+/// person reading `javap` once, and nothing in the build re-checked it — so a
+/// JDK upgrade that reorders a private field would not fail a test, it would
+/// silently corrupt an object. That is wave-2 step 4, and this is its type: the
+/// claim written down in a form the loaded image can contradict.
+///
+/// A claim names a field by index AND descriptor. The descriptor matters: two
+/// adjacent `int`s reorder without the name check noticing anything if only the
+/// type is compared, and two fields of different types can swap without the
+/// index moving.
+#[derive(Clone, Copy, Debug)]
+pub struct PositionalClaim {
+    /// Internal class name the claim is about.
+    pub class: &'static str,
+    /// Absolute instance-field index, which is what the raw access uses.
+    pub index: usize,
+    /// The field the code believes is at `index`.
+    pub name: &'static str,
+    /// Its declared descriptor.
+    pub descriptor: &'static str,
+    /// Where the claim is made, so a failure names the code to fix.
+    pub site: &'static str,
+}
+
+/// Every `JDK-ONLY-LAYOUT: safe` positional claim in the tree.
+///
+/// Adding a `safe` marker without adding its row here is the failure mode this
+/// table exists to prevent, and `every_safe_claim_names_a_real_site` keeps the
+/// two spellings from drifting into different vocabularies.
+pub const SAFE_POSITIONAL_CLAIMS: &[PositionalClaim] = &[
+    // `vm/src/vm/vm_object.rs:28` — the file-level anchor every `java/lang/String`
+    // slot literal in that file inherits. JDK 9+ compact strings.
+    PositionalClaim {
+        class: "java/lang/String",
+        index: 0,
+        name: "value",
+        descriptor: "[B",
+        site: "vm/src/vm/vm_object.rs String slot anchor",
+    },
+    PositionalClaim {
+        class: "java/lang/String",
+        index: 1,
+        name: "coder",
+        descriptor: "B",
+        site: "vm/src/vm/vm_object.rs String slot anchor",
+    },
+    PositionalClaim {
+        class: "java/lang/String",
+        index: 2,
+        name: "hash",
+        descriptor: "I",
+        site: "vm/src/vm/vm_object.rs String slot anchor",
+    },
+    PositionalClaim {
+        class: "java/lang/String",
+        index: 3,
+        name: "hashIsZero",
+        descriptor: "Z",
+        site: "vm/src/vm/vm_object.rs String slot anchor",
+    },
+    // `vm/src/vm/vm_util.rs` post-clinit fixups.
+    PositionalClaim {
+        class: "java/util/concurrent/atomic/AtomicInteger",
+        index: 0,
+        name: "value",
+        descriptor: "I",
+        site: "vm/src/vm/vm_util.rs ServiceContainerImpl fixup",
+    },
+    PositionalClaim {
+        class: "sun/text/normalizer/NormalizerBase$ModeImpl",
+        index: 0,
+        name: "normalizer2",
+        descriptor: "Lsun/text/normalizer/Normalizer2;",
+        site: "vm/src/vm/vm_util.rs NormalizerBase fixup",
+    },
+];
+
+/// Check every claim this table makes about `class_id`, against the layout the
+/// image actually declares.
+///
+/// Returns one message per BROKEN claim, empty when the class carries no claim
+/// or every claim holds. Callers report these unconditionally: the whole point
+/// is that a JDK upgrade is loud, so this must not sit behind a debug flag the
+/// way the census does.
+///
+/// A claim about a class that is itself a fabricated stub is skipped rather
+/// than failed — there is no image to contradict it, and `--jdk-only`'s own
+/// machinery is what refuses fabrication.
+#[must_use]
+pub fn check_positional_claims(store: &ClassStore, class_id: ClassId) -> Vec<String> {
+    let Some(class) = store.get(class_id) else {
+        return Vec::new();
+    };
+    if class.origin.is_compatibility_stub() {
+        return Vec::new();
+    }
+    let name = &*class.name;
+    let mut broken = Vec::new();
+    for claim in SAFE_POSITIONAL_CLAIMS.iter().filter(|c| c.class == name) {
+        match real_field_at_index(store, class_id, claim.index) {
+            Some(f) if &*f.name == claim.name && &*f.descriptor == claim.descriptor => {}
+            Some(f) => broken.push(format!(
+                "{} slot {} is `{}:{}` on this image, not `{}:{}` ({})",
+                name, claim.index, f.name, f.descriptor, claim.name, claim.descriptor, claim.site,
+            )),
+            None => broken.push(format!(
+                "{} slot {} does not exist on this image; `{}:{}` was assumed ({})",
+                name, claim.index, claim.name, claim.descriptor, claim.site,
+            )),
+        }
+    }
+    broken
 }
 
 /// Diff `model` (CratonVM's `synthetic_stub_fields` entry for the class) against
@@ -707,6 +824,102 @@ mod tests {
         assert!(rendered.contains("TYPE"), "{rendered}");
     }
 
+    /// Wave-2 step 4's non-vacuity check: the claim checker must go RED on a
+    /// layout that contradicts a claim, and green on the one it was written
+    /// against.
+    ///
+    /// Both halves matter. A checker that never fires is decoration, and one
+    /// that fires on the correct layout would have to be switched off the first
+    /// time it cried wolf.
+    #[test]
+    fn a_safe_positional_claim_is_checked_against_the_image() {
+        // JDK 9+ `java.lang.String`, in declaration order — what every claim
+        // about it asserts.
+        let mut store = ClassStore::new();
+        let cid = add_real(
+            &mut store,
+            "java/lang/String",
+            None,
+            vec![
+                field("value", "[B"),
+                field("coder", "B"),
+                field("hash", "I"),
+                field("hashIsZero", "Z"),
+            ],
+        );
+        assert!(
+            check_positional_claims(&store, cid).is_empty(),
+            "the claims must hold against the layout they were written for"
+        );
+
+        // Pre-9 `String`: `char[] value; int hash;`. Slot 1 is `hash`, not
+        // `coder` — the exact regression the marker's own text warns about.
+        let mut store = ClassStore::new();
+        let cid = add_real(
+            &mut store,
+            "java/lang/String",
+            None,
+            vec![field("value", "[C"), field("hash", "I")],
+        );
+        let broken = check_positional_claims(&store, cid);
+        assert_eq!(
+            broken.len(),
+            4,
+            "all four String claims should break on a pre-9 layout, got {broken:?}"
+        );
+        assert!(broken[0].contains("value"), "{broken:?}");
+        assert!(broken[1].contains("coder"), "{broken:?}");
+        assert!(
+            broken[3].contains("does not exist"),
+            "slot 3 is past a two-field layout: {broken:?}"
+        );
+
+        // A same-name, different-TYPE field must still break the claim: two
+        // ints reorder without a name check noticing.
+        let mut store = ClassStore::new();
+        let cid = add_real(
+            &mut store,
+            "java/util/concurrent/atomic/AtomicInteger",
+            None,
+            vec![field("value", "J")],
+        );
+        assert_eq!(check_positional_claims(&store, cid).len(), 1);
+    }
+
+    /// A class with no claim, and a fabricated stub, are both silent — so the
+    /// tripwire cannot become background noise on a synthetic boot.
+    #[test]
+    fn claims_are_silent_for_unclaimed_and_fabricated_classes() {
+        let mut store = ClassStore::new();
+        let cid = add_real(&mut store, "java/util/Fake", None, vec![field("a", "I")]);
+        assert!(check_positional_claims(&store, cid).is_empty());
+
+        let id = store.next_id();
+        let mut class = make_class(id, "java/lang/String", None, anon(1), 0, 1);
+        class.set_origin(crate::class_origin::ClassOrigin::compatibility_stub(
+            "test fixture",
+        ));
+        store.add(class);
+        assert!(
+            check_positional_claims(&store, id).is_empty(),
+            "a fabricated stub has no image to contradict a claim"
+        );
+    }
+
+    /// Every claim names a site and a plausible descriptor, and the table is
+    /// not empty — the cheapest way for step 4 to become vacuous is for
+    /// somebody to empty this table while the checker stays wired in.
+    #[test]
+    fn every_safe_claim_names_a_real_site() {
+        assert!(SAFE_POSITIONAL_CLAIMS.len() >= 6);
+        for c in SAFE_POSITIONAL_CLAIMS {
+            assert!(!c.class.is_empty() && c.class.contains('/'), "{c:?}");
+            assert!(!c.name.is_empty(), "{c:?}");
+            assert!(!c.descriptor.is_empty(), "{c:?}");
+            assert!(c.site.contains(".rs"), "a claim must name its code: {c:?}");
+        }
+    }
+
     #[test]
     fn anonymous_model_field_recognition() {
         assert!(is_anonymous_model_field("_f0"));
@@ -747,20 +960,10 @@ mod production_model_order_tests {
                 "java/util/Collections$SingletonMap",
                 &["_f0", "_f1", "k", "v"],
             ),
-            // java.io.Reader contributes lock, skipBuffer ahead of `in`.
-            // Slot 0 is `_vm0`, not `_f0`: `native_br_init` copies the wrapped
-            // reader's fd there, over `Reader.lock`.
-            ("java/io/BufferedReader", &["_vm0", "skipBuffer", "in"]),
-            // java.io.Writer contributes writeBuffer, lock ahead of `out`.
-            // Slot 0 is `_vm0`: `Files.newBufferedWriter` parks an fd there,
-            // over `Writer.writeBuffer`.
-            ("java/io/BufferedWriter", &["_vm0", "lock", "out"]),
-            // A real InputStreamReader/OutputStreamWriter declares NO `in`/`out`
-            // — the wrapped stream lives inside the StreamDecoder/StreamEncoder.
-            // The synthetic natives park one at slot 0 (and, for the reader,
-            // slot 1) anyway, so those slots are `_vmN`.
-            ("java/io/InputStreamReader", &["_vm0", "_vm1", "sd"]),
-            ("java/io/OutputStreamWriter", &["_vm0", "lock", "se"]),
+            // The java.io Reader/Writer chain is spelled differently in the two
+            // builds, so it is pinned by `reader_writer_models_match_the_build`
+            // below — a row here can only state one of the two.
+            //
             // Declaration order, NOT the CodeSource(URL, Certificate[]) ctor.
             ("java/security/CodeSource", &["location", "signers", "certs"]),
             // Fixed earlier the same day; pinned here so the whole family is
@@ -895,5 +1098,76 @@ mod production_model_order_tests {
             cases.len(),
             wrong.join("\n")
         );
+    }
+
+    /// The `java.io` Reader/Writer chain is the one family whose model is
+    /// `#[cfg]`-split, so it needs a per-build assertion rather than a row in
+    /// the table above.
+    ///
+    /// The split is load-bearing in BOTH directions and this pins both ends:
+    ///
+    /// * in the default build the four models must name the real JDK fields and
+    ///   carry NO `_vmN`. A `_vmN` here would be a claim that CratonVM parks a
+    ///   value on a JDK-owned slot, and after `bw_synthetic_fd` went behind the
+    ///   `synthetic-jdk` gate there is no writer and no reader left to do it.
+    ///   Re-introducing one without moving it off slot 0 fails here.
+    /// * under `synthetic-jdk` slot 0 (and, for `InputStreamReader`, slot 1)
+    ///   must STAY `_vmN`. That is where `native_isr_init`, `native_br_init`,
+    ///   `native_osw_init` and `native_bw_init` park an fd or a wrapped stream,
+    ///   and spelling it anonymously is how `Files.newBufferedWriter`'s fd read
+    ///   as an innocuous `pad` for a day.
+    ///
+    /// Slots 1 and 2 are the real names in both builds, which is what makes the
+    /// two lists comparable at a glance.
+    #[test]
+    fn reader_writer_models_match_the_build() {
+        #[cfg(not(feature = "synthetic-jdk"))]
+        let cases: &[(&str, &[&str])] = &[
+            ("java/io/InputStreamReader", &["lock", "skipBuffer", "sd"]),
+            ("java/io/BufferedReader", &["lock", "skipBuffer", "in"]),
+            ("java/io/OutputStreamWriter", &["writeBuffer", "lock", "se"]),
+            ("java/io/BufferedWriter", &["writeBuffer", "lock", "out"]),
+        ];
+        #[cfg(feature = "synthetic-jdk")]
+        let cases: &[(&str, &[&str])] = &[
+            ("java/io/InputStreamReader", &["_vm0", "_vm1", "sd"]),
+            ("java/io/BufferedReader", &["_vm0", "skipBuffer", "in"]),
+            ("java/io/OutputStreamWriter", &["_vm0", "lock", "se"]),
+            ("java/io/BufferedWriter", &["_vm0", "lock", "out"]),
+        ];
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (class, want) in cases {
+            let got = instance_names(class);
+            let got: Vec<&str> = got.iter().map(String::as_str).collect();
+            if got != *want {
+                wrong.push(format!("  {class}\n    model: {got:?}\n    want:  {want:?}"));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} java.io Reader/Writer models are wrong for this build \
+             (synthetic-jdk = {}):\n{}",
+            wrong.len(),
+            cases.len(),
+            cfg!(feature = "synthetic-jdk"),
+            wrong.join("\n")
+        );
+
+        // The non-vacuity half: in the default build the claim is specifically
+        // that NOTHING is parked, so no `_vmN` may appear anywhere in these four
+        // models — including at an index this test's prefix does not reach.
+        #[cfg(not(feature = "synthetic-jdk"))]
+        for (class, _) in cases {
+            let vm: Vec<String> = instance_names(class)
+                .into_iter()
+                .filter(|n| is_vm_internal_model_field(n))
+                .collect();
+            assert!(
+                vm.is_empty(),
+                "{class} still parks {vm:?} on a JDK-owned slot in the default \
+                 build; move the value or gate its writer on `synthetic-jdk`"
+            );
+        }
     }
 }
