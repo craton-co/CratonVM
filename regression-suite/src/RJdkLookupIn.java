@@ -163,10 +163,16 @@ public class RJdkLookupIn {
         eq(l.dropLookupMode(Lookup.PACKAGE).lookupModes(), 17, "dropLookupMode(PACKAGE)");
         eq(l.dropLookupMode(Lookup.MODULE).lookupModes(), 1, "dropLookupMode(MODULE)");
         eq(l.dropLookupMode(Lookup.PUBLIC).lookupModes(), 0, "dropLookupMode(PUBLIC)");
-        // dropLookupMode always drops ORIGINAL, even when the dropped bit is
-        // one the lookup does not hold.
-        eq(l.dropLookupMode(Lookup.UNCONDITIONAL).lookupModes(), 31,
-                "dropLookupMode(UNCONDITIONAL) still drops ORIGINAL");
+        // dropLookupMode's opening move is `oldModes & ~(modeToDrop | PROTECTED
+        // | ORIGINAL)` — PROTECTED and ORIGINAL come off for EVERY argument,
+        // including one the lookup does not hold. Dropping UNCONDITIONAL from
+        // a 95 lookup is therefore 27, not 31 and not 95: measured on OpenJDK
+        // 25, and the arm a "drop only what was named, plus ORIGINAL" model
+        // gets wrong while agreeing on all five of the lines above.
+        eq(l.dropLookupMode(Lookup.UNCONDITIONAL).lookupModes(), 27,
+                "dropLookupMode(UNCONDITIONAL) drops PROTECTED and ORIGINAL too");
+        eq(l.dropLookupMode(Lookup.ORIGINAL).lookupModes(), 27,
+                "dropLookupMode(ORIGINAL) drops PROTECTED too");
         System.out.println("CK RJdkLookupIn drop="
                 + l.dropLookupMode(Lookup.PRIVATE).lookupModes()
                 + "," + l.dropLookupMode(Lookup.PACKAGE).lookupModes()
