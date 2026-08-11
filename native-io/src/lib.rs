@@ -896,6 +896,80 @@ fn check_array_bounds(off: i32, len: i32, arr_len: usize) -> Result<(), MethodCa
     }
 }
 
+/// The `StringIndexOutOfBoundsException` `String.getChars` raises, which is how
+/// every `Writer.write(String, int, int)` bounds check is actually reached.
+fn writer_region_out_of_bounds(off: i32, begin: i64, end: i64, total: i64) -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::StringIndexOutOfBoundsException {
+            index: off,
+            message: Some(format!("begin {begin}, end {end}, length {total}")),
+        },
+    ))
+}
+
+/// Slice the `[off, off + len)` region of a `Writer.write(String, int, int)`
+/// argument, in the units the JDK counts.
+///
+/// Two things the call sites all had wrong before this existed.
+///
+/// **The check.** `java.io.Writer.write(String,int,int)` performs
+/// `str.getChars(off, (off + len), cbuf, 0)`, and `getChars`'
+/// `checkBoundsBeginEnd` refuses `begin < 0 || begin > end || end > length` —
+/// documented as "@throws IndexOutOfBoundsException ... if off is negative, or
+/// len is negative, or off + len is negative or greater than the length of the
+/// given string". The sites clamped with `.min(text.len())` instead, so
+/// `w.write(s, 0, 500)` on a 3-character string wrote 3 characters and returned
+/// normally: a caller that had mis-computed `len` saw a completed write and a
+/// short file, with nothing anywhere to say the two disagreed.
+///
+/// **The unit.** `off` and `len` are `String.length()` indices, i.e. UTF-16
+/// code units; `text.len()` is Rust BYTES. For any non-ASCII content the window
+/// silently moved, and `&text[off..end]` could land inside a multi-byte
+/// sequence and panic the VM rather than write the wrong text.
+fn writer_string_region(text: &str, off: i32, len: i32) -> Result<String, MethodCallFailed> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let total = units.len() as i64;
+    let begin = i64::from(off);
+    let end = begin + i64::from(len);
+    if begin < 0 || begin > end || end > total {
+        return Err(writer_region_out_of_bounds(off, begin, end, total));
+    }
+    Ok(String::from_utf16_lossy(&units[begin as usize..end as usize]))
+}
+
+/// The same region, under `java.io.BufferedWriter`'s deliberately weaker
+/// contract for this one overload — `Ok(None)` means "write nothing, raise
+/// nothing".
+///
+/// Its @implSpec: "While the specification of this method in the superclass
+/// recommends that an IndexOutOfBoundsException be thrown if len is negative or
+/// off + len is negative, the implementation in this class does not throw such
+/// an exception in these cases but instead simply writes no characters."
+/// Its @throws is still "IndexOutOfBoundsException If off is negative, or
+/// off + len is greater than the length of the given string", which is what the
+/// `while (b < t) { s.getChars(b, b + d, …) }` loop enforces when the region is
+/// non-empty. Keeping the two apart is the whole point: a single clamp deletes
+/// the mandated half along with the tolerated one.
+fn buffered_writer_string_region(
+    text: &str,
+    off: i32,
+    len: i32,
+) -> Result<Option<String>, MethodCallFailed> {
+    if len <= 0 {
+        return Ok(None);
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let total = units.len() as i64;
+    let begin = i64::from(off);
+    let end = begin + i64::from(len);
+    if begin < 0 || end > total {
+        return Err(writer_region_out_of_bounds(off, begin, end, total));
+    }
+    Ok(Some(String::from_utf16_lossy(
+        &units[begin as usize..end as usize],
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Native method implementations: java.io.File
 // ---------------------------------------------------------------------------
@@ -2807,20 +2881,24 @@ fn native_osw_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => String::new(),
     };
     let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
-        _ => text.len(),
+        Some(Value::Int(l)) => *l,
+        _ => text.encode_utf16().count() as i32,
     };
+    // `OutputStreamWriter` inherits `Writer`'s bounds contract unweakened (it
+    // is `BufferedWriter` that documents the exception below it away), so the
+    // strict helper applies. Check BEFORE touching the fd: the JDK's
+    // `getChars` runs before anything is handed to the encoder, so a rejected
+    // region must leave the stream untouched.
+    let sub = writer_string_region(&text, off, len)?;
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let end = (off + len).min(text.len());
-    let sub = &text[off..end];
-    ctx.fd_table().write_string(fd, sub).map_err(io_err)?;
+    ctx.fd_table().write_string(fd, &sub).map_err(io_err)?;
     Ok(None)
 }
 
@@ -2846,8 +2924,18 @@ fn native_osw_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().flush(fd);
+    // The FLUSH is reported, the CLOSE is not, and the asymmetry is the point.
+    // `Writer.close()` is specified "Closes the stream, flushing it first ...
+    // @throws IOException If an I/O error occurs", so the buffered bytes
+    // failing to reach the disk on the way out — a full volume, a broken pipe
+    // — is the caller's to hear about; `let _ =` on it meant a
+    // `try (Writer w = …) { w.write(everything); }` block exited cleanly with
+    // the tail of the file missing. Releasing the descriptor afterwards stays
+    // best-effort and unconditional: "Closing a previously closed stream has
+    // no effect", and a leaked fd would outlive the error either way.
+    let flushed = ctx.fd_table().flush(fd);
     let _ = ctx.fd_table().close(fd);
+    flushed.map_err(io_err)?;
     Ok(None)
 }
 
@@ -2881,20 +2969,26 @@ fn native_bw_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => String::new(),
     };
     let off = match args.get(2) {
-        Some(Value::Int(o)) => *o as usize,
+        Some(Value::Int(o)) => *o,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(l)) => *l as usize,
-        _ => text.len(),
+        Some(Value::Int(l)) => *l,
+        _ => text.encode_utf16().count() as i32,
+    };
+    // The WEAK half of the pair — `BufferedWriter` is the one class that
+    // documents the negative-`len` exception away, so `None` here is a
+    // spec-mandated no-op rather than a swallowed refusal. Everything else
+    // (`off < 0`, or a region running past the end) still throws.
+    let sub = match buffered_writer_string_region(&text, off, len)? {
+        Some(s) => s,
+        None => return Ok(None),
     };
     let fd = match ctx.get_field(this, 0) {
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let end = (off + len).min(text.len());
-    let sub = &text[off..end];
-    ctx.fd_table().write_string(fd, sub).map_err(io_err)?;
+    ctx.fd_table().write_string(fd, &sub).map_err(io_err)?;
     Ok(None)
 }
 
@@ -2953,8 +3047,12 @@ fn native_bw_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Value::Int(fd) => fd as FdId,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().flush(fd);
+    // Same split as `native_osw_close`: the real class closes with
+    // `try (Writer w = out) { flushBuffer(); }`, so the final flush's failure
+    // propagates and the descriptor is released either way.
+    let flushed = ctx.fd_table().flush(fd);
     let _ = ctx.fd_table().close(fd);
+    flushed.map_err(io_err)?;
     Ok(None)
 }
 
@@ -6248,7 +6346,12 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
                     Value::Int(fd) => fd as u32,
                     _ => return Ok(None),
                 };
-                let _ = ctx.fd_table().write_string(fd, &text);
+                // `let _ =` here made `FileWriter.write(String)` the only
+                // write in this crate that could not fail: "@throws IOException
+                // If an I/O error occurs" (`Writer.write(String)`), and a
+                // caller that got no exception has been told the characters
+                // are in the file.
+                ctx.fd_table().write_string(fd, &text).map_err(io_err)?;
                 Ok(None)
             },
         );
@@ -6267,19 +6370,24 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
                     _ => String::new(),
                 };
                 let off = match args.get(2) {
-                    Some(Value::Int(v)) => *v as usize,
+                    Some(Value::Int(v)) => *v,
                     _ => 0,
                 };
                 let len = match args.get(3) {
-                    Some(Value::Int(v)) => *v as usize,
-                    _ => text.len(),
+                    Some(Value::Int(v)) => *v,
+                    _ => text.encode_utf16().count() as i32,
                 };
+                // `FileWriter` extends `OutputStreamWriter` and does not
+                // redeclare this method, so `Writer`'s unweakened bounds
+                // contract applies — see `writer_string_region`. Clamping BOTH
+                // ends made `fw.write(s, 0, s.length() + 1)` write the whole
+                // string and return normally.
+                let sub = writer_string_region(&text, off, len)?;
                 let fd = match ctx.get_field(this, 0) {
                     Value::Int(fd) => fd as u32,
                     _ => return Ok(None),
                 };
-                let sub = &text[off.min(text.len())..(off + len).min(text.len())];
-                let _ = ctx.fd_table().write_string(fd, sub);
+                ctx.fd_table().write_string(fd, &sub).map_err(io_err)?;
                 Ok(None)
             },
         );
@@ -8074,9 +8182,22 @@ fn native_bb_set_position(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => 0,
     };
     let lim = buf_read_limit(ctx, this);
-    let clamped = new_pos.clamp(0, lim);
-    buf_set_position(ctx, this, clamped);
-    if buf_read_mark(ctx, this) > clamped {
+    // `java.nio.Buffer.position(int)` range-CHECKS, it does not clamp:
+    // "if (newPosition > limit | newPosition < 0) throw
+    // createPositionException(newPosition)", specified as "@throws
+    // IllegalArgumentException If the preconditions on newPosition do not
+    // hold". `new_pos.clamp(0, lim)` returned `this` for every out-of-range
+    // call, so a caller that mis-computed an offset got a buffer silently
+    // parked at `limit` (or 0) and read the wrong bytes from it, instead of
+    // the exception that names the bad offset.
+    if new_pos < 0 || new_pos > lim {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("newPosition {new_pos} out of range [0, {lim}]"),
+        }
+        .into());
+    }
+    buf_set_position(ctx, this, new_pos);
+    if buf_read_mark(ctx, this) > new_pos {
         buf_set_mark(ctx, this, -1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -8106,12 +8227,24 @@ fn native_bb_set_limit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     } else {
         0
     };
-    let clamped = new_lim.clamp(0, cap);
-    buf_set_limit(ctx, this, clamped);
-    if buf_read_position(ctx, this) > clamped {
-        buf_set_position(ctx, this, clamped);
+    // Same contract as `position(int)` one function up:
+    // "if (newLimit > capacity | newLimit < 0) throw
+    // createLimitException(newLimit)", "@throws IllegalArgumentException If
+    // the preconditions on newLimit do not hold". A clamped `limit(cap + 1)`
+    // is the more dangerous of the pair — it hands back a buffer whose
+    // `remaining()` is smaller than the caller asked for, so the short read
+    // that follows reads as a short read from the CHANNEL.
+    if new_lim < 0 || new_lim > cap {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("newLimit {new_lim} out of range [0, {cap}]"),
+        }
+        .into());
     }
-    if buf_read_mark(ctx, this) > clamped {
+    buf_set_limit(ctx, this, new_lim);
+    if buf_read_position(ctx, this) > new_lim {
+        buf_set_position(ctx, this, new_lim);
+    }
+    if buf_read_mark(ctx, this) > new_lim {
         buf_set_mark(ctx, this, -1);
     }
     Ok(Some(Value::Object(Some(this))))
@@ -9501,9 +9634,28 @@ fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(s) => s,
         None => return Err(ioe_stream_closed()),
     };
-    let remaining = (state.units.len() - state.pos) as i64;
-    let skip = n.clamp(0, remaining);
-    state.pos = (state.pos as i64 + skip) as usize;
+    // `StringReader.skip` is the one `skip` in `java.io` that accepts a
+    // negative argument, and the lower half of `n.clamp(0, remaining)` deleted
+    // that whole half of the contract: "The n parameter may be negative, even
+    // though the skip method of the Reader superclass throws an exception in
+    // this case. Negative values of n cause the stream to skip backwards.
+    // Negative return values indicate a skip backwards. It is not possible to
+    // skip backwards past the beginning of the string."
+    //
+    // Clamping to 0 answered "skipped nothing" — a legal, unremarkable return
+    // — for a rewind the caller had every right to expect, so a lookahead
+    // parser that skips forward and then backs up read the same region twice
+    // rather than the region before it. The real body is
+    // `r = Math.min(length - next, n); r = Math.max(-next, r);` behind the
+    // "If the entire string has been read or skipped, then this method has no
+    // effect and always returns 0" guard, which is what this now mirrors.
+    let pos = state.pos as i64;
+    let length = state.units.len() as i64;
+    if pos >= length {
+        return Ok(Some(Value::Long(0)));
+    }
+    let skip = (length - pos).min(n).max(-pos);
+    state.pos = (pos + skip) as usize;
     Ok(Some(Value::Long(skip)))
 }
 
@@ -12664,10 +12816,14 @@ fn native_raf_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Int(-1))),
     };
     let mut buf = [0u8; 1];
+    // Same as `native_raf_read_bulk`: `-1` is `RandomAccessFile.read()`'s
+    // "the end of the file has been reached", and the method separately
+    // declares "@throws IOException if an I/O error occurs". Answering EOF for
+    // a failed read merges the two states the contract keeps apart.
     match ctx.fd_table().rw_read(fd, &mut buf) {
         Ok(0) => Ok(Some(Value::Int(-1))),
         Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
-        Err(_) => Ok(Some(Value::Int(-1))),
+        Err(e) => Err(io_err(e)),
     }
 }
 
@@ -12696,10 +12852,17 @@ fn native_raf_read_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return Ok(Some(Value::Int(0)));
     }
     let mut tmp = vec![0u8; len];
+    // `Err(_) => -1` reported an I/O FAILURE as end-of-file, the one value a
+    // read loop is built to stop on: "@return the total number of bytes read
+    // into the buffer, or -1 if there is no more data because the end of the
+    // file has been reached" (`RandomAccessFile.read(byte[],int,int)`), which
+    // also declares "@throws IOException If the first byte cannot be read for
+    // any reason other than end of file". A caller cannot tell the two apart,
+    // so a truncated read looked like a complete file.
     let n = match ctx.fd_table().rw_read(fd, &mut tmp) {
         Ok(0) => return Ok(Some(Value::Int(-1))),
         Ok(n) => n,
-        Err(_) => return Ok(Some(Value::Int(-1))),
+        Err(e) => return Err(io_err(e)),
     };
     for i in 0..n {
         ctx.set_array_element(buf, off + i, Value::Int(tmp[i] as i8 as i32));
@@ -12720,7 +12883,12 @@ fn native_raf_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().rw_write(fd, &[b]);
+    // Every `RandomAccessFile` write in this file declares "@throws IOException
+    // if an I/O error occurs" and returns void — the exception is the ONLY
+    // channel it has, so `let _ =` left the method literally unable to report
+    // anything. A record-appending loop against a full volume completed
+    // silently.
+    ctx.fd_table().rw_write(fd, &[b]).map_err(io_err)?;
     Ok(None)
 }
 
@@ -12751,7 +12919,7 @@ fn native_raf_write_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             bytes.push(b as u8);
         }
     }
-    let _ = ctx.fd_table().rw_write(fd, &bytes);
+    ctx.fd_table().rw_write(fd, &bytes).map_err(io_err)?;
     Ok(None)
 }
 
@@ -12771,13 +12939,28 @@ fn native_raf_seek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
         _ => 0,
     };
+    // `RandomAccessFile.seek(long)`: "@throws IOException if pos is less than 0
+    // or if an I/O error occurs." Note the refusal is an `IOException` here,
+    // not the `IllegalArgumentException` `FileChannel.position(long)` raises
+    // for the same input — the two classes genuinely differ, so this cannot be
+    // shared with the channel-side check. `pos.max(0)` answered a successful
+    // seek to the start of the file, which is exactly what commons-compress's
+    // seek-from-EOF arithmetic produces when its length source is wrong: the
+    // next `read` then returned the FIRST record instead of the one asked for.
+    if pos < 0 {
+        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IOException {
+                message: format!("Negative seek offset: {pos}"),
+            },
+        )));
+    }
     let fd = match ctx.get_field(this, RAF_FIELD_FD) {
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx
-        .fd_table()
-        .rw_seek(fd, std::io::SeekFrom::Start(pos.max(0) as u64));
+    ctx.fd_table()
+        .rw_seek(fd, std::io::SeekFrom::Start(pos as u64))
+        .map_err(io_err)?;
     Ok(None)
 }
 
@@ -12867,7 +13050,12 @@ fn native_raf_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().write_bytes(fd, &v.to_be_bytes());
+    // `DataOutput.writeInt`/`writeLong` are void and declare "@throws
+    // IOException if an I/O error occurs"; discarding the result left them
+    // unable to say anything but success. See `native_raf_write`.
+    ctx.fd_table()
+        .write_bytes(fd, &v.to_be_bytes())
+        .map_err(io_err)?;
     Ok(None)
 }
 
@@ -12884,7 +13072,12 @@ fn native_raf_write_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Value::Int(v) => v as u32,
         _ => return Ok(None),
     };
-    let _ = ctx.fd_table().write_bytes(fd, &v.to_be_bytes());
+    // `DataOutput.writeInt`/`writeLong` are void and declare "@throws
+    // IOException if an I/O error occurs"; discarding the result left them
+    // unable to say anything but success. See `native_raf_write`.
+    ctx.fd_table()
+        .write_bytes(fd, &v.to_be_bytes())
+        .map_err(io_err)?;
     Ok(None)
 }
 
@@ -17447,10 +17640,24 @@ fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         };
     }
 
+    // `AsynchronousFileChannel.truncate(long)` carries the same clause as its
+    // synchronous twin: "@throws IllegalArgumentException If the new size is
+    // negative". Note where this check has to sit — AFTER the closed and
+    // not-writable refusals above, because the JDK checks those first and a
+    // caller distinguishing the three by type would otherwise see the wrong
+    // one. `(*v).max(0)` truncated the file to EMPTY for a negative size and
+    // returned the channel as though that had been the request.
     let new_len = match args.get(1) {
-        Some(Value::Long(v)) => (*v).max(0) as u64,
+        Some(Value::Long(v)) => *v,
         _ => 0,
     };
+    if new_len < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("Negative size: {new_len}"),
+        }
+        .into());
+    }
+    let new_len = new_len as u64;
     // STW-TAKEOVER guard -- see the matching comment in native_afc_read.
     // `this` isn't touched again after this call, but the ObjectRef we
     // ultimately return must reflect any relocation from a GC that ran
