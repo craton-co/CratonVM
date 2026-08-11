@@ -821,6 +821,70 @@ impl JvmThread {
     ) {
         // Split the frame's inner Vecs out of it exactly once.
         let (local_vals, local_tags, stack_vals, stack_tags) = frame.take_pool_parts();
+        self.route_pool_parts(
+            local_vals,
+            local_tags,
+            stack_vals,
+            stack_tags,
+            operand_stack_pool,
+            tag_pool,
+        );
+    }
+
+    /// [`Self::recycle_frame_with_shared`] for a frame that is still sitting in
+    /// its `FrameStack` slot: harvest its four pooled `Vec`s in place, then let
+    /// `FrameStack::truncate` drop the husk where it lies.
+    ///
+    /// # Why
+    ///
+    /// `Frame` is a ~300-byte by-value struct and the return path used to move
+    /// it three times — out of the buffer (`FrameStack::pop`), into
+    /// `recycle_frame_with_shared`, and again into `take_pool_parts` — to
+    /// arrive at four `Vec` headers. `perf` on the interpreted-invoke probe put
+    /// `memcpy` under `Vec::pop<Frame>` and `pop_and_recycle_frame_with_reason`
+    /// at 6.97% of the invoke arm, inside a frame-lifecycle group worth ~24.7%
+    /// of it. See
+    /// `known-issues/tomcat/!webapp-deploy-annotation-scan-interpreted-226x.md`.
+    ///
+    /// Returns `false` when there was no frame to pop, so callers keep the
+    /// `if let Some(..)` shape the `pop()` form gave them.
+    pub fn recycle_top_frame_in_place(
+        &mut self,
+        operand_stack_pool: &crate::runtime::alloc_fastpath::VecPool<u64>,
+        tag_pool: &crate::runtime::alloc_fastpath::VecPool<u8>,
+    ) -> bool {
+        let depth = self.frames.len();
+        let Some(top) = self.frames.last_mut() else {
+            return false;
+        };
+        let (local_vals, local_tags, stack_vals, stack_tags) = top.take_pool_parts_in_place();
+        // `truncate` runs `Drop` on the element where it sits and never moves a
+        // surviving frame — the address-stability contract `FrameStack` exists
+        // for. The husk's remaining fields (metadata `Arc`s, `monitor_on_exit`)
+        // are released by that drop exactly as they were by the old move.
+        self.frames.truncate(depth - 1);
+        self.route_pool_parts(
+            local_vals,
+            local_tags,
+            stack_vals,
+            stack_tags,
+            operand_stack_pool,
+            tag_pool,
+        );
+        true
+    }
+
+    /// Thread-local pool first, VM-wide pools once it is full. Shared by both
+    /// recycle entry points so the routing policy cannot drift between them.
+    fn route_pool_parts(
+        &mut self,
+        local_vals: Vec<u64>,
+        local_tags: Vec<u8>,
+        stack_vals: Vec<u64>,
+        stack_tags: Vec<u8>,
+        operand_stack_pool: &crate::runtime::alloc_fastpath::VecPool<u64>,
+        tag_pool: &crate::runtime::alloc_fastpath::VecPool<u8>,
+    ) {
         if self.locals_pool.len() < MAX_POOL_SIZE {
             self.locals_pool.push((local_vals, local_tags));
             self.stacks_pool.push((stack_vals, stack_tags));
