@@ -9799,6 +9799,25 @@ pub struct JitCache {
     /// arms every cache, while a *test* flushing its own `JitCache` cannot
     /// refuse a concurrent test's publication into a different one.
     flush_barrier: std::sync::atomic::AtomicU64,
+    /// Every class name that appears in some published body's
+    /// [`CompiledMethod::inlined_methods`] — an over-approximation, and
+    /// deliberately so.
+    ///
+    /// `invalidate_for_class` and `invalidate_for_class_change` match ONLY on
+    /// `inlined_methods`, and they run on every class definition. Almost no
+    /// definition invalidates a CHA assumption, so almost every call walked all
+    /// 128 shards' method and OSR maps to conclude nothing. `invalidate_matching`
+    /// already bails before its three *later* whole-cache passes once the match
+    /// set comes back empty; this is the same argument moved in front of the
+    /// scan that produces it.
+    ///
+    /// Over-approximate is the safe direction: a name in this set only means
+    /// the scan runs, which is the old behaviour. A name absent from it means no
+    /// published body names that class, so the predicate is false everywhere and
+    /// the scan could only have returned 0. Entries are therefore never removed
+    /// on eviction — only [`Self::clear_all`] empties it, alongside the maps it
+    /// summarises.
+    inlined_class_names: parking_lot::Mutex<std::collections::HashSet<Arc<str>>>,
 }
 
 static JIT_ENTRY_OWNERS: std::sync::OnceLock<
@@ -10434,7 +10453,30 @@ impl JitCache {
             invoke_info_arena: parking_lot::Mutex::new(Vec::new()),
             // Never flushed: every artifact is at or above epoch 1.
             flush_barrier: std::sync::atomic::AtomicU64::new(0),
+            inlined_class_names: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Record the classes `compiled` inlined from, so a later
+    /// `invalidate_for_class` naming a class nobody inlined can answer without
+    /// a scan. See [`Self::inlined_class_names`].
+    fn note_inlined_classes(&self, compiled: &CompiledMethod) {
+        if compiled.inlined_methods.is_empty() {
+            return;
+        }
+        let mut names = self.inlined_class_names.lock();
+        for (class_name, _, _) in &compiled.inlined_methods {
+            if !names.contains(class_name.as_str()) {
+                names.insert(Arc::from(class_name.as_str()));
+            }
+        }
+    }
+
+    /// Could any published body have inlined from `class_name`? A `false` here
+    /// is a proof that an `inlined_methods`-only invalidation would find
+    /// nothing.
+    fn any_body_inlined_from(&self, class_name: &str) -> bool {
+        self.inlined_class_names.lock().contains(class_name)
     }
 
     /// Compatibility accessors for callers written against the historical
@@ -10647,6 +10689,11 @@ flushed at epoch {barrier}",
             // later invocation, by which time the callee has a live body.
             return;
         }
+        // Record what this body inlined BEFORE it is shared, so a class
+        // definition racing this publication cannot conclude "nobody inlined
+        // from me" against a set that does not yet name it. Both run under
+        // `mutation`, so the ordering here is what makes the early-out sound.
+        self.note_inlined_classes(&compiled);
         // Stamp the declaring class before the artifact is shared: it is what
         // `JitEntryGuard` reads to keep this class's defining loader alive
         // while one of these frames is on a stack.
@@ -10739,7 +10786,8 @@ flushed at epoch {barrier}",
             // later invocation, by which time the callee has a live body.
             return;
         }
-        // See the matching note in `put`.
+        // See the matching notes in `put`.
+        self.note_inlined_classes(&compiled);
         compiled.owner_class_id = declaring_class_id.as_u32();
         compiled._buffer.mark_published();
         let arc = Arc::new(compiled);
@@ -10811,6 +10859,11 @@ flushed at epoch {barrier}",
     ///
     /// Returns the number of evicted entries.
     pub fn invalidate_for_class_change(&self, changed_class: &str) -> usize {
+        // See `inlined_class_names`: nobody inlined it, so nothing can match,
+        // and the scan below would walk every shard to say 0.
+        if !self.any_body_inlined_from(changed_class) {
+            return 0;
+        }
         self.invalidate_matching(|_, cm| {
             cm.inlined_methods
                 .iter()
@@ -10821,6 +10874,9 @@ flushed at epoch {barrier}",
     /// Invalidate all compiled methods that inlined code from `class_name`.
     /// Returns the number of methods evicted.
     pub fn invalidate_for_class(&self, class_name: &str) -> usize {
+        if !self.any_body_inlined_from(class_name) {
+            return 0;
+        }
         self.invalidate_matching(|_, compiled| {
             compiled
                 .inlined_methods
@@ -10993,6 +11049,8 @@ flushed at epoch {barrier}",
         let barrier = bump_jit_install_epoch();
         self.flush_barrier
             .fetch_max(barrier, std::sync::atomic::Ordering::AcqRel);
+        // The maps this set summarises are about to be emptied.
+        self.inlined_class_names.lock().clear();
         let mut count = 0;
         for shard in self.shards.iter() {
             for map in [shard.methods.load(), shard.osr_methods.load()] {
@@ -27338,5 +27396,114 @@ mod code_cache_lifetime_tests {
                 "bisect-only with an unmatched prefix must force {c}.{m} interpreted"
             );
         }
+    }
+}
+
+/// The `inlined_class_names` early-out must be a shortcut, never a change of
+/// answer.
+///
+/// `invalidate_for_class` runs on EVERY class definition and almost never
+/// matches, so it now refuses before scanning when no published body names the
+/// class. That is only sound while the set is a true over-approximation of what
+/// the maps contain, and the failure mode if it is not — a real CHA
+/// invalidation silently skipped, leaving a devirtualised call bound to a
+/// method that now has a second implementor — is a miscompile, not a slowdown.
+/// So each case below is the equivalence, not the speed.
+#[cfg(test)]
+mod invalidate_early_out {
+    use super::*;
+
+    fn body(inlined: &[(&str, &str, &str)]) -> CompiledMethod {
+        let mut cm = CompiledMethod::new(ExecutableBuffer::new(64).unwrap());
+        cm.inlined_methods = inlined
+            .iter()
+            .map(|(c, m, d)| (c.to_string(), m.to_string(), d.to_string()))
+            .collect();
+        cm
+    }
+
+    const CID: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0);
+
+    #[test]
+    fn a_class_that_was_inlined_still_evicts() {
+        let cache = JitCache::new();
+        cache.put("Caller".into(), "a".into(), "()V".into(), CID, body(&[]));
+        cache.put(
+            "Caller".into(),
+            "b".into(),
+            "()V".into(),
+            CID,
+            body(&[("Helper", "getX", "()I")]),
+        );
+        assert_eq!(
+            cache.invalidate_for_class("Helper"),
+            1,
+            "the early-out swallowed a real CHA invalidation"
+        );
+    }
+
+    #[test]
+    fn a_class_nobody_inlined_returns_zero_without_scanning() {
+        let cache = JitCache::new();
+        cache.put(
+            "Caller".into(),
+            "b".into(),
+            "()V".into(),
+            CID,
+            body(&[("Alpha", "foo", "()V")]),
+        );
+        assert_eq!(cache.invalidate_for_class("Beta"), 0);
+        assert_eq!(cache.len(), 1, "a non-matching invalidation evicted a body");
+    }
+
+    /// The set is only ever added to, so a body that is evicted leaves its
+    /// class name behind. That must degrade to "scan and find nothing", not to
+    /// a wrong answer.
+    #[test]
+    fn a_stale_name_costs_a_scan_and_still_answers_zero() {
+        let cache = JitCache::new();
+        cache.put(
+            "Caller".into(),
+            "b".into(),
+            "()V".into(),
+            CID,
+            body(&[("Helper", "getX", "()I")]),
+        );
+        assert_eq!(cache.invalidate_for_class("Helper"), 1);
+        // "Helper" is still in the name set; the cache no longer holds it.
+        assert_eq!(cache.invalidate_for_class("Helper"), 0);
+    }
+
+    /// `invalidate_unloaded_class` ALSO matches on `declaring_class_id`, which
+    /// the name set says nothing about. It deliberately has no early-out, and a
+    /// future edit that gives it one by symmetry would drop every body whose
+    /// class was unloaded without ever having been inlined from.
+    #[test]
+    fn unloaded_class_eviction_does_not_depend_on_the_inlined_name_set() {
+        let cache = JitCache::new();
+        let owner = cratonvm_types::ClassId::new(7);
+        cache.put("Doomed".into(), "m".into(), "()V".into(), owner, body(&[]));
+        assert_eq!(
+            cache.invalidate_unloaded_class(owner, "Doomed"),
+            1,
+            "an unloaded class's own body survived: `invalidate_unloaded_class` \
+             matches by declaring_class_id and must not be gated on the \
+             inlined-name set"
+        );
+    }
+
+    #[test]
+    fn clear_all_empties_the_name_set_with_the_maps() {
+        let cache = JitCache::new();
+        cache.put(
+            "Caller".into(),
+            "b".into(),
+            "()V".into(),
+            CID,
+            body(&[("Helper", "getX", "()I")]),
+        );
+        cache.clear_all();
+        assert!(!cache.any_body_inlined_from("Helper"));
+        assert_eq!(cache.invalidate_for_class("Helper"), 0);
     }
 }
