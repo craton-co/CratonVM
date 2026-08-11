@@ -155,10 +155,29 @@ fn remap_lambda_singletons(shared: &crate::vm::SharedVm, map: &cratonvm_types::P
     crate::runtime::invokedynamic::gc_update_lambda_singleton_refs(shared.vm_identity, map);
 }
 fn scan_collection_overlays(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    // `young_marker_follows_side_tables()` is the canonical predicate for
+    // "this cycle's precise marker will do owner-based overlay propagation
+    // itself" -- the same one `VmHeap::mirror_pin_deferrable` uses for the
+    // analogous class-mirror case. The three-way OR this replaced
+    // (`is_active` / `unregistered_jit_frame_on_stack` / `major_gc_requested`)
+    // covered only the JIT-safety diversion reasons for non-moving young, not
+    // an explicit `System.gc()` reaching the non-moving sweep by the
+    // `explicit_full_gc` term `young_marker_follows_side_tables` already
+    // folds in -- so a plain, no-JIT-frame `System.gc()` (this test's exact
+    // shape) fell through to the unconditional scan, which roots every
+    // element of every overlay-backed collection with no reachability gate
+    // at all (see gc_and_alloc.rs's `scan_collection_overlay_roots` comment).
     let conditional = shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
-        && (cratonvm_gc::gc_quiescence::is_active()
-            || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
-            || cratonvm_gc::gc_quiescence::major_gc_requested());
+        && cratonvm_gc::gc_quiescence::young_marker_follows_side_tables();
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_GATE").is_some() {
+        eprintln!(
+            "[OVERLAYGATE] conditional={conditional} gc_algo={:?} major_gc_requested={} is_active={} unregistered_jit={}",
+            shared.config.gc_algorithm,
+            cratonvm_gc::gc_quiescence::major_gc_requested(),
+            cratonvm_gc::gc_quiescence::is_active(),
+            cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack(),
+        );
+    }
     if !conditional {
         cratonvm_gc::external_roots::scan_external_roots(roots);
     }

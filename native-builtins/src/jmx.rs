@@ -4299,37 +4299,77 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
-    r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let init_v = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let used_v = match ctx.get_field(this, 1) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let committed_v = match ctx.get_field(this, 2) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let max_v = match ctx.get_field(this, 3) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
-        let text = format!(
-            "init={}, used={}, committed={}, max={}",
-            init_v, used_v, committed_v, max_v
-        );
-        let s = ctx.create_string(&text);
-        Ok(Some(Value::Object(Some(s))))
-    });
+    // `toString` is NOT overridden on a real JDK: the real bytecode reads the
+    // same four slots this file writes by index (`init`, `used`, `committed`,
+    // `max`, declared in that order) and renders HotSpot's exact
+    // `init = N(NK) used = N(NK) committed = N(NK) max = N(NK)` — including the
+    // `>> 10` kibibyte column and its `-1(-1K)` for an undefined value. The
+    // shim rendered `init=N, used=N, committed=N, max=N`, a format that exists
+    // on no real JVM, so anything logging or scraping a MemoryUsage read
+    // differently here. See `memoryusage_tostring_shim_enabled`.
+    if memoryusage_tostring_shim_enabled() {
+        r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let init_v = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let used_v = match ctx.get_field(this, 1) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let committed_v = match ctx.get_field(this, 2) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            let max_v = match ctx.get_field(this, 3) {
+                Value::Long(v) => v,
+                _ => 0,
+            };
+            // Kept byte-for-byte identical to the real `MemoryUsage.toString()`
+            // so a synthetic-jdk run is not a second, different divergence.
+            let text = format!(
+                "init = {}({}K) used = {}({}K) committed = {}({}K) max = {}({}K)",
+                init_v,
+                init_v >> 10,
+                used_v,
+                used_v >> 10,
+                committed_v,
+                committed_v >> 10,
+                max_v,
+                max_v >> 10
+            );
+            let s = ctx.create_string(&text);
+            Ok(Some(Value::Object(Some(s))))
+        });
+    }
     r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
 // 5. ThreadMXBean — 6-field synthetic
 // ---------------------------------------------------------------------------
+
+/// Should `java.lang.management.MemoryUsage.toString()` be answered by the
+/// shim rather than the class's own bytecode?
+///
+/// **Default: no.** `MemoryUsage` is a real, self-contained JDK class whose
+/// `toString` needs nothing this VM cannot already provide — the four fields it
+/// reads (`init`, `used`, `committed`, `max`) are declared in exactly the order
+/// this file writes them by index, so the real bytecode sees the values the
+/// sibling `getInit`/`getUsed`/`getCommitted`/`getMax` natives hand back.
+///
+/// `synthetic-jdk` builds have no such bytecode and keep the shim;
+/// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1` restores it on a real-JDK run.
+fn memoryusage_tostring_shim_enabled() -> bool {
+    if cfg!(feature = "synthetic-jdk") {
+        return true;
+    }
+    matches!(
+        std::env::var("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
 
 fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> ClassId {
     ctx.ensure_class_initialized(class_name)
@@ -6978,7 +7018,23 @@ mod jmx_tests {
         assert!(r.find(cls, "getUsed", "()J").is_some());
         assert!(r.find(cls, "getCommitted", "()J").is_some());
         assert!(r.find(cls, "getMax", "()J").is_some());
-        assert!(r.find(cls, "toString", "()Ljava/lang/String;").is_some());
+        // `toString` is deliberately NOT here: on a real JDK the class's own
+        // bytecode renders it, and the shim rendered a format that exists on no
+        // real JVM. `memoryusage_tostring_shim_is_off_by_default` below owns
+        // that assertion.
+        assert!(r.find(cls, "toString", "()Ljava/lang/String;").is_none());
+    }
+
+    /// The four getters stay native (they serve CratonVM-synthesised
+    /// `MemoryUsage` receivers); `toString` does not, because the real bytecode
+    /// reads the very slots those getters read and formats them the way every
+    /// other JVM does.
+    #[test]
+    fn memoryusage_tostring_shim_is_off_by_default() {
+        assert!(
+            !memoryusage_tostring_shim_enabled(),
+            "the MemoryUsage.toString shim must stay off unless synthetic-jdk              or CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING asks for it"
+        );
     }
 
     #[test]
