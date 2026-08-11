@@ -343,6 +343,54 @@
 > It needs generation-aware memoization (a class defined later must not be
 > missed), which is why it is recorded here rather than guessed at.
 >
+> ### The annotation-proxy gate: scoped, and why it is a cache-population change
+>
+> The last named item, ~2.0% of the invoke arm. On every non-`invokespecial`
+> virtual invoke `execute_invokevirtual_cached` takes the class-manager read
+> lock, calls `get_class(actual_class_id)` and compares the name against one
+> literal, `"java/lang/annotation/AnnotationProxy"`, to decide whether to force
+> a `CacheMiss`.
+>
+> Two things were checked before proposing anything, and both change the answer:
+>
+> * **It cannot be memoized on `CachedBytecodeMethod`**, which is where the
+>   other two per-call-site memos on this path live
+>   (`force_native_cache`, `intercept_shape_cache`). That struct describes the
+>   resolved *target method*, whose declaring class is frequently a supertype —
+>   an `AnnotationProxy` receiver calling an inherited `Object` method shares
+>   its entry with every other receiver of that method. A bit cached there
+>   would answer for the wrong class.
+> * **It cannot be deferred** the way the tier-up predicates were. Those gate an
+>   optional promotion; this one is consumed immediately and decides
+>   correctness.
+>
+> What makes it tractable is the branch above it: when
+> `actual_class_id != receiver_class_id` the code either rebinds to the
+> polymorphic entry **for `actual_class_id`** or returns `CacheMiss`. So by the
+> time the gate runs, the live `CachedInvokeTarget::VirtualBytecode` is the
+> entry for exactly this receiver class — and "is this receiver class the
+> annotation proxy" is a **per-cache-entry constant**.
+>
+> **So the fix is to compute it once at cache-population time**
+> (`populate_virtual_invoke_cache` already holds the class manager) and store a
+> bool on the `VirtualBytecode` variant, leaving the hit path a field test.
+> Entry invalidation is already handled by `entry_gate.generation`, so this
+> needs no epoch key of its own — unlike the alternative of a global
+> `ClassId`-keyed memo, which would have to answer two questions this
+> investigation has not: whether that name can be defined under more than one
+> loader, and whether a `ClassId` can be recycled after class unloading
+> (`RClassUnloadSweep` says unloading exists). Guessing either one wrong in a
+> correctness gate is the failure mode this page already documents five times.
+>
+> It touches `CachedInvokeTarget` — a hot enum cloned on every cache hit — and
+> every site that constructs the variant, which is why it is scoped here rather
+> than done alongside the three smaller fixes above. `class_definition_epoch()`
+> (one `Acquire` load) is the right key if a global memo is chosen instead.
+>
+> **Coordinate first**: `fix/jdk-only-strict-annotation-proxy-20260811` was an
+> active worktree while this was written and is likely editing the same
+> predicate for policy reasons.
+>
 > **One caution about that call-graph run**, because it nearly cost a session:
 > `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
 > inside `execute_invokevirtual_cached`, which would have been a spectacular
