@@ -260,8 +260,8 @@ pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 /// Expected to be ZERO. Non-zero means `retry_after_evacuation_failure` handed
 /// [`G1Collector::record_outgoing_rset_edges`] a self-forwarded address that is
 /// region-resident but is not an object start — which, before the guard, was a
-/// SIGSEGV inside that walk (see
-/// `docs/internal/known-issues/h2/g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
+/// SIGSEGV inside that walk (see the internal record
+/// `fixed-suite-bugs/h2-suite-bugs/g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
 pub static KEPT_SEED_REJECTED: AtomicUsize = AtomicUsize::new(0);
 
 /// The value of [`KEPT_SEED_REJECTED`].
