@@ -240,31 +240,81 @@ something HotSpot admits. `publicLookup().findVirtual(Holder.class, "pub", …)`
 is admitted here and refused by HotSpot (`Holder` is package-private) — nothing
 in the corpus asks.
 
-`Lookup.unreflect` / `unreflectSpecial` (`classloader.rs::lk_unreflect`,
-the live registrations) are **not** checked. That is closer to correct than it
+~~`Lookup.unreflect` / `unreflectSpecial` (`classloader.rs::lk_unreflect`, the
+live registrations) are **not** checked. That is closer to correct than it
 looks: the JDK admits `unreflect` of any `Method` whose `setAccessible(true)`
 flag is set, regardless of lookup modes. The residual is the
-non-`setAccessible` case.
+non-`setAccessible` case.~~
 
-## Optional hardening patches (not required by the test)
+> **CLOSED 2026-08-11, and the struck paragraph is wrong twice.**
+>
+> **Wrong about which registration is live.** `classloader.rs::lk_unreflect` is
+> reachable only through `register_classloader_natives`, which reaches the
+> registry only through `register_synthetic_overrides` — and
+> `vm/src/native/builtins.rs` compiles that to a no-op without the
+> `synthetic-jdk` feature. In `--real-jdk` and `--jdk-only` the live natives are
+> `lang_invoke.rs`'s `lookup_unreflect` &co., registered by
+> `register_t28_method_handle_completeness` straight from `vm_init`. Under
+> `--synthetic-jdk` both registrars run and `classloader.rs` is last, so *there*
+> its two win — but the other four (`unreflectGetter`, `unreflectSetter`,
+> `unreflectVarHandle`, `unreflectConstructor`) have no `classloader.rs` copy
+> and route to `lang_invoke.rs` in every mode.
+>
+> **Wrong about the residual being small.** The `setAccessible` observation
+> itself is right — JDK 25's body is `Lookup lookup = m.isAccessible() ?
+> IMPL_LOOKUP : this;` — but the non-`setAccessible` case is not a corner. It is
+> the whole check this page installed, reachable around in one line:
+> `publicLookup().findVirtual(Holder.class, "secret", …)` is refused,
+> `publicLookup().unreflect(Holder.class.getDeclaredMethod("secret", int.class))`
+> was admitted. Same Lookup, same member, opposite answers.
+>
+> Fixed in `lang_invoke.rs::lk_enforce_unreflect_access`, sharing
+> `lk_modes_required_for_member` with `lk_enforce_find_access` so the two gates
+> cannot drift apart again. Full rule, the quoted JDK 25 javadoc for each of the
+> three *different* `accessible`-flag treatments, and the mode-scope argument:
+> W6-8, section "The `Lookup.unreflect*` row".
 
-Both are in `native-builtins/src/classloader.rs`, both the same species as
-half 1 — a slot-index read of `allowedModes`. They currently survive by
-accident: on the real layout `get_field(this, 1)` answers `Value::Object`, the
-`match` falls through to a hardcoded default, and the default happens to be
-right for the one case the test exercises.
+## Optional hardening patches — BOTH ALREADY IN THE TREE (checked 2026-08-11)
 
-1. `lk_drop_lookup_mode` — replace
-   `let modes = match ctx.get_field(this, LK_ALLOWED_MODES) { Value::Int(v) => v, _ => LK_FULL_POWER };`
-   with `let modes = lk_modes_of(ctx, this);`. Without it,
-   `publicLookup().dropLookupMode(x)` *raises* the mode word to `0x5F & !x`.
-2. `lk_in_method` — same substitution against its `_ => LK_PUBLIC` default.
-   (This registration is shadowed by `lang_invoke.rs`'s `in` under the current
-   registration order; fix it anyway so the order stops mattering.)
+**Do not apply these. They are done.** Verified against
+`native-builtins/src/classloader.rs` before writing a line, per this campaign's
+finding that records claim a hand-off patch was never applied when it is in fact
+in the tree.
 
-The dead `enforce_lookup_access` / `lk_find_*` block in `classloader.rs` and
-its four unit tests should either be deleted or re-pointed at the live
-`lang_invoke.rs` implementation. Leaving it is how this defect stayed hidden.
+1. `lk_drop_lookup_mode` — already reads `let modes = lk_modes_of(ctx, this);`,
+   carrying the comment "See `lk_in_method` for why this must not read
+   `LK_ALLOWED_MODES` raw." It went further than this page asked: a receiver
+   reporting 0 now stays 0 instead of falling through to `LK_FULL_POWER`,
+   because dropping a mode must never *grant* one.
+2. `lk_in_method` — same, `let modes = lk_modes_of(ctx, this);`, and likewise
+   keeps a 0 at 0 ("`in()` never GRANTS access the receiver did not have",
+   measured). It also gained `lk_check_in_target` (the primitive / array / null
+   argument shapes) and `lk_class_relation`, which answers the same-package
+   question *plus* the two a same-package test cannot: is the target the lookup
+   class itself, and are the two members of the same top-level class.
+   `lang_invoke.rs::lk_same_package` is correspondingly caller-free and
+   documented as superseded — a same-package test alone over-grants
+   `PRIVATE|PROTECTED`, measured 31 where OpenJDK 25.0.3 answers 25.
+
+The dead `enforce_lookup_access` / `lk_find_*` block in `classloader.rs` and its
+four unit tests are **still there**. `classloader.rs` is not this lane's file:
+
+### Out-of-file patch (not applied)
+
+No behavioural patch is outstanding — both hardening items are already in. The
+one remaining action is deletion-only and carries no behaviour change: remove
+`enforce_lookup_access`, `lk_find_virtual`, `lk_find_static`,
+`lk_find_constructor`, `lk_find_getter`, `lk_find_setter`,
+`lk_find_static_getter`, `lk_find_static_setter`, `lk_find_special`,
+`lk_find_var_handle` and `lk_public_lookup` from
+`native-builtins/src/classloader.rs`. Every one is unregistered — the
+registration site says so in its own comment — and `dead_code` is allowed
+crate-wide (`native-builtins/src/lib.rs:9`), so nothing warns that they are
+unreachable. **Re-point the four unit tests rather than delete them**: aim
+`lk_find_virtual_private_method_with_public_lookup_throws` and its siblings at
+`lang_invoke.rs::lk_enforce_find_access`, which is the function that actually
+runs. A green suite for a check the VM never invokes is what let this defect
+ship.
 
 ## How to verify
 

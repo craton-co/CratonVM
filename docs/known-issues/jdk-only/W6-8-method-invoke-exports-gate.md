@@ -118,7 +118,8 @@ java.base detector is `RJdkStrict`.
 | `Field.getInt/getLong/.../setInt/...` | `field_get_raw` / `field_set_raw` → the same funnel | same | **CLOSED** with it |
 | `Method.getAnnotation(s)` / `Field.getAnnotation(s)` / parameter annotations | `lang_class::native_*_get_annotation*` | no gate | correct — HotSpot does not access-check annotation reads (measured OK above) |
 | record component accessor | `RecordComponent.getAccessor()` returns a `Method`; invocation goes through `Method.invoke` | inherits the fix | correct |
-| `MethodHandles.Lookup.unreflect` / `unreflectSpecial` / `unreflectGetter` / `unreflectSetter` / `unreflectConstructor` / `findVirtual` / `findStatic` / `findGetter` / … | `lang_invoke.rs` (`lookup_unreflect` &co.) | **no module check of any kind** | **OPEN, same species** — HotSpot throws IllegalAccessException (measured above). Not this lane's file. |
+| `MethodHandles.Lookup.findVirtual` / `findStatic` / `findGetter` / … | `lang_invoke.rs` (`lookup_find_*` → `lk_enforce_find_access`) | no module check; **lookup-mode check since W4-1** | mode half correct; module half is W4-1's stated one-directional residual |
+| `MethodHandles.Lookup.unreflect` / `unreflectSpecial` / `unreflectGetter` / `unreflectSetter` / `unreflectVarHandle` / `unreflectConstructor` | `lang_invoke.rs` (`lookup_unreflect` &co. → `lk_enforce_unreflect_access`) | no module check; **lookup-mode check added 2026-08-11** | **FIXED here** — see below |
 | `Class.newInstance()` (deprecated) | `lang_class::native_class_new_instance` | no check at all (not even the caller check) | **OPEN**, but synthetic-jdk only — it is registered exclusively in `register_synthetic_overrides`; under `--real-jdk` the real bytecode routes to `Constructor.newInstance` |
 
 ### The `Field.get` row — ADJUDICATED 2026-08-11: it was already fixed
@@ -172,6 +173,95 @@ differently is the shape that produced several defects in this campaign, so it
 now carries a doc comment saying it must not be wired to a `get`/`set`/`invoke`
 path and why. It is kept rather than deleted because it is the surviving
 in-source statement of the `opens`-vs-`exports` distinction.
+
+### The `Lookup.unreflect*` row — FIXED 2026-08-11
+
+The `find*` family has consulted `allowedModes` since W4-1. The `unreflect`
+family did not consult anything, so the check W4-1 installed was reachable
+around in one line of Java:
+
+```java
+MethodHandles.Lookup pub = MethodHandles.publicLookup();
+pub.findVirtual(Holder.class, "secret", methodType(int.class, int.class)); // refused (W4-1)
+pub.unreflect(Holder.class.getDeclaredMethod("secret", int.class));        // ADMITTED
+```
+
+HotSpot refuses both, and refuses them in the same place: `find*` and
+`unreflect*` both funnel into `Lookup.getDirectMethod` / `getDirectField`,
+which is where the JDK's check lives. Two entry points to one question, one of
+them ungated, is this campaign's most-repeated shape.
+
+**The rule, quoted.** JDK 25 `java.lang.invoke.MethodHandles.Lookup`
+(`src.zip`, Temurin 25.0.3) states a *different* `accessible`-flag rule for
+three groups, and the implementation matches the javadoc line for line:
+
+| entry point | specifying sentence | body |
+|---|---|---|
+| `unreflect(Method)`, `unreflectConstructor(Constructor)`, `unreflectGetter(Field)`, `unreflectSetter(Field)` | "If the method's `accessible` flag is not set, access checking is performed immediately on behalf of the lookup class." | `Lookup lookup = m.isAccessible() ? IMPL_LOOKUP : this;` |
+| `unreflectVarHandle(Field)` | "Access checking is performed immediately on behalf of the lookup class, **regardless of the value of the field's `accessible` flag**." | reads `isAccessible()` nowhere |
+| `unreflectSpecial(Method, Class)` | "Before method resolution, if the explicitly specified caller class is not identical with the lookup class, or if this lookup object does not have private access privileges, the access fails." | `checkSpecialCaller(...)` first, and the comment `// ignore m.isAccessible:  this is a new kind of access` |
+
+Note what the first row's implementation actually does: a set `accessible` flag
+does not *soften* the check, it swaps in `IMPL_LOOKUP` (TRUSTED) to perform it.
+So the flag is an unconditional allow, not a discount — which is why the gate
+can read it and return, and why `unreflectVarHandle` must not.
+
+**What landed.** `lang_invoke.rs::lk_enforce_unreflect_access`, called as the
+FIRST statement of all six natives (`args` still holds the ObjectRefs the VM
+handed over, and nothing has allocated yet). It shares
+`lk_modes_required_for_member` with `lk_enforce_find_access` so the two gates
+cannot drift; that factoring is the point of the change as much as the new call
+sites are.
+
+Valves, in order — the first four are allows:
+
+1. modes unreadable (`None` from `lk_read_allowed_modes_opt`) → allow;
+2. `PRIVATE` set → allow, before touching the reflective object;
+3. `accessible` flag set, on the four arms whose javadoc says it waives → allow;
+4. `modifiers` unreadable → allow;
+5. `modes == 0` → refuse (a `dropLookupMode(PUBLIC)` Lookup refuses public
+   members too — measured, see `lk_read_allowed_modes_opt`);
+6. `UNCONDITIONAL` alone and the declaring class is not public → refuse;
+7. otherwise the member's modifier picks the required bit.
+
+**Which mode this applies in: all of them, and that is the point.** These are
+JDK reflection semantics, not a strictness policy, so the gate is not keyed on
+`--jdk-only` — the same posture as the `find*` gate, the `setAccessible` gate
+and the `exports` gate, none of which are mode-keyed either. The `Compatible`
+(`--real-jdk`) safety argument is clause 2: every Lookup a framework holds
+(`MethodHandles.lookup()` = 0x5F, `privateLookupIn` = 0x1F, TRUSTED = -1)
+carries `PRIVATE` and short-circuits before the member is even read, so Spring,
+Hibernate, Jackson, Groovy, ByteBuddy and `LambdaMetafactory` cannot be refused
+by this check at all. The only new refusals come from `publicLookup()`, an
+explicitly dropped mode, and a cross-package `Lookup.in` — the three cases
+HotSpot also refuses.
+
+**Under `--synthetic-jdk` two of the six are not even the live natives.**
+`register_classloader_natives` runs LAST there and its `lk_unreflect` /
+`lk_unreflect_special` win the registration for those two descriptors; the
+other four route here. In `--real-jdk` and `--jdk-only`
+`register_classloader_natives` is never called at all (it reaches the registry
+only through `register_synthetic_overrides`, which `vm/src/native/builtins.rs`
+compiles to a no-op without the feature), so all six are live. **This
+contradicts W4-1**, which names `classloader.rs::lk_unreflect` as "the live
+registrations" without qualification; corrected there.
+
+### Still open on this family
+
+* **`unreflectSetter` on a trusted-final field.** "If the field is `final`,
+  write access will not be allowed and access checking will fail […] fields
+  which are both `static` and `final` may never be set." That is
+  `MemberName.isTrustedFinalField`, a different question from lookup modes.
+  Deliberately not written blind: guessing it would refuse the
+  `setAccessible`-then-`unreflectSetter` idiom every deserialization framework
+  uses. It wants its own paired ALLOW/DENY probe.
+* **The module half** (`exports`) for `find*` and `unreflect*` alike. W4-1
+  records it as one-directional and it stays that way.
+* **`unreflectSpecial`'s `specialCaller != lookupClass()` conjunct.** Not
+  enforced, deliberately: our `lookupClass` comes from a stack walk in the
+  `MethodHandles.lookup()` native, and W4-1's standing rule is that a wrong
+  answer there must never become a refusal. Only the
+  `(lookupModes() & PRIVATE) == 0` half is enforced.
 
 ## Vectors
 
