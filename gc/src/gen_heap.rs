@@ -9821,7 +9821,17 @@ impl GenerationalHeap {
                     .unwrap_or(used)
                     .min(used);
                 let run_end = zero_run_end(from_base, cursor, limit);
-                if run_end - cursor >= HEADER_SIZE {
+                // `side_sorted` is this cycle's independently-computed live
+                // set (object bases, ascending). Since HEADER_SIZE 16 made the
+                // hash lazy, a live, never-hashed, never-locked object with
+                // `ClassId(0)` and no shape bits reads all-zero — indistinguishable
+                // from reclaimed memory by header bytes alone. An address the
+                // marker vouches for is not anomaly evidence, whatever its
+                // header reads: fall through and parse it as a normal live
+                // header below, instead of unwinding every reclaim decision
+                // taken since the last anchor for an ordinary live object.
+                let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+                if run_end - cursor >= HEADER_SIZE && !vouched_live {
                     let n = SWEEP_ZERO_SPAN_HITS.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
                         tracing::warn!(
@@ -9876,10 +9886,11 @@ impl GenerationalHeap {
                     }
                     break;
                 }
-                // Zero run shorter than a header: a real `ClassId(0)` ad-hoc
-                // container's header legitimately starts with zero words
-                // (class_id=0, kind=Object, hash=0) but has a non-zero
-                // `num_slots`/`gc_flags` word — parse it normally below.
+                // Either the zero run is shorter than a header (a real
+                // `ClassId(0)` ad-hoc container's header legitimately starts
+                // with zero words but has a non-zero `num_slots`/`gc_flags`
+                // word), or the marker vouches for this address — parse it
+                // normally below either way.
             }
             let total_size = gen_object_total_size(header);
             // Defensive: a corrupt / zero-size header would desynchronise

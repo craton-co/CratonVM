@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **root-caused**, fix not yet written |
+| **Status** | OPEN — **two root causes now confirmed, only the first is fixed**; see 2026-08-11 update at the bottom |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
@@ -328,3 +328,92 @@ reference to a live object, so widening the gate trades over-retention for a
 use-after-free. A JDT `StackMapFrame` reachable only from an overlay after
 compilation finished suggests stale overlay ENTRIES, in which case pruning is
 the fix and costs nothing in safety.
+
+## 2026-08-11: root cause #1 fixed; root cause #2 confirmed real and unfixed — this test needs both
+
+Picked this page up to write the fix `## The fix, and the constraint on it`
+describes. Both halves below were measured on `dev` merged fresh into
+`fix/definstmgr-fourth-recurrence-20260810` (271 commits ahead of where this
+page left off) — worth restating because the second finding directly
+contradicts a still-standing claim in `## Also eliminated` above.
+
+### Root cause #1 (the all-zero-span screen): fixed
+
+`gc/src/gen_heap.rs`, the site the disposition census names (`mw_site[1]`):
+added the discriminator the page's own "The fix, and the constraint on it"
+section specified. `side_sorted` — this cycle's independently-computed live
+set, object bases ascending — is checked with a binary search before the
+anomaly/unwind branch fires:
+
+```rust
+let vouched_live = side_sorted.binary_search(&(from_base + cursor)).is_ok();
+if run_end - cursor >= HEADER_SIZE && !vouched_live {
+    // unwind-and-resync, unchanged
+}
+// else: fall through and parse the header normally, exactly like the
+// existing short-zero-run case just below it
+```
+
+An all-zero span the marker vouches for is a live never-hashed object, not
+anomaly evidence — it now falls through to ordinary header parsing instead of
+discarding every reclaim decision since the last anchor and abandoning the
+walk to the next free block. The conservative arm is untouched for spans
+`side_sorted` does NOT vouch for, so the double-free protection the site was
+written for survives.
+
+Verified: `cargo test --release -p cratonvm-gc` — 109 `gen_heap` tests + the
+full crate suite (131 total) pass, no regressions.
+
+**This fix alone does not clear `TestDefaultInstanceManager` — confirmed by
+running it 3× after the fix, still `FAILURES!!! Tests run: 1, Failures: 1`
+every time.** That is expected, not a refutation: see below.
+
+### Root cause #2 (`collection-overlays` unconditional rooting): confirmed real on the default collector, NOT gated as this page assumed
+
+`## Also eliminated` above dismisses overlay over-rooting because
+`scan_collection_overlays`'s `major_gc_requested()` gate "skips the
+unconditional scan when [...] under Generational, which is precisely this
+test's path." **That reasoning was checked by reading the gate, not by asking
+which source actually rooted the object — the same trap the page's own
+`## Two independent additions` section calls out one level up.** Re-running
+`CRATONVM_DBG_ROOT_SOURCE=1` with the sweep fix applied (so any signal here
+cannot be root cause #1 in disguise):
+
+```
+[MIRRORWHY]   [root=collection-overlays] org/eclipse/jdt/internal/compiler/codegen/StackMapFrame@...
+  -> VerificationTypeInfo -> VerificationTypeInfo -> SourceTypeBinding -> LookupEnvironment
+  -> JDTCompiler$1 -> JDTCompiler -> JspCompilationContext -> cid<evicted mirror>
+```
+
+`collection-overlays` is contributing roots on the default collector, in this
+exact failing run, after the sweep fix — the gate is not preventing it here.
+This is the SAME mechanism `vm/src/runtime/interpreter/gc_and_alloc.rs:2061-2079`
+already documents in detail from an earlier (pre-dating this page's chain)
+session: `gc_scan_collection_overlay_roots` roots every element of every
+overlay-backed collection unconditionally, with no gate on whether the
+backing collection itself is reachable; a scratch `List<StackMapFrame>` the
+JDT compiler uses transiently during JSP compilation gets force-rooted this
+way, and forward-tracing from that illegitimate root walks back through the
+compiler's real field references into the evicted JSP's `JspServletWrapper`
+and its `ClassLoader` — keeping the whole cluster permanently, artificially
+reachable. That comment already scoped the real fix (the same
+conditional-rooting + mark-time-propagation treatment `class_mirrors` got,
+generalized to every overlay table) and already flagged it as "a materially
+larger, higher-risk change... left for a dedicated follow-up." It still is —
+not attempted here.
+
+**Correction to `## Also eliminated` above:** its claim that the
+`major_gc_requested()` gate makes this "not the default-collector mechanism"
+is wrong; the gate does not fire (or fires too narrowly) for this test's
+actual `System.gc()` timing, and this IS live on the default collector.
+
+### Net effect
+
+Both root causes are independently necessary conditions for this symptom.
+Fixing #1 removes one way the evicted mirror's span could be
+mis-reported-live; fixing #2 (not done) would remove the other way it is
+*genuinely* kept alive via an illegitimate root. Closing this test requires
+both. Root cause #1's fix is real, tested, and worth keeping regardless of
+when #2 lands — it is a correctness and throughput bug in its own right (see
+`## Scope` above: "everywhere else it costs throughput and footprint while
+failing nothing").
