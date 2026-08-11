@@ -377,8 +377,12 @@ there) — 16 of 17, the missing one being §4.1.
 **Why the acceptance measurement could not see it**, three reasons and all
 three are reusable:
 
-* **No corpus vector calls `Logger.getLogger`.** The 23/4 that licensed the
-  retirement is a vector-level verdict, and JUL owns no vector.
+* **No corpus vector calls `Logger.getLogger`.** Checked, not assumed:
+  `grep -l "java.util.logging\|Logger.getLogger" regression-suite/src/*.java`
+  matches **nothing**, across all 57 vectors and all three class lists. The
+  23/4 that licensed the retirement is a vector-level verdict and JUL owns no
+  vector, which is exactly the case the README's licence carves out — "a record
+  claiming something narrower than its vector asserts still owns that claim".
 * **The dial yields once per triple (§1).** Even a vector that called
   `getLogger` twice would have taken the native the second time, so the
   workload the dial measured is not the workload the retirement produces.
