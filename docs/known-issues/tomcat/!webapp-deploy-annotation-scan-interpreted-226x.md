@@ -248,6 +248,47 @@
 > all after this change, so the push-side move is either already elided by the
 > compiler or below 0.5%. Re-measure before building it.
 >
+> ### Second piece taken: the interception chain is classified once per call site
+>
+> `intercept_force_registered_native_cached` runs on every inline-cache hit.
+> Below its memoized `force_native_cache` sat three arms still evaluated from
+> scratch every time, and **every one of their keys is a function of the call
+> site's own triple**:
+>
+> * a `ClassLoader` null-resource re-target — `(method_name, descriptor)`
+>   against three pairs;
+> * a `java/lang/Class` reflection re-target — the same pair against four more;
+> * `real_http_url_connection_native`, whose *entire* gate is `class_name`
+>   against five literals.
+>
+> `CachedBytecodeMethod` now carries an `intercept_shape_cache: OnceLock<u8>`
+> classifying the triple against all three, once. The argument- and
+> receiver-dependent halves are untouched: a set bit still runs the original
+> test in full, and a clear bit skips a test whose name-keyed half could not
+> have matched.
+>
+> | symbol | before | after |
+> |---|---:|---:|
+> | `intercept_force_registered_native_cached` | 1.44% | **0.99%** |
+> | `real_http_url_connection_native` | 1.29% | **absent** |
+> | **total** | **2.73%** | **0.99%** |
+>
+> **-1.74 percentage points, a 64% cut**, and one function leaves the hot path
+> entirely. Wall clock, four interleaved passes at load 20: before mean 318 ns
+> per invoke (303-344), after 300.5 (275-326) — the ranges overlap, so as with
+> the frame change the mechanism is the evidence and the wall clock is not.
+> 2490 unit tests and the 38-class regression suite green.
+>
+> **A recorded negative, because it is the interesting half.** The first
+> version added a `shape == 0` early return into a shared tail function, on the
+> reasoning that the common call site should not even step over three bit
+> tests. Measured, that was **worse than leaving the control flow alone**:
+> entry 1.05% + tail 1.12% = 2.17%, against 0.99% for the same string-work
+> removal with the arms guarded in place and no split. The function boundary
+> cost more than the three bit tests it skipped. The comment in
+> `intercept_force_registered_native_cached` says so, so the shortcut does not
+> get reinvented.
+>
 > **One caution about that call-graph run**, because it nearly cost a session:
 > `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
 > inside `execute_invokevirtual_cached`, which would have been a spectacular
