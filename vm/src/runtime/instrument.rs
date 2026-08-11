@@ -2382,6 +2382,23 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     // body IS the implementation. This registration also appears in
     // `interpreter.rs`'s force-native-override table so it beats the real
     // bytecode, which would otherwise enter VM-private init we cannot honour.
+    //
+    // RESTORED 2026-08-11. `dc55e8057` deleted it as `method-nowhere` — true,
+    // and it always will be: `<init>` is a constructor, so no image declares it
+    // `ACC_NATIVE` and a census cannot tell CratonVM's deliberate no-op from a
+    // dead row. Deleting it left three things pointing at nothing: the
+    // `ctx.invoke("sun/instrument/InstrumentationImpl", "<init>", …)` in
+    // `attach_agent_in_process` above, the force-native-override entry in
+    // `native_override.rs`, and the paragraph you are reading. The invoke then
+    // reaches the real ctor and enters exactly the VM-private init this comment
+    // says cannot be honoured — on the self-attach path, which is the one every
+    // `Mockito.mock()` arms.
+    r.register(
+        impl_class,
+        "<init>",
+        "(JLjava/lang/String;ZZ)V",
+        |_ctx, _args| Ok(None),
+    );
 
     // ---- in-process probe bridge ----
     let bridge_class = "cratonvm/Instrument";
@@ -3129,81 +3146,82 @@ mod tests {
         assert!(sz > 0);
     }
 
+    /// The registrar must cover every `InstrumentationImpl` native the JDK
+    /// declares — **at the descriptor the JDK declares it with**.
+    ///
+    /// Until 2026-08-11 this asserted thirteen spellings with no leading
+    /// `long`: `redefineClasses0([ClassDefinition;)V`,
+    /// `getAllLoadedClasses0()[Class;`, `isModifiableClass0(Class;)Z` and the
+    /// rest. **Every native on this class takes `long jvmtienv` first**, on
+    /// both Temurin 21.0.12+8 and 25.0.4+7 (`javap -p -s --module
+    /// java.instrument`), so those thirteen could never bind and the test
+    /// agreed with thirteen registrations that could never be reached. Both
+    /// sides were wrong together, which is why it stayed green for so long.
+    ///
+    /// `dc55e8057` deleted the unbindable registrations as dead — correctly —
+    /// and this test went red. The fix is the real descriptors, not the
+    /// registrations back.
+    ///
+    /// Three of the old assertions have no JDK counterpart at all and are gone
+    /// rather than corrected: `isRedefineClassesSupported0`,
+    /// `isNativeMethodPrefixSupported0` and `setNativeMethodPrefix0` are not
+    /// native on any supported image, and `appendTo{Bootstrap,System}
+    /// ClassLoaderSearch0` is one JDK method, `appendToClassLoaderSearch0`,
+    /// taking `(long, String, boolean)`.
     #[test]
     fn register_natives_includes_required_methods() {
         let mut r = NativeMethodRegistry::new();
         register_instrumentation_natives(&mut r);
         let impl_class = "sun/instrument/InstrumentationImpl";
-        assert!(r
-            .find(
-                impl_class,
-                "addTransformer0",
-                "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "removeTransformer",
-                "(Ljava/lang/instrument/ClassFileTransformer;)Z",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "redefineClasses0",
-                "([Ljava/lang/instrument/ClassDefinition;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(impl_class, "retransformClasses0", "([Ljava/lang/Class;)V",)
-            .is_some());
-        assert!(r
-            .find(impl_class, "getAllLoadedClasses0", "()[Ljava/lang/Class;")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isModifiableClass0", "(Ljava/lang/Class;)Z")
-            .is_some());
-        assert!(r
-            .find(impl_class, "getObjectSize0", "(Ljava/lang/Object;)J")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isRetransformClassesSupported0", "()Z")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isRedefineClassesSupported0", "()Z")
-            .is_some());
-        assert!(r
-            .find(impl_class, "isNativeMethodPrefixSupported0", "()Z")
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "appendToBootstrapClassLoaderSearch0",
-                "(Ljava/lang/String;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "appendToSystemClassLoaderSearch0",
-                "(Ljava/lang/String;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "setNativeMethodPrefix0",
-                "(Ljava/lang/instrument/ClassFileTransformer;Ljava/lang/String;)V",
-            )
-            .is_some());
-        assert!(r
-            .find(
-                impl_class,
-                "getInitiatedClasses0",
-                "(Ljava/lang/ClassLoader;)[Ljava/lang/Class;",
-            )
-            .is_some());
+        // (method, descriptor) — each one verified present and ACC_NATIVE on
+        // BOTH supported images. Keep this list and the image in step: a
+        // descriptor here that the JDK does not declare is a registration that
+        // binds to nothing, and this assertion would hide it.
+        for (name, descriptor) in [
+            ("redefineClasses0", "(J[Ljava/lang/instrument/ClassDefinition;)V"),
+            ("retransformClasses0", "(J[Ljava/lang/Class;)V"),
+            ("getAllLoadedClasses0", "(J)[Ljava/lang/Class;"),
+            ("getInitiatedClasses0", "(JLjava/lang/ClassLoader;)[Ljava/lang/Class;"),
+            ("isModifiableClass0", "(JLjava/lang/Class;)Z"),
+            ("getObjectSize0", "(JLjava/lang/Object;)J"),
+            ("isRetransformClassesSupported0", "(J)Z"),
+            ("appendToClassLoaderSearch0", "(JLjava/lang/String;Z)V"),
+            ("setHasRetransformableTransformers", "(JZ)V"),
+            ("setNativeMethodPrefixes", "(J[Ljava/lang/String;Z)V"),
+        ] {
+            assert!(
+                r.find(impl_class, name, descriptor).is_some(),
+                "{impl_class}.{name}{descriptor} is declared native by JDK 21                  and 25 and must be registered"
+            );
+        }
+        // The no-`jvmtienv` spellings must NOT come back. Re-adding one makes
+        // the assertions above pass while binding nothing, which is exactly the
+        // state this test was in before 2026-08-11.
+        for (name, descriptor) in [
+            ("redefineClasses0", "([Ljava/lang/instrument/ClassDefinition;)V"),
+            ("retransformClasses0", "([Ljava/lang/Class;)V"),
+            ("getAllLoadedClasses0", "()[Ljava/lang/Class;"),
+            ("isModifiableClass0", "(Ljava/lang/Class;)Z"),
+            ("getObjectSize0", "(Ljava/lang/Object;)J"),
+        ] {
+            assert!(
+                r.find(impl_class, name, descriptor).is_none(),
+                "{impl_class}.{name}{descriptor} has no leading `long jvmtienv`                  and is declared by no supported JDK image; registering it                  binds nothing and hides the arity that does"
+            );
+        }
+        // CratonVM's own convenience surface on the same class: no-`0`, no
+        // `jvmtienv`. These are ours, not the JDK's, and the census scores them
+        // `method-nowhere` for that reason.
+        for (name, descriptor) in [
+            ("removeTransformer", "(Ljava/lang/instrument/ClassFileTransformer;)Z"),
+            ("addTransformer", "(Ljava/lang/instrument/ClassFileTransformer;)V"),
+            ("addTransformer", "(Ljava/lang/instrument/ClassFileTransformer;Z)V"),
+        ] {
+            assert!(
+                r.find(impl_class, name, descriptor).is_some(),
+                "{impl_class}.{name}{descriptor} is CratonVM's own entry point                  and must stay registered"
+            );
+        }
         // Bridge surface for the in-process probe.
         let bridge = "cratonvm/Instrument";
         assert!(r

@@ -7,9 +7,9 @@
 # jdk_version: 25.0.4
 # mode: compatible
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
-# rows: 11633
+# rows: 11636
 # unchosen: 0
-# note: Re-frozen on the merge with 892ab4f40. Two contributions, and they are not the same change: this branch restores 65 registrations dc55e8057 deleted (49 Bridge, 16 SyntheticStub on no-image receivers) taking the count 8977 -> 9026, and merging origin/dev's 892ab4f40 adds 6 more (native-builtins/src/lang_reflect.rs) taking it to 9032. The +6 is dev's and dev is red on its own baseline without this branch: the same tree measures 9026 before the merge and 9032 after, with nothing else differing. On the restores: the dead-sweep scored them method-nowhere, which is also what CratonVM's own additions to a real class look like -- a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists because the JDK declares only the BiFunction form. 24 tests across two crates pinned them and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md
+# note: Restores sun/instrument/InstrumentationImpl.<init>(JLjava/lang/String;ZZ)V, the deliberate no-op ctor dc55e8057 deleted as method-nowhere. It always will be method-nowhere -- <init> is a constructor, so no image declares it ACC_NATIVE and a census cannot tell a deliberate no-op from a dead row. Deleting it left the ctx.invoke in attach_agent_in_process, the force-native-override entry in native_override.rs and the KEEP comment all pointing at nothing, so the invoke reached the real ctor and entered the VM-private init that comment says cannot be honoured -- on the self-attach path every Mockito.mock() arms. That accounts for +1 here and +1 on shadows_bytecode; the remainder arrived with dev between this freeze and the last. Also in this change: vm/src/runtime/instrument.rs's register_natives_includes_required_methods asserted 13 InstrumentationImpl descriptors with no leading long jvmtienv, which no supported image declares -- test and registrations were wrong together, which is why it stayed green. It now asserts the 10 real ones plus negative assertions on the unbindable spellings. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -1412,6 +1412,7 @@ java/io/PrintStream	charset	()Ljava/nio/charset/Charset;	0	intrinsic	0	1
 java/io/PrintStream	close	()V	0	bridge	0	1
 java/io/PrintStream	flush	()V	0	bridge	0	1
 java/io/PrintStream	format	(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
+java/io/PrintStream	format	(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
 java/io/PrintStream	print	(C)V	0	bridge	0	1
 java/io/PrintStream	print	(D)V	0	bridge	0	1
 java/io/PrintStream	print	(F)V	0	bridge	0	1
@@ -1421,6 +1422,7 @@ java/io/PrintStream	print	(Ljava/lang/Object;)V	0	bridge	0	1
 java/io/PrintStream	print	(Ljava/lang/String;)V	0	bridge	0	1
 java/io/PrintStream	print	(Z)V	0	bridge	0	1
 java/io/PrintStream	printf	(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
+java/io/PrintStream	printf	(Ljava/util/Locale;Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;	0	bridge	0	1
 java/io/PrintStream	println	()V	0	bridge	0	1
 java/io/PrintStream	println	(C)V	0	bridge	0	1
 java/io/PrintStream	println	(D)V	0	bridge	0	1
@@ -10645,6 +10647,7 @@ sun/awt/image/BytePackedRaster	initIDs	()V	0	bridge	1	1
 sun/awt/image/GifImageDecoder	initIDs	()V	0	bridge	1	1
 sun/awt/image/IntegerComponentRaster	initIDs	()V	0	bridge	1	1
 sun/awt/image/ShortComponentRaster	initIDs	()V	0	bridge	1	1
+sun/instrument/InstrumentationImpl	<init>	(JLjava/lang/String;ZZ)V	0	bridge	0	1
 sun/instrument/InstrumentationImpl	addTransformer	(Ljava/lang/instrument/ClassFileTransformer;)V	0	bridge	0	1
 sun/instrument/InstrumentationImpl	addTransformer	(Ljava/lang/instrument/ClassFileTransformer;Z)V	0	bridge	0	1
 sun/instrument/InstrumentationImpl	appendToClassLoaderSearch0	(JLjava/lang/String;Z)V	0	bridge	1	1
