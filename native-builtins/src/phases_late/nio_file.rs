@@ -5163,20 +5163,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(p57_access_denied(ctx, &p)?)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let exc = try_alloc_concurrent_synthetic(
-                        ctx,
-                        "java/nio/file/FileAlreadyExistsException",
-                        4,
-                    )?;
-                    // Pin across the create_string below — a moving young GC
-                    // there would relocate the fresh exception (native
-                    // stale-local family).
-                    let exc_pin = ctx.pin_native_root(exc);
-                    let file_str = ctx.create_string(&p);
-                    let exc = ctx.read_native_pin(exc_pin, exc);
-                    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
-                    ctx.unpin_native_roots(exc_pin);
-                    Err(MethodCallFailed::ExceptionThrown(exc))
+                    Err(p57_file_already_exists_synthetic(ctx, &p)?)
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -5209,20 +5196,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(p57_access_denied(ctx, &p)?)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let exc = try_alloc_concurrent_synthetic(
-                        ctx,
-                        "java/nio/file/FileAlreadyExistsException",
-                        4,
-                    )?;
-                    // Pin across the create_string below — a moving young GC
-                    // there would relocate the fresh exception (native
-                    // stale-local family).
-                    let exc_pin = ctx.pin_native_root(exc);
-                    let file_str = ctx.create_string(&p);
-                    let exc = ctx.read_native_pin(exc_pin, exc);
-                    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
-                    ctx.unpin_native_roots(exc_pin);
-                    Err(MethodCallFailed::ExceptionThrown(exc))
+                    Err(p57_file_already_exists_synthetic(ctx, &p)?)
                 }
                 Err(e) => Err(p57_io_error(&e)),
             }
@@ -8916,16 +8890,55 @@ pub(crate) fn p57_directory_not_empty(
     Ok(MethodCallFailed::ExceptionThrown(exc))
 }
 
+/// Build a *typed* `java.nio.file.FileAlreadyExistsException` the synthetic
+/// way, for the call sites that allocate rather than run the real constructor.
+///
+/// This body was copied inline at each `ErrorKind::AlreadyExists` arm, which is
+/// how `createDirectory` kept naming a forward-slash path on Windows after
+/// every other builder had been fixed: a per-site conversion cannot reach a
+/// site nobody remembers exists. [`p57_file_already_exists`] is the variant that
+/// runs the class's real one-String constructor, kept separate because H2's own
+/// bytecode catches that instance and reads its fields.
+pub(crate) fn p57_file_already_exists_synthetic(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<MethodCallFailed, MethodCallFailed> {
+    let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4)?;
+    // Pin across the create_string below — a moving young GC there would
+    // relocate the fresh exception (native stale-local family).
+    let exc_pin = ctx.pin_native_root(exc);
+    let file_str = p57_exception_path_string(ctx, path);
+    let exc = ctx.read_native_pin(exc_pin, exc);
+    ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    ctx.unpin_native_roots(exc_pin);
+    Ok(MethodCallFailed::ExceptionThrown(exc))
+}
+
 /// Build a *typed* `java.nio.file.NotLinkException` for `path` (mirrors
 /// [`p57_no_such_file`]). Thrown by `readSymbolicLink` when the path exists but
 /// is not a symbolic link — the JDK's contract, and what
 /// `Files.readSymbolicLink`'s callers catch.
-pub(crate) fn p57_not_link(ctx: &mut dyn NativeContext, path: &str) -> Result<MethodCallFailed, MethodCallFailed> {
+///
+/// `reason` is the OS's explanation when the caller has one, and goes to
+/// `detailMessage` for the same reason it does in [`p57_filesystem_exception`]:
+/// `NotLinkException` inherits `FileSystemException`'s two fields and reads its
+/// reason out of `Throwable`. HotSpot reports one here, so `None` is only for
+/// callers that genuinely have no OS error to quote.
+pub(crate) fn p57_not_link(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    reason: Option<&str>,
+) -> Result<MethodCallFailed, MethodCallFailed> {
     let exc = try_alloc_concurrent_synthetic(ctx, "java/nio/file/NotLinkException", 4)?;
     let exc_pin = ctx.pin_native_root(exc);
     let file_str = p57_exception_path_string(ctx, path);
     let exc = ctx.read_native_pin(exc_pin, exc);
     ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+    if let Some(reason) = reason {
+        let reason_str = ctx.create_string(reason);
+        let exc = ctx.read_native_pin(exc_pin, exc);
+        ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(reason_str)));
+    }
     ctx.unpin_native_roots(exc_pin);
     Ok(MethodCallFailed::ExceptionThrown(exc))
 }
@@ -9005,15 +9018,18 @@ pub(crate) fn p57_filesystem_exception(
 /// exactly as the JDK's own `zipfs`/`jrtfs` render them, so rewriting those
 /// would introduce the divergence this is here to remove — and the encoding's
 /// own structure would be corrupted along with it.
+///
+/// The implementation lives in `native-io` because that crate raises
+/// `java.nio.file` exceptions too and cannot depend on this one (the dependency
+/// runs the other way). One implementation, so the two crates cannot drift.
 pub(crate) fn p57_exception_path(path: &str) -> std::borrow::Cow<'_, str> {
-    #[cfg(windows)]
-    {
-        if path.contains('/') && vfs_decode(path).is_none() {
-            return std::borrow::Cow::Owned(path.replace('/', "\\"));
-        }
-    }
-    std::borrow::Cow::Borrowed(path)
+    cratonvm_native_io::nio_native::exception_path(path)
 }
+
+/// `native-io` cannot see [`JARFS_SENTINEL`], so it declares the same marker
+/// itself. If either moves, this stops compiling instead of silently letting
+/// archive-entry paths get their separators rewritten.
+const _: () = assert!(JARFS_SENTINEL == cratonvm_native_io::nio_native::VFS_SENTINEL);
 
 /// `create_string` for a path that is about to be stored in an exception, with
 /// [`p57_exception_path`] applied. Every `java.nio.file` exception builder goes
@@ -9161,7 +9177,21 @@ pub(crate) fn p57_read_symbolic_link(
     // both map to the JDK's types (NoSuchFileException vs NotLinkException)
     // rather than to whatever errno `readlink` happens to produce for each.
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if !meta.file_type().is_symlink() => return Err(p57_not_link(ctx, path)?),
+        Ok(meta) if !meta.file_type().is_symlink() => {
+            // The TYPE is decided here, but the REASON has to come from the OS,
+            // as it does on HotSpot: `readSymbolicLink` on a regular file
+            // reports `NotLinkException` carrying the platform's own text
+            // ("The file or directory is not a reparse point." on Windows,
+            // "Invalid argument" for EINVAL on Unix). Making the call is what
+            // produces that text; inventing one here would be a string of ours
+            // dressed up as the system's. If the call unexpectedly succeeds the
+            // reason is simply absent, which is the old behaviour.
+            let reason = std::fs::read_link(path).err().map(|e| {
+                let text = e.to_string();
+                text.split(" (os error ").next().unwrap_or(&text).to_string()
+            });
+            return Err(p57_not_link(ctx, path, reason.as_deref())?);
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(p57_no_such_file(ctx, path)?)
         }
