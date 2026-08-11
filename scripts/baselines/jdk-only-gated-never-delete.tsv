@@ -129,10 +129,10 @@ java/util/concurrent/atomic/AtomicReferenceFieldUpdater$RustJvmImpl	weakCompareA
 java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:6040	kind=synthetic-stub
 java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:6040	kind=synthetic-stub
 java/util/concurrent/locks/StampedLock	isLocked	()Z	synthetic-stub	native-builtins/src/util_concurrent_ext.rs:6040	kind=synthetic-stub
-java/util/function/Function$Identity	andThen	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:38168	kind=synthetic-stub
+java/util/function/Function$Identity	andThen	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:38194	kind=synthetic-stub
 java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/phases_late/streams.rs:2937	kind=synthetic-stub
-java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/lib.rs:38162	kind=synthetic-stub
-java/util/function/Function$Identity	compose	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:38174	kind=synthetic-stub
+java/util/function/Function$Identity	apply	(Ljava/lang/Object;)Ljava/lang/Object;	synthetic-stub	native-builtins/src/lib.rs:38188	kind=synthetic-stub
+java/util/function/Function$Identity	compose	(Ljava/util/function/Function;)Ljava/util/function/Function;	synthetic-stub	native-builtins/src/lib.rs:38200	kind=synthetic-stub
 java/util/logging/LogManager$StringEnumeration	nextElement	()Ljava/lang/Object;	synthetic-stub	native-builtins/src/logmanager.rs:6302	kind=synthetic-stub
 java/util/stream/Stream	sequential	()Ljava/util/stream/Stream;	bridge	native-builtins/src/streams.rs:185	pinned by a contract test
 java/util/zip/ZipFile$1	entryLocalNameEncoding	(Ljava/util/zip/ZipEntry;)Z	bridge	native-builtins/src/shared_secrets_bridge.rs:2533	pinned by a contract test
@@ -166,6 +166,7 @@ jdk/internal/ref/DirectBufferDeallocator	run	()V	synthetic-stub	native-builtins/
 jdk/internal/util/Preconditions	checkFromIndexSize	(III)I	bridge	native-builtins/src/preconditions.rs:431	pinned by a contract test
 jdk/internal/util/Preconditions	checkFromToIndex	(III)I	bridge	native-builtins/src/preconditions.rs:430	pinned by a contract test
 jdk/internal/util/Preconditions	checkIndex	(II)I	bridge	native-builtins/src/preconditions.rs:429	pinned by a contract test
+sun/instrument/InstrumentationImpl	<init>	(JLjava/lang/String;ZZ)V	bridge	vm/src/runtime/instrument.rs:2396	pinned by a contract test
 sun/management/OperatingSystemImpl	getCommittedVirtualMemorySize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
 sun/management/OperatingSystemImpl	getFreePhysicalMemorySize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub
 sun/management/OperatingSystemImpl	getFreeSwapSpaceSize0	()J	synthetic-stub	native-builtins/src/jmx.rs:3007	kind=synthetic-stub

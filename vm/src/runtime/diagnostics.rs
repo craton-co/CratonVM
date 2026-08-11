@@ -99,7 +99,15 @@ impl DiagnosticCounters {
             bytecodes_executed: Self::get(&self.bytecodes_executed),
             method_invocations: Self::get(&self.method_invocations),
             exceptions_thrown: Self::get(&self.exceptions_thrown),
-            classes_loaded: Self::get(&self.classes_loaded),
+            // Served by the class loader's own counter, not by this struct's
+            // `classes_loaded` cell. That cell was incremented by nothing and
+            // therefore reported `Classes loaded: 0` on every run — which reads
+            // as a measurement rather than as a missing instrument, and is why
+            // "what is still defining classes in steady state?" went unasked
+            // long enough to become a line item on the H2 throughput page.
+            // `define_census::total` counts DEFINITIONS at the single choke
+            // point every `define_class*` entry funnels through.
+            classes_loaded: cratonvm_classloading::define_census::total(),
             classes_unloaded: Self::get(&self.classes_unloaded),
             gc_cycles: Self::get(&self.gc_cycles),
             gc_pause_us: Self::get(&self.gc_pause_us),
@@ -324,12 +332,37 @@ mod tests {
     #[test]
     fn test_summary_snapshot() {
         let counters = DiagnosticCounters::new();
-        counters.add(&counters.classes_loaded, 42);
         counters.inc(&counters.gc_cycles);
         let summary = counters.summary();
-        assert_eq!(summary.classes_loaded, 42);
         assert_eq!(summary.gc_cycles, 1);
         assert!(summary.uptime_secs >= 0.0);
+    }
+
+    /// `classes_loaded` reports the class loader's own definition count, not
+    /// this struct's cell.
+    ///
+    /// The previous version of this test wrote 42 into the cell and read 42
+    /// back, which passed for as long as the field existed and proved only that
+    /// an `AtomicU64` stores what you put in it. Nothing in the VM ever wrote to
+    /// it, so the report said `Classes loaded: 0` forever and the test was
+    /// green throughout. A summary field must be tested against the thing that
+    /// PRODUCES it.
+    #[test]
+    fn summary_classes_loaded_tracks_real_class_definitions() {
+        let counters = DiagnosticCounters::new();
+        let before = counters.summary().classes_loaded;
+        cratonvm_classloading::define_census::note("com/example/DiagnosticsProbe");
+        assert_eq!(
+            counters.summary().classes_loaded,
+            before + 1,
+            "summary().classes_loaded did not follow a real class definition"
+        );
+        // And the struct's own cell is NOT what feeds it — writing to the cell
+        // must not move the reported number, or the old defect can come back
+        // silently by someone re-pointing the field.
+        let held = counters.summary().classes_loaded;
+        counters.add(&counters.classes_loaded, 42);
+        assert_eq!(counters.summary().classes_loaded, held);
     }
 
     #[test]
