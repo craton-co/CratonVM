@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **bisected to a named commit**, root cause not yet isolated within it |
+| **Status** | OPEN — **root-caused**, fix not yet written |
 | **Symptom** | `java.lang.AssertionError: expected:<8> but was:<9>` (`TestDefaultInstanceManager.java:66`) |
 | **First bad commit** | [`1d2817c75`](#the-bisect) `feat(types,gc,vm,jit): delete identity_hash_code from ObjectHeader` (2026-08-07 08:24) |
 | **Reproduces** | default GC and ZGC; **G1 passes**. Deterministic, ~17 s standalone |
@@ -131,13 +131,11 @@ The live loader is the control that proves the instrument can fire. So:
 That is a complete chain from a false premise to the assertion, and it explains
 why every rooting lever was inert: nothing about rooting is wrong.
 
-Note the premise is the one the bisected commit is documented as having
-weakened — "a fresh header is never all-zero" died when the hash went lazy, and
-these predicates were rewritten onto the mark word "WEAKER, not equivalent".
-The connection is consistent but **not yet proven**; the open question is now
-narrow and mechanical.
+The premise involved is the one the bisected commit is documented as having
+killed — "a fresh header is never all-zero" died when the hash went lazy. The
+section after next PROVES the connection rather than leaving it plausible.
 
-## Which skip arm? NONE — and the sweep reclaims nothing at all
+## Which skip arm? NONE
 
 `CRATONVM_DBG_MARK_WHY_CLASS` now also classifies the watched address against
 every stretch the walk can stride over, and reports where the walk ended.
@@ -161,38 +159,86 @@ All three candidates are eliminated:
 So the walk *covers* the address and still never stops at it. Its object grid
 strides over that base: some earlier object's computed size swallows the span.
 
-And the headline number: **`objects_swept=0`**. That counter is incremented in
-the publication loop over `dead_regions` — the real reclamation path, not a
-diagnostic one — so this sweep reclaimed NOTHING. 119,985 objects walked, zero
-dead, in a run that started Tomcat and compiled three JSPs. The same is true in
-the control run on a live JSP, so it is the whole sweep, not this object.
+So the mirror is not retained by a rooting decision, a side-table edge, or a
+skip list. The next section shows what does it: the walk identifies the span as
+dead and then UNWINDS that decision, and re-anchors past it.
 
-That subsumes the earlier framing. The mirror is not being retained by a rooting
-decision, a side-table edge, or a skip list. **No young object is reclaimed at
-all**, so no span is ever zeroed, so `is_live_young_survivor` (`word0 != 0`)
-answers "live" for every young address, and class unloading cannot work by
-construction.
+## ROOT CAUSE: the sweep's all-zero-span anomaly screen fires on live objects
 
-## The open question
+`dead_regions` is not empty because the walk finds nothing dead. It finds
+27,252 dead objects and then throws almost all of them away. Per-unwind-site
+census on the failing run:
 
-Why is `dead_regions` empty? Two shapes, distinguishable:
+```
+side_marked=118647  late_pinned=0  forwarded=0  header_marked=0
+dead_pushed=27252   unwinds=83  sites=[0, 83, 0, 0]
+unwound_entries=27285  dead_regions_final=51  side_sorted=132548
+```
 
-1. the walk classifies every object LIVE (its grid is desynced, so it never
-   lands on a dead object's base — which is exactly what the watched address
-   shows), or
-2. the walk collects dead spans and then UNWINDS them: `dead_regions.truncate`
-   back to `dead_watermark` on an anomaly, which is silent without a debug gate.
+**All 83 unwinds come from one site**, and its trigger is:
 
-Both are consistent with the bisected commit, whose layout changes moved
-`ARRAY_LENGTH_OFFSET`/`NUM_SLOTS_OFFSET` 12 -> 8 and whose own message records
-the walk's plausibility screen getting weaker. The probe to write next reports
-`dead_regions.len()` at the watermark and after each truncate, plus the walk's
-per-object stride around the watched offset.
+```rust
+let word0 = unsafe { *(obj_ptr as *const u64) };
+if word0 == 0 {
+    // "unlisted all-zero span" -> anomaly evidence
+    dead_regions.truncate(dead_watermark);   // drop every reclaim decision
+    // ... then re-anchor at the next FREE BLOCK, abandoning everything between
+```
 
-Note the scope this changes: if the young non-moving sweep reclaims nothing,
-`TestDefaultInstanceManager` is the symptom that happened to have an assertion
-on it. This is a young-generation reclamation failure on the `System.gc()` path
-and should be expected to cost throughput and footprint everywhere else.
+That screen exists because an all-zero header used to be proof of reclaimed
+memory. It rests on the premise the bisected commit is documented as killing,
+in its own words:
+
+> The stale-pointer detector and the zeroed-region screens keyed on "a fresh
+> header is never all-zero, because a hash is stamped at allocation". That
+> premise is dead: the hash is lazy now, so a live never-hashed never-locked
+> bare `new Object()` reads all-zero exactly like reclaimed memory.
+
+With `HEADER_SIZE` 16, `word0` is `class_id` (0..4) + `shape` (4..8). A live,
+never-hashed, never-locked object with `ClassId(0)` and no shape bits reads
+all-zero — indistinguishable from a reclaimed span by header bytes alone. So
+ordinary live objects now trip an anomaly screen **83 times per sweep**, and
+each hit discards every reclaim decision taken since the last anchor.
+
+That is the whole defect, and it produces the symptom twice over:
+
+1. **The unwind** throws away the evicted JSP loader's own reclaim decision
+   along with ~27k others, so its span is never zeroed and
+   `is_live_young_survivor` (`word0 != 0` — the loader has a real class id)
+   answers "live".
+2. **The resume** re-anchors at the next free block, "abandoning everything in
+   between" — which is why the earlier probe never saw the walk stop at that
+   base at all. The site's own comment already calls this resume behaviour
+   wrong and records it costing 233 MB of a 256 MB young generation on the H2
+   UPDATE path.
+
+## Scope
+
+This is not a Tomcat bug. The non-moving young sweep publishes **51 reclaimed
+regions out of 27,252 identified** on the `System.gc()` path.
+`TestDefaultInstanceManager` is simply the test that happens to assert on a
+consequence; everywhere else it costs throughput and footprint while failing
+nothing, which is why it went unnoticed from 08-07.
+
+(Correcting an earlier reading on this page: I first reported `objects_swept=0`
+as "the sweep reclaims nothing". That counter is incremented in the publication
+loop, and my probe printed before it. The accurate statement is the ratio
+above.)
+
+## The fix, and the constraint on it
+
+The screen must stop treating "all-zero header" as evidence of anything. The
+commit that broke it also closed the obvious repair: minting a hash eagerly to
+restore the invariant is not available, because a non-zero mark word loses the
+thin-lock CAS and every `synchronized` block in the program would inflate.
+
+The discriminator that IS available is the one the sweep already has:
+`side_sorted`, the complete live set (132,548 entries here). A span that is
+all-zero and NOT side-marked is legitimately reclaimable; the anomaly is
+all-zero AND on a stretch the grid cannot vouch for. Any fix must keep the
+double-free protection the site was written for — the comment above it records
+a real UAF from parsing zero spans as 40-byte phantom objects — so the
+conservative arm has to survive, just stop firing on live never-hashed objects.
 
 ## Do not close this without a regression pin
 
