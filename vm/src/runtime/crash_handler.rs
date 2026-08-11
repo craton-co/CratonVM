@@ -238,12 +238,44 @@ pub fn publish_primordial_frame_trace(
 /// those cycles — which is exactly the state a heap-corruption or
 /// stale-`ObjectRef` bug needs to be read against.
 pub fn gc_state_lines() -> Vec<String> {
+    gc_state_lines_for(
+        ACTIVE_GC_ALGORITHM
+            .get()
+            .copied()
+            .unwrap_or("<unpublished>"),
+    )
+}
+
+/// The generational young collector's `moving_young_*` state is meaningful in
+/// a crash report only when that collector is the one running.
+///
+/// `record_moving_young_cycle` and `record_moving_young_coverage_fallback` are
+/// each called from exactly one place — `gen_heap.rs` — and `moving_young_enabled()`
+/// is read nowhere in `g1.rs`. So under `-XX:+UseG1GC` the policy line described
+/// a collector that was not running and both counters were zero *by
+/// construction*, not by measurement. Printed together they read as "G1's
+/// moving young generation relocated nothing", which is a claim the report
+/// cannot make.
+///
+/// That is not hypothetical: it is how
+/// fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md got
+/// its title. Four G1 crash dumps carried `young-gen policy: moving (Cheney
+/// young copy)` beside `last incomplete-coverage reason:
+/// innermost-rbp-belongs-to-unguarded-callee`, and the page concluded G1's
+/// moving young collector had an unguarded-callee root-coverage gap. The real
+/// defect was an unaligned G1 TLAB carve, and root scanning was never involved.
+///
+/// The incomplete-coverage reason and the two JIT-frame lines below stay for
+/// every collector: `g1.rs` does call `mark_moving_young_coverage_incomplete_because`,
+/// and `set_unregistered_jit_frame_on_stack` comes from the collector-agnostic
+/// `jit::conservative_roots`.
+///
+/// Split out from [`gc_state_lines`] so the collector can be varied in a test;
+/// `ACTIVE_GC_ALGORITHM` is a process-wide `OnceLock`.
+pub(crate) fn gc_state_lines_for(collector: &str) -> Vec<String> {
     use cratonvm_gc::gc_quiescence as q;
 
-    let collector = ACTIVE_GC_ALGORITHM
-        .get()
-        .copied()
-        .unwrap_or("<unpublished>");
+    let generational = collector == "generational";
     let moving_cycles = q::moving_young_cycle_count();
     let fallbacks = q::moving_young_coverage_fallback_count();
     let policy = if q::moving_young_enabled() {
@@ -252,15 +284,22 @@ pub fn gc_state_lines() -> Vec<String> {
         "non-moving (STW mark-sweep young)"
     };
 
-    let mut lines = vec![
-        format!("gc collector: {collector}"),
-        format!("gc young-gen policy: {policy}"),
-        format!(
+    let mut lines = vec![format!("gc collector: {collector}")];
+    if generational {
+        lines.push(format!("gc young-gen policy: {policy}"));
+        lines.push(format!(
             "gc young-gen actual: {moving_cycles} moving cycle(s), \
              {fallbacks} cycle(s) diverted to the NON-MOVING sweep"
-        ),
-    ];
-    if fallbacks > 0 || q::moving_young_coverage_incomplete() {
+        ));
+    } else {
+        lines.push(
+            "gc young-gen policy/actual: n/a — those counters are the GENERATIONAL \
+             young collector's and are never incremented by this one, so they would \
+             read zero whatever happened"
+                .to_string(),
+        );
+    }
+    if (generational && fallbacks > 0) || q::moving_young_coverage_incomplete() {
         lines.push(format!(
             "gc young-gen last incomplete-coverage reason: {}",
             q::incomplete_reason::label(q::moving_young_incomplete_reason())
@@ -3372,9 +3411,8 @@ mod tests {
 
     #[test]
     fn gc_state_lines_report_collector_and_the_moving_verdict() {
-        let lines = gc_state_lines();
-        let joined = lines.join("\n");
-        assert!(joined.contains("gc collector:"), "{joined}");
+        let joined = gc_state_lines_for("generational").join("\n");
+        assert!(joined.contains("gc collector: generational"), "{joined}");
         // The policy/actual split is the whole point: a report that only said
         // "generational" would not distinguish a compacting young generation
         // from one permanently diverted to the non-moving sweep.
@@ -3384,6 +3422,43 @@ mod tests {
             joined.contains("moving cycle(s)") && joined.contains("NON-MOVING sweep"),
             "the actual line must carry both counters: {joined}"
         );
+        // And the collector line is not merely echoed back: an unpublished
+        // collector must not be reported as a known one.
+        assert!(
+            gc_state_lines_for("<unpublished>")
+                .join("\n")
+                .contains("gc collector: <unpublished>")
+        );
+    }
+
+    /// The counters behind `young-gen policy` / `young-gen actual` are
+    /// incremented only by `gen_heap.rs`, so under any other collector they are
+    /// zero by construction. Printing them there reads as a measurement of that
+    /// collector and is how the Tomcat G1 SIGSEGV page
+    /// (fixed-suite-bugs/tomcat/g1-sigsegv-unguarded-callee-jit-frame-FIXED.md)
+    /// came to blame a moving young collector that was never running.
+    #[test]
+    fn gc_state_lines_omit_generational_only_counters_under_another_collector() {
+        for collector in ["g1", "zgc", "<unpublished>"] {
+            let joined = gc_state_lines_for(collector).join("\n");
+            assert!(joined.contains(&format!("gc collector: {collector}")), "{joined}");
+            assert!(
+                !joined.contains("gc young-gen policy:"),
+                "{collector}: the generational policy line must not appear: {joined}"
+            );
+            assert!(
+                !joined.contains("gc young-gen actual:"),
+                "{collector}: the generational counters must not appear: {joined}"
+            );
+            assert!(
+                !joined.contains("Cheney young copy"),
+                "{collector}: must not name the generational young collector: {joined}"
+            );
+            assert!(
+                joined.contains("gc young-gen policy/actual: n/a"),
+                "{collector}: their absence must be stated, not silent: {joined}"
+            );
+        }
     }
 
     #[test]
