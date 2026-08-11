@@ -2215,6 +2215,20 @@ enum SnapshotItrRoute {
     /// A native `TreeSet` (including the descending snapshot), removed through
     /// the sorted array + size bookkeeping in [`ts_remove_element`].
     TreeSet,
+    /// A native `LinkedList`, removed through [`native_ll_remove_object`].
+    ///
+    /// This is the one route whose `remove()` is not the same operation the
+    /// fabricated iterator performed: `LinkedList$Itr` is node-live and unlinks
+    /// the node `next()` returned, while this deletes the FIRST occurrence of
+    /// that element. The two differ only for a list holding duplicates, and
+    /// only on the `--jdk-only` path — where the alternative is not a
+    /// better-behaved `remove()` but a `NoClassDefFoundError` before `next()`.
+    LinkedList,
+    /// A native `ArrayDeque`, removed through
+    /// [`native_ad_remove_first_occurrence`] — which is the same call
+    /// `native_ad_itr_remove` already makes for the fabricated `ArrayDeque$Itr`,
+    /// so this route changes the class name and nothing else.
+    ArrayDeque,
 }
 
 /// The live collection a snapshot iterator's `remove()` must delete from.
@@ -31376,7 +31390,51 @@ fn native_ll_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let (this, itr) = rooted_across1(ctx, this, |ctx| {
         try_alloc_synthetic(ctx, "java/util/LinkedList$Itr", 3)
     });
-    let itr = itr?;
+    // `java/util/LinkedList$Itr` is a name no JDK image declares (the real one
+    // is `LinkedList$ListItr`), so `--jdk-only` refuses it and every
+    // `linkedList.iterator()` — including the one real
+    // `AbstractCollection.toString()` reaches — died with
+    // `NoClassDefFoundError: java/util/LinkedList$Itr` before `hasNext()`.
+    //
+    // The obvious alternative was to drop the interception and let real
+    // `LinkedList` bytecode run, and unlike the other collections here that is
+    // genuinely available: the natives mirror their overlay into the real
+    // `first`/`last`/`size` fields (`ll_set`; see `ll_get`'s overlay-MISS arm),
+    // and `linkedList.descendingIterator()` — which nothing intercepts —
+    // already walks that chain and answers `[c,b,a]` under `--jdk-only` today.
+    // The two registrar comments below claiming *"the JDK `first` field is
+    // always null"* and *"our overlay-based LL never writes those"* have been
+    // outlived by that mirror.
+    //
+    // It is still the wrong answer, and one run says why. Drive a real
+    // `ListItr.remove()` (via `descendingIterator()`) against a native
+    // LinkedList and the two owners disagree: real `unlink` decrements the real
+    // `size` and re-links the real nodes, `ll_get` reads the OVERLAY first and
+    // still answers the old size, and the NEXT real iteration walks off the end
+    // — `NullPointerException: Cannot read field "item"` at
+    // `LinkedList$ListItr.previous`, reproducible in `Compatible` mode on an
+    // unmodified binary. Handing iteration to real bytecode would put a second
+    // writer on state the natives own. The snapshot keeps one owner.
+    //
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there and the
+    // node-live `LinkedList$Itr` is still what `--real-jdk` hands back, with
+    // its `remove()`-unlinks-the-node-just-returned semantics intact.
+    let itr = match itr {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            if head_pin != usize::MAX {
+                ctx.unpin_native_roots(head_pin);
+            }
+            let this_pin = ctx.pin_native_root(this);
+            let snap = ll_snapshot_array(ctx, this);
+            let n = ctx.array_length(snap);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real =
+                real_snapshot_iterator(ctx, snap, n, Some((this, SnapshotItrRoute::LinkedList)));
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let head = read_pinned_elem(ctx, head_pin, head);
     if head_pin != usize::MAX {
         ctx.unpin_native_roots(head_pin);
@@ -33758,7 +33816,42 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         let value = read_pinned_elem(ctx, elem_pins[i], *e);
         ctx.set_array_element(arr, i, value);
     }
-    let itr = try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3)?;
+    // No JDK image declares `java/util/ArrayDeque$Itr` — the real one is
+    // `ArrayDeque$DeqIterator` — so `--jdk-only` refuses it and, before this
+    // arm, `new ArrayDeque<>(..).iterator()` raised
+    // `NoClassDefFoundError: java/util/ArrayDeque$Itr` before `hasNext()`.
+    // Land on the real `Arrays$ArrayItr` instead, exactly as the HashSet and
+    // TreeSet sites do. The trade is smaller here than anywhere else: this
+    // iterator is ALREADY snapshot-backed (field 0 is the copy taken above,
+    // not the ring buffer), and `native_ad_itr_remove`'s whole body is the
+    // `native_ad_remove_first_occurrence` call that `SnapshotItrRoute::ArrayDeque`
+    // makes — so the two shapes differ in the class name and nothing else.
+    //
+    // Letting real `ArrayDeque.iterator()` bytecode run instead is NOT an
+    // option, and the measurement says why: real `DeqIterator` derives its
+    // bounds from `head`/`tail`, and a CratonVM-native deque leaves `tail` at 0
+    // — reflectively, a two-element deque reads `elements=Object[2] head=0
+    // tail=0`, so real bytecode computes size 0 and iterates nothing. (The same
+    // unwritten `tail` is why `ArrayDeque.stream().count()` answers 0 in BOTH
+    // modes today; that one is not this arm's to fix — see
+    // `docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md`.)
+    //
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there.
+    let itr = match try_alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                arr,
+                elems.len(),
+                Some((this, SnapshotItrRoute::ArrayDeque)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let itr_pin = ctx.pin_native_root(itr);
     let itr = ctx.read_native_pin(itr_pin, itr);
     let arr = ctx.read_native_pin(arr_pin, arr);
@@ -45548,34 +45641,53 @@ fn native_ksv_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let this_pin = ctx.pin_native_root(this);
     let (arr, total) = ksv_snapshot_array(ctx, this);
     let arr_pin = ctx.pin_native_root(arr);
-    // THE LAST MINT SITE ON THE INFALLIBLE FUNNEL — migrated 2026-08-10, and
-    // the trade it makes is not the one the two previous notes describe.
+    // Fallible since 2026-08-10; the refusal ARM below was added 2026-08-11,
+    // and the reason the arm was missing is worth keeping because it was a
+    // correct argument that its own file had already outgrown.
     //
-    // Every other snapshot iterator LANDS on a real `Arrays$ArrayItr` when
-    // `--jdk-only` refuses the fabricated shape, and that trade was argued as
-    // free: "on the strict path the alternative was never a working `remove()`
-    // — it was an iteration that did not reach `next()`". That argument does
-    // NOT hold here, and `RChmKeySetView` is what measured it: HotSpot's
-    // `ConcurrentHashMap$KeySetView.iterator()` returns a `KeyIterator` whose
-    // `remove()` writes through to the map, the test exercises exactly that,
-    // and a fixed-size list's iterator answers
-    // `UnsupportedOperationException: remove`. So this site still must NOT be
-    // landed on the array iterator, and it is not.
+    // The 2026-08-10 note said this site must refuse rather than land on a real
+    // `Arrays$ArrayItr`, because HotSpot's `KeySetView.iterator()` returns a
+    // `KeyIterator` whose `remove()` writes through to the map, `RChmKeySetView`
+    // exercises exactly that, and a fixed-size list's iterator answers
+    // `UnsupportedOperationException: remove`. Every clause of that was true
+    // when it was written and the last one no longer is: `real_snapshot_iterator`
+    // takes a `backing` argument, [`snapshot_itr_backing_table`] carries the
+    // pointer the real two-field class has no slot for, and
+    // `native_snapshot_itr_remove`'s `SetLike` arm ALREADY discriminates a key-set
+    // view (`if is_key_set_view(ctx, backing) { native_ksv_remove(..) }`) — the
+    // write-through this site was held back for was built for this receiver and
+    // then not wired to it. Measured on the pre-fix binary: `--jdk-only`
+    // `RChmKeySetView` died at `surface():140` with
+    // `NoClassDefFoundError: java/util/HashMap$KeyItr` on the plain `for (String
+    // x : s)`, i.e. the refusal cost the whole iteration, not just `remove()`.
     //
-    // REFUSING is a different thing from landing, and it is what step 3 needs.
-    // In the default `Compatible` mode `try_alloc_synthetic` is byte-for-byte
-    // what the infallible spelling did, so `RChmKeySetView` and every ordinary
-    // run are unchanged. Under `--jdk-only` the fabrication of
-    // `java/util/HashMap$KeyItr` — a name NO JDK image declares — now raises a
-    // `NoClassDefFoundError` naming that class instead of silently running a
-    // synthetic collection iterator in place of `java.base`'s bytecode, which
-    // is what contract §11 asks for and what `counts.compatibility_classes`
-    // was reporting as its last non-zero row.
+    // What is NOT available here, and why the refusal cannot simply be dropped:
+    // real `KeySetView.iterator()` bytecode reads `ConcurrentHashMap.table`, and
+    // on a CratonVM-native CHM that field is null — measured reflectively under
+    // `--add-opens java.base/java.util.concurrent=ALL-UNNAMED`: `table = null`,
+    // `baseCount = 0` for a map with one entry, against `Node[16]`/`1` on
+    // HotSpot. Letting the real iterator run would iterate EMPTY, which is the
+    // failure mode that reads as a pass. The snapshot keeps the natives the one
+    // owner of the state; only the class name becomes honest.
     //
-    // The capability is recovered, not traded away, when CratonVM's
-    // `ConcurrentHashMap` carries a real `table[]` its own `KeyIterator` can
-    // walk — the collections reclassification wave, not this one.
-    let itr = try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS)?;
+    // `Compatible` is untouched: `try_alloc_synthetic` succeeds there, so this
+    // arm never runs and the fabricated `HashMap$KeyItr` is still what
+    // `--real-jdk` hands back.
+    let itr = match try_alloc_synthetic(ctx, "java/util/HashMap$KeyItr", MAP_KEY_ITR_NUM_FIELDS) {
+        Ok(itr) => itr,
+        Err(_refused) => {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let this = ctx.read_native_pin(this_pin, this);
+            let real = real_snapshot_iterator(
+                ctx,
+                arr,
+                total,
+                Some((this, SnapshotItrRoute::SetLike)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            return real;
+        }
+    };
     let arr = ctx.read_native_pin(arr_pin, arr);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(itr, MAP_KEY_ITR_FIELD_KEYS, Value::Object(Some(arr)));
@@ -50978,6 +51090,12 @@ fn native_snapshot_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             }
         }
         SnapshotItrRoute::TreeSet => ts_remove_element(ctx, state.backing, last),
+        SnapshotItrRoute::LinkedList => {
+            native_ll_remove_object(ctx, &[Value::Object(Some(state.backing)), last])
+        }
+        SnapshotItrRoute::ArrayDeque => {
+            native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(state.backing)), last])
+        }
     };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
