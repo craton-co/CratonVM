@@ -2,31 +2,31 @@
   "jdk": {
     "25/linux": {
       "bridge_shadows_bytecode": 4555,
-      "bridge_without_acc_native": 8977,
+      "bridge_without_acc_native": 9026,
       "jdk_version": "25.0.4",
       "mode": "compatible",
-      "note": "248 registrations re-tagged Bridge -> SyntheticStub because no supported JDK image declares their receiver class (six images: Temurin 21.0.12+8 and 25.0.4+7 on linux, windows and macos), so contract 1.5 has no ACC_NATIVE method for them to bind to. Table, exclusion and measurement in native-api/src/no_image_receiver.rs; the one exclusion is the proxy machinery, kept Bridge as a reviewed VM service. Verified against a binary built from dev without the change, same host and images: --jdk-only corpus 52 passed / 6 failed and compatible 35 / 0 on BOTH arms, and the CRATONVM_NO_STUBS drop list grows by exactly 248 with nothing moving the other way. Taken on the merge with dc55e8057, which deleted ensure_synthetic_class and 179 registrations, so the row total falls to 11555 for reasons that are not this change.",
+      "note": "Restores 65 registrations dc55e8057 deleted: 49 Bridge here, 16 SyntheticStub on receivers no image declares. Its dead-sweep scored them method-nowhere (class on the image, method not), which is also exactly what CratonVM's own additions to a real class look like: a SharedSecrets owner method is ordinary bytecode on every image, a <clinit> no-op shim can never be declared native, and Preconditions.checkIndex(II)I exists precisely because the JDK declares only the BiFunction form. 24 tests across two crates named the triples they pin and went red; the commit shipped on cargo check --all-targets, which compiles tests and runs none. native-builtins --lib 3380/22 -> 3402/0, native-io --lib 436/2 -> 438/0, --jdk-only corpus 52 -> 53 passed, compatible 35 -> 36, same six pre-existing failures. scripts/jdk-only-dead-sweep.py --pinned now walks a DIRECTORY: pins 38 -> 2488, and all eight restored triples leave the deletion list. Record: fixed-bugs/jdk-only-method-nowhere-deleted-live-registrations-FIXED-20260811.md",
       "observed": {
         "bridge": {
-          "abstract_method": 1318,
+          "abstract_method": 1327,
           "acc_native": 780,
           "class_absent": 872,
-          "class_present_method_undeclared": 2232,
-          "rows": 9757,
+          "class_present_method_undeclared": 2272,
+          "rows": 9806,
           "shadows_bytecode": 4555,
-          "without_acc_native": 8977
+          "without_acc_native": 9026
         },
         "census_schema_version": 3,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 9757,
+          "bridge": 9806,
           "intrinsic": 663,
-          "synthetic-stub": 1135
+          "synthetic-stub": 1158
         },
         "schema": 1,
-        "total_rows": 11555
+        "total_rows": 11627
       },
       "os": "linux",
       "workload": "generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only"

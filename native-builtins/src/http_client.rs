@@ -1670,6 +1670,24 @@ fn http2_client_orchestrator_register(r: &mut NativeMethodRegistry) {
         },
     );
     // sendHttp2(HttpRequest, BodyHandler) -> HttpResponse
+    r.register(
+        cls,
+        "sendHttp2",
+        "(Ljdk/internal/net/http/HttpRequestImpl;Ljava/net/http/HttpResponse$BodyHandler;)Ljdk/internal/net/http/HttpResponseImpl;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let req = obj_arg(args, 1)?;
+            let parent = match ctx.get_field(this, 0) {
+                Value::Object(Some(c)) => c,
+                _ => return Err(iae("Http2ClientImpl: no parent HttpClientImpl")),
+            };
+            do_send(ctx, parent, req, args.get(2).copied())
+        },
+    );
+    r.register(cls, "openConnections", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
 }
 
 fn http1_exchange_register(r: &mut NativeMethodRegistry) {
@@ -1684,6 +1702,15 @@ fn http1_exchange_register(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Object(None));
         Ok(None)
     });
+    r.register(cls, "writeRequest", "([B)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Simply stash the bytes on the exchange (field 0) so test code
+        // can read them back. A real exchange-level write lives inside
+        // the connection pool, but for reflection-driven dispatch we
+        // need a no-throw method here.
+        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+        Ok(None)
+    });
 
     // Http1HeaderParser parses a single `\r\n`-terminated header line.
     let cls = "jdk/internal/net/http/Http1HeaderParser";
@@ -1694,6 +1721,38 @@ fn http1_exchange_register(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Object(None));
         Ok(None)
+    });
+    r.register(cls, "parse", "([B)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = match args.get(1) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let bytes = read_byte_array(ctx, arr);
+        let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+        let mut resp = httparse::Response::new(&mut headers_storage);
+        match resp.parse(&bytes) {
+            Ok(httparse::Status::Complete(_)) => {
+                if let Some(code) = resp.code {
+                    ctx.set_field(this, 1, Value::Int(code as i32));
+                }
+                let arr_obj = ctx.new_ref_array(ClassId::new(0), resp.headers.len());
+                for (i, h) in resp.headers.iter().enumerate() {
+                    let k = h.name;
+                    let v = std::str::from_utf8(h.value).unwrap_or("");
+                    let line = ctx.create_string(&format!("{k}: {v}"));
+                    ctx.set_array_element(arr_obj, i, Value::Object(Some(line)));
+                }
+                ctx.set_field(this, 2, Value::Object(Some(arr_obj)));
+                Ok(Some(Value::Int(1)))
+            }
+            Ok(httparse::Status::Partial) => Ok(Some(Value::Int(0))),
+            Err(_) => Ok(Some(Value::Int(0))),
+        }
+    });
+    r.register(cls, "statusCode", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
     });
 }
 
@@ -1709,8 +1768,20 @@ pub fn register_http_client_real(r: &mut NativeMethodRegistry) {
     r.register(
         cls,
         "send",
+        "(Ljdk/internal/net/http/HttpRequestImpl;Ljava/net/http/HttpResponse$BodyHandler;)Ljdk/internal/net/http/HttpResponseImpl;",
+        hci_send,
+    );
+    r.register(
+        cls,
+        "send",
         "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/net/http/HttpResponse;",
         hci_send,
+    );
+    r.register(
+        cls,
+        "sendAsync",
+        "(Ljdk/internal/net/http/HttpRequestImpl;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/util/concurrent/CompletableFuture;",
+        hci_send_async,
     );
     r.register(
         cls,

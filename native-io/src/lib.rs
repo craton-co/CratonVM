@@ -11226,6 +11226,18 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/String;)Ljava/nio/file/Path;",
         native_paths_get,
     );
+    // The one-argument spelling is CratonVM's own. `Paths.get` is varargs on
+    // every JDK, so `(Ljava/lang/String;)Ljava/nio/file/Path;` is declared by no
+    // image and a census scores it `method-nowhere` — indistinguishable, from
+    // the image alone, from a dead entry. It is pinned by
+    // `io_tests::path_and_files_methods_registered`, which is what went red when
+    // `dc55e8057` deleted it as dead. Restored 2026-08-10.
+    registry.register(
+        paths,
+        "get",
+        "(Ljava/lang/String;)Ljava/nio/file/Path;",
+        native_paths_get_simple,
+    );
 
     // Path methods
     registry.register(
