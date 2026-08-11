@@ -791,8 +791,8 @@ fn native_lock_support_get_blocker(
     Ok(Some(Value::Object(None)))
 }
 
-/// Report a caller that imposes its own small field layout on a class which
-/// already has a bigger one.
+/// Report a caller that imposes its own field layout on a class which already
+/// has a different one — in EITHER direction.
 ///
 /// `alloc_concurrent_synthetic` does NOT truncate: both it and
 /// `NativeContext::alloc_object` clamp the slot count UP to the resolved
