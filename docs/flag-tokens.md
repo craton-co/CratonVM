@@ -59,7 +59,7 @@ export inherited from a parent shell.
 
 ## `CRATONVM_DBG`
 
-429 tokens.
+435 tokens.
 
 | Token | Expands to |
 | --- | --- |
@@ -136,6 +136,7 @@ export inherited from a parent shell.
 | `debug-stack-tag` | `CRATONVM_DEBUG_STACK_TAG` |
 | `debug-stackwalk` | `CRATONVM_DEBUG_STACKWALK` |
 | `define` | `CRATONVM_DBG_DEFINE` |
+| `define-census` | `CRATONVM_DBG_DEFINE_CENSUS` |
 | `deflate` | `CRATONVM_DBG_DEFLATE` |
 | `deopt` | `CRATONVM_DBG_DEOPT` |
 | `deopt-eager` | `CRATONVM_DEOPT_EAGER` |
@@ -159,6 +160,7 @@ export inherited from a parent shell.
 | `dupclass` | `CRATONVM_DBG_DUPCLASS` |
 | `dupclass-bt` | `CRATONVM_DBG_DUPCLASS_BT` |
 | `dupclass-filter` | `CRATONVM_DBG_DUPCLASS_FILTER` |
+| `typecheck-filter` | `CRATONVM_DBG_TYPECHECK_FILTER` |
 | `dupx-methods` | `CRATONVM_DBG_DUPX_METHODS` |
 | `ecwatch` | `CRATONVM_DBG_ECWATCH` |
 | `ecwatch-native` | `CRATONVM_DBG_ECWATCH_NATIVE` |
@@ -300,6 +302,10 @@ export inherited from a parent shell.
 | `mh-dispatch` | `CRATONVM_DBG_MH_DISPATCH` |
 | `mh-stack` | `CRATONVM_DBG_MH_STACK` |
 | `mic-prof` | `CRATONVM_DBG_MIC_PROF` |
+| `mic-method` | `CRATONVM_DBG_MIC_METHOD` |
+| `mark-why-class` | `CRATONVM_DBG_MARK_WHY_CLASS` |
+| `mirrorpin-why` | `CRATONVM_DBG_MIRRORPIN_WHY` |
+| `root-source` | `CRATONVM_DBG_ROOT_SOURCE` |
 | `mic-trace` | `CRATONVM_DBG_MIC_TRACE` |
 | `minvoke` | `CRATONVM_DBG_MINVOKE` |
 | `mirrorpin` | `CRATONVM_DBG_MIRRORPIN` |
@@ -720,10 +726,11 @@ export inherited from a parent shell.
 
 ## `CRATONVM_REAL`
 
-24 tokens.
+25 tokens.
 
 | Token | Expands to |
 | --- | --- |
+| `bytebuffer-intrinsic` | `CRATONVM_BYTEBUFFER_INTRINSIC` |
 | `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
 | `annotations` | `CRATONVM_REAL_ANNOTATIONS / CRATONVM_SYNTHETIC_ANNOTATIONS` |
 | `aqs` | `CRATONVM_REAL_AQS / CRATONVM_SYNTHETIC_AQS` |
