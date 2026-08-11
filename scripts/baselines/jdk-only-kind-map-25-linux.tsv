@@ -7,9 +7,9 @@
 # jdk_version: 25.0.4
 # mode: compatible
 # workload: generated BridgeRatchetCensusProbe (boot + one println); -cp is its own directory only
-# rows: 11635
+# rows: 11636
 # unchosen: 0
-# note: java.util.logging shadows RETIRED (wave-2 item 2). 84 live triples plus their 20 superseded duplicates move Bridge -> SyntheticStub via native-api/src/retired_shadow.rs, so --jdk-only refuses them and the real class runs; --real-jdk is unchanged. Acceptance: with CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/logging/ the strict corpus is 23 passed / 4 failed with the failing set unchanged (RJdkHandles RJdkReflect RJdkForkJoin RJdkJmx), and with the retirement live it is the same 23/4 and the core corpus is 37/0. without_acc_native 9015 -> 8911, shadows_bytecode 6170 -> 6066, both by exactly the 104 rows retired. Logger.log(Level,Supplier,Throwable) is held back by name: that signature is not in JDK 25 at all, so it resolves nowhere and refusing it would replace a shadow with an UnsatisfiedLinkError.
+# note: Re-measured on the merge of fix/jdk-only-precedence-and-bridge-wave-20260811 with origin/dev b240353e1. Two independent movements: this branch (census schema 4 with hierarchy resolution, three new ratchets, and the java.util.logging shadow retirement) and dev (fc7d9c9f0 / c2391d63b / acb43cf4b, the openmbean carrier and java.io directory-open natives). Neither side baseline described the merged tree, so both were re-taken from one census here.
 # class	name	descriptor	ordinal	kind	kind_stated	kind_chosen
 CratonVM$HttpServerLoop	run	()V	0	bridge	0	1
 brave/internal/collect/WeakConcurrentMap$WeakKey	equals	(Ljava/lang/Object;)Z	0	bridge	0	1
@@ -10647,6 +10647,7 @@ sun/awt/image/BytePackedRaster	initIDs	()V	0	bridge	1	1
 sun/awt/image/GifImageDecoder	initIDs	()V	0	bridge	1	1
 sun/awt/image/IntegerComponentRaster	initIDs	()V	0	bridge	1	1
 sun/awt/image/ShortComponentRaster	initIDs	()V	0	bridge	1	1
+sun/instrument/InstrumentationImpl	<init>	(JLjava/lang/String;ZZ)V	0	bridge	0	1
 sun/instrument/InstrumentationImpl	addTransformer	(Ljava/lang/instrument/ClassFileTransformer;)V	0	bridge	0	1
 sun/instrument/InstrumentationImpl	addTransformer	(Ljava/lang/instrument/ClassFileTransformer;Z)V	0	bridge	0	1
 sun/instrument/InstrumentationImpl	appendToClassLoaderSearch0	(JLjava/lang/String;Z)V	0	bridge	1	1
