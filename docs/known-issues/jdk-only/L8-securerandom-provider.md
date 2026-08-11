@@ -1,7 +1,12 @@
 # `SecureRandom.getProvider()` was null, and `getInstance` fabricated a PRNG for any string
 
-**Status:** FIXED in source 2026-08-06 (lane L8, JDK-only wave 2). Not yet
-verified against a binary — see *How to verify* below.
+**Status:** headline defect FIXED in source 2026-08-06 (lane L8, JDK-only
+wave 2). Not yet verified against a binary — see *How to verify* below.
+
+**Residual pass 2026-08-11 (JCA residuals lane).** The kept residual is live,
+but the reason given for keeping it is wrong in a way that matters, and a
+second shadowed registration beside it is worse than the one that was named.
+See the section at the foot of this record. Nothing was built or run.
 
 ## The failure
 
@@ -236,3 +241,210 @@ No `register*` call was added or changed, so
 `native-builtins/tests/stub_ratchet.rs` all score identically. No file under
 `scripts/baselines/` or `native-builtins/tests/` mentions `securerandom`, so
 the ~110 inserted lines cannot stale a fixed line band.
+
+---
+
+# Residual pass, 2026-08-11 — the seed, and which registration is absent
+
+The campaign-wide audit kept this record for one residual: *"the synthetic-jdk
+`SecureRandom([B)V` no-op is still registered"*, on the reasoning that *"a
+seeded `SecureRandom` that ignores its seed is a fabricated success of the most
+dangerous kind — the caller believes it has determinism (or entropy) it does not
+have."*
+
+The registration is live. **The reasoning is not, and it points at the wrong
+half of the problem.**
+
+## Verdict 1 — the registration is live, and it is synthetic-jdk ONLY
+
+`native-builtins/src/crypto_impl.rs` still carries
+`native_secure_random_init_seed_bytes` (two argument-shape checks and
+`Ok(None)`) and still registers it for `java/security/SecureRandom.<init>([B)V`
+inside `register_crypto_impl_natives`. Confirmed by reading the tree, not
+recalled — this record's *Out of scope* section predicted it and the prediction
+holds.
+
+Which mode it bites in matters, and the distinction is the one
+`docs/architecture/natives-over-real-jdk-classes.md` §2 exists to make:
+
+* `register_crypto_impl_natives` has exactly one call site in
+  `native-builtins/src/lib.rs`, and it is inside `register_synthetic_overrides`.
+* `register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`, and
+  `vm/src/vm/vm_init.rs` reaches it only when `config.use_synthetic_jdk` is also
+  true.
+* `synthetic-jdk` is in **no crate's default feature set**.
+
+So in a plain CLI build the registrar **never compiles in at all**. This is not
+a registration that is present and declined by policy — it is *absent from the
+binary*, which is a different thing and a weaker claim than "still registered"
+suggests. In `--real-jdk` and `--jdk-only`, `<init>([B)V` is served by
+`securerandom.rs`'s `native_secure_random_init`, which stamps both `algorithm`
+and `provider`.
+
+Registration order within the synthetic arm, since it is last-write-wins:
+`register_synthetic_overrides` calls `register_security_natives` (which calls
+`securerandom::register_random_and_securerandom_natives`) **before** it calls
+`register_crypto_impl_natives`. The `crypto_impl` bodies therefore win in
+synthetic mode, as its own comment claims — though the comment's stated reason
+(a phase ordering in `lib.rs`) is not the mechanism; both calls are in the same
+function and it is their order *within* it that decides.
+
+## Verdict 2 — "ignores its seed" is what HotSpot does, and the record already said so
+
+Measured this lane on Eclipse Adoptium jdk-25.0.3.9-hotspot
+(`java.version=25.0.3`), drawing 16 bytes from two identically seeded
+instances:
+
+```
+ctor(seed) alg=DRBG prov=SUN
+  d1=ad1b218bf7da9b2ce93f0dbfb20efbb2
+  d2=5d8d4d0bd95ab80a64e952d612b64831
+  ctor(seed) reproducible? false
+SHA1PRNG+setSeed reproducible? true v=484cd4718bc11f0673790ab384813637
+ctor() alg=DRBG prov=SUN
+getInstanceStrong alg=Windows-PRNG
+```
+
+`new SecureRandom(seed)` selects DRBG, and DRBG's `engineSetSeed` *reseeds* —
+it does not replace the state. **The caller cannot have determinism from
+HotSpot either**, so discarding the constructor seed is not a fabricated
+success; it is the measured behaviour. Nor is entropy lost: every draw in this
+module reads the OS CSPRNG directly, and supplementing a fully seeded CSPRNG is
+a no-op.
+
+`securerandom.rs`'s registration already states exactly this, in place, and the
+measurement above is an independent confirmation of it rather than a discovery:
+
+> `SecureRandom(byte[] seed)`: the seed argument is DISCARDED, and that matches
+> HotSpot rather than merely being convenient. […] So `new SecureRandom(seed)`
+> is not reproducible on HotSpot either […]
+
+So on the live paths there is **no silent discard to fix**: the discard is
+documented, oracle-matched, and the constructor is not a no-op — it stamps
+`algorithm` and `provider`. The instruction "make the seed actually seed, or
+make the constructor refuse" has a third correct answer here, which is the one
+already in the tree: match the oracle and say so.
+
+## Verdict 3 — the real defect in the shadowing block, and it is not the one that was named
+
+What is wrong with `crypto_impl`'s `<init>([B)V` is not the discarded seed. It
+is that the body stamps **neither `algorithm` nor `provider`** — so under
+`--synthetic-jdk`, `new SecureRandom(byte[])` still answers `null` from
+`getAlgorithm()` *and* `getProvider()`. That is this record's own headline
+defect, surviving in one mode because a later registrar overwrote the fix.
+
+And the same block shadows more than the constructor. `register_crypto_impl_natives`
+registers five triples, all of which `securerandom.rs` has already registered:
+
+| triple | `crypto_impl` body | what it shadows |
+|---|---|---|
+| `nextBytes([B)V` | OS CSPRNG | equivalent |
+| `generateSeed(I)[B` | OS CSPRNG | equivalent |
+| `<init>([B)V` | no-op | loses `algorithm` + `provider` (verdict 3) |
+| `setSeed(J)V` | no-op | **loses SHA1PRNG reseeding** |
+| `setSeed([B)V` | no-op | **loses SHA1PRNG reseeding** |
+
+Both `setSeed` shadows are worse than the constructor one, and they are the
+place the audit's "determinism the caller does not have" sentence is actually
+true. `securerandom.rs`'s bodies check `secure_random_is_sha1prng(ctx, this)`
+and route SHA1PRNG through real reseeding — that is the wave-4 STUB-REMOVAL
+whose own comment records the symptom (*"`getInstance("SHA1PRNG")` seeded twice
+alike yields identical bytes on HotSpot and yielded different bytes here"*).
+The `crypto_impl` no-ops undo it wholesale in synthetic mode. The measurement
+above pins the property they break: **`SHA1PRNG` + `setSeed` IS reproducible on
+HotSpot**, and it is the one place the JDK guarantees replay for a
+`SecureRandom`. This record's own *Rest of `secureRandoms`* paragraph and the
+H2 `TestAll` motivation (internal record
+`fixed-suite-bugs/app-jvm-bugs/bug-h2-securerandom-sha1prng.md`) both hang off
+`SHA1PRNG`.
+
+## One divergence deliberately left alone
+
+HotSpot reports `new SecureRandom().getAlgorithm()` as `DRBG` (provider `SUN`),
+and `getInstanceStrong()` as `Windows-PRNG` on this host. This module stamps
+`OS-CSPRNG` for both. That is a divergence, and it is the honest one: the name
+describes what the module actually does — read fresh OS entropy on every draw —
+whereas stamping `DRBG` would assert a deterministic-random-bit-generator
+construction that is not there. `RJdkSecurity` asserts only that the name is
+non-null and non-empty. Recorded so that nobody "fixes" `getAlgorithm()` to say
+`DRBG` while `nextBytes` still goes straight to the OS.
+
+## Out-of-file patch (not applied)
+
+`native-builtins/src/crypto_impl.rs` is not owned by this lane. The fix is a
+deletion, and it is the one this record's *Out of scope* section already
+prescribed — widened to the two `setSeed` rows, which it did not cover.
+
+In `register_crypto_impl_natives`, delete these three registrations:
+
+```rust
+    r.register(
+        "java/security/SecureRandom",
+        "setSeed",
+        "(J)V",
+        native_secure_random_set_seed_long,
+    );
+    r.register(
+        "java/security/SecureRandom",
+        "setSeed",
+        "([B)V",
+        native_secure_random_set_seed_bytes,
+    );
+    r.register(
+        "java/security/SecureRandom",
+        "<init>",
+        "([B)V",
+        native_secure_random_init_seed_bytes,
+    );
+```
+
+and, once nothing references them, the three now-dead bodies
+`native_secure_random_set_seed_long`, `native_secure_random_set_seed_bytes` and
+`native_secure_random_init_seed_bytes`.
+
+`nextBytes([B)V` and `generateSeed(I)[B` should **stay**. Both draw from the OS
+CSPRNG in either file, so the shadowing is behaviour-neutral, and the block
+comment above them is the live record of the `VULN(secrand)` /
+`VULN(secrand-collision)` fixes — deleting the registrations would orphan it.
+
+The registration-order comment on that block must be corrected at the same
+time. It reads:
+
+> IMPORTANT (registration order): `register_crypto_impl_natives` runs AFTER
+> `securerandom::register_random_and_securerandom_natives` (lib.rs phase
+> ordering: register_security_natives ~line 9773 vs register_crypto_impl
+> ~line 10010), so these last-write registrations WIN.
+
+Two things are wrong with it. The line numbers are stale by thousands of lines
+(both calls now sit inside `register_synthetic_overrides`, in that order). More
+importantly it presents the win as a phase-ordering fact when it is a
+*same-function* call ordering, and it does not say that the whole block is
+unreachable outside `--synthetic-jdk` — which is the first thing a reader needs
+in order to scope any defect found here.
+
+Replace with:
+
+```rust
+    // Registration order: both this registrar and
+    // `securerandom::register_random_and_securerandom_natives` are called from
+    // `register_synthetic_overrides`, this one SECOND, so these bodies win —
+    // `register()` is last-registration-wins. That scope is the whole story:
+    // `register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]`,
+    // the feature is in no crate's default set, and `vm_init` reaches it only
+    // when `config.use_synthetic_jdk` is also true. So none of this exists in a
+    // default CLI build, and `--real-jdk` / `--jdk-only` are served by
+    // `securerandom.rs` — see docs/architecture/natives-over-real-jdk-classes.md §2.
+    // Only `nextBytes` / `generateSeed` are registered here: both draw from the
+    // OS CSPRNG in either file, so the shadowing is behaviour-neutral. The
+    // `setSeed` and seeded-ctor rows were REMOVED (L8 residual pass, 2026-08-11)
+    // because their no-op bodies silently undid two fixes in `securerandom.rs`:
+    // SHA1PRNG reseeding, which HotSpot makes reproducible and which is the one
+    // replay guarantee the JDK gives a `SecureRandom`; and the `algorithm` /
+    // `provider` stamping this record exists for.
+```
+
+**Mode: synthetic-jdk only, in both directions.** Deleting these rows cannot
+change Compatible-mode or `--jdk-only` behaviour by any amount, because the
+registrar is not reachable in either. For the same reason it cannot move
+`scripts/baselines/jdk-only-bridge-ratchet.json`, which is taken in Compatible
+mode — see `docs/architecture/natives-over-real-jdk-classes.md` §7.
