@@ -1371,30 +1371,165 @@ fn build_provides_set(
     Ok(set)
 }
 
+/// The binary name of the `requires` modifier enum.
+///
+/// Spelling a fixed JDK type as a literal is not the "bind by NAME" hazard this
+/// campaign keeps hitting — that one is a *decision* keyed on a rendered class /
+/// module / package name that varies with the code under test. This is the same
+/// kind of constant as the `java/util/HashSet` literals throughout this file:
+/// one specific JDK class, resolved once, compared against nothing.
+const REQUIRES_MODIFIER_ENUM: &str = "java/lang/module/ModuleDescriptor$Requires$Modifier";
+
+/// Read one enum constant out of an already-initialized enum's statics.
+///
+/// Pure reads only — `static_field_index_by_name` and `get_static_field` neither
+/// allocate nor re-enter Java, so a caller may hold an unpinned `ObjectRef`
+/// across this. Initializing the enum (which DOES run Java) is the caller's job,
+/// deliberately hoisted out of the allocation-bearing loop below.
+///
+/// `None` means the constant could not be produced — field absent, or a null
+/// static because the enum never really initialized (a synthetic-JDK stand-in).
+/// The caller must then leave that modifier out rather than write a null into a
+/// set whose `hashCode()` real JDK bytecode will walk.
+fn enum_constant(
+    ctx: &dyn NativeContext,
+    class_id: cratonvm_types::ClassId,
+    constant: &str,
+) -> Option<ObjectRef> {
+    let index = ctx.static_field_index_by_name(class_id, constant)?;
+    match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// The binary name of the module-level modifier enum. Same constant-literal
+/// rationale as [`REQUIRES_MODIFIER_ENUM`].
+const MODULE_MODIFIER_ENUM: &str = "java/lang/module/ModuleDescriptor$Modifier";
+
+/// Build `ModuleDescriptor.modifiers()`.
+///
+/// This set was previously empty for every module unconditionally, which is a
+/// false positive claim for an open module: the javadoc for
+/// `ModuleDescriptor.isOpen()` is "Returns true if this is an open module", and
+/// `newOpenModule` is specified to build a descriptor whose modifiers contain
+/// `Modifier.OPEN`, so `modifiers().contains(OPEN)` and `isOpen()` are two
+/// spellings of one fact. `isOpen()` was already answered truthfully from
+/// `module_is_open`, so `modifiers()` disagreeing with it was an internal
+/// contradiction, not merely a missing feature — and it is fixed here from data
+/// the `NativeContext` already exposes.
+///
+/// The other three constants are NOT fabricated:
+///
+/// * `AUTOMATIC` — the registry knows this (`ModuleDescriptor::automatic`) but
+///   no `NativeContext` accessor surfaces it, so this native cannot ask. Note
+///   the same gap makes `isAutomatic()` itself a hardcoded `false` in
+///   `build_module_descriptor`; both want one new accessor, and the patch is in
+///   the W2-3 known-issues record.
+/// * `SYNTHETIC` / `MANDATED` — no module-level flag word survives
+///   `descriptor_from_module_attribute`, which extracts only `ACC_MODULE_OPEN`
+///   from the `Module` attribute's `flags`.
+///
+/// Leaving those out understates the set rather than inventing membership,
+/// which is the safe direction: a caller testing `contains(X)` gets a false
+/// negative, never a false positive.
+fn build_module_modifier_set(
+    ctx: &mut dyn NativeContext,
+    is_open: bool,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    // Hoisted for the same reason as in `build_requires_set`: `<clinit>` runs
+    // Java and can move the heap, so it must not run while `set` is live.
+    let modifier_enum = if is_open {
+        ctx.ensure_class_initialized(MODULE_MODIFIER_ENUM).ok()
+    } else {
+        None
+    };
+    let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "modifiers")?;
+    if let Some(enum_id) = modifier_enum {
+        if let Some(value) = enum_constant(ctx, enum_id, "OPEN") {
+            collection_add(ctx, set, value)?;
+        }
+    }
+    Ok(set)
+}
+
 /// Build the `Set<Requires>` for a whole module.
 ///
 /// `Requires` is `(Set mods, String name, Version compiledVersion, String
 /// rawCompiledVersion)`. `name()` is a plain field read, which is the accessor
-/// every caller in the corpus uses. `mods` is left EMPTY even for a
-/// `requires transitive` / `requires static` edge: the modifier set is an
-/// `EnumSet<Requires.Modifier>` and a native cannot mint enum constants here
-/// without reading the enum's statics, so `Requires.modifiers()` remains a
-/// known gap (recorded in the known-issues doc). The transitive/static bits are
-/// NOT lost to the VM — `ModuleRegistry::build_readability_graph` consumes them
-/// on the Rust side; they are only invisible through this Java mirror.
+/// every caller in the corpus uses, and `modifiers()` is a plain field read of
+/// `mods`.
+///
+/// `mods` used to be unconditionally empty, discarding the transitive/static
+/// bits `module_requires` already hands us — the registry has carried them the
+/// whole time (`ModuleRegistry::build_readability_graph` consumes them on the
+/// Rust side); they were simply dropped on the way into the Java mirror. They
+/// are now minted from the REAL enum's static constants, because `Enum.equals`
+/// is identity: a caller's `mods.contains(Requires.Modifier.TRANSITIVE)` can
+/// only answer true if the set holds the genuine singleton, and a fabricated
+/// stand-in would compare unequal and read as "not transitive" — a wrong answer
+/// dressed as a right one.
+///
+/// Still absent: `MANDATED` / `SYNTHETIC`. Those bits ARE parsed now
+/// (`ModuleRequiresEntry::{is_mandated,is_synthetic}`), but `module_requires`'
+/// `(String, bool, bool)` tuple has no room to carry them and widening it means
+/// editing `native-api` and `vm`, outside this lane's files — the exact patch is
+/// recorded in the W2-3 known-issues record. Until it lands `requires java.base`
+/// reports `[]` where HotSpot reports `[MANDATED]`: a NARROWING of the existing
+/// gap, not a new one.
 fn build_requires_set(
     ctx: &mut dyn NativeContext,
     entries: &[(String, bool, bool)],
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    // Resolve the modifier enum ONCE, before the first allocation below.
+    // `ensure_class_initialized` runs the enum's `<clinit>`, i.e. arbitrary
+    // Java, which can move the heap — doing it inside the loop would expose a
+    // live ref to a collection between a pin and its read. Skipped entirely
+    // when no entry carries a modifier, which is the overwhelmingly common
+    // shape (`requires <plain>`), so the ordinary path never drags the enum
+    // through initialization at all.
+    //
+    // An initialization failure is swallowed rather than propagated: this
+    // enum's `<clinit>` is four `new Modifier(int)` calls and an array, so it
+    // cannot realistically throw, and a descriptor missing its modifier set is
+    // a far better outcome than `getDescriptor()` itself failing.
+    let modifier_enum =
+        if entries.iter().any(|(_, transitive, is_static)| *transitive || *is_static) {
+            ctx.ensure_class_initialized(REQUIRES_MODIFIER_ENUM).ok()
+        } else {
+            None
+        };
+
     let set = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires")?;
     let pin = ctx.pin_native_root(set);
-    for (name, _transitive, _is_static) in entries {
+    for (name, transitive, is_static) in entries {
         let element =
             try_alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor$Requires", 4)?;
         let element_pin = ctx.pin_native_root(element);
-        let mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+
+        let mut mods = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "requires mods")?;
+        let mods_pin = ctx.pin_native_root(mods);
+        if let Some(enum_id) = modifier_enum {
+            for (wanted, constant) in [(*transitive, "TRANSITIVE"), (*is_static, "STATIC")] {
+                if !wanted {
+                    continue;
+                }
+                // Re-read the pin first: a previous `collection_add` re-entered
+                // Java (`Enum.hashCode`) and may have moved `mods`. Assigned
+                // back into the outer binding rather than shadowed inside the
+                // loop body, so the second iteration re-reads from the updated
+                // ref instead of handing `read_native_pin` a stale fallback.
+                mods = ctx.read_native_pin(mods_pin, mods);
+                if let Some(value) = enum_constant(ctx, enum_id, constant) {
+                    collection_add(ctx, mods, value)?;
+                }
+            }
+        }
+        let mods = ctx.read_native_pin(mods_pin, mods);
+        ctx.unpin_native_roots(mods_pin);
         let element = ctx.read_native_pin(element_pin, element);
         ctx.set_field_by_name(element, "mods", Value::Object(Some(mods)));
+
         let name_str = ctx.create_string(name);
         let element = ctx.read_native_pin(element_pin, element);
         ctx.set_field_by_name(element, "name", Value::Object(Some(name_str)));
@@ -1479,11 +1614,31 @@ pub(crate) fn build_module_descriptor(
     }
     ctx.set_field_by_name(desc, "name", name_val);
     ctx.set_field_by_name(desc, "open", Value::Int(if is_open { 1 } else { 0 }));
+    // UNSOURCED, and knowingly so. The registry does record whether a module is
+    // automatic (`ModuleDescriptor::automatic`, set for a `module-info.class`
+    // found on the CLASS path), but no `NativeContext` accessor surfaces it, so
+    // this native cannot ask and writes the majority answer instead. That makes
+    // `RJdkModule`'s `check(!d.isAutomatic(), ...)` pass for the wrong reason —
+    // it would pass against a hardcoded `false` whatever the module really is.
+    // One accessor fixes this and `Modifier.AUTOMATIC` together; the patch is in
+    // the W2-3 known-issues record.
     ctx.set_field_by_name(desc, "automatic", Value::Int(0));
 
-    // `modifiers` has no registry backing (see `build_requires_set`), so it
-    // stays an empty set — but it must be a non-null one.
-    let modifiers = new_initialized_object(ctx, "java/util/HashSet", "()V", &[], "modifiers")?;
+    // `version`, `rawVersionString` and `mainClass` are deliberately LEFT NULL
+    // rather than set to anything. Real `ModuleDescriptor.version()` /
+    // `rawVersion()` / `mainClass()` are `Optional.ofNullable(field)`, so a null
+    // field already renders as `Optional.empty()` — the honest "nothing was
+    // recorded" answer, and the correct one for a module-info that carries no
+    // version. It is NOT correct for one that does: `descriptor_from_module_attribute`
+    // has always parsed the module version into `ModuleDescriptor::version`, and
+    // `requires`' compiled version is parsed as of this change, but neither
+    // crosses `NativeContext`. Writing a fabricated value here would turn a
+    // truthful empty into a false claim, so nothing is written.
+
+    // `modifiers` carries OPEN when the module is open; the remaining three
+    // constants have no data source reachable from here. See
+    // `build_module_modifier_set` for what is deliberately NOT fabricated.
+    let modifiers = build_module_modifier_set(ctx, is_open)?;
     let desc = ctx.read_native_pin(pin, desc);
     ctx.set_field_by_name(desc, "modifiers", Value::Object(Some(modifiers)));
 
