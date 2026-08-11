@@ -44,13 +44,16 @@
 //! `--real-jdk` is unchanged (a `SyntheticStub` registers and dispatches
 //! normally in `Compatible` mode).
 //!
-//! **One `java/util/logging/` bridge is deliberately NOT here.**
-//! `java/util/logging/Logger.log` — the census resolves its triple NOWHERE in
-//! the hierarchy, so there is no bytecode for it to yield to and refusing it
-//! would replace a shadow with an `UnsatisfiedLinkError`. That is the shape the
-//! 2026-08-10 wave hit when four of 43 re-tagged receivers had to be held back,
-//! and it is why this list is per-TRIPLE rather than per-class-prefix: a prefix
-//! rule cannot see it.
+//! **One `java/util/logging/` bridge is deliberately NOT here**, and it is why
+//! this list is per-TRIPLE rather than per-class or even per-(class, method).
+//! `Logger.log` has eight registered overloads; seven shadow real bytecode and
+//! are retired. The eighth is
+//! `log(Ljava/util/logging/Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V`,
+//! which is not a JDK 25 signature at all — the real overload takes the
+//! `Throwable` SECOND — so the census resolves it nowhere in the hierarchy and
+//! there is no bytecode for it to yield to. Refusing it would replace a shadow
+//! with an `UnsatisfiedLinkError`, which is the shape the 2026-08-10 wave hit
+//! when four of 43 re-tagged receivers had to be held back.
 //!
 //! # Why this is applied centrally
 //!
@@ -199,19 +202,33 @@ mod tests {
         }
     }
 
-    /// The retirement is per-TRIPLE. `Logger.log` shares the class with entries
-    /// that ARE retired, and it must not be swept in: the census resolves it
-    /// nowhere in the hierarchy, so refusing it would replace a shadow with an
-    /// `UnsatisfiedLinkError`.
+    /// The retirement is per-TRIPLE, and `Logger.log` is where that earns its
+    /// keep: SEVEN of its eight registered overloads shadow real bytecode and
+    /// are retired, while the eighth resolves NOWHERE in the image and is held
+    /// back. A per-class or even per-(class, method) rule cannot express that.
     #[test]
-    fn logger_log_is_held_back() {
-        assert!(triple_is_retired_shadow(
-            "java/util/logging/Logger", "fine", "(Ljava/lang/String;)V"));
+    fn the_one_logger_log_overload_the_image_lacks_is_held_back() {
+        // Retired: the image declares these with a Code attribute.
+        for d in [
+            "(Ljava/util/logging/Level;Ljava/lang/String;)V",
+            "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
+            "(Ljava/util/logging/Level;Ljava/lang/Throwable;Ljava/util/function/Supplier;)V",
+            "(Ljava/util/logging/LogRecord;)V",
+        ] {
+            assert!(triple_is_retired_shadow("java/util/logging/Logger", "log", d), "{d}");
+        }
+        // HELD BACK: `log(Level, Supplier, Throwable)` is not a JDK 25
+        // signature at all — the real overload takes the Throwable SECOND —
+        // so the census resolves it nowhere and there is no bytecode for it to
+        // yield to. Refusing it would replace a shadow with an
+        // `UnsatisfiedLinkError`.
         assert!(!triple_is_retired_shadow(
             "java/util/logging/Logger",
             "log",
-            "(Ljava/util/logging/Level;Ljava/lang/String;)V"
+            "(Ljava/util/logging/Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V"
         ));
+        assert!(triple_is_retired_shadow(
+            "java/util/logging/Logger", "fine", "(Ljava/lang/String;)V"));
     }
 
     /// Nothing outside the retired subsystem is touched.
