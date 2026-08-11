@@ -705,6 +705,12 @@ struct Lowerer<'a> {
     /// Shared post-call frame publication used by direct and hashed dispatch
     /// stubs. Zero when precise frame tracking is unavailable.
     frame_record: usize,
+    /// Segment-relative displacement of the compile-id mirror, and this
+    /// compilation's identity — the pair that lets the GC name the method
+    /// owning the innermost RBP without decoding the call that created the
+    /// frame. Both 0 when unavailable → nothing is published.
+    inline_cm_tls_disp: usize,
+    compile_id: u32,
     /// `jit_service_callee_deopt` — services a compiled callee's `i64::MIN`
     /// deopt sentinel at the megamorphic stub's inline call site, so the
     /// callee's stashed frame is resumed there instead of escaping to the
@@ -1081,6 +1087,21 @@ impl<'a> Lowerer<'a> {
             ic_slots,
             invoke_virtual_mic: helpers.invoke_virtual_mic,
             frame_record: helpers.frame_record,
+            // Reserved here, at the start of this compilation: the prologue has
+            // to encode the id as an immediate, and the `CompiledMethod` that
+            // will own it does not exist until this buffer is filled.
+            inline_cm_tls_disp: if crate::x64::inline_rbp_tls_disp() != 0 {
+                crate::x64::inline_cm_tls_disp()
+            } else {
+                0
+            },
+            compile_id: if crate::x64::inline_rbp_tls_disp() != 0
+                && crate::x64::inline_cm_tls_disp() != 0
+            {
+                crate::reserve_compile_id()
+            } else {
+                0
+            },
             service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
             sr_map,
@@ -1897,6 +1918,11 @@ fn reloc_emit_enabled() -> bool {
         let disp = crate::x64::inline_rbp_tls_disp();
         if disp != 0 {
             self.emit_mov_tls_disp32_rbp(disp as u32);
+            // …and the identity of the frame that RBP names. Without it the GC
+            // must decode the call that created this frame, which is impossible
+            // when the caller reached us indirectly (`CALL R11` — every inline
+            // cache hit).
+            self.emit_frame_record_identity();
         } else {
             // No usable TLS displacement on this target: fall back to the
             // helper. Params are already in frame slots, so its caller-saved
@@ -1923,6 +1949,9 @@ fn reloc_emit_enabled() -> bool {
         let disp = crate::x64::inline_rbp_tls_disp();
         if disp != 0 {
             self.emit_mov_tls_disp32_rbp(disp as u32);
+            // The callee published its own identity on entry; restoring only
+            // the RBP would leave the pair naming two different frames.
+            self.emit_frame_record_identity();
             return;
         }
         self.buf.emit_byte(0x50); // PUSH RAX (preserve the Java return value)
@@ -1962,6 +1991,25 @@ fn reloc_emit_enabled() -> bool {
         self.buf.emit_byte(0x2C); // ModRM: reg=RBP, r/m=SIB
         self.buf.emit_byte(0x25); // SIB: [disp32] absolute
         self.buf.emit(&disp32.to_le_bytes());
+    }
+
+    /// `MOV dword <seg>:[disp32], imm32` — the identity half of the frame
+    /// record, emitted immediately after every RBP store so the two always
+    /// describe the same frame.
+    ///
+    /// 32-bit and immediate, so it needs no scratch register: the post-call
+    /// republish path runs with the callee's return value live in RAX. Byte
+    /// layout matches the single-pass `emit_mov_tls_disp32_imm32`.
+    fn emit_frame_record_identity(&mut self) {
+        if self.inline_cm_tls_disp == 0 {
+            return;
+        }
+        self.buf.emit_byte(crate::x64::inline_rbp_tls_segment_prefix());
+        self.buf.emit_byte(0xC7); // MOV r/m32, imm32
+        self.buf.emit_byte(0x04); // ModRM: /0, r/m=SIB
+        self.buf.emit_byte(0x25); // SIB: [disp32] absolute
+        self.buf.emit(&(self.inline_cm_tls_disp as u32).to_le_bytes());
+        self.buf.emit(&self.compile_id.to_le_bytes());
     }
 
     /// Cache `*mut JvmThread` in its reserved slot.
@@ -9786,6 +9834,9 @@ pub(crate) fn lower_inner_with_scopes(
         crate::metrics::note_current_reloads(lowerer.ls_reloads);
     }
 
+    // Carry the identity the prologue encoded, so publication can bind it to
+    // the artifact this buffer becomes.
+    let compile_id = lowerer.compile_id;
     let mut buf = lowerer.buf;
     // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
     // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
@@ -9815,6 +9866,7 @@ pub(crate) fn lower_inner_with_scopes(
     let _code_size = buf.pos();
 
     let mut cm = CompiledMethod::new(buf);
+    cm.compile_id = compile_id;
     cm.deopt_points = deopt_points;
     cm._deopt_point_boxes = deopt_boxes;
 

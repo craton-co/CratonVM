@@ -175,6 +175,19 @@ pub(crate) struct PreciseFrameInfo {
     /// dropping every ancestor frame's spilled oops → live objects reclaimed →
     /// heap corruption. `0` until the prologue records it (gate off).
     pub exact_rbp: usize,
+    /// The compile id published by the frame standing at [`Self::exact_rbp`],
+    /// captured in the SAME breath as that RBP.
+    ///
+    /// Both halves are written together by generated code, but they are only a
+    /// matched pair at the instant they are read off the mirrors. Reading the
+    /// id later — at scan time — is wrong twice over: the owning thread may
+    /// have entered and left other compiled frames since, and the scan often
+    /// runs on the COLLECTOR's thread, whose mirrors describe its own stack and
+    /// not the one being walked. (Measured: reading it at scan time left the
+    /// obligation in 785 of 786 cycles, i.e. it never once resolved.) So it is
+    /// snapshotted here, beside the RBP it belongs to, and every consumer takes
+    /// it from this struct. `0` = nothing published for that frame.
+    pub exact_cm_id: u32,
 }
 
 // SAFETY: the raw pointers in JitFrameChainEntry are not dereferenced
@@ -314,6 +327,42 @@ pub fn top_rbp_mirror_read() -> usize {
 /// `emit_post_call_rbp_republish` in `jit/src/x64.rs`.
 pub fn top_rbp_mirror_write(v: usize) {
     top_rbp_set(v);
+}
+
+/// Save/restore of the IDENTITY half of the frame record, for the same bracket
+/// as [`top_rbp_mirror_write`].
+///
+/// The two mirrors are written together by generated code, and that pairing is
+/// what lets a conservative scan name the method owning the innermost RBP. A
+/// bracket that restored only the RBP would leave the pair naming two different
+/// frames — the caller's rbp beside the callee's identity — and the scan cannot
+/// detect that, because both halves would still read consistently out of the
+/// mirrors. So this is not an optimisation: restoring one without the other is
+/// how the identity becomes actively wrong rather than merely absent.
+pub fn top_cm_id_mirror_read() -> u32 {
+    published_compile_id()
+}
+
+/// See [`top_cm_id_mirror_read`]. A no-op when no identity slot is active.
+pub fn top_cm_id_mirror_write(id: u32) {
+    #[cfg(windows)]
+    {
+        let disp = cratonvm_jit::x64::inline_cm_tls_disp();
+        if disp != 0 {
+            // SAFETY: `disp` was validated by the startup sentinel probe in
+            // `inline_cm_tls_disp()` — a live, 8-byte-aligned TEB TLS slot on
+            // every thread, exactly as for the RBP mirror.
+            unsafe { write_gs_qword(disp, id as usize) };
+            return;
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if cratonvm_jit::x64::inline_cm_tls_mirror_write(id) {
+            return;
+        }
+    }
+    let _ = id;
 }
 
 #[inline]
@@ -708,6 +757,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         if let Some(old_top) = v.last_mut() {
             if let Some(info) = old_top.precise.as_mut() {
                 info.exact_rbp = top_rbp_get();
+                info.exact_cm_id = published_compile_id();
             }
         }
         v.push(entry);
@@ -1006,6 +1056,7 @@ impl JitEntryGuard {
                 frame_base: sp,
                 entry_ptr: cm.entry_ptr(),
                 exact_rbp: 0,
+                exact_cm_id: 0,
             }),
         };
         let depth_at_push = push_entry_full(entry);
@@ -1868,11 +1919,12 @@ fn moving_young_frame_live_hi(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> 
 /// a call from a different method, bytes that cannot be read — stays foreign.
 fn chain_entry_rbp_is_foreign(
     exact_rbp: usize,
+    exact_cm_id: u32,
     entry_sp: usize,
     scanner_sp: usize,
     cm: *const cratonvm_jit::CompiledMethod,
 ) -> bool {
-    innermost_frame_method(exact_rbp, entry_sp, scanner_sp, cm).is_none()
+    innermost_frame_method(exact_rbp, exact_cm_id, entry_sp, scanner_sp, cm).is_none()
 }
 
 /// Whether the direct-call callee resolution below is enabled. Default ON;
@@ -1924,6 +1976,7 @@ fn callee_resolve_enabled() -> bool {
 /// direction is a non-moving sweep, never a frame walked with the wrong map.
 fn innermost_frame_method(
     exact_rbp: usize,
+    exact_cm_id: u32,
     entry_sp: usize,
     scanner_sp: usize,
     cm: *const cratonvm_jit::CompiledMethod,
@@ -1956,7 +2009,62 @@ fn innermost_frame_method(
     if !callee_resolve_enabled() {
         return None;
     }
+    // The frame's own prologue named itself; no decode needed.
+    if let Some(published) = published_innermost_method(exact_cm_id) {
+        return Some(published);
+    }
     direct_call_callee(ret_addr, caller_cm)
+}
+
+/// The method the innermost frame's own prologue named, or `None`.
+///
+/// [`direct_call_callee`] can only answer for a frame entered by a direct
+/// `CALL rel32`. An INDIRECT JIT->JIT call — every inline-cache hit ends in
+/// `CALL R11`, plus the megamorphic stub and the trampolines — encodes no
+/// rel32, so it failed closed and diverted the whole young collection to the
+/// non-moving sweep. That was 419 of 419 of `Log4J2LoggingSystemTests`'s
+/// fallback cycles under `-XX:+UseGenerationalGC`, with no other obligation in
+/// the set (`docs/known-issues/springboot/`, the moving-young page).
+///
+/// Codegen publishes the compile id beside the RBP it already stores, in the
+/// same instruction pair, at every point that touches the mirror. `id` is that
+/// value as captured by [`JitPreciseFrameInfo::exact_cm_id`] — snapshotted
+/// together with the RBP it belongs to, NOT read here. Reading the mirror at
+/// scan time instead cost a whole verification round: the owning thread has
+/// moved on by then, and the scan often runs on the collector's thread whose
+/// mirrors describe a different stack, so the id resolved in 1 of 786 cycles.
+///
+/// An unbound id (reserved but not yet published, or released on drop) answers
+/// `None`, which returns the caller to the decode it always had.
+fn published_innermost_method(id: u32) -> Option<*const cratonvm_jit::CompiledMethod> {
+    let cm_ptr = cratonvm_jit::lookup_compile_id(id)?;
+    Some(cm_ptr as *const cratonvm_jit::CompiledMethod)
+}
+
+/// Read the compile-id mirror — the identity half of the inline frame record.
+/// Windows reads the probed TEB slot directly (as the RBP mirror does); Linux
+/// goes through the JIT crate's accessor for the same Rust TLS cell generated
+/// code writes. `0` = nothing published.
+#[inline]
+fn published_compile_id() -> u32 {
+    #[cfg(windows)]
+    {
+        let disp = cratonvm_jit::x64::inline_cm_tls_disp();
+        if disp != 0 {
+            // SAFETY: `disp` was validated by the startup sentinel probe in
+            // `inline_cm_tls_disp()` to be a live, 8-byte-aligned TEB TLS slot
+            // present on every thread — the same earned safety as the RBP
+            // mirror read directly above.
+            return (unsafe { read_gs_qword(disp) } & 0xFFFF_FFFF) as u32;
+        }
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if let Some(id) = cratonvm_jit::x64::inline_cm_tls_mirror_read() {
+            return id;
+        }
+    }
+    0
 }
 
 /// Decode the direct `CALL` whose return address is `ret_addr` and resolve its
@@ -2266,7 +2374,7 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 continue;
             }
             let Some(innermost_cm) =
-                innermost_frame_method(rbp, entry_sp, scanner_sp, info.compiled_method)
+                innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method)
             else {
                 // Nothing describes the frame now standing at `exact_rbp` — the
                 // inline MIC/PIC cascade or the hashed megamorphic stub reached
@@ -2577,6 +2685,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
             if let Some(top) = chain.last_mut() {
                 if let Some(info) = top.precise.as_mut() {
                     info.exact_rbp = top_rbp_get();
+                info.exact_cm_id = published_compile_id();
                 }
             }
         }
@@ -2624,7 +2733,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 continue;
             }
             let innermost =
-                innermost_frame_method(exact_rbp, entry.entry_sp, scanner_sp, info.compiled_method);
+                innermost_frame_method(exact_rbp, info.exact_cm_id, entry.entry_sp, scanner_sp, info.compiled_method);
             // The frame standing at the recorded RBP may belong to a method the
             // entry does not name (a JIT->JIT call published its own base
             // there). When the call was the direct form, the callee resolves
@@ -3473,6 +3582,11 @@ pub fn set_top_frame_base(rbp: usize) {
             if let Some(top) = c.borrow_mut().last_mut() {
                 if let Some(info) = top.precise.as_mut() {
                     info.exact_rbp = rbp;
+                    // This RBP came from the caller, not from the mirror, so
+                    // the mirror's id is not known to describe it. Publishing
+                    // nothing is the honest answer — the scan falls back to
+                    // decoding the call, exactly as before.
+                    info.exact_cm_id = 0;
                 }
             }
         });
@@ -3502,6 +3616,7 @@ fn flush_top_rbp_cache_to_chain(v: &mut [JitFrameChainEntry]) {
     if let Some(top) = v.last_mut() {
         if let Some(info) = top.precise.as_mut() {
             info.exact_rbp = top_rbp_get();
+                info.exact_cm_id = published_compile_id();
         }
     }
 }
@@ -3580,6 +3695,7 @@ pub fn remap_active_jit_frames(pointer_map: &cratonvm_types::PointerMap) {
                 // `!chain_entry_rbp_is_foreign(..)` term in the condition above.
                 if let Some(innermost_cm) = innermost_frame_method(
                     info.exact_rbp,
+                    info.exact_cm_id,
                     entry_sp,
                     scanner_sp,
                     info.compiled_method,
@@ -3917,6 +4033,7 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         // conservatively.
         if let Some(innermost_cm) = innermost_frame_method(
             info.exact_rbp,
+            info.exact_cm_id,
             info.frame_base,
             scanner_sp,
             info.compiled_method,
@@ -4008,7 +4125,7 @@ fn scan_compiled_frame_bands(
     // scanner's own SP instead: the collector runs beneath that frame, so
     // `[scanner_sp, rbp)` covers all of it and nothing above it. Parent frames
     // are identified through the child frame's return address either way.
-    let innermost = innermost_frame_method(rbp, entry_sp, scanner_sp, info.compiled_method);
+    let innermost = innermost_frame_method(rbp, info.exact_cm_id, entry_sp, scanner_sp, info.compiled_method);
     let mut innermost_is_foreign = innermost.is_none();
     // SAFETY: the chain entry's pointer is Arc-owned by the JIT cache while any
     // of its frames is live; a resolved callee is kept alive by the live frame
@@ -4589,6 +4706,9 @@ mod tests {
                 // Exactly what `enter_with_compiled` stores: the prologue
                 // publishes the real RBP into the mirror, never into here.
                 exact_rbp: 0,
+                // …and its identity travels with it, so an unpublished RBP
+                // carries an unpublished id.
+                exact_cm_id: 0,
             }),
         });
 
