@@ -421,7 +421,24 @@ run_shard() {
         -Dcraton.batch=1 "$RUNNER_CLASS" "$cls" >"$tmp" 2>>"$RAW"; rc=$?
     cat "$tmp" >> "$RAW"
     local rline found ok failed aborted skipped ms status sig
-    rline=$(grep "^@@RESULT " "$tmp" | head -1)
+    # NOT anchored at line start, and matched against THIS class's name.
+    #
+    # `^@@RESULT ` was, and it silently converted a clean PASS into a CRASH.
+    # `CratonRunner` writes its result line to the same `System.out` the test
+    # bodies write to, and a test that ends with a newline-less write leaves the
+    # cursor mid-line: `bootstrap.scanning.JarVisitorTest` finishes with
+    # `System.out.printf("InputStream byte[] extraction algorithms; ...")` and
+    # no `%n`, so the run emits
+    #     InputStream byte[] extraction algorithms; old = `59`, new = `17`@@RESULT org.hibernate...
+    # The anchored grep found nothing, the row was recorded
+    # `CRASH ... process-died rc=0`, and a class that had just reported
+    # `found=9 ok=9 failed=0` was carried into a known-issues doc as a
+    # VM-vs-HotSpot divergence (2026-08-11 Azure Linux full suite). rc=0 with no
+    # result line is a PARSE failure far more often than a VM failure.
+    #
+    # Including `$cls` keeps `-o` from picking up a `@@RESULT`-looking string a
+    # test body printed for some other class.
+    rline=$(grep -o "@@RESULT $cls found=.*" "$tmp" | head -1)
     if [ -n "$rline" ]; then
       found=$(printf '%s' "$rline"|grep -o 'found=[0-9]*'|cut -d= -f2); ok=$(printf '%s' "$rline"|grep -o 'ok=[0-9]*'|cut -d= -f2)
       failed=$(printf '%s' "$rline"|grep -o 'failed=[0-9]*'|cut -d= -f2); aborted=$(printf '%s' "$rline"|grep -o 'aborted=[0-9]*'|cut -d= -f2)

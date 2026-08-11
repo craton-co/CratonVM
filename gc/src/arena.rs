@@ -231,6 +231,12 @@ pub struct Arena {
     alloc_anchors: Vec<usize>,
     /// `log2` of the anchor bucket width. See [`Arena::rearm_alloc_anchors`].
     anchor_shift: u32,
+    /// "A block has been pushed since the last [`Arena::coalesce_free_list`]",
+    /// i.e. the free list may hold adjacency a merge would collapse. Set by
+    /// every push (`push_block_routed`), cleared by the merge. Without it the
+    /// last-resort merge in [`Arena::alloc`] would re-sort a list it already
+    /// proved maximal on every one of a wedged heap's failing allocations.
+    free_dirty: bool,
 }
 
 /// Alignment tripwire (perf/halfgap residuals, 2026-07-18): every free-list
@@ -340,6 +346,7 @@ impl Arena {
             free_bytes_total: 0,
             alloc_anchors: Vec::new(),
             anchor_shift: 0,
+            free_dirty: false,
         };
         a.rearm_alloc_anchors();
         a
@@ -452,6 +459,8 @@ impl Arena {
             }
         }
         self.free_bytes_total += block.size;
+        // A new block may sit next to one already on the list.
+        self.free_dirty = true;
     }
 
     /// True when both tiers are empty.
@@ -725,7 +734,100 @@ impl Arena {
             // block, which came from a region inside the buffer.
             return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
         }
+
+        // LAST RESORT BEFORE OOM: merge adjacent holes and look once more.
+        //
+        // Coalescing used to happen ONLY inside a collector's post-sweep hook
+        // (`zgc::collect_garbage`, `gen_heap`'s non-moving sweep). Between two
+        // sweeps the free list is mutated constantly by paths that MINT
+        // adjacency and never merge it: every `split` remainder, and — on ZGC —
+        // every TLAB retire, which hands back the unused tail of a chunk whose
+        // used part the sweep has already free-listed object by object. So a
+        // heap could sit on a free list that was *bytes-wise* enormous and
+        // *block-wise* capped, and fail an allocation the merged list would
+        // have served without collecting at all.
+        //
+        // That is not theoretical either. On the 2026-08-11 Azure Linux
+        // Hibernate run, `sql.exec.SmokeTests` and
+        // `boot.database.qualfiedTableNaming.DefaultCatalogAndSchemaTest` both
+        // died with `OutOfMemoryError: Java heap space` while the guard line
+        // reported `free_list_bytes=1211378512 largest_free_block=65528` — 1.13
+        // GiB free, no hole big enough for one 65552-byte `DFAState[8192]`.
+        // Both classes pass on the same heap with the TLAB fast path disabled
+        // (`CRATONVM_ZGC_TLAB=0`) and on G1, which evacuates.
+        //
+        // Placed HERE, on the path that has already exhausted both tiers and
+        // the bump tail, so it costs nothing until the alternative is failing.
+        // `free_dirty` keeps a hopeless request from re-merging an already
+        // merged list once per attempt.
+        if self.coalesce_free_list() != 0 {
+            let base = self.data.as_ptr() as usize;
+            let mut hit = self.small_fit(base, alloc_size, align);
+            if hit.is_none() {
+                hit = self.large_fit(base, alloc_size, align);
+            }
+            if let Some((alloc_offset, remainders)) = hit {
+                for r in remainders.into_iter().flatten() {
+                    self.push_block_routed(r);
+                }
+                // SAFETY: as above — inside the consumed block.
+                return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
+            }
+        }
         None
+    }
+
+    /// Merge adjacent (and defensively overlapping) free blocks into maximal
+    /// spans. Returns the number of blocks the merge removed — `0` means the
+    /// list was already maximal, or nothing has changed since the last merge.
+    ///
+    /// This is the *shared* implementation of what every non-moving collector
+    /// in this crate has to do after a sweep: the sweep returns one
+    /// object-sized hole per dead object, and a heap that never merges them
+    /// can only ever serve object-sized requests again. It is also called from
+    /// [`Self::alloc`]'s last-resort arm, so an allocation never fails while
+    /// the bytes are present and merely split.
+    ///
+    /// `free_dirty` is the "something was pushed since the last merge" bit. It
+    /// makes a repeated call on an unchanged list free, which matters because
+    /// the `alloc` caller reaches it once per about-to-fail allocation and a
+    /// wedged heap produces a great many of those.
+    pub fn coalesce_free_list(&mut self) -> usize {
+        if !self.free_dirty {
+            return 0;
+        }
+        self.free_dirty = false;
+        let sorted = self.free_blocks_sorted();
+        if sorted.len() < 2 {
+            return 0;
+        }
+        let before = sorted.len();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(before);
+        for (off, sz) in sorted {
+            if let Some(last) = merged.last_mut() {
+                let last_end = last.0 + last.1;
+                if off <= last_end {
+                    // Adjacent or overlapping: extend to the farther end so no
+                    // span is ever double-served.
+                    let new_end = last_end.max(off + sz);
+                    last.1 = new_end - last.0;
+                    continue;
+                }
+            }
+            merged.push((off, sz));
+        }
+        if merged.len() == before {
+            return 0;
+        }
+        let removed = before - merged.len();
+        self.clear_free_list();
+        for (off, sz) in merged {
+            self.add_free_block(off, sz);
+        }
+        // The rebuild above set the bit again through `add_free_block`; the
+        // list it produced IS maximal, so clear it back.
+        self.free_dirty = false;
+        removed
     }
 
     /// Register a reclaimed `[offset, offset+size)` region as a free block.
@@ -766,6 +868,8 @@ impl Arena {
         self.max_free_upper = 0;
         self.large_max_exact.set(Some(0));
         self.free_bytes_total = 0;
+        // An empty list holds no adjacency.
+        self.free_dirty = false;
     }
 
     /// Total bytes currently held on the free lists (reclaimed but unallocated).

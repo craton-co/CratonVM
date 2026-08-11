@@ -5541,27 +5541,11 @@ impl GarbageCollector for ZgcRealHeap {
             // the free list. Merging adjacent (and defensively overlapping)
             // holes rebuilds them into a few large spans that route to the
             // unbounded large tier, restoring reuse.
-            let sorted = arena.free_blocks_sorted();
-            if sorted.len() > 1 {
-                arena.clear_free_list();
-                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
-                for (off, sz) in sorted {
-                    if let Some(last) = merged.last_mut() {
-                        let last_end = last.0 + last.1;
-                        if off <= last_end {
-                            // Adjacent or overlapping: extend to the farther
-                            // end so no span is ever double-served.
-                            let new_end = last_end.max(off + sz);
-                            last.1 = new_end - last.0;
-                            continue;
-                        }
-                    }
-                    merged.push((off, sz));
-                }
-                for (off, sz) in merged {
-                    arena.add_free_block(off, sz);
-                }
-            }
+            //
+            // The merge itself now lives on `Arena` (`coalesce_free_list`), so
+            // this sweep and the last-resort merge `Arena::alloc` runs before
+            // it returns `None` cannot drift apart.
+            arena.coalesce_free_list();
             // Un-bump a wholly-free tail. Coalescing above has made the topmost
             // span maximal, so this is one comparison — and it is the only
             // thing on a non-compacting heap that can restore a large
