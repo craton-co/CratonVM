@@ -1945,6 +1945,19 @@ fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
         LinkageError::IncompatibleClassChangeError { message } => {
             ("java/lang/IncompatibleClassChangeError", message.clone())
         }
+        // `java.lang.LinkageError` ITSELF, not a subclass — that is what
+        // HotSpot throws for a duplicate definition, and code that catches it
+        // (Tomcat's loader lifecycle, ByteBuddy's injection strategies) catches
+        // the base type. The message reproduces HotSpot's wording up to the
+        // parenthetical module tail, which carries an identity hash.
+        LinkageError::DuplicateClassDefinition { class_name, loader } => (
+            "java/lang/LinkageError",
+            format!(
+                "loader {} attempted duplicate class definition for {}.",
+                loader,
+                class_name.replace('/', ".")
+            ),
+        ),
         LinkageError::AbstractMethodError {
             class_name,
             method_name,
