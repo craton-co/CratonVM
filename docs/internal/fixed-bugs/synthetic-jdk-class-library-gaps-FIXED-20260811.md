@@ -195,6 +195,22 @@ agreeing with a fixture is not evidence the fixture is right.**
 | pristine dev, 11 pinned | 922 passed, 2 failed (one real, one unexpected-pass) |
 | this branch, list empty, `--test-threads=1` | 924 passed |
 | this branch, list empty, default parallelism | 924 passed |
+| after merging dev (`147740f0e`), both thread counts | 924 passed |
+
+Alongside: `cratonvm-classloading` default and `--features synthetic-jdk`;
+`cratonvm-native-builtins --lib` synthetic (3,589) and default (3,406);
+`cratonvm-native-collections --lib` synthetic (111); `cratonvm-vm --test
+tier1_tests --features synthetic-jdk` (58, including the
+`t9c_synthetic_field_tables_cover_their_factories` gate that ties
+`synthetic_stub_fields` to every `alloc_concurrent_synthetic` factory site);
+`cratonvm-types --test doc_citation_paths`; and a default-feature
+`cratonvm-cli` build, since the real-JDK path must be untouched.
+
+**Not fixed here, and not caused here:** `cargo test -p cratonvm-vm --lib`
+does not compile on dev — `MonomorphicInlineCache::update` (`jit/src/lib.rs`)
+grew a fifth `jdk_only: bool` parameter and the ten call sites in
+`vm/src/vm/tests.rs` were not updated (E0061). Confirmed against a pristine
+checkout; this branch touches neither file.
 
 Plus a `--synthetic-jdk` probe (`GapProbe`) covering all nine observations,
 run against Temurin 25.0.4 and against CratonVM before and after, so each
