@@ -1,12 +1,12 @@
 {
   "jdk": {
     "25/linux": {
-      "bridge_shadows_bytecode": 6170,
+      "bridge_shadows_bytecode": 6066,
       "bridge_stated_shadows_bytecode": 24,
-      "bridge_without_acc_native": 9015,
+      "bridge_without_acc_native": 8911,
       "jdk_version": "25.0.4",
       "mode": "compatible",
-      "note": "Schema 4: image_declaring_method resolves up the hierarchy inside ClassManager::adjudicate_natives_against_image, so the 19 inherited ACC_NATIVE rows stop counting as unadjudicated (18 FileDispatcherImpl inheriting UnixFileDispatcherImpl plus ComponentSampleModel.initIDs from SampleModel) and the 1,613 inherited shadows become visible without jdk-only-inherited-decl.sh plus a HotSpot run. The 4 java/lang/reflect/*Type.hashCode credits through java.lang.Object are deliberately NOT counted: Object is inherited by everything and would discharge any hashCode Bridge anywhere. Three new ratchets. bridge_stated_shadows_bytecode 24: rows that STATE Bridge over concrete bytecode, all ForkJoinTask/RecursiveTask/RecursiveAction, deliberate load-bearing shadows that belong to the shadow blocker rather than a re-tag. superseded_kind_disagreements 52 and superseded_stub_lost_to_admitted 4: of 1,215 superseded registrations 1,163 agree with the winner and are inert, but 52 disagree, so which kind ships was decided by call order in vm_init, and 4 of those are a SyntheticStub shipping as a Bridge that --jdk-only then admits. without_acc_native 9032 -> 9015 (19 credited, 2 added by dev PrintStream.format/printf with a Locale); shadows_bytecode 4555 -> 6170 now that the same ratchet covers the inherited shadows.",
+      "note": "java.util.logging shadows RETIRED (wave-2 item 2). 84 live triples plus their 20 superseded duplicates move Bridge -> SyntheticStub via native-api/src/retired_shadow.rs, so --jdk-only refuses them and the real class runs; --real-jdk is unchanged. Acceptance: with CRATONVM_ENFORCE_NATIVE_SHADOW=java/util/logging/ the strict corpus is 23 passed / 4 failed with the failing set unchanged (RJdkHandles RJdkReflect RJdkForkJoin RJdkJmx), and with the retirement live it is the same 23/4 and the core corpus is 37/0. without_acc_native 9015 -> 8911, shadows_bytecode 6170 -> 6066, both by exactly the 104 rows retired. Logger.log(Level,Supplier,Throwable) is held back by name: that signature is not in JDK 25 at all, so it resolves nowhere and refusing it would replace a shadow with an UnsatisfiedLinkError.",
       "observed": {
         "bridge": {
           "abstract_method": 1327,
@@ -15,21 +15,21 @@
           "class_present_method_undeclared": 363,
           "inherited_abstract_method": 283,
           "inherited_acc_native": 19,
-          "inherited_shadows_bytecode": 1613,
-          "rows": 9814,
-          "shadows_bytecode": 4557,
-          "shadows_bytecode_anywhere": 6170,
+          "inherited_shadows_bytecode": 1609,
+          "rows": 9710,
+          "shadows_bytecode": 4457,
+          "shadows_bytecode_anywhere": 6066,
           "stated_shadows_bytecode": 24,
-          "without_acc_native": 9015
+          "without_acc_native": 8911
         },
         "census_schema_version": 4,
         "image_adjudication": true,
         "mode": "compatible",
         "partial": false,
         "registrations": {
-          "bridge": 9814,
+          "bridge": 9710,
           "intrinsic": 663,
-          "synthetic-stub": 1158
+          "synthetic-stub": 1262
         },
         "schema": 1,
         "superseded": {
