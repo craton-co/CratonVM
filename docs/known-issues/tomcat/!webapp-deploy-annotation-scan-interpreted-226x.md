@@ -193,6 +193,61 @@
 > * **A class-manager `RwLock` read per invoke, ~3.7%**, the invoke-side twin
 >   of the field-path finding in § The clusters, by mechanism.
 >
+> ### First piece taken: the returning frame is recycled in place
+>
+> The return path opened with `if let Some(f) = thread.frames.pop()`, and `f`
+> then travelled into `recycle_frame_with_shared` and again into
+> `take_pool_parts` — **three moves of a ~300-byte `Frame` to arrive at four
+> `Vec` headers**. Nothing on that path needed the frame anywhere but where it
+> already was. It now reads the dying frame through a borrow, harvests the four
+> buffers by header (`std::mem::take`), and lets `FrameStack::truncate` drop
+> the husk where it lies.
+>
+> **The mechanism moved, and only the mechanism** — same probe, same host, both
+> binaries, `perf` shares (load-independent, which matters: the box was at load
+> 17):
+>
+> | symbol | before | after |
+> |---|---:|---:|
+> | `__memmove_avx512_unaligned_erms` | 5.75% | **2.64%** |
+> | `pop_and_recycle_frame_with_reason` | 6.10% | **3.92%** |
+> | `execute_invokevirtual_cached` | 15.21% | 14.82% |
+> | `Frame::new_pooled_cached` | 3.84% | 3.87% |
+> | `is_object_address` | 2.40% | 2.45% |
+> | `CachedInvokeTarget::clone` | 2.33% | 2.36% |
+> | `InvokeCache::get` | 2.12% | 2.17% |
+> | `init_locals_from_parts` | 1.88% | 1.89% |
+>
+> **−5.3 percentage points of the invoke arm**, entirely in the two symbols the
+> change targets; every other symbol is flat. A call-graph re-run confirms the
+> `memcpy` under `Vec::pop<Frame>` is gone — what remains is attributed to
+> `intercept_force_registered_native_cached`, i.e. the *other* item on the list
+> above.
+>
+> **On the workload it is ~2%, and this host cannot resolve that.** Four
+> interleaved passes, arms reversed on even passes, `taglibs-standard-impl`
+> us/class: before 579.6 / 699.8 / 751.2 / 846.5 (mean **719.3**), after
+> 673.7 / 703.2 / 724.7 / 717.3 (mean **704.7**), HotSpot 10.7–20.6. The means
+> differ by 2.0% and the ranges overlap, so **the workload figure is a
+> prediction from the mechanism, not a measurement** — which is what the
+> arithmetic says to expect: −5.3 pp of an invoke arm that is about half the
+> scan's interpreted time. The `after` column being much tighter (674–725
+> against 580–847) is suggestive, and is not evidence.
+>
+> Correctness: 2487 `cratonvm-vm` unit tests and the 38-class regression suite
+> green on the changed binary. `regression-suite/perf/c2-reach.sh` and a
+> CratonBench pass were **not** run and are not implicated — this change alters
+> no admission or tier-up decision, so nothing moves between the tiers those
+> gates watch.
+>
+> **What is left of the frame group.** `Frame::new_pooled_cached` (3.87%),
+> `init_locals_from_parts` (1.89%) and `copy_args_to_locals` (1.64%) are the
+> push side, and the symmetric fix — constructing into the slot rather than
+> moving into it — is **not** justified on this evidence:
+> `push_frame_and_fire_entry` no longer appears among the `memcpy` callers at
+> all after this change, so the push-side move is either already elided by the
+> compiler or below 0.5%. Re-measure before building it.
+>
 > **One caution about that call-graph run**, because it nearly cost a session:
 > `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
 > inside `execute_invokevirtual_cached`, which would have been a spectacular
