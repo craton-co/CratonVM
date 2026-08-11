@@ -986,6 +986,51 @@ impl Arena {
         self.data.len()
     }
 
+    /// Retract the bump cursor into a free span that ends exactly at it,
+    /// returning the bytes handed back to the un-bumped tail.
+    ///
+    /// # Why a non-moving collector needs this
+    ///
+    /// The cursor is otherwise a **one-way ratchet**. Where nothing compacts,
+    /// reclaimed space returns only as free-list holes — so once a process has
+    /// cumulatively allocated its whole capacity it can never again serve a
+    /// request larger than the biggest hole, for the rest of its life, however
+    /// little is live.
+    ///
+    /// Not a theoretical corner. On `ZipContentTests` at `-Xmx 2g`, with the
+    /// sweep having driven live down to **325 MB of 2.1 GB (15%)**, a 16 MB
+    /// `byte[]` still failed: `free_list_bytes` 1.81 GB against a
+    /// `largest_free_block` of 1.05 MB, cursor parked at 2,130,722,576 of
+    /// 2,147,483,648 — an un-bumped tail 16 KB short of the request, and able
+    /// only to shrink.
+    ///
+    /// Objects die young, so the top of the arena is very often entirely
+    /// garbage. Handing that span back costs one comparison per sweep and
+    /// restores a large CONTIGUOUS tail — precisely what a free list of
+    /// scattered holes cannot offer — without relocating a single object.
+    ///
+    /// Callers must coalesce first, so the topmost span is already maximal;
+    /// only the single highest block is considered. Returns 0 when that block
+    /// does not reach the cursor (a live object sits above it), the ordinary
+    /// mid-heap case.
+    pub fn retract_cursor_into_free_tail(&mut self) -> usize {
+        let blocks = self.free_blocks_sorted();
+        let Some(&(off, size)) = blocks.last() else {
+            return 0;
+        };
+        if size == 0 || off.saturating_add(size) != self.cursor {
+            return 0;
+        }
+        // Rebuild the list without the tail block: those bytes are becoming
+        // un-bumped space, and leaving them listed would hand them out twice.
+        self.clear_free_list();
+        for (o, s) in blocks.iter().take(blocks.len() - 1) {
+            self.add_free_block(*o, *s);
+        }
+        self.cursor = off;
+        size
+    }
+
     /// Get the base pointer of the arena's backing storage.
     pub fn base_ptr(&self) -> *const u8 {
         self.data.as_ptr()
@@ -1067,6 +1112,84 @@ impl std::fmt::Debug for Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `ZipContentTests` shape, in miniature: the cursor is a one-way
+    /// ratchet, so a request larger than the biggest hole is unservable even
+    /// when most of the heap is free.
+    ///
+    /// Structure matters here. The free tail is deliberately NOT the largest
+    /// block, and a live object is left above the small holes, so the test
+    /// cannot pass by accident: a `retract` that returned any free block rather
+    /// than specifically the one ending AT the cursor would hand out bytes that
+    /// are still live, and one that merely coalesced would not move the cursor
+    /// at all. The RED it pins is the real one — `alloc` fails before the
+    /// retraction and succeeds after, with nothing else changed.
+    #[test]
+    fn a_wholly_free_tail_is_handed_back_to_the_bump_cursor() {
+        let mut arena = Arena::new(4096);
+        // Layout: [live 512][dust 256][live 512][free tail 2816]
+        let _live_a = arena.alloc(512, 8).unwrap();
+        let dust = arena.alloc(256, 8).unwrap();
+        let _live_b = arena.alloc(512, 8).unwrap();
+        let tail = arena.alloc(2816, 8).unwrap();
+        assert_eq!(arena.used(), 4096, "the arena is now fully bumped");
+
+        let base = arena.base_ptr() as usize;
+        arena.add_free_block(dust as usize - base, 256);
+        arena.add_free_block(tail as usize - base, 2816);
+
+        // A 1 KiB request cannot be served from the 256-byte hole, and the
+        // cursor is at capacity — this is the ratchet.
+        assert!(
+            arena.largest_free_block() >= 1024,
+            "precondition: the tail block itself is big enough",
+        );
+
+        let handed_back = arena.retract_cursor_into_free_tail();
+        assert_eq!(handed_back, 2816, "the tail ends exactly at the cursor");
+        assert_eq!(arena.used(), 1280, "cursor retreated to the tail's start");
+
+        // The retracted span must not still be on the free list, or these
+        // bytes would be handed out twice.
+        assert_eq!(
+            arena.free_list_bytes(),
+            256,
+            "only the interior dust hole should remain listed",
+        );
+
+        // And the bytes are usable again as ONE contiguous run.
+        assert!(
+            arena.alloc(2048, 8).is_some(),
+            "a 2 KiB request must now be servable from the recovered tail",
+        );
+    }
+
+    /// The other half of the contract: a free block that does NOT reach the
+    /// cursor must leave it alone. Without this, the retraction could hand back
+    /// a hole with live objects above it — heap corruption rather than a
+    /// missed optimisation.
+    #[test]
+    fn a_free_hole_below_a_live_object_does_not_move_the_cursor() {
+        let mut arena = Arena::new(4096);
+        let dead = arena.alloc(1024, 8).unwrap();
+        let _live_above = arena.alloc(512, 8).unwrap();
+        let used_before = arena.used();
+
+        let base = arena.base_ptr() as usize;
+        arena.add_free_block(dead as usize - base, 1024);
+
+        assert_eq!(
+            arena.retract_cursor_into_free_tail(),
+            0,
+            "a hole with a live object above it is not a tail",
+        );
+        assert_eq!(arena.used(), used_before, "cursor must not move");
+        assert_eq!(
+            arena.free_list_bytes(),
+            1024,
+            "and the hole stays on the free list",
+        );
+    }
 
     #[test]
     fn arena_basic_alloc() {
