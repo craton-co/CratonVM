@@ -14705,11 +14705,16 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(out)))
         }
     });
-    // getIV() -> byte[]
-    r.register(cipher, "getIV", "()[B", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, CIPHER_IV)))
-    });
+    // getIV() -> byte[] — DELETED, see `jca::cipher::register_cipher_dispatch`.
+    //
+    // The third aliasing accessor in this registrar, and superseded like the
+    // other two: real `Cipher.getIV` ends `return (iv == null) ? null :
+    // iv.clone()` in the SPI (`CipherCore.getIV`, JDK 25 src.zip), this copy
+    // handed back the stored array, and `jca::cipher`'s copy — which registers
+    // after this one and therefore wins — builds a fresh array from its own
+    // side table. An IV a caller can rewrite in place after `init` is a nonce
+    // that can be made to repeat, which for GCM is a key-recovery bug rather
+    // than an untidiness.
     // Constants — KEEP. These are `static final int` FIELD reads (note the "I"
     // field descriptor, not a method descriptor), and 1/2/3/4 are the literal
     // values `javax.crypto.Cipher` declares. A constant is the correct
@@ -24379,10 +24384,10 @@ mod t2_tests {
     #[test]
     fn keygen_size_admission_matches_hotspot() {
         let (aes, _) = keygen_allowed_bits("AES").expect("AES has a fixed set");
-        assert_eq!(aes, &[128, 192, 256]);
+        assert_eq!(aes, &[128, 192, 256][..]);
         assert!(!aes.contains(&129));
         let (desede, _) = keygen_allowed_bits("DESede").expect("DESede has a fixed set");
-        assert_eq!(desede, &[112, 168]);
+        assert_eq!(desede, &[112, 168][..]);
         assert!(!desede.contains(&128));
         // The HMAC family takes any positive multiple of 8 — HotSpot really
         // does hand back an 8-byte key for `HmacSHA256` `init(64)`.
