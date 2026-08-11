@@ -258,10 +258,18 @@ public class RForeignLayoutJdkInterfaces {
         check(p.getFileSystem() == null, "Path.getFileSystem");
         check(p.toFile() == null, "Path.toFile");
         check(p.toUri() == null, "Path.toUri");
-        check("SENTINEL-path-toString".equals(p.toString()), "Path.toString = " + p.toString());
-        check(p.hashCode() == I, "Path.hashCode = " + p.hashCode());
-        check(p.equals("anything") == B, "Path.equals");
-        check(r.seen.size() == 16, "Path: 16 calls, saw " + r.seen.size() + " " + r.seen);
+        // Captured into locals first: a `p.toString()` inside an assertion
+        // MESSAGE is evaluated eagerly and would be a 17th call through the
+        // handler, which the count below would then report as interception
+        // failing to happen twice.
+        String ts = p.toString();
+        int hc = p.hashCode();
+        boolean eq = p.equals("anything");
+        check("SENTINEL-path-toString".equals(ts), "Path.toString = " + ts);
+        check(hc == I, "Path.hashCode = " + hc);
+        check(eq == B, "Path.equals");
+        int seen = r.seen.size();
+        check(seen == 15, "Path: 15 calls, saw " + seen + " " + r.seen);
         System.out.println("CK RForeignLayoutJdkInterfaces path=" + r.seen.size());
 
         // A REAL Path must be unaffected: the interception question is about
