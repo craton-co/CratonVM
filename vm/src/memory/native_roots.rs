@@ -108,6 +108,62 @@ pub(crate) mod rootprof {
             detail
         );
     }
+
+    // ── Conservative native-stack scan counters ────────────────────────────
+    //
+    // WHY THESE EXIST. `conservative_roots::scan_one_frame` and
+    // `native_stack_has_jit_frame` are the two functions that walk raw native
+    // stack memory a word at a time, and between them they were 3.3% of a
+    // `DefaultCatalogAndSchemaTest` profile. Attributing that to a CALLER took
+    // several rounds and never succeeded by sampling: the release build omits
+    // frame pointers so `perf --call-graph fp` yields nothing, and `dwarf`
+    // unwinding gives up on this VM's stack depths. Every candidate caller was
+    // then argued from static call sites — and the arguments kept being wrong,
+    // because the plausible drivers (`update_root_snapshot`, `collect_roots`,
+    // `deposit_root_snapshot`) run at wildly different rates and only counting
+    // separates them.
+    //
+    // So count. A relaxed `fetch_add` per CALL (never per word) is free next to
+    // the bulk loop it measures, and the word totals turn "this function is 2%
+    // of CPU" into "it is 2% because it reads N words of stack per second",
+    // which is the number that says whether to make the scan cheaper or to
+    // stop calling it.
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static SCAN_FRAME_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static SCAN_FRAME_WORDS: AtomicU64 = AtomicU64::new(0);
+    pub static SCAN_FRAME_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static JITPROBE_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static JITPROBE_WORDS: AtomicU64 = AtomicU64::new(0);
+
+    /// Fold one `scan_one_frame` pass into the counters, and print a cumulative
+    /// line every 4096 passes. No-op unless [`on`].
+    pub fn note_stack_scan(words: u64, hits: u64) {
+        if !on() {
+            return;
+        }
+        SCAN_FRAME_WORDS.fetch_add(words, Relaxed);
+        SCAN_FRAME_HITS.fetch_add(hits, Relaxed);
+        let n = SCAN_FRAME_CALLS.fetch_add(1, Relaxed) + 1;
+        if n % 4096 == 0 {
+            let w = SCAN_FRAME_WORDS.load(Relaxed);
+            eprintln!(
+                "[rootprof] conservative-scan calls={n} words={w} hits={} avg_words={} | jitprobe calls={} words={}",
+                SCAN_FRAME_HITS.load(Relaxed),
+                w / n,
+                JITPROBE_CALLS.load(Relaxed),
+                JITPROBE_WORDS.load(Relaxed),
+            );
+        }
+    }
+
+    /// Fold one `native_stack_has_jit_frame` probe into the counters.
+    pub fn note_jit_probe(words: u64) {
+        if !on() {
+            return;
+        }
+        JITPROBE_WORDS.fetch_add(words, Relaxed);
+        JITPROBE_CALLS.fetch_add(1, Relaxed);
+    }
 }
 
 type VmScanFn = fn(&crate::vm::SharedVm, &mut Vec<ObjectRef>);

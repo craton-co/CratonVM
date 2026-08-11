@@ -1675,6 +1675,13 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> Option<(usize, usize)> {
         let mut addr = (lo + 7) & !7usize;
         const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
         let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+        // Counted per CALL — see `rootprof::note_jit_probe`. Recorded up front
+        // so an early `return Some(..)` (a hit, which stops the walk) still
+        // reports the band this probe was ASKED for, which is the quantity the
+        // memo's incremental-band logic is supposed to be shrinking.
+        crate::memory::native_roots::rootprof::note_jit_probe(
+            (hi.saturating_sub(addr) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
+        );
         while addr + 8 <= hi {
             // SAFETY: aligned read inside the calling thread's own live stack
             // band between two known stack pointers (same contract as
@@ -4274,6 +4281,7 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     // before.
     let span = heap.conservative_addr_span();
     let mut addr = aligned_low;
+    let hits_before = out.len();
     while addr + 8 <= aligned_high {
         let qword = unsafe { (addr as *const usize).read() };
         addr += 8;
@@ -4286,6 +4294,13 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
             out.push(obj);
         }
     }
+    // Counted per CALL, never per word — see `rootprof::note_stack_scan` for
+    // why these exist. Free when `CRATONVM_DBG_ROOTPROF` is unset (one
+    // already-resolved `OnceLock` load).
+    crate::memory::native_roots::rootprof::note_stack_scan(
+        ((aligned_high - aligned_low) / 8) as u64, // Widening: bounded by MAX_SCAN_BYTES
+        (out.len() - hits_before) as u64,          // Widening: a Vec length
+    );
 }
 
 // ---------------------------------------------------------------------------
