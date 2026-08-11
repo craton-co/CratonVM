@@ -243,3 +243,34 @@ produces the identical two lines and the identical 389 removed rows, so both the
 firing and the ratchet's "IMPROVED, lock it in" are pre-existing drift between
 dev and the frozen baselines. Re-freezing them inside this change would launder
 someone else's re-tag and claim credit for 294 removals it did not make.
+
+## A second confirmed victim: `CachesEndpointWebIntegrationTests`
+
+`module/spring-boot-cache`'s `CachesEndpointWebIntegrationTests` was showing as
+a deterministic HANG at 1500s (default GC, `dev@4c4fb3902`, the commit just
+before this fix landed) in an otherwise-clean rerun of the 22-class
+FAIL/HANG union from the 2026-08-08 non-passed reruns — the one class in that
+batch that did NOT resolve at 5x the original 300s budget, and looked like a
+real stuck-forever bug rather than timeout-boundary noise.
+
+Its `.out.log` showed steady, non-stalled progress the whole time (repeated
+Tomcat/Jersey/WebMvc/Netty context start-stop cycles — `@WebEndpointTest` runs
+each of the class's 7 test methods against 3 web-server backends, 21 cycles
+total), but each `Root WebApplicationContext: initialization completed in N
+ms` line grew dramatically across the run: 2722, 3598, 7179, 20384, 26887,
+72903, 39913, 101569, 50401, 114912 ms — a >40x cost increase over ~10 of the
+21 expected cycles, with a zero-line `.err.log` (no GC/JIT diagnostic
+warnings at all, ruling out the unrelated `[moving-young]` fallback death
+spiral documented elsewhere for other classes). That per-cycle-growing-cost,
+GC-silent shape is exactly this bug: `CachesEndpointWebIntegrationTests`
+exercises the actuator's `CachesEndpoint`/`CacheManager` machinery across many
+synchronized Spring infrastructure objects, all within one long-running
+process — precisely the `jmx_locked_monitors` growth condition this page
+describes, just reached through many small `synchronized` calls across 21
+context cycles rather than one call-dense method.
+
+Rebuilt at `dev@92b35f1e5` (this fix included) and reran the single class
+alone: **PASS, 74.6s total** (all 21 cycles), vs. not finishing at all in
+1500s before. Confirms the fix is not narrow to `ZipContentTests` — any
+long-running single-process class with enough cumulative `synchronized` use
+was affected, and this "HANG" was never a real deadlock.

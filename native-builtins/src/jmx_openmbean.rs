@@ -1561,8 +1561,73 @@ fn carrier_get(ctx: &mut dyn NativeContext, carrier: ObjectRef, key: &str) -> Va
     Value::Object(None)
 }
 
+/// The two open-data carrier classes. These are REAL JDK classes under
+/// `real-jdk` mode — see [`delegates_to_bytecode`].
+const CDS_CLASS: &str = "javax/management/openmbean/CompositeDataSupport";
+const TDS_CLASS: &str = "javax/management/openmbean/TabularDataSupport";
+
+/// Is `obj` one of CratonVM's synthetic open-data carriers?
+///
+/// [`build_composite_data`] / [`build_tabular_data`] allocate an instance of
+/// the *real* `CompositeDataSupport` / `TabularDataSupport` class and keep
+/// their state on two CratonVM-private fields ([`CONTENTS_FIELD`],
+/// [`OPEN_TYPE_FIELD`]) rather than in the JDK's own `contents`/`compositeType`
+/// (resp. `dataMap`/`tabularType`). An instance the application built through
+/// the JDK constructors has neither field, so this is the only per-instance
+/// discriminator available — native registration is per
+/// (class, method, descriptor) and therefore global.
+fn is_synthetic_carrier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    matches!(
+        ctx.get_field_by_name(obj, CONTENTS_FIELD),
+        Value::Object(Some(_))
+    ) || matches!(
+        ctx.get_field_by_name(obj, OPEN_TYPE_FIELD),
+        Value::Object(Some(_))
+    )
+}
+
+/// Should the carrier natives below hand `obj` back to real JDK bytecode?
+///
+/// They were written against the carriers [`build_composite_data`] /
+/// [`build_tabular_data`] mint, but registration made them shadow the JDK
+/// bytecode for *every* `CompositeDataSupport`/`TabularDataSupport`, including
+/// ones the application constructed itself. Those have no
+/// [`CONTENTS_FIELD`]/[`OPEN_TYPE_FIELD`], so the natives answered
+/// `null`/`false`/`0` for all of them:
+/// `new CompositeDataSupport(t, names, values).getCompositeType()` returned
+/// null, which made `CompositeType.isValue()` reject a value against the very
+/// type it was built from and `CompositeDataSupport`'s own constructor throw
+/// `OpenDataException` naming two type descriptions that print identically
+/// (`TestJMXAccessorTask.testCreatePropertyForTabularDataSupport`). The
+/// `TabularDataSupport` side was worse: the native `put` wrote into the carrier
+/// map while `values()` — which has no native — read the JDK's empty `dataMap`.
+///
+/// Same real-vs-synthetic-by-instance problem, and same remedy, as the
+/// `ThreadPoolExecutor.execute`/`submit`/`shutdown` natives; see
+/// [`NativeSystemAccess::invoke_virtual_bytecode_only`], which reaches the
+/// bytecode without re-entering this registration.
+///
+/// Gated on the class not being a fabricated stub so `synthetic-jdk` mode —
+/// where there is no bytecode to delegate to — keeps the carrier behaviour
+/// unchanged.
+///
+/// Note that the two builders currently have no caller outside this module's
+/// tests, so under `real-jdk` this predicate is true for every instance and
+/// the seven natives below defer wholesale. The per-instance check is kept
+/// rather than reduced to the class-level gate because it is what makes the
+/// natives correct again the moment a caller mints a carrier.
+fn delegates_to_bytecode(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
+    !is_synthetic_carrier(ctx, obj) && !ctx.is_class_synthetic_stub(class_name)
+}
+
+/// Arguments to forward to [`NativeSystemAccess::invoke_virtual_bytecode_only`],
+/// which pushes the receiver itself.
+fn args_without_receiver(args: &[Value]) -> &[Value] {
+    args.get(1..).unwrap_or(&[])
+}
+
 fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
-    let cds = "javax/management/openmbean/CompositeDataSupport";
+    let cds = CDS_CLASS;
 
     // CompositeData.get(String) -> Object.
     r.register(
@@ -1574,6 +1639,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "get",
+                    "(Ljava/lang/String;)Ljava/lang/Object;",
+                    args_without_receiver(args),
+                );
+            }
             let key = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -1588,6 +1661,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
+        if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+            return ctx.invoke_virtual_bytecode_only(
+                this,
+                "containsKey",
+                "(Ljava/lang/String;)Z",
+                args_without_receiver(args),
+            );
+        }
         let key = match args.get(1) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
@@ -1606,6 +1687,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getCompositeType",
+                    "()Ljavax/management/openmbean/CompositeType;",
+                    args_without_receiver(args),
+                );
+            }
             Ok(Some(ctx.get_field_by_name(this, OPEN_TYPE_FIELD)))
         },
     );
@@ -1620,6 +1709,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, CDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "getAll",
+                    "([Ljava/lang/String;)[Ljava/lang/Object;",
+                    args_without_receiver(args),
+                );
+            }
             let keys = match args.get(1) {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Object(None))),
@@ -1652,7 +1749,7 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
     // TabularDataSupport: a Map<List<?>, CompositeData> keyed by index
     // values. We model it on the same backing store keyed by the index's
     // String form; the natives operate on the carrier's contents map.
-    let tds = "javax/management/openmbean/TabularDataSupport";
+    let tds = TDS_CLASS;
 
     // TabularData.put(CompositeData) -> CompositeData. Key the row by the
     // String form of its first index item; for the simple platform tables
@@ -1666,6 +1763,14 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            if delegates_to_bytecode(ctx, this, TDS_CLASS) {
+                return ctx.invoke_virtual_bytecode_only(
+                    this,
+                    "put",
+                    "(Ljavax/management/openmbean/CompositeData;)Ljavax/management/openmbean/CompositeData;",
+                    args_without_receiver(args),
+                );
+            }
             let row = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
@@ -1713,6 +1818,9 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(0))),
         };
+        if delegates_to_bytecode(ctx, this, TDS_CLASS) {
+            return ctx.invoke_virtual_bytecode_only(this, "size", "()I", &[]);
+        }
         let map = match ctx.get_field_by_name(this, CONTENTS_FIELD) {
             Value::Object(Some(m)) => m,
             _ => return Ok(Some(Value::Int(0))),
@@ -1729,6 +1837,9 @@ fn register_open_data_carriers(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Int(1))),
         };
+        if delegates_to_bytecode(ctx, this, TDS_CLASS) {
+            return ctx.invoke_virtual_bytecode_only(this, "isEmpty", "()Z", &[]);
+        }
         let map = match ctx.get_field_by_name(this, CONTENTS_FIELD) {
             Value::Object(Some(m)) => m,
             _ => return Ok(Some(Value::Int(1))),
@@ -2637,6 +2748,66 @@ mod tests {
         let mut ctx = mock_ctx();
         let td = build_tabular_data(&mut ctx, None).unwrap();
         assert!(ctx.object_num_fields(td) >= 4);
+    }
+
+    #[test]
+    fn only_cratonvm_built_carriers_are_answered_by_the_carrier_natives() {
+        use cratonvm_native_api::FieldMetadata;
+        let mut ctx = mock_ctx();
+        let cid = match ctx.ensure_class_initialized(CDS_CLASS) {
+            Ok(cid) => cid,
+            Err(e) => panic!("mock could not initialize {CDS_CLASS}: {e:?}"),
+        };
+        // The mock resolves a field name only through `set_declared_fields`;
+        // the real VM's by-name path resolves the two carrier fields on the
+        // synthetically-allocated instance itself. Declare them so both
+        // branches below are reachable here.
+        ctx.set_declared_fields(
+            cid,
+            vec![
+                FieldMetadata {
+                    name: CONTENTS_FIELD.to_string(),
+                    descriptor: "Ljava/lang/Object;".to_string(),
+                    access_flags: 0,
+                    slot_index: 0,
+                    declaring_class_id: cid,
+                    is_static: false,
+                },
+                FieldMetadata {
+                    name: OPEN_TYPE_FIELD.to_string(),
+                    descriptor: "Ljava/lang/Object;".to_string(),
+                    access_flags: 0,
+                    slot_index: 1,
+                    declaring_class_id: cid,
+                    is_static: false,
+                },
+            ],
+        );
+
+        let carrier = match ctx.new_object(CDS_CLASS) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate an instance: {other:?}"),
+        };
+
+        // Untouched, an instance looks exactly like one the application built
+        // through the JDK's own constructor: neither carrier field is set. The
+        // natives answered those from the carrier fields and so returned null
+        // for everything — `getCompositeType()` in particular, which made
+        // `CompositeType.isValue()` reject a value against its own declared
+        // type. It has to go back to the bytecode.
+        assert!(!is_synthetic_carrier(&ctx, carrier));
+        assert!(delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
+
+        // Stamped the way `build_composite_data` stamps it, the same instance
+        // is this crate's own carrier and the natives must keep answering it —
+        // under `synthetic-jdk` there is no bytecode to fall back to.
+        let map = match ctx.new_object("java/util/HashMap") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate a map: {other:?}"),
+        };
+        ctx.set_field_by_name(carrier, CONTENTS_FIELD, Value::Object(Some(map)));
+        assert!(is_synthetic_carrier(&ctx, carrier));
+        assert!(!delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
     }
 
     #[test]
