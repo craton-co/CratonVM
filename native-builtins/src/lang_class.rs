@@ -3868,21 +3868,43 @@ pub(crate) fn native_class_is_primitive(
     // `None`, so a call landing before `java/lang/Class` has resolved to its
     // real (non-stub) form still gets rechecked, rather than falling back to
     // the name-based check for the rest of the run.
+    Ok(Some(Value::Int(i32::from(mirror_is_primitive(ctx, this)))))
+}
+
+/// `Class.isPrimitive()` for a mirror, callable from Rust.
+///
+/// Factored out of [`native_class_is_primitive`] so that natives which have to
+/// make the same *decision* — rather than answer the same Java call — cannot
+/// drift from it. `MethodHandles.Lookup.in` is the first such caller: it must
+/// reject a primitive or array target, and a private re-implementation of
+/// "is this mirror primitive" is how the slot-vs-name subtlety documented
+/// above gets lost.
+pub(crate) fn mirror_is_primitive(ctx: &dyn NativeContext, mirror: ObjectRef) -> bool {
     if let Some(idx) = primitive_field_slot(ctx) {
-        if let Value::Int(flag) = ctx.get_field(this, idx) {
+        if let Value::Int(flag) = ctx.get_field(mirror, idx) {
             if flag != 0 {
-                return Ok(Some(Value::Int(1)));
+                return true;
             }
         }
     }
     // Fallback: the legacy synthetic-mode layout where the only signal
     // for primitive-ness is the name string.
-    let name = mirror_class_name(ctx, this).unwrap_or_default();
-    let result = matches!(
+    let name = mirror_class_name(ctx, mirror).unwrap_or_default();
+    matches!(
         name.as_str(),
         "int" | "long" | "float" | "double" | "boolean" | "char" | "byte" | "short" | "void"
-    );
-    Ok(Some(Value::Int(if result { 1 } else { 0 })))
+    )
+}
+
+/// `Class.isArray()` for a mirror, callable from Rust.
+///
+/// An array mirror's internal name is its descriptor (`[I`, `[Ljava/lang/String;`),
+/// which is the one shape a class name can never otherwise take — JVMS §4.2.1
+/// forbids `[` in a binary name. A mirror whose name cannot be read is NOT an
+/// array: the caller is deciding whether to REJECT, and an unreadable name is
+/// not evidence for rejecting.
+pub(crate) fn mirror_is_array(ctx: &dyn NativeContext, mirror: ObjectRef) -> bool {
+    mirror_class_name(ctx, mirror).is_some_and(|n| n.starts_with('['))
 }
 
 /// Instance-field index of `java/lang/Class.primitive` (a `boolean`),

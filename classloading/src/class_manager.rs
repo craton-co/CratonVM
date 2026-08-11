@@ -1864,7 +1864,7 @@ pub struct RedefineOptions {
 /// *loaded* class store the same question and therefore answers only for classes
 /// the run happened to touch. See
 /// [`ClassManager::adjudicate_natives_against_image`] for why both exist.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageMethodVerdict {
     /// The class path (CDS, then bootstrap, extension, application) yields bytes
     /// for this name. `false` means the image has no such class — which for a
@@ -1880,7 +1880,99 @@ pub struct ImageMethodVerdict {
     /// attribute, so a lazy-attribute decode state cannot masquerade as a fact
     /// about the class.
     pub has_code: bool,
+    /// The SUPERTYPE that declares this method, when the named class does not.
+    ///
+    /// `declared: false` used to be the whole answer, and reading it as "this
+    /// registration targets nothing" is wrong for three quarters of the bucket.
+    /// CratonVM's dispatch is receiver-driven: a native registered on
+    /// `sun/nio/ch/FileDispatcherImpl.read0` intercepts a receiver of that class
+    /// even though `read0` is declared a frame up on `UnixFileDispatcherImpl`.
+    /// Nineteen such rows are `ACC_NATIVE` on a supertype — genuine §1.5 bridges
+    /// the census used to score as unadjudicated — and roughly 1,600 more
+    /// inherit concrete bytecode, i.e. are §1.4 shadows no `has_code` column
+    /// could see.
+    ///
+    /// `None` means either "the named class declares it" (read `declared`) or
+    /// "no class in the hierarchy does". The three `inherited_*` flags are false
+    /// in both of those cases, so a reader never has to tell them apart to
+    /// score a row.
+    ///
+    /// Resolution order is JVMS §5.4.3.3: the class, then its superclass chain,
+    /// then its superinterfaces. That is also CratonVM's dispatch order, which
+    /// is what makes the answer a statement about what would actually run.
+    pub inherited_from: Option<Arc<str>>,
+    /// The inherited declaration is `ACC_NATIVE`. A `Bridge` row with this set
+    /// is correctly stated — contract §1.5's target exists, on a supertype.
+    pub inherited_acc_native: bool,
+    /// The inherited declaration carries `Code`: a §1.4 shadow of INHERITED
+    /// bytecode.
+    pub inherited_has_code: bool,
+    /// The inherited declaration is abstract, so the registration intercepts
+    /// every implementor rather than shadowing anything.
+    pub inherited_abstract: bool,
 }
+
+impl ImageMethodVerdict {
+    /// "Some class in the hierarchy declares this triple `ACC_NATIVE`" — the
+    /// contract §1.5 question, asked of the whole hierarchy rather than of one
+    /// class name. Every gate that scores a `Bridge` row should ask this and not
+    /// [`Self::acc_native`]; the difference is the nineteen rows the census used
+    /// to miscount in the dangerous direction.
+    pub fn acc_native_anywhere(&self) -> bool {
+        self.acc_native || self.inherited_acc_native
+    }
+
+    /// "Some class in the hierarchy declares this triple with a `Code`
+    /// attribute" — the §1.4 shadow question over the whole hierarchy.
+    pub fn has_code_anywhere(&self) -> bool {
+        self.has_code || self.inherited_has_code
+    }
+
+    /// The verdict for a class the image does not have at all.
+    fn absent() -> Self {
+        Self {
+            image_has_class: false,
+            declared: false,
+            acc_native: false,
+            has_code: false,
+            inherited_from: None,
+            inherited_acc_native: false,
+            inherited_has_code: false,
+            inherited_abstract: false,
+        }
+    }
+}
+
+/// One image class, reduced to what the native adjudication has to ask of it.
+///
+/// Parsed once per DISTINCT registered class (the registry has thousands of
+/// rows over roughly a thousand classes) and then re-read once per row and once
+/// per hierarchy walk that passes through it.
+#[derive(Default)]
+struct ImageClassShape {
+    /// `(name, descriptor) -> (acc_native, has_code)`.
+    methods: FxHashMap<(Arc<str>, Arc<str>), (bool, bool)>,
+    super_class: Option<Arc<str>>,
+    interfaces: Vec<Arc<str>>,
+}
+
+impl ImageClassShape {
+    fn find(&self, name: &str, descriptor: &str) -> Option<(bool, bool)> {
+        self.methods
+            .iter()
+            .find(|((n, d), _)| &**n == name && &**d == descriptor)
+            .map(|(_, flags)| *flags)
+    }
+}
+
+/// How deep [`ClassManager::adjudicate_natives_against_image`] walks before it
+/// gives up on a hierarchy.
+///
+/// A malformed image could describe a cycle, and this pass runs on a diagnostic
+/// path where a hang is far worse than an unresolved row. The deepest chain in
+/// JDK 25's `java.base` is under a dozen; 64 is past anything real and still
+/// bounded.
+const IMAGE_HIERARCHY_MAX_DEPTH: usize = 64;
 
 /// Manages class loading for the VM.
 ///
@@ -4836,59 +4928,158 @@ impl ClassManager {
         &self,
         triples: &[(String, String, String)],
     ) -> Vec<ImageMethodVerdict> {
-        use std::collections::hash_map::Entry;
-
-        // class name -> (present, methods it declares). `None` for the map
-        // means "bytes absent"; parsing failure yields an empty method set.
-        let mut parsed: FxHashMap<String, Option<FxHashMap<(Arc<str>, Arc<str>), (bool, bool)>>> =
-            FxHashMap::default();
+        let mut parsed: FxHashMap<String, Option<ImageClassShape>> = FxHashMap::default();
 
         triples
             .iter()
             .map(|(class, name, descriptor)| {
-                let entry = match parsed.entry(class.clone()) {
-                    Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(v) => {
-                        let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
-                            match cratonvm_reader::class_reader::read_class(&bytes) {
-                                Ok(cf) => cf
-                                    .methods
-                                    .iter()
-                                    .map(|m| {
-                                        (
-                                            (m.name.clone(), m.descriptor.clone()),
-                                            (m.is_native(), !m.is_native() && !m.is_abstract()),
-                                        )
-                                    })
-                                    .collect(),
-                                Err(_) => FxHashMap::default(),
-                            }
-                        });
-                        v.insert(decoded)
-                    }
+                let Some(shape) = self.image_class_shape(&mut parsed, class) else {
+                    return ImageMethodVerdict::absent();
                 };
-                match entry {
-                    None => ImageMethodVerdict {
-                        image_has_class: false,
+                if let Some((acc_native, has_code)) = shape.find(name, descriptor) {
+                    return ImageMethodVerdict {
+                        image_has_class: true,
+                        declared: true,
+                        acc_native,
+                        has_code,
+                        inherited_from: None,
+                        inherited_acc_native: false,
+                        inherited_has_code: false,
+                        inherited_abstract: false,
+                    };
+                }
+                // Not declared here. Ask the hierarchy, in the order both JVMS
+                // §5.4.3.3 and CratonVM's dispatch use: superclass chain, then
+                // superinterfaces.
+                let inherited = self.resolve_in_image_hierarchy(&mut parsed, class, name, descriptor);
+                match inherited {
+                    Some((declarer, acc_native, has_code)) => ImageMethodVerdict {
+                        image_has_class: true,
                         declared: false,
                         acc_native: false,
                         has_code: false,
+                        inherited_acc_native: acc_native,
+                        inherited_has_code: has_code,
+                        inherited_abstract: !acc_native && !has_code,
+                        inherited_from: Some(declarer),
                     },
-                    Some(methods) => {
-                        let found = methods
-                            .iter()
-                            .find(|((n, d), _)| &**n == name.as_str() && &**d == descriptor.as_str())
-                            .map(|(_, flags)| *flags);
-                        ImageMethodVerdict {
-                            image_has_class: true,
-                            declared: found.is_some(),
-                            acc_native: found.is_some_and(|(is_native, _)| is_native),
-                            has_code: found.is_some_and(|(_, has_code)| has_code),
-                        }
-                    }
+                    None => ImageMethodVerdict {
+                        image_has_class: true,
+                        declared: false,
+                        acc_native: false,
+                        has_code: false,
+                        inherited_from: None,
+                        inherited_acc_native: false,
+                        inherited_has_code: false,
+                        inherited_abstract: false,
+                    },
                 }
             })
             .collect()
+    }
+
+    /// Parse `class`'s image bytes once and memoise the shape the adjudication
+    /// needs. `None` means the image has no bytes for the name; a parse failure
+    /// yields a shape with no methods and no supertypes, which is deliberately
+    /// indistinguishable from "declares nothing and extends nothing" — both mean
+    /// "the image gives this registration no target", the only question asked.
+    fn image_class_shape<'a>(
+        &self,
+        parsed: &'a mut FxHashMap<String, Option<ImageClassShape>>,
+        class: &str,
+    ) -> Option<&'a ImageClassShape> {
+        use std::collections::hash_map::Entry;
+        let entry = match parsed.entry(class.to_string()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                let decoded = self.find_class_bytes_delegated(class).ok().map(|(bytes, _)| {
+                    match cratonvm_reader::class_reader::read_class(&bytes) {
+                        Ok(cf) => ImageClassShape {
+                            methods: cf
+                                .methods
+                                .iter()
+                                .map(|m| {
+                                    (
+                                        (m.name.clone(), m.descriptor.clone()),
+                                        (m.is_native(), !m.is_native() && !m.is_abstract()),
+                                    )
+                                })
+                                .collect(),
+                            super_class: cf.super_class.clone(),
+                            interfaces: cf.interfaces.clone(),
+                        },
+                        Err(_) => ImageClassShape::default(),
+                    }
+                });
+                v.insert(decoded)
+            }
+        };
+        entry.as_ref()
+    }
+
+    /// Find the SUPERTYPE declaration of `(name, descriptor)` for a class that
+    /// does not declare it itself. Returns `(declaring class, acc_native,
+    /// has_code)`.
+    ///
+    /// Superclasses first and interfaces after, breadth-first, which is JVMS
+    /// §5.4.3.3's order and also the order a receiver-driven dispatch would
+    /// reach them. Bounded by [`IMAGE_HIERARCHY_MAX_DEPTH`] *and* by a visited
+    /// set, so neither a cycle nor a diamond can make this quadratic.
+    fn resolve_in_image_hierarchy(
+        &self,
+        parsed: &mut FxHashMap<String, Option<ImageClassShape>>,
+        class: &str,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(Arc<str>, bool, bool)> {
+        // Superclass chain first: a concrete override on a superclass wins over
+        // an abstract interface declaration, which is what dispatch does too.
+        let mut visited: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        visited.insert(class.to_string());
+        let mut interface_queue: Vec<Arc<str>> = self
+            .image_class_shape(parsed, class)
+            .map(|s| s.interfaces.clone())
+            .unwrap_or_default();
+
+        let mut current: Option<Arc<str>> = self
+            .image_class_shape(parsed, class)
+            .and_then(|s| s.super_class.clone());
+        let mut depth = 0usize;
+        while let Some(sup) = current {
+            depth += 1;
+            if depth > IMAGE_HIERARCHY_MAX_DEPTH || !visited.insert(sup.to_string()) {
+                break;
+            }
+            let Some(shape) = self.image_class_shape(parsed, &sup) else {
+                break;
+            };
+            let found = shape.find(name, descriptor);
+            let next = shape.super_class.clone();
+            interface_queue.extend(shape.interfaces.iter().cloned());
+            if let Some((acc_native, has_code)) = found {
+                return Some((sup, acc_native, has_code));
+            }
+            current = next;
+        }
+
+        // Then superinterfaces, breadth-first.
+        let mut head = 0usize;
+        while head < interface_queue.len() && head < IMAGE_HIERARCHY_MAX_DEPTH * 64 {
+            let iface = interface_queue[head].clone();
+            head += 1;
+            if !visited.insert(iface.to_string()) {
+                continue;
+            }
+            let Some(shape) = self.image_class_shape(parsed, &iface) else {
+                continue;
+            };
+            let found = shape.find(name, descriptor);
+            interface_queue.extend(shape.interfaces.iter().cloned());
+            if let Some((acc_native, has_code)) = found {
+                return Some((iface, acc_native, has_code));
+            }
+        }
+        None
     }
 
     /// Find class bytes using parent delegation.

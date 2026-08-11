@@ -468,7 +468,7 @@ struct Args {
 
     /// Synthetic-stub census: dump every registered native with its
     /// classification (intrinsic / bridge / synthetic-stub) to the given
-    /// JSON file on VM shutdown. Schema (`schema_version` 3):
+    /// JSON file on VM shutdown. Schema (`schema_version` 4):
     /// `{ "mode", "image_adjudication", "counts": {...}, "invocations": {...},
     /// "natives": [{class, name, descriptor, kind, registered_by, overwrote,
     /// invocations, kind_stated, real_declaring_method,

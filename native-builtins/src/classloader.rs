@@ -3610,21 +3610,18 @@ pub(crate) fn cl_define_class_basic(
         return Ok(Some(v));
     }
 
-    // Read optional ProtectionDomain at arg[5]. Synthetic-PD layout:
-    // field 0 holds either a CodeSource (with URL string at field 0)
-    // or directly a URL string.
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(5) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(5) {
+        Some(Value::Object(Some(pd))) => extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     // Define via the shared backend. Empty name = use class file's
     // own this_class. Loader id 0 = application loader.
@@ -4602,19 +4599,18 @@ fn unsafe_define_class_defensive(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => 0,
     };
 
-    // Extract optional PD URL (same layout as cl_define_class_basic).
-    let mut pd_url: Option<String> = None;
-    if let Some(Value::Object(Some(pd))) = args.get(6) {
-        if let Value::Object(Some(cs)) = ctx.get_field(*pd, 0) {
-            if let Some(s) = ctx.read_string(cs) {
-                pd_url = Some(s);
-            } else if let Value::Object(Some(url)) = ctx.get_field(cs, 0) {
-                if let Some(s) = ctx.read_string(url) {
-                    pd_url = Some(s);
-                }
-            }
-        }
-    }
+    // The caller's ProtectionDomain, decoded through the ONE reader that
+    // understands both PD shapes. Six copies of an inline decode used to
+    // stand here, and all six read `CodeSource.location` with
+    // `read_string` -- which fails on a real `java.net.URL`, a different
+    // concrete class -- so every real-JDK-constructed CodeSource silently
+    // lost its URL and the defined class came back carrying the
+    // synthesised `file:/runtime-defined/<name>.class` instead of the
+    // caller's. See `extract_pd_code_source_url`.
+    let pd_url = match args.get(6) {
+        Some(Value::Object(Some(pd))) => extract_pd_code_source_url(ctx, *pd),
+        _ => None,
+    };
 
     let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
@@ -9410,9 +9406,64 @@ pub(crate) fn lk_class_relation(
     (false, same_package, same_nest)
 }
 
+/// `MethodHandles.Lookup.in`'s TARGET-CLASS validity test, shared by both
+/// registrations of the method.
+///
+/// The JDK opens `in` with three rejections, before any mode arithmetic:
+///
+/// ```java
+/// Objects.requireNonNull(requestedLookupClass);
+/// if (requestedLookupClass.isPrimitive())
+///     throw new IllegalArgumentException(requestedLookupClass + " is a primitive class");
+/// if (requestedLookupClass.isArray())
+///     throw new IllegalArgumentException(requestedLookupClass + " is an array class");
+/// ```
+///
+/// A native that only computes modes drops all three, and the drop is silent:
+/// `lookup().in(int.class)` returns a Lookup over a primitive instead of
+/// raising, and every later `find*` on it fails with a message naming the wrong
+/// thing. Both `in` registrations — this file's (synthetic-JDK mode) and
+/// `lang_invoke.rs::register_p63_method_handles_lookup`'s (both real-JDK arms)
+/// — call this, for the same reason they share [`lk_in_modes`]: two copies of a
+/// rule drift, and the drift is only visible from outside the VM.
+///
+/// Measured on OpenJDK 25.0.3: `lookup().in(int.class)` and
+/// `lookup().in(String[].class)` both raise `IllegalArgumentException`;
+/// `lookup().in(null)` raises `NullPointerException`. `regression-suite/src/
+/// RJdkLookupIn.java` is the vector.
+pub(crate) fn lk_check_in_target(ctx: &dyn NativeContext, target: Value) -> Result<(), VmError> {
+    let mirror = match target {
+        Value::Object(Some(m)) => m,
+        // `in(null)` is an NPE in the JDK, not an IAE and not a silent
+        // full-power Lookup over nothing.
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("Lookup.in: requestedLookupClass is null".to_string()),
+            }
+            .into());
+        }
+    };
+    let describe = |kind: &str| {
+        let name = crate::lang_class::mirror_class_name(ctx, mirror)
+            .map(|n| n.replace('/', "."))
+            .unwrap_or_else(|| "?".to_string());
+        cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("{name} is {kind}"),
+        }
+    };
+    if crate::lang_class::mirror_is_primitive(ctx, mirror) {
+        return Err(describe("a primitive class").into());
+    }
+    if crate::lang_class::mirror_is_array(ctx, mirror) {
+        return Err(describe("an array class").into());
+    }
+    Ok(())
+}
+
 fn lk_in_method(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    lk_check_in_target(ctx, target)?;
     // Read via `lk_modes_of`, which is correct against BOTH layouts. The old
     // `get_field(this, LK_ALLOWED_MODES)` here was the synthetic slot only; on
     // a real Lookup slot 1 is `prevLookupClass`, a reference, so the `Int` arm

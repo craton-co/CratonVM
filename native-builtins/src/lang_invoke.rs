@@ -4596,6 +4596,11 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
+            // Before any mode arithmetic: `in` REJECTS a null, primitive or
+            // array target. Shared with `classloader`'s copy — see
+            // `lk_check_in_target` for the measured JDK behaviour and for why
+            // the test cannot live in one of the two registrations only.
+            crate::classloader::lk_check_in_target(ctx, target_class)?;
             // `Lookup.in` applies FOUR reductions, not two. Re-measured for
             // this lane on OpenJDK 25.0.3 (`p.LkProbe2`, receiver
             // `MethodHandles.lookup()` == 95):
