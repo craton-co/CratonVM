@@ -2850,6 +2850,20 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
+    /// Bytes currently COMMITTED for the Java heap — backing storage the VM
+    /// holds whether or not anything lives in it. `Runtime.totalMemory()`, the
+    /// JMX heap `MemoryUsage.getCommitted()`, and (minus
+    /// [`Self::heap_allocated_bytes`]) `Runtime.freeMemory()`.
+    ///
+    /// Capacity, never occupancy: `totalMemory()` is expected to move only when
+    /// the heap grows or shrinks. See `gc::vm_heap::VmHeap::committed_bytes`.
+    ///
+    /// The default is the historical `Runtime.totalMemory()` stub, kept for
+    /// mock/test contexts that have no heap; the VM overrides it.
+    fn committed_heap_bytes(&self) -> usize {
+        64 * 1024 * 1024
+    }
+
     // -- ObjectStreamClass descriptor cache (WP0.2) --
     //
     // Backs `java.io.ObjectStreamClass.lookup(Class)`. See
