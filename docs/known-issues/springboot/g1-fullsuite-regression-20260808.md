@@ -801,7 +801,7 @@ non-generational collector.
   for its *throughput* behaviour. The G1 failure in §3 is a different, harder
   symptom (memory corruption, not slowness) and belongs here.
 * `HikariDataSourceConfigurationTests` —
-  [`hikaridatasourceconfigurationtests-pool-start-hang-20260807.md`](hikaridatasourceconfigurationtests-pool-start-hang-20260807.md).
+  the retired `hikaridatasourceconfigurationtests-pool-start-hang-20260807.md`, now `fixed-suite-bugs/springboot/hikaridatasourceconfigurationtests-proxy-interface-identity-FIXED-20260811.md`.
   It passes on both arms here (485 / 615 s), so this page adds nothing to it.
 * The superseded page,
   `fixed-suite-bugs/springboot/g1-fullsuite-regression-RETIRED-20260807.md`,
@@ -948,7 +948,7 @@ worth noting as still-linked, not coincidence:
 - `HikariDataSourceConfigurationTests`: G1 PASS->HANG (300.183s, TIMEOUT), ZGC
   PASS->FAIL (256.111s, `AssertionError`). This class already has an open,
   unresolved doc from 2026-08-07
-  (`hikaridatasourceconfigurationtests-pool-start-hang-20260807.md`) — the
+  (since retired to `fixed-suite-bugs/springboot/hikaridatasourceconfigurationtests-proxy-interface-identity-FIXED-20260811.md`) — the
   ZGC arm finally erroring out at 256s rather than running the full 300s is
   consistent with the same underlying slow/stuck mechanism, not a new one.
 
