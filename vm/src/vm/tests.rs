@@ -30389,24 +30389,57 @@ use std::sync::Arc;
         assert_eq!(h1, h2);
     }
 
+    /// Read one of `java.nio.charset.StandardCharsets`' static finals, the way
+    /// production does: run the registered `<clinit>`, then read the field.
+    ///
+    /// `StandardCharsets.UTF_8` is a static FIELD, not a method. The two tests
+    /// below used to ask the registry for a *method* named `UTF_8` with
+    /// descriptor `()Ljava/nio/charset/Charset;`, which was how these constants
+    /// were served until the charset-NPE fix of 2026-05-21 replaced the
+    /// field-shaped natives with a `<clinit>` that populates the real static
+    /// slots (`phases_early.rs`). Nothing has registered the method form since,
+    /// so both tests panicked with "not registered" — invisibly, because this
+    /// whole module is `#[cfg(all(test, feature = "synthetic-jdk"))]` and did
+    /// not compile at all between the `JitMICSlot::update` arity change and its
+    /// repair.
+    ///
+    /// The `<clinit>` writes through `set_static_field_by_name`, which resolves
+    /// the class by name and is a SILENT no-op when it is not loaded — hence
+    /// the explicit `ensure_class_initialized` first. Calling `<clinit>` again
+    /// afterwards is idempotent (it just rewrites the same six slots) and makes
+    /// the population unconditional whether or not the load already ran it.
+    fn standard_charset_static(
+        shared: &Arc<SharedVm>,
+        thread: &mut JvmThread,
+        field: &str,
+    ) -> ObjectRef {
+        const SCS: &str = "java/nio/charset/StandardCharsets";
+        {
+            let mut ctx = NativeContextImpl { shared, thread };
+            ctx.ensure_class_initialized(SCS)
+                .unwrap_or_else(|e| panic!("{SCS} failed to initialize: {e:?}"));
+        }
+        call_native(shared, thread, SCS, "<clinit>", "()V", &[])
+            .unwrap_or_else(|e| panic!("{SCS}.<clinit> failed: {e:?}"));
+        let mut ctx = NativeContextImpl { shared, thread };
+        let cid = ctx
+            .class_id_by_name(SCS)
+            .unwrap_or_else(|| panic!("{SCS} not loaded after <clinit>"));
+        let idx = ctx
+            .static_field_index_by_name(cid, field)
+            .unwrap_or_else(|| panic!("{SCS}.{field} is not a modelled static field"));
+        match ctx.get_static_field(cid, idx) {
+            Value::Object(Some(o)) => o,
+            other => panic!("{SCS}.{field} = {other:?}, expected a Charset"),
+        }
+    }
+
     #[test]
     fn standard_charsets_utf8() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let result = call_native(
-            &shared,
-            &mut thread,
-            "java/nio/charset/StandardCharsets",
-            "UTF_8",
-            "()Ljava/nio/charset/Charset;",
-            &[],
-        )
-        .unwrap();
-        let charset = match result {
-            Some(Value::Object(Some(o))) => o,
-            _ => panic!("expected charset"),
-        };
+        let charset = standard_charset_static(&shared, &mut thread, "UTF_8");
 
         let cs_name = call_native(
             &shared,
@@ -30442,19 +30475,7 @@ use std::sync::Arc;
         ];
 
         for (field, expected) in variants {
-            let result = call_native(
-                &shared,
-                &mut thread,
-                "java/nio/charset/StandardCharsets",
-                field,
-                "()Ljava/nio/charset/Charset;",
-                &[],
-            )
-            .unwrap();
-            let charset = match result {
-                Some(Value::Object(Some(o))) => o,
-                _ => panic!("expected charset for {}", field),
-            };
+            let charset = standard_charset_static(&shared, &mut thread, field);
 
             let cs_name = call_native(
                 &shared,
@@ -42872,23 +42893,27 @@ use std::sync::Arc;
         );
     }
 
-    #[test]
-    fn file_visit_result_enum_p57() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cont = call_native(
-            &shared,
-            &mut thread,
-            "java/nio/file/FileVisitResult",
-            "CONTINUE",
-            "Ljava/nio/file/FileVisitResult;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        let c_ref = cont.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(c_ref, 1), Value::Int(0)); // ordinal 0
-    }
+    // RETIRED 2026-08-11 — `file_visit_result_enum_p57`.
+    //
+    // This test called `call_native(class, "CONTINUE", "Ljava/nio/file/FileVisitResult;")`: a
+    // FIELD name with a FIELD descriptor, asking the native registry for a
+    // pseudo-method that served a static constant. `dc55e8057` deleted that
+    // whole family as "dead everywhere" — correctly, since no JDK image has a
+    // *method* by that name and nothing in the sampled workloads called it —
+    // and the deletion is governed by `scripts/baselines/jdk-only-dead-everywhere.tsv`
+    // plus `registry_contracts.rs` for the registrations that must survive.
+    //
+    // The test was not updated with it, and could not report that: this module
+    // is `#[cfg(all(test, feature = "synthetic-jdk"))]`, and `dc55e8057` was
+    // verified with `cargo check --workspace --all-targets`, which COMPILES
+    // tests and runs none. It has been red ever since, then invisible again
+    // once the `JitMICSlot::update` arity change stopped the module compiling.
+    //
+    // Retired rather than re-pointed: unlike `StandardCharsets`, which grew a
+    // `<clinit>` that populates its real static slots, there is no replacement
+    // mechanism to assert against, and re-registering the pseudo-method to keep
+    // a test green would reverse a landed, documented decision from inside a
+    // test file.
 
     #[test]
     fn process_builder_basics_p57() {
@@ -43210,23 +43235,27 @@ use std::sync::Arc;
         );
     }
 
-    #[test]
-    fn standard_open_option_enum_p57() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let read_opt = call_native(
-            &shared,
-            &mut thread,
-            "java/nio/file/StandardOpenOption",
-            "READ",
-            "Ljava/nio/file/StandardOpenOption;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        let r_ref = read_opt.as_object().unwrap();
-        assert_eq!(shared.mem.heap.get_field(r_ref, 1), Value::Int(0)); // ordinal
-    }
+    // RETIRED 2026-08-11 — `standard_open_option_enum_p57`.
+    //
+    // This test called `call_native(class, "READ", "Ljava/nio/file/StandardOpenOption;")`: a
+    // FIELD name with a FIELD descriptor, asking the native registry for a
+    // pseudo-method that served a static constant. `dc55e8057` deleted that
+    // whole family as "dead everywhere" — correctly, since no JDK image has a
+    // *method* by that name and nothing in the sampled workloads called it —
+    // and the deletion is governed by `scripts/baselines/jdk-only-dead-everywhere.tsv`
+    // plus `registry_contracts.rs` for the registrations that must survive.
+    //
+    // The test was not updated with it, and could not report that: this module
+    // is `#[cfg(all(test, feature = "synthetic-jdk"))]`, and `dc55e8057` was
+    // verified with `cargo check --workspace --all-targets`, which COMPILES
+    // tests and runs none. It has been red ever since, then invisible again
+    // once the `JitMICSlot::update` arity change stopped the module compiling.
+    //
+    // Retired rather than re-pointed: unlike `StandardCharsets`, which grew a
+    // `<clinit>` that populates its real static slots, there is no replacement
+    // mechanism to assert against, and re-registering the pseudo-method to keep
+    // a test green would reverse a landed, documented decision from inside a
+    // test file.
 
     #[test]
     fn path_get_name_p57() {
@@ -51322,27 +51351,27 @@ use std::sync::Arc;
         }
     }
 
-    #[test]
-    fn sql_types_constants_p68() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-        let types = "java/sql/Types";
-
-        let int_type = call_native(&shared, &mut thread, types, "INTEGER", "I", &[])
-            .unwrap()
-            .unwrap();
-        assert_eq!(int_type, Value::Int(4));
-
-        let varchar = call_native(&shared, &mut thread, types, "VARCHAR", "I", &[])
-            .unwrap()
-            .unwrap();
-        assert_eq!(varchar, Value::Int(12));
-
-        let ts = call_native(&shared, &mut thread, types, "TIMESTAMP", "I", &[])
-            .unwrap()
-            .unwrap();
-        assert_eq!(ts, Value::Int(93));
-    }
+    // RETIRED 2026-08-11 — `sql_types_constants_p68`.
+    //
+    // This test called `call_native(class, "INTEGER", "I")`: a
+    // FIELD name with a FIELD descriptor, asking the native registry for a
+    // pseudo-method that served a static constant. `dc55e8057` deleted that
+    // whole family as "dead everywhere" — correctly, since no JDK image has a
+    // *method* by that name and nothing in the sampled workloads called it —
+    // and the deletion is governed by `scripts/baselines/jdk-only-dead-everywhere.tsv`
+    // plus `registry_contracts.rs` for the registrations that must survive.
+    //
+    // The test was not updated with it, and could not report that: this module
+    // is `#[cfg(all(test, feature = "synthetic-jdk"))]`, and `dc55e8057` was
+    // verified with `cargo check --workspace --all-targets`, which COMPILES
+    // tests and runs none. It has been red ever since, then invisible again
+    // once the `JitMICSlot::update` arity change stopped the module compiling.
+    //
+    // Retired rather than re-pointed: unlike `StandardCharsets`, which grew a
+    // `<clinit>` that populates its real static slots, there is no replacement
+    // mechanism to assert against, and re-registering the pseudo-method to keep
+    // a test green would reverse a landed, documented decision from inside a
+    // test file.
 
     #[test]
     fn method_handle_proxies_p68() {
@@ -52095,29 +52124,27 @@ use std::sync::Arc;
         }
     }
 
-    #[test]
-    fn posix_file_permission_enum_p70() {
-        let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mut thread = JvmThread::new(ThreadId(0), "test");
-
-        let perm = call_native(
-            &shared,
-            &mut thread,
-            "java/nio/file/attribute/PosixFilePermission",
-            "OWNER_READ",
-            "Ljava/nio/file/attribute/PosixFilePermission;",
-            &[],
-        )
-        .unwrap()
-        .unwrap();
-        assert!(matches!(perm, Value::Object(Some(_))));
-
-        // Check ordinal = 0 (OWNER_READ)
-        if let Value::Object(Some(obj)) = perm {
-            let ordinal = shared.mem.heap.get_field(obj, 1);
-            assert_eq!(ordinal, Value::Int(0));
-        }
-    }
+    // RETIRED 2026-08-11 — `posix_file_permission_enum_p70`.
+    //
+    // This test called `call_native(class, "OWNER_READ", "Ljava/nio/file/attribute/PosixFilePermission;")`: a
+    // FIELD name with a FIELD descriptor, asking the native registry for a
+    // pseudo-method that served a static constant. `dc55e8057` deleted that
+    // whole family as "dead everywhere" — correctly, since no JDK image has a
+    // *method* by that name and nothing in the sampled workloads called it —
+    // and the deletion is governed by `scripts/baselines/jdk-only-dead-everywhere.tsv`
+    // plus `registry_contracts.rs` for the registrations that must survive.
+    //
+    // The test was not updated with it, and could not report that: this module
+    // is `#[cfg(all(test, feature = "synthetic-jdk"))]`, and `dc55e8057` was
+    // verified with `cargo check --workspace --all-targets`, which COMPILES
+    // tests and runs none. It has been red ever since, then invisible again
+    // once the `JitMICSlot::update` arity change stopped the module compiling.
+    //
+    // Retired rather than re-pointed: unlike `StandardCharsets`, which grew a
+    // `<clinit>` that populates its real static slots, there is no replacement
+    // mechanism to assert against, and re-registering the pseudo-method to keep
+    // a test green would reverse a landed, documented decision from inside a
+    // test file.
 
     #[test]
     fn posix_file_permissions_to_string_p70() {
@@ -74152,8 +74179,19 @@ public class SkippedTest {
         assert_eq!(mic.cached_class_id.load(Ordering::Relaxed), 10);
         assert_eq!(mic.cached_entry_ptr.load(Ordering::Relaxed), 0);
 
-        // Phase 3: full update after first resolution
-        mic.update(10, "java/lang/String", 0xABCD0000, true);
+        // Phase 3: full update after first resolution.
+        //
+        // The trailing `false` is `jdk_only`, and every `update` in this block
+        // passes it. Production reads it from
+        // `dispatch_policy(vm).is_jdk_only()`; under `JdkOnly` an entry with no
+        // live `CompiledMethod` owner — which every synthetic sentinel address
+        // in these tests is — is REFUSED rather than published, so the slot
+        // would come back "class cached, target unresolved" and every
+        // `cached_entry_ptr` assertion here would be reading a 0. `false` is
+        // Compatible mode, which is the mode these lifecycle tests describe.
+        // `s33_mic_update_refuses_native_entry_under_jdk_only` below covers the
+        // other value, so neither one is asserted by assumption.
+        mic.update(10, "java/lang/String", 0xABCD0000, true, false);
         assert_eq!(mic.cached_class_id.load(Ordering::Acquire), 10);
         assert_eq!(
             mic.cached_class_name.lock().as_deref(),
@@ -74222,7 +74260,7 @@ public class SkippedTest {
 
         let mic = JitMICSlot::new();
         // First receiver: Dog class
-        mic.update(1, "Dog", 0x1000, false);
+        mic.update(1, "Dog", 0x1000, false, false);
         mic.record_hit();
         mic.record_hit();
         mic.record_hit();
@@ -74230,7 +74268,7 @@ public class SkippedTest {
         // Class changes to Cat — the miss is recorded, and the update for the
         // new class is refused rather than tearing the installed entry.
         mic.record_miss();
-        mic.update(2, "Cat", 0x2000, true);
+        mic.update(2, "Cat", 0x2000, true, false);
 
         assert_eq!(
             mic.cached_class_id.load(Ordering::Acquire),
@@ -74259,7 +74297,7 @@ public class SkippedTest {
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
-        mic.update(42, "MyClass", 0, false); // No entry yet
+        mic.update(42, "MyClass", 0, false, false); // No entry yet
 
         // Simulate: first dispatch goes slow path (entry=0), resolves, then stores ptr
         let entry = mic.cached_entry_ptr.load(Ordering::Acquire);
@@ -74280,7 +74318,7 @@ public class SkippedTest {
 
         let mic = Arc::new(JitMICSlot::new());
         mic.prepopulate(1);
-        mic.update(1, "Worker", 0x5000, false);
+        mic.update(1, "Worker", 0x5000, false, false);
 
         let mut handles = Vec::new();
         // 4 threads doing hits (same class)
@@ -74349,19 +74387,19 @@ public class SkippedTest {
 
         // Context-free method: the flag stays clear.
         let context_free = JitMICSlot::new();
-        context_free.update(1, "Adder", 0x1000, false);
+        context_free.update(1, "Adder", 0x1000, false, false);
         assert_eq!(context_free.cached_class_id.load(Ordering::Acquire), 1);
         assert!(!context_free.cached_needs_context.load(Ordering::Relaxed));
 
         // Context-requiring method: the installing update carries it through.
         let context_needed = JitMICSlot::new();
-        context_needed.update(2, "Allocator", 0x2000, true);
+        context_needed.update(2, "Allocator", 0x2000, true, false);
         assert_eq!(context_needed.cached_class_id.load(Ordering::Acquire), 2);
         assert!(context_needed.cached_needs_context.load(Ordering::Relaxed));
 
         // A refused (different-class) update cannot flip the flag under the
         // entry it does not own.
-        context_free.update(2, "Allocator", 0x2000, true);
+        context_free.update(2, "Allocator", 0x2000, true, false);
         assert_eq!(context_free.cached_class_id.load(Ordering::Acquire), 1);
         assert_eq!(context_free.cached_entry_ptr.load(Ordering::Acquire), 0x1000);
         assert!(!context_free.cached_needs_context.load(Ordering::Relaxed));
@@ -74381,7 +74419,7 @@ public class SkippedTest {
         use std::sync::atomic::Ordering;
 
         let mic = JitMICSlot::new();
-        mic.update(5, "Slow", 0, false); // entry_ptr = 0
+        mic.update(5, "Slow", 0, false, false); // entry_ptr = 0
 
         // Even though class_id matches, entry_ptr=0 means no direct call
         let cid = mic.cached_class_id.load(Ordering::Acquire);
@@ -74404,13 +74442,91 @@ public class SkippedTest {
         assert_eq!(mic.cached_entry_ptr.load(Ordering::Relaxed), 0);
 
         // Full update with the same class_id
-        mic.update(99, "FullyResolved", 0xBEEF, true);
+        mic.update(99, "FullyResolved", 0xBEEF, true, false);
         assert_eq!(mic.cached_class_id.load(Ordering::Acquire), 99);
         assert_eq!(
             mic.cached_class_name.lock().as_deref(),
             Some("FullyResolved")
         );
         assert_eq!(mic.cached_entry_ptr.load(Ordering::Acquire), 0xBEEF);
+    }
+
+    /// The `jdk_only` argument every `update` above passes as `false` has to
+    /// change something, and nothing proved it did.
+    ///
+    /// `JitMICSlot::update` grew that fifth parameter without any test taking
+    /// the `true` branch — `jdk_only_ic_native_refusals()`, the counter it
+    /// bumps, is read only by `--jdk-only-report`'s diagnostics struct. So the
+    /// whole refusal could have been inverted, or dropped, and every suite
+    /// stayed green. It is not a cosmetic flag: it is what stops generated
+    /// code from `CALL R11`-ing a native/builtin trampoline directly, with no
+    /// dispatch helper on the path, so `resolve_dispatch` never runs and a
+    /// `SyntheticStub` callback bound before the policy was consulted would
+    /// execute unnoticed — the "stale JIT or alternate dispatch path" that
+    /// `docs/feature-designs/jdk-only-mode.md` §1.3/§7 forbids outright.
+    ///
+    /// Both arms use the same unowned sentinel address, so the ONLY difference
+    /// between them is the flag.
+    #[test]
+    fn s33_mic_update_refuses_native_entry_under_jdk_only() {
+        use cratonvm_jit::JitMICSlot;
+        use std::sync::atomic::Ordering;
+
+        // An address that is neither a `jit_entry_owners` key nor inside a live
+        // JIT code region — i.e. what `jit_entry_publishable` classifies as a
+        // native/builtin target. That is the shape the JDK-only arm refuses;
+        // an unresolvable *JIT* artifact is refused in BOTH modes, so it could
+        // not tell the two apart.
+        const NATIVE_SENTINEL: u64 = 0x5AFE_0000;
+
+        // Compatible mode publishes it: no owner to keep it alive, but nothing
+        // unmaps a native trampoline either.
+        let compatible = JitMICSlot::new();
+        compatible.update(7, "Native", NATIVE_SENTINEL, true, false);
+        assert_eq!(compatible.cached_class_id.load(Ordering::Acquire), 7);
+        assert_eq!(
+            compatible.cached_entry_ptr.load(Ordering::Acquire),
+            NATIVE_SENTINEL,
+            "Compatible mode must still publish an unowned native entry"
+        );
+        assert!(compatible.cached_needs_context.load(Ordering::Relaxed));
+
+        // JDK-only refuses it, and the refusal is a DOWNGRADE, not a dropped
+        // update: the class guard and name are still installed, so the site
+        // stays usable — it just falls back to `jit_invoke_virtual_mic` /
+        // `jit_invoke_dispatch`, which re-resolve under the policy.
+        let refusals_before = cratonvm_jit::jdk_only_ic_native_refusals();
+        let jdk_only = JitMICSlot::new();
+        jdk_only.update(7, "Native", NATIVE_SENTINEL, true, true);
+        assert_eq!(
+            jdk_only.cached_class_id.load(Ordering::Acquire),
+            7,
+            "the refusal must leave the class guard installed"
+        );
+        assert_eq!(
+            jdk_only.cached_class_name.lock().as_deref(),
+            Some("Native"),
+            "…and the class name with it"
+        );
+        assert_eq!(
+            jdk_only.cached_entry_ptr.load(Ordering::Acquire),
+            0,
+            "JDK-only must NOT publish an unowned native entry: generated code \
+             would CALL it with no dispatch helper on the path"
+        );
+        assert!(
+            !jdk_only.cached_needs_context.load(Ordering::Relaxed),
+            "a refused entry must not leave its calling convention behind — the \
+             next publication attempt reads this flag"
+        );
+
+        // The counter is process-global and other tests in this binary may be
+        // publishing concurrently, so assert it MOVED rather than pinning an
+        // exact value.
+        assert!(
+            cratonvm_jit::jdk_only_ic_native_refusals() > refusals_before,
+            "the refusal must be counted — it is what --jdk-only-report reports"
+        );
     }
 
     // ===================================================================
