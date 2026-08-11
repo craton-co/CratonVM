@@ -254,6 +254,21 @@ pub static EVAC_SOURCE_WALK_DESYNC: AtomicUsize = AtomicUsize::new(0);
 /// there. Expected to be ZERO.
 pub static EVAC_HOLDER_CLAMPED: AtomicUsize = AtomicUsize::new(0);
 
+/// How many unresolved-kept SEEDS the post-evacuation-failure rset recording
+/// refused to walk because their header did not look like a live object.
+///
+/// Expected to be ZERO. Non-zero means `retry_after_evacuation_failure` handed
+/// [`G1Collector::record_outgoing_rset_edges`] a self-forwarded address that is
+/// region-resident but is not an object start — which, before the guard, was a
+/// SIGSEGV inside that walk (see
+/// `docs/internal/known-issues/h2/g1-sigsegv-shared-fault-site-20260811-FIXED.md`).
+pub static KEPT_SEED_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The value of [`KEPT_SEED_REJECTED`].
+pub fn kept_seeds_rejected() -> usize {
+    KEPT_SEED_REJECTED.load(Ordering::Relaxed)
+}
+
 /// The values of [`EVAC_HOLDER_REJECTED`] and [`EVAC_HOLDER_CLAMPED`].
 pub fn evacuation_holder_counts() -> (usize, usize) {
     (
@@ -2284,9 +2299,50 @@ impl G1Collector {
             return;
         };
         let obj_ptr = obj_addr as *mut u8;
-        // Kept objects are ordinary (humongous regions never enter a CSet),
-        // so flat payload reads are in-bounds.
+        // `lookup_region_for_addr` only answers "is this word inside some
+        // region's SPAN". That is not "is this an object", and the seeds are
+        // not trustworthy enough for the difference to be ignorable: they are
+        // the self-forwarded keys of a FAILED evacuation's pointer map, and
+        // the same pause's ref-scan is on record rejecting holders out of that
+        // very set ("evacuation ref-scan REJECTED a non-object HOLDER"). A
+        // header read at a non-object address yields an arbitrary `num_slots`
+        // / `array_length`, and the walks below then read past the region — the
+        // measured H2 crash was exactly this: `collect_garbage` ->
+        // `retry_after_evacuation_failure` -> `record_outgoing_rset_edges` ->
+        // `for_each_flat_object_reference` faulting on a 4 MiB-aligned address
+        // well past the committed arena.
+        //
+        // Same screen the ref-scan sibling applies to its own holders, and the
+        // same one the reachability verifier gained in `1ccaf9caf`. Dropping a
+        // non-object seed costs nothing: an address that is not an object has
+        // no outgoing references to remember.
+        if !self.candidate_header_is_plausible(regions, obj_addr) {
+            let n = KEPT_SEED_REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] kept-seed rset recording REJECTED a non-object SEED (#{n}): \
+                     obj=0x{obj_addr:x} — walking its slots would have read outside any \
+                     live region. Skipped; the pause continues."
+                );
+            }
+            return;
+        }
+        // SAFETY: `candidate_header_is_plausible` validated the tag bytes and
+        // placed the address inside a live region's committed span.
         let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+        // Clamp a reference array's element walk to what the holder's own
+        // region actually holds, for the same reason `scan_and_evacuate_refs`
+        // does: `array_length` is a u32 bounded only by `i32::MAX`, so
+        // `HEADER_SIZE + len * 8` is not implied to be inside the region by the
+        // header being plausible. Computed here, before `record` borrows
+        // `regions` mutably.
+        let walkable_elements = if header.kind() == ObjectKind::Array
+            && header.element_type() == ArrayElementType::Reference
+        {
+            self.holder_walkable_slots(regions, obj_ptr, header.array_length() as usize)
+        } else {
+            0
+        };
         // G1AUD-5: GC-internal edges are stamped with the pause's generation,
         // exactly like the mutator barrier's.
         let generation = self.rset_generation();
@@ -2303,13 +2359,10 @@ impl G1Collector {
             }
         };
         if header.kind() == ObjectKind::Array {
-            if header.element_type() == ArrayElementType::Reference {
-                for i in 0..header.array_length() as usize {
-                    // SAFETY: i < array_length — inside the allocation.
-                    let raw =
-                        unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
-                    record(raw as usize);
-                }
+            for i in 0..walkable_elements {
+                // SAFETY: i < the region-clamped element count.
+                let raw = unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
+                record(raw as usize);
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| record(raw));
@@ -10109,6 +10162,138 @@ mod tests {
         assert!(
             matches!(gc.get_field(obj, 1), Value::Int(2)),
             "the dropped write must not have reached the object at all"
+        );
+    }
+
+    /// A self-forwarded SEED handed to `record_outgoing_rset_edges` only has to
+    /// be region-RESIDENT to reach the walk — `lookup_region_for_addr` answers
+    /// "inside some region's span", not "is an object". A word above the
+    /// source region's allocation cursor satisfies the first and fails the
+    /// second, and the walk then reads an arbitrary `array_length` /
+    /// `num_slots` out of whatever bytes are there.
+    ///
+    /// That is the measured H2 crash (`TestKillProcessWhileWriting`,
+    /// `TestRandomMapOps`, both SIGSEGV at `addr=0x20084400000` with the fault
+    /// PC symbolizing to `collect_garbage -> retry_after_evacuation_failure ->
+    /// record_outgoing_rset_edges -> for_each_flat_object_reference`). Here the
+    /// fabricated header is deliberately *readable* so the pre-fix behaviour is
+    /// an observable wrong rset edge rather than a process-killing fault.
+    #[test]
+    fn kept_seed_rset_recording_refuses_a_non_object_seed() {
+        let gc = make_collector();
+        let live = gc.alloc_object(ClassId::new(1), 1);
+        let src_idx = gc
+            .lookup_region_for_addr(live.as_ptr() as usize)
+            .expect("the live allocation is in a region");
+
+        // A second live region to be the edge's TARGET: an edge is only
+        // recorded when the destination is a different, non-Free region.
+        let (dst_idx, target_addr) = {
+            let mut regions = gc.regions.lock();
+            let dst_idx = if src_idx + 1 < regions.len() {
+                src_idx + 1
+            } else {
+                src_idx - 1
+            };
+            regions[dst_idx].region_type = RegionType::Old;
+            regions[dst_idx].cursor = 4096;
+            let addr = regions[dst_idx].data.as_ptr() as usize;
+            (dst_idx, addr)
+        };
+
+        // The seed: inside the source region's span, above its cursor. The
+        // fabricated header is a one-element reference array pointing at the
+        // target region — what the pre-fix walk would have followed.
+        let seed_addr = {
+            let mut regions = gc.regions.lock();
+            let region = &mut regions[src_idx];
+            let addr = region.data.as_ptr() as usize + region.cursor + 64;
+            assert_eq!(addr & 0x7, 0, "seed must stay 8-aligned");
+            // SAFETY: `addr` is inside the region's own `region_size`-byte
+            // buffer (the cursor is far below it in a fresh collector), so both
+            // writes are in-bounds of an allocation this test owns.
+            unsafe {
+                std::ptr::write(
+                    addr as *mut ObjectHeader,
+                    ObjectHeader::new(
+                        ClassId::new(1),
+                        ObjectKind::Array,
+                        ArrayElementType::Reference,
+                        1,
+                        0,
+                    ),
+                );
+                std::ptr::write((addr + HEADER_SIZE) as *mut u64, target_addr as u64);
+            }
+            addr
+        };
+        assert_eq!(
+            gc.lookup_region_for_addr(seed_addr),
+            Some(src_idx),
+            "the seed has to be region-resident, or the walk would be skipped \
+             for the wrong reason and this test would pass vacuously"
+        );
+
+        let before = KEPT_SEED_REJECTED.load(Ordering::Relaxed);
+        {
+            let mut regions = gc.regions.lock();
+            gc.record_outgoing_rset_edges(&mut regions, seed_addr);
+        }
+
+        let regions = gc.regions.lock();
+        assert!(
+            !regions[dst_idx].rset.sources().contains(&src_idx),
+            "a seed above its region's allocation cursor is not an object; its \
+             fabricated header must not be walked, and no rset edge may be \
+             recorded from it"
+        );
+        assert_eq!(
+            KEPT_SEED_REJECTED.load(Ordering::Relaxed),
+            before + 1,
+            "the refusal must be counted, so a real run can be asked whether \
+             the guard ever fired"
+        );
+    }
+
+    /// The other arm of the same guard: a genuine live object seed is still
+    /// walked, and its cross-region edge is still recorded. Without this, the
+    /// test above could be satisfied by a `record_outgoing_rset_edges` that
+    /// refuses everything.
+    #[test]
+    fn kept_seed_rset_recording_still_records_a_real_object_seed() {
+        let gc = make_collector();
+        let holder = gc.alloc_object(ClassId::new(1), 1);
+        let src_idx = gc
+            .lookup_region_for_addr(holder.as_ptr() as usize)
+            .expect("the live allocation is in a region");
+
+        let (dst_idx, target_addr) = {
+            let mut regions = gc.regions.lock();
+            let dst_idx = if src_idx + 1 < regions.len() {
+                src_idx + 1
+            } else {
+                src_idx - 1
+            };
+            regions[dst_idx].region_type = RegionType::Old;
+            regions[dst_idx].cursor = 4096;
+            let addr = regions[dst_idx].data.as_ptr() as usize;
+            (dst_idx, addr)
+        };
+
+        // Point the holder's only field at the other region.
+        // SAFETY: `target_addr` is the non-null base of a live region's buffer.
+        let target = unsafe { ObjectRef::from_raw(target_addr as *mut u8) };
+        gc.set_field(holder, 0, Value::Object(Some(target)));
+
+        {
+            let mut regions = gc.regions.lock();
+            gc.record_outgoing_rset_edges(&mut regions, holder.as_ptr() as usize);
+        }
+
+        let regions = gc.regions.lock();
+        assert!(
+            regions[dst_idx].rset.sources().contains(&src_idx),
+            "a real live seed's cross-region edge must still be remembered"
         );
     }
 
