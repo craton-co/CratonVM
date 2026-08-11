@@ -113,6 +113,14 @@ fn maybe_dump_shutdown_reports() {
     // its cost somewhere the compiler statistics do not reach.
     cratonvm_vm::jit::conservative_roots::scan_prof::dump();
 
+    // Which classes this run DEFINED, hottest first, self-gated on
+    // `CRATONVM_DBG=define-census`. Class definition is the only thing that
+    // calls `JitCache::invalidate_for_class`, so a profile that shows that
+    // symbol long past warm-up is asking this question and nothing else could
+    // answer it — `runtime::diagnostics::classes_loaded` reported zero because
+    // nothing incremented it.
+    cratonvm_classloading::define_census::dump();
+
     if cratonvm_types::flags().jit.method_stats {
         cratonvm_jit::tiered::dump_method_stats_to_stderr();
         // The bytecode loop rewriter's admission tally, on the same switch and

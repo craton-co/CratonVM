@@ -1037,6 +1037,16 @@ pub struct LoaderFlags {
     pub dbg_classpath: bool,
     /// `CRATONVM_DBG_DEFINE` — [`parse::present_utf8`].
     pub dbg_define: bool,
+    /// `CRATONVM_DBG_DEFINE_CENSUS` — dump a per-class tally of every class
+    /// DEFINITION at exit, hottest first. [`parse::present_utf8`].
+    ///
+    /// Exists because "what is still defining classes in steady state?" had no
+    /// instrument at all. `runtime::diagnostics::classes_loaded` was declared,
+    /// reset, formatted and unit-tested, and incremented by nothing — so it
+    /// reported a confident zero, while `JitCache::invalidate_for_class`, which
+    /// runs ONLY on a class definition, sat at ~1% of an H2 profile taken long
+    /// past warm-up with nothing able to say what was calling it.
+    pub dbg_define_census: bool,
     /// `CRATONVM_DBG_DUPCLASS` — [`parse::present_utf8`].
     pub dbg_dupclass: bool,
     /// `CRATONVM_DBG_DUPCLASS_BT`
@@ -1098,6 +1108,7 @@ impl LoaderFlags {
             dbg_access: present_utf8(src, "CRATONVM_DBG_ACCESS"),
             dbg_classpath: present(src, "CRATONVM_DBG_CLASSPATH"),
             dbg_define: present_utf8(src, "CRATONVM_DBG_DEFINE"),
+            dbg_define_census: present_utf8(src, "CRATONVM_DBG_DEFINE_CENSUS"),
             dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
             dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
             dbg_dupclass_filter: utf8(src, "CRATONVM_DBG_DUPCLASS_FILTER"),

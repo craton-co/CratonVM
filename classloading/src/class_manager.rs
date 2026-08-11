@@ -5000,6 +5000,9 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
+        // Every class definition in the process funnels through here, so this
+        // is the one place the count can be taken. See `define_census`.
+        crate::define_census::note(name);
         if loader_flags().dbg_define
             && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
         {
