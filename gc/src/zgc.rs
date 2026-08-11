@@ -2724,7 +2724,26 @@ impl ZgcRealHeap {
     fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
         let ptr = {
             let mut arena = self.arena.lock();
-            let ptr = match arena.alloc(size, 8) {
+            let mut got = arena.alloc(size, 8);
+            if got.is_none() {
+                // Before this can be called a failure: every live TLAB is
+                // holding a chunk whose unused tail is arena space no allocator
+                // can see. On a non-compacting heap that tail is also the piece
+                // most likely to be ADJACENT to a free hole (a chunk is carved
+                // from one), so handing it back can both supply the bytes and
+                // let `Arena::alloc`'s merge re-form a bigger span.
+                //
+                // Lock order is cell -> arena, never the reverse, so the arena
+                // guard has to go first. Dropping it is safe here: the first
+                // attempt already failed, and a peer that allocates in the
+                // window can only make the retry fail again — which is exactly
+                // the pre-existing answer.
+                drop(arena);
+                self.retire_all_tlabs();
+                arena = self.arena.lock();
+                got = arena.alloc(size, 8);
+            }
+            let ptr = match got {
                 Some(p) => p,
                 None => {
                     // Allocation failure on a NON-COMPACTING heap is not the
@@ -3733,16 +3752,48 @@ const ZGC_TLAB_ALIGN: usize = 8;
 
 /// Ceiling on a TLAB chunk carved from the arena.
 ///
-/// Deliberately **below** `crate::tlab::default_tlab_size()` (256 KiB). The
-/// shared default is sized for the generational young arena, which is disjoint
-/// from the accounting this heap performs; here every byte sitting in a live
-/// chunk but not yet handed to an object is a byte `ZgcRealHeap::allocated`
-/// does not know about (see [`ZgcRealHeap::alloc_tlab`] on accounting). That
-/// blind spot is bounded by `live_threads * chunk`, so the chunk is the knob
-/// that bounds it. 64 KiB still amortises the arena mutex over ~600 typical
-/// (104-byte) objects, i.e. a ~600x reduction in arena-lock traffic, at a
-/// quarter of the accounting blind spot a 256 KiB chunk would cost.
-const ZGC_TLAB_MAX_CHUNK: usize = 64 * 1024;
+/// Two forces pull on this number in opposite directions.
+///
+/// DOWN: every byte sitting in a live chunk but not yet handed to an object is
+/// a byte `ZgcRealHeap::allocated` does not know about (see
+/// [`ZgcRealHeap::alloc_tlab`] on accounting). That blind spot is bounded by
+/// `live_threads * chunk`, so the chunk is the knob that bounds it. This was
+/// 64 KiB for that reason alone — deliberately below
+/// `crate::tlab::default_tlab_size()` (256 KiB), which is sized for the
+/// generational young arena and its disjoint accounting.
+///
+/// UP, and this is the force that was missing: **on a non-compacting heap the
+/// chunk size sets the GRANULARITY OF FREE-LIST HOLES.** A chunk is one
+/// `arena.alloc`; the objects inside it are freed individually by the sweep and
+/// merged back by the coalescer, but a single survivor anywhere in a chunk
+/// walls it off from its neighbours. The steady state is therefore a free list
+/// whose largest block is about one chunk — and an allocation LARGER than a
+/// chunk can then never be served again, no matter how much of the heap is
+/// free.
+///
+/// 64 KiB was the worst possible value for that, because a 64 KiB hole is
+/// exactly too small for one of the most common large Java allocations there
+/// is: `new T[8192]` is `8192 * 8 + 16 = 65552` bytes. Measured on the
+/// 2026-08-11 Azure Linux Hibernate run, `sql.exec.SmokeTests` died with
+/// `OutOfMemoryError` on precisely that array — ANTLR's
+/// `ParserATNSimulator.computeTargetState` allocating `DFAState[8192]` — with
+/// the guard line reading `free_list_bytes=1211993376 largest_free_block=65528`:
+/// 1.13 GiB free, short by 24 bytes. The same class passes on the same heap
+/// with `CRATONVM_ZGC_TLAB=0` (no chunks, no walls) and on G1 (which
+/// evacuates).
+///
+/// 512 KiB keeps the hole granularity an order of magnitude above the array
+/// shapes real workloads repeat, and raises `max_tlab_alloc` (`chunk / 8`) from
+/// 8 KiB to 64 KiB so mid-sized arrays stop needing an arena hole at all. The
+/// accounting blind spot it costs is `live_threads * 512 KiB` — a few MiB on
+/// the thread counts this VM runs, against a heap sized in gigabytes — and the
+/// unused tail is returned to the free list at every retire
+/// ([`ZgcRealHeap::tlab_retire_locked`]), so it is a reservation, not waste.
+///
+/// Small heaps are unaffected: [`ZArenaTlabRegistry::chunk_bytes_for_capacity`]
+/// takes `capacity / 1024` first, so this ceiling only binds above ~512 MiB,
+/// which is exactly where the fragmentation it exists to prevent appears.
+const ZGC_TLAB_MAX_CHUNK: usize = 512 * 1024;
 
 /// Runtime kill switch: `CRATONVM_ZGC_TLAB`. **Default on.**
 ///
