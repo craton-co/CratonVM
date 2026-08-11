@@ -10863,7 +10863,7 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
     // native_map_put re-enters Java, moving `this` and every pending pair.
     let this_pin = ctx.pin_native_root(this);
-    let entries = collect_entries_any(ctx, other);
+    let entries = collect_entries_any(ctx, other)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, pair_handles) = pin_value_slice(ctx, &flat);
     for (i, (key, value)) in entries.iter().enumerate() {
@@ -11263,7 +11263,17 @@ fn source_map_remove(
 /// Collect `(key, value)` pairs from any of the natively-modelled maps,
 /// dispatching on the concrete backend so a LinkedHashMap's overlay / a
 /// TreeMap's tree are read correctly rather than as empty bucket tables.
-fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(Value, Value)> {
+///
+/// Fallible for the reason on [`collection_elements_generic`], and this is the
+/// map-side twin of that defect: every caller below is a copy constructor, a
+/// `putAll`, a `forEach`, a `hashCode` or a serialisation writer, and each one
+/// reads an empty answer as "the source map had no entries". A refused
+/// `isEmpty()` / `entrySet()` / `iterator()` therefore used to produce an empty
+/// destination map and no exception at all.
+fn collect_entries_any(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Result<Vec<(Value, Value)>, MethodCallFailed> {
     // See through CratonVM's synthetic unmodifiable wrapper first so a
     // `Map.of(...)` / `Collections.unmodifiableMap(...)` source is read as its
     // backing map (and the TreeMap/LHM dispatch below sees the real class).
@@ -11274,10 +11284,10 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if is_lhm_receiver(ctx, source) {
         let ks = lhm_collect_keys(ctx, source);
         let vs = lhm_collect_values(ctx, source);
-        return ks.into_iter().zip(vs).collect();
+        return Ok(ks.into_iter().zip(vs).collect());
     }
     if is_tree_map_receiver(ctx, source) {
-        return tm_collect_pairs(ctx, source);
+        return Ok(tm_collect_pairs(ctx, source));
     }
     // Only interpret the source's fields as a HashMap bucket table when it is
     // actually one of the map kinds CratonVM models that way (real/synthetic
@@ -11291,7 +11301,7 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if is_native_bucket_map(ctx, source) {
         let entries = map_collect_entries(ctx, source);
         if !entries.is_empty() {
-            return entries;
+            return Ok(entries);
         }
     }
     // Either a genuinely empty native map, or a `Map` whose internal layout
@@ -11311,21 +11321,26 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     // own entry pin then faithfully pinned an ALREADY-STALE address. Pin +
     // refresh across the probe.
     let source_pin = ctx.pin_native_root(source);
-    let nonempty = matches!(
-        ctx.invoke(
-            "java/util/Map",
-            "isEmpty",
-            "()Z",
-            &[Value::Object(Some(source))],
-        ),
-        Ok(Some(Value::Int(0)))
+    // The `matches!` this replaced folded `Err` into "empty", which is the
+    // arm that mattered: a refused `isEmpty()` skipped the walk entirely and
+    // the caller copied nothing. Unwind the pin before propagating.
+    let is_empty = ctx.invoke(
+        "java/util/Map",
+        "isEmpty",
+        "()Z",
+        &[Value::Object(Some(source))],
     );
     let source = ctx.read_native_pin(source_pin, source);
     ctx.unpin_native_roots(source_pin);
+    let nonempty = match is_empty {
+        Ok(Some(Value::Int(0))) => true,
+        Err(e) => return Err(e),
+        _ => false,
+    };
     if nonempty {
         return collect_entries_via_iterator(ctx, source);
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 /// Walk an arbitrary `java.util.Map` via its polymorphic
@@ -11367,9 +11382,13 @@ impl Drop for IterCollectGuard {
 fn collect_entries_via_iterator(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
-) -> Vec<(Value, Value)> {
+) -> Result<Vec<(Value, Value)>, MethodCallFailed> {
     let guard_key = source.as_ptr() as u64;
     let inserted = ITER_COLLECT_GUARD.with(|g| g.borrow_mut().insert(guard_key));
+    // The RAII guard also covers the `?`-shaped early returns the inner walk
+    // now has: an `Err` unwinds through `Drop` exactly as a panic did, so a
+    // refusal cannot leave a stale key behind and make a later collection of a
+    // pointer-reused source wrongly answer empty.
     let _guard = IterCollectGuard {
         key: guard_key,
         inserted,
@@ -11377,7 +11396,7 @@ fn collect_entries_via_iterator(
     if !inserted {
         // Re-entrant collection of the SAME source via its own entrySet view —
         // walking it again would recurse forever. Break the cycle.
-        return Vec::new();
+        return Ok(Vec::new());
     }
     collect_entries_via_iterator_inner(ctx, source)
 }
@@ -11385,7 +11404,7 @@ fn collect_entries_via_iterator(
 fn collect_entries_via_iterator_inner(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
-) -> Vec<(Value, Value)> {
+) -> Result<Vec<(Value, Value)>, MethodCallFailed> {
     let mut out = Vec::new();
     // Dispatch through `invoke_virtual` on each concrete receiver — NOT
     // `ctx.invoke("java/util/Map", ...)`. The latter keys the native lookup on
@@ -11415,18 +11434,26 @@ fn collect_entries_via_iterator_inner(
     let source_c = ctx.read_native_pin(source_pin, source);
     let set = match ctx.invoke_virtual(source_c, "entrySet", "()Ljava/util/Set;", &[]) {
         Ok(Some(Value::Object(Some(s)))) => s,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Err(e);
+        }
         _ => {
             ctx.unpin_native_roots(source_pin);
-            return out;
+            return Ok(out);
         }
     };
     let set_pin = ctx.pin_native_root(set);
     let set_c = ctx.read_native_pin(set_pin, set);
     let it = match ctx.invoke_virtual(set_c, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(i)))) => i,
+        Err(e) => {
+            ctx.unpin_native_roots(source_pin);
+            return Err(e);
+        }
         _ => {
             ctx.unpin_native_roots(source_pin);
-            return out;
+            return Ok(out);
         }
     };
     let it_pin = ctx.pin_native_root(it);
@@ -11434,34 +11461,50 @@ fn collect_entries_via_iterator_inner(
     // strictly LIFO — nothing is unpinned until the single truncate below, so
     // handles stay valid (see the PIN-DANGLING history in chm_extra_entries).
     let mut pinned: Vec<(usize, Value, usize, Value)> = Vec::new();
+    // Same reason as `collection_elements_generic`: a failure inside the walk
+    // is recorded and the loop left by the normal `break`, so the one truncate
+    // at `source_pin` still covers `set_pin`, `it_pin` and every per-entry pin.
+    let mut failed: Option<MethodCallFailed> = None;
     loop {
         let it_c = ctx.read_native_pin(it_pin, it);
-        let has_next = matches!(
-            ctx.invoke_virtual(it_c, "hasNext", "()Z", &[]),
-            Ok(Some(Value::Int(n))) if n != 0
-        );
-        if !has_next {
-            break;
+        match ctx.invoke_virtual(it_c, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+            _ => break,
         }
         let it_c = ctx.read_native_pin(it_pin, it);
         let entry = match ctx.invoke_virtual(it_c, "next", "()Ljava/lang/Object;", &[]) {
             Ok(Some(Value::Object(Some(e)))) => e,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
             _ => break,
         };
         let entry_pin = ctx.pin_native_root(entry);
         let entry_c = ctx.read_native_pin(entry_pin, entry);
-        let key = ctx
-            .invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        // `.ok().flatten().unwrap_or(null)` mapped a throwing or refused
+        // `getKey()` to a null KEY, which then went into the destination map as
+        // a real entry — a fabricated datum, not a missing one.
+        let key = match ctx.invoke_virtual(entry_c, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         let key_pin = pin_value(ctx, key);
         let entry_c = ctx.read_native_pin(entry_pin, entry);
-        let value = ctx
-            .invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[])
-            .ok()
-            .flatten()
-            .unwrap_or(Value::Object(None));
+        let value = match ctx.invoke_virtual(entry_c, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(v) => v.unwrap_or(Value::Object(None)),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        };
         let value_pin = pin_value(ctx, value);
         pinned.push((key_pin, key, value_pin, value));
     }
@@ -11471,7 +11514,10 @@ fn collect_entries_via_iterator_inner(
         out.push((key, value));
     }
     ctx.unpin_native_roots(source_pin);
-    out
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
 }
 
 /// Build a keySet/entrySet view: a `HashSet` snapshot whose backing remembers
@@ -11609,7 +11655,7 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) -> Result<(), Me
     set_map_size(ctx, backing, 0);
     let sentinel = Value::Int(1);
     if kind == VIEW_KIND_ENTRYSET {
-        let entries = collect_entries_any(ctx, source);
+        let entries = collect_entries_any(ctx, source)?;
         let entry_pins: Vec<(usize, usize)> = entries
             .iter()
             .map(|(k, v)| (pin_value(ctx, *k), pin_value(ctx, *v)))
@@ -11730,7 +11776,7 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             // them and hand back only refreshed addresses (canary-caught
             // live via `native_hs_iterator` during WildFly domain boot).
             let src_pin = ctx.pin_native_root(source);
-            let entries = collect_entries_any(ctx, source);
+            let entries = collect_entries_any(ctx, source)?;
             let source = ctx.read_native_pin(src_pin, source);
             let (keys, vals): (Vec<Value>, Vec<Value>) = entries.into_iter().unzip();
             let (_, kh) = pin_value_slice(ctx, &keys);
@@ -11820,7 +11866,7 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) -> Result<Ob
             _ => false,
         }
     };
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
 
     // GC-SAFETY: the entry-view branch below allocates a new `SimpleEntry`
     // per element via `alloc_live_entry`, and `alloc_ref_array` further down
@@ -11906,7 +11952,7 @@ fn remove_source_entry_by_value(
     source: ObjectRef,
     value: Value,
 ) -> Result<(), MethodCallFailed> {
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     // Family-1 fix (cce0079): the per-entry `equals()` dispatch can move
     // `source`/`value`/every snapshot key+value — pin them all, refresh per
     // use, and hand `source_map_remove` current addresses.
@@ -15393,7 +15439,7 @@ fn native_hibernate_persistent_map_for_each(
             return Ok(None);
         }
     };
-    let entries = collect_entries_any(ctx, backing);
+    let entries = collect_entries_any(ctx, backing)?;
     let keys: Vec<Value> = entries.iter().map(|(k, _)| *k).collect();
     let vals: Vec<Value> = entries.iter().map(|(_, v)| *v).collect();
     let (key_pin_base, key_pins) = pin_value_slice(ctx, &keys);
@@ -15436,7 +15482,7 @@ fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // iteration must hand the value to the consumer, not evaluate its
     // `hashCode()`. Use the concrete-backend collector so this bridge is also
     // safe for LinkedHashMap, TreeMap, immutable wrappers, and foreign maps.
-    let entries = collect_entries_any(ctx, this);
+    let entries = collect_entries_any(ctx, this)?;
     // GC-SAFETY: the BiConsumer `accept` allocates → moving young GC relocates
     // `action` and every key/value; pin all and re-read from the handles before
     // each dispatch.
@@ -27825,7 +27871,7 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // `new HashMap<>(treeMap)` / `new HashMap<>(unmodifiableNavigableMap)`
     // silently produced an empty map.
     let source = ctx.read_native_pin(source_pin, source);
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, pair_handles) = pin_value_slice(ctx, &flat);
     for (i, (key, value)) in entries.iter().enumerate() {
@@ -27930,7 +27976,7 @@ fn native_hashmap_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     if let Some(cname) = ctx.class_name_of_id(ctx.class_id_of_object(this)) {
         ensure_hashtable_load_factor(ctx, this, &cname);
     }
-    let entries = collect_entries_any(ctx, this);
+    let entries = collect_entries_any(ctx, this)?;
     let size = entries.len() as i32;
     let cap = hashmap_serialized_capacity(ctx, this, size);
     let oos_cls = "java/io/ObjectOutputStream";
@@ -32178,7 +32224,7 @@ fn build_reversed_map_snapshot(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
 ) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
-    let mut entries = collect_entries_any(ctx, source);
+    let mut entries = collect_entries_any(ctx, source)?;
     entries.reverse();
     let m = alloc_linked_hash_map(ctx);
     for (k, v) in entries {
@@ -33318,7 +33364,7 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // cceres3: pin across GC-capable call (stream stale-at-store wave) — each
     // native_lhm_put re-enters Java, moving `this` and every pending pair.
     let this_pin = ctx.pin_native_root(this);
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, pair_handles) = pin_value_slice(ctx, &flat);
     for (i, (key, val)) in entries.iter().enumerate() {
@@ -40675,7 +40721,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // implements via `putAll`) silently copied nothing — the second half of the
     // Elasticsearch `Settings.Builder.put(Settings)` failure (its builder map is
     // a TreeMap, so `output.map.putAll(settingsMap)` lands here).
-    let pairs = collect_entries_any(ctx, source);
+    let pairs = collect_entries_any(ctx, source)?;
     // Family-1 stale-ObjectRef fix: each `native_tm_put` call below can run a
     // user Comparator/lambda and trigger a moving GC. `this` was a bare local
     // reused across every iteration, and `pairs` (keys/values collected
@@ -43311,7 +43357,7 @@ fn native_chm_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 
         // --- key/value pairs, then the two-null terminator.
         let this = ctx.read_native_pin(this_pin, this);
-        let entries = collect_entries_any(ctx, this);
+        let entries = collect_entries_any(ctx, this)?;
         let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
         let (_, flat_pins) = pin_value_slice(ctx, &flat);
         for i in 0..flat.len() {
@@ -43904,7 +43950,7 @@ fn native_chm_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // collected entries are reused across GC-triggering hashing/puts and
     // GC-pausable segment-lock waits; `this` is pinned BEFORE the
     // GC-triggering collection.
-    let src_entries = collect_entries_any(ctx, source);
+    let src_entries = collect_entries_any(ctx, source)?;
     let _resize_flag = ChmResizeLockGuard::enter();
     let flat: Vec<Value> = src_entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, flat_pins) = pin_value_slice(ctx, &flat);
@@ -44931,7 +44977,7 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // flattened slice (plus `this`, pinned BEFORE the GC-triggering
     // collection) and re-read each element right before use.
     let this_pin = ctx.pin_native_root(this);
-    let entries = collect_entries_any(ctx, source);
+    let entries = collect_entries_any(ctx, source)?;
     let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
     let (_, flat_pins) = pin_value_slice(ctx, &flat);
     let result = (|| -> MethodCallResult {
