@@ -1718,6 +1718,12 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_FORKJOINPOOL`
     pub synthetic_forkjoinpool: bool,
 
+    /// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — answer
+    /// `java.lang.management.MemoryUsage.toString()` from the shim instead of
+    /// the class's own bytecode. On a real-JDK run the real bytecode is the
+    /// default. [`parse::one_true_yes_exact`].
+    pub synthetic_memoryusage_tostring: bool,
+
     /// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1|true|yes` — opt back into the
     /// synthetic JMX MXBean type mapping that types every unrecognised Java
     /// type as `SimpleType.STRING` and converts nothing. The real JDK
@@ -1915,6 +1921,10 @@ impl NativeFlags {
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
             synthetic_forkjoinpool: present(src, "CRATONVM_SYNTHETIC_FORKJOINPOOL"),
+            synthetic_memoryusage_tostring: one_true_yes_exact(
+                src,
+                "CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING",
+            ),
             synthetic_mxbean_mapping: one_true_yes_exact(
                 src,
                 "CRATONVM_SYNTHETIC_MXBEAN_MAPPING",
