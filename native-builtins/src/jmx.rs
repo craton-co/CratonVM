@@ -4365,10 +4365,15 @@ fn memoryusage_tostring_shim_enabled() -> bool {
     if cfg!(feature = "synthetic-jdk") {
         return true;
     }
-    matches!(
-        std::env::var("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    // The latched `VmFlags` snapshot, not a live `getenv`. An undeclared flag
+    // read straight from `std::env` is unreachable from
+    // `CRATONVM_REAL=-memoryusage-tostring` and invisible to
+    // `flags::with_thread_overrides`, so a test that arranges it through the
+    // supported hook silently measures the developer's ambient environment
+    // instead. `one_true_yes_exact` also accepts `yes`, which the previous
+    // `Ok("1") | Ok("true")` did not — a strict widening of an opt-out escape
+    // hatch. Same treatment as `jmx_openmbean`'s sibling gate.
+    crate::nbflags().synthetic_memoryusage_tostring
 }
 
 fn jmx_class_id_or_object(ctx: &mut dyn NativeContext, class_name: &str) -> ClassId {

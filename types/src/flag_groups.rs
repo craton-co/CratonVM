@@ -1126,6 +1126,11 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::REAL, token: "forkjoinpool", on_key: Some("CRATONVM_REAL_FORKJOINPOOL"), off_key: Some("CRATONVM_SYNTHETIC_FORKJOINPOOL"), off_word: None },
     E { group: Group::REAL, token: "jca", on_key: Some("CRATONVM_REAL_JCA"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "msc-real-start", on_key: Some("CRATONVM_MSC_REAL_START"), off_key: None, off_word: Some("off") },
+    // Declared 2026-08-11 alongside `mxbean-mapping`, same shape and same
+    // reason: `MemoryUsage.toString()` is answered by the real JDK bytecode by
+    // default (`jmx::memoryusage_tostring_shim_enabled`) and this restores the
+    // shim.
+    E { group: Group::REAL, token: "memoryusage-tostring", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING"), off_word: None },
     // Declared 2026-08-11. The real JDK MXBean type-mapping machinery became
     // the default that day (`jmx_openmbean::real_mxbean_mapping_enabled`);
     // this is its opt-out, and it has no `on_key` for the same reason `raf`
