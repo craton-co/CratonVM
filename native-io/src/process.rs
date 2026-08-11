@@ -2340,9 +2340,10 @@ fn os_process_start_time(_pid: i64) -> Option<i64> {
 /// process instance, because a pid can be recycled between them.
 ///
 /// **The start time is the same number `start_time_or_any` answers, by
-/// construction.** The Windows arm here is `os_process_start_time`'s body plus
-/// `start_time_or_any`'s `STARTTIME_ANY` fallback, inlined; the non-Windows arm
-/// calls `start_time_or_any` outright. That identity is load-bearing:
+/// construction.** The Windows and Linux arms here are each
+/// `os_process_start_time`'s own body plus `start_time_or_any`'s
+/// `STARTTIME_ANY` fallback, inlined; the catch-all arm calls
+/// `start_time_or_any` outright. That identity is load-bearing:
 /// `ProcessHandleImpl$Info.info(pid, startTime)` wipes `command`, `arguments`,
 /// `startTime`, `totalTime` and `user` off the record unless `startTime ==
 /// info.startTime` — a bare `!=` with no `STARTTIME_ANY` wildcarding — and
