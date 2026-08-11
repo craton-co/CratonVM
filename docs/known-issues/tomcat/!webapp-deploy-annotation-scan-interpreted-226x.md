@@ -289,36 +289,59 @@
 > `intercept_force_registered_native_cached` says so, so the shortcut does not
 > get reinvented.
 >
-> ### Third item, NOT taken: the per-invoke class-manager lock is unattributed
+> ### Third piece: half the per-invoke class-manager lock, and a working instrument
 >
-> `OrderedPlRwLock<ClassManager>::try_read` 1.30% + `::read` 1.12% + the read
-> guard's `drop_glue` 1.30% is **~3.7% of the invoke arm** spent acquiring and
-> releasing the class-manager read lock on a single-threaded probe — atomics,
-> not contention. It is the largest identified item left. **Which call site
-> takes it is still unknown, and two attempts to find out produced wrong
-> answers**, so the next person should start with the instrument, not the
-> hypothesis.
+> **The instrument first.** `--call-graph=dwarf` could not attribute this: it
+> named two inlined callers, `intercept_classloader_set_default_assertion_status`
+> and `init_locals_from_parts`, and **neither takes a lock** (checked against
+> the source). `--no-inline` collapsed the chains to the symbol itself with one
+> arm at a bare `0x18700000000` — the unwinder had no usable parents at all.
+> A rebuild with `RUSTFLAGS="-C force-frame-pointers=yes"` and
+> `perf record --call-graph=fp` named the caller immediately and correctly.
+> **Use a frame-pointer build for any call-graph question on this binary.**
 >
-> `--call-graph=dwarf` on the release binary named two callers, both inlined,
-> and **both are false**:
+> It put both acquisitions directly in `execute_invokevirtual_cached`:
+> `try_read` 1.85%, `read` 1.43%, read-guard `drop_glue` 1.28%.
 >
-> * the guard drop under `intercept_classloader_set_default_assertion_status` —
->   that function's first statement is two `&str` comparisons and it takes no
->   lock at all;
-> * `::read` under `init_locals_from_parts` — which touches only `Vec`s and
->   also takes no lock.
+> **What `try_read` was.** The virtual tier-up gate computed two predicates
+> into `let` bindings *above* the `if` that consumes them:
+> `has_registered_native` (a `NativeMethodRegistry` resolve) and
+> `receiver_is_java_util` (class-manager `try_read` + `get_class` +
+> `starts_with("java/util/")`). The `&&` chain below them is ordered cheapest-
+> first and short-circuits — but eager `let`s never see it. Under `--nojit`,
+> where `!disable_jit()` makes the chain fail several conditions earlier, the
+> work was done anyway, on **every cached invoke in the VM**, to decide an
+> optional tier-up that could not happen.
 >
-> Re-running with `--no-inline` does not rescue it: the chains collapse to the
-> symbol itself, and one arm resolves to a bare `0x18700000000`. The dwarf
-> unwinder is not producing usable parent frames for this binary, and its
-> inline nesting is confidently wrong on top of that — the same trap recorded
-> below for the `dbg_loader_trace` arm, hit twice more.
+> Both are now closures called in place in the chain, and
+> `has_registered_native()` is ordered after the JIT kill-switch. Every
+> condition here is a pure predicate, so `&&` may order them freely.
 >
-> **The remedy is a frame-pointer build**: `RUSTFLAGS="-C force-frame-pointers=yes"`
-> plus `perf record --call-graph=fp`. Do that before forming any hypothesis
-> about which of the ~30 `class_manager.read()` sites in `dispatch_virtual.rs`
-> is the hot one. Checking a named attribution against the function's source
-> costs a minute and caught both false leads here.
+> `try_read` **disappears from the profile entirely**. And with the host
+> finally quiet (load 3.5), six interleaved passes, arm order reversed each
+> pass, ns per interpreted invoke:
+>
+> | | p1 | p2 | p3 | p4 | p5 | p6 | mean |
+> |---|---:|---:|---:|---:|---:|---:|---:|
+> | before | 203 | 202 | 201 | 201 | 201 | 202 | **201.7** |
+> | after | 193 | 195 | 194 | 193 | 194 | 195 | **194.0** |
+>
+> **-3.8%, 6/6, and no overlap between the two columns** — the first fully
+> separated wall-clock reading in this whole sequence, which is what a quiet
+> host buys and nothing else does. 2490 unit tests and the 38-class regression
+> suite green.
+>
+> **The other half is now attributed, not fixed.** The remaining `::read`
+> (2.01%, same function) is `dispatch_virtual.rs`'s annotation-proxy gate: on
+> every non-`invokespecial` virtual invoke it takes the class-manager read
+> lock, calls `get_class(actual_class_id)` and compares the name against the
+> single literal `"java/lang/annotation/AnnotationProxy"`. Unlike the tier-up
+> predicates it is a **correctness** gate consumed immediately, so it cannot be
+> deferred — it has to become an identity test. Resolve that one class's
+> `ClassId` once and compare ids; a name comparison per invoke is also exactly
+> the shape `reference_class_name_shape_tests_are_dispatch_bugs` warns about.
+> It needs generation-aware memoization (a class defined later must not be
+> missed), which is why it is recorded here rather than guessed at.
 >
 > **One caution about that call-graph run**, because it nearly cost a session:
 > `perf` also attributed a 3.16% `memcpy` arm to `dbg_loader_trace` inlined
