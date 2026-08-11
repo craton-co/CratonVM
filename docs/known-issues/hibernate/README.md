@@ -1,5 +1,23 @@
 # Hibernate ORM suite — open known issues
 
+## Azure Linux host, full-suite first run (2026-08-11)
+
+First time the full 4579-class suite was run end-to-end on the Azure Linux
+host (`/data/cratonvm-hib-linux-20260811`). Two findings, two docs:
+
+- `azure-linux-common-args-missing-bytecode-enhancement-sysprop-20260811.md`
+  — a harness config gap (missing sysprop), NOT a CratonVM bug, caused 246 of
+  305 initial FAILs. Fixed locally, verified.
+- `hotspot-vs-cratonvm-linux-fullsuite-residuals-20260811.md` — the 9
+  genuine CratonVM-vs-HotSpot divergences left after that fix, each verified
+  against real HotSpot on the same host/classpath. Mostly cross-references
+  to already-tracked findings from the same day's Windows-side
+  investigation (DefaultCatalogAndSchemaTest's old-gen fragmentation gap,
+  the HQL-parser cluster, the temporal-type HANG family); two are new:
+  SmokeTests shows a different failure shape than its already-retired
+  timeout doc, and JarVisitorTest CRASHes with rc=0 (no other CRASH this
+  session has had a zero exit code).
+
 ## Audited, not a bug (2026-07-31) — ABORTED classes in the fresh 4548-class run
 
 Three classes show class-level **ABORTED** in the fresh 2026-07-30/31 full-suite
