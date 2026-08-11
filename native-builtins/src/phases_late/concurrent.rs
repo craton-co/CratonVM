@@ -8423,9 +8423,19 @@ pub(crate) mod new15_tests {
         assert!(is_safe_factory_class_name(
             "io.quarkus.bootstrap.forkjoin.QuarkusForkJoinWorkerThreadFactory"
         ));
-        // JDK default factory name with $ inner-class separator.
+        // A nested class name, i.e. one carrying the `$` separator. W7-14: this
+        // asserts the *syntax* validator accepts `$`, nothing about which class
+        // the JDK declares — the name below is the JDK-21-era one that JDK 25
+        // dropped, and reading this case as "the JDK default" is how that name
+        // kept looking load-bearing. Both spellings are exercised so the
+        // distinction cannot quietly collapse again.
         assert!(is_safe_factory_class_name(
             "java.util.concurrent.ForkJoinPool$DefaultCommonPoolForkJoinWorkerThreadFactory"
+        ));
+        // What JDK 25 actually declares, and what HotSpot 25 answers from
+        // `commonPool().getFactory().getClass().getName()`.
+        assert!(is_safe_factory_class_name(
+            "java.util.concurrent.ForkJoinPool$DefaultForkJoinWorkerThreadFactory"
         ));
     }
 
