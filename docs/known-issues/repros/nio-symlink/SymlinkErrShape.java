@@ -39,6 +39,12 @@ public class SymlinkErrShape {
         Path targetDir = dir.resolve("targetdir");
         Files.createDirectory(targetDir);
 
+        // The separator the VM puts in an exception is a property of the VM, not
+        // of the host, so print what Path.toString() says first: on Windows these
+        // two disagreed (Path correct, exception text forward-slashed) and the
+        // pairing is what localizes that.
+        System.out.println("pathToString | " + dir);
+
         t("createSymbolicLink(file)", () -> Files.createSymbolicLink(dir.resolve("l1"), target));
         t("createSymbolicLink(dir)", () -> Files.createSymbolicLink(dir.resolve("l2"), targetDir));
         t("createSymbolicLink(relative)", () -> Files.createSymbolicLink(dir.resolve("l3"), Paths.get("target.txt")));
@@ -49,5 +55,14 @@ public class SymlinkErrShape {
         t("newByteChannel(missing)", () -> Files.newByteChannel(dir.resolve("nope.txt")));
         t("createDirectory(existing)", () -> Files.createDirectory(targetDir));
         t("delete(missing)", () -> Files.delete(dir.resolve("nope2.txt")));
+
+        // A non-empty directory is DirectoryNotEmptyException, a SUBCLASS of
+        // FileSystemException -- so this line distinguishes the two only if the
+        // probe prints the class name, which is why `class=` is printed for
+        // every case above. CratonVM raised the supertype here until 2026-08-11,
+        // and a caller's `catch (DirectoryNotEmptyException)` recursion branch
+        // therefore never ran.
+        Files.write(targetDir.resolve("child.txt"), "child".getBytes());
+        t("delete(non-empty-dir)", () -> Files.delete(targetDir));
     }
 }

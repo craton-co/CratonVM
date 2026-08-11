@@ -3866,6 +3866,15 @@ pub(crate) fn km_alias_material(km_id: i32, alias: &str) -> Option<(Vec<Vec<u8>>
 }
 
 fn classify_key_type_from_pkcs8(key_der: &[u8]) -> &'static str {
+    // Structural read first: walk PrivateKeyInfo to its AlgorithmIdentifier OID
+    // rather than searching the whole DER for OID bytes, which can also match
+    // key material that happens to contain them. The needle scan below stays as
+    // the fallback for encodings that walk fails on, and "RSA" remains the
+    // last-resort default this function has always returned -- callers here
+    // treat it as a hint, not a verdict.
+    if let Some(name) = crate::t27_tls::pkcs8_algorithm_name(key_der) {
+        return name;
+    }
     // PKCS#8 PrivateKeyInfo ::= SEQUENCE { version, AlgorithmIdentifier, OCTET STRING }
     let needles: &[(&[u8], &'static str)] = &[
         (

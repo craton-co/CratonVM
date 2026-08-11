@@ -492,6 +492,123 @@ function Resolve-BothFailStatus {
   return 'BOTH-FAIL'
 }
 
+# ---------------------------------------------------------------------------
+# Host capability gating -- failures the host cannot not have
+# ---------------------------------------------------------------------------
+# Three Spring Boot classes create symbolic links in test setup:
+# `ConfigTreePropertySourceTests` (Kubernetes ConfigMap trees are a `..data`
+# directory plus one relative link per key), `ApplicationTempTests`, and
+# `FileWatcherTests`. Creating one on Windows needs `SeCreateSymbolicLinkPrivilege`
+# -- an elevated token, or Developer Mode. Without it the call fails on ANY VM:
+# verified 2026-08-11 on this host, where stock HotSpot (Temurin 25.0.3) fails
+# the same calls with the same `FileSystemException`.
+#
+# All three pass under CratonVM on Linux, where the call needs no privilege
+# (2026-08-11: FileWatcherTests 15/15, ConfigTreePropertySourceTests 23/23,
+# ApplicationTempTests 7/7, zero skipped or aborted -- i.e. the symlink tests
+# genuinely ran).
+#
+# So on a privilege-less Windows host these rows are a property of the host, not
+# a CratonVM defect, and arriving as a plain `FAIL` sent them round a triage loop
+# that could not converge: the identical `FAIL 23/3` for
+# `ConfigTreePropertySourceTests` appears in at least ten runs between
+# 2026-07-27 and 2026-08-01. `Resolve-BothFailStatus` cannot help here -- it
+# needs a same-scope HotSpot baseline, and no Windows full-suite HotSpot run has
+# ever existed. A capability probe needs no reference VM at all.
+function Test-HostSymlinkSupport {
+  if ($null -ne $script:HostSymlinkSupport) { return $script:HostSymlinkSupport }
+  $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("craton-symlink-probe-" + [guid]::NewGuid().ToString('N'))
+  $supported = $false
+  $detail = ''
+  try {
+    New-Item -ItemType Directory -Path $probeDir -Force | Out-Null
+    $target = Join-Path $probeDir 'target.txt'
+    Set-Content -Path $target -Value 'probe' -Encoding ascii
+    $link = Join-Path $probeDir 'link.txt'
+    try {
+      New-Item -ItemType SymbolicLink -Path $link -Target $target -ErrorAction Stop | Out-Null
+      $supported = Test-Path $link
+    } catch {
+      $detail = $_.Exception.Message
+    }
+  } catch {
+    $detail = $_.Exception.Message
+  } finally {
+    try { Remove-Item -Path $probeDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+  }
+  $script:HostSymlinkSupport = $supported
+  if ($supported) {
+    Write-Info 'host symlink support: yes -- symlink-dependent classes are scored normally'
+  } else {
+    # Say it out loud. A probe whose result is never printed is indistinguishable
+    # from a probe that never ran, and this one silently reclassifies rows.
+    Write-Info "host symlink support: NO (creating a symbolic link failed: $detail) -- symlink-only failures will be recorded as ENV-GATED"
+  }
+  return $script:HostSymlinkSupport
+}
+
+# What a symlink-privilege failure looks like in a per-class log, on BOTH sides
+# of the divide it has to span.
+#
+# Do NOT match the OS's explanation text. It is localized -- on this host the
+# Win32 message arrives in Russian and `-Duser.language=en` does not change it,
+# because it comes from `FormatMessage`, not from Java. A detector keyed on
+# "A required privilege is not held by the client" would silently never fire.
+# Match the exception TYPE and the JUnit-sanctioned abort reason instead.
+$script:SymlinkGapSignature =
+  'java\.nio\.file\.FileSystemException|java\.lang\.UnsupportedOperationException.*[Ss]ymbolic|createSymbolicLink|[Ss]ymlink creation not supported|[Ss]ymbolic links? (are )?not supported'
+
+# Returns 'ENV-GATED' when EVERY non-passing test in this class failed for want
+# of the host symlink privilege, otherwise ''.
+#
+# Deliberately strict, because this status excuses a row:
+#
+#   * only a plain `FAIL` qualifies. A CRASH/HANG/LOADFAIL is a different
+#     category of wrong and is never a host gap.
+#   * `containersFailed` disqualifies: a container-level failure is not a
+#     per-test symlink refusal.
+#   * the number of failure/abort blocks carrying the signature must EQUAL the
+#     counter they are explaining. If `failed=3` and only two blocks match, the
+#     third failure is ours and the row stays FAIL.
+#
+# That last rule is also what makes this safe against a stale
+# `SbRunner.class`: with no `SBRUNNER_ABORTED_DETAIL` lines emitted, the counts
+# cannot match, and the row stays FAIL rather than being excused by evidence
+# that was never printed.
+function Resolve-EnvGatedStatus {
+  # Stdout ONLY, never the combined text. Every SBRUNNER_* marker is printed on
+  # stdout, and `$combined` appends stderr AFTER it -- so the last failure block
+  # would otherwise swallow the whole of stderr, and a stray `FileSystemException`
+  # logged there could satisfy the check for a failure that was nothing of the
+  # kind.
+  param([string]$Status, [string]$Stdout, [int]$Failed, [int]$Aborted, [int]$ContainersFailed)
+  if ($Status -ne 'FAIL') { return '' }
+  if ($ContainersFailed -gt 0) { return '' }
+  if ($Failed -le 0 -and $Aborted -le 0) { return '' }
+  if (Test-HostSymlinkSupport) { return '' }
+
+  if ($Failed -gt 0) {
+    # Split on the per-failure marker SbRunner prints, so each failure's own
+    # stack trace is checked rather than the whole log at once (one symlink
+    # failure must not excuse an unrelated second one). The final block is
+    # bounded at the summary line for the same reason.
+    $blocks = @([regex]::Split($Stdout, 'SBRUNNER_FAILURE_DETAIL ') | Select-Object -Skip 1)
+    if ($blocks.Count -ne $Failed) { return '' }
+    foreach ($block in $blocks) {
+      $body = ($block -split 'SBRUNNER_RESULT ')[0]
+      if ($body -notmatch $script:SymlinkGapSignature) { return '' }
+    }
+  }
+  if ($Aborted -gt 0) {
+    $lines = @([regex]::Matches($Stdout, '(?m)^SBRUNNER_ABORTED_DETAIL (.*)$'))
+    if ($lines.Count -ne $Aborted) { return '' }
+    foreach ($line in $lines) {
+      if ($line.Groups[1].Value -notmatch $script:SymlinkGapSignature) { return '' }
+    }
+  }
+  return 'ENV-GATED'
+}
+
 function Get-BaselineNote {
   param([object]$Baseline, [string]$Module, [string]$Class)
   if (-not $Baseline) { return '' }
@@ -1051,6 +1168,17 @@ function Complete-ProcessRecord {
       -Class $Record.class -Status $status -Failed $failed -Aborted $aborted -ContainersFailed $containersFailed
     if ($bothFail) { $status = $bothFail }
     if ($baselineNote) { $note = if ($note) { "$note | $baselineNote" } else { $baselineNote } }
+    # Host-capability gating runs after the baseline reclassifier and can still
+    # apply to a row the baseline left alone: it needs no reference VM, which
+    # matters because no Windows full-suite HotSpot baseline has ever existed.
+    $envGated = Resolve-EnvGatedStatus -Status $status -Stdout $Stdout `
+      -Failed $failed -Aborted $aborted -ContainersFailed $containersFailed
+    if ($envGated) {
+      $status = $envGated
+      $gateNote = 'env-gated: host cannot create symbolic links (needs SeCreateSymbolicLinkPrivilege or Developer Mode); stock HotSpot fails these same tests here'
+      $note = if ($note) { "$gateNote | $note" } else { $gateNote }
+      if ($note.Length -gt 240) { $note = $note.Substring(0, 240) }
+    }
   }
 
   $line = @(
@@ -1220,6 +1348,29 @@ $script:SpringBootDir = [System.IO.Path]::GetFullPath($SpringBootRoot)
 if (-not (Test-Path $script:SpringBootDir)) { Die "Spring Boot root not found: $script:SpringBootDir" }
 $script:SbRunnerDir = Join-Path $script:SpringBootDir 'sb-runner'
 if (-not (Test-Path (Join-Path $script:SbRunnerDir 'SbRunner.class'))) { Die "missing SbRunner.class in $script:SbRunnerDir (javac SbRunner.java against the JUnit platform jars first)" }
+# Existence was the only thing ever checked, so a `.class` compiled before the
+# `.java` last changed kept running unnoticed -- and the fixture directory is
+# NOT under version control, so it goes stale by default. That is why
+# `SBRUNNER_ABORTED_DETAIL` was documented as landed and yet appeared in no run
+# log: `SbRunner.class` in the fixture predated the change that emits it, and
+# the missing line was then read as "the reason strings are not wired up".
+# (Confirmed 2026-08-11 on the Azure fixture: `SbRunner$OutcomeReasonCollector.class`
+# did not exist beside a `SbRunner.java` that declares it.)
+#
+# Refuse to run on a stale runner rather than produce logs missing the very
+# evidence the harness now classifies on -- `Resolve-EnvGatedStatus` counts
+# those lines.
+foreach ($src in @('SbRunner.java', 'SbRunnerMethod.java')) {
+  $srcPath = Join-Path $script:SbRunnerDir $src
+  if (-not (Test-Path $srcPath)) { continue }
+  $clsPath = Join-Path $script:SbRunnerDir ([System.IO.Path]::ChangeExtension($src, '.class'))
+  if (-not (Test-Path $clsPath) -or
+      (Get-Item $srcPath).LastWriteTimeUtc -gt (Get-Item $clsPath).LastWriteTimeUtc) {
+    Die ("stale sb-runner: $src is newer than its .class in $script:SbRunnerDir. " +
+         "Recompile before running, e.g.`n" +
+         "  javac -cp `"<any module>/build/cratonvm-test-cp.txt contents>`" -d `"$script:SbRunnerDir`" `"$script:SbRunnerDir\*.java`"")
+  }
+}
 
 if (-not $WorkDir) { $WorkDir = Join-Path $PSScriptRoot '.suite' }
 $script:WorkRoot = [System.IO.Path]::GetFullPath($WorkDir)
