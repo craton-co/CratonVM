@@ -820,6 +820,43 @@ fn file_not_found(path: &str) -> MethodCallFailed {
     }))
 }
 
+/// Reject a `java.io` open of a directory the way HotSpot does.
+///
+/// HotSpot's platform `handleOpen` (`io_util_md.c`) `fstat`s the descriptor it
+/// just opened and turns a directory into `EISDIR`, so every `java.io` open of
+/// a directory — `new FileInputStream(dir)`, `new FileOutputStream(dir)`,
+/// `new RandomAccessFile(dir, mode)` — raises
+/// `FileNotFoundException: <path> (Is a directory)`. Linux's `open(2)` only
+/// refuses a directory on the *write* side, so without this the read lane
+/// handed back a live stream that only failed on the first `read()`.
+///
+/// That is the whole `*ResourceSet` family failure: Tomcat's
+/// `FileResource.doGetInputStream` opens the resource unconditionally and
+/// relies on the constructor throwing for a directory, so
+/// `AbstractTestResourceSet.testGetResourceDir{,Without}TrailingFileSeperator`
+/// got a `FileInputStream` where the servlet contract requires `null`.
+///
+/// Deliberately NOT applied to the `java.nio.file` lane: HotSpot's
+/// `UnixChannelFactory` opens a directory read-only without complaint, so
+/// `Files.newInputStream(dir)` succeeds there and only fails on first read —
+/// verified against JDK 25 on this host. Adding the check to
+/// `FileDescriptorTable::open_read` instead would break that match, which is
+/// why it lives at the `java.io` call sites.
+///
+/// `RuntimeError::FileNotFoundException`'s `path` payload *is* the Java
+/// exception message (`types/src/error.rs`), so the HotSpot suffix is built
+/// into it here rather than at the throw site.
+///
+/// The stat happens before the open rather than on the resulting descriptor
+/// (the fd table hands back an `FdId`, not a `File`); the resulting TOCTOU
+/// window can only mis-decide if the path changes kind mid-open.
+fn reject_directory_open(path: &str) -> Result<(), MethodCallFailed> {
+    if fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(file_not_found(&format!("{path} (Is a directory)")));
+    }
+    Ok(())
+}
+
 /// Convert an `io::Error` for a `java.nio.file` operation, mapping ENOENT to
 /// the real JDK's `NoSuchFileException` (not a bare `IOException`) so callers
 /// that specifically catch `NoSuchFileException` — e.g.
@@ -1438,6 +1475,7 @@ fn fis_open_path(
     path_obj: Option<ObjectRef>,
 ) -> MethodCallResult {
     let path = validated_path(path)?;
+    reject_directory_open(&path)?;
     let fd = ctx
         .fd_table()
         .open_read(&path)
@@ -1880,6 +1918,7 @@ fn native_fos_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => String::new(),
     };
     let path = validated_path(&path)?;
+    reject_directory_open(&path)?;
     let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
@@ -1899,6 +1938,7 @@ fn native_fos_init_string_append(ctx: &mut dyn NativeContext, args: &[Value]) ->
         _ => String::new(),
     };
     let path = validated_path(&path)?;
+    reject_directory_open(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
     let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
     fos_set_fd(ctx, this, fd);
@@ -1924,6 +1964,7 @@ fn native_fos_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let path = read_file_path(ctx, file_obj).unwrap_or_default();
     let path = validated_path(&path)?;
+    reject_directory_open(&path)?;
     let fd = ctx.fd_table().open_write(&path, false).map_err(io_err)?;
     fos_set_fd(ctx, this, fd);
     Ok(None)
@@ -1948,6 +1989,7 @@ fn native_fos_init_file_append(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     };
     let path = read_file_path(ctx, file_obj).unwrap_or_default();
     let path = validated_path(&path)?;
+    reject_directory_open(&path)?;
     let append = matches!(args.get(2), Some(Value::Int(1)));
     let fd = ctx.fd_table().open_write(&path, append).map_err(io_err)?;
     fos_set_fd(ctx, this, fd);
@@ -12572,6 +12614,7 @@ fn native_raf_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => "r".to_string(),
     };
     let writable = mode.contains('w');
+    reject_directory_open(&path)?;
     let fd = ctx
         .fd_table()
         .open_read_write(&path, writable)
@@ -12600,6 +12643,7 @@ fn native_raf_init_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => "r".to_string(),
     };
     let writable = mode.contains('w');
+    reject_directory_open(&path)?;
     let fd = ctx
         .fd_table()
         .open_read_write(&path, writable)
