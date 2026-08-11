@@ -4,6 +4,19 @@
 hole a wave-4 lane closed, which that lane found, named, and left alone because
 it was unmeasured.
 
+> **2026-08-11 — both surviving OPEN rows are closed. Nothing here is a work item.**
+>
+> | row | verdict |
+> |---|---|
+> | `Field.get` over-denies | **stale** — closed 2026-08-07 by `dcfe77cb8` (wave 8), the same day this page was filed. Its own prescription would have opened an under-deny; see the row. |
+> | `Lookup.unreflect*` unchecked | **FIXED 2026-08-11** — `lang_invoke.rs::lk_enforce_unreflect_access`, sharing `lk_modes_required_for_member` with the `find*` gate. |
+>
+> Still open, and deliberately: `unreflectSetter` on a trusted-final field, the
+> module (`exports`) half for `find*`/`unreflect*`, and `unreflectSpecial`'s
+> `specialCaller != lookupClass()` conjunct. All three are stated with their
+> reasons under "Still open on this family". Nothing here has been built or run;
+> no verification is claimed.
+
 ## The defect
 
 `native_method_invoke` (`native-builtins/src/lang_class.rs`) asked the JPMS

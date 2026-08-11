@@ -4,6 +4,21 @@
 verified against a binary — see *How to verify*. **No out-of-file patch is
 required**; two optional hardening patches are listed at the end.
 
+> **2026-08-11 — the residuals are closed, and two of this page's claims were
+> wrong.** Nothing below is a work item.
+>
+> * The **two "optional hardening patches"** at the end are **already in the
+>   tree**, and went further than this page asked. Do not re-apply them.
+> * The **`unreflect` residual** is fixed
+>   (`lang_invoke.rs::lk_enforce_unreflect_access`). This page called it small;
+>   it was the whole check, reachable around in one line.
+> * This page names `classloader.rs::lk_unreflect` as "the live registrations".
+>   **It is not**, in `--real-jdk` or `--jdk-only`. Corrected in place.
+> * The `lk_enforce_find_access` described under *The fix* has since gained two
+>   arms this page predates: a genuine zero-mode Lookup is now refused (`Some(0)`
+>   and "could not read" are kept apart), and `UNCONDITIONAL` now requires the
+>   target CLASS to be public. The "Residual" section is updated accordingly.
+
 This is the failure lane W3-1 left behind. With
 `CRATONVM_MH_STRICT_INVOKEEXACT=1` the run now clears `adaptation()` and dies
 in `accessChecks()`.
@@ -234,11 +249,30 @@ three cases where HotSpot also refuses.
 ## Residual (deliberately not enforced)
 
 Nestmate relationships, `protected`-receiver rules, module `exports`/`opens`,
-and the `UNCONDITIONAL` "public member of a public *exported* type" rule. All
-one-directional: they can only admit something HotSpot refuses, never refuse
-something HotSpot admits. `publicLookup().findVirtual(Holder.class, "pub", …)`
+~~and the `UNCONDITIONAL` "public member of a public *exported* type" rule~~.
+All one-directional: they can only admit something HotSpot refuses, never refuse
+something HotSpot admits. ~~`publicLookup().findVirtual(Holder.class, "pub", …)`
 is admitted here and refused by HotSpot (`Holder` is package-private) — nothing
-in the corpus asks.
+in the corpus asks.~~
+
+> **Two of these have since been enforced** (2026-08-11 re-read; both predate
+> this lane's work and neither is mine):
+>
+> * The `UNCONDITIONAL` rule's **class half** is enforced —
+>   `publicLookup().findVirtual(Holder.class, "pub", …)` is now refused,
+>   measured against OpenJDK 25.0.3 as `IllegalAccessException: symbolic
+>   reference class is not accessible`. The struck example is out of date. Only
+>   the "unconditionally *exported* package" half remains unenforced, for want
+>   of a module graph, and that half stays one-directional.
+> * A genuine **zero-mode Lookup** is now refused every member, public ones
+>   included (`lookup().dropLookupMode(PUBLIC)` is 0 and refuses a public method
+>   of a public class on OpenJDK 25.0.3). That required `Some(0)` and "could not
+>   read the field" to stop being the same value — see
+>   `lk_read_allowed_modes_opt`. The `allowedModes == 0` → allow bullet under
+>   *The fix* describes the pre-2026-08-11 behaviour and is superseded.
+>
+> Both rules are mirrored into the new `unreflect` gate, which is the point of
+> the two gates sharing `lk_modes_required_for_member`.
 
 ~~`Lookup.unreflect` / `unreflectSpecial` (`classloader.rs::lk_unreflect`, the
 live registrations) are **not** checked. That is closer to correct than it
