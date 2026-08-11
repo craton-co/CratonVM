@@ -383,6 +383,20 @@ def gate(block, baseline, jdk_feature, os_name):
             "would make every ratchet below pass for the wrong reason."
         )
 
+    missing = [b for _, b, _ in RATCHETS if b not in entry]
+    if missing:
+        # A baseline that predates a ratchet cannot score it, and defaulting the
+        # frozen value (to 0, or to the observed number) would either fire on
+        # every run or freeze whatever is there today as acceptable. Refuse and
+        # say which key is absent.
+        return 2, [
+            f"REFUSING: the baseline for {key} has no "
+            f"{', '.join(missing)} entry, so {'that ratchet' if len(missing) == 1 else 'those ratchets'} "
+            "cannot be scored. Re-freeze in the same change that added it: "
+            "python3 scripts/jdk-only-bridge-ratchet.py --census <census.json> "
+            f"--jdk-feature {jdk_feature} --update-baseline --note '<why>'"
+        ]
+
     for block_key, base_key, human in RATCHETS:
         observed = block["bridge"][block_key]
         frozen = entry[base_key]
@@ -543,6 +557,14 @@ def selftest():
     check("schema 3 (pre-hierarchy) census is refused", 2, pre_hierarchy)
 
     check("unknown JDK feature is refused", 2, _synthetic_census(), feature=21)
+
+    # A baseline that predates a ratchet must REFUSE, not default the frozen
+    # value. Defaulting to 0 fires on every run; defaulting to the observed
+    # number freezes whatever is there today as acceptable, silently.
+    stale_baseline = _selftest_baseline()
+    del stale_baseline["jdk"]["25/linux"]["bridge_stated_shadows_bytecode"]
+    check("a baseline missing a ratchet key is refused", 2, _synthetic_census(),
+          baseline=stale_baseline)
     check("a census from another OS is refused, not scored", 2,
           _synthetic_census(), os_name="windows")
 
