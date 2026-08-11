@@ -26934,6 +26934,32 @@ fn native_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     Ok(Some(Value::Object(this_opt)))
 }
 
+/// `printf`/`format(Locale, String, Object[])` — the locale-taking overloads.
+///
+/// Without these the call reached real `PrintStream.format(Locale, …)`
+/// bytecode, which builds a `java.util.Formatter` over `this` and writes
+/// through `Appendable.append`. That route printed **nothing at all** — not a
+/// wrong string, not an exception, no output — while the no-locale overload
+/// registered beside it worked, so `System.out.printf(Locale.ROOT, …)` silently
+/// dropped the line. `probes/JitEntryFloorProbe` prints its one measurement
+/// exactly that way, and deliberately (`%.2f` under a comma-decimal locale
+/// turns its CSV row into four columns), so the probe ran green to completion
+/// and reported no number.
+///
+/// The locale is dropped, exactly as `String.format(Locale, …)` already drops
+/// it (`lang_string::native_string_format_locale`) — so the two overloads now
+/// agree, instead of one of them being empty. When the formatter learns
+/// locales, both should stop dropping it in the same change.
+fn native_printf_locale(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // args = [this, Locale, format String, Object[]] -> [this, format, Object[]]
+    let without_locale = [
+        args.first().copied().unwrap_or(Value::Object(None)),
+        args.get(2).copied().unwrap_or(Value::Object(None)),
+        args.get(3).copied().unwrap_or(Value::Object(None)),
+    ];
+    native_printf(ctx, &without_locale)
+}
+
 /// Return the underlying `Writer` from a `PrintWriter` object when it is a
 /// non-fd-backed Writer (e.g. `StringWriter` in `ModelNode.toString()`).
 ///

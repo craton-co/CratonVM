@@ -3508,6 +3508,49 @@ pub(crate) fn monitor_enter_blocking(
     fixed
 }
 
+/// Release a monitor AND retract the JMX ownership publish its acquisition
+/// made, in the one order that is correct.
+///
+/// Every `monitorenter` route in the VM ends in
+/// [`crate::threading::thread_registry::ThreadRegistry::complete_jmx_monitor_enter`],
+/// which appends the object to the thread's `jmx_locked_monitors`. That list is
+/// two things at once: what `ThreadMXBean.getLockedMonitors()` reports, and a GC
+/// root set. It is also **membership-scanned linearly on every acquisition**, so
+/// a publish with no matching retract does not merely misreport — it makes the
+/// list grow to "every distinct object this thread has ever locked" and turns
+/// `monitorenter` into an O(objects-ever-locked) scan.
+///
+/// That has now happened twice. The first time it was one synchronized-method
+/// path and cost 14.9% of a Tomcat webapp deploy (see
+/// [`SynchronizedMethodGuard`]). The second time it was the JIT's `monitorexit`
+/// helper (`jit::helpers::jit_monitor_exit`), which released the monitor and
+/// stopped there: on `ZipContentTests` the two scan functions were **54% of the
+/// whole JIT run** and were the bulk of the JIT's +52% CPU against `--nojit`.
+/// Both were a missing three-line tail on one of five otherwise identical exit
+/// sites, which is the shape of defect that recurs until the idiom is a
+/// function. This is that function — release through it, never through a bare
+/// `monitors.exit`.
+///
+/// The `holds` re-check is load-bearing and must stay INSIDE: a re-entrant
+/// acquisition is still held after this release, and retracting there would
+/// under-report a monitor the thread really does own.
+pub(crate) fn monitor_exit_and_retract_jmx(
+    shared: &SharedVm,
+    obj: ObjectRef,
+    thread_id: ThreadId,
+) -> Result<(), crate::error::MethodCallFailed> {
+    let result = shared.threads.monitors.exit(obj, thread_id);
+    // Retract even when `exit` failed: an exit that reports "not held" leaves no
+    // ownership for the publish to describe, and keeping the entry is the leak.
+    if !shared.threads.monitors.holds(obj, thread_id) {
+        shared
+            .threads
+            .thread_registry
+            .remove_jmx_locked_monitor(thread_id, obj);
+    }
+    result
+}
+
 /// GC-safe acquire for an `ACC_SYNCHRONIZED` method monitor.
 ///
 /// Synchronized invoke paths pop arguments into Rust locals before pushing the
@@ -12211,27 +12254,12 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
     }
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
-        let _ = self
-            .shared
-            .threads
-            .monitors
-            .exit(obj, self.thread.thread_id);
         // `monitor_enter_gc_safe` publishes JMX ownership (it goes through
         // `monitor_enter_blocking`), so this is its retract. Plain
         // `monitor_enter` above never publishes, which makes the retract a
         // harmless no-op there rather than a wrong removal - the list is
         // address-keyed and `remove` on an absent address does nothing.
-        if !self
-            .shared
-            .threads
-            .monitors
-            .holds(obj, self.thread.thread_id)
-        {
-            self.shared
-                .threads
-                .thread_registry
-                .remove_jmx_locked_monitor(self.thread.thread_id, obj);
-        }
+        let _ = monitor_exit_and_retract_jmx(self.shared, obj, self.thread.thread_id);
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -25206,6 +25234,13 @@ impl Drop for SynchronizedMethodGuard<'_> {
             thread.native_pin_roots.truncate(self.monitor_pin);
             cur
         };
+        // Retract the ownership publish `monitor_enter_synchronized_method`
+        // made, but only on the OUTERMOST exit: `holds` is still true while a
+        // recursive acquisition remains, and retracting there would
+        // under-report a monitor the thread really does hold. That rule now
+        // lives inside `monitor_exit_and_retract_jmx`, which this guard cannot
+        // reach through `SharedVm` (it holds only the two halves it borrowed),
+        // so it is spelled out here — the one site that must keep its own copy.
         if let Err(e) = self.monitor_pool.exit(obj, self.thread_id) {
             tracing::warn!(
                 thread_id = ?self.thread_id,
@@ -25213,12 +25248,6 @@ impl Drop for SynchronizedMethodGuard<'_> {
                 "implicit monitorexit on synchronized-method exit failed"
             );
         }
-        // Retract the ownership publish `monitor_enter_synchronized_method`
-        // made, but only on the OUTERMOST exit: `holds` is still true while a
-        // recursive acquisition remains, and retracting there would
-        // under-report a monitor the thread really does hold. Same shape as
-        // `JitSynchronizedMonitorGuard::drop` and the interpreter's
-        // `monitor_on_exit` frame-pop path, both of which already do this.
         if !self.monitor_pool.holds(obj, self.thread_id) {
             self.thread_registry
                 .remove_jmx_locked_monitor(self.thread_id, obj);

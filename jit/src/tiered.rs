@@ -614,8 +614,51 @@ struct CompilerCore {
     /// deterministic and hermetic; driving it from the global would make it
     /// depend on whatever every other test in the process happened to flush.
     install_epoch_source: Option<Arc<AtomicU64>>,
+    /// Invocation count the C1→C2 supersede requires, or `0` for "no gate" —
+    /// the historical, and still default, behaviour.
+    ///
+    /// [`Self::request_c2_upgrade`] consulted no invocation count at all:
+    /// **every** successful C1 publish enqueued a C2 recompile, gated only by
+    /// the eligibility flags and by `c2_upgrade_would_engage`'s bytecode scan.
+    /// That path produces nearly all of the C2 compiles in a real run, so C2
+    /// entry is structural rather than hotness-driven — and
+    /// `CRATONVM_TIER_C2_THRESHOLD` was **inert** exactly where it mattered:
+    /// raising it to 2e9 on `ZipContentTests` still produced `c2=97` against a
+    /// baseline `c2=95`. A knob that reads as "the C2 tier-up threshold" while
+    /// governing only one of the two doors to that tier is worse than no knob,
+    /// because it answers an A/B with the baseline twice and the reader cannot
+    /// tell.
+    ///
+    /// Setting `CRATONVM_TIER_C2_THRESHOLD` now closes this door too, so the
+    /// lever means what it says. It is deliberately NOT applied when the knob
+    /// is unset: gating the supersede at the default 20 000 would change which
+    /// methods reach C2 for every workload, and nothing measured here says that
+    /// is an improvement — the JIT deficit this was found under turned out to be
+    /// a leaked JMX owned-monitor set, not admission. The gate exists so the
+    /// trade can be priced on the gauntlet, not so it can be flipped.
+    ///
+    /// Mirrored onto the core because the supersede runs on the worker, which
+    /// holds only an `Arc<CompilerCore>` and cannot reach the manager's policy
+    /// mutex. One relaxed load on a path that already takes `methods`.
+    c2_upgrade_min_invocations: AtomicU64,
     /// Aggregate compilation statistics (shared so the worker can update them).
     stats: CompilationStats,
+}
+
+/// The invocation count the C1→C2 supersede should require, or `0` for "no
+/// gate" (the default, and what every build did before this existed).
+///
+/// Returns non-zero only when the operator actually asked, which is the whole
+/// point: see [`CompilerCore::c2_upgrade_min_invocations`]. The env var is read
+/// here rather than inferred from `policy.c2_threshold`, because a policy that
+/// happens to equal the default is indistinguishable from one nobody set — and
+/// "the operator set this knob" is exactly the distinction being made.
+fn c2_upgrade_gate(policy: &CompilationPolicy) -> u64 {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_TIER_C2_THRESHOLD").is_some() {
+        u64::from(policy.c2_threshold)
+    } else {
+        0
+    }
 }
 
 impl CompilerCore {
@@ -630,6 +673,9 @@ impl CompilerCore {
             dropped: AtomicU64::new(0),
             inflight_epoch: AtomicU64::new(0),
             install_epoch_source,
+            // 0 = no gate. Raised by the manager's constructor and by
+            // `set_policy` only when the operator set the knob explicitly.
+            c2_upgrade_min_invocations: AtomicU64::new(0),
             stats: CompilationStats::default(),
         }
     }
@@ -755,6 +801,17 @@ impl CompilerCore {
                 || state.ineligible
                 || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
             {
+                return;
+            }
+            // Hotness gate, off unless the operator set
+            // `CRATONVM_TIER_C2_THRESHOLD`. Every other door to C2 asks for
+            // `invocation_count >= c2_threshold`; this one asked for nothing,
+            // which is what made that knob inert for the path that produces
+            // nearly all C2 compiles. See the field for why the default stays
+            // ungated. A method held back here is not held back forever:
+            // `should_compile`'s own C2 arm admits it once it really is that hot.
+            let gate = self.c2_upgrade_min_invocations.load(Ordering::Relaxed);
+            if gate != 0 && state.invocation_count < gate {
                 return;
             }
             state.queued_for_compilation = true;
@@ -1429,6 +1486,8 @@ impl TieredCompilationManager {
         // introspection — see that function's doc comment.
         let _ = DIAG_CORE.set(core.clone());
         DIAG_C1_THRESHOLD.store(policy.c1_threshold as u64, Ordering::Relaxed);
+        core.c2_upgrade_min_invocations
+            .store(c2_upgrade_gate(&policy), Ordering::Relaxed);
         Self {
             core,
             policy: Mutex::new(policy),
@@ -1821,6 +1880,9 @@ impl TieredCompilationManager {
 
     /// Update the compilation policy.
     pub fn set_policy(&self, policy: CompilationPolicy) {
+        self.core
+            .c2_upgrade_min_invocations
+            .store(c2_upgrade_gate(&policy), Ordering::Relaxed);
         *self.policy.lock() = policy;
     }
 
