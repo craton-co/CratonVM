@@ -10,6 +10,8 @@
 
 use super::*;
 
+use cratonvm_types::lock_order::{LockLevel, OrderedPlMutex};
+
 // =============================================================================
 // java.util.jar — JarFile, JarEntry, Manifest, Attributes
 // JarFile = 2-field synthetic (path=0 String, manifest=1 Manifest)
@@ -1705,21 +1707,49 @@ pub(crate) fn p59_set_jar_entry_times(
 /// is held for the life of the `ZipFile`. Re-stat-per-accessor was stricter
 /// than the thing it was emulating.
 fn jar_path_mtime(path: &str) -> u128 {
-    if let Some(m) = mtime_memo()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(path)
-    {
-        return *m;
+    // Copy the hit out under an explicit, closed scope rather than in an
+    // `if let` condition. A guard held by an `if let` scrutinee outlives the
+    // body, so the miss path below would still be holding this non-reentrant
+    // mutex when `jar_path_mtime_probe` re-locks it — the exact deadlock
+    // `jar_entry_bytes_cached` already documents having hit with `ARCHIVES`.
+    // `parking_lot` gives no second chance there: it blocks, it does not
+    // report a poisoned re-entry.
+    let hit = { mtime_memo().lock().get(path).copied() };
+    match hit {
+        Some(m) => m,
+        None => jar_path_mtime_probe(path),
     }
-    jar_path_mtime_probe(path)
 }
 
-fn mtime_memo() -> &'static std::sync::Mutex<std::collections::HashMap<String, u128>> {
-    static MEMO: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, u128>>,
-    > = std::sync::OnceLock::new();
-    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// Path → last observed mtime. See [`jar_path_mtime`] for why it is memoised.
+fn mtime_memo() -> &'static OrderedPlMutex<std::collections::HashMap<String, u128>> {
+    // LEVEL (lock-discipline ratchet): `Scratch` is L0, the bottom of the
+    // hierarchy — a thread holding it may acquire NOTHING else. This memo
+    // meets that claim about as plainly as a lock in this crate can: it has
+    // exactly two critical sections, a `get(&str).copied()` here and an
+    // `insert(String, u128)` in `jar_path_mtime_probe`, both on a plain
+    // `HashMap` of owned values. Neither function takes a `NativeContext`, so
+    // neither *can* re-enter the VM, and neither takes another lock.
+    //
+    // Both callers that pair this with a jar cache — `jar_contents_cached` and
+    // `jar_entry_bytes_cached` — read the mtime FIRST and lock their own cache
+    // afterwards, so this is never the outer lock of a pair either. Keep it
+    // that way: the mtime is only wanted to build a cache key, so there is no
+    // reason to still hold it once the key exists.
+    //
+    // Why the bottom and not some other free level: this crate re-enters the
+    // VM constantly (a native callback calls back into Java, taking the heap
+    // and the L10 class-manager lock), so anything held across that re-entry
+    // is a cycle. L0 says this one never is, and makes a future violation a
+    // checker failure instead of a hang.
+    //
+    // `OnceLock` rather than a `static` initialiser like `AOT_CACHE_INPUT_PATH`
+    // only because `HashMap::new` is not `const`.
+    static MEMO: std::sync::OnceLock<OrderedPlMutex<std::collections::HashMap<String, u128>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| {
+        OrderedPlMutex::new(std::collections::HashMap::new(), LockLevel::Scratch)
+    })
 }
 
 /// Stat `path` for real and record the answer.
@@ -1735,10 +1765,7 @@ fn jar_path_mtime_probe(path: &str) -> u128 {
         .map(|d| d.as_nanos());
     match probed {
         Some(mtime) => {
-            mtime_memo()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(path.to_string(), mtime);
+            mtime_memo().lock().insert(path.to_string(), mtime);
             mtime
         }
         None => 0,
@@ -4443,6 +4470,50 @@ mod jar_mtime_memo_tests {
             "a reopened jar must be reparsed, not served stale"
         );
         assert!(!fresh.by_name.contains_key("first.txt"));
+    }
+
+    /// The memo's `LockLevel::Scratch` claim is actually EVALUATED by these
+    /// tests, and the miss path does not re-enter the lock it just took.
+    ///
+    /// Two things worth one test between them:
+    ///
+    /// * `enforcement_active()` is unconditionally true in DEBUG builds, which
+    ///   is what makes every other test in this module a live check of the
+    ///   ordering claim rather than a run with the checker asleep. Asserting it
+    ///   there means a future change that makes debug enforcement conditional
+    ///   turns this module from silently vacuous into loudly red. The
+    ///   assertion is `cfg`-gated because in RELEASE enforcement is off unless
+    ///   `CRATONVM_LOCK_ORDER_CHECK` is set, and `cargo test --release` runs
+    ///   this test too — an ungated assert here fails on a correct tree, which
+    ///   is how the first version of it was caught.
+    /// * `jar_path_mtime` on a MISS takes the memo lock, drops it, and only
+    ///   then calls `jar_path_mtime_probe`, which takes it again. The guard
+    ///   used to live in an `if let` scrutinee, where it outlives the body —
+    ///   and `parking_lot` is not reentrant, so getting that wrong is a hang,
+    ///   not a failure. A hang is exactly what this asserts the absence of, and
+    ///   it is profile-independent, so that half runs in both.
+    #[test]
+    fn memo_lock_is_order_checked_and_not_re_entered_on_a_miss() {
+        #[cfg(debug_assertions)]
+        assert!(
+            cratonvm_types::lock_order::enforcement_active(),
+            "debug builds must enforce lock order, or this module's ordering \
+             claim is never checked by anything"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let jar = dir.path().join("reentry.jar");
+        let path = jar.to_string_lossy().into_owned();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_100_000_000);
+        write_jar(&jar, "only.txt", t0);
+
+        // Miss: lock, release, probe, lock again.
+        let first = jar_path_mtime(&path);
+        // Hit: the copied-out fast path.
+        assert_eq!(jar_path_mtime(&path), first);
+        // Re-probe, then hit again — the whole cycle, still single-entry.
+        jar_cache_revalidate(&path);
+        assert_eq!(jar_path_mtime(&path), first);
     }
 
     /// A path that does not exist must not pin a 0 mtime for the life of the

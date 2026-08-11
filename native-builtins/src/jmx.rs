@@ -4360,21 +4360,19 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
 /// sibling `getInit`/`getUsed`/`getCommitted`/`getMax` natives hand back.
 ///
 /// `synthetic-jdk` builds have no such bytecode and keep the shim;
-/// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — or the grouped
-/// `CRATONVM_REAL=-memoryusage-tostring` — restores it on a real-JDK run.
-///
-/// Read from the latched snapshot, not from `std::env`. It was a raw
-/// `std::env::var` when it landed, which is the defect
-/// `flag_declaration_guard` exists to catch: an undeclared name is served by a
-/// live `getenv`, so the grouped spelling could not reach it at all and
-/// `flags::with_thread_overrides` could not arrange it in a test — a
-/// flag-dependent test would have silently measured the developer's ambient
-/// environment. Same fix, same day, as its sibling
-/// `jmx_openmbean::real_mxbean_mapping_enabled`.
+/// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1` restores it on a real-JDK run.
 fn memoryusage_tostring_shim_enabled() -> bool {
     if cfg!(feature = "synthetic-jdk") {
         return true;
     }
+    // The latched `VmFlags` snapshot, not a live `getenv`. An undeclared flag
+    // read straight from `std::env` is unreachable from
+    // `CRATONVM_REAL=-memoryusage-tostring` and invisible to
+    // `flags::with_thread_overrides`, so a test that arranges it through the
+    // supported hook silently measures the developer's ambient environment
+    // instead. `one_true_yes_exact` also accepts `yes`, which the previous
+    // `Ok("1") | Ok("true")` did not — a strict widening of an opt-out escape
+    // hatch. Same treatment as `jmx_openmbean`'s sibling gate.
     crate::nbflags().synthetic_memoryusage_tostring
 }
 

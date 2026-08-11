@@ -1718,11 +1718,10 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_FORKJOINPOOL`
     pub synthetic_forkjoinpool: bool,
 
-    /// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — opt back into the
-    /// shim answer for `java.lang.management.MemoryUsage.toString()`. The
-    /// class's own JDK bytecode is the default on a real-JDK run;
-    /// `synthetic-jdk` builds have no such bytecode and keep the shim whatever
-    /// this says. [`parse::one_true_yes_exact`].
+    /// `CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING=1|true|yes` — answer
+    /// `java.lang.management.MemoryUsage.toString()` from the shim instead of
+    /// the class's own bytecode. On a real-JDK run the real bytecode is the
+    /// default. [`parse::one_true_yes_exact`].
     pub synthetic_memoryusage_tostring: bool,
 
     /// `CRATONVM_SYNTHETIC_MXBEAN_MAPPING=1|true|yes` — opt back into the
@@ -2497,20 +2496,24 @@ mod tests {
     #[test]
     fn synthetic_memoryusage_tostring_is_snapshot_backed_and_reads_one_true_yes() {
         assert!(
-            !VmFlags::from_source(&MapSource::empty()).natives.synthetic_memoryusage_tostring,
+            !VmFlags::from_source(&MapSource::empty())
+                .natives
+                .synthetic_memoryusage_tostring,
             "the real JDK bytecode is the default",
         );
         for word in ["1", "true", "yes"] {
             assert!(
                 VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
-                    .natives.synthetic_memoryusage_tostring,
+                    .natives
+                    .synthetic_memoryusage_tostring,
                 "`{word}` must turn the shim back on",
             );
         }
         for word in ["0", "false", "no", ""] {
             assert!(
                 !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_MEMORYUSAGE_TOSTRING", word)]))
-                    .natives.synthetic_memoryusage_tostring,
+                    .natives
+                    .synthetic_memoryusage_tostring,
                 "`{word}` must leave the default alone",
             );
         }
