@@ -20577,11 +20577,27 @@ pub(crate) fn native_method_get_annotated_return_type(
 /// `Parameter.getType()`, as a `Class` mirror вЂ” the fallback backing `Type`
 /// for [`native_parameter_get_annotated_type`] when the declaring
 /// executable's generic parameter type isn't available.
-fn parameter_erased_type_mirror(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    match ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]) {
-        Ok(Some(Value::Object(Some(m)))) => m,
-        _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
-    }
+/// W7-26 — this returns `Result`, and the return type IS the fix.
+///
+/// W7-20's sharpest observation was that the same refusal was loud on four
+/// rows and silent on one, and the only difference was the return type of the
+/// helper it landed in. This was that helper: a bare `ObjectRef` gave it no
+/// error channel, so an exception out of `Parameter.getType()` had nowhere to
+/// go but the `ClassId(0)` mirror, and `Parameter.getAnnotatedType()` reflected
+/// a parameter whose type was garbage. Both call sites are inside
+/// `native_parameter_get_annotated_type`, which is a `MethodCallResult` and
+/// already `?`s the `make_annotated_type_with_anns` two lines below — the
+/// channel was always there, this helper just did not reach it.
+fn parameter_erased_type_mirror(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, MethodCallFailed> {
+    Ok(
+        match ladder_rung(ctx.invoke_virtual(this, "getType", "()Ljava/lang/Class;", &[]))? {
+            Some(Value::Object(Some(m))) => m,
+            _ => ctx.get_class_mirror(cratonvm_types::ClassId::new(0)),
+        },
+    )
 }
 
 /// `Parameter.getAnnotatedType()Ljava/lang/reflect/AnnotatedType;`
@@ -20623,19 +20639,22 @@ pub(crate) fn native_parameter_get_annotated_type(
         }
         None => (None, Vec::new(), Vec::new()),
     };
-    let type_mirror = match ctx.invoke_virtual(
+    // W7-26 — see `ladder_rung`. The erased fallback still covers every
+    // non-throwing reason it already covered (no generic array, index out of
+    // range for a synthetic/mandated parameter, a non-object element).
+    let type_mirror = match ladder_rung(ctx.invoke_virtual(
         exec,
         "getGenericParameterTypes",
         "()[Ljava/lang/reflect/Type;",
         &[],
-    ) {
-        Ok(Some(Value::Object(Some(arr)))) if idx < ctx.array_length(arr) => {
+    ))? {
+        Some(Value::Object(Some(arr))) if idx < ctx.array_length(arr) => {
             match ctx.get_array_element(arr, idx) {
                 Value::Object(Some(m)) => m,
-                _ => parameter_erased_type_mirror(ctx, this),
+                _ => parameter_erased_type_mirror(ctx, this)?,
             }
         }
-        _ => parameter_erased_type_mirror(ctx, this),
+        _ => parameter_erased_type_mirror(ctx, this)?,
     };
     let at = make_annotated_type_with_anns(ctx, type_mirror, &anns, declaring_class_id)?;
     stash_annotated_type_argument_anns(at, type_arg_anns);
