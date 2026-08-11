@@ -50,20 +50,34 @@ public class InvokeAttributionProbe {
         return s;
     }
 
+    /**
+     * `args[1]` selects which arm runs, so a native profiler can record ONE of
+     * them at a time and the difference between the two profiles is the invoke
+     * path. Recording both in one process mixes them and no symbol can be
+     * attributed. Default `both` keeps the self-timing form above usable.
+     */
     public static void main(String[] args) {
         int n = args.length > 0 ? Integer.parseInt(args[0]) : 20_000_000;
+        String mode = args.length > 1 ? args[1] : "both";
+        int rounds = args.length > 2 ? Integer.parseInt(args[2]) : 3;
         InvokeAttributionProbe p = new InvokeAttributionProbe();
-        for (int round = 0; round < 3; round++) {
-            long t0 = System.nanoTime();
-            long a = p.spin(n);
-            long call = System.nanoTime() - t0;
-
-            t0 = System.nanoTime();
-            long b = p.spinNoCall(n);
-            long plain = System.nanoTime() - t0;
-
+        for (int round = 0; round < rounds; round++) {
+            long call = 0;
+            long plain = 0;
+            long a = 0;
+            long b = 0;
+            if (!mode.equals("nocall")) {
+                long t0 = System.nanoTime();
+                a = p.spin(n);
+                call = System.nanoTime() - t0;
+            }
+            if (!mode.equals("call")) {
+                long t0 = System.nanoTime();
+                b = p.spinNoCall(n);
+                plain = System.nanoTime() - t0;
+            }
             p.acc += (int) (a ^ b);
-            System.out.println("ROUND " + round
+            System.out.println("ROUND " + round + " mode=" + mode
                     + " withCall_ns=" + (call / n)
                     + " noCall_ns=" + (plain / n)
                     + " invokeDelta_ns=" + ((call - plain) / n)
