@@ -9000,10 +9000,15 @@ pub(crate) fn p57_filesystem_exception(
 ///
 /// On Unix the separator already matches, so this is the identity function and
 /// costs nothing.
+/// A virtual-filesystem path (a zip/jar entry, or a runtime-image entry) is
+/// exempt: entry names inside an archive are `/`-separated on every platform,
+/// exactly as the JDK's own `zipfs`/`jrtfs` render them, so rewriting those
+/// would introduce the divergence this is here to remove — and the encoding's
+/// own structure would be corrupted along with it.
 pub(crate) fn p57_exception_path(path: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(windows)]
     {
-        if path.contains('/') {
+        if path.contains('/') && vfs_decode(path).is_none() {
             return std::borrow::Cow::Owned(path.replace('/', "\\"));
         }
     }
@@ -16726,7 +16731,7 @@ mod registry_content_type_tests {
 /// probe, 2026-08-11) rather than to what the code used to do.
 #[cfg(test)]
 mod exception_shape_tests {
-    use super::{is_directory_not_empty, p57_exception_path};
+    use super::{is_directory_not_empty, jarfs_encode, jrtfs_encode, p57_exception_path};
 
     /// HotSpot names `C:\Users\...\missing.txt` in every `java.nio.file`
     /// exception; CratonVM named `C:/Users/.../missing.txt`, because the
@@ -16753,6 +16758,23 @@ mod exception_shape_tests {
             std::borrow::Cow::Borrowed(_)
         ));
         assert_eq!(p57_exception_path(already), already);
+    }
+
+    /// An archive entry is `/`-separated on every platform — that is what the
+    /// JDK's own zipfs and jrtfs report — so the separator rewrite must not
+    /// touch a virtual-filesystem path. It would also destroy the encoding.
+    #[test]
+    fn a_virtual_filesystem_path_keeps_its_slashes() {
+        for encoded in [
+            jarfs_encode("C:/libs/app.jar", "org/example/Missing.class"),
+            jrtfs_encode("C:/jdk-25", "modules/java.base/java/lang/Object.class"),
+        ] {
+            assert_eq!(
+                p57_exception_path(&encoded),
+                encoded,
+                "a VFS path must pass through unchanged"
+            );
+        }
     }
 
     /// `Files.delete` of a non-empty directory is `DirectoryNotEmptyException`
