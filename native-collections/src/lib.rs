@@ -30527,33 +30527,35 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // fields, and the whole real node chain reads back correctly (see the
     // `toArray(T[])` note above). The registration is still correct because the
     // overlay wins on READ while real bytecode writes the heap, so a real
-    // `ListItr` that mutates leaves the two disagreeing. UNDER `--jdk-only`
-    // THIS PAIR IS AN OPEN GAP, not a fix: `cratonvm/internal/
-    // LinkedListSnapshotListItr` is refused, so `listIterator()` and every real
-    // `AbstractList` method that reaches it (`equals`, `hashCode`, `indexOf`
-    // against a foreign list) raise `NoClassDefFoundError` there. A real
-    // `Arrays$ArrayItr` cannot stand in — it has no `previous`/`set`/`add` —
-    // and a real `ArrayList$ListItr` over a snapshot would drop `set()` writes
-    // silently, which is worse. Reasoned in
+    // `ListItr` that mutates leaves the two disagreeing. A real
+    // `Arrays$ArrayItr` cannot stand in either — it has no
+    // `previous`/`set`/`add` — and a real `ArrayList$ListItr` over a snapshot
+    // would drop `set()` writes silently, which is worse. Reasoned in
     // docs/known-issues/jdk-only/W2-1-strict-refuses-the-synthetic-stream-stack.md
     //
-    // 2026-08-11, the third candidate that record did not consider: mint the
-    // carrier through `ensure_vm_internal_class` (`ClassOrigin::VmInternal`),
-    // the door ten `MethodHandles` combinator carriers were moved to the same
-    // day (docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md). The
-    // class qualifies — no image declares `cratonvm/internal/*`, no class file
-    // could exist for it, and it is a 3-slot tuple of the VM's own state — but
-    // **the door alone does not fix this site**, and that is the finding worth
-    // keeping. Two independent gates refuse this carrier, not one:
+    // UNDER `--jdk-only` THIS PAIR WAS AN OPEN GAP UNTIL 2026-08-11:
+    // `cratonvm/internal/LinkedListSnapshotListItr` was refused, so
+    // `listIterator()` and every real `AbstractList` method reaching it
+    // (`equals`, `hashCode`, `indexOf` against a foreign list) raised
+    // `NoClassDefFoundError`. Two independent gates refused it, not one, and
+    // both had to move in the same commit:
     //
-    //   1. the class:  `try_alloc_synthetic` stamps `CompatibilityStub`, which
-    //      §5 forbids. The `VmInternal` door clears this.
-    //   2. its natives: `cratonvm/internal/LinkedListSnapshotListItr` is on
-    //      `VM_MINTED_STAND_IN_RECEIVERS` in native-api/src/no_image_receiver.rs,
-    //      so `register()` re-tags all nine registrations below from the
-    //      ambient `Bridge` to `SyntheticStub` BEFORE the `JdkOnly` arm reads
-    //      the kind — and that arm then returns without inserting them. The
-    //      door does not touch this.
+    //   1. the class:  `try_alloc_synthetic` stamped `CompatibilityStub`, which
+    //      §5 forbids. Now minted through `ensure_vm_internal_class`
+    //      (`ClassOrigin::VmInternal`) — the door ten `MethodHandles`
+    //      combinator carriers took the same day, on the same test
+    //      (docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md). The
+    //      class qualifies: no image declares `cratonvm/internal/*`, no class
+    //      file could exist for it, and it is a 3-slot tuple of the VM's own
+    //      state.
+    //   2. its natives: the name was on `VM_MINTED_STAND_IN_RECEIVERS` in
+    //      native-api/src/no_image_receiver.rs, so `register()` re-tagged all
+    //      nine registrations below from the ambient `Bridge` to
+    //      `SyntheticStub` BEFORE the `JdkOnly` arm read the kind — and that
+    //      arm then returned without inserting them. Confirmed by
+    //      `--dump-native-registry`, which printed `synthetic-stub` for all
+    //      nine though this registrar sets `Bridge`. Moved to
+    //      `VM_SERVICE_RECEIVERS`.
     //
     // Clearing 1 without 2 leaves strict holding a well-formed carrier with no
     // implementation: the failure moves from `NoClassDefFoundError` at
@@ -30561,20 +30563,30 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     // later, further from the cause, and no better for the contract. That is
     // the exact trap `STRICT_STILL_FABRICATES` is kept as an empty table to
     // name ("the two halves of this defect are the registration's kind and the
-    // class's existence"), running in the other direction. So this site is left
-    // refusing until both halves can land together; the companion retag is
-    // written out verbatim in
+    // class's existence"), running in the other direction. Measured, not
+    // inferred, in
     // docs/known-issues/jdk-only/W7-16-arraydeque-and-linkedlist-residuals.md
     //
-    // What that record also measures, and what makes the current refusal worse
-    // than it looks: it is NOT loud everywhere. `new ArrayList<>(List.of("a",
-    // "b","c")).equals(linkedList)` answers **false** under `--jdk-only` — no
-    // exception, just the wrong answer. The launderer is ours and is in this
-    // file: `native_al_equals`'s cross-layout arm calls
-    // `collection_elements_generic`, whose signature is `-> Vec<Value>` with no
-    // error channel, so the `NoClassDefFoundError` its `iterator()` call raises
-    // becomes `Vec::new()` and the two sides differ in length. A refusal that
-    // reaches a caller with nowhere to put it does not stay a refusal.
+    // **The gap does NOT leave the census, and that is deliberate.** The row
+    // that names it is `native-shadows-bytecode` on
+    // `java/util/LinkedList.listIterator`, keyed on the REAL class and on this
+    // registration, so no change to the carrier can move it. Only
+    // `compatibility-class-requested` for the carrier's own name disappears.
+    // CratonVM still serves `listIterator` from a native instead of running the
+    // JDK's bytecode; that is an ownership defect and it is still counted.
+    //
+    // What the same record measures, and what made the old refusal worse than
+    // it looked: it was NOT loud everywhere. `new ArrayList<>(List.of("a",
+    // "b","c")).equals(linkedList)` answered **false** under `--jdk-only` — no
+    // exception, just the wrong answer — because `native_al_equals`'s
+    // cross-layout arm called `collection_elements_generic`, whose signature
+    // had no error channel, so the `NoClassDefFoundError` its `iterator()` call
+    // raised became `Vec::new()` and the two sides differed in length. That
+    // helper now returns a `Result` and its whole family with it
+    // (docs/known-issues/jdk-only/W7-20-refusal-laundered-into-wrong-answer.md),
+    // which matters independently of the mint above: a refusal that reaches a
+    // caller with nowhere to put it does not stay a refusal, and the next
+    // carrier to be refused here would have been laundered the same way.
     registry.register(
         c,
         "listIterator",
@@ -30679,9 +30691,30 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
         ll_snapshot_array(ctx, this_at_call)
     });
+    // Minted through the VM-internal door, not the compatibility one. This
+    // carrier is VM-internal state, not a stand-in: no image declares a
+    // `cratonvm/…` name, nothing is being stood in for, and the three slots are
+    // the snapshot, the cursor and the backing list. Contract §1 item 6 permits
+    // that in both modes — the door
+    // docs/known-issues/jdk-only/W7-13-strict-mh-insert-wrapper.md established
+    // for the ten `MethodHandles` combinator carriers, on the same test.
+    //
+    // Load-bearing pairing: inert without the companion move of this class from
+    // `VM_MINTED_STAND_IN_RECEIVERS` to `VM_SERVICE_RECEIVERS` in
+    // native-api/src/no_image_receiver.rs, and that move is inert without this.
+    // Without the move, `register()` re-tags the nine natives below
+    // `SyntheticStub` and `--jdk-only` drops them, so this mint hands strict a
+    // well-formed object with no methods and the failure becomes an
+    // `UnsatisfiedLinkError` at the first `hasNext()`. Land both or neither.
+    //
+    // `ensure_vm_internal_class` is infallible, so the `?` this call used to
+    // carry is gone. The allocation stays INSIDE `rooted_across`: it can
+    // collect, and `arr` and `this` are stored into the result immediately
+    // after, so hoisting it out would leave both unrooted across a moving GC.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        try_alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
-    })?;
+        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
+        ctx.alloc_object(cid, 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(0));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -30704,9 +30737,11 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let mut arr = rooted_across(ctx, &mut [&mut this], |ctx| {
         ll_snapshot_array(ctx, this_at_call)
     });
+    // Same mint, same pairing, as `native_ll_list_iterator` above.
     let it = rooted_across(ctx, &mut [&mut this, &mut arr], |ctx| {
-        try_alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3)
-    })?;
+        let cid = ctx.ensure_vm_internal_class("cratonvm/internal/LinkedListSnapshotListItr", 3);
+        ctx.alloc_object(cid, 3)
+    });
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(idx.max(0)));
     ctx.set_field(it, 2, Value::Object(Some(this)));
