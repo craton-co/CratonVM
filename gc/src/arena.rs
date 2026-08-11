@@ -231,13 +231,32 @@ pub struct Arena {
     alloc_anchors: Vec<usize>,
     /// `log2` of the anchor bucket width. See [`Arena::rearm_alloc_anchors`].
     anchor_shift: u32,
-    /// "A block has been pushed since the last [`Arena::coalesce_free_list`]",
-    /// i.e. the free list may hold adjacency a merge would collapse. Set by
-    /// every push (`push_block_routed`), cleared by the merge. Without it the
-    /// last-resort merge in [`Arena::alloc`] would re-sort a list it already
-    /// proved maximal on every one of a wedged heap's failing allocations.
-    free_dirty: bool,
+    /// Blocks pushed since the last [`Arena::coalesce_free_list`], i.e. how
+    /// much adjacency a merge could possibly have to collapse. Bumped by every
+    /// push (`push_block_routed`), zeroed by the merge.
+    free_pushed: usize,
+    /// How many pushes [`Arena::alloc`]'s last-resort merge waits for before it
+    /// will sort the free list again.
+    ///
+    /// A merge is `O(n log n)` over the whole list, and `alloc` reaches that
+    /// arm once per allocation on a heap that has wedged — so an ungated merge
+    /// is per-allocation. Measured: `Arena::free_blocks_sorted` was 9.1% of a
+    /// `type.temporal.ZonedDateTimeTest` profile the day the merge landed.
+    ///
+    /// So: back off when merging does not pay. A merge that removes nothing
+    /// quadruples this (capped); one that removes something resets it. On a
+    /// genuinely fragmented heap — holes walled by live objects, nothing
+    /// adjacent — the arm switches itself off within a few attempts, while a
+    /// list that really is merely split still gets merged on the first ask.
+    coalesce_threshold: usize,
 }
+
+/// Starting (and post-productive-merge) value of [`Arena::coalesce_threshold`]:
+/// one push is enough to justify looking.
+const COALESCE_THRESHOLD_MIN: usize = 1;
+/// Ceiling for the backoff. At this point the merge arm is effectively off,
+/// which is the right answer for a heap whose holes are walled by live data.
+const COALESCE_THRESHOLD_MAX: usize = 1 << 20;
 
 /// Alignment tripwire (perf/halfgap residuals, 2026-07-18): every free-list
 /// block must sit on the 8-aligned object grid — the non-moving sweep's walk
@@ -346,7 +365,8 @@ impl Arena {
             free_bytes_total: 0,
             alloc_anchors: Vec::new(),
             anchor_shift: 0,
-            free_dirty: false,
+            free_pushed: 0,
+            coalesce_threshold: COALESCE_THRESHOLD_MIN,
         };
         a.rearm_alloc_anchors();
         a
@@ -460,7 +480,7 @@ impl Arena {
         }
         self.free_bytes_total += block.size;
         // A new block may sit next to one already on the list.
-        self.free_dirty = true;
+        self.free_pushed += 1;
     }
 
     /// True when both tiers are empty.
@@ -758,9 +778,12 @@ impl Arena {
         //
         // Placed HERE, on the path that has already exhausted both tiers and
         // the bump tail, so it costs nothing until the alternative is failing.
-        // `free_dirty` keeps a hopeless request from re-merging an already
-        // merged list once per attempt.
-        if self.coalesce_free_list() != 0 {
+        // `coalesce_threshold`'s backoff keeps a hopeless request from
+        // re-sorting the list once per attempt — see its field doc.
+        if self.free_bytes_total >= alloc_size
+            && self.free_pushed >= self.coalesce_threshold
+            && self.coalesce_free_list() != 0
+        {
             let base = self.data.as_ptr() as usize;
             let mut hit = self.small_fit(base, alloc_size, align);
             if hit.is_none() {
@@ -788,15 +811,16 @@ impl Arena {
     /// [`Self::alloc`]'s last-resort arm, so an allocation never fails while
     /// the bytes are present and merely split.
     ///
-    /// `free_dirty` is the "something was pushed since the last merge" bit. It
-    /// makes a repeated call on an unchanged list free, which matters because
-    /// the `alloc` caller reaches it once per about-to-fail allocation and a
-    /// wedged heap produces a great many of those.
+    /// A call with nothing pushed since the last one is free: the list it
+    /// produced was maximal and nothing has touched it.
+    ///
+    /// Every call also re-aims [`Self::coalesce_threshold`], the backoff
+    /// `Arena::alloc`'s last-resort arm consults — see that field.
     pub fn coalesce_free_list(&mut self) -> usize {
-        if !self.free_dirty {
+        if self.free_pushed == 0 {
             return 0;
         }
-        self.free_dirty = false;
+        self.free_pushed = 0;
         let sorted = self.free_blocks_sorted();
         if sorted.len() < 2 {
             return 0;
@@ -817,6 +841,13 @@ impl Arena {
             merged.push((off, sz));
         }
         if merged.len() == before {
+            // Nothing was adjacent: this heap's holes are walled by live data,
+            // not merely split. Ask for four times as much churn before paying
+            // for the next sort.
+            self.coalesce_threshold = self
+                .coalesce_threshold
+                .saturating_mul(4)
+                .clamp(COALESCE_THRESHOLD_MIN, COALESCE_THRESHOLD_MAX);
             return 0;
         }
         let removed = before - merged.len();
@@ -824,9 +855,11 @@ impl Arena {
         for (off, sz) in merged {
             self.add_free_block(off, sz);
         }
-        // The rebuild above set the bit again through `add_free_block`; the
-        // list it produced IS maximal, so clear it back.
-        self.free_dirty = false;
+        // The rebuild above counted every re-added block through
+        // `add_free_block`; the list it produced IS maximal, so zero it back.
+        self.free_pushed = 0;
+        // Merging paid: be willing to look again immediately.
+        self.coalesce_threshold = COALESCE_THRESHOLD_MIN;
         removed
     }
 
@@ -869,7 +902,7 @@ impl Arena {
         self.large_max_exact.set(Some(0));
         self.free_bytes_total = 0;
         // An empty list holds no adjacency.
-        self.free_dirty = false;
+        self.free_pushed = 0;
     }
 
     /// Total bytes currently held on the free lists (reclaimed but unallocated).
@@ -1732,6 +1765,55 @@ mod tests {
             "alloc must coalesce and retry rather than return None with 256 KiB free",
         );
         assert_eq!(arena.free_list_bytes(), 4 * hole - 96 * 1024);
+    }
+
+    /// The last-resort merge must back off on a heap it cannot help.
+    ///
+    /// `alloc` reaches that arm once per allocation on a wedged heap, and the
+    /// merge is `O(n log n)` over the whole free list — ungated it showed up as
+    /// 9.1% of a `type.temporal.ZonedDateTimeTest` profile the day it landed.
+    /// A list whose holes are walled by live data has nothing to merge, so the
+    /// arm has to switch itself off rather than re-sort forever.
+    #[test]
+    fn the_last_resort_merge_backs_off_when_merging_never_pays() {
+        let mut arena = Arena::new(64 * 1024);
+        arena.alloc(arena.capacity(), 8).unwrap();
+        // Non-adjacent holes: an 8-byte live wall between each pair.
+        for i in 0..8 {
+            arena.add_free_block(i * 1024, 1016);
+        }
+        assert_eq!(arena.coalesce_free_list(), 0, "nothing here is adjacent");
+        let after_one = arena.coalesce_threshold;
+        assert!(
+            after_one > COALESCE_THRESHOLD_MIN,
+            "an unproductive merge must raise the bar, got {after_one}",
+        );
+        // Keep feeding it non-adjacent blocks; the bar must keep rising.
+        for round in 0..6 {
+            for _ in 0..arena.coalesce_threshold.min(64) {
+                arena.free_pushed += 1;
+            }
+            let before = arena.coalesce_threshold;
+            assert_eq!(arena.coalesce_free_list(), 0, "round {round}");
+            assert!(
+                arena.coalesce_threshold >= before,
+                "round {round}: the bar must never fall on an unproductive merge",
+            );
+        }
+        assert!(
+            arena.coalesce_threshold >= 4096,
+            "six unproductive merges must have effectively switched the arm off, \
+             got {}",
+            arena.coalesce_threshold,
+        );
+
+        // ...and a productive merge re-arms it immediately, so a list that
+        // really is merely split is never left unmerged.
+        arena.clear_free_list();
+        arena.add_free_block(0, 1024);
+        arena.add_free_block(1024, 1024);
+        assert_eq!(arena.coalesce_free_list(), 1);
+        assert_eq!(arena.coalesce_threshold, COALESCE_THRESHOLD_MIN);
     }
 
     /// The merge must not invent contiguity: a live object between two holes is
