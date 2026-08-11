@@ -1615,6 +1615,28 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // implementation: this triple is registered from BOTH registrars and the
     // two must not answer differently depending on which ran last — the same
     // contract the `isAlive` registration below already carries.
+    //
+    // `SyntheticStub`, stated, for these three triples, on the reasoning
+    // `register_p60_process_handle` sets out at length. The tag has to be
+    // restated HERE as well as there, and that is what this scope is for.
+    // `NativeKind` is ambient; `register()` is last-write-wins for the
+    // CALLBACK; and under `--jdk-only` a `SyntheticStub` registration is
+    // REFUSED, returning before it can overwrite anything. So had this
+    // registrar — reached early, from `register_essential_natives_with_shims` —
+    // left the three as `Bridge` while only the later
+    // `register_p60_process_handle` restated them, strict mode would accept the
+    // `Bridge` rows here, refuse the corrected rows there, and go on
+    // dispatching the very bodies the re-tag exists to drop. An unstated
+    // re-registration does not downgrade the kind quietly; it decides it.
+    //
+    // `javap java.lang.ProcessHandle` (Eclipse Adoptium jdk-25.0.3.9-hotspot,
+    // `javap -version` 25.0.3): `current()` is `ACC_PUBLIC, ACC_STATIC` and
+    // carries `Code` (`invokestatic ProcessHandleImpl.current`); `pid()` and
+    // `isAlive()` are `ACC_PUBLIC, ACC_ABSTRACT`. None of the three is
+    // `ACC_NATIVE`, so none is a bridge under §1.5, and `current()` shadows
+    // real bytecode besides (§1.4).
+    let __ph_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(
         "java/lang/ProcessHandle",
         "current",
@@ -1631,6 +1653,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // registered from BOTH registrars and the two must not answer differently
     // depending on which ran last.
     r.register("java/lang/ProcessHandle", "isAlive", "()Z", p60_handle_is_alive);
+    r.set_category(__ph_cat);
     r.set_category(__prev_cat);
 }
 
@@ -2346,7 +2369,171 @@ fn p60_handle_destroy(
     }
 }
 
-fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// Rebuild a MINTED bare-`java/lang/ProcessHandle` receiver as the real
+/// `java.lang.ProcessHandleImpl` for the same pid, or `None` when the image has
+/// no such class.
+///
+/// **Who reaches the bodies below.** Every *instance* registration on
+/// `java/lang/ProcessHandle` in this file is reachable only from a receiver
+/// whose runtime class IS the interface. All three native-shadow hierarchy
+/// walks in the tree are `superclass` walks and none of them walks interfaces
+/// (`vm/src/runtime/interpreter/invoke.rs`'s step-1 `or_else`, and
+/// `dispatch_virtual.rs`'s vtable fast path plus `populate_virtual_invoke_cache`
+/// — the rule is `docs/architecture/natives-over-real-jdk-classes.md` §1). An
+/// interface cannot be instantiated, so such a receiver is always one this VM
+/// minted: `try_alloc_concurrent_synthetic(…, "java/lang/ProcessHandle", 1)`
+/// here, or `alloc_process_handle` in `native-io/src/process.rs`. A real
+/// `ProcessHandleImpl` never reaches them; it runs the JDK's own bytecode.
+///
+/// **Why that made the bodies fabrications.** A mint carries exactly one fact,
+/// the pid in slot 0. `children`, `descendants`, `parent` and `info` are OS
+/// measurements, and slot 0 is not one — so those bodies answered plausible
+/// constants (an empty stream, this VM's own `getppid()`, a fieldless `Info`)
+/// that are indistinguishable from true answers. The measurements do exist, in
+/// `native-io/src/process.rs`'s `getProcessPids0` / `parent0` / `Info.info0`
+/// natives, and the supported way to reach them is the JDK's own
+/// `ProcessHandleImpl` bytecode. So rebuild the receiver and delegate, rather
+/// than growing a second implementation of the same process table that can
+/// disagree with the first.
+///
+/// **Why `getInternal` and not the `(JJ)V` constructor.** `javap -p
+/// java.lang.ProcessHandleImpl` (JDK 25.0.3) declares
+/// `static ProcessHandleImpl getInternal(long)`, whose body is
+/// `new ProcessHandleImpl(pid, isAlive0(pid))`. That second argument is the
+/// whole point: a hardcoded `0` there is `STARTTIME_ANY`, which
+/// `ProcessHandleImpl$Info.info(long, long)` does NOT honour — it compares with
+/// a bare `!=` and, on a mismatch, wipes every field `info0` has just written.
+/// Passing the constructor a start time this file computes separately is how
+/// W5-2 happened; taking it from `isAlive0` makes the two agree by
+/// construction and leaves nothing for a later edit to get out of step.
+/// docs/known-issues/jdk-only/W5-2-two-silently-skipped-process-checks.md.
+///
+/// `None` means there is no `java.lang.ProcessHandleImpl` in the image at all —
+/// synthetic-JDK mode, where `java/lang/ProcessHandle` is itself a carrier
+/// `ClassManager` fabricates (`is_native_backed_jdk_stub`,
+/// `classloading/src/class_manager.rs`). Callers fall back to the historical
+/// answer there and nowhere else.
+fn p60_real_handle_for(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+    let pid = p60_handle_pid(ctx, args)?;
+    match ctx.invoke(
+        "java/lang/ProcessHandleImpl",
+        "getInternal",
+        "(J)Ljava/lang/ProcessHandleImpl;",
+        &[Value::Long(pid)],
+    ) {
+        Ok(Some(Value::Object(Some(real)))) => Some(real),
+        _ => None,
+    }
+}
+
+/// Answer one of a minted handle's OS queries from the real
+/// `ProcessHandleImpl`; `None` when there is no real class to delegate to.
+///
+/// The inner `MethodCallResult` is returned UNTOUCHED, exceptions included, and
+/// that is the half that matters. `ProcessHandleImpl.children(long)` funnels
+/// into `getProcessPids0`, which `native-io/src/process.rs` raises a
+/// `java.lang.RuntimeException` from when the enumeration syscall fails —
+/// the same thing HotSpot's `ProcessHandleImpl_md.c` and
+/// `ProcessHandleImpl_unix.c` do. Catching that here and answering an empty
+/// stream would reinstate exactly the fabricated success this change removes,
+/// one layer further down.
+///
+/// GC: `real` is used only as the receiver of the call that immediately
+/// follows it, with no allocation in between, so there is no window for the
+/// stale-native-local hazard `p60_process_parent` pins against below.
+fn p60_delegate_to_real_handle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method_name: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let real = p60_real_handle_for(ctx, args)?;
+    Some(ctx.invoke_virtual(real, method_name, descriptor, &[]))
+}
+
+/// The empty `Stream<ProcessHandle>` the synthetic-JDK fallback answers with —
+/// and the one place the fabrication left in this block is written down rather
+/// than implied.
+///
+/// It IS a fabrication. `children()`'s javadoc carries no absence clause:
+/// *"@return a sequential Stream of ProcessHandles for processes that are
+/// direct children of the process"* (`ProcessHandle.java`, JDK 25 `src.zip`).
+/// An empty stream therefore states "this process has no children", which is a
+/// measurement. Contrast `parent()`, whose javadoc says the Optional *"is empty
+/// if the child process does not have a parent or if the parent is not
+/// available, possibly due to operating system limitations"*, and `Info`, whose
+/// *"attributes … are not available in all implementations"*. Those two may
+/// honestly answer empty when nothing can be measured; this one may not.
+///
+/// It survives because synthetic-JDK mode has no process table this VM can
+/// consult through a supported route and no `ProcessHandleImpl` to delegate to
+/// — the whole `java/lang/ProcessHandle` carrier is fabricated there. In
+/// real-JDK mode the delegation above answers instead, and under `--jdk-only`
+/// the `SyntheticStub` tag means this function is not reachable at all, because
+/// the registration that would call it is refused. Removing the last of it
+/// needs a process enumerator `native-builtins` can call without a real JDK;
+/// see the record.
+///
+/// `make_stream_from_elements` rather than the hand-rolled allocation this
+/// replaces: that one built a ONE-field `java/util/stream/Stream`, and
+/// `STREAM_NUM_FIELDS` in `native-collections` is 2 — slot 1 holds the
+/// `BaseStream.onClose` handler array. Every slot-1 reader guards on the field
+/// count, so a 1-field stream is not a crash; it is silently a stream that can
+/// never carry a close handler.
+fn p60_unmeasurable_process_tree(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    cratonvm_native_collections::make_stream_from_elements(ctx, &[])
+}
+
+/// The pid a minted `java/lang/ProcessHandle$Info` carries in slot 0.
+///
+/// Separate from [`p60_handle_pid`] because the guard is different: an `Info`
+/// minted by an older path (or by anything that copies the previous ZERO-field
+/// allocation) has no slot 0 at all, and reading past the end of an object is
+/// the one failure mode worth spending a branch on. Interfaces declare no
+/// instance fields, so `try_alloc_concurrent_synthetic`'s `num_fields.max(real)`
+/// leaves slot 0 ours — the slot-index species (W4-4 / W6-3) cannot bite here.
+fn p60_info_pid(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<i64> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    if ctx.object_num_fields(this) == 0 {
+        return None;
+    }
+    match ctx.get_field(this, 0) {
+        Value::Long(pid) if pid > 0 => Some(pid),
+        Value::Int(pid) if pid > 0 => Some(pid as i64),
+        _ => None,
+    }
+}
+
+/// `java/lang/ProcessHandle.parent()`.
+///
+/// This used to ignore the receiver entirely and answer `getppid()` — this
+/// VM's own parent — for a handle to *any* process on the machine, wrapped in a
+/// fresh bare-interface mint. Two fabrications in four lines: the pid was not
+/// the receiver's parent, and the object handed back could not answer anything
+/// about the process it named either.
+///
+/// Delegating gets the real `parent0(pid, startTime)` measurement AND a real
+/// `ProcessHandleImpl` in the `Optional`, so the handle the caller walks to
+/// next is a working one. It also removes the second-largest source of
+/// bare-interface mints in the tree.
+fn p60_process_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(result) = p60_delegate_to_real_handle(ctx, args, "parent", "()Ljava/util/Optional;")
+    {
+        return result;
+    }
+    // Synthetic-JDK fallback. `getppid()` answers for exactly one receiver —
+    // this process — and for any other pid there is nothing here that can
+    // measure a parent. Empty is the specified answer for that, verbatim:
+    // "the {@code Optional} is empty if the child process does not have a
+    // parent or if the parent is not available, possibly due to operating
+    // system limitations". Answering this VM's parent for someone else's
+    // process is not.
+    if p60_handle_pid(ctx, args) != Some(std::process::id() as i64) {
+        return p60_empty_optional(ctx, &[]);
+    }
     let parent_pid = p60_parent_pid();
     if parent_pid <= 0 {
         return p60_empty_optional(ctx, &[]);
@@ -2367,9 +2554,71 @@ fn p60_process_parent(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 
 /// Register the native-backed ProcessHandle surface in both synthetic- and
 /// real-JDK modes. SmallRye invokes `current().info()` during class init.
+///
+/// # The surface, from the image
+///
+/// `javap java.lang.ProcessHandle` / `javap 'java.lang.ProcessHandle$Info'` on
+/// Eclipse Adoptium jdk-25.0.3.9-hotspot (`javap -version` 25.0.3):
+///
+/// * `ProcessHandle` — **13 abstract** (`pid`, `parent`, `children`,
+///   `descendants`, `info`, `onExit`, `supportsNormalTermination`, `destroy`,
+///   `destroyForcibly`, `isAlive`, `hashCode`, `equals(Object)`,
+///   `compareTo(ProcessHandle)`), **3 static** (`of(J)`, `current()`,
+///   `allProcesses()`), **1 default** (the `compareTo(Object)` bridge).
+/// * `ProcessHandle$Info` — **6 abstract** (`command`, `commandLine`,
+///   `arguments`, `startInstant`, `totalCpuDuration`, `user`), no default, no
+///   static.
+///
+/// # `SyntheticStub`, stated for the whole block
+///
+/// **Not one method on either interface is `ACC_NATIVE`** — every flags line is
+/// `ACC_PUBLIC, ACC_ABSTRACT` or `ACC_PUBLIC, ACC_STATIC`. §1.5 defines a
+/// bridge as what an `ACC_NATIVE` method *on the image* binds to, so the
+/// ambient `Bridge` this block used to carry was a misstatement on every row,
+/// not just the arguable ones. Two distinct arguments, both landing here:
+///
+/// * `current()` is a **§1.4 shadow**: `acc_native: false, has_code: true`, and
+///   its real body is `invokestatic ProcessHandleImpl.current` — a `getstatic`
+///   of the class's own singleton. Static interface methods keep the native
+///   check in real-JDK mode, so unlike the abstract rows this one really does
+///   intercept live pipelines, and what it intercepts is *better than what it
+///   substitutes*: the memo below mints its own `ProcessHandleImpl` through the
+///   private `(JJ)V` constructor, which is not `ProcessHandleImpl.current`, so
+///   `ProcessHandle.current() != ProcessHandleImpl.current()` for the rest of
+///   the run. Refused under strict, the real `getstatic` answers and the
+///   identity is the JDK's. Same shape, same reasoning and same disposition as
+///   `native-io/src/process.rs`'s `ProcessBuilder.start()`.
+/// * The **abstract instance rows** (this interface's 11, `$Info`'s 6) bind to
+///   no image method at all, and the only receiver that can reach them is one
+///   this VM minted — an interface cannot be instantiated. A registration whose
+///   entire receiver population is fabricated is a compatibility shim by the
+///   review's own disposition table ("No real method/class + compatibility
+///   behaviour -> CompatibilityShim"), whatever it answers.
+///
+/// The `Bridge` tag was not baseless, and knowing why matters for the next
+/// reader: in **synthetic-JDK mode** these classes have no class file and
+/// `ClassManager::is_native_backed_jdk_stub` fabricates a carrier whose methods
+/// it marks `MethodAccessFlags::NATIVE` (`classloading/src/class_manager.rs`).
+/// On that carrier the rows *are* `ACC_NATIVE`. But the carrier is not the
+/// image, §1.5 asks about the image, and a single ambient tag cannot say "true
+/// in one mode". `SyntheticStub` is the tag that makes both modes coherent:
+/// Compatible keeps every registration and is unchanged, strict refuses them
+/// and the real JDK answers.
+///
+/// **Strict mode loses nothing by the refusal.** After the delegation fixes
+/// below, no path in the tree mints a bare-interface handle when
+/// `java.lang.ProcessHandleImpl` is loadable: `current()` builds a real one,
+/// `parent()` returns the real one `parent0` found, and
+/// `native-io::build_process_handle` prefers a real one for `Process.toHandle`.
+/// A residual mint under strict would raise `AbstractMethodError` naming the
+/// exact triple — which is the outcome strict mode is for, and strictly better
+/// than a silent fabricated answer.
+///
+/// Restated in `register_phase57_process` for the three triples it shares; see
+/// the note there for why both sites have to say it.
 pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let ph = "java/lang/ProcessHandle";
     r.register(
         ph,
@@ -2382,27 +2631,34 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 0)))
     });
     r.register(ph, "isAlive", "()Z", p60_handle_is_alive);
-    r.register(
-        ph,
-        "children",
-        "()Ljava/util/stream/Stream;",
-        |ctx, _args| {
-            // Return empty stream
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
-            ctx.set_field(stream, 0, Value::Object(Some(arr)));
-            Ok(Some(Value::Object(Some(stream))))
-        },
-    );
+    // `children()` and `descendants()` answered a hardcoded empty stream — the
+    // fabricated success this campaign is named for. "This process has no
+    // children" and "this VM cannot enumerate processes" are different facts,
+    // only one of them is ever true, and the empty stream says the first while
+    // meaning the second. Delegating routes both through
+    // `ProcessHandleImpl.children(long)` -> `getProcessPids0`, which is the
+    // same probe the `ProcessHandleImpl` natives in `native-io/src/process.rs`
+    // already answer with — so the two cannot report different process trees —
+    // and which THROWS on a failed scan the way HotSpot does.
+    r.register(ph, "children", "()Ljava/util/stream/Stream;", |ctx, args| {
+        if let Some(result) =
+            p60_delegate_to_real_handle(ctx, args, "children", "()Ljava/util/stream/Stream;")
+        {
+            return result;
+        }
+        p60_unmeasurable_process_tree(ctx)
+    });
     r.register(
         ph,
         "descendants",
         "()Ljava/util/stream/Stream;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            let stream = try_alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1)?;
-            ctx.set_field(stream, 0, Value::Object(Some(arr)));
-            Ok(Some(Value::Object(Some(stream))))
+        |ctx, args| {
+            if let Some(result) =
+                p60_delegate_to_real_handle(ctx, args, "descendants", "()Ljava/util/stream/Stream;")
+            {
+                return result;
+            }
+            p60_unmeasurable_process_tree(ctx)
         },
     );
     r.register(
@@ -2454,13 +2710,29 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // ProcessHandle.Info = 0-field synthetic
+    // `info()` minted a ZERO-field `ProcessHandle$Info` — an object carrying no
+    // fact about any process, whose six accessors therefore had nothing to
+    // answer from and answered constants. Delegating produces a real
+    // `java.lang.ProcessHandleImpl$Info` filled by `info0(pid)`, which serves
+    // all six from one measurement, including `commandLine()`, which this file
+    // could not have supplied at all (see its registration below).
+    //
+    // The synthetic fallback now carries the pid in slot 0. That is one fact
+    // rather than none, and it is what lets `command()` below tell "this VM's
+    // own executable" apart from "some other process's, which I do not know".
     r.register(
         ph,
         "info",
         "()Ljava/lang/ProcessHandle$Info;",
-        |ctx, _args| {
-            let info = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle$Info", 0)?;
+        |ctx, args| {
+            if let Some(result) =
+                p60_delegate_to_real_handle(ctx, args, "info", "()Ljava/lang/ProcessHandle$Info;")
+            {
+                return result;
+            }
+            let pid = p60_handle_pid(ctx, args).unwrap_or(0);
+            let info = try_alloc_concurrent_synthetic(ctx, "java/lang/ProcessHandle$Info", 1)?;
+            ctx.set_field(info, 0, Value::Long(pid));
             Ok(Some(Value::Object(Some(info))))
         },
     );
@@ -2470,8 +2742,25 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
     // `PathMatchingResourcePatternResolverTests$ClassPathManifestEntries` does
     // exactly that, and an empty Optional there is an immediate
     // `NoSuchElementException: No value present`. Report this VM's own
-    // executable, the way the real `ProcessHandleImpl.Info` does.
+    // executable when — and only when — the receiver describes this VM.
+    //
+    // That pid gate is the correction. `current_exe()` is
+    // a real measurement of exactly ONE process — this one — and the `Info` it
+    // was being answered from could describe any process on the machine, so for
+    // every other pid it was a fabricated command line dressed as a
+    // measurement. `Optional.empty()` is what the interface specifies for a
+    // value it cannot supply: "The attributes of a process vary by operating
+    // system and are not available in all implementations. … The return types
+    // are {@code Optional<T>} allowing explicit tests and actions if the value
+    // is available" (`ProcessHandle.Info`, JDK 25 `src.zip`).
+    //
+    // In real-JDK mode `info()` above no longer reaches this at all — the real
+    // `ProcessHandleImpl$Info` answers `command()` from `info0`, for the right
+    // process, so the Spring case is served better than it was here.
     r.register(phi, "command", "()Ljava/util/Optional;", |ctx, args| {
+        if p60_info_pid(ctx, args) != Some(std::process::id() as i64) {
+            return p60_empty_optional(ctx, args);
+        }
         let Ok(exe) = std::env::current_exe() else {
             return Ok(p60_empty_optional(ctx, args)?);
         };
@@ -2506,6 +2795,35 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         p60_empty_optional,
     );
+    // `commandLine()` — the SIXTH abstract on `java.lang.ProcessHandle$Info`
+    // (`javap 'java.lang.ProcessHandle$Info'`, JDK 25.0.3: six abstract, no
+    // default, no static), and until now registered nowhere in the tree. On a
+    // minted receiver an abstract declaration has no `Code` to fall back on, so
+    // this triple was an `AbstractMethodError` waiting for its first caller —
+    // and `regression-suite/src/RJdkProcess.java:128` already calls
+    // `info.commandLine()`, so "waiting" is the only accurate word.
+    //
+    // It reached nobody because the five siblings around it were the only rows
+    // anything exercised, and W5-2 read that silence as evidence the `$Info`
+    // stubs do not intercept. An absence used as evidence is still an absence:
+    // what it actually showed is that `current()` already produced a real
+    // `ProcessHandleImpl`, so no caller had ever held a minted `Info`.
+    //
+    // Registered, and registered EMPTY, deliberately. The minted `Info` carries
+    // a pid and nothing else; `commandLine()` is `command()` and `arguments()`
+    // joined, or failing that "a best-effort, platform dependent representation
+    // of the command line" — neither of which this file can measure for an
+    // arbitrary process without reimplementing `info0`. `Optional.empty()` is
+    // the specified answer for a value that is not available, and it is what
+    // the four siblings beside it already answer for the same reason. In
+    // real-JDK mode `info()` returns the real `ProcessHandleImpl$Info` and this
+    // row is never reached.
+    //
+    // Registration ORDER: this registrar is the last writer for every
+    // `java/lang/ProcessHandle*` triple in both boot arms (`vm_init.rs:1901`
+    // and `:2406`, after `register_io_natives`), so nothing overwrites it. It
+    // is also a NEW triple — no prior slot, so last-write-wins does not apply.
+    r.register(phi, "commandLine", "()Ljava/util/Optional;", p60_empty_optional);
     r.set_category(__prev_cat);
     ()
 }
