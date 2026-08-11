@@ -1209,6 +1209,24 @@ fn check_reflection_export_access_with_target_id(
 ///
 /// `mirror_field_index` is the slot holding the `Class` mirror on the
 /// reflection object (field 0 for Field/Method/Constructor).
+///
+/// **CALLER-FREE, and must stay that way.** It asks
+/// [`check_reflection_module_access`] — the `opens` question — which is
+/// `setAccessible(true)`'s gate and decides no reflective read or call. Every
+/// live reflective member gate asks
+/// [`check_reflection_export_access_with_target_id`] instead
+/// (`enforce_module_check_on_field`, `native_method_invoke`,
+/// `native_constructor_new_instance`); `enforce_set_accessible_gate` is the one
+/// site the `opens` question belongs to, and it calls the `_with_target_id`
+/// form directly. Wiring this back onto a `get`/`set`/`invoke` path reinstates
+/// the over-denial catalogued in [`enforce_module_check_on_field`]'s doc
+/// comment — `--add-opens java.base/java.lang=ALL-UNNAMED` does NOT make
+/// `String.hash` readable on HotSpot 25, so `opens` is not the edge those
+/// paths are asking about.
+///
+/// Kept rather than deleted only because it is the surviving in-source
+/// statement of that distinction; `dead_code` is allowed crate-wide
+/// (`lib.rs:9`), so nothing warns that it is unreachable.
 fn enforce_module_check_from_mirror(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
