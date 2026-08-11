@@ -9381,6 +9381,27 @@ impl GenerationalHeap {
         // `existing_free` is already the MERGE of the arena free list and the
         // JIT TLAB reservations, so the two are tested separately here — a
         // reserved TLAB tail and a genuine free block are not the same finding.
+        // MARKWHY: this sweep RAN, and here is where the watch is relative to
+        // it.
+        //
+        // Every other MARKWHY line below is gated on the watch being inside
+        // from-space, so all of them go silent together — and their silence has
+        // (at least) three causes that want three different next steps: this
+        // sweep never ran, it ran and the watched object is not in from-space
+        // (promoted, or in the other semispace), or it ran with the object in
+        // range and the walk simply never reached it. Reading the third from
+        // the absence of output is how a measurement about the object gets made
+        // out of a fact about the collector's schedule.
+        {
+            let w = crate::heap::young_mark_watch();
+            if w != 0 {
+                let used_now = young_from.used();
+                eprintln!(
+                    "[MARKWHY] sweep enter: watch={w:#x} from_base={from_base:#x} used={used_now:#x}                      in_from_space={} cycle={sweep_zero_cycle}",
+                    w >= from_base && w < from_base + used_now,
+                );
+            }
+        }
         {
             let w = crate::heap::young_mark_watch();
             if w != 0 && w >= from_base && w < from_base + young_from.used() {
