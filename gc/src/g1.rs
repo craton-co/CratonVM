@@ -2684,7 +2684,7 @@ impl G1Collector {
         // JIT). Map each published root address to its region and exclude those
         // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
         // is in JIT (the common case for a JIT-triggered young GC).
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         if gc_flags().g1_dbg_pins {
             eprintln!(
                 "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
@@ -3160,7 +3160,7 @@ impl G1Collector {
         // place) — see `young_collection` / `jit_pinned_region_set`. A mixed GC
         // can also select the (now promoted) region of a long-lived JIT-rooted
         // object, so this guard matters for both young and old CSet members.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
 
         // Build CSet: all young regions + worst old regions (skip pinned + any
         // region holding a conservative JIT root)
@@ -3788,7 +3788,7 @@ impl G1Collector {
         // move. Empty (free) unless a thread is in JIT, and the young path
         // only dispatches here when none is — this keeps the invariant even
         // if that gate is ever loosened or the fn is called directly.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         let cset: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -3956,7 +3956,7 @@ impl G1Collector {
         // bounded by both the percentage cap and the Step-7 pause budget —
         // identical selection to the serial `mixed_collection`.
         // Conservative-JIT-root region exclusion — see young_collection_parallel.
-        let jit_pinned_regions = self.jit_pinned_region_set();
+        let jit_pinned_regions = self.pinned_region_set_including_non_object_roots(&regions, roots);
         let mut cset: Vec<usize> = regions
             .iter()
             .enumerate()
@@ -8316,6 +8316,60 @@ impl G1Collector {
     /// from inside one.
     fn refuse_evacuation(coverage_incomplete: Option<usize>, lever_on: bool) -> Option<usize> {
         coverage_incomplete.filter(|_| lever_on)
+    }
+
+    /// [`Self::jit_pinned_region_set`] PLUS every region holding a root that is
+    /// not the start of a live object.
+    ///
+    /// The root array is over-approximate by design. `collect_roots` filters
+    /// operand-stack slots with `is_heap_addr` — a RANGE check — because the
+    /// strict `is_object_address` probe dropped genuine young / mid-init roots
+    /// when it was used there (2026-08-04). So a primitive `long` (a file size,
+    /// a hash, a computed interior address) whose bits land in the heap range is
+    /// handed to the collector as a root. For a NON-MOVING sweep that is safe:
+    /// a false positive only over-retains, which is what that comment says.
+    ///
+    /// A MOVING collector cannot leave it at that. The root loops screened a
+    /// root for CSet membership and nothing else, so `evacuate_object` read a
+    /// header at whatever address arrived, sized a memcpy from those bytes and
+    /// copied them (measured: 6-8 such roots per affected H2 pause, all COPIED,
+    /// and the copy then broke the destination region's object grid), installed
+    /// old→new in the pointer map — which the VM's post-GC remap then applies to
+    /// the very operand-stack slot the address came from, rewriting a Java
+    /// `long` — and, when to-space ran out instead, self-forwarded it into an
+    /// identity entry that `retry_after_evacuation_failure` picked up as a
+    /// "live self-forwarded seed".
+    ///
+    /// Evacuating such a root is unsound and so is skipping it, for the same
+    /// reason: the collector cannot tell a real reference from a long, so it may
+    /// neither rewrite the slot nor drop what it might point at. Pin the region
+    /// instead — precisely what this collector already does with a conservative
+    /// JIT root it cannot rewrite.
+    fn pinned_region_set_including_non_object_roots(
+        &self,
+        regions: &[G1Region],
+        roots: &[ObjectRef],
+    ) -> std::collections::HashSet<usize> {
+        let mut set = self.jit_pinned_region_set();
+        for root in roots {
+            let addr = root.as_ptr() as usize;
+            let Some(idx) = self.lookup_region_for_addr(addr) else {
+                continue;
+            };
+            if set.contains(&idx) || self.candidate_header_is_plausible(regions, addr) {
+                continue;
+            }
+            let n = NON_OBJECT_ROOT_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::warn!(
+                    "[g1] root is not an object (#{n}): addr=0x{addr:x} {} — pinning region \
+                     {idx} instead of evacuating it.",
+                    self.describe_rejected_address(regions, addr),
+                );
+            }
+            set.insert(idx);
+        }
+        set
     }
 
     fn jit_pinned_region_set(&self) -> std::collections::HashSet<usize> {
