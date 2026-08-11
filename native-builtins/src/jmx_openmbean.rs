@@ -1588,11 +1588,12 @@ fn is_synthetic_carrier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 
 /// Should the carrier natives below hand `obj` back to real JDK bytecode?
 ///
-/// They were written for the synthetic carriers the platform-MXBean natives
-/// mint, but registration made them shadow the JDK bytecode for *every*
-/// `CompositeDataSupport`/`TabularDataSupport`, including ones the application
-/// constructed itself. Those have no [`CONTENTS_FIELD`]/[`OPEN_TYPE_FIELD`], so
-/// the natives answered `null`/`false`/`0` for all of them:
+/// They were written against the carriers [`build_composite_data`] /
+/// [`build_tabular_data`] mint, but registration made them shadow the JDK
+/// bytecode for *every* `CompositeDataSupport`/`TabularDataSupport`, including
+/// ones the application constructed itself. Those have no
+/// [`CONTENTS_FIELD`]/[`OPEN_TYPE_FIELD`], so the natives answered
+/// `null`/`false`/`0` for all of them:
 /// `new CompositeDataSupport(t, names, values).getCompositeType()` returned
 /// null, which made `CompositeType.isValue()` reject a value against the very
 /// type it was built from and `CompositeDataSupport`'s own constructor throw
@@ -1607,8 +1608,14 @@ fn is_synthetic_carrier(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// bytecode without re-entering this registration.
 ///
 /// Gated on the class not being a fabricated stub so `synthetic-jdk` mode —
-/// where there is no bytecode to delegate to and every instance comes from
-/// [`build_composite_data`] — keeps the carrier behaviour unchanged.
+/// where there is no bytecode to delegate to — keeps the carrier behaviour
+/// unchanged.
+///
+/// Note that the two builders currently have no caller outside this module's
+/// tests, so under `real-jdk` this predicate is true for every instance and
+/// the seven natives below defer wholesale. The per-instance check is kept
+/// rather than reduced to the class-level gate because it is what makes the
+/// natives correct again the moment a caller mints a carrier.
 fn delegates_to_bytecode(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
     !is_synthetic_carrier(ctx, obj) && !ctx.is_class_synthetic_stub(class_name)
 }
@@ -2745,31 +2752,62 @@ mod tests {
 
     #[test]
     fn only_cratonvm_built_carriers_are_answered_by_the_carrier_natives() {
+        use cratonvm_native_api::FieldMetadata;
         let mut ctx = mock_ctx();
+        let cid = match ctx.ensure_class_initialized(CDS_CLASS) {
+            Ok(cid) => cid,
+            Err(e) => panic!("mock could not initialize {CDS_CLASS}: {e:?}"),
+        };
+        // The mock resolves a field name only through `set_declared_fields`;
+        // the real VM's by-name path resolves the two carrier fields on the
+        // synthetically-allocated instance itself. Declare them so both
+        // branches below are reachable here.
+        ctx.set_declared_fields(
+            cid,
+            vec![
+                FieldMetadata {
+                    name: CONTENTS_FIELD.to_string(),
+                    descriptor: "Ljava/lang/Object;".to_string(),
+                    access_flags: 0,
+                    slot_index: 0,
+                    declaring_class_id: cid,
+                    is_static: false,
+                },
+                FieldMetadata {
+                    name: OPEN_TYPE_FIELD.to_string(),
+                    descriptor: "Ljava/lang/Object;".to_string(),
+                    access_flags: 0,
+                    slot_index: 1,
+                    declaring_class_id: cid,
+                    is_static: false,
+                },
+            ],
+        );
 
-        // A carrier this crate minted carries CONTENTS_FIELD/OPEN_TYPE_FIELD,
-        // so the natives must keep answering for it (synthetic-jdk mode has no
-        // bytecode to fall back to).
-        let carrier = build_composite_data(&mut ctx, None, &[("used".to_string(), Value::Long(1))])
-            .unwrap();
+        let carrier = match ctx.new_object(CDS_CLASS) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate an instance: {other:?}"),
+        };
+
+        // Untouched, an instance looks exactly like one the application built
+        // through the JDK's own constructor: neither carrier field is set. The
+        // natives answered those from the carrier fields and so returned null
+        // for everything — `getCompositeType()` in particular, which made
+        // `CompositeType.isValue()` reject a value against its own declared
+        // type. It has to go back to the bytecode.
+        assert!(!is_synthetic_carrier(&ctx, carrier));
+        assert!(delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
+
+        // Stamped the way `build_composite_data` stamps it, the same instance
+        // is this crate's own carrier and the natives must keep answering it —
+        // under `synthetic-jdk` there is no bytecode to fall back to.
+        let map = match ctx.new_object("java/util/HashMap") {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            other => panic!("mock could not allocate a map: {other:?}"),
+        };
+        ctx.set_field_by_name(carrier, CONTENTS_FIELD, Value::Object(Some(map)));
         assert!(is_synthetic_carrier(&ctx, carrier));
         assert!(!delegates_to_bytecode(&ctx, carrier, CDS_CLASS));
-
-        let table = build_tabular_data(&mut ctx, None).unwrap();
-        assert!(is_synthetic_carrier(&ctx, table));
-        assert!(!delegates_to_bytecode(&ctx, table, TDS_CLASS));
-
-        // An instance the application constructed through the JDK's own
-        // bytecode has neither field. Answering it from the carrier fields
-        // returned null for everything — `getCompositeType()` in particular,
-        // which made `CompositeType.isValue()` reject a value against its own
-        // declared type. It must be handed back to the bytecode instead.
-        let real = match ctx.new_object(CDS_CLASS) {
-            Ok(Some(Value::Object(Some(o)))) => o,
-            other => panic!("mock could not allocate a plain instance: {other:?}"),
-        };
-        assert!(!is_synthetic_carrier(&ctx, real));
-        assert!(delegates_to_bytecode(&ctx, real, CDS_CLASS));
     }
 
     #[test]
